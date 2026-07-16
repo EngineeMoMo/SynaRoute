@@ -1,0 +1,93 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   SynaRoute 设计系统 — 色彩 Token（对齐 UI 设计文档 §3.1）
+   以 shadcn/ui 的 CSS 变量体系组织，支持浅色/深色主题切换
+   ============================================================ */
+
+@layer base {
+  :root {
+    /* 中性色 - 浅色 */
+    --background: 250 250 250; /* #FAFAFA */
+    --surface: 255 255 255; /* #FFFFFF */
+    --surface-hover: 244 244 245; /* #F4F4F5 */
+    --border: 228 228 231; /* #E4E4E7 */
+    --text-primary: 24 24 27; /* #18181B */
+    --text-secondary: 113 113 122; /* #71717A */
+    --text-muted: 161 161 170; /* #A1A1AA */
+
+    /* 品牌与功能色 */
+    --primary: 109 94 247; /* #6D5EF7 靛紫 */
+    --primary-foreground: 255 255 255; /* #FFFFFF */
+    --success: 34 197 94; /* #22C55E */
+    --warning: 245 158 11; /* #F59E0B */
+    --danger: 239 68 68; /* #EF4444 */
+    --info: 59 130 246; /* #3B82F6 */
+
+    --radius-card: 12px;
+    --radius-control: 8px;
+  }
+
+  .dark {
+    /* 中性色 - 深色 */
+    --background: 14 14 17; /* #0E0E11 */
+    --surface: 24 24 27; /* #18181B */
+    --surface-hover: 35 35 41; /* #232329 */
+    --border: 39 39 42; /* #27272A */
+    --text-primary: 250 250 250; /* #FAFAFA */
+    --text-secondary: 161 161 170; /* #A1A1AA */
+    --text-muted: 82 82 91; /* #52525B */
+
+    /* 品牌与功能色（深色下略微提亮） */
+    --primary: 129 116 255; /* 略亮的靛紫 */
+    --primary-foreground: 255 255 255;
+    --success: 34 197 94;
+    --warning: 245 158 11;
+    --danger: 239 68 68;
+    --info: 59 130 246;
+  }
+
+  * {
+    border-color: rgb(var(--border));
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    background-color: rgb(var(--background));
+    color: rgb(var(--text-primary));
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, -apple-system,
+      sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden; /* 桌面应用不整页滚动，滚动交给内容区 */
+  }
+
+  /* 等宽字体（端点/密钥/代码） */
+  .font-mono {
+    font-family: "Cascadia Code", "Consolas", "Courier New", monospace;
+  }
+
+  /* 滚动条美化 */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background-color: rgb(var(--border));
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: rgb(var(--text-muted));
+  }
+}
