@@ -65,6 +65,7 @@ export interface ModelInfo {
   realName: string;
   source: "fetched" | "manual";
   fetchedAt?: number;
+  contextWindow?: number;
 }
 
 /** 健康状态（FR-011 / FR-012） */
@@ -149,4 +150,6 @@ export interface AppSettings {
   masterPasswordEnabled: boolean; // 加密增强：主口令（默认关，DPAPI 免口令）
   lanExposure: boolean; // 局域网暴露（默认关，NFR-007）
   requestLogEnabled: boolean; // 调用模型日志（默认关，开启后记录每次转发）
+  healthCheckIntervalSecs: number;
+  logDir?: string;
 }

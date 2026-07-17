@@ -105,6 +105,16 @@ export const api = {
   saveSettings: (settings: AppSettings) =>
     call<void>("save_settings", { settings }, () => mockBridge.saveSettings(settings)),
 
+  // ---- 版本与更新 ----
+  getAppVersion: () => call<string>("get_app_version", undefined, () => "0.1.0"),
+
+  checkForUpdates: () => call<string | null>("check_for_updates", undefined, async () => null),
+
+  // ---- 文件目录选择 ----
+  pickDirectory: () => call<string | null>("pick_directory", undefined, async () => null),
+
+  getDefaultLogDir: () => call<string>("get_default_log_dir", undefined, async () => "C:\\AppData\\SynaRoute\\logs"),
+
   // ---- 厂商预设 ----
   listVendors: () => call<Vendor[]>("list_vendors", undefined, () => mockBridge.listVendors()),
 

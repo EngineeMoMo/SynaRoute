@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useStore } from "@/store";
 import { Badge } from "@/components/ui/Badge";
 import { useT } from "@/lib/useT";
@@ -31,8 +31,15 @@ const TYPE_META: Record<
 
 /** 运行日志 / 可观测性视图（FR-020）。request 类型可展开查看完整调用链路。 */
 export function LogsPage() {
-  const { events, lang } = useStore();
+  const { events, lang, refreshEvents } = useStore();
   const t = useT();
+
+  // 实时刷新：每 2s 拉一次事件（仅事件，不重载 keys/proxy，开销小）。
+  useEffect(() => {
+    void refreshEvents();
+    const id = setInterval(() => void refreshEvents(), 2000);
+    return () => clearInterval(id);
+  }, [refreshEvents]);
 
   return (
     <div className="flex h-full flex-col">

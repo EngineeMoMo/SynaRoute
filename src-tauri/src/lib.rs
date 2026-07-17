@@ -83,7 +83,7 @@ async fn fetch_models(
     let now = chrono::Utc::now().timestamp_millis();
     let models: Vec<ModelInfo> = names
         .into_iter()
-        .map(|n| ModelInfo { real_name: n, source: "fetched".into(), fetched_at: Some(now) })
+        .map(|n| ModelInfo { real_name: n, source: "fetched".into(), fetched_at: Some(now), context_window: None })
         .collect();
     state.store.set_models(&key_id, models.clone())?;
     Ok(models)
@@ -113,7 +113,7 @@ async fn fetch_models_draft(
     let now = chrono::Utc::now().timestamp_millis();
     let models: Vec<ModelInfo> = names
         .into_iter()
-        .map(|n| ModelInfo { real_name: n, source: "fetched".into(), fetched_at: Some(now) })
+        .map(|n| ModelInfo { real_name: n, source: "fetched".into(), fetched_at: Some(now), context_window: None })
         .collect();
     Ok(models)
 }
@@ -213,6 +213,44 @@ fn save_settings(state: tauri::State<AppState>, settings: AppSettings) -> AppRes
     state.store.save_settings(settings)
 }
 
+// ============ 版本与更新 ============
+
+#[tauri::command]
+fn get_app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+#[tauri::command]
+async fn check_for_updates(app: tauri::AppHandle) -> AppResult<Option<String>> {
+    use tauri_plugin_updater::UpdaterExt;
+    let update = app
+        .updater()
+        .map_err(|e| error::AppError::Other(format!("{e}")))?
+        .check()
+        .await
+        .map_err(|e| error::AppError::Other(format!("检查更新失败: {e}")))?;
+    Ok(update.map(|u| u.version))
+}
+
+// ============ 文件目录选择 ============
+
+#[tauri::command]
+async fn pick_directory(app: tauri::AppHandle) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |path| {
+        let _ = tx.send(path.map(|p| p.to_string()));
+    });
+    rx.await.ok().flatten()
+}
+
+#[tauri::command]
+fn get_default_log_dir() -> String {
+    dirs::data_dir()
+        .map(|d| d.join("SynaRoute").join("logs").to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 // ============ 厂商预设命令 ============
 
 #[tauri::command]
@@ -253,14 +291,15 @@ pub fn run() {
     let store = Arc::new(Store::init().expect("初始化配置失败"));
     let proxy = Arc::new(ProxyManager::new(store.clone()));
 
-    // 后台定时健康检查（arch-decisions §6：每 45s 全量探测）
+    // 后台定时健康检查（arch-decisions §6）。间隔由用户配置（AppSettings.health_check_interval_secs，
+    // 默认 60s），每轮结束后重新读取最新配置，改设置即时生效、无需重启。设 10s 下限防误配把上游打爆。
     {
         let store_bg = store.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio rt");
             rt.block_on(async move {
+                const MIN_INTERVAL_SECS: u64 = 10;
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(45)).await;
                     for cat in [
                         CategoryType::ClaudeCli,
                         CategoryType::ClaudeDesktop,
@@ -268,6 +307,11 @@ pub fn run() {
                     ] {
                         health::check_category(&store_bg, cat).await;
                     }
+                    let interval = store_bg
+                        .get_settings()
+                        .health_check_interval_secs
+                        .max(MIN_INTERVAL_SECS);
+                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
                 }
             });
         });
@@ -314,6 +358,10 @@ pub fn run() {
             list_events,
             get_settings,
             save_settings,
+            get_app_version,
+            check_for_updates,
+            pick_directory,
+            get_default_log_dir,
             list_vendors,
             upsert_vendor,
             delete_vendor,

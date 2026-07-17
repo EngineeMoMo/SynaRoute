@@ -89,10 +89,41 @@ impl Store {
             trace,
         };
         let mut ev = self.events.write();
-        ev.push(entry);
+        ev.push(entry.clone());
         if ev.len() > MAX_EVENTS {
             let overflow = ev.len() - MAX_EVENTS;
             ev.drain(0..overflow);
+        }
+        drop(ev);
+        self.write_log_to_file(&entry);
+    }
+
+    fn write_log_to_file(&self, entry: &EventLogEntry) {
+        let settings = self.get_settings();
+        let log_dir = match &settings.log_dir {
+            Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+            _ => match self.config_path.parent() {
+                Some(p) => p.join("logs"),
+                None => return,
+            },
+        };
+        if let Err(e) = std::fs::create_dir_all(&log_dir) {
+            tracing::warn!("创建日志目录失败: {e}");
+            return;
+        }
+        let date = chrono::Utc::now().format("%Y-%m-%d");
+        let log_file = log_dir.join(format!("{date}.jsonl"));
+        let line = match serde_json::to_string(entry) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("序列化日志条目失败: {e}");
+                return;
+            }
+        };
+        use std::io::Write;
+        match std::fs::OpenOptions::new().create(true).append(true).open(&log_file) {
+            Ok(mut f) => { let _ = writeln!(f, "{line}"); }
+            Err(e) => { tracing::warn!("写入日志文件失败: {e}"); }
         }
     }
 

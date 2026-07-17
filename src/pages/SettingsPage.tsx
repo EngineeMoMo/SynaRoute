@@ -7,16 +7,25 @@ import { Button } from "@/components/ui/Button";
 import { useT } from "@/lib/useT";
 import { LANGS } from "@/lib/i18n";
 import type { AppSettings, ThemePref } from "@/types";
-import { Sun, Moon, Monitor, ShieldCheck, KeyRound, Languages, ScrollText, type LucideIcon } from "lucide-react";
+import {
+  Sun, Moon, Monitor, ShieldCheck, KeyRound, Languages, ScrollText,
+  Activity, RefreshCw, FolderOpen, Info, type LucideIcon,
+} from "lucide-react";
 
-/** 设置页（主题 / 语言 / 自启 / 加密方式 / 局域网暴露） */
+/** 设置页（主题 / 语言 / 自启 / 加密方式 / 局域网暴露 / 版本更新 / 日志路径） */
 export function SettingsPage() {
   const { theme, setTheme, lang, setLang } = useStore();
   const t = useT();
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [version, setVersion] = useState<string>("");
+  const [updateMsg, setUpdateMsg] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [defaultLogDir, setDefaultLogDir] = useState<string>("");
 
   useEffect(() => {
     void api.getSettings().then(setSettings);
+    void api.getAppVersion().then(setVersion);
+    void api.getDefaultLogDir().then(setDefaultLogDir);
   }, []);
 
   const update = (patch: Partial<AppSettings>) => {
@@ -24,6 +33,24 @@ export function SettingsPage() {
     const next = { ...settings, ...patch };
     setSettings(next);
     void api.saveSettings(next);
+  };
+
+  const handleCheckUpdate = async () => {
+    setChecking(true);
+    setUpdateMsg(null);
+    try {
+      const newVer = await api.checkForUpdates();
+      setUpdateMsg(newVer ? t("settings.updateAvailable", { version: newVer }) : t("settings.upToDate"));
+    } catch (e) {
+      setUpdateMsg(t("settings.updateError", { err: String((e as Error)?.message ?? e) }));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const handlePickLogDir = async () => {
+    const dir = await api.pickDirectory();
+    if (dir) update({ logDir: dir });
   };
 
   const themeOptions: { value: ThemePref; tKey: string; icon: LucideIcon }[] = [
@@ -39,6 +66,31 @@ export function SettingsPage() {
       </div>
 
       <div className="max-w-2xl space-y-4 p-6">
+        {/* 版本与更新 */}
+        <Card>
+          <CardHeader>
+            <CardTitle>{t("settings.about")}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex gap-2.5">
+                <Info size={16} className="mt-0.5 shrink-0 text-text-secondary" />
+                <div>
+                  <div className="text-sm font-medium text-text-primary">
+                    SynaRoute v{version}
+                  </div>
+                  {updateMsg && (
+                    <div className="mt-1 text-xs text-text-muted">{updateMsg}</div>
+                  )}
+                </div>
+              </div>
+              <Button size="sm" variant="secondary" onClick={() => void handleCheckUpdate()} disabled={checking}>
+                <RefreshCw size={14} className={checking ? "animate-spin" : ""} />
+                {t("settings.checkUpdate")}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
         {/* 主题 */}
         <Card>
           <CardHeader>
@@ -126,7 +178,7 @@ export function SettingsPage() {
           <CardHeader>
             <CardTitle>{t("settings.debug")}</CardTitle>
           </CardHeader>
-          <CardContent>
+          <CardContent className="space-y-3">
             <ToggleRow
               icon={ScrollText}
               title={t("settings.reqLogTitle")}
@@ -134,6 +186,26 @@ export function SettingsPage() {
               checked={settings?.requestLogEnabled ?? false}
               onChange={(v) => update({ requestLogEnabled: v })}
             />
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex gap-2.5">
+                <Activity size={16} className="mt-0.5 shrink-0 text-text-secondary" />
+                <div>
+                  <div className="text-sm font-medium text-text-primary">{t("settings.healthTitle")}</div>
+                  <div className="text-xs text-text-muted">{t("settings.healthDesc")}</div>
+                </div>
+              </div>
+              <select
+                className="shrink-0 rounded-control border border-border bg-surface px-2.5 py-1.5 text-xs text-text-primary"
+                value={settings?.healthCheckIntervalSecs ?? 60}
+                onChange={(e) => update({ healthCheckIntervalSecs: Number(e.target.value) })}
+              >
+                {[30, 60, 120, 300].map((s) => (
+                  <option key={s} value={s}>
+                    {t(`settings.health.${s}`)}
+                  </option>
+                ))}
+              </select>
+            </div>
           </CardContent>
         </Card>
 
@@ -149,6 +221,38 @@ export function SettingsPage() {
               checked={settings?.autoStart ?? false}
               onChange={(v) => update({ autoStart: v })}
             />
+          </CardContent>
+        </Card>
+
+        {/* 日志文件 */}
+        <Card>
+          <CardHeader>
+            <CardTitle>{t("settings.logTitle")}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="flex gap-2.5">
+              <FolderOpen size={16} className="mt-0.5 shrink-0 text-text-secondary" />
+              <div className="flex-1">
+                <div className="text-xs text-text-muted">{t("settings.logDesc")}</div>
+                <div className="mt-2 flex items-center gap-2">
+                  <input
+                    type="text"
+                    className="flex-1 rounded-control border border-border bg-bg px-2.5 py-1.5 font-mono text-xs text-text-primary placeholder:text-text-muted"
+                    value={settings?.logDir ?? ""}
+                    placeholder={defaultLogDir || t("settings.logDirDefault")}
+                    onChange={(e) => update({ logDir: e.target.value || undefined })}
+                  />
+                  <Button size="sm" variant="secondary" onClick={() => void handlePickLogDir()}>
+                    {t("settings.logBrowse")}
+                  </Button>
+                  {settings?.logDir && (
+                    <Button size="sm" variant="outline" onClick={() => update({ logDir: undefined })}>
+                      {t("settings.logReset")}
+                    </Button>
+                  )}
+                </div>
+              </div>
+            </div>
           </CardContent>
         </Card>
 

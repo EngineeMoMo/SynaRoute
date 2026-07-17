@@ -115,6 +115,9 @@ pub struct ModelInfo {
     pub source: String, // "fetched" | "manual"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fetched_at: Option<i64>,
+    /// 上下文窗口大小（token 数），如 200000、1000000
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,10 +280,20 @@ pub struct AppSettings {
     /// 调用模型日志：开启后每次代理转发记一条 request 事件（默认关，避免噪音）
     #[serde(default)]
     pub request_log_enabled: bool,
+    /// 后台定时健康检查间隔（秒）。用户可配置，默认 60s。
+    #[serde(default = "default_health_interval")]
+    pub health_check_interval_secs: u64,
+    /// 日志文件目录（None 时使用默认 %APPDATA%\SynaRoute\logs）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_dir: Option<String>,
 }
 
 fn default_language() -> String {
     "zh".into()
+}
+
+fn default_health_interval() -> u64 {
+    60
 }
 
 impl Default for AppSettings {
@@ -292,6 +305,8 @@ impl Default for AppSettings {
             master_password_enabled: false,
             lan_exposure: false,
             request_log_enabled: false,
+            health_check_interval_secs: default_health_interval(),
+            log_dir: None,
         }
     }
 }

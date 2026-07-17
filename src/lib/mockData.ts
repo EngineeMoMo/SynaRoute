@@ -19,8 +19,8 @@ import type {
 const now = Date.now();
 
 /** 便捷构造模型列表 */
-const models = (names: string[]): ModelInfo[] =>
-  names.map((n) => ({ realName: n, source: "fetched" as const, fetchedAt: now - 3600_000 }));
+const models = (names: string[], ctxWindow?: number): ModelInfo[] =>
+  names.map((n) => ({ realName: n, source: "fetched" as const, fetchedAt: now - 3600_000, contextWindow: ctxWindow }));
 
 // 内存态，仅本次会话有效
 const store: Record<CategoryType, ProviderKey[]> = {
@@ -36,7 +36,7 @@ const store: Record<CategoryType, ProviderKey[]> = {
       enabled: true,
       priority: 0,
       params: { temperature: 1.0, maxTokens: 8192 },
-      models: models(["opus-4-6", "opus-4-7", "opus-4-8"]),
+      models: models(["opus-4-6", "opus-4-7", "opus-4-8"], 200000),
       mappings: [],
       health: { status: "up", lastChecked: now - 20_000, latencyMs: 320, failCount: 0 },
     },
@@ -51,7 +51,7 @@ const store: Record<CategoryType, ProviderKey[]> = {
       enabled: true,
       priority: 1,
       params: { temperature: 1.0, maxTokens: 8192 },
-      models: models(["opus-4-6", "opus-4-7", "opus-4-8", "fable-5"]),
+      models: models(["opus-4-6", "opus-4-7", "opus-4-8", "fable-5"], 200000),
       mappings: [],
       health: { status: "up", lastChecked: now - 22_000, latencyMs: 540, failCount: 0 },
     },
@@ -253,6 +253,7 @@ let settings: AppSettings = {
   masterPasswordEnabled: false,
   lanExposure: false,
   requestLogEnabled: false,
+  healthCheckIntervalSecs: 60,
 };
 
 // 内置厂商种子（与后端 model.rs Vendor::builtin_seed 保持一致）

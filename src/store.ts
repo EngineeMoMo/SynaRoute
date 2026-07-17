@@ -40,8 +40,13 @@ interface AppState {
   showToast: (kind: "error" | "success", msg: string) => void;
   clearToast: () => void;
 
+  // 启动代理后自动写入配置的弹窗提示
+  configAppliedCategory: CategoryType | null;
+  clearConfigApplied: () => void;
+
   // 动作
   loadCategory: (c: CategoryType) => Promise<void>;
+  refreshEvents: () => Promise<void>;
   loadSettings: () => Promise<void>;
   loadVendors: () => Promise<void>;
   toggleKey: (keyId: string, enabled: boolean) => Promise<void>;
@@ -95,6 +100,9 @@ export const useStore = create<AppState>((set, get) => ({
   showToast: (kind, msg) => set({ toast: { kind, msg } }),
   clearToast: () => set({ toast: null }),
 
+  configAppliedCategory: null,
+  clearConfigApplied: () => set({ configAppliedCategory: null }),
+
   async loadCategory(c) {
     set({ loading: true });
     // 容错：4 个 IPC 独立结算，单个失败不拖垮其余刷新（避免"操作后列表不更新"的假象）。
@@ -115,6 +123,17 @@ export const useStore = create<AppState>((set, get) => ({
       events: eventsR.status === "fulfilled" ? eventsR.value : s.events,
       loading: false,
     }));
+  },
+
+  // 轻量刷新：仅拉事件日志（运行日志页 2s 轮询用），不动 keys/proxy/brain，避免整页重载闪烁。
+  async refreshEvents() {
+    const c = get().activeCategory;
+    try {
+      const events = await api.listEvents(c);
+      set({ events });
+    } catch (e) {
+      console.error("refreshEvents failed", e);
+    }
   },
 
   async loadSettings() {
@@ -173,8 +192,19 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async startProxy() {
-    const proxy = await api.startProxy(get().activeCategory);
+    const cat = get().activeCategory;
+    const proxy = await api.startProxy(cat);
     set({ proxy });
+    // 启动即写入目标工具配置，省去用户再手点一次「写入工具配置」。
+    // 写入失败不回滚代理（代理已起来可用），仅弹提示告知。
+    try {
+      await api.applyToolConfig(cat);
+      await get().loadCategory(cat);
+      set({ configAppliedCategory: cat });
+    } catch (e) {
+      console.error("applyToolConfig after start failed", e);
+      get().showToast("error", String((e as Error)?.message ?? e));
+    }
   },
 
   async stopProxy() {

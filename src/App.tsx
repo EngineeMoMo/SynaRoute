@@ -7,6 +7,7 @@ import { SettingsPage } from "@/pages/SettingsPage";
 import { VendorPage } from "@/pages/VendorPage";
 import { KeyEditor } from "@/components/KeyEditor";
 import { Toast } from "@/components/Toast";
+import { ConfigAppliedDialog } from "@/components/ConfigAppliedDialog";
 import { useStore, applyTheme } from "@/store";
 import { isTauri } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
@@ -73,6 +74,7 @@ export default function App() {
       )}
 
       <Toast />
+      <ConfigAppliedDialog />
 
       {/* 浏览器预览模式提示（Tauri 环境不显示） */}
       {!isTauri() && (
