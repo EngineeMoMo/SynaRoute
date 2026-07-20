@@ -26,8 +26,8 @@
     --danger: 239 68 68; /* #EF4444 */
     --info: 59 130 246; /* #3B82F6 */
 
-    --radius-card: 12px;
-    --radius-control: 8px;
+    --radius-card: 16px;
+    --radius-control: 10px;
   }
 
   .dark {

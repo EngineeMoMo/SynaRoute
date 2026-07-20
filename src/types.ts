@@ -7,7 +7,26 @@ export type { Lang };
 export type CategoryType = "claude-cli" | "claude-desktop" | "codex";
 
 /** 上游协议 */
-export type Protocol = "anthropic" | "openai";
+export type Protocol = "anthropic" | "openai_chat" | "openai_responses";
+
+/** 协议的展示名（UI 徽标/卡片用）。 */
+export function protocolLabel(p: Protocol): string {
+  switch (p) {
+    case "anthropic":
+      return "Anthropic";
+    case "openai_chat":
+      return "OpenAI Chat";
+    case "openai_responses":
+      return "OpenAI Responses";
+  }
+}
+
+/** 厂商预设模型条目（取自 cc-switch 的 modelCatalog）：上游不暴露模型接口时供一键导入 */
+export interface PresetModel {
+  realName: string;
+  displayName?: string;
+  contextWindow?: number;
+}
 
 /** 厂商预设（FR-002 扩展）：选中后自动填充 Key 的 baseUrl / protocol */
 export interface Vendor {
@@ -16,6 +35,8 @@ export interface Vendor {
   defaultBaseUrl: string; // 选中后预填的 Base URL
   defaultProtocol: Protocol;
   builtin: boolean; // 内置项：只读，不可编辑/删除
+  icon?: string; // 自定义图标（data-URL）；内置厂商为空，走品牌图标启发式
+  presetModels?: PresetModel[]; // 内置预设模型清单：上游不暴露模型接口时供一键导入
 }
 
 /** 路由模式（由启用 Key 数量与聚合开关自动判定，FR-007） */
@@ -49,6 +70,13 @@ export interface ProviderKey {
   params: KeyParams;
   models: ModelInfo[];
   mappings: ModelMapping[];
+  /** 默认兜底模型（可选）：故障转移到本 Key 时，请求模型既非映射期望名也非本 Key 真实模型名，则改用它（FR-006） */
+  defaultModel?: string;
+  /** 三档快捷映射（取自 cc-switch 的 haiku/sonnet/opus 语义）：Claude Code 按任务发家族模型名，
+   *  配了对应档位即在运行时代理改写为上游真实名。与 mappings 并存，精确映射优先级更高。 */
+  tierHaiku?: string;
+  tierSonnet?: string;
+  tierOpus?: string;
   health: HealthState;
 }
 
@@ -87,6 +115,34 @@ export interface BrainConfig {
   summarizerRef?: string; // 汇总模型：keyId::modelName，缺省复用决策者
   deciderRef?: string; // 决策者：keyId::modelName（必填才能开启）
   members: BrainMember[];
+  workDir?: string; // 文件检索的工作目录
+  maxContextTokens?: number; // 注入文件 token 上限（默认 50000）
+  retrievalEnabled: boolean; // 是否启用文件检索
+  autoFollowActive?: boolean; // 自动跟随最近活动项目（每次运行时取最新工作目录，忽略 workDir）
+}
+
+/** 聚合运行结果 */
+export interface AggregateResult {
+  resultType: "plan" | "applied" | "error";
+  content: string;
+  filesModified?: string[];
+  /** Phase1 定下的工作目录，Phase2 执行时回传以避免 auto-follow 目录漂移 */
+  workDir?: string;
+}
+
+/** 文件检索结果 */
+export interface RetrievedFile {
+  path: string;
+  content: string;
+  source: "grep" | "codegraph";
+}
+
+/** 最近使用过的工作目录（从各工具会话反推） */
+export interface RecentWorkdir {
+  path: string; // 绝对路径
+  source: "claude-cli" | "codex" | "claude-desktop"; // 来源工具
+  lastUsed: number; // 时间戳(ms)
+  label?: string; // 展示用简短名（可选，通常为目录名）
 }
 
 /** 聚合成员（FR-014） */
@@ -124,10 +180,10 @@ export interface EventLogEntry {
   id: string;
   ts: number;
   categoryId: CategoryType;
-  type: "route" | "failover" | "health" | "aggregate" | "error" | "request";
+  type: "route" | "failover" | "health" | "aggregate" | "error" | "request" | "mcp" | "config";
   keyId?: string;
   detail: string;
-  trace?: RequestTrace; // 仅 request 类型有：完整链路快照
+  trace?: RequestTrace; // request / mcp 类型带完整链路快照
 }
 
 /** 主题偏好 */
@@ -152,4 +208,15 @@ export interface AppSettings {
   requestLogEnabled: boolean; // 调用模型日志（默认关，开启后记录每次转发）
   healthCheckIntervalSecs: number;
   logDir?: string;
+  mcpEnabled?: boolean; // 内置 MCP 服务器：开启即随应用启动
+  mcpPort?: number; // MCP 服务器端口（默认 9527，占用时自动向上找空闲端口）
+  upstreamRetryEnabled?: boolean; // 上游临时错误（502/503/504/429/连接失败）自动重试（默认开）
+  healthProbeRealCompletion?: boolean; // 健康探测用真实补全请求（默认关，消耗少量额度）
+}
+
+/** MCP 服务器运行状态（供设置页展示连接指示灯与故障原因） */
+export interface McpStatus {
+  running: boolean;
+  port?: number; // 实际绑定端口（可能与配置端口不同——占用时自动 fallback）
+  lastError?: string; // 最近一次启动失败原因（成功时为空）
 }

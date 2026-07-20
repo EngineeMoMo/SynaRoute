@@ -4,14 +4,18 @@
 mod aggregate;
 mod error;
 mod health;
+mod mcp;
 mod model;
 mod proxy;
+mod retrieval;
 mod secret;
 mod store;
 mod tools;
 mod upstream;
+mod workdirs;
 
 use error::AppResult;
+use mcp::McpManager;
 use model::*;
 use proxy::ProxyManager;
 use std::sync::Arc;
@@ -22,6 +26,7 @@ use tauri::Manager;
 pub struct AppState {
     store: Arc<Store>,
     proxy: Arc<ProxyManager>,
+    mcp: Arc<McpManager>,
 }
 
 // ============ 配置管理命令 ============
@@ -81,9 +86,17 @@ async fn fetch_models(
 
     let names = upstream::fetch_models(&key, &secret).await?;
     let now = chrono::Utc::now().timestamp_millis();
+    let old_ctx: std::collections::HashMap<String, Option<u32>> = key
+        .models
+        .iter()
+        .map(|m| (m.real_name.clone(), m.context_window))
+        .collect();
     let models: Vec<ModelInfo> = names
         .into_iter()
-        .map(|n| ModelInfo { real_name: n, source: "fetched".into(), fetched_at: Some(now), context_window: None })
+        .map(|n| {
+            let cw = old_ctx.get(&n).copied().flatten();
+            ModelInfo { real_name: n, source: "fetched".into(), fetched_at: Some(now), context_window: cw }
+        })
         .collect();
     state.store.set_models(&key_id, models.clone())?;
     Ok(models)
@@ -187,7 +200,7 @@ async fn apply_tool_config(
     let msg = tools::apply(category_id, &endpoint)?;
     state
         .store
-        .append_event(category_id, "route", None, &format!("写入工具配置: {endpoint}"));
+        .append_event(category_id, "config", None, &format!("写入工具配置: {endpoint}"));
     Ok(msg)
 }
 
@@ -209,8 +222,148 @@ fn get_settings(state: tauri::State<AppState>) -> AppSettings {
 }
 
 #[tauri::command]
-fn save_settings(state: tauri::State<AppState>, settings: AppSettings) -> AppResult<()> {
-    state.store.save_settings(settings)
+async fn save_settings(
+    state: tauri::State<'_, AppState>,
+    settings: AppSettings,
+) -> AppResult<()> {
+    let mcp_enabled = settings.mcp_enabled;
+    let mcp_port = settings.mcp_port;
+    state.store.save_settings(settings)?;
+    // MCP 开关/端口变化即时生效：开启→启动（幂等，端口变则重启）；关闭→停止。
+    if mcp_enabled {
+        if let Err(e) = state.mcp.start(mcp_port).await {
+            tracing::warn!("MCP 服务器启动失败: {e}");
+        }
+    } else {
+        state.mcp.stop();
+    }
+    Ok(())
+}
+
+// ============ MCP 服务器 ============
+
+/// MCP 服务器运行状态（供设置页展示连接指示灯）
+#[tauri::command]
+fn mcp_status(state: tauri::State<AppState>) -> McpStatus {
+    McpStatus {
+        running: state.mcp.is_running(),
+        port: state.mcp.running_port(),
+        last_error: state.mcp.last_error(),
+    }
+}
+
+/// MCP 服务器地址（供前端展示实际绑定端口的接入地址）。
+fn mcp_url_for(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/mcp")
+}
+
+/// 把 synaroute MCP 注册进指定分类对应工具的客户端配置，并把该分类记进
+/// settings.mcp_registered_categories（去重）。写盘/跳过都记一条事件日志，方便用户排查。
+fn register_and_record(state: &AppState, category: CategoryType, port: u16) {
+    let url = mcp_url_for(port);
+    match tools::register_mcp_client(category, &url) {
+        Ok((msg, _wrote)) => {
+            state.store.append_event(category, "config", None, &msg);
+            let mut s = state.store.get_settings();
+            let cat = category.as_str().to_string();
+            if !s.mcp_registered_categories.contains(&cat) {
+                s.mcp_registered_categories.push(cat);
+                let _ = state.store.save_settings(s);
+            }
+        }
+        Err(e) => {
+            state.store.append_event(
+                category,
+                "error",
+                None,
+                &format!("MCP 自动注册到客户端失败: {e}"),
+            );
+        }
+    }
+}
+
+/// 端口漂移后，用新端口重写所有已注册分类的客户端配置（url 里的端口跟着变）。
+fn rewrite_registered_clients(state: &AppState, port: u16) {
+    let url = mcp_url_for(port);
+    let cats = state.store.get_settings().mcp_registered_categories;
+    for c in cats {
+        if let Some(category) = CategoryType::from_str(&c) {
+            match tools::register_mcp_client(category, &url) {
+                Ok((msg, wrote)) => {
+                    if wrote {
+                        state.store.append_event(category, "config", None, &msg);
+                    }
+                }
+                Err(e) => state.store.append_event(
+                    category,
+                    "error",
+                    None,
+                    &format!("MCP 端口变化后重写客户端失败: {e}"),
+                ),
+            }
+        }
+    }
+}
+
+/// 启用/停用 MCP 并自动注册到「当前活跃分类」对应的工具。
+/// 前端 MCP 开关走这里（携带 activeCategory），而非通用 save_settings。
+#[tauri::command]
+async fn set_mcp_enabled(
+    state: tauri::State<'_, AppState>,
+    category_id: CategoryType,
+    enabled: bool,
+    port: u16,
+) -> AppResult<McpStatus> {
+    {
+        let mut s = state.store.get_settings();
+        s.mcp_enabled = enabled;
+        s.mcp_port = port;
+        state.store.save_settings(s)?;
+    }
+    if enabled {
+        match state.mcp.start(port).await {
+            Ok(bound) => {
+                // 实际绑定端口可能因占用而回退；用它注册，保证客户端地址与真实端口一致。
+                register_and_record(&state, category_id, bound);
+                // 若端口漂移，其它已注册分类也要跟着改。
+                if bound != port {
+                    rewrite_registered_clients(&state, bound);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("MCP 服务器启动失败: {e}");
+            }
+        }
+    } else {
+        state.mcp.stop();
+        // 关闭开关：从已注册分类移除 synaroute，并清空记录。
+        let cats = state.store.get_settings().mcp_registered_categories.clone();
+        for c in &cats {
+            if let Some(category) = CategoryType::from_str(c) {
+                match tools::unregister_mcp_client(category) {
+                    Ok((msg, wrote)) => {
+                        if wrote {
+                            state.store.append_event(category, "config", None, &msg);
+                        }
+                    }
+                    Err(e) => state.store.append_event(
+                        category,
+                        "error",
+                        None,
+                        &format!("MCP 注销失败: {e}"),
+                    ),
+                }
+            }
+        }
+        let mut s = state.store.get_settings();
+        s.mcp_registered_categories.clear();
+        state.store.save_settings(s)?;
+    }
+    Ok(McpStatus {
+        running: state.mcp.is_running(),
+        port: state.mcp.running_port(),
+        last_error: state.mcp.last_error(),
+    })
 }
 
 // ============ 版本与更新 ============
@@ -246,9 +399,7 @@ async fn pick_directory(app: tauri::AppHandle) -> Option<String> {
 
 #[tauri::command]
 fn get_default_log_dir() -> String {
-    dirs::data_dir()
-        .map(|d| d.join("SynaRoute").join("logs").to_string_lossy().into_owned())
-        .unwrap_or_default()
+    store::default_log_dir().to_string_lossy().into_owned()
 }
 
 // ============ 厂商预设命令 ============
@@ -268,15 +419,45 @@ fn delete_vendor(state: tauri::State<AppState>, vendor_id: String) -> AppResult<
     state.store.delete_vendor(&vendor_id)
 }
 
-// ============ 大脑聚合手动触发（测试用） ============
+// ============ 大脑聚合 V2 ============
 
+/// Phase1: 文件检索 + 参与者思考 + 决策者输出计划
 #[tauri::command]
-async fn run_aggregate(
+async fn aggregate_plan(
     state: tauri::State<'_, AppState>,
     category_id: CategoryType,
     prompt: String,
-) -> AppResult<String> {
-    aggregate::run(&state.store, category_id, &prompt).await
+) -> AppResult<model::AggregateResult> {
+    aggregate::run_plan(&state.store, category_id, &prompt).await
+}
+
+/// Phase2: 用户确认计划后，决策者执行修改。
+/// work_dir 由 Phase1 的返回结果回传，锁定工作目录避免 auto-follow 漂移。
+#[tauri::command]
+async fn aggregate_execute(
+    state: tauri::State<'_, AppState>,
+    category_id: CategoryType,
+    prompt: String,
+    confirmed_plan: String,
+    work_dir: Option<String>,
+) -> AppResult<model::AggregateResult> {
+    aggregate::run_apply(&state.store, category_id, &prompt, &confirmed_plan, work_dir).await
+}
+
+/// 检索文件（供前端预览用）
+#[tauri::command]
+async fn retrieve_files(
+    work_dir: String,
+    query: String,
+    max_tokens: Option<u32>,
+) -> AppResult<Vec<retrieval::RetrievedFile>> {
+    retrieval::retrieve(&work_dir, &query, max_tokens.unwrap_or(50_000)).await
+}
+
+/// 检测其他 AI 工具中最近使用的项目目录（Claude CLI + Codex），按最近使用时间排序。
+#[tauri::command]
+fn detect_recent_workdirs() -> AppResult<Vec<workdirs::RecentWorkdir>> {
+    workdirs::scan()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -290,6 +471,13 @@ pub fn run() {
 
     let store = Arc::new(Store::init().expect("初始化配置失败"));
     let proxy = Arc::new(ProxyManager::new(store.clone()));
+    let mcp = Arc::new(McpManager::new(store.clone()));
+
+    // 注意：MCP 自启动移到下方 setup() 里、跑在 Tauri 托管的异步运行时上。
+    // 早期版本在此处用 std::thread + 临时 Runtime + block_on(mcp.start())：start() 只 spawn
+    // accept 循环便返回，block_on 随即结束、临时 Runtime 被 drop → accept 任务连同监听器一起
+    // 被取消，端口不再监听，但状态却显示 running（自启动的 MCP 形同虚设）。改用 Tauri 运行时
+    // （生命周期与应用一致）后 accept 循环得以长存。
 
     // 后台定时健康检查（arch-decisions §6）。间隔由用户配置（AppSettings.health_check_interval_secs，
     // 默认 60s），每轮结束后重新读取最新配置，改设置即时生效、无需重启。设 10s 下限防误配把上游打爆。
@@ -325,9 +513,47 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .manage(AppState { store, proxy })
+        .manage(AppState { store, proxy, mcp })
         .setup(|app| {
             build_tray(app.handle())?;
+            // 内置 MCP 服务器：若用户已启用，则随应用启动（Q8），端口取自设置（默认 9527，Q7）。
+            // 跑在 Tauri 托管异步运行时上，生命周期与应用一致（避免临时 Runtime drop 杀掉 accept 循环）。
+            let state = app.state::<AppState>();
+            let settings = state.store.get_settings();
+            if settings.mcp_enabled {
+                let mcp_bg = state.mcp.clone();
+                let store_bg = state.store.clone();
+                let port = settings.mcp_port;
+                tauri::async_runtime::spawn(async move {
+                    match mcp_bg.start(port).await {
+                        Ok(bound) => {
+                            // 启动时端口可能因占用回退到别的值：用实际绑定端口重写所有已注册分类的
+                            // 客户端配置，使 ~/.claude.json / config.toml 里的 url 端口跟真实端口一致，
+                            // 用户重启客户端即可用，无需手动重配（幂等：端口没变则不写盘）。
+                            let url = format!("http://127.0.0.1:{bound}/mcp");
+                            let cats = store_bg.get_settings().mcp_registered_categories;
+                            for c in cats {
+                                if let Some(category) = CategoryType::from_str(&c) {
+                                    match tools::register_mcp_client(category, &url) {
+                                        Ok((msg, wrote)) => {
+                                            if wrote {
+                                                store_bg.append_event(category, "config", None, &msg);
+                                            }
+                                        }
+                                        Err(e) => store_bg.append_event(
+                                            category,
+                                            "error",
+                                            None,
+                                            &format!("MCP 启动后重写客户端失败: {e}"),
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => tracing::warn!("MCP 服务器启动失败: {e}"),
+                    }
+                });
+            }
             Ok(())
         })
         // 关闭窗口 = 隐藏到托盘（后台代理继续运行），而非退出进程。
@@ -358,6 +584,8 @@ pub fn run() {
             list_events,
             get_settings,
             save_settings,
+            mcp_status,
+            set_mcp_enabled,
             get_app_version,
             check_for_updates,
             pick_directory,
@@ -365,7 +593,10 @@ pub fn run() {
             list_vendors,
             upsert_vendor,
             delete_vendor,
-            run_aggregate,
+            aggregate_plan,
+            aggregate_execute,
+            retrieve_files,
+            detect_recent_workdirs,
         ])
         .run(tauri::generate_context!())
         .expect("运行 SynaRoute 失败");

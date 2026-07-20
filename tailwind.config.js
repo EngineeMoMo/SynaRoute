@@ -25,8 +25,9 @@ export default {
         info: "rgb(var(--info) / <alpha-value>)",
       },
       borderRadius: {
-        card: "12px",
-        control: "8px",
+        card: "16px",
+        control: "10px",
+        pill: "9999px",
       },
       fontFamily: {
         sans: ['"Segoe UI"', '"Microsoft YaHei"', "system-ui", "sans-serif"],

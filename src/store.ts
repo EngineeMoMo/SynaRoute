@@ -46,6 +46,7 @@ interface AppState {
 
   // 动作
   loadCategory: (c: CategoryType) => Promise<void>;
+  refreshCategory: () => Promise<void>;
   refreshEvents: () => Promise<void>;
   loadSettings: () => Promise<void>;
   loadVendors: () => Promise<void>;
@@ -125,6 +126,22 @@ export const useStore = create<AppState>((set, get) => ({
     }));
   },
 
+  async refreshCategory() {
+    const c = get().activeCategory;
+    try {
+      const [keysR, proxyR] = await Promise.allSettled([
+        api.listKeys(c),
+        api.getProxyState(c),
+      ]);
+      set((s) => ({
+        keys: keysR.status === "fulfilled" ? keysR.value : s.keys,
+        proxy: proxyR.status === "fulfilled" ? proxyR.value : s.proxy,
+      }));
+    } catch (e) {
+      console.error("refreshCategory failed", e);
+    }
+  },
+
   // 轻量刷新：仅拉事件日志（运行日志页 2s 轮询用），不动 keys/proxy/brain，避免整页重载闪烁。
   async refreshEvents() {
     const c = get().activeCategory;
@@ -193,8 +210,15 @@ export const useStore = create<AppState>((set, get) => ({
 
   async startProxy() {
     const cat = get().activeCategory;
-    const proxy = await api.startProxy(cat);
-    set({ proxy });
+    // 启动失败（端口被占等）必须可见，不能静默吞掉——ProxyStatusBar 以 void 调用本函数。
+    try {
+      const proxy = await api.startProxy(cat);
+      set({ proxy });
+    } catch (e) {
+      console.error("startProxy failed", e);
+      get().showToast("error", String((e as Error)?.message ?? e));
+      return; // 代理没起来，不继续写工具配置
+    }
     // 启动即写入目标工具配置，省去用户再手点一次「写入工具配置」。
     // 写入失败不回滚代理（代理已起来可用），仅弹提示告知。
     try {

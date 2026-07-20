@@ -21,6 +21,11 @@ struct SecretVault {
     entries: HashMap<String, String>,
     /// 是否使用主口令模式
     master_mode: bool,
+    /// 主口令模式的随机盐（argon2 SaltString 格式，base64）。
+    /// 首次启用主口令时随机生成并落盘；后续解锁复用同一盐派生同一密钥。
+    /// 旧版本用固定盐（已废弃）——因主口令模式此前从未接线前端，无存量数据需迁移。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    salt: Option<String>,
 }
 
 pub struct SecretStore {
@@ -46,10 +51,21 @@ impl SecretStore {
         self.vault.master_mode
     }
 
-    /// 设置主口令（用于主口令模式解锁/初始化）
+    /// 设置主口令（用于主口令模式解锁/初始化）。
+    /// 首次调用（vault 无盐）时生成随机盐并落盘；之后复用已存盐，保证同口令派生同密钥。
     #[allow(dead_code)] // 主口令模式能力，前端接线后启用
     pub fn unlock_with_master(&mut self, password: &str) -> AppResult<()> {
-        let key = derive_key(password)?;
+        let salt = match &self.vault.salt {
+            Some(s) => s.clone(),
+            None => {
+                let s = generate_salt();
+                self.vault.salt = Some(s.clone());
+                // 落盘保存新盐（否则重启后无法用同口令解密已存密钥）
+                self.persist()?;
+                s
+            }
+        };
+        let key = derive_key(password, &salt)?;
         self.master_key = Some(key);
         Ok(())
     }
@@ -100,14 +116,23 @@ impl SecretStore {
     }
 }
 
-/// 用 Argon2 从主口令派生 32 字节 AES 密钥（固定盐简化演示；正式版应存随机盐）
+/// 生成随机盐并编码为 b64（存进 vault，与密钥库同寿命）。
 #[allow(dead_code)] // 主口令模式能力，前端接线后启用
-fn derive_key(password: &str) -> AppResult<[u8; 32]> {
+fn generate_salt() -> String {
+    use argon2::password_hash::SaltString;
+    let mut rng = OsRng;
+    SaltString::generate(&mut rng).as_str().to_string()
+}
+
+/// 用 Argon2 从主口令 + 已存随机盐派生 32 字节 AES 密钥。
+/// 盐随 vault 落盘，保证同口令每次派生同一密钥（否则无法解密已存数据），
+/// 同时避免固定盐带来的彩虹表风险。
+#[allow(dead_code)] // 主口令模式能力，前端接线后启用
+fn derive_key(password: &str, salt_b64: &str) -> AppResult<[u8; 32]> {
     use argon2::{Argon2, PasswordHasher};
     use argon2::password_hash::SaltString;
-    // 固定盐：为使同一口令每次派生同一密钥（否则无法解密旧数据）
-    let salt = SaltString::from_b64("c3luYXJvdXRlc2FsdA")
-        .map_err(|e| AppError::Crypto(e.to_string()))?;
+    let salt = SaltString::from_b64(salt_b64)
+        .map_err(|e| AppError::Crypto(format!("盐解析失败: {e}")))?;
     let argon2 = Argon2::default();
     let hash = argon2
         .hash_password(password.as_bytes(), &salt)
@@ -147,12 +172,12 @@ fn aes_decrypt(key: &[u8; 32], data: &[u8]) -> AppResult<Vec<u8>> {
 fn dpapi_encrypt(plain: &[u8]) -> AppResult<Vec<u8>> {
     use windows::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
     unsafe {
-        let mut in_blob = CRYPT_INTEGER_BLOB {
+        let in_blob = CRYPT_INTEGER_BLOB {
             cbData: plain.len() as u32,
             pbData: plain.as_ptr() as *mut u8,
         };
         let mut out_blob = CRYPT_INTEGER_BLOB::default();
-        CryptProtectData(&mut in_blob, None, None, None, None, 0, &mut out_blob)
+        CryptProtectData(&in_blob, None, None, None, None, 0, &mut out_blob)
             .map_err(|e| AppError::Crypto(format!("DPAPI 加密失败: {e}")))?;
         let slice = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize);
         let out = slice.to_vec();
@@ -167,12 +192,12 @@ fn dpapi_encrypt(plain: &[u8]) -> AppResult<Vec<u8>> {
 fn dpapi_decrypt(cipher: &[u8]) -> AppResult<Vec<u8>> {
     use windows::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
     unsafe {
-        let mut in_blob = CRYPT_INTEGER_BLOB {
+        let in_blob = CRYPT_INTEGER_BLOB {
             cbData: cipher.len() as u32,
             pbData: cipher.as_ptr() as *mut u8,
         };
         let mut out_blob = CRYPT_INTEGER_BLOB::default();
-        CryptUnprotectData(&mut in_blob, None, None, None, None, 0, &mut out_blob)
+        CryptUnprotectData(&in_blob, None, None, None, None, 0, &mut out_blob)
             .map_err(|e| AppError::Crypto(format!("DPAPI 解密失败: {e}")))?;
         let slice = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize);
         let out = slice.to_vec();

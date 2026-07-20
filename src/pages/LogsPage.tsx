@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useStore } from "@/store";
 import { Badge } from "@/components/ui/Badge";
 import { useT } from "@/lib/useT";
@@ -14,6 +14,7 @@ import {
   ChevronRight,
   Copy,
   Check,
+  Settings2,
   type LucideIcon,
 } from "lucide-react";
 
@@ -25,14 +26,41 @@ const TYPE_META: Record<
   failover: { tKey: "logs.type.failover", variant: "warning", icon: ArrowLeftRight },
   health: { tKey: "logs.type.health", variant: "info", icon: Activity },
   aggregate: { tKey: "logs.type.aggregate", variant: "primary", icon: Brain },
+  mcp: { tKey: "logs.type.mcp", variant: "primary", icon: Brain },
+  config: { tKey: "logs.type.config", variant: "info", icon: Settings2 },
   error: { tKey: "logs.type.error", variant: "danger", icon: AlertCircle },
   request: { tKey: "logs.type.request", variant: "neutral", icon: ArrowUpRight },
 };
 
-/** 运行日志 / 可观测性视图（FR-020）。request 类型可展开查看完整调用链路。 */
+/** 日志分组：把事件类型归到 4 个用户可辨识的大类。 */
+type LogGroup = "system" | "brain" | "routing" | "error";
+
+const GROUP_OF: Record<EventLogEntry["type"], LogGroup> = {
+  config: "system",
+  health: "system",
+  aggregate: "brain",
+  mcp: "brain",
+  route: "routing",
+  failover: "routing",
+  request: "routing",
+  error: "error",
+};
+
+const GROUP_ORDER: LogGroup[] = ["system", "brain", "routing", "error"];
+
+const GROUP_META: Record<LogGroup, { tKey: string; icon: LucideIcon; dot: string }> = {
+  system: { tKey: "logs.group.system", icon: Settings2, dot: "bg-info" },
+  brain: { tKey: "logs.group.brain", icon: Brain, dot: "bg-primary" },
+  routing: { tKey: "logs.group.routing", icon: Radio, dot: "bg-success" },
+  error: { tKey: "logs.group.error", icon: AlertCircle, dot: "bg-danger" },
+};
+
+/** 运行日志 / 可观测性视图（FR-020）。按「系统 / 大脑聚合 / 路由 / 错误」分组，顶部可筛选。 */
 export function LogsPage() {
   const { events, lang, refreshEvents } = useStore();
   const t = useT();
+  // 当前筛选：null = 全部；否则只看某一组。
+  const [filter, setFilter] = useState<LogGroup | null>(null);
 
   // 实时刷新：每 2s 拉一次事件（仅事件，不重载 keys/proxy，开销小）。
   useEffect(() => {
@@ -41,22 +69,58 @@ export function LogsPage() {
     return () => clearInterval(id);
   }, [refreshEvents]);
 
+  // 每组事件计数（供筛选标签展示 + 决定该组是否渲染）。
+  const counts = useMemo(() => {
+    const c: Record<LogGroup, number> = { system: 0, brain: 0, routing: 0, error: 0 };
+    for (const e of events) c[GROUP_OF[e.type] ?? "system"] += 1;
+    return c;
+  }, [events]);
+
+  // 最新在前；按筛选裁剪。
+  const visible = useMemo(() => {
+    const ordered = [...events].reverse();
+    return filter ? ordered.filter((e) => (GROUP_OF[e.type] ?? "system") === filter) : ordered;
+  }, [events, filter]);
+
   return (
     <div className="flex h-full flex-col">
       <div className="border-b border-border px-6 py-4">
         <h1 className="text-lg font-semibold text-text-primary">{t("logs.title")}</h1>
         <p className="mt-1 text-xs text-text-muted">{t("logs.subtitle")}</p>
+
+        {/* 筛选标签：全部 + 4 个分组（带计数） */}
+        <div className="mt-3 flex flex-wrap gap-1.5">
+          <FilterTab
+            label={t("logs.filter.all")}
+            count={events.length}
+            active={filter === null}
+            onClick={() => setFilter(null)}
+          />
+          {GROUP_ORDER.map((g) => {
+            const GIcon = GROUP_META[g].icon;
+            return (
+              <FilterTab
+                key={g}
+                label={t(GROUP_META[g].tKey)}
+                icon={GIcon}
+                count={counts[g]}
+                active={filter === g}
+                onClick={() => setFilter(g)}
+              />
+            );
+          })}
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto p-6">
-        {events.length === 0 ? (
+        {visible.length === 0 ? (
           <div className="flex flex-col items-center gap-3 py-16 text-text-muted">
             <ScrollText size={40} />
             <p className="text-sm">{t("logs.empty")}</p>
           </div>
         ) : (
           <div className="space-y-1.5">
-            {[...events].reverse().map((e) => (
+            {visible.map((e) => (
               <LogRow key={e.id} entry={e} lang={lang} />
             ))}
           </div>
@@ -66,12 +130,47 @@ export function LogsPage() {
   );
 }
 
+/** 顶部筛选标签（带左侧分组色点 + 计数）。 */
+function FilterTab({
+  label,
+  icon: Icon,
+  count,
+  active,
+  onClick,
+}: {
+  label: string;
+  icon?: LucideIcon;
+  count: number;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`flex items-center gap-1.5 rounded-control border px-2.5 py-1 text-xs transition-colors ${
+        active
+          ? "border-primary bg-primary/10 text-primary"
+          : "border-border text-text-secondary hover:bg-surface-hover"
+      }`}
+    >
+      {Icon && <Icon size={12} />}
+      <span>{label}</span>
+      <span className={`rounded-full px-1.5 text-[10px] ${active ? "bg-primary/20" : "bg-surface-hover text-text-muted"}`}>
+        {count}
+      </span>
+    </button>
+  );
+}
+
 function LogRow({ entry, lang }: { entry: EventLogEntry; lang: string }) {
   const t = useT();
   const [open, setOpen] = useState(false);
-  const meta = TYPE_META[entry.type];
+  const meta = TYPE_META[entry.type] ?? TYPE_META.route;
   const Icon = meta.icon;
-  const expandable = entry.type === "request" && !!entry.trace;
+  // 所有类型都可展开：有 trace 的展开完整链路快照；无 trace 的展开 detail 全文
+  //（长 detail 在收起态被 truncate 截断，展开后不截断，解决「日志太长看不了」）。
+  const expandable = !!entry.trace || entry.detail.length > 0;
   const time = new Date(entry.ts).toLocaleTimeString(lang === "en" ? "en-US" : "zh-CN");
 
   return (
@@ -93,7 +192,9 @@ function LogRow({ entry, lang }: { entry: EventLogEntry; lang: string }) {
           <Icon size={10} />
           {t(meta.tKey)}
         </Badge>
-        <span className="flex-1 truncate text-sm text-text-primary">{entry.detail}</span>
+        <span className={`flex-1 text-sm text-text-primary ${open ? "whitespace-pre-wrap break-words" : "truncate"}`}>
+          {entry.detail}
+        </span>
       </div>
 
       {open && entry.trace && <TraceDetail trace={entry.trace} />}

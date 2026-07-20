@@ -6,21 +6,23 @@ import { Switch } from "@/components/ui/Switch";
 import { Button } from "@/components/ui/Button";
 import { useT } from "@/lib/useT";
 import { LANGS } from "@/lib/i18n";
-import type { AppSettings, ThemePref } from "@/types";
+import type { AppSettings, McpStatus, ThemePref } from "@/types";
 import {
   Sun, Moon, Monitor, ShieldCheck, KeyRound, Languages, ScrollText,
-  Activity, RefreshCw, FolderOpen, Info, type LucideIcon,
+  Activity, RefreshCw, FolderOpen, Info, Plug, BookOpen, Copy, Check, X, type LucideIcon,
 } from "lucide-react";
 
 /** 设置页（主题 / 语言 / 自启 / 加密方式 / 局域网暴露 / 版本更新 / 日志路径） */
 export function SettingsPage() {
-  const { theme, setTheme, lang, setLang } = useStore();
+  const { theme, setTheme, lang, setLang, showToast, activeCategory } = useStore();
   const t = useT();
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [version, setVersion] = useState<string>("");
   const [updateMsg, setUpdateMsg] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
   const [defaultLogDir, setDefaultLogDir] = useState<string>("");
+  const [mcp, setMcp] = useState<McpStatus | null>(null);
+  const [showWizard, setShowWizard] = useState(false);
 
   useEffect(() => {
     void api.getSettings().then(setSettings);
@@ -28,11 +30,43 @@ export function SettingsPage() {
     void api.getDefaultLogDir().then(setDefaultLogDir);
   }, []);
 
+  // MCP 运行状态轮询：开启时每 3s 刷新一次，展示运行中/端口/故障原因。
+  useEffect(() => {
+    if (!settings?.mcpEnabled) {
+      setMcp(null);
+      return;
+    }
+    let alive = true;
+    const tick = () => void api.mcpStatus().then((s) => { if (alive) setMcp(s); });
+    tick();
+    const id = setInterval(tick, 3000);
+    return () => { alive = false; clearInterval(id); };
+  }, [settings?.mcpEnabled]);
+
   const update = (patch: Partial<AppSettings>) => {
     if (!settings) return;
     const next = { ...settings, ...patch };
     setSettings(next);
-    void api.saveSettings(next);
+    // 落盘失败必须可见（项目硬规则：禁止静默吞错）。乐观更新 UI，写盘失败时弹提示。
+    void api.saveSettings(next).catch((e) => {
+      console.error("saveSettings failed", e);
+      showToast("error", String((e as Error)?.message ?? e));
+    });
+  };
+
+  // MCP 开关/端口走专用命令：携带当前活跃分类，后端据此自动注册 synaroute 到对应工具客户端
+  // （~/.claude.json 或 ~/.codex/config.toml），并在端口漂移时重写。不走通用 saveSettings，
+  // 因为那拿不到 activeCategory。
+  const applyMcp = (enabled: boolean, port: number) => {
+    if (!settings) return;
+    setSettings({ ...settings, mcpEnabled: enabled, mcpPort: port });
+    void api
+      .setMcpEnabled(activeCategory, enabled, port)
+      .then((s) => setMcp(s))
+      .catch((e) => {
+        console.error("setMcpEnabled failed", e);
+        showToast("error", String((e as Error)?.message ?? e));
+      });
   };
 
   const handleCheckUpdate = async () => {
@@ -51,6 +85,17 @@ export function SettingsPage() {
   const handlePickLogDir = async () => {
     const dir = await api.pickDirectory();
     if (dir) update({ logDir: dir });
+  };
+
+  // MCP 接入地址：优先用实际绑定端口（占用时会 fallback），否则用配置端口。
+  const mcpPort = mcp?.port ?? settings?.mcpPort ?? 9527;
+  const mcpAddress = `http://127.0.0.1:${mcpPort}/mcp`;
+  const [copied, setCopied] = useState(false);
+  const handleCopyAddr = () => {
+    void navigator.clipboard?.writeText(mcpAddress).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1400);
+    });
   };
 
   const themeOptions: { value: ThemePref; tKey: string; icon: LucideIcon }[] = [
@@ -159,8 +204,9 @@ export function SettingsPage() {
               icon={ShieldCheck}
               title={t("settings.masterPwTitle")}
               desc={t("settings.masterPwDesc")}
-              checked={settings?.masterPasswordEnabled ?? false}
-              onChange={(v) => update({ masterPasswordEnabled: v })}
+              checked={false}
+              onChange={() => {}}
+              disabled
             />
             <ToggleRow
               icon={KeyRound}
@@ -170,6 +216,76 @@ export function SettingsPage() {
               onChange={(v) => update({ lanExposure: v })}
               danger
             />
+          </CardContent>
+        </Card>
+
+        {/* MCP 服务器 */}
+        <Card>
+          <CardHeader>
+            <CardTitle>{t("settings.mcpTitle")}</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <ToggleRow
+              icon={Plug}
+              title={t("settings.mcpEnable")}
+              desc={t("settings.mcpEnableDesc")}
+              checked={settings?.mcpEnabled ?? false}
+              onChange={(v) => applyMcp(v, settings?.mcpPort ?? 9527)}
+            />
+            {settings?.mcpEnabled && (
+              <>
+                {/* 端口 */}
+                <div className="flex items-start justify-between gap-4">
+                  <div className="flex gap-2.5">
+                    <Plug size={16} className="mt-0.5 shrink-0 text-text-secondary" />
+                    <div>
+                      <div className="text-sm font-medium text-text-primary">{t("settings.mcpPort")}</div>
+                      <div className="text-xs text-text-muted">{t("settings.mcpPortDesc")}</div>
+                    </div>
+                  </div>
+                  <input
+                    type="number"
+                    min={1024}
+                    max={65535}
+                    className="w-24 shrink-0 rounded-control border border-border bg-bg px-2.5 py-1.5 text-xs text-text-primary"
+                    defaultValue={settings?.mcpPort ?? 9527}
+                    onBlur={(e) => applyMcp(true, Number(e.target.value) || 9527)}
+                  />
+                </div>
+
+                {/* 服务地址 + 复制 */}
+                <div className="flex items-start justify-between gap-4">
+                  <div className="flex gap-2.5">
+                    <Activity size={16} className={`mt-0.5 shrink-0 ${mcp?.running ? "text-success" : "text-text-muted"}`} />
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium text-text-primary">
+                        {t("settings.mcpAddress")}
+                        <span className={`ml-2 text-xs ${mcp?.running ? "text-success" : "text-text-muted"}`}>
+                          {mcp?.running ? `● ${t("settings.mcpRunning")}` : `○ ${t("settings.mcpStopped")}`}
+                        </span>
+                      </div>
+                      <div className="mt-1 break-all font-mono text-xs text-text-muted">{mcpAddress}</div>
+                      {mcp?.running && mcp.port != null && mcp.port !== (settings?.mcpPort ?? 9527) && (
+                        <div className="mt-1 text-xs text-warning">
+                          {t("settings.mcpPortFallback", { port: mcp.port })}
+                        </div>
+                      )}
+                      {mcp?.lastError && (
+                        <div className="mt-1 text-xs text-danger">{mcp.lastError}</div>
+                      )}
+                    </div>
+                  </div>
+                  <Button size="sm" variant="secondary" onClick={handleCopyAddr}>
+                    {copied ? <Check size={14} /> : <Copy size={14} />}
+                    {copied ? t("settings.mcpCopied") : t("settings.mcpCopy")}
+                  </Button>
+                </div>
+
+                <Button size="sm" variant="outline" onClick={() => setShowWizard(true)}>
+                  <BookOpen size={14} /> {t("settings.mcpWizard")}
+                </Button>
+              </>
+            )}
           </CardContent>
         </Card>
 
@@ -206,6 +322,13 @@ export function SettingsPage() {
                 ))}
               </select>
             </div>
+            <ToggleRow
+              icon={Activity}
+              title={t("settings.realProbeTitle")}
+              desc={t("settings.realProbeDesc")}
+              checked={settings?.healthProbeRealCompletion ?? false}
+              onChange={(v) => update({ healthProbeRealCompletion: v })}
+            />
           </CardContent>
         </Card>
 
@@ -261,12 +384,124 @@ export function SettingsPage() {
           <CardHeader>
             <CardTitle>{t("settings.backup")}</CardTitle>
           </CardHeader>
-          <CardContent className="flex gap-2">
-            <Button variant="secondary" size="sm">{t("settings.export")}</Button>
-            <Button variant="secondary" size="sm">{t("settings.import")}</Button>
+          <CardContent className="space-y-2">
+            <div className="flex gap-2">
+              <Button variant="secondary" size="sm" disabled>{t("settings.export")}</Button>
+              <Button variant="secondary" size="sm" disabled>{t("settings.import")}</Button>
+            </div>
+            <div className="text-xs text-text-muted">{t("settings.backupDeveloping")}</div>
           </CardContent>
         </Card>
       </div>
+
+      {showWizard && (
+        <McpWizard mcpAddress={mcpAddress} onClose={() => setShowWizard(false)} t={t} />
+      )}
+    </div>
+  );
+}
+
+/** MCP 接入向导弹窗：分步展示 Codex / Claude Code 的接入命令与可选钩子。 */
+function McpWizard({
+  mcpAddress,
+  onClose,
+  t,
+}: {
+  mcpAddress: string;
+  onClose: () => void;
+  t: (key: string, vars?: Record<string, string | number>) => string;
+}) {
+  const codexCmd = `codex mcp add --transport http synaroute ${mcpAddress}`;
+  const codexHook = "遇到复杂的代码审查、架构设计、疑难排查任务时，优先调用 synaroute_ai 工具，获取多个模型的综合分析后再动手。";
+  const claudeCmd = `claude mcp add --transport http synaroute ${mcpAddress}`;
+  const claudeHook = `{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "matcher": "review|审查|重构", "hooks": [{ "type": "prompt", "prompt": "优先调用 synaroute_ai 做多模型分析" }] }
+    ]
+  }
+}`;
+  const verifyCmd = "claude mcp list";
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="max-h-[85vh] w-full max-w-xl overflow-y-auto rounded-card border border-border bg-surface p-5 shadow-xl">
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-base font-semibold text-text-primary">{t("settings.mcpWizardTitle")}</h2>
+          <button onClick={onClose} className="rounded p-1 text-text-muted hover:bg-surface-hover hover:text-text-primary">
+            <X size={16} />
+          </button>
+        </div>
+        <p className="mb-4 text-xs text-text-muted">{t("settings.mcpWizardIntro")}</p>
+
+        <WizardStep n={1} title={t("settings.mcpWizardCodex")}>
+          <div className="mb-1 text-xs text-text-secondary">{t("settings.mcpWizardCodexStep")}</div>
+          <WizardCode text={codexCmd} />
+          <div className="mb-1 mt-2 text-xs text-text-secondary">{t("settings.mcpWizardCodexHook")}</div>
+          <WizardCode text={codexHook} />
+        </WizardStep>
+
+        <WizardStep n={2} title={t("settings.mcpWizardClaude")}>
+          <div className="mb-1 text-xs text-text-secondary">{t("settings.mcpWizardClaudeStep")}</div>
+          <WizardCode text={claudeCmd} />
+          <div className="mb-1 mt-2 text-xs text-text-secondary">{t("settings.mcpWizardClaudeHook")}</div>
+          <WizardCode text={claudeHook} />
+        </WizardStep>
+
+        <WizardStep n={3} title={t("settings.mcpWizardVerify")}>
+          <div className="mb-1 text-xs text-text-secondary">{t("settings.mcpWizardVerifyStep")}</div>
+          <WizardCode text={verifyCmd} />
+        </WizardStep>
+
+        <WizardStep n={4} title={t("settings.mcpWizardUse")}>
+          <div className="text-xs text-text-secondary">{t("settings.mcpWizardUseStep")}</div>
+        </WizardStep>
+
+        <div className="mt-4 flex justify-end">
+          <Button size="sm" variant="secondary" onClick={onClose}>{t("settings.mcpWizardClose")}</Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function WizardStep({ n, title, children }: { n: number; title: string; children: React.ReactNode }) {
+  return (
+    <div className="mb-4">
+      <div className="mb-1.5 flex items-center gap-2">
+        <span className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/15 text-[11px] font-semibold text-primary">{n}</span>
+        <span className="text-sm font-medium text-text-primary">{title}</span>
+      </div>
+      <div className="pl-7">{children}</div>
+    </div>
+  );
+}
+
+function WizardCode({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = () => {
+    void navigator.clipboard?.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    });
+  };
+  return (
+    <div className="relative">
+      <pre className="overflow-x-auto rounded-control border border-border bg-bg p-2.5 pr-9 font-mono text-[11px] leading-relaxed text-text-primary whitespace-pre-wrap break-all">
+        {text}
+      </pre>
+      <button
+        onClick={copy}
+        className="absolute right-1.5 top-1.5 rounded p-1 text-text-muted hover:bg-surface-hover hover:text-text-primary"
+        title="copy"
+      >
+        {copied ? <Check size={12} /> : <Copy size={12} />}
+      </button>
     </div>
   );
 }
@@ -278,6 +513,8 @@ function ToggleRow({
   checked,
   onChange,
   danger,
+  disabled,
+  badge,
 }: {
   icon?: LucideIcon;
   title: string;
@@ -285,17 +522,26 @@ function ToggleRow({
   checked: boolean;
   onChange: (v: boolean) => void;
   danger?: boolean;
+  disabled?: boolean;
+  badge?: string;
 }) {
   return (
-    <div className="flex items-start justify-between gap-4">
+    <div className={`flex items-start justify-between gap-4 ${disabled ? "opacity-60" : ""}`}>
       <div className="flex gap-2.5">
         {Icon && <Icon size={16} className={`mt-0.5 shrink-0 ${danger ? "text-danger" : "text-text-secondary"}`} />}
         <div>
-          <div className="text-sm font-medium text-text-primary">{title}</div>
+          <div className="flex items-center gap-2 text-sm font-medium text-text-primary">
+            {title}
+            {badge && (
+              <span className="rounded-full border border-border px-1.5 py-0.5 text-[10px] font-normal text-text-muted">
+                {badge}
+              </span>
+            )}
+          </div>
           <div className="text-xs text-text-muted">{desc}</div>
         </div>
       </div>
-      <Switch checked={checked} onCheckedChange={onChange} />
+      <Switch checked={checked} onCheckedChange={onChange} disabled={disabled} />
     </div>
   );
 }

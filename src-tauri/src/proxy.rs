@@ -11,8 +11,9 @@ use crate::health;
 use crate::model::{CategoryType, Protocol, ProviderKey, RequestTrace};
 use crate::store::Store;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use futures_util::StreamExt;
+use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -24,10 +25,21 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+/// 响应体类型：可能是完整缓冲体（Full）或流式体（StreamBody），统一装箱为 BoxBody。
+/// 流式路径用于同协议 SSE 透传（stream:true），缓冲路径用于非流式 / 跨协议。
+type ResBody = BoxBody<Bytes, std::io::Error>;
+
+/// 把完整字节体装箱为 ResBody（Full 的错误类型是 Infallible，用 `match` 消解）。
+fn full_body(body: Bytes) -> ResBody {
+    Full::new(body).map_err(|never| match never {}).boxed()
+}
+
 /// 运行中的代理句柄
 struct RunningProxy {
     port: u16,
     handle: JoinHandle<()>,
+    /// 关闭信号：广播给 accept 循环与所有已建立的连接任务，实现「停止即断连」。
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 /// 代理管理器：管理各分类的代理生命周期
@@ -66,29 +78,56 @@ impl ProxyManager {
             .map_err(|e| AppError::Proxy(e.to_string()))?
             .port();
 
+        // 关闭信号通道：stop() 时 send(true)，accept 循环退出、每个连接任务 select 到即断开。
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let store = self.store.clone();
+        let accept_shutdown = shutdown_rx.clone();
         let handle = tokio::spawn(async move {
+            let mut loop_shutdown = accept_shutdown;
             loop {
-                let Ok((stream, _)) = listener.accept().await else { break };
-                let io = TokioIo::new(stream);
-                let store = store.clone();
-                tokio::spawn(async move {
-                    let svc = service_fn(move |req| handle_request(store.clone(), category, req));
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, svc)
-                        .await;
-                });
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { break };
+                        let io = TokioIo::new(stream);
+                        let store = store.clone();
+                        let mut conn_shutdown = shutdown_rx.clone();
+                        tokio::spawn(async move {
+                            let svc = service_fn(move |req| handle_request(store.clone(), category, req));
+                            let conn = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(io, svc);
+                            tokio::pin!(conn);
+                            tokio::select! {
+                                _ = conn.as_mut() => {}
+                                // 收到停止信号：drop 连接（立即断开），使「已停止」后不再有请求被转发。
+                                _ = conn_shutdown.changed() => {}
+                            }
+                        });
+                    }
+                    _ = loop_shutdown.changed() => break, // 停止：退出 accept 循环，释放端口
+                }
             }
         });
 
-        self.running
-            .lock()
-            .insert(category.as_str().to_string(), RunningProxy { port, handle });
+        // 竞态处理（并发 start 同一分类）：绑定发生在 await 期间、锁外，故拿锁后再检查一次。
+        // 若别的调用已插入，则放弃我们刚建的这套（发关闭信号 + abort，释放刚绑的端口），
+        // 返回已存在的端口——避免泄漏一个无法再被 stop 的监听器。
+        let mut running = self.running.lock();
+        if let Some(existing) = running.get(category.as_str()) {
+            let _ = shutdown_tx.send(true);
+            handle.abort();
+            return Ok(existing.port);
+        }
+        running.insert(
+            category.as_str().to_string(),
+            RunningProxy { port, handle, shutdown: shutdown_tx },
+        );
         Ok(port)
     }
 
     pub fn stop(&self, category: CategoryType) {
         if let Some(p) = self.running.lock().remove(category.as_str()) {
+            // 先广播关闭信号（断开已建立的 keep-alive 连接），再 abort accept 循环。
+            let _ = p.shutdown.send(true);
             p.handle.abort();
         }
     }
@@ -99,8 +138,24 @@ async fn handle_request(
     store: Arc<Store>,
     category: CategoryType,
     req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let path = req.uri().path().to_string();
+) -> Result<Response<ResBody>, hyper::Error> {
+    // 保留完整路径 + query（如 /v1/messages/count_tokens?beta=true）：同协议转发时原样透传，
+    // 使 count_tokens 等非补全端点不被误改写为补全端点。协议判定仍用 contains 兼容。
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+
+    // 模型发现端点：Claude Code（v2.1.126+）/model 选择器会 GET <base>/v1/models 拉取可选模型。
+    // 只放行 model 发现的可选模型（各启用 Key 可服务模型的交集/单 Key 自身），不进故障转移补全逻辑。
+    // 用 path（去掉 query）的路径部分判定，避免把补全端点误判进来。
+    let path_only = req.uri().path();
+    if req.method() == hyper::Method::GET
+        && (path_only == "/v1/models" || path_only == "/models" || path_only.starts_with("/v1/models/"))
+    {
+        return Ok(handle_list_models(&store, category));
+    }
 
     // 透传下游（Claude Code / CLI 等客户端）的原始请求头，供中转商做客户端身份校验
     // （FR：部分分组只放行 Claude Code 客户端，靠 User-Agent/anthropic-beta/x-app 等识别）。
@@ -130,18 +185,32 @@ async fn handle_request(
         .unwrap_or("")
         .to_string();
 
-    // 候选：启用 + 未熔断，按优先级
-    let candidates: Vec<ProviderKey> = store
-        .enabled_keys_sorted(category)
-        .into_iter()
-        .filter(|k| health::is_candidate(&k.health))
-        .collect();
+    // 下游是否要求流式（Claude Code / Codex 默认 stream:true）。
+    let wants_stream = req_json
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+    // 下游请求协议（按 path 判定）：/messages=Anthropic，/responses=OpenAI Responses，否则 Chat。
+    let downstream = downstream_protocol(&path);
+
+    // 候选：启用 + 未熔断，按优先级。全被熔断时（如单 Key 刚熔断）忽略熔断兜底，
+    // 避免无处可切却直接 503——熔断本为多 Key 快速切换，无候选可切时不应自杀。
+    let (candidates, used_breaker_fallback) =
+        health::select_candidates(store.enabled_keys_sorted(category));
 
     if candidates.is_empty() {
         return Ok(error_resp(
             StatusCode::SERVICE_UNAVAILABLE,
-            "无可用 Key（全部停用或熔断）",
+            "无可用 Key（全部停用或明确不可用）",
         ));
+    }
+    if used_breaker_fallback {
+        store.append_event(
+            category,
+            "failover",
+            None,
+            "所有 Key 均在熔断窗口内，已忽略熔断兜底重试（无处可切换）",
+        );
     }
 
     // 调用模型日志开关（默认关）：开启后每次转发尝试记一条 request 事件（含完整链路快照）
@@ -196,9 +265,86 @@ async fn handle_request(
         store.append_event_trace(category, "request", Some(&key.id), &detail, Some(trace));
     };
 
+    // 流式可走真流式的条件：同协议直通，或跨协议但有受支持的 SSE 翻译方向。
+    // 其余跨协议组合（无翻译器）才跳过，交给故障转移找同协议 Key。
+    let can_stream = |k: &ProviderKey| {
+        downstream == k.protocol
+            || crate::upstream::sse_direction(downstream, k.protocol).is_some()
+    };
+
     let mut last_err = String::new();
     for key in &candidates {
         let started = std::time::Instant::now();
+
+        // 流式直通分支：下游要 stream 且无需跨协议转换 → 真流式透传（边收边发）。
+        // 先探上游状态码：非 2xx 则照常切换下一个 Key（首字节尚未发出，切换安全）；
+        // 2xx 则把上游 SSE 流原样转给下游，正确设置 content-type，直接返回（不再切换）。
+        if wants_stream && can_stream(key) {
+            match try_stream_to_key(&store, key, &path, &req_json, &requested_model, &fwd_headers).await {
+                Ok(StreamAttempt::Streaming(resp)) => {
+                    health::record_live_success(&store, &key.id);
+                    store.append_event(
+                        category,
+                        "route",
+                        Some(&key.id),
+                        &format!(
+                            "{} 流式返回 {}",
+                            key.name,
+                            fmt_route_model(&requested_model, &mapped_model(key, &requested_model))
+                        ),
+                    );
+                    return Ok(resp);
+                }
+                // 上游非 2xx：记录并切下一个
+                Ok(StreamAttempt::HttpError { status, body, url, real_model }) => {
+                    let elapsed = started.elapsed().as_millis() as u64;
+                    let snippet: String = body.trim().chars().take(400).collect();
+                    last_err = if snippet.is_empty() {
+                        format!("HTTP {status}")
+                    } else {
+                        format!("HTTP {status}: {snippet}")
+                    };
+                    log_request(&store, key, elapsed, url, real_model, downstream_body.clone(), body, Some(status), false);
+                    health::record_live_failure(&store, &key.id);
+                    store.append_event(
+                        category,
+                        "failover",
+                        Some(&key.id),
+                        &format!("{} 失败（{}），尝试下一个", key.name, last_err),
+                    );
+                    continue;
+                }
+                // 连接层失败：记录并切下一个
+                Err(e) => {
+                    let elapsed = started.elapsed().as_millis() as u64;
+                    last_err = e.to_string();
+                    log_request(&store, key, elapsed, String::new(), mapped_model(key, &requested_model), downstream_body.clone(), last_err.clone(), None, false);
+                    health::record_live_failure(&store, &key.id);
+                    store.append_event(
+                        category,
+                        "failover",
+                        Some(&key.id),
+                        &format!("{} 失败（{}），尝试下一个", key.name, last_err),
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // 流式 + 无法翻译的跨协议组合（如两端各为 Anthropic/Responses，无中枢路径）：
+        // 绝不能走缓冲路径返回 application/json——下游按 text/event-stream 解析必失败。
+        // 跳过该候选，让故障转移去找可流式的 Key；若最终都不可流式，循环结束统一回 502。
+        if wants_stream && !can_stream(key) {
+            last_err = "流式请求不支持跨协议转换（该 Key 协议与下游不一致）".to_string();
+            store.append_event(
+                category,
+                "failover",
+                Some(&key.id),
+                &format!("{} 跳过（{}），尝试下一个", key.name, last_err),
+            );
+            continue;
+        }
+
         let result = forward_to_key(&store, key, &path, &req_json, &requested_model, &fwd_headers).await;
         let elapsed = started.elapsed().as_millis() as u64;
         match result {
@@ -215,11 +361,16 @@ async fn handle_request(
                     Some(outcome.status),
                     true,
                 );
+                health::record_live_success(&store, &key.id);
                 store.append_event(
                     category,
                     "route",
                     Some(&key.id),
-                    &format!("{} 成功返回 {}", key.name, requested_model),
+                    &format!(
+                        "{} 成功返回 {}",
+                        key.name,
+                        fmt_route_model(&requested_model, &outcome.real_model)
+                    ),
                 );
                 return Ok(json_resp(StatusCode::OK, outcome.bytes));
             }
@@ -243,6 +394,7 @@ async fn handle_request(
                     Some(outcome.status),
                     false,
                 );
+                health::record_live_failure(&store, &key.id);
                 store.append_event(
                     category,
                     "failover",
@@ -264,6 +416,7 @@ async fn handle_request(
                     None,
                     false,
                 );
+                health::record_live_failure(&store, &key.id);
                 store.append_event(
                     category,
                     "failover",
@@ -281,6 +434,69 @@ async fn handle_request(
     ))
 }
 
+/// 计算 `/model` 选择器应展示的可选模型集（用户约定）：
+/// - 无候选 → 空
+/// - 单个候选 → 该 Key 自身可服务模型集（cc-switch 式）
+/// - 多个候选 → 各 Key 可服务模型集的**交集**（共有），保证选任意模型都能在所有候选上路由，
+///   不会「模型不存在」。顺序以主 Key（candidates[0]，已按 priority 升序）为准。
+/// - 交集为空（多 Key 对外名不统一）→ 回退主 Key 的可服务模型集。
+fn discoverable_models(candidates: &[ProviderKey]) -> Vec<String> {
+    let Some((primary, rest)) = candidates.split_first() else {
+        return Vec::new();
+    };
+    let primary_models = primary.serviceable_models();
+    if rest.is_empty() {
+        return primary_models;
+    }
+    // 各备用 Key 的可服务集，用于取交集
+    let backup_sets: Vec<std::collections::HashSet<String>> = rest
+        .iter()
+        .map(|k| k.serviceable_models().into_iter().collect())
+        .collect();
+    let intersection: Vec<String> = primary_models
+        .iter()
+        .filter(|m| backup_sets.iter().all(|s| s.contains(*m)))
+        .cloned()
+        .collect();
+    if intersection.is_empty() {
+        // 空交集：对外名不统一。回退主 Key，保证选择器不空且主 Key 一定能路由。
+        primary_models
+    } else {
+        intersection
+    }
+}
+
+/// 返回模型发现结果（GET /v1/models）。按分类协议输出对应形态：
+/// - Claude CLI / 桌面端（Anthropic）：`{"data":[{"type":"model","id":..,"display_name":..}],"has_more":false}`
+/// - Codex（OpenAI）：`{"object":"list","data":[{"id":..,"object":"model","owned_by":"synaroute"}]}`
+fn handle_list_models(store: &Arc<Store>, category: CategoryType) -> Response<ResBody> {
+    // 与路由一致：全被熔断时忽略熔断兜底，避免 /model 因熔断变空列表、CLI 选不到模型。
+    let (candidates, _) = health::select_candidates(store.enabled_keys_sorted(category));
+    let models = discoverable_models(&candidates);
+
+    // 分类固定了下游协议形态：Codex 用 OpenAI，Claude CLI/桌面端用 Anthropic。
+    let body = if matches!(category, CategoryType::Codex) {
+        let data: Vec<Value> = models
+            .iter()
+            .map(|m| serde_json::json!({"id": m, "object": "model", "owned_by": "synaroute"}))
+            .collect();
+        serde_json::json!({"object": "list", "data": data})
+    } else {
+        let data: Vec<Value> = models
+            .iter()
+            .map(|m| serde_json::json!({"type": "model", "id": m, "display_name": m}))
+            .collect();
+        serde_json::json!({
+            "data": data,
+            "has_more": false,
+            "first_id": models.first(),
+            "last_id": models.last(),
+        })
+    };
+    let bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
+    json_resp(StatusCode::OK, bytes)
+}
+
 /// 请求/响应体在日志里的最大字符数（防止超大 body 撑爆内存日志）
 const REQ_LOG_CAP: usize = 20_000;
 
@@ -292,6 +508,184 @@ fn cap(s: &str) -> String {
         let head: String = s.chars().take(REQ_LOG_CAP).collect();
         format!("{head}\n…（已截断，共 {} 字符）", s.chars().count())
     }
+}
+
+/// 流式转发的尝试结果。
+enum StreamAttempt {
+    /// 上游 2xx：已构建好流式响应，直接返回给下游（不再切换 Key）。
+    Streaming(Response<ResBody>),
+    /// 上游有响应但非 2xx：缓冲错误体，调用方据此切换下一个 Key。
+    HttpError {
+        status: u16,
+        body: String,
+        url: String,
+        real_model: String,
+    },
+}
+
+/// 同协议流式转发：把上游 SSE 响应边收边发透传给下游。
+///
+/// 与 forward_to_key 的差异：
+/// - 不设总超时（长回答会被 30s 掐断），仅设连接超时；流本身靠客户端断开或上游结束收尾。
+/// - 先 send() 探状态码：非 2xx 缓冲错误体返回 HttpError（首字节未发，切换安全）；
+///   2xx 则用 bytes_stream() 逐块转发，content-type 沿用上游真实值（保 text/event-stream）。
+/// - 仅在下游协议与 Key 协议一致时调用（无需跨协议转换），跨协议 SSE 翻译属已知限制。
+async fn try_stream_to_key(
+    store: &Arc<Store>,
+    key: &ProviderKey,
+    path: &str,
+    req_json: &Value,
+    requested_model: &str,
+    fwd_headers: &[(String, String)],
+) -> AppResult<StreamAttempt> {
+    let secret = store
+        .secrets
+        .read()
+        .get(&key.id)?
+        .ok_or_else(|| AppError::Upstream("密钥缺失".into()))?;
+
+    // 模型解析：映射 → 原生支持 → 默认兜底 → 第一个模型 → 透传（见 ProviderKey::resolve_model）
+    let real_model = key.resolve_model(requested_model);
+
+    // 下游协议 → 上游 Key 协议：请求体按需转换（同协议 convert_request 内部直接克隆）。
+    let downstream = downstream_protocol(path);
+    let mut payload = req_json.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("model".into(), Value::String(real_model.clone()));
+    }
+    let payload = crate::upstream::convert_request(&payload, downstream, key.protocol);
+
+    // SSE 翻译方向：同协议为 None（原样透传）；跨协议按方向重组事件流。
+    let sse_dir = crate::upstream::sse_direction(downstream, key.protocol);
+
+    // 同协议：原样保留下游路径 + query（count_tokens 等子路径正确透传）。
+    // 跨协议：退回上游协议的补全端点。
+    let resource_path: std::borrow::Cow<str> = if downstream == key.protocol {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        std::borrow::Cow::Borrowed(key.protocol.completion_path())
+    };
+    let url = crate::upstream::join_endpoint(&key.base_url, &resource_path);
+    let (auth_header, auth_val, extra) = if matches!(key.protocol, Protocol::Anthropic) {
+        ("x-api-key", secret.clone(), Some(("anthropic-version", "2023-06-01")))
+    } else {
+        ("authorization", format!("Bearer {secret}"), None)
+    };
+
+    // 流式：用共享客户端（连接池复用，含 connect_timeout），不设总超时，避免长回答被掐断。
+    let client = crate::upstream::shared_client();
+
+    let mut rb = client.post(&url).json(&payload);
+    for (h, v) in fwd_headers {
+        rb = rb.header(h, v);
+    }
+    rb = rb.header(auth_header, auth_val);
+    if let Some((h, v)) = extra {
+        rb = rb.header(h, v);
+    }
+
+    let resp = rb
+        .send()
+        .await
+        .map_err(|e| AppError::Upstream(format!("连接 {url} 失败: {e}")))?;
+    let status = resp.status();
+
+    if !status.is_success() {
+        // 非 2xx：缓冲错误体供切换决策与日志。
+        let body = resp
+            .bytes()
+            .await
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .unwrap_or_default();
+        return Ok(StreamAttempt::HttpError {
+            status: status.as_u16(),
+            body,
+            url,
+            real_model,
+        });
+    }
+
+    // 2xx：同协议原样透传；跨协议用 SseTranslator 逐块重组事件流。
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("text/event-stream")
+        .to_string();
+
+    let body: ResBody = match sse_dir {
+        // 同协议：reqwest 字节流 → hyper StreamBody，逐块原样透传。
+        None => {
+            let byte_stream = resp.bytes_stream().map(|chunk| {
+                chunk
+                    .map(Frame::data)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            });
+            BodyExt::boxed(StreamBody::new(byte_stream))
+        }
+        // 跨协议：有状态翻译器逐块把上游 SSE 重组成下游协议事件；流末尾冲刷收尾事件。
+        // 用 stream::unfold 承载状态机（不引 async_stream 依赖）：累加器持有翻译器、上游流、
+        // 以及「是否已冲刷收尾」标志。每步产出一个 Frame。
+        Some(dir) => {
+            let translator = crate::upstream::SseTranslator::new(dir);
+            let upstream = resp.bytes_stream();
+            struct StreamState<S> {
+                translator: crate::upstream::SseTranslator,
+                upstream: S,
+                finished: bool,
+            }
+            let init = StreamState { translator, upstream, finished: false };
+            let translated = futures_util::stream::unfold(init, |mut st| async move {
+                loop {
+                    match st.upstream.next().await {
+                        Some(Ok(bytes)) => {
+                            let out = st.translator.push(&bytes);
+                            if out.is_empty() {
+                                continue; // 该块未凑齐完整行，继续拉取
+                            }
+                            let frame = Ok(Frame::data(Bytes::from(out)));
+                            return Some((frame, st));
+                        }
+                        Some(Err(e)) => {
+                            let frame = Err(std::io::Error::other(e.to_string()));
+                            st.finished = true;
+                            return Some((frame, st));
+                        }
+                        None => {
+                            // 上游结束：冲刷一次收尾事件，之后终止。
+                            if st.finished {
+                                return None;
+                            }
+                            st.finished = true;
+                            let tail = st.translator.finish();
+                            if tail.is_empty() {
+                                return None;
+                            }
+                            let frame = Ok(Frame::data(Bytes::from(tail)));
+                            return Some((frame, st));
+                        }
+                    }
+                }
+            });
+            BodyExt::boxed(StreamBody::new(translated))
+        }
+    };
+
+    // 跨协议时下游 content-type 固定为 SSE（上游的可能不同）；同协议沿用上游值。
+    let out_content_type = if sse_dir.is_some() {
+        "text/event-stream".to_string()
+    } else {
+        content_type
+    };
+
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", out_content_type)
+        .header("cache-control", "no-cache")
+        .body(body)
+        .map_err(|e| AppError::Upstream(e.to_string()))?;
+
+    Ok(StreamAttempt::Streaming(response))
 }
 
 /// 一次转发的完整结果：既供路由决策（bytes/ok），也供调用模型日志（url/model/body 快照）。
@@ -308,6 +702,19 @@ struct ForwardOutcome {
     status: u16,
     /// 是否 2xx
     ok: bool,
+}
+
+/// 按下游请求 path 判定下游客户端使用的协议：
+/// `/messages` → Anthropic（Claude CLI/桌面端）；`/responses` → OpenAI Responses（Codex）；
+/// 其余（`/chat/completions` 等）→ OpenAI Chat。用于选择请求/响应的跨协议转换方向。
+fn downstream_protocol(path: &str) -> Protocol {
+    if path.contains("/messages") {
+        Protocol::Anthropic
+    } else if path.contains("/responses") {
+        Protocol::OpenaiResponses
+    } else {
+        Protocol::OpenaiChat
+    }
 }
 
 /// 转发到单个 Key：套用模型映射 + 协议适配。
@@ -328,56 +735,47 @@ async fn forward_to_key(
         .get(&key.id)?
         .ok_or_else(|| AppError::Upstream("密钥缺失".into()))?;
 
-    // 模型映射：把下游请求的期望模型翻译为该 Key 的真实模型（FR-006）
-    let real_model = key
-        .mappings
-        .iter()
-        .find(|m| m.expected_name == requested_model)
-        .map(|m| m.real_name.clone())
-        .unwrap_or_else(|| requested_model.to_string());
+    // 模型解析：映射 → 原生支持 → 默认兜底 → 第一个模型 → 透传（FR-006，见 resolve_model）
+    let real_model = key.resolve_model(requested_model);
 
     // 判定下游请求协议（按 path），与目标 Key 协议做适配
-    let downstream_is_anthropic = path.contains("/messages");
+    let downstream = downstream_protocol(path);
     let mut payload = req_json.clone();
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("model".into(), Value::String(real_model.clone()));
     }
 
-    // 跨协议转换（MVP 非流式）
-    let payload = match (downstream_is_anthropic, key.protocol) {
-        (true, Protocol::Openai) => crate::upstream::anthropic_to_openai(&payload),
-        (false, Protocol::Anthropic) => crate::upstream::openai_to_anthropic(&payload),
-        _ => payload,
-    };
+    // 跨协议转换（下游协议 → 上游 Key 协议；同协议时 convert_request 内部直接返回克隆）
+    let payload = crate::upstream::convert_request(&payload, downstream, key.protocol);
 
     // 发往上游的请求体快照（pretty，方便页面阅读；密钥不在 body 里，安全）
     let request_body = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
 
-    // 目标 URL + 鉴权
-    let (url, auth_header, auth_val, extra) = match key.protocol {
-        Protocol::Anthropic => (
-            join(&key.base_url, "/v1/messages"),
-            "x-api-key",
-            secret.clone(),
-            Some(("anthropic-version", "2023-06-01")),
-        ),
-        Protocol::Openai => (
-            join(&key.base_url, "/v1/chat/completions"),
-            "authorization",
-            format!("Bearer {secret}"),
-            None,
-        ),
+    // 目标 URL + 鉴权。
+    // 同协议：原样保留下游路径 + query（count_tokens 等子路径正确透传）。
+    // 跨协议：只能映射主补全端点（其它子路径无跨协议等价物，退回该上游协议的补全端点）。
+    let same_protocol = downstream == key.protocol;
+    let resource_path: std::borrow::Cow<str> = if same_protocol {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        std::borrow::Cow::Borrowed(key.protocol.completion_path())
+    };
+    let url = crate::upstream::join_endpoint(&key.base_url, &resource_path);
+    let (auth_header, auth_val, extra) = if matches!(key.protocol, Protocol::Anthropic) {
+        ("x-api-key", secret.clone(), Some(("anthropic-version", "2023-06-01")))
+    } else {
+        ("authorization", format!("Bearer {secret}"), None)
     };
 
-    let timeout = key.params.timeout_ms.unwrap_or(30_000);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(timeout))
-        .build()
-        .map_err(|e| AppError::Upstream(e.to_string()))?;
+    // 用共享客户端（连接池复用），总超时按 Key 配置逐请求指定。
+    let client = crate::upstream::shared_client();
 
     // 先透传下游客户端头（User-Agent / anthropic-beta / x-app / x-stainless-* 等），
     // 让中转商识别为真实 Claude Code 客户端；再用本 Key 的鉴权头覆盖，确保鉴权用对密钥。
-    let mut rb = client.post(&url).json(&payload);
+    let mut rb = client
+        .post(&url)
+        .json(&payload)
+        .timeout(std::time::Duration::from_millis(key.params.timeout_ms.unwrap_or(30_000)));
     for (h, v) in fwd_headers {
         rb = rb.header(h, v);
     }
@@ -393,6 +791,21 @@ async fn forward_to_key(
         .map_err(|e| AppError::Upstream(format!("连接 {url} 失败: {e}")))?;
     let status = resp.status();
     let bytes = resp.bytes().await.map_err(|e| AppError::Upstream(e.to_string()))?;
+
+    // 跨协议响应翻译：上游 2xx 时，把响应体从上游协议翻译回下游客户端期望的协议格式。
+    // 请求已翻译（上面的 payload 转换），响应也必须翻译，否则下游客户端收到无法解析的异协议体。
+    // 非 2xx 不翻译：错误体原样透传，便于日志显示上游真实错误。同协议时 convert_response 内部直接返回克隆。
+    let bytes = if status.is_success() && !same_protocol {
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => {
+                let translated = crate::upstream::convert_response(&v, key.protocol, downstream);
+                Bytes::from(serde_json::to_vec(&translated).unwrap_or_else(|_| bytes.to_vec()))
+            }
+            Err(_) => bytes, // 解析失败（非 JSON）：原样透传
+        }
+    } else {
+        bytes
+    };
 
     Ok(ForwardOutcome {
         request_body,
@@ -429,33 +842,250 @@ fn is_stripped_header(name: &str) -> bool {
     )
 }
 
-/// 映射后真实模型名（日志展示用，与 forward_to_key 内映射逻辑一致）。
+/// 解析后真实模型名（日志展示用，与 forward 内解析逻辑一致，见 ProviderKey::resolve_model）。
 fn mapped_model(key: &ProviderKey, requested_model: &str) -> String {
-    key.mappings
-        .iter()
-        .find(|m| m.expected_name == requested_model)
-        .map(|m| m.real_name.clone())
-        .unwrap_or_else(|| requested_model.to_string())
+    key.resolve_model(requested_model)
 }
 
-fn join(base: &str, path: &str) -> String {
-    let base = base.trim_end_matches('/');
-    if base.ends_with("/v1") && path.starts_with("/v1/") {
-        format!("{}{}", base, &path[3..])
+/// 路由成功日志里的模型展示：发生映射时显示「原名 → 真实名」，
+/// 原生透传（两者相同）或原名缺失时只显示单个名字，避免冗余。
+fn fmt_route_model(requested: &str, real: &str) -> String {
+    if requested.is_empty() || requested == real {
+        real.to_string()
     } else {
-        format!("{}{}", base, path)
+        format!("{requested} → {real}")
     }
 }
 
-fn json_resp(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {
+fn json_resp(status: StatusCode, body: Bytes) -> Response<ResBody> {
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(Full::new(body))
+        .body(full_body(body))
         .unwrap()
 }
 
-fn error_resp(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
+fn error_resp(status: StatusCode, msg: &str) -> Response<ResBody> {
     let body = serde_json::json!({ "error": { "message": msg, "source": "synaroute" } });
     json_resp(status, Bytes::from(serde_json::to_vec(&body).unwrap()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{CategoryType, HealthState, KeyParams, Protocol, ProviderKey};
+    use crate::store::Store;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("synaroute_proxy_test_{}_{}_{}", tag, std::process::id(), seq));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn key(id: &str, priority: i32, base_url: &str) -> ProviderKey {
+        ProviderKey {
+            id: id.into(),
+            category_id: CategoryType::ClaudeCli,
+            name: format!("k-{id}"),
+            vendor: "test".into(),
+            base_url: base_url.into(),
+            protocol: Protocol::Anthropic,
+            has_secret: true,
+            enabled: true,
+            priority,
+            headers_json: None,
+            params: KeyParams::default(),
+            models: vec![],
+            mappings: vec![],
+            default_model: None,
+            tier_haiku: None,
+            tier_sonnet: None,
+            tier_opus: None,
+            health: HealthState::default(),
+        }
+    }
+
+    /// 起一个返回固定 status + body 的 mock 上游，返回其 base_url。
+    async fn spawn_mock(status: u16, body: &'static str) -> String {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| async move {
+                        let resp = Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .body(full_body(Bytes::from(body)))
+                            .unwrap();
+                        Ok::<_, hyper::Error>(resp)
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// 端到端：高优先 Key 返 401 → 自动故障转移到低优先 Key 返 200，响应来自后者。
+    #[tokio::test]
+    async fn proxy_fails_over_bad_to_good() {
+        let bad = spawn_mock(401, r#"{"error":{"message":"unauthorized"}}"#).await;
+        let good = spawn_mock(
+            200,
+            r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}"#,
+        )
+        .await;
+
+        let dir = temp_dir("failover");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        store.upsert_key(key("k1", 0, &bad)).unwrap();
+        store.upsert_key(key("k2", 1, &good)).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        store.secrets.write().set("k2", "y").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "应故障转移到好 Key 返回 200");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["content"][0]["text"], "ok", "响应应来自 good 上游");
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 端到端：全部候选失败 → 502。
+    #[tokio::test]
+    async fn proxy_all_fail_returns_502() {
+        let bad1 = spawn_mock(401, "no").await;
+        let bad2 = spawn_mock(500, "err").await;
+        let dir = temp_dir("allfail");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        store.upsert_key(key("k1", 0, &bad1)).unwrap();
+        store.upsert_key(key("k2", 1, &bad2)).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        store.secrets.write().set("k2", "y").unwrap();
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 502, "全部失败应回 502");
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- /v1/models 模型发现 ----
+
+    use crate::model::{ModelInfo, ModelMapping};
+
+    fn model_info(name: &str) -> ModelInfo {
+        ModelInfo { real_name: name.into(), source: "manual".into(), fetched_at: None, context_window: None }
+    }
+    fn mapping(expected: &str, real: &str) -> ModelMapping {
+        ModelMapping { id: format!("{expected}->{real}"), expected_name: expected.into(), real_name: real.into() }
+    }
+
+    #[test]
+    fn discover_single_key_uses_its_own_models() {
+        let mut k = key("k1", 0, "http://x");
+        k.mappings = vec![mapping("opus-4-8", "glm-5.2")];
+        k.models = vec![model_info("glm-5.2"), model_info("glm-5.1")];
+        // 单 Key：对外映射名 + 原生名，去重保序
+        assert_eq!(discoverable_models(&[k]), vec!["opus-4-8", "glm-5.2", "glm-5.1"]);
+    }
+
+    #[test]
+    fn discover_multi_key_uses_intersection() {
+        let mut a = key("a", 0, "http://x");
+        a.mappings = vec![mapping("opus-4-8", "glm-5.2"), mapping("opus-4-7", "glm-5.1")];
+        let mut b = key("b", 1, "http://y");
+        b.mappings = vec![mapping("opus-4-8", "ds-v4")]; // 只共有 opus-4-8
+        assert_eq!(discoverable_models(&[a, b]), vec!["opus-4-8"]);
+    }
+
+    #[test]
+    fn discover_empty_intersection_falls_back_to_primary() {
+        // 对外名不统一：a=claude-opus-4-7，b=opus-4-7 → 交集空 → 回退主 Key(a)
+        let mut a = key("a", 0, "http://x");
+        a.mappings = vec![mapping("claude-opus-4-7", "glm-5.1")];
+        let mut b = key("b", 1, "http://y");
+        b.mappings = vec![mapping("opus-4-7", "ds-v4")];
+        assert_eq!(discoverable_models(&[a, b]), vec!["claude-opus-4-7"]);
+    }
+
+    #[test]
+    fn discover_empty_when_no_candidates() {
+        assert!(discoverable_models(&[]).is_empty());
+    }
+
+    #[test]
+    fn fmt_route_model_shows_mapping_only_when_differs() {
+        // 发生映射：显示「原名 → 真实名」
+        assert_eq!(fmt_route_model("claude-opus-4-8", "glm-5.2"), "claude-opus-4-8 → glm-5.2");
+        // 原生透传（相同）：只显示单个
+        assert_eq!(fmt_route_model("glm-5.2", "glm-5.2"), "glm-5.2");
+        // 原名缺失：只显示真实名
+        assert_eq!(fmt_route_model("", "glm-5.2"), "glm-5.2");
+    }
+
+    #[tokio::test]
+    async fn proxy_get_v1_models_returns_intersection() {
+        let dir = temp_dir("listmodels");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let mut a = key("a", 0, "http://x");
+        a.mappings = vec![mapping("opus-4-8", "glm-5.2"), mapping("opus-4-7", "glm-5.1")];
+        let mut b = key("b", 1, "http://y");
+        b.mappings = vec![mapping("opus-4-8", "ds-v4")];
+        store.upsert_key(a).unwrap();
+        store.upsert_key(b).unwrap();
+        store.secrets.write().set("a", "x").unwrap();
+        store.secrets.write().set("b", "y").unwrap();
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let ids: Vec<String> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["opus-4-8"], "应只返回共有的 opus-4-8");
+        assert_eq!(body["data"][0]["type"], "model", "Anthropic 形态");
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

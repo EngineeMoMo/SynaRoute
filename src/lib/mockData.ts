@@ -61,7 +61,7 @@ const store: Record<CategoryType, ProviderKey[]> = {
       name: "厂商3（GLM 映射）",
       vendor: "glm",
       baseUrl: "https://open.bigmodel.cn/api/paas/v4",
-      protocol: "openai",
+      protocol: "openai_chat",
       hasSecret: true,
       enabled: true,
       priority: 2,
@@ -82,7 +82,7 @@ const store: Record<CategoryType, ProviderKey[]> = {
       name: "OpenAI 官方",
       vendor: "openai",
       baseUrl: "https://api.openai.com/v1",
-      protocol: "openai",
+      protocol: "openai_responses",
       hasSecret: true,
       enabled: true,
       priority: 0,
@@ -101,13 +101,14 @@ const brainConfigs: Record<CategoryType, BrainConfig> = {
     aggregateMode: "compressed",
     concurrencyLimit: 3,
     totalTimeoutMs: 60000,
-    summarizerRef: undefined, // 缺省复用决策者
+    summarizerRef: undefined,
     deciderRef: "k2::opus-4-8",
     members: [
       { id: "bm1", keyId: "k1", modelName: "opus-4-8" },
       { id: "bm2", keyId: "k2", modelName: "opus-4-7" },
       { id: "bm3", keyId: "k3", modelName: "GLM5.2" },
     ],
+    retrievalEnabled: false,
   },
   "claude-desktop": {
     categoryId: "claude-desktop",
@@ -116,6 +117,7 @@ const brainConfigs: Record<CategoryType, BrainConfig> = {
     concurrencyLimit: 3,
     totalTimeoutMs: 60000,
     members: [],
+    retrievalEnabled: false,
   },
   codex: {
     categoryId: "codex",
@@ -124,6 +126,7 @@ const brainConfigs: Record<CategoryType, BrainConfig> = {
     concurrencyLimit: 3,
     totalTimeoutMs: 60000,
     members: [],
+    retrievalEnabled: false,
   },
 };
 
@@ -159,6 +162,32 @@ const events: EventLogEntry[] = [
     detail: "厂商3 健康检查：状态未知（尚未探测）",
   },
   {
+    id: "e3b",
+    ts: now - 28000,
+    categoryId: "claude-cli",
+    type: "config",
+    detail: "已注册 MCP 到 Claude：C:\\Users\\me\\.claude.json（http://127.0.0.1:9527/mcp），重启客户端生效",
+  },
+  {
+    id: "e3c",
+    ts: now - 20000,
+    categoryId: "claude-cli",
+    type: "mcp",
+    detail: "synaroute_ai · C:\\proj\\demo · 3个参与者 · 5个文件 · 8200ms",
+    trace: {
+      keyName: "synaroute_ai",
+      vendor: "mcp",
+      protocol: "anthropic",
+      url: "-",
+      requestedModel: "-",
+      realModel: "-",
+      requestBody: "分析当前项目的登录模块有哪些安全隐患",
+      responseBody: "## 🧠 SynaRoute 多模型聚合分析\n\n1. 密码明文比对……\n2. 缺少速率限制……",
+      latencyMs: 8200,
+      ok: true,
+    },
+  },
+  {
     id: "e4",
     ts: now - 15000,
     categoryId: "claude-cli",
@@ -168,7 +197,7 @@ const events: EventLogEntry[] = [
     trace: {
       keyName: "厂商2",
       vendor: "zhipu",
-      protocol: "openai",
+      protocol: "openai_chat",
       url: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
       requestedModel: "claude-opus-4",
       realModel: "glm-4.6",
@@ -254,15 +283,35 @@ let settings: AppSettings = {
   lanExposure: false,
   requestLogEnabled: false,
   healthCheckIntervalSecs: 60,
+  mcpEnabled: false,
+  mcpPort: 9527,
 };
 
 // 内置厂商种子（与后端 model.rs Vendor::builtin_seed 保持一致）
 let vendors: Vendor[] = [
-  { id: "anthropic", name: "Anthropic", defaultBaseUrl: "https://api.anthropic.com", defaultProtocol: "anthropic", builtin: true },
-  { id: "openai", name: "OpenAI", defaultBaseUrl: "https://api.openai.com/v1", defaultProtocol: "openai", builtin: true },
-  { id: "zhipu", name: "智谱 GLM", defaultBaseUrl: "https://open.bigmodel.cn/api/paas/v4", defaultProtocol: "openai", builtin: true },
-  { id: "deepseek", name: "DeepSeek", defaultBaseUrl: "https://api.deepseek.com", defaultProtocol: "openai", builtin: true },
-  { id: "moonshot", name: "月之暗面 Kimi", defaultBaseUrl: "https://api.moonshot.cn/v1", defaultProtocol: "openai", builtin: true },
+  { id: "anthropic", name: "Anthropic", defaultBaseUrl: "https://api.anthropic.com", defaultProtocol: "anthropic", builtin: true, presetModels: [
+    { realName: "claude-opus-4-5", displayName: "Claude Opus 4.5", contextWindow: 200_000 },
+    { realName: "claude-sonnet-4-5", displayName: "Claude Sonnet 4.5", contextWindow: 200_000 },
+    { realName: "claude-haiku-4-5", displayName: "Claude Haiku 4.5", contextWindow: 200_000 },
+  ] },
+  { id: "openai", name: "OpenAI", defaultBaseUrl: "https://api.openai.com/v1", defaultProtocol: "openai_responses", builtin: true, presetModels: [
+    { realName: "gpt-5.5", displayName: "GPT-5.5", contextWindow: 400_000 },
+    { realName: "gpt-5", displayName: "GPT-5", contextWindow: 400_000 },
+    { realName: "gpt-4o", displayName: "GPT-4o", contextWindow: 128_000 },
+  ] },
+  { id: "zhipu", name: "智谱 GLM", defaultBaseUrl: "https://open.bigmodel.cn/api/paas/v4", defaultProtocol: "openai_chat", builtin: true, presetModels: [
+    { realName: "glm-4.6", displayName: "GLM-4.6", contextWindow: 200_000 },
+    { realName: "glm-4.5", displayName: "GLM-4.5", contextWindow: 128_000 },
+    { realName: "glm-4.5-air", displayName: "GLM-4.5-Air", contextWindow: 128_000 },
+  ] },
+  { id: "deepseek", name: "DeepSeek", defaultBaseUrl: "https://api.deepseek.com", defaultProtocol: "openai_chat", builtin: true, presetModels: [
+    { realName: "deepseek-chat", displayName: "DeepSeek Chat", contextWindow: 128_000 },
+    { realName: "deepseek-reasoner", displayName: "DeepSeek Reasoner", contextWindow: 128_000 },
+  ] },
+  { id: "moonshot", name: "月之暗面 Kimi", defaultBaseUrl: "https://api.moonshot.cn/v1", defaultProtocol: "openai_chat", builtin: true, presetModels: [
+    { realName: "kimi-k2-0905-preview", displayName: "Kimi K2", contextWindow: 256_000 },
+    { realName: "moonshot-v1-128k", displayName: "Moonshot v1 128k", contextWindow: 128_000 },
+  ] },
   { id: "custom", name: "自定义", defaultBaseUrl: "", defaultProtocol: "anthropic", builtin: true },
 ];
 

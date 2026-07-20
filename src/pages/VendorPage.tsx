@@ -1,17 +1,21 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useStore } from "@/store";
 import { api } from "@/lib/bridge";
 import { Card, CardContent } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
+import { BrandIcon } from "@/components/BrandIcon";
 import { useT } from "@/lib/useT";
-import type { Protocol, Vendor } from "@/types";
-import { Building2, Lock, Pencil, Plus, Trash2 } from "lucide-react";
+import { protocolLabel, type Protocol, type Vendor } from "@/types";
+import { Building2, Lock, Pencil, Plus, Trash2, ImagePlus, X } from "lucide-react";
 
 const inputCls =
   "h-9 w-full rounded-control border border-border bg-surface px-3 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-ring";
 
-type Draft = { id: string; name: string; defaultBaseUrl: string; defaultProtocol: Protocol };
+/** 自定义图标大小上限（data-URL 存进 config.json，过大会撑胖配置）。约 200KB 原图。 */
+const MAX_ICON_BYTES = 256 * 1024;
+
+type Draft = { id: string; name: string; defaultBaseUrl: string; defaultProtocol: Protocol; icon?: string };
 
 /** 厂商管理页（FR-002 扩展）：维护可在 Key 编辑器中选择的厂商预设 */
 export function VendorPage() {
@@ -21,6 +25,7 @@ export function VendorPage() {
   const [editing, setEditing] = useState<Draft | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     void loadVendors();
@@ -36,7 +41,20 @@ export function VendorPage() {
 
   const startEdit = (v: Vendor) => {
     setError(null);
-    setEditing({ id: v.id, name: v.name, defaultBaseUrl: v.defaultBaseUrl, defaultProtocol: v.defaultProtocol });
+    setEditing({ id: v.id, name: v.name, defaultBaseUrl: v.defaultBaseUrl, defaultProtocol: v.defaultProtocol, icon: v.icon });
+  };
+
+  // 选图标文件 → 校验大小 → 读为 data-URL 存进草稿（随厂商落 config.json）
+  const pickIcon = (file: File | undefined) => {
+    if (!editing || !file) return;
+    if (file.size > MAX_ICON_BYTES) {
+      setError(t("vendor.iconTooLarge", { max: "256KB" }));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => setEditing((cur) => (cur ? { ...cur, icon: String(reader.result) } : cur));
+    reader.onerror = () => setError(t("vendor.iconReadFailed"));
+    reader.readAsDataURL(file);
   };
 
   const slugify = (name: string) =>
@@ -65,6 +83,7 @@ export function VendorPage() {
         defaultBaseUrl: editing.defaultBaseUrl.trim(),
         defaultProtocol: editing.defaultProtocol,
         builtin: false,
+        icon: editing.icon,
       };
       await api.upsertVendor(vendor);
       await loadVendors();
@@ -107,6 +126,37 @@ export function VendorPage() {
         {editing && (
           <Card>
             <CardContent className="space-y-3 pt-5">
+              {/* 图标：自定义上传（可选）；不传走品牌图标启发式/首字母占位 */}
+              <div>
+                <label className="mb-1 block text-xs font-medium text-text-secondary">{t("vendor.icon")}</label>
+                <div className="flex items-center gap-3">
+                  <BrandIcon
+                    hint={editing.id || editing.name}
+                    fallbackLabel={editing.name || "?"}
+                    iconUrl={editing.icon}
+                    size={40}
+                  />
+                  <input
+                    ref={fileRef}
+                    type="file"
+                    accept="image/png,image/jpeg,image/svg+xml,image/webp"
+                    className="hidden"
+                    onChange={(e) => {
+                      pickIcon(e.target.files?.[0]);
+                      e.target.value = ""; // 允许重复选同一文件
+                    }}
+                  />
+                  <Button variant="secondary" size="sm" onClick={() => fileRef.current?.click()}>
+                    <ImagePlus size={14} /> {t("vendor.iconPick")}
+                  </Button>
+                  {editing.icon && (
+                    <Button variant="ghost" size="sm" onClick={() => setEditing({ ...editing, icon: undefined })}>
+                      <X size={14} /> {t("vendor.iconClear")}
+                    </Button>
+                  )}
+                </div>
+                <p className="mt-1 text-[11px] text-text-muted">{t("vendor.iconHint")}</p>
+              </div>
               <div>
                 <label className="mb-1 block text-xs font-medium text-text-secondary">{t("vendor.name")}</label>
                 <input
@@ -134,7 +184,8 @@ export function VendorPage() {
                   onChange={(e) => setEditing({ ...editing, defaultProtocol: e.target.value as Protocol })}
                 >
                   <option value="anthropic">Anthropic</option>
-                  <option value="openai">OpenAI</option>
+                  <option value="openai_chat">OpenAI Chat</option>
+                  <option value="openai_responses">OpenAI Responses</option>
                 </select>
               </div>
               {error && <p className="text-sm text-danger">{error}</p>}
@@ -187,6 +238,7 @@ function VendorRow({
   return (
     <Card>
       <CardContent className="flex items-center gap-3 py-3">
+        <BrandIcon hint={vendor.id || vendor.name} fallbackLabel={vendor.name} iconUrl={vendor.icon} size={32} />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <span className="truncate text-sm font-medium text-text-primary">{vendor.name}</span>
@@ -195,7 +247,7 @@ function VendorRow({
                 <Lock size={11} /> {t("vendor.builtin")}
               </Badge>
             ) : (
-              <Badge variant="info">{vendor.defaultProtocol === "openai" ? "OpenAI" : "Anthropic"}</Badge>
+              <Badge variant="info">{protocolLabel(vendor.defaultProtocol)}</Badge>
             )}
           </div>
           <p className="mt-0.5 truncate font-mono text-xs text-text-secondary">
@@ -204,7 +256,7 @@ function VendorRow({
         </div>
         {vendor.builtin ? (
           <span className="text-xs text-text-secondary" title={t("vendor.builtinLocked")}>
-            {vendor.defaultProtocol === "openai" ? "OpenAI" : "Anthropic"}
+            {protocolLabel(vendor.defaultProtocol)}
           </span>
         ) : (
           <div className="flex gap-1">

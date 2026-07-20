@@ -19,6 +19,30 @@ pub struct Store {
 /// 事件日志内存上限
 const MAX_EVENTS: usize = 500;
 
+/// 默认日志目录：安装目录（exe 同级）下的 `logs/`。
+/// 路径动态解析（current_exe），禁止硬编码（dev-hard-rules 规则2）。
+/// 若安装目录不可写（如装在 Program Files 需管理员权限），回退到 %APPDATA%\SynaRoute\logs。
+pub fn default_log_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let logs = dir.join("logs");
+            // 探测可写性：能创建目录即认为可写，用它
+            if std::fs::create_dir_all(&logs).is_ok() {
+                // 进一步验证真的能写入（Program Files 下 create_dir_all 可能因已存在而成功，但写入失败）
+                let probe = logs.join(".write-probe");
+                if std::fs::write(&probe, b"ok").is_ok() {
+                    let _ = std::fs::remove_file(&probe);
+                    return logs;
+                }
+            }
+        }
+    }
+    // 回退：%APPDATA%\SynaRoute\logs
+    dirs::data_dir()
+        .map(|d| d.join("SynaRoute").join("logs"))
+        .unwrap_or_else(|| PathBuf::from("logs"))
+}
+
 impl Store {
     /// 初始化：定位数据目录（%APPDATA%\SynaRoute），加载配置与密钥库。
     /// 路径全部动态解析，禁止硬编码（dev-hard-rules 规则2）。
@@ -44,6 +68,14 @@ impl Store {
             config.vendors = Vendor::builtin_seed();
         }
 
+        // 迁移：老配置的内置厂商没有 preset_models 字段（serde default 给空 vec），
+        // 从种子按 id 回填，让老用户也能用「一键导入预设模型」。仅补空、不覆盖用户已有数据。
+        let migrated = if !seeded {
+            Self::backfill_builtin_presets(&mut config.vendors)
+        } else {
+            false
+        };
+
         let secrets = SecretStore::load(secrets_path)?;
 
         let store = Self {
@@ -52,10 +84,29 @@ impl Store {
             secrets: RwLock::new(secrets),
             events: RwLock::new(Vec::new()),
         };
-        if seeded {
+        if seeded || migrated {
             store.persist()?;
         }
         Ok(store)
+    }
+
+    /// 为内置厂商回填预设模型（幂等）：仅当某内置厂商 preset_models 为空时，
+    /// 按 id 从种子拷贝。返回是否有改动（用于决定是否落盘）。自定义厂商不动。
+    fn backfill_builtin_presets(vendors: &mut [Vendor]) -> bool {
+        let seed = Vendor::builtin_seed();
+        let mut changed = false;
+        for v in vendors.iter_mut() {
+            if !v.builtin || !v.preset_models.is_empty() {
+                continue;
+            }
+            if let Some(s) = seed.iter().find(|s| s.id == v.id) {
+                if !s.preset_models.is_empty() {
+                    v.preset_models = s.preset_models.clone();
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     // ---- 事件日志（FR-020）----
@@ -102,10 +153,7 @@ impl Store {
         let settings = self.get_settings();
         let log_dir = match &settings.log_dir {
             Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
-            _ => match self.config_path.parent() {
-                Some(p) => p.join("logs"),
-                None => return,
-            },
+            _ => default_log_dir(),
         };
         if let Err(e) = std::fs::create_dir_all(&log_dir) {
             tracing::warn!("创建日志目录失败: {e}");
@@ -137,8 +185,14 @@ impl Store {
     }
 
     fn persist(&self) -> AppResult<()> {
-        let cfg = self.config.read();
-        let data = serde_json::to_vec_pretty(&*cfg)?;
+        // 仅在序列化期间持读锁；随后释放锁再做阻塞落盘。
+        // atomic_write 含进程级互斥 + 最长数百毫秒 sleep 重试，若持锁期间执行，会经
+        // parking_lot「写者优先」把后续所有读者（代理转发的 enabled_keys_sorted /
+        // secrets 读等）挡在等待的写者之后，阻塞 tokio worker 线程。
+        let data = {
+            let cfg = self.config.read();
+            serde_json::to_vec_pretty(&*cfg)?
+        };
         atomic_write(&self.config_path, &data)
     }
 
@@ -192,15 +246,27 @@ impl Store {
         self.persist()
     }
 
-    /// 更新某 Key 的健康状态（健康检查模块调用）
+    /// 更新某 Key 的健康状态（健康检查模块调用）。
+    /// 仅当「熔断相关」字段（status / fail_count / breaker_until）变化时才落盘——
+    /// last_checked / latency 每轮都变但无需持久化（内存态已更新，UI 走内存态实时展示），
+    /// 避免后台健康检查每轮对每个 Key 都整份重写 config.json，减少磁盘写与锁竞争。
     pub fn update_health(&self, key_id: &str, health: HealthState) -> AppResult<()> {
-        {
+        let changed = {
             let mut cfg = self.config.write();
             if let Some(k) = cfg.keys.iter_mut().find(|k| k.id == key_id) {
-                k.health = health;
+                let sig_changed = k.health.status != health.status
+                    || k.health.fail_count != health.fail_count
+                    || k.health.breaker_until != health.breaker_until;
+                k.health = health; // 始终更新内存态
+                sig_changed
+            } else {
+                false
             }
+        };
+        if changed {
+            self.persist()?;
         }
-        self.persist()
+        Ok(())
     }
 
     /// 更新某 Key 的模型列表（拉取模型后调用）
@@ -246,6 +312,10 @@ impl Store {
                 summarizer_ref: None,
                 decider_ref: None,
                 members: vec![],
+                work_dir: None,
+                max_context_tokens: 50_000,
+                retrieval_enabled: false,
+                auto_follow_active: false,
             })
     }
 
@@ -267,9 +337,13 @@ impl Store {
         self.config.read().settings.clone()
     }
 
-    pub fn save_settings(&self, settings: AppSettings) -> AppResult<()> {
+    pub fn save_settings(&self, mut settings: AppSettings) -> AppResult<()> {
         {
             let mut cfg = self.config.write();
+            // mcp_registered_categories 是后端自管字段：前端 saveSettings 不携带它（序列化为空 vec），
+            // 若直接覆盖会在每次切主题/语言时清空注册记录。故保留已有值，只由后端注册逻辑更新。
+            settings.mcp_registered_categories =
+                std::mem::take(&mut cfg.settings.mcp_registered_categories);
             cfg.settings = settings;
         }
         self.persist()
@@ -320,7 +394,7 @@ impl Store {
 
     /// 测试专用：在指定路径构造 Store，避免污染真实 %APPDATA% 配置。
     #[cfg(test)]
-    fn new_at(config_path: PathBuf, secrets_path: PathBuf) -> AppResult<Self> {
+    pub(crate) fn new_at(config_path: PathBuf, secrets_path: PathBuf) -> AppResult<Self> {
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -370,6 +444,10 @@ mod tests {
             params: KeyParams::default(),
             models: vec![],
             mappings: vec![],
+            default_model: None,
+            tier_haiku: None,
+            tier_sonnet: None,
+            tier_opus: None,
             health: HealthState::default(),
         }
     }
@@ -412,6 +490,61 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 迁移：老配置的内置厂商无 preset_models 时应从种子回填；自定义厂商与已有数据不动。
+    #[test]
+    fn backfill_builtin_presets_only_fills_empty_builtins() {
+        // 模拟老配置：内置 anthropic 预设为空，自定义厂商预设为空，另一内置厂商已有自定义预设
+        let mut vendors = vec![
+            Vendor {
+                id: "anthropic".into(),
+                name: "Anthropic".into(),
+                default_base_url: "https://api.anthropic.com".into(),
+                default_protocol: Protocol::Anthropic,
+                builtin: true,
+                icon: None,
+                preset_models: vec![], // 老配置：空 → 应被回填
+            },
+            Vendor {
+                id: "my-relay".into(),
+                name: "自定义中转".into(),
+                default_base_url: "https://relay.example.com".into(),
+                default_protocol: Protocol::Anthropic,
+                builtin: false,
+                icon: None,
+                preset_models: vec![], // 自定义 → 不动
+            },
+            Vendor {
+                id: "zhipu".into(),
+                name: "智谱 GLM".into(),
+                default_base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
+                default_protocol: Protocol::OpenaiChat,
+                builtin: true,
+                icon: None,
+                preset_models: vec![PresetModel {
+                    real_name: "glm-custom".into(),
+                    display_name: None,
+                    context_window: None,
+                }], // 已有数据 → 不覆盖
+            },
+        ];
+
+        let changed = Store::backfill_builtin_presets(&mut vendors);
+        assert!(changed, "至少 anthropic 被回填，应返回 true");
+
+        let anthropic = vendors.iter().find(|v| v.id == "anthropic").unwrap();
+        assert!(!anthropic.preset_models.is_empty(), "空的内置厂商应被回填");
+
+        let relay = vendors.iter().find(|v| v.id == "my-relay").unwrap();
+        assert!(relay.preset_models.is_empty(), "自定义厂商不应被回填");
+
+        let zhipu = vendors.iter().find(|v| v.id == "zhipu").unwrap();
+        assert_eq!(zhipu.preset_models.len(), 1, "已有预设的内置厂商不应被覆盖");
+        assert_eq!(zhipu.preset_models[0].real_name, "glm-custom");
+
+        // 幂等：再跑一次应无改动
+        assert!(!Store::backfill_builtin_presets(&mut vendors), "回填应幂等");
+    }
+
     /// 模拟后台健康检查线程与前端保存并发写盘：唯一临时名 + 重试应保证不丢、不损坏。
     #[test]
     fn concurrent_persist_is_consistent() {
@@ -447,6 +580,88 @@ mod tests {
         let parsed: AppConfig = serde_json::from_slice(&raw).expect("config.json 应为完整合法 JSON");
         assert_eq!(parsed.keys.len(), 1);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 编辑（upsert 已存 Key）：字段更新且落盘持久。
+    #[test]
+    fn edit_key_updates_fields_in_place() {
+        let dir = temp_dir("edit");
+        let cfg = dir.join("config.json");
+        let store = Store::new_at(cfg.clone(), dir.join("secrets.enc")).unwrap();
+
+        store.upsert_key(sample_key("k1", 5)).unwrap();
+        // 编辑：改名 + 改优先级 + 改 base_url
+        let mut edited = store.get_key("k1").unwrap();
+        edited.name = "改后的名字".into();
+        edited.priority = 0;
+        edited.base_url = "https://new.example.com".into();
+        store.upsert_key(edited).unwrap();
+
+        let got = store.get_key("k1").unwrap();
+        assert_eq!(got.name, "改后的名字");
+        assert_eq!(got.priority, 0);
+        assert_eq!(got.base_url, "https://new.example.com");
+        assert_eq!(store.list_keys(CategoryType::ClaudeCli).len(), 1, "编辑不应新增");
+
+        // 重载确认落盘
+        let reloaded = Store::new_at(cfg, dir.join("secrets.enc")).unwrap();
+        assert_eq!(reloaded.get_key("k1").unwrap().name, "改后的名字");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 路由候选选择：仅取「该分类 + 启用」的 Key，且按 priority 升序。
+    #[test]
+    fn enabled_keys_sorted_filters_and_orders() {
+        let dir = temp_dir("sorted");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        store.upsert_key(sample_key("high", 2)).unwrap();
+        store.upsert_key(sample_key("low", 0)).unwrap();
+        store.upsert_key(sample_key("mid", 1)).unwrap();
+        // 一个禁用的：不应出现在候选
+        let mut disabled = sample_key("off", 0);
+        disabled.enabled = false;
+        store.upsert_key(disabled).unwrap();
+
+        let sorted = store.enabled_keys_sorted(CategoryType::ClaudeCli);
+        let ids: Vec<&str> = sorted.iter().map(|k| k.id.as_str()).collect();
+        assert_eq!(ids, vec!["low", "mid", "high"], "应按 priority 升序且排除禁用");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 健康态无实质变化（仅 last_checked/latency 变）时 update_health 不重复落盘。
+    #[test]
+    fn update_health_skips_persist_when_unchanged() {
+        let dir = temp_dir("health_skip");
+        let cfg = dir.join("config.json");
+        let store = Store::new_at(cfg.clone(), dir.join("secrets.enc")).unwrap();
+        store.upsert_key(sample_key("k1", 0)).unwrap();
+
+        // 首次写 Up
+        store
+            .update_health("k1", HealthState { status: HealthStatus::Up, last_checked: Some(1), ..Default::default() })
+            .unwrap();
+        let mtime1 = std::fs::metadata(&cfg).unwrap().modified().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // 仅 last_checked/latency 变化（status/fail_count/breaker 不变）→ 不应重写文件
+        store
+            .update_health("k1", HealthState { status: HealthStatus::Up, last_checked: Some(999), latency_ms: Some(50), ..Default::default() })
+            .unwrap();
+        let mtime2 = std::fs::metadata(&cfg).unwrap().modified().unwrap();
+        assert_eq!(mtime1, mtime2, "健康态无实质变化不应重写 config.json");
+
+        // 内存态仍更新（UI 走内存）：last_checked 应是最新值
+        assert_eq!(store.get_key("k1").unwrap().health.last_checked, Some(999));
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // status 变化 → 应落盘
+        store
+            .update_health("k1", HealthState { status: HealthStatus::Down, fail_count: 1, ..Default::default() })
+            .unwrap();
+        let mtime3 = std::fs::metadata(&cfg).unwrap().modified().unwrap();
+        assert!(mtime3 > mtime2, "status 变化应重写 config.json");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

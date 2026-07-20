@@ -3,9 +3,10 @@ import { api } from "@/lib/bridge";
 import { useStore } from "@/store";
 import { useT } from "@/lib/useT";
 import { Button } from "@/components/ui/Button";
-import { Badge } from "@/components/ui/Badge";
+import { Combobox } from "@/components/ui/Combobox";
+import { BrandIcon } from "@/components/BrandIcon";
 import type { ModelInfo, ModelMapping, ProviderKey, Protocol } from "@/types";
-import { X, RefreshCw, Plus, Trash2, ArrowLeftRight, Eye, EyeOff } from "lucide-react";
+import { X, RefreshCw, Plus, Trash2, ArrowRight, Eye, EyeOff, Zap, Gauge, Brain, Download } from "lucide-react";
 
 interface KeyEditorProps {
   initial: ProviderKey | null; // null = 新增
@@ -29,6 +30,10 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
   const [maxTokens, setMaxTokens] = useState(initial?.params.maxTokens ?? 8192);
   const [models, setModels] = useState<ModelInfo[]>(initial?.models ?? []);
   const [mappings, setMappings] = useState<ModelMapping[]>(initial?.mappings ?? []);
+  const [defaultModel, setDefaultModel] = useState(initial?.defaultModel ?? "");
+  const [tierHaiku, setTierHaiku] = useState(initial?.tierHaiku ?? "");
+  const [tierSonnet, setTierSonnet] = useState(initial?.tierSonnet ?? "");
+  const [tierOpus, setTierOpus] = useState(initial?.tierOpus ?? "");
   const [fetching, setFetching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -76,16 +81,18 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
         hasSecret: initial?.hasSecret || secret.length > 0,
         enabled: initial?.enabled ?? false,
         priority: initial?.priority ?? 999,
-        params: { temperature, maxTokens },
+        params: { ...initial?.params, temperature, maxTokens },
         models,
         mappings,
+        defaultModel: defaultModel.trim() || undefined,
         health: initial?.health ?? { status: "unknown", failCount: 0 },
       };
       const fetched = await api.fetchModelsDraft(draft, secret || undefined);
       if (fetched.length === 0) {
         setError(t("editor.errNoModels"));
       } else {
-        setModels(fetched);
+        const oldCtx = new Map(models.map((m) => [m.realName, m.contextWindow]));
+        setModels(fetched.map((m) => ({ ...m, contextWindow: m.contextWindow ?? oldCtx.get(m.realName) })));
       }
     } catch (e) {
       setError(t("editor.errFetch", { err: String(e) }));
@@ -124,6 +131,16 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
   const addMapping = () =>
     setMappings([...mappings, { id: `m_${Date.now()}`, expectedName: "", realName: "" }]);
 
+  // 当前厂商的内置预设模型（用于「一键导入」补全空列表）
+  const presetModels = vendors.find((v) => v.id === vendor)?.presetModels ?? [];
+  const importPresetModels = () => {
+    const existing = new Set(models.map((m) => m.realName));
+    const added: ModelInfo[] = presetModels
+      .filter((p) => !existing.has(p.realName))
+      .map((p) => ({ realName: p.realName, source: "manual", contextWindow: p.contextWindow }));
+    if (added.length) setModels([...models, ...added]);
+  };
+
   const save = async () => {
     if (!name.trim()) return setError(t("editor.errNeedName"));
     if (!baseUrl.trim()) return setError(t("editor.errNeedBaseUrl2"));
@@ -138,9 +155,13 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
       hasSecret: initial?.hasSecret || secret.length > 0,
       enabled: initial?.enabled ?? false,
       priority: initial?.priority ?? 999,
-      params: { temperature, maxTokens },
+      params: { ...initial?.params, temperature, maxTokens },
       models,
       mappings: mappings.filter((m) => m.expectedName && m.realName),
+      defaultModel: defaultModel.trim() || undefined,
+      tierHaiku: tierHaiku.trim() || undefined,
+      tierSonnet: tierSonnet.trim() || undefined,
+      tierOpus: tierOpus.trim() || undefined,
       health: initial?.health ?? { status: "unknown", failCount: 0 },
     };
 
@@ -149,6 +170,12 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
     try {
       await api.upsertKey(key);
       if (secret) await api.saveSecret(key.id, secret);
+      // 保存成功后默认跑一次可用性检查并回写 health（探测失败不阻断保存，仅标记 health=down）
+      try {
+        await api.checkHealth(key.id);
+      } catch {
+        // 探测异常忽略：Key 已保存，后台定时健康检查仍会兜底刷新
+      }
       await loadCategory(activeCategory);
       onClose(); // 仅在成功后关闭
     } catch (e) {
@@ -161,11 +188,15 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end bg-black/30" onClick={onClose}>
-      <div
-        className="flex h-full w-[440px] flex-col bg-surface shadow-2xl"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <div
+      className="fixed inset-0 z-50 flex justify-end bg-black/30"
+      onMouseDown={(e) => {
+        // 仅当在遮罩上真正按下并松开（纯点击外部）才关闭，避免框内拖选文字松手落到遮罩误关
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="flex h-full w-[440px] flex-col bg-surface shadow-2xl">
+
         {/* 头 */}
         <div className="flex items-center justify-between border-b border-border px-5 py-4">
           <h2 className="text-base font-semibold text-text-primary">
@@ -178,23 +209,32 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
 
         {/* 表单体 */}
         <div className="flex-1 space-y-4 overflow-y-auto px-5 py-4">
+          {isNew && (
+            <div className="rounded-control bg-info/10 px-3 py-2 text-[11px] leading-relaxed text-text-secondary">
+              {t("editor.newKeyHint")}
+            </div>
+          )}
           <Field label={t("editor.name")}>
             <input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} placeholder={t("editor.namePlaceholder")} />
           </Field>
 
           <div className="flex gap-3">
             <Field label={t("editor.vendor")} className="flex-1">
-              <select className={inputCls} value={vendor} onChange={(e) => handleVendorChange(e.target.value)}>
-                {vendors.map((v) => (
-                  <option key={v.id} value={v.id}>{v.name}</option>
-                ))}
-                {vendorMissing && <option value={vendor}>{vendor}</option>}
-              </select>
+              <div className="flex items-center gap-2">
+                <BrandIcon hint={vendor} fallbackLabel={vendor} iconUrl={vendors.find((v) => v.id === vendor)?.icon} size={28} />
+                <select className={inputCls} value={vendor} onChange={(e) => handleVendorChange(e.target.value)}>
+                  {vendors.map((v) => (
+                    <option key={v.id} value={v.id}>{v.name}</option>
+                  ))}
+                  {vendorMissing && <option value={vendor}>{vendor}</option>}
+                </select>
+              </div>
             </Field>
-            <Field label={t("editor.protocol")} className="w-32">
+            <Field label={t("editor.protocol")} className="w-48">
               <select className={inputCls} value={protocol} onChange={(e) => setProtocol(e.target.value as Protocol)}>
                 <option value="anthropic">Anthropic</option>
-                <option value="openai">OpenAI</option>
+                <option value="openai_chat">OpenAI Chat</option>
+                <option value="openai_responses">OpenAI Responses</option>
               </select>
             </Field>
           </div>
@@ -266,23 +306,80 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
                 <Plus size={13} /> {t("common.add")}
               </Button>
             </div>
-            <div className="flex flex-wrap gap-1.5 rounded-control border border-border p-2">
+            {/* 上游不暴露 /v1/models 时，从当前厂商内置预设一键导入（参考 cc-switch 的 modelCatalog） */}
+            {presetModels.length > 0 && (
+              <div className="mb-1.5">
+                <Button size="sm" variant="ghost" onClick={importPresetModels}>
+                  <Download size={13} /> {t("editor.importPreset", { n: String(presetModels.length) })}
+                </Button>
+              </div>
+            )}
+            <div className="space-y-0.5 rounded-control border border-border p-2">
               {models.length === 0 ? (
                 <span className="text-xs text-text-muted">{t("editor.noModels")}</span>
               ) : (
                 models.map((m) => (
-                  <Badge key={m.realName} variant={m.source === "manual" ? "neutral" : "info"}>
-                    {m.realName}
+                  <div key={m.realName} className="flex items-center gap-2 rounded-control px-1 py-1 hover:bg-surface-hover">
+                    <BrandIcon hint={vendor === "custom" ? m.realName : vendor} fallbackLabel={m.realName} size={20} />
+                    <span className={`flex-1 truncate font-mono text-xs ${m.source === "manual" ? "text-text-secondary" : "text-text-primary"}`}>
+                      {m.realName}
+                    </span>
+                    <input
+                      type="number"
+                      className="h-7 w-24 rounded-control border border-border bg-bg px-2 text-xs text-text-primary placeholder:text-text-muted"
+                      placeholder={t("editor.contextWindowPlaceholder")}
+                      value={m.contextWindow ?? ""}
+                      onChange={(e) => {
+                        const val = e.target.value ? Number(e.target.value) : undefined;
+                        setModels(models.map((x) => x.realName === m.realName ? { ...x, contextWindow: val } : x));
+                      }}
+                      title={t("editor.contextWindow")}
+                    />
                     <button
                       onClick={() => setModels(models.filter((x) => x.realName !== m.realName))}
-                      className="ml-1 rounded hover:text-danger"
+                      className="shrink-0 rounded p-1 text-text-muted hover:text-danger"
                       title={t("common.remove")}
                     >
-                      <X size={10} />
+                      <X size={12} />
                     </button>
-                  </Badge>
+                  </div>
                 ))
               )}
+            </div>
+          </div>
+
+          {/* 三档快捷映射（取自 cc-switch 的 haiku/sonnet/opus 语义，落到运行时代理） */}
+          <div>
+            <div className="mb-1.5">
+              <span className="text-xs font-medium text-text-secondary">{t("editor.tierTitle")}</span>
+              <p className="mt-0.5 text-[11px] leading-relaxed text-text-muted">{t("editor.tierHint")}</p>
+            </div>
+            <div className="space-y-1.5">
+              {([
+                { icon: Zap, label: t("editor.tierHaiku"), value: tierHaiku, set: setTierHaiku, ph: "glm-4.5-air" },
+                { icon: Gauge, label: t("editor.tierSonnet"), value: tierSonnet, set: setTierSonnet, ph: "glm-4.6" },
+                { icon: Brain, label: t("editor.tierOpus"), value: tierOpus, set: setTierOpus, ph: "deepseek-reasoner" },
+              ] as const).map((tier) => {
+                const Icon = tier.icon;
+                return (
+                  <div key={tier.label} className="flex items-center gap-1.5">
+                    <span className="flex w-24 shrink-0 items-center gap-1 text-xs text-text-secondary">
+                      <Icon size={13} className="text-text-muted" /> {tier.label}
+                    </span>
+                    <ArrowRight size={14} className="shrink-0 text-text-muted" />
+                    <div className="flex-1">
+                      <Combobox
+                        className={`${inputCls} font-mono`}
+                        value={tier.value}
+                        options={models.map((mm) => mm.realName)}
+                        placeholder={tier.ph}
+                        emptyHint={t("editor.comboNoModels")}
+                        onChange={tier.set}
+                      />
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
 
@@ -300,24 +397,28 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
               )}
               {mappings.map((m, i) => (
                 <div key={m.id} className="flex items-center gap-1.5">
+                  <div className="flex-1">
+                    <Combobox
+                      className={`${inputCls} font-mono`}
+                      value={m.realName}
+                      options={models.map((mm) => mm.realName)}
+                      placeholder="GLM5.1"
+                      emptyHint={t("editor.comboNoModels")}
+                      onChange={(val) => {
+                        const next = [...mappings];
+                        next[i] = { ...m, realName: val };
+                        setMappings(next);
+                      }}
+                    />
+                  </div>
+                  <ArrowRight size={14} className="shrink-0 text-text-muted" />
                   <input
-                    className={`${inputCls} font-mono`}
+                    className={`${inputCls} flex-1 font-mono`}
                     placeholder="opus-4-7"
                     value={m.expectedName}
                     onChange={(e) => {
                       const next = [...mappings];
                       next[i] = { ...m, expectedName: e.target.value };
-                      setMappings(next);
-                    }}
-                  />
-                  <ArrowLeftRight size={14} className="shrink-0 text-text-muted" />
-                  <input
-                    className={`${inputCls} font-mono`}
-                    placeholder="GLM5.1"
-                    value={m.realName}
-                    onChange={(e) => {
-                      const next = [...mappings];
-                      next[i] = { ...m, realName: e.target.value };
                       setMappings(next);
                     }}
                   />
@@ -331,6 +432,19 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
               ))}
             </div>
           </div>
+
+          {/* 默认兜底模型（选填）：故障转移到本 Key 时，请求模型既无映射、本 Key 又不支持，则改用它。 */}
+          <Field label={t("editor.defaultModel")}>
+            <Combobox
+              className={`${inputCls} font-mono`}
+              value={defaultModel}
+              options={models.map((m) => m.realName)}
+              placeholder={t("editor.defaultModelPlaceholder")}
+              emptyHint={t("editor.comboNoModels")}
+              onChange={setDefaultModel}
+            />
+            <p className="mt-1 text-[11px] leading-relaxed text-text-muted">{t("editor.defaultModelHint")}</p>
+          </Field>
 
           {error && <div className="rounded-control bg-danger/10 px-3 py-2 text-xs text-danger">{error}</div>}
         </div>

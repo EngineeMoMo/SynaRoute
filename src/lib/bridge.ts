@@ -3,13 +3,17 @@
 // 中降级到 mock 数据，使前端可独立展示，不阻塞于 Rust 编译。
 
 import type {
+  AggregateResult,
   AppSettings,
   BrainConfig,
   CategoryType,
   EventLogEntry,
+  McpStatus,
   ModelInfo,
   ProviderKey,
   ProxyState,
+  RecentWorkdir,
+  RetrievedFile,
   Vendor,
 } from "@/types";
 import { mockBridge } from "./mockData";
@@ -123,4 +127,47 @@ export const api = {
 
   deleteVendor: (vendorId: string) =>
     call<void>("delete_vendor", { vendorId }, () => mockBridge.deleteVendor(vendorId)),
+
+  // ---- 大脑聚合 V2（文件检索 + 两阶段决策） ----
+  runAggregatePlan: (categoryId: CategoryType, prompt: string) =>
+    call<AggregateResult>("aggregate_plan", { categoryId, prompt }, async () => ({
+      resultType: "plan" as const,
+      content: "Mock: 修改 src/main.ts 第 10 行...",
+    })),
+
+  runAggregateExecute: (
+    categoryId: CategoryType,
+    prompt: string,
+    confirmedPlan: string,
+    workDir?: string,
+  ) =>
+    call<AggregateResult>(
+      "aggregate_execute",
+      { categoryId, prompt, confirmedPlan, workDir },
+      async () => ({
+        resultType: "applied" as const,
+        content: "已修改 src/main.ts",
+        filesModified: ["src/main.ts"],
+      }),
+    ),
+
+  retrieveFiles: (workDir: string, query: string) =>
+    call<RetrievedFile[]>("retrieve_files", { workDir, query }, async () => []),
+
+  // ---- 最近工作目录（从 Claude CLI / Codex 会话中检测） ----
+  detectRecentWorkdirs: () =>
+    call<RecentWorkdir[]>("detect_recent_workdirs", undefined, async () => []),
+
+  // ---- MCP 服务器 ----
+  mcpStatus: () =>
+    call<McpStatus>("mcp_status", undefined, async () => ({ running: false })),
+
+  // 启用/停用 MCP，并自动注册到「当前活跃分类」对应工具的客户端配置（重启客户端即用）。
+  // 返回启动后的实际状态（含可能因占用而 fallback 的真实端口）。
+  setMcpEnabled: (categoryId: CategoryType, enabled: boolean, port: number) =>
+    call<McpStatus>(
+      "set_mcp_enabled",
+      { categoryId, enabled, port },
+      async () => ({ running: enabled, port }),
+    ),
 };

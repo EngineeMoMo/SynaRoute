@@ -4,16 +4,18 @@ import { Badge } from "@/components/ui/Badge";
 import { Switch } from "@/components/ui/Switch";
 import { Button } from "@/components/ui/Button";
 import { HealthBadge } from "@/components/HealthBadge";
-import type { ProviderKey } from "@/types";
+import { BrandIcon } from "@/components/BrandIcon";
+import { type ProviderKey, protocolLabel } from "@/types";
 import { useStore } from "@/store";
 import { formatRelativeTime } from "@/lib/utils";
 import { useT } from "@/lib/useT";
-import { GripVertical, RefreshCw, Pencil, Trash2, ArrowLeftRight } from "lucide-react";
+import { GripVertical, RefreshCw, Pencil, Trash2, ArrowRight } from "lucide-react";
 
 /** 单个厂商 Key 卡片（FR-001/003/006/010/011） */
 export function KeyCard({ k, onEdit }: { k: ProviderKey; onEdit: (k: ProviderKey) => void }) {
-  const { toggleKey, deleteKey, checkHealth } = useStore();
+  const { toggleKey, deleteKey, checkHealth, vendors } = useStore();
   const t = useT();
+  const vendorIcon = vendors.find((v) => v.id === k.vendor)?.icon;
   // 就地二次确认：不用原生 confirm()（在 Tauri WebView2 里行为不可靠，会导致删除不触发）
   const [confirmingDelete, setConfirmingDelete] = React.useState(false);
 
@@ -27,6 +29,8 @@ export function KeyCard({ k, onEdit }: { k: ProviderKey; onEdit: (k: ProviderKey
         >
           <GripVertical size={16} />
         </button>
+
+        <BrandIcon hint={k.vendor} fallbackLabel={k.name} iconUrl={vendorIcon} size={28} className="mt-0.5" />
 
         <div className="min-w-0 flex-1">
           {/* 标题行 */}
@@ -42,7 +46,7 @@ export function KeyCard({ k, onEdit }: { k: ProviderKey; onEdit: (k: ProviderKey
           <div className="mt-1 truncate font-mono text-xs text-text-secondary">
             {k.baseUrl}
             <span className="ml-2 text-text-muted">
-              · {k.protocol === "anthropic" ? "Anthropic" : "OpenAI"} {t("key.protocolSuffix")}
+              · {protocolLabel(k.protocol)} {t("key.protocolSuffix")}
             </span>
           </div>
 
@@ -51,8 +55,7 @@ export function KeyCard({ k, onEdit }: { k: ProviderKey; onEdit: (k: ProviderKey
             {k.mappings.length > 0 ? (
               k.mappings.map((m) => (
                 <Badge key={m.id} variant="info" title={t("key.mappingTitle")}>
-                  <ArrowLeftRight size={10} />
-                  {m.expectedName} ← {m.realName}
+                  {m.realName} <ArrowRight size={10} /> {m.expectedName}
                 </Badge>
               ))
             ) : (
@@ -69,7 +72,13 @@ export function KeyCard({ k, onEdit }: { k: ProviderKey; onEdit: (k: ProviderKey
 
           <div className="mt-2 text-[11px] text-text-muted">
             {t("key.healthCheckLabel", { time: formatRelativeTime(k.health.lastChecked) })}
-            {k.health.latencyMs != null && ` · ${k.health.latencyMs}ms`}
+            {k.health.latencyMs != null &&
+              (k.health.status === "down" ? (
+                // 探测失败时这个延迟只是「失败前的往返耗时」，标红并注明，避免被读成探测成功。
+                <span className="text-danger">{` · ${k.health.latencyMs}ms · ${t("key.healthProbeFailed")}`}</span>
+              ) : (
+                ` · ${k.health.latencyMs}ms`
+              ))}
           </div>
         </div>
 
