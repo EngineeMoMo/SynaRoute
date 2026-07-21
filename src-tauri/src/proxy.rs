@@ -470,9 +470,10 @@ fn discoverable_models(candidates: &[ProviderKey]) -> Vec<String> {
 /// - Claude CLI / 桌面端（Anthropic）：`{"data":[{"type":"model","id":..,"display_name":..}],"has_more":false}`
 /// - Codex（OpenAI）：`{"object":"list","data":[{"id":..,"object":"model","owned_by":"synaroute"}]}`
 fn handle_list_models(store: &Arc<Store>, category: CategoryType) -> Response<ResBody> {
-    // 与路由一致：全被熔断时忽略熔断兜底，避免 /model 因熔断变空列表、CLI 选不到模型。
-    let (candidates, _) = health::select_candidates(store.enabled_keys_sorted(category));
-    let models = discoverable_models(&candidates);
+    // 模型发现不受健康态影响：只要 Key 启用，就应在 /model 选择器里列出它能服务的模型名。
+    // 健康/熔断只决定「实际路由到哪个 Key」，不该决定「能选哪些模型」——否则单 Key 被真实探测
+    // 判 Down 后 /model 会空掉，用户连模型都选不了（此前用 select_candidates 过滤导致的 bug）。
+    let models = discoverable_models(&store.enabled_keys_sorted(category));
 
     // 分类固定了下游协议形态：Codex 用 OpenAI，Claude CLI/桌面端用 Anthropic。
     let body = if matches!(category, CategoryType::Codex) {
@@ -1085,6 +1086,45 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["opus-4-8"], "应只返回共有的 opus-4-8");
         assert_eq!(body["data"][0]["type"], "model", "Anthropic 形态");
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn proxy_v1_models_lists_even_when_key_is_down() {
+        // 回归：真实探测把单 Key 判 Down 后，/model 仍应列出它能服务的模型名。
+        // 模型发现不受健康态影响——健康只决定路由，不决定「能选哪些模型」。
+        let dir = temp_dir("listmodels-down");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let mut k = key("k1", 0, "http://x");
+        k.mappings = vec![mapping("opus-4-8", "glm-5.2")];
+        k.models = vec![model_info("glm-5.2")];
+        // 关键：把该 Key 置为 Down（模拟真实探测失败判死）。
+        k.health = HealthState {
+            status: crate::model::HealthStatus::Down,
+            fail_count: 3,
+            ..Default::default()
+        };
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let ids: Vec<String> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["opus-4-8", "glm-5.2"], "Down 的 Key 也应列出其模型");
         pm.stop(CategoryType::ClaudeCli);
         std::fs::remove_dir_all(&dir).ok();
     }
