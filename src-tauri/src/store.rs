@@ -239,6 +239,11 @@ impl Store {
             let mut cfg = self.config.write();
             if let Some(k) = cfg.keys.iter_mut().find(|k| k.id == key_id) {
                 k.enabled = enabled;
+                // 禁用时清空健康状态：否则遗留的 Down/熔断会一直显示「不可用」，
+                // 而禁用的 Key 已不再被探测、无从自愈。重置为 Unknown，重新启用后再探测。
+                if !enabled {
+                    k.health = HealthState::default();
+                }
             } else {
                 return Err(AppError::NotFound(key_id.into()));
             }
@@ -627,6 +632,33 @@ mod tests {
         let sorted = store.enabled_keys_sorted(CategoryType::ClaudeCli);
         let ids: Vec<&str> = sorted.iter().map(|k| k.id.as_str()).collect();
         assert_eq!(ids, vec!["low", "mid", "high"], "应按 priority 升序且排除禁用");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 禁用 Key 时应清空遗留的 Down/熔断状态，避免界面一直显示「不可用」。
+    #[test]
+    fn disabling_key_clears_stale_health() {
+        let dir = temp_dir("toggle_health");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        store.upsert_key(sample_key("k1", 0)).unwrap();
+        // 先把它探成 Down + 熔断。
+        store
+            .update_health(
+                "k1",
+                HealthState {
+                    status: HealthStatus::Down,
+                    fail_count: 3,
+                    breaker_until: Some(9_999_999_999_999),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // 禁用 → 健康态应被重置为默认（Unknown、无熔断）。
+        store.toggle_key("k1", false).unwrap();
+        let h = store.get_key("k1").unwrap().health;
+        assert_eq!(h.status, HealthStatus::Unknown, "禁用后不应残留 Down");
+        assert_eq!(h.fail_count, 0);
+        assert!(h.breaker_until.is_none(), "禁用后不应残留熔断窗口");
         std::fs::remove_dir_all(&dir).ok();
     }
 

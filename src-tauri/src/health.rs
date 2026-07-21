@@ -199,9 +199,11 @@ pub fn select_candidates(keys: Vec<crate::model::ProviderKey>) -> (Vec<crate::mo
     (fallback, used_fallback)
 }
 
-/// 后台定时全量健康检查（对某分类所有 Key）。
+/// 后台定时健康检查（对某分类**已启用**的 Key）。
+/// 只探测启用的 Key：禁用的 Key 不参与路由，对它探测既白耗额度，又会因失败被判 Down/熔断，
+/// 在界面上留下无意义的「熔断中/不可用」状态污染。
 pub async fn check_category(store: &Arc<Store>, category: crate::model::CategoryType) {
-    let keys = store.list_keys(category);
+    let keys = store.enabled_keys_sorted(category);
     for k in keys {
         check_one(store, &k.id).await;
     }
