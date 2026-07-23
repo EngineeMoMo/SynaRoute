@@ -282,6 +282,7 @@ let settings: AppSettings = {
   masterPasswordEnabled: false,
   lanExposure: false,
   requestLogEnabled: false,
+  aggregateTraceEnabled: false,
   healthCheckIntervalSecs: 60,
   mcpEnabled: false,
   mcpPort: 9527,

@@ -201,7 +201,15 @@ async fn apply_tool_config(
     // 确保代理已启动
     let port = state.proxy.start(category_id).await?;
     let endpoint = format!("http://127.0.0.1:{port}");
-    let msg = tools::apply(category_id, &endpoint)?;
+    // 默认模型（供 Codex 写顶层 model 字段，借鉴 cc-switch）：取该分类首个启用 Key 的
+    // 首个可服务模型（对外名，代理侧 resolve_model 会改写为上游真实名）。取不出则为 None，
+    // apply 不动用户已有 model 字段。仅 Codex 端用到；其余端忽略此参数。
+    let default_model = state
+        .store
+        .enabled_keys_sorted(category_id)
+        .first()
+        .and_then(|k| k.serviceable_models().into_iter().next());
+    let msg = tools::apply(category_id, &endpoint, default_model.as_deref())?;
     state
         .store
         .append_event(category_id, "config", None, &format!("写入工具配置: {endpoint}"));

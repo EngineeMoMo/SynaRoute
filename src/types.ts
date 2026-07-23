@@ -212,6 +212,7 @@ export interface AppSettings {
   mcpPort?: number; // MCP 服务器端口（默认 9527，占用时自动向上找空闲端口）
   upstreamRetryEnabled?: boolean; // 上游临时错误（502/503/504/429/连接失败）自动重试（默认开）
   healthProbeRealCompletion?: boolean; // 健康探测用真实补全请求（默认关，消耗少量额度）
+  aggregateTraceEnabled?: boolean; // 大脑聚合详细快照：开启后落盘成员答案/汇总/决策者入参出参（默认关，避免大 IO）
 }
 
 /** MCP 服务器运行状态（供设置页展示连接指示灯与故障原因） */

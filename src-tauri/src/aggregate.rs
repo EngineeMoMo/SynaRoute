@@ -9,7 +9,10 @@
 //!    - Phase2: 用户确认后执行修改（apply）
 
 use crate::error::{AppError, AppResult};
-use crate::model::{AggregateMode, AggregateResult, AppliedChange, BrainConfig, CategoryType};
+use crate::model::{
+    AggregateMode, AggregateResult, AppliedChange, BrainConfig, CategoryType, Protocol,
+    RequestTrace,
+};
 use crate::retrieval;
 use crate::store::Store;
 use crate::upstream;
@@ -17,9 +20,59 @@ use futures_util::future::join_all;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
 
+/// 聚合日志里请求/响应体的最大字符数（与调用模型日志同量级，防超大 prompt 撑爆内存日志）。
+const AGG_LOG_CAP: usize = 20_000;
+
+/// 截断超长文本，附省略提示（成员答案/汇总产物/决策者入参出参落日志用）。
+fn cap_text(s: &str) -> String {
+    if s.chars().count() <= AGG_LOG_CAP {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(AGG_LOG_CAP).collect();
+        format!("{head}\n…（已截断，共 {} 字符）", s.chars().count())
+    }
+}
+
+/// 为「keyId::model 引用」的一次聚合调用构造链路快照（汇总者/决策者/降级独答用）。
+/// 让用户在运行日志里展开看到：这一步喂给模型的完整入参 + 模型的完整回答。
+fn trace_for_ref(
+    store: &Arc<Store>,
+    reference: &str,
+    prompt: &str,
+    output: &str,
+    latency_ms: u64,
+    ok: bool,
+) -> Option<RequestTrace> {
+    let (key_id, model) = reference.split_once("::")?;
+    let key = store.get_key(key_id)?;
+    Some(RequestTrace {
+        key_name: key.name,
+        vendor: key.vendor,
+        protocol: key.protocol,
+        url: key.base_url,
+        requested_model: model.to_string(),
+        real_model: model.to_string(),
+        request_body: cap_text(prompt),
+        response_body: cap_text(output),
+        status: None,
+        latency_ms,
+        ok,
+    })
+}
+
 struct MemberAnswer {
     label: String,
     answer: String,
+}
+
+/// 成员一次实际调用的元信息（构造日志 trace 用）。
+struct MemberCallMeta {
+    key_name: String,
+    vendor: String,
+    protocol: Protocol,
+    base_url: String,
+    model: String,
+    latency_ms: u64,
 }
 
 /// gather_members 的结果：成功答案 + 统计（供结果面板展示「N 参与 / M 失败」）。
@@ -88,7 +141,7 @@ pub async fn run_plan(
                 .summarizer_ref
                 .clone()
                 .unwrap_or_else(|| decider_ref.clone());
-            match compress(store, &summarizer_ref, answers, brain.total_timeout_ms).await {
+            match compress(store, category, &summarizer_ref, answers, brain.total_timeout_ms).await {
                 Ok(s) => s,
                 // 压缩失败（summarizer Key 限流/余额/被删）不作废已成功的成员回答，
                 // 降级为全量拼接，避免整轮聚合白跑。
@@ -380,16 +433,8 @@ pub async fn run_mcp(
                     answers.len()
                 ),
             );
-            match compress(store, &summarizer_ref, answers, brain.total_timeout_ms).await {
-                Ok(s) => {
-                    store.append_event(
-                        category,
-                        "aggregate",
-                        None,
-                        &format!("汇总成功 · {}", label_ref(store, &summarizer_ref)),
-                    );
-                    s
-                }
+            match compress(store, category, &summarizer_ref, answers, brain.total_timeout_ms).await {
+                Ok(s) => s,
                 // 压缩失败（summarizer Key 限流/余额/被删）不作废已成功的成员回答，
                 // 降级为全量拼接，避免整轮聚合白跑。
                 Err(e) => {
@@ -443,13 +488,19 @@ pub async fn run_mcp(
             format!("## 相关文件\n{}\n\n", file_context)
         }
     );
+    let decider_started = std::time::Instant::now();
     let analysis = match call_ref(store, &decider_ref, &decider_prompt, brain.total_timeout_ms).await {
         Ok(a) => {
-            store.append_event(
+            let latency = decider_started.elapsed().as_millis() as u64;
+            // 带 trace：展开可见「喂给决策者的完整入参（原问题+聚合意见+文件）+ 决策者最终答案」。
+            store.append_event_trace(
                 category,
                 "aggregate",
                 None,
-                &format!("决策者返回 · {}", label_ref(store, &decider_ref)),
+                &format!("决策者返回 · {} · {latency}ms", label_ref(store, &decider_ref)),
+                store.get_settings().aggregate_trace_enabled
+                    .then(|| trace_for_ref(store, &decider_ref, &decider_prompt, &a, latency, true))
+                    .flatten(),
             );
             a
         }
@@ -457,7 +508,9 @@ pub async fn run_mcp(
         // 用户等了数十秒的多专家意见不能因决策者一句错就整轮丢失。降级：把已聚合的
         // 成员答案作为最终返回，并在正文头部明确标注决策者失败原因，让用户看到中间产物。
         Err(e) => {
-            store.append_event(
+            let latency = decider_started.elapsed().as_millis() as u64;
+            // 失败也带 trace：展开可见喂给决策者的完整入参 + 失败原因，便于排障。
+            store.append_event_trace(
                 category,
                 "aggregate",
                 None,
@@ -465,6 +518,9 @@ pub async fn run_mcp(
                     "决策者失败 · {} · {e} · 降级为「返回已聚合成员意见」",
                     label_ref(store, &decider_ref)
                 ),
+                store.get_settings().aggregate_trace_enabled
+                    .then(|| trace_for_ref(store, &decider_ref, &decider_prompt, &e.to_string(), latency, false))
+                    .flatten(),
             );
             format!(
                 "> ⚠️ 决策者 `{}` 未能完成综合分析：{e}\n> 以下是已成功获取的 {} 位专家意见，供你参考：\n\n{}",
@@ -535,9 +591,10 @@ fn build_solo_decider_prompt(prompt: &str, file_context: &str) -> String {
 
 /// 单个成员任务的结果：成功带答案，失败带原因（用于落日志）。
 enum MemberOutcome {
-    Ok(MemberAnswer),
-    /// 调用失败：label + 具体原因（超时 / HTTP / 连接 / 空答案）。
-    Failed { label: String, reason: String },
+    /// 成功：答案 + 调用元信息（供日志 trace 展示完整入参/出参）。
+    Ok(MemberAnswer, MemberCallMeta),
+    /// 调用失败：label + 具体原因（超时 / HTTP / 连接 / 空答案）；meta 供 trace。
+    Failed { label: String, reason: String, meta: Option<MemberCallMeta> },
     /// 被禁用而跳过（不计失败）。
     SkippedDisabled,
     /// 无密钥 / 熔断 / Key 不存在等前置不可用（计入失败，附原因）。
@@ -551,7 +608,11 @@ async fn gather_members(
     prompt: &str,
 ) -> GatherOutcome {
     let total_timeout = Duration::from_millis(brain.total_timeout_ms);
-    let retry = store.get_settings().upstream_retry_enabled;
+    let settings = store.get_settings();
+    let retry = settings.upstream_retry_enabled;
+    // 重型 trace（成员完整入参/答案，可达数十万字符）受开关控制，默认关，避免每轮聚合都写盘增大磁盘 IO。
+    // 状态行（成功/失败/耗时）始终保留——轻量且排障必需。
+    let trace_enabled = settings.aggregate_trace_enabled;
     let sem = Arc::new(tokio::sync::Semaphore::new(
         brain.concurrency_limit.max(1) as usize,
     ));
@@ -610,23 +671,36 @@ async fn gather_members(
             // 非流式长回答必然被掐死、重试 3 次 ≈ 91s 全灭）；外层 tokio timeout 先到点，
             // 报出干净的「超时（>Xms）」而非 reqwest 的晦涩错误。
             let req_timeout = Duration::from_millis(brain.total_timeout_ms.saturating_add(5_000));
+            let started = std::time::Instant::now();
+            let mk_meta = |latency_ms: u64| MemberCallMeta {
+                key_name: key.name.clone(),
+                vendor: key.vendor.clone(),
+                protocol: key.protocol,
+                base_url: key.base_url.clone(),
+                model: model.clone(),
+                latency_ms,
+            };
             let call = upstream::text_completion(&key, &secret, &model, &prompt, max_tokens, retry, req_timeout);
             match timeout(total_timeout, call).await {
                 Ok(Ok(ans)) if !ans.trim().is_empty() => {
-                    MemberOutcome::Ok(MemberAnswer { label, answer: ans })
+                    let meta = mk_meta(started.elapsed().as_millis() as u64);
+                    MemberOutcome::Ok(MemberAnswer { label, answer: ans }, meta)
                 }
                 Ok(Ok(_)) => MemberOutcome::Failed {
                     label,
                     reason: "返回空答案".into(),
+                    meta: Some(mk_meta(started.elapsed().as_millis() as u64)),
                 },
                 Ok(Err(e)) => MemberOutcome::Failed {
                     label,
                     // upstream 错误已含 HTTP 状态码 / 连接失败详情。
                     reason: format!("调用失败：{e}"),
+                    meta: Some(mk_meta(started.elapsed().as_millis() as u64)),
                 },
                 Err(_) => MemberOutcome::Failed {
                     label,
                     reason: format!("超时（>{}ms）", brain.total_timeout_ms),
+                    meta: Some(mk_meta(started.elapsed().as_millis() as u64)),
                 },
             }
         }
@@ -640,25 +714,54 @@ async fn gather_members(
     let mut skipped_disabled = 0usize;
     for o in outcomes {
         match o {
-            MemberOutcome::Ok(ans) => {
+            MemberOutcome::Ok(ans, meta) => {
                 attempted += 1;
-                store.append_event(
+                // 带 trace：展开可见「喂给该成员的完整 prompt + 成员的完整答案」。受开关控制。
+                let trace = trace_enabled.then(|| RequestTrace {
+                    key_name: meta.key_name,
+                    vendor: meta.vendor,
+                    protocol: meta.protocol,
+                    url: meta.base_url,
+                    requested_model: meta.model.clone(),
+                    real_model: meta.model,
+                    request_body: cap_text(&prompt),
+                    response_body: cap_text(&ans.answer),
+                    status: None,
+                    latency_ms: meta.latency_ms,
+                    ok: true,
+                });
+                store.append_event_trace(
                     category,
                     "aggregate",
                     None,
-                    &format!("参与者成功 · {}", ans.label),
+                    &format!("参与者成功 · {} · {}ms", ans.label, meta.latency_ms),
+                    trace,
                 );
                 answers.push(ans);
             }
-            MemberOutcome::Failed { label, reason } => {
+            MemberOutcome::Failed { label, reason, meta } => {
                 attempted += 1;
                 failed += 1;
-                // 失败原因落日志（归「大脑聚合」分组），不再静默吞。
-                store.append_event(
+                // 失败原因落日志（归「大脑聚合」分组），不再静默吞；带 trace 供展开看入参。受开关控制。
+                let trace = meta.filter(|_| trace_enabled).map(|m| RequestTrace {
+                    key_name: m.key_name,
+                    vendor: m.vendor,
+                    protocol: m.protocol,
+                    url: m.base_url,
+                    requested_model: m.model.clone(),
+                    real_model: m.model,
+                    request_body: cap_text(&prompt),
+                    response_body: cap_text(&reason),
+                    status: None,
+                    latency_ms: m.latency_ms,
+                    ok: false,
+                });
+                store.append_event_trace(
                     category,
                     "aggregate",
                     None,
                     &format!("参与者失败 · {label} · {reason}"),
+                    trace,
                 );
             }
             MemberOutcome::Unavailable { label, reason } => {
@@ -686,6 +789,7 @@ async fn gather_members(
 
 async fn compress(
     store: &Arc<Store>,
+    category: CategoryType,
     summarizer_ref: &str,
     answers: &[MemberAnswer],
     budget_ms: u64,
@@ -703,7 +807,23 @@ async fn compress(
         "以下是多位专家顾问对同一个问题的分析和建议。\n\
          请提炼各位的关键要点、共识与分歧，压缩成简洁的要点清单，供最终决策参考。\n\n{joined}"
     );
-    call_ref(store, summarizer_ref, &sum_prompt, budget_ms).await
+    let started = std::time::Instant::now();
+    let result = call_ref(store, summarizer_ref, &sum_prompt, budget_ms).await?;
+    let latency = started.elapsed().as_millis() as u64;
+    // 带 trace：展开可见「喂给汇总者的全部成员答案 + 压缩后的要点清单」。受开关控制。
+    let trace = if store.get_settings().aggregate_trace_enabled {
+        trace_for_ref(store, summarizer_ref, &sum_prompt, &result, latency, true)
+    } else {
+        None
+    };
+    store.append_event_trace(
+        category,
+        "aggregate",
+        None,
+        &format!("汇总成功 · {} · {latency}ms", label_ref(store, summarizer_ref)),
+        trace,
+    );
+    Ok(result)
 }
 
 fn build_full_context(answers: &[MemberAnswer]) -> String {

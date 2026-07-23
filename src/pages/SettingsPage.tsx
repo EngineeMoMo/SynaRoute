@@ -9,7 +9,7 @@ import { LANGS } from "@/lib/i18n";
 import type { AppSettings, McpStatus, ThemePref } from "@/types";
 import {
   Sun, Moon, Monitor, ShieldCheck, KeyRound, Languages, ScrollText,
-  Activity, RefreshCw, FolderOpen, Info, Plug, BookOpen, Copy, Check, X, type LucideIcon,
+  Activity, RefreshCw, FolderOpen, Info, Plug, BookOpen, Copy, Check, X, Brain, type LucideIcon,
 } from "lucide-react";
 
 /** 设置页（主题 / 语言 / 自启 / 加密方式 / 局域网暴露 / 版本更新 / 日志路径） */
@@ -355,6 +355,13 @@ export function SettingsPage() {
               desc={t("settings.realProbeDesc")}
               checked={settings?.healthProbeRealCompletion ?? false}
               onChange={(v) => update({ healthProbeRealCompletion: v })}
+            />
+            <ToggleRow
+              icon={Brain}
+              title={t("settings.aggTraceTitle")}
+              desc={t("settings.aggTraceDesc")}
+              checked={settings?.aggregateTraceEnabled ?? false}
+              onChange={(v) => update({ aggregateTraceEnabled: v })}
             />
           </CardContent>
         </Card>

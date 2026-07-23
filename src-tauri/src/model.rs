@@ -612,6 +612,11 @@ pub struct AppSettings {
     /// 开启后健康「可用/熔断」与真实业务一致，不再出现「连通正常却熔断」的割裂。
     #[serde(default)]
     pub health_probe_real_completion: bool,
+    /// 大脑聚合详细快照：开启后每次聚合把成员完整答案、汇总产物、决策者入参/回答
+    /// 落进可展开 trace（体量可达数十万字符）。默认关，避免每轮聚合都写重型日志、
+    /// 徒增磁盘 IO；状态行（参与者成功/失败、汇总/决策者返回）不受此开关影响，始终记录。
+    #[serde(default)]
+    pub aggregate_trace_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -646,6 +651,7 @@ impl Default for AppSettings {
             mcp_registered_categories: Vec::new(),
             upstream_retry_enabled: true,
             health_probe_real_completion: false,
+            aggregate_trace_enabled: false,
         }
     }
 }

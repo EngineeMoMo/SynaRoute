@@ -7,7 +7,8 @@
 //!
 //! 接入机制（基于接入验证实证）：
 //! - Claude CLI：~/.claude/settings.json 的 env.ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN
-//! - Codex：~/.codex/config.toml 的 model_provider + [model_providers.synaroute]（base_url/wire_api/env_key）
+//! - Codex：~/.codex/config.toml 的 model_provider + [model_providers.synaroute]（base_url/wire_api/requires_openai_auth）
+//!   + ~/.codex/auth.json 的 OPENAI_API_KEY 占位（免手设环境变量，借鉴 cc-switch）
 //! - Claude 桌面端：%APPDATA%/Claude/claude_desktop_config.json（cc-switch 同款思路）
 
 use crate::error::{AppError, AppResult};
@@ -19,10 +20,14 @@ use std::path::{Path, PathBuf};
 const BACKUP_SUFFIX: &str = "synaroute.bak";
 
 /// 将某分类的代理端点写入对应目标工具配置。返回人类可读的结果说明。
-pub fn apply(category: CategoryType, endpoint: &str) -> AppResult<String> {
+///
+/// `default_model`：仅 Codex 用——写入 config.toml 的 `model` 字段，让 Codex 启动即有默认模型
+/// （借鉴 cc-switch：Codex 不像 Claude CLI 靠 /v1/models 发现，缺 `model` 字段会启动无模型需手选）。
+/// Claude CLI / 桌面端忽略此参数（它们靠网关模型发现填充 /model 选择器）。
+pub fn apply(category: CategoryType, endpoint: &str, default_model: Option<&str>) -> AppResult<String> {
     match category {
         CategoryType::ClaudeCli => apply_claude_cli(endpoint),
-        CategoryType::Codex => apply_codex(endpoint),
+        CategoryType::Codex => apply_codex(endpoint, default_model),
         CategoryType::ClaudeDesktop => apply_claude_desktop(endpoint),
     }
 }
@@ -81,9 +86,47 @@ fn codex_config_path() -> AppResult<PathBuf> {
     Ok(home.join(".codex").join("config.toml"))
 }
 
-fn apply_codex(endpoint: &str) -> AppResult<String> {
+/// Codex 密钥文件 ~/.codex/auth.json（与 config.toml 同目录）。
+/// Codex 从这里读 `OPENAI_API_KEY`（provider 的 env_key 未在真实环境变量中设置时）。
+fn codex_auth_path() -> AppResult<PathBuf> {
+    // 与 config.toml 同目录，保证 CODEX_HOME 覆盖时一起走。
+    let cfg = codex_config_path()?;
+    Ok(cfg.with_file_name("auth.json"))
+}
+
+fn apply_codex(endpoint: &str, default_model: Option<&str>) -> AppResult<String> {
     let path = codex_config_path()?;
-    apply_codex_at(&path, endpoint)
+    let auth_path = codex_auth_path()?;
+    // Codex 接入要同时写两个文件（config.toml + auth.json）。用 with_rollback 快照两者，
+    // 任一步失败就整体回滚，杜绝「config 已改但 auth 没写」的半配置状态（借鉴 cc-switch 的原子切换）。
+    with_rollback(&[path.clone(), auth_path.clone()], || {
+        let msg = apply_codex_at(&path, endpoint, default_model)?;
+        // 借鉴 cc-switch：把占位密钥写进 auth.json 的 OPENAI_API_KEY，免去用户手设环境变量。
+        // 代理侧不校验该值（真实密钥由代理按路由 Key 注入），但 Codex 需要一个非空 key 才走鉴权流程。
+        write_codex_auth(&auth_path)?;
+        Ok(format!(
+            "{msg}\n已写入 {} 的 OPENAI_API_KEY 占位（无需手设环境变量）",
+            auth_path.display()
+        ))
+    })
+}
+
+/// 幂等合并写入 Codex auth.json：仅设置/补齐 `OPENAI_API_KEY` 占位，保留其余字段。
+/// 已是目标占位值则不写盘。
+fn write_codex_auth(path: &Path) -> AppResult<()> {
+    const PLACEHOLDER: &str = "synaroute-proxy";
+    let mut root = read_json_or_empty(path)?;
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| AppError::ToolConfig("auth.json 顶层非对象".into()))?;
+    // 幂等：已有任意非空 OPENAI_API_KEY 则保留不动（避免覆盖用户真实 key / 反复写盘）。
+    if let Some(Value::String(existing)) = obj.get("OPENAI_API_KEY") {
+        if !existing.trim().is_empty() {
+            return Ok(());
+        }
+    }
+    obj.insert("OPENAI_API_KEY".into(), Value::String(PLACEHOLDER.into()));
+    backup_and_write_json(path, &root)
 }
 
 /// 写入 Codex 的自定义 provider 指向本地代理。
@@ -96,11 +139,12 @@ fn apply_codex(endpoint: &str) -> AppResult<String> {
 /// - `[model_providers.synaroute]`：base_url = `{endpoint}/v1`（Codex 按 wire_api=responses
 ///   调 `{base_url}/responses`，本地代理已识别 `/v1/responses`）；wire_api="responses"（Codex 默认且唯一支持）。
 /// - `model_provider = "synaroute"` 选中它。
-/// - env_key 指向 `SYNAROUTE_API_KEY`：代理侧不校验 token，但 Codex 需要一个 env 变量名；
-///   用户把它设为任意非空值即可（值不影响路由，真实密钥由代理按 Key 注入）。
+/// - requires_openai_auth=true（借鉴 cc-switch）：走 OpenAI 风格鉴权、读同目录 auth.json 的
+///   OPENAI_API_KEY（由 write_codex_auth 写占位），故**不写 env_key**——避免让 Codex 改从
+///   环境变量读 key、重新引入「用户手设环境变量」负担。真实密钥仍由代理按路由 Key 注入。
 ///
-/// 幂等：三项都已是目标值则不写盘。保留 config.toml 其余表（mcp_servers 等）不动。
-fn apply_codex_at(path: &Path, endpoint: &str) -> AppResult<String> {
+/// 幂等：目标值已写则不重复。保留 config.toml 其余表（mcp_servers 等）不动。
+fn apply_codex_at(path: &Path, endpoint: &str, default_model: Option<&str>) -> AppResult<String> {
     let content = if path.exists() {
         std::fs::read_to_string(path)?
     } else {
@@ -126,6 +170,13 @@ fn apply_codex_at(path: &Path, endpoint: &str) -> AppResult<String> {
         toml::Value::String(MCP_CLIENT_NAME.to_string()),
     );
 
+    // 默认模型（借鉴 cc-switch：写顶层 model 字段，让 Codex 启动即有模型，无需 /model 手选）。
+    // 取该分类可服务模型集的首个（对外名，代理侧 resolve_model 会改写为上游真实名）。
+    // 仅在能解析出模型时写入；解析不出则不动用户已有的 model 字段（避免清空）。
+    if let Some(m) = default_model.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        table.insert("model".to_string(), toml::Value::String(m.to_string()));
+    }
+
     // [model_providers.synaroute]
     let providers = table
         .entry("model_providers".to_string())
@@ -137,18 +188,22 @@ fn apply_codex_at(path: &Path, endpoint: &str) -> AppResult<String> {
     entry.insert("name".into(), toml::Value::String("SynaRoute".into()));
     entry.insert("base_url".into(), toml::Value::String(base_url.clone()));
     entry.insert("wire_api".into(), toml::Value::String("responses".into()));
-    entry.insert(
-        "env_key".into(),
-        toml::Value::String("SYNAROUTE_API_KEY".into()),
-    );
+    // 鉴权走 auth.json 的 OPENAI_API_KEY（见 write_codex_auth），故**不写 env_key**：
+    // env_key 会让 Codex 改从该名环境变量读 key，与 auth.json 冲突、且重新引入「用户手设环境变量」负担。
+    // requires_openai_auth=true（借鉴 cc-switch 验证过的写法）让 Codex 走 OpenAI 风格鉴权、读 auth.json。
+    entry.insert("requires_openai_auth".into(), toml::Value::Boolean(true));
     providers_table.insert(MCP_CLIENT_NAME.to_string(), toml::Value::Table(entry));
 
     let serialized =
         toml::to_string_pretty(&doc).map_err(|e| AppError::ToolConfig(e.to_string()))?;
     backup_and_write_bytes(path, serialized.as_bytes())?;
+    let model_note = default_model
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|m| format!("，默认模型={m}"))
+        .unwrap_or_default();
     Ok(format!(
-        "已写入 Codex 配置：{}（model_provider=synaroute，base_url={base_url}，wire_api=responses），原文件已备份。\
-         注意：请把环境变量 SYNAROUTE_API_KEY 设为任意非空值（代理不校验其值）",
+        "已写入 Codex 配置：{}（model_provider=synaroute，base_url={base_url}，wire_api=responses{model_note}），原文件已备份",
         path.display()
     ))
 }
@@ -420,6 +475,48 @@ fn backup_and_write_bytes(path: &Path, data: &[u8]) -> AppResult<()> {
     crate::secret::atomic_write(path, data)
 }
 
+/// 多文件写入的整体回滚（借鉴 cc-switch 的 with_rollback）。
+///
+/// 场景：一次接入要动多个文件（如 Codex 的 config.toml + auth.json）。若中途某步失败，
+/// 已写的文件会留下「半配置」状态。此辅助先对每个目标文件拍快照（内容 or「原本不存在」），
+/// 执行闭包；闭包返回 Err 时把所有文件恢复到执行前的状态，避免部分写入。
+///
+/// 快照失败（无法读原文件）直接返回错误、不执行闭包——宁可不写，也不在无法回滚时冒险。
+fn with_rollback<T>(
+    paths: &[PathBuf],
+    op: impl FnOnce() -> AppResult<T>,
+) -> AppResult<T> {
+    // 拍快照：Some(bytes)=原内容；None=原本不存在（回滚时应删除）。
+    let mut snapshots: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::with_capacity(paths.len());
+    for p in paths {
+        let snap = if p.exists() {
+            Some(std::fs::read(p).map_err(|e| {
+                AppError::ToolConfig(format!("回滚快照失败(读 {}): {e}", p.display()))
+            })?)
+        } else {
+            None
+        };
+        snapshots.push((p.clone(), snap));
+    }
+
+    match op() {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // 尽力回滚：逐个恢复原状。回滚本身的错误不覆盖原始错误，仅告警。
+            for (p, snap) in &snapshots {
+                let restored = match snap {
+                    Some(bytes) => crate::secret::atomic_write(p, bytes),
+                    None => std::fs::remove_file(p).map_err(AppError::from),
+                };
+                if let Err(re) = restored {
+                    tracing::warn!("接入写入失败后回滚 {} 出错: {re}", p.display());
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
 /// 还原某工具配置（从 .synaroute.bak 恢复）
 pub fn restore(category: CategoryType) -> AppResult<String> {
     let path = match category {
@@ -572,17 +669,21 @@ mod tests {
         )
         .unwrap();
 
-        let msg = apply_codex_at(&path, "http://127.0.0.1:8790").unwrap();
+        let msg = apply_codex_at(&path, "http://127.0.0.1:8790", Some("claude-opus-4-8")).unwrap();
         assert!(msg.contains("model_provider=synaroute"));
 
         let doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         // 选中自定义 provider
         assert_eq!(doc["model_provider"].as_str(), Some("synaroute"));
-        // provider 定义正确：base_url 追加 /v1、wire_api=responses、env_key 存在
+        // 默认模型写入顶层 model（借鉴 cc-switch，让 Codex 启动即有模型）
+        assert_eq!(doc["model"].as_str(), Some("claude-opus-4-8"));
+        // provider 定义正确：base_url 追加 /v1、wire_api=responses、requires_openai_auth=true
         let p = &doc["model_providers"]["synaroute"];
         assert_eq!(p["base_url"].as_str(), Some("http://127.0.0.1:8790/v1"));
         assert_eq!(p["wire_api"].as_str(), Some("responses"));
-        assert_eq!(p["env_key"].as_str(), Some("SYNAROUTE_API_KEY"));
+        assert_eq!(p["requires_openai_auth"].as_bool(), Some(true));
+        // 鉴权走 auth.json，故不写 env_key（避免让 Codex 改从环境变量读、重新引入手设负担）
+        assert!(p.get("env_key").is_none(), "不应写 env_key，鉴权走 auth.json");
         // 绝不能再写 ANTHROPIC_BASE_URL
         assert!(
             doc.get("shell_environment_policy").is_none(),
@@ -617,5 +718,69 @@ mod tests {
         );
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn with_rollback_restores_all_files_on_failure() {
+        // 多文件写入中途失败：已改的文件应回滚到原内容，原本不存在的应被删除。
+        let dir = std::env::temp_dir().join(format!(
+            "synaroute_rollback_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("existing.json");
+        let fresh = dir.join("fresh.json");
+        std::fs::write(&existing, b"ORIGINAL").unwrap();
+        // fresh 原本不存在
+
+        let paths = vec![existing.clone(), fresh.clone()];
+        let result: AppResult<()> = with_rollback(&paths, || {
+            // 先改两个文件，再返回 Err，模拟「第二步失败」。
+            crate::secret::atomic_write(&existing, b"MODIFIED")?;
+            crate::secret::atomic_write(&fresh, b"NEW")?;
+            Err(AppError::ToolConfig("模拟失败".into()))
+        });
+
+        assert!(result.is_err(), "闭包返回 Err 应上抛");
+        // existing 回滚到原内容
+        assert_eq!(
+            std::fs::read(&existing).unwrap(),
+            b"ORIGINAL",
+            "已存在文件应回滚到原内容"
+        );
+        // fresh 原本不存在 → 应被删除
+        assert!(!fresh.exists(), "原本不存在的文件应在回滚时被删除");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn with_rollback_keeps_writes_on_success() {
+        // 闭包成功：所有写入应保留，不触发回滚。
+        let dir = std::env::temp_dir().join(format!(
+            "synaroute_rollback_ok_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("f.json");
+
+        let paths = vec![f.clone()];
+        let result: AppResult<()> = with_rollback(&paths, || {
+            crate::secret::atomic_write(&f, b"WRITTEN")?;
+            Ok(())
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(std::fs::read(&f).unwrap(), b"WRITTEN", "成功时写入应保留");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
