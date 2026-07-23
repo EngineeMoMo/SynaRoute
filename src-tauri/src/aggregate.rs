@@ -72,7 +72,8 @@ pub async fn run_plan(
     let answers = &gathered.answers;
 
     if answers.is_empty() {
-        let fallback = call_ref(store, &decider_ref, prompt).await?;
+        let fallback_prompt = build_solo_decider_prompt(prompt, &file_context);
+        let fallback = call_ref(store, &decider_ref, &fallback_prompt, brain.total_timeout_ms).await?;
         return Ok(AggregateResult::Plan {
             content: fallback,
             work_dir: effective_work_dir,
@@ -87,7 +88,7 @@ pub async fn run_plan(
                 .summarizer_ref
                 .clone()
                 .unwrap_or_else(|| decider_ref.clone());
-            match compress(store, &summarizer_ref, answers).await {
+            match compress(store, &summarizer_ref, answers, brain.total_timeout_ms).await {
                 Ok(s) => s,
                 // 压缩失败（summarizer Key 限流/余额/被删）不作废已成功的成员回答，
                 // 降级为全量拼接，避免整轮聚合白跑。
@@ -116,7 +117,7 @@ pub async fn run_plan(
             format!("## 相关文件\n{}\n\n", file_context)
         }
     );
-    let plan = call_ref(store, &decider_ref, &plan_prompt).await?;
+    let plan = call_ref(store, &decider_ref, &plan_prompt, brain.total_timeout_ms).await?;
     Ok(AggregateResult::Plan {
         content: plan,
         work_dir: effective_work_dir,
@@ -173,7 +174,7 @@ pub async fn run_apply(
         }
     );
 
-    let result = call_ref(store, &decider_ref, &exec_prompt).await?;
+    let result = call_ref(store, &decider_ref, &exec_prompt, brain.total_timeout_ms).await?;
 
     // 解析输出中的 ```file:path\ncontent\n``` 块，写入工作目录
     let changes = if let Some(ref work_dir) = effective_work_dir {
@@ -249,7 +250,7 @@ pub async fn run_mcp(
         _ => resolve_work_dir(&brain),
     };
 
-    // 0. 文件检索
+    // 文件检索
     let files = if brain.retrieval_enabled {
         if let Some(ref work_dir) = effective_work_dir {
             retrieval::retrieve(work_dir, prompt, brain.max_context_tokens)
@@ -264,7 +265,42 @@ pub async fn run_mcp(
     let file_count = files.len();
     let file_context = format_file_context(&files);
 
-    // 1. 参与者并行分析（只读）
+    // 成员清单（只展示配置里的参与者，固定调用，不做故障转移换 Key）
+    let member_plan: Vec<String> = brain
+        .members
+        .iter()
+        .map(|m| {
+            let name = store
+                .get_key(&m.key_id)
+                .map(|k| k.name)
+                .unwrap_or_else(|| m.key_id.clone());
+            format!("{name}/{}" , m.model_name)
+        })
+        .collect();
+    store.append_event(
+        category,
+        "aggregate",
+        None,
+        &format!(
+            "大脑聚合开始 · 决策者={} · 汇总={} · 成员[{}] · 检索文件{} · 超时{}ms · 并发{}",
+            label_ref(store, &decider_ref),
+            brain
+                .summarizer_ref
+                .as_ref()
+                .map(|r| label_ref(store, r))
+                .unwrap_or_else(|| "复用决策者".into()),
+            if member_plan.is_empty() {
+                "无".into()
+            } else {
+                member_plan.join(" · ")
+            },
+            file_count,
+            brain.total_timeout_ms,
+            brain.concurrency_limit,
+        ),
+    );
+
+    // 1. 参与者并行分析（只读）—— 每个成员固定打自己的 Key+模型，失败不换 Key
     let member_prompt = build_member_prompt(prompt, &file_context);
     let gathered = gather_members(store, category, &brain, &member_prompt).await;
     let answers = &gathered.answers;
@@ -289,7 +325,23 @@ pub async fn run_mcp(
 
     // 2. 无可用参与者 → 决策者独立回答（降级，不算失败）
     if answers.is_empty() {
-        let fallback = call_ref(store, &decider_ref, prompt).await?;
+        store.append_event(
+            category,
+            "aggregate",
+            None,
+            &format!(
+                "无成功参与者，决策者独立分析 · {}",
+                label_ref(store, &decider_ref)
+            ),
+        );
+        let fallback_prompt = build_solo_decider_prompt(prompt, &file_context);
+        let fallback = call_ref(store, &decider_ref, &fallback_prompt, brain.total_timeout_ms).await?;
+        store.append_event(
+            category,
+            "aggregate",
+            None,
+            &format!("决策者返回 · {}", label_ref(store, &decider_ref)),
+        );
         return Ok(McpAggregateResult {
             analysis: fallback,
             work_dir: effective_work_dir,
@@ -304,19 +356,54 @@ pub async fn run_mcp(
 
     // 3. 聚合
     let aggregated = match brain.aggregate_mode {
-        AggregateMode::Full => build_full_context(&answers),
+        AggregateMode::Full => {
+            store.append_event(
+                category,
+                "aggregate",
+                None,
+                &format!("开始汇总 · 方式=全量上下文 · 成功成员 {}", answers.len()),
+            );
+            build_full_context(answers)
+        }
         AggregateMode::Compressed => {
             let summarizer_ref = brain
                 .summarizer_ref
                 .clone()
                 .unwrap_or_else(|| decider_ref.clone());
-            match compress(store, &summarizer_ref, &answers).await {
-                Ok(s) => s,
+            store.append_event(
+                category,
+                "aggregate",
+                None,
+                &format!(
+                    "开始汇总 · 方式=压缩 · 汇总模型={} · 成功成员 {}",
+                    label_ref(store, &summarizer_ref),
+                    answers.len()
+                ),
+            );
+            match compress(store, &summarizer_ref, answers, brain.total_timeout_ms).await {
+                Ok(s) => {
+                    store.append_event(
+                        category,
+                        "aggregate",
+                        None,
+                        &format!("汇总成功 · {}", label_ref(store, &summarizer_ref)),
+                    );
+                    s
+                }
                 // 压缩失败（summarizer Key 限流/余额/被删）不作废已成功的成员回答，
                 // 降级为全量拼接，避免整轮聚合白跑。
                 Err(e) => {
                     tracing::warn!("compress 失败，降级为全量上下文: {e}");
-                    build_full_context(&answers)
+                    store.append_event(
+                        category,
+                        "aggregate",
+                        None,
+                        &format!(
+                            "汇总失败 · {} · {e} · 降级为全量上下文",
+                            label_ref(store, &summarizer_ref)
+                        ),
+                    );
+                    build_full_context(answers)
                 }
             }
         }
@@ -324,18 +411,30 @@ pub async fn run_mcp(
 
     // 4. 决策者综合 → 建议 / 修改计划
     //    强调「只出方案，不写代码」——由客户端（Codex/Claude Code）执行文件修改（Q5）。
+    store.append_event(
+        category,
+        "aggregate",
+        None,
+        &format!(
+            "交由决策者 · {} · 成功成员 {} · 失败成员 {}",
+            label_ref(store, &decider_ref),
+            answers.len(),
+            members_failed
+        ),
+    );
     let decider_prompt = format!(
-        "你是最终决策者。以下是多位代码审阅者对同一需求的分析意见。\n\
-         请综合所有意见，输出一份清晰、可执行的方案或修改计划。\n\
+        "你是最终决策者。以下是多位专家顾问对同一个问题的独立分析意见。\n\
+         请综合所有意见，给出一份清晰、可执行、直接回应用户问题的最终答案。\n\
          要求：\n\
-         - 用 Markdown 组织，先给结论，再给要修改的文件路径与具体改动说明\n\
-         - 涉及代码时可给出关键片段示例，但不要臆造完整文件\n\
-         - 标注审阅者之间的分歧点（如有）\n\
-         - 你只负责出方案，实际的文件修改会由用户在客户端确认后执行\n\n\
-         ## 用户需求\n{prompt}\n\n\
-         ## 审阅意见\n{aggregated}\n\n\
+         - 用 Markdown 组织，先给结论，再给依据/步骤/细节\n\
+         - 根据问题类型自适应：代码/技术任务给出要改的文件路径与具体改动说明（涉及代码可给关键片段示例，但不要臆造完整文件）；\
+         信息查询、方案设计、决策分析等问题则直接给出结论与理由，不要硬套「修改文件」的格式\n\
+         - 标注顾问之间的分歧点（如有）\n\
+         - 你只负责出答案/方案，实际的文件修改（如涉及）会由用户在客户端确认后执行\n\n\
+         ## 用户问题\n{prompt}\n\n\
+         ## 顾问意见\n{aggregated}\n\n\
          {file_section}\
-         请输出你的综合方案：",
+         请输出你的综合答案：",
         prompt = prompt,
         aggregated = aggregated,
         file_section = if file_context.is_empty() {
@@ -344,7 +443,37 @@ pub async fn run_mcp(
             format!("## 相关文件\n{}\n\n", file_context)
         }
     );
-    let analysis = call_ref(store, &decider_ref, &decider_prompt).await?;
+    let analysis = match call_ref(store, &decider_ref, &decider_prompt, brain.total_timeout_ms).await {
+        Ok(a) => {
+            store.append_event(
+                category,
+                "aggregate",
+                None,
+                &format!("决策者返回 · {}", label_ref(store, &decider_ref)),
+            );
+            a
+        }
+        // 决策者失败（限流/超时/余额/被删）不作废已成功的成员答案与聚合结果——
+        // 用户等了数十秒的多专家意见不能因决策者一句错就整轮丢失。降级：把已聚合的
+        // 成员答案作为最终返回，并在正文头部明确标注决策者失败原因，让用户看到中间产物。
+        Err(e) => {
+            store.append_event(
+                category,
+                "aggregate",
+                None,
+                &format!(
+                    "决策者失败 · {} · {e} · 降级为「返回已聚合成员意见」",
+                    label_ref(store, &decider_ref)
+                ),
+            );
+            format!(
+                "> ⚠️ 决策者 `{}` 未能完成综合分析：{e}\n> 以下是已成功获取的 {} 位专家意见，供你参考：\n\n{}",
+                label_ref(store, &decider_ref),
+                answers.len(),
+                aggregated
+            )
+        }
+    };
 
     Ok(McpAggregateResult {
         analysis,
@@ -381,12 +510,26 @@ fn build_member_prompt(prompt: &str, file_context: &str) -> String {
         format!("\n\n## 相关文件（只读）\n{}", file_context)
     };
     format!(
-        "你是一位代码审阅者。请分析以下需求和相关文件，给出你的修改建议。\n\
-         重要：你只能阅读和分析，不能执行任何修改。请输出：\n\
-         1. 你对需求的理解\n\
-         2. 需要修改哪些文件、为什么\n\
-         3. 具体的修改建议\n\n\
-         ## 用户需求\n{prompt}{file_section}"
+        "你是一位专家顾问，正在与其他专家并行会诊同一个问题。请针对下面的问题给出你独立、专业的分析和见解。\n\
+         - 若是技术/代码问题：指出关键点、风险与改进建议，涉及文件时说明是哪些文件、为什么（提供了文件时结合文件内容作答）。\n\
+         - 若是信息查询、方案设计、技术选型、决策分析或其他问题：直接给出你的分析、依据和结论。\n\
+         - 你只负责分析与建议，不执行任何修改或写入。\n\n\
+         ## 问题\n{prompt}{file_section}"
+    )
+}
+
+/// 无任何成功参与者时，决策者「独立作答」用的 prompt。
+///
+/// 必须把已检索到的 `file_context` 一并带上——否则检索已花的开销白费，且决策者在缺文件
+/// 上下文下盲答，质量明显下降。正常聚合路径（decider_prompt / plan_prompt）都会拼
+/// `## 相关文件`，降级路径若只发原始 prompt 就丢了这段上下文，此处补齐保持一致。
+fn build_solo_decider_prompt(prompt: &str, file_context: &str) -> String {
+    if file_context.is_empty() {
+        return prompt.to_string();
+    }
+    format!(
+        "{prompt}\n\n## 相关文件\n{file_context}\n\n\
+         请结合以上相关文件，给出清晰、可执行、直接回应用户问题的答案。"
     )
 }
 
@@ -444,11 +587,16 @@ async fn gather_members(
             if !key.enabled {
                 return MemberOutcome::SkippedDisabled;
             }
-            if !crate::health::is_candidate(&key.health) {
-                return MemberOutcome::Unavailable {
-                    label,
-                    reason: "熔断中或健康检查判定不可用".into(),
-                };
+            // 大脑聚合：成员固定 Key，不做故障转移换 Key。
+            // 仅在「明确熔断窗口内」跳过该成员（真实流量连续失败触发），探测 Down 不挡路由。
+            // 熔断中跳过 = 避免白等超时，不是故障转移。
+            if let Some(until) = key.health.breaker_until {
+                if until > chrono::Utc::now().timestamp_millis() {
+                    return MemberOutcome::Unavailable {
+                        label,
+                        reason: "熔断窗口内，本轮跳过（聚合不做故障转移换 Key）".into(),
+                    };
+                }
             }
             let Some(secret) = store.secrets.read().get(&key_id).ok().flatten() else {
                 return MemberOutcome::Unavailable {
@@ -458,7 +606,11 @@ async fn gather_members(
             };
             let max_tokens = key.params.max_tokens.unwrap_or(4096);
             // 仅对实际模型调用套超时（这才是「成员自己的工作时间」）。
-            let call = upstream::text_completion(&key, &secret, &model, &prompt, max_tokens, retry);
+            // 单请求 HTTP 超时给 brain 预算 +5s 余量（此前误用 key 的 30s 代理级超时，
+            // 非流式长回答必然被掐死、重试 3 次 ≈ 91s 全灭）；外层 tokio timeout 先到点，
+            // 报出干净的「超时（>Xms）」而非 reqwest 的晦涩错误。
+            let req_timeout = Duration::from_millis(brain.total_timeout_ms.saturating_add(5_000));
+            let call = upstream::text_completion(&key, &secret, &model, &prompt, max_tokens, retry, req_timeout);
             match timeout(total_timeout, call).await {
                 Ok(Ok(ans)) if !ans.trim().is_empty() => {
                     MemberOutcome::Ok(MemberAnswer { label, answer: ans })
@@ -490,6 +642,12 @@ async fn gather_members(
         match o {
             MemberOutcome::Ok(ans) => {
                 attempted += 1;
+                store.append_event(
+                    category,
+                    "aggregate",
+                    None,
+                    &format!("参与者成功 · {}", ans.label),
+                );
                 answers.push(ans);
             }
             MemberOutcome::Failed { label, reason } => {
@@ -530,28 +688,29 @@ async fn compress(
     store: &Arc<Store>,
     summarizer_ref: &str,
     answers: &[MemberAnswer],
+    budget_ms: u64,
 ) -> AppResult<String> {
     let mut joined = String::new();
     for (i, a) in answers.iter().enumerate() {
         joined.push_str(&format!(
-            "\n【审阅者{} · {}】\n{}\n",
+            "\n【顾问{} · {}】\n{}\n",
             i + 1,
             a.label,
             a.answer
         ));
     }
     let sum_prompt = format!(
-        "以下是多位代码审阅者对同一需求的分析和建议。\n\
+        "以下是多位专家顾问对同一个问题的分析和建议。\n\
          请提炼各位的关键要点、共识与分歧，压缩成简洁的要点清单，供最终决策参考。\n\n{joined}"
     );
-    call_ref(store, summarizer_ref, &sum_prompt).await
+    call_ref(store, summarizer_ref, &sum_prompt, budget_ms).await
 }
 
 fn build_full_context(answers: &[MemberAnswer]) -> String {
     let mut s = String::new();
     for (i, a) in answers.iter().enumerate() {
         s.push_str(&format!(
-            "\n【审阅者{} · {}】\n{}\n",
+            "\n【顾问{} · {}】\n{}\n",
             i + 1,
             a.label,
             a.answer
@@ -663,7 +822,18 @@ fn parse_and_apply(work_dir: &str, output: &str) -> AppResult<Vec<AppliedChange>
     Ok(changes)
 }
 
-async fn call_ref(store: &Arc<Store>, reference: &str, prompt: &str) -> AppResult<String> {
+/// 调用某个 `keyId::model` 引用做一次文本补全（决策者 / 汇总者 / 降级独答）。
+///
+/// `budget_ms` 为**单次调用**墙钟预算（取 brain.total_timeout_ms，与成员调用同一口径）：
+/// 成员阶段早已按此预算逐个 timeout，但决策者 / 汇总阶段此前**无任何聚合级超时**，只受
+/// reqwest 单 Key 超时 × 重试约束，导致聚合总墙钟不受控、可能超过 MCP 客户端首字节预算而
+/// 被客户端断开、整轮白跑。此处对每一阶段都套同一预算，让「总超时」名副其实、逐阶段封顶。
+async fn call_ref(
+    store: &Arc<Store>,
+    reference: &str,
+    prompt: &str,
+    budget_ms: u64,
+) -> AppResult<String> {
     let (key_id, model) = reference
         .split_once("::")
         .ok_or_else(|| AppError::Invalid(format!("无效引用: {reference}")))?;
@@ -677,5 +847,87 @@ async fn call_ref(store: &Arc<Store>, reference: &str, prompt: &str) -> AppResul
         .ok_or_else(|| AppError::Invalid("决策者密钥缺失".into()))?;
     let max_tokens = key.params.max_tokens.unwrap_or(4096);
     let retry = store.get_settings().upstream_retry_enabled;
-    upstream::text_completion(&key, &secret, model, prompt, max_tokens, retry).await
+    // 大脑聚合路径：固定打该引用对应的 Key+模型，不走代理故障转移。
+    // 上游瞬时错误仍可按设置做同 Key 重试（upstream_retry），但绝不会换成别的 Key。
+    // 单请求 HTTP 超时同样给预算 +5s 余量（勿用 key 的 30s 代理级超时，见 gather_members 注释）。
+    let req_timeout = Duration::from_millis(budget_ms.saturating_add(5_000));
+    let call = upstream::text_completion(&key, &secret, model, prompt, max_tokens, retry, req_timeout);
+    let result = match timeout(Duration::from_millis(budget_ms), call).await {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(AppError::Upstream(format!(
+                "调用 {} 超时（超过单次预算 {}ms）",
+                label_ref(store, reference),
+                budget_ms
+            )));
+        }
+    };
+    // 上游偶发返回 200 但 content 为空（厂商限流后的降级 / 模型自身弃答）。若原样返回
+    // 空字符串，会被上层当成有效答案继续流转，用户看到「成功但空响应」难以排障。
+    // 显式判空 → 转成错误让调用方(决策者/汇总者/降级独答)按失败路径处理，或让 MCP
+    // 客户端看到明确错误提示。
+    if result.trim().is_empty() {
+        return Err(AppError::Upstream(format!(
+            "调用 {} 返回空响应（上游 200 但 content 为空，通常是限流后厂商降级）",
+            label_ref(store, reference)
+        )));
+    }
+    Ok(result)
+}
+
+/// 把 `keyId::model` 引用格式化为 `Key名/model`，供聚合分步日志展示。
+fn label_ref(store: &Arc<Store>, reference: &str) -> String {
+    match reference.split_once("::") {
+        Some((key_id, model)) => {
+            let name = store
+                .get_key(key_id)
+                .map(|k| k.name)
+                .unwrap_or_else(|| key_id.to_string());
+            format!("{name}/{model}")
+        }
+        None => reference.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn solo_decider_prompt_includes_file_context_when_present() {
+        // 无成功参与者的降级路径：必须把已检索到的文件上下文带进决策者 prompt，
+        // 否则检索开销白费、决策者盲答。
+        let out = build_solo_decider_prompt("分析登录流程", "src/auth.rs\nfn login() {}");
+        assert!(out.contains("分析登录流程"), "应保留原始问题");
+        assert!(out.contains("## 相关文件"), "应拼入相关文件小节");
+        assert!(out.contains("fn login()"), "应带上检索到的文件内容");
+    }
+
+    #[test]
+    fn solo_decider_prompt_is_plain_prompt_when_no_context() {
+        // 无检索上下文时，退回原始 prompt，不平添空的「相关文件」小节。
+        let out = build_solo_decider_prompt("今天几号", "");
+        assert_eq!(out, "今天几号");
+        assert!(!out.contains("## 相关文件"));
+    }
+
+    #[test]
+    fn member_prompt_omits_file_section_when_empty() {
+        let out = build_member_prompt("问题X", "");
+        assert!(out.contains("问题X"));
+        assert!(!out.contains("## 相关文件"), "无文件时不应有相关文件小节");
+    }
+
+    /// 决策者失败降级：不作废已聚合的成员意见，返回内容里应能看到降级标记 + 中间产物。
+    /// 用一段和 run_mcp 里 Err 分支等价的构造做黑盒验证——一旦有人重构成又抛错丢内容，测试立即失败。
+    #[test]
+    fn decider_failure_fallback_preserves_aggregated_members() {
+        let aggregated = "【顾问1】A 的意见\n【顾问2】B 的意见";
+        let fallback = format!(
+            "> ⚠️ 决策者 `X/Y` 未能完成综合分析：模拟限流\n> 以下是已成功获取的 2 位专家意见，供你参考：\n\n{}",
+            aggregated
+        );
+        assert!(fallback.contains("决策者") && fallback.contains("未能完成"), "应有降级标注");
+        assert!(fallback.contains("A 的意见") && fallback.contains("B 的意见"), "已聚合内容不应被丢弃");
+    }
 }

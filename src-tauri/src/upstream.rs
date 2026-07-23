@@ -20,7 +20,7 @@ pub async fn fetch_models(key: &ProviderKey, secret: &str) -> AppResult<Vec<Stri
     // 依次尝试候选路径，任一 2xx 即用；全失败则汇总错误。
     let mut last_err = String::from("无候选端点");
     for url in model_endpoints(&key.base_url) {
-        let mut req = client.get(&url).timeout(key_timeout(key));
+        let mut req = client.get(&url).timeout(fast_timeout(key));
         // /models 用双鉴权头（Bearer + x-api-key），兼容把 Anthropic 挂子路径的 OpenAI 风格 /models
         req = apply_models_auth(req, secret);
 
@@ -192,6 +192,12 @@ pub fn is_retriable_upstream_error(e: &AppError) -> bool {
 /// 一次性文本请求（用于聚合成员/决策者/汇总模型调用）。
 /// prompt 作为单条 user 消息发送，返回助手文本。
 /// `retry` 为 true 时，对临时性上游错误（502/503/504/429/连接失败）自动重试。
+///
+/// `request_timeout` 为**单次 HTTP 请求**的超时（含上游完整生成时间）。此前硬用
+/// `key_timeout`（默认 30s）——那是给代理转发/健康探测的量级；非流式补全要等上游把
+/// 整篇内容生成完才返回，30s 必然掐死正常长回答，再叠加 3 次重试 ≈ 91s 全灭，
+/// 表象是「error sending request / error decoding response body」而健康探测（max_tokens=1
+/// 秒回）始终显示可用。聚合路径应传入 brain 总预算量级的超时。
 pub async fn text_completion(
     key: &ProviderKey,
     secret: &str,
@@ -199,6 +205,7 @@ pub async fn text_completion(
     prompt: &str,
     max_tokens: u32,
     retry: bool,
+    request_timeout: Duration,
 ) -> AppResult<String> {
     let max_attempts = if retry { RETRY_MAX_ATTEMPTS } else { 1 };
     let mut last_err = None;
@@ -206,12 +213,12 @@ pub async fn text_completion(
         let client = build_client(key)?;
         let result = match key.protocol {
             Protocol::Anthropic => {
-                anthropic_message(&client, key, secret, model, prompt, max_tokens).await
+                anthropic_message(&client, key, secret, model, prompt, max_tokens, request_timeout).await
             }
             // 大脑聚合成员探测走 Chat Completions；Responses 上游此处也用 Chat 形态发最小请求
             // （聚合成员探测为尽力而为，非主转发路径）。
             Protocol::OpenaiChat | Protocol::OpenaiResponses => {
-                openai_chat(&client, key, secret, model, prompt, max_tokens).await
+                openai_chat(&client, key, secret, model, prompt, max_tokens, request_timeout).await
             }
         };
         match result {
@@ -350,6 +357,7 @@ async fn anthropic_message(
     model: &str,
     prompt: &str,
     max_tokens: u32,
+    request_timeout: Duration,
 ) -> AppResult<String> {
     let url = join_endpoint(&key.base_url, "/v1/messages");
     let payload = json!({
@@ -357,7 +365,7 @@ async fn anthropic_message(
         "max_tokens": max_tokens,
         "messages": [{ "role": "user", "content": prompt }]
     });
-    let mut req = client.post(&url).json(&payload).timeout(key_timeout(key));
+    let mut req = client.post(&url).json(&payload).timeout(request_timeout);
     req = req.header("anthropic-version", "2023-06-01");
     req = apply_auth(req, key, secret);
 
@@ -386,6 +394,7 @@ async fn openai_chat(
     model: &str,
     prompt: &str,
     max_tokens: u32,
+    request_timeout: Duration,
 ) -> AppResult<String> {
     let url = join_endpoint(&key.base_url, "/v1/chat/completions");
     let payload = json!({
@@ -393,7 +402,7 @@ async fn openai_chat(
         "max_tokens": max_tokens,
         "messages": [{ "role": "user", "content": prompt }]
     });
-    let mut req = client.post(&url).json(&payload).timeout(key_timeout(key));
+    let mut req = client.post(&url).json(&payload).timeout(request_timeout);
     req = apply_auth(req, key, secret);
 
     let resp = req.send().await?;
@@ -438,7 +447,7 @@ pub async fn health_probe(key: &ProviderKey, secret: &str) -> (bool, u64) {
         .into_iter()
         .next()
         .unwrap_or_else(|| key.base_url.trim_end_matches('/').to_string());
-    let mut req = apply_models_auth(client.get(&url).timeout(key_timeout(key)), secret);
+    let mut req = apply_models_auth(client.get(&url).timeout(fast_timeout(key)), secret);
     // Anthropic 真实 API 的 GET /v1/models 需带版本头，否则 400（不影响健康判定，但让
     // 有效 Key 能拿到真实 200 与准确延迟）。
     if matches!(key.protocol, Protocol::Anthropic) {
@@ -475,7 +484,9 @@ pub async fn health_probe_real(key: &ProviderKey, secret: &str) -> (bool, u64, O
     };
     let start = std::time::Instant::now();
     // 极小请求：一个字 prompt、max_tokens=1。不重试（探测要快、如实反映当下）。
-    let result = text_completion(key, secret, &model, "hi", 1, false).await;
+    // 探测超时封顶 30s（fast_timeout）：1 token 秒回,不跟随用户为慢厂商设的长超时,
+    // 否则串行探测循环会被一个挂掉的慢 Key 拖住几分钟。
+    let result = text_completion(key, secret, &model, "hi", 1, false, fast_timeout(key)).await;
     let latency = start.elapsed().as_millis() as u64;
     match result {
         Ok(_) => (true, latency, None),
@@ -1648,9 +1659,21 @@ pub fn shared_client() -> reqwest::Client {
         .clone()
 }
 
-/// 某 Key 的单请求总超时（缺省 30s）。
+/// 某 Key 的单请求总超时（缺省 30s）。可在 Key 编辑器设置（timeoutMs），
+/// 服务「非流式转发」这类要等上游完整生成的请求——慢厂商可调大。
 pub fn key_timeout(key: &ProviderKey) -> Duration {
     Duration::from_millis(key.params.timeout_ms.unwrap_or(30_000))
+}
+
+/// 元数据级快请求（健康探测 / 拉模型列表）的超时：取 key_timeout 但**封顶 30s**。
+///
+/// 为什么封顶：Key 超时开放用户设置后，慢厂商可能设 300s+；但
+/// - 健康检查是**串行**循环（health::check_category 逐 Key await），一个挂掉的慢 Key
+///   若跟随大超时，会把整个分类的探测阻塞几分钟；
+/// - 拉模型按候选端点顺序试（最多 4 个），跟随大超时时「拉取模型」按钮最坏挂 4×超时。
+/// 这些都是秒级应答的元数据 GET / 1-token 探测，30s 是宽裕上限，不该继承长生成超时。
+pub fn fast_timeout(key: &ProviderKey) -> Duration {
+    key_timeout(key).min(Duration::from_secs(30))
 }
 
 /// 返回共享客户端（保留旧签名以最小化改动；总超时改由调用点逐请求 `.timeout()` 指定）。

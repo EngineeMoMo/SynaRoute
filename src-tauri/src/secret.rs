@@ -1,29 +1,25 @@
 //! 密钥加密存储（FR-018 / NFR-006）
 //!
-//! 双模式（arch-decisions §3）：
-//! - 默认 DPAPI 免口令：用 Windows DPAPI 绑定当前用户账户加密，无需口令。
-//! - 可选主口令增强：用 Argon2 从主口令派生密钥，AES-256-GCM 加密。
+//! 当前仅实现 Windows DPAPI 免口令加密（绑定当前用户账户）。
+//! 主口令增强模式 UI 标注「开发中」且从未接线，相关解锁/派生代码已移除，避免死代码。
+//! vault 仍保留 master_mode/salt 字段以兼容旧 secrets 文件反序列化。
 //!
 //! 密钥单独存于 secrets 加密文件，绝不随 ProviderKey 经 IPC 下发前端。
 
 use crate::error::{AppError, AppResult};
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
-use aes_gcm::{Aes256Gcm, Nonce};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use rand::RngCore;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// 加密后的密钥库文件结构（落盘为 JSON）
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct SecretVault {
-    /// keyId -> base64(密文)，密文本身由所选模式加密
+    /// keyId -> base64(密文)
     entries: HashMap<String, String>,
-    /// 是否使用主口令模式
+    /// 历史主口令模式标记（当前运行时忽略，仅兼容旧文件）
+    #[serde(default)]
     master_mode: bool,
-    /// 主口令模式的随机盐（argon2 SaltString 格式，base64）。
-    /// 首次启用主口令时随机生成并落盘；后续解锁复用同一盐派生同一密钥。
-    /// 旧版本用固定盐（已废弃）——因主口令模式此前从未接线前端，无存量数据需迁移。
+    /// 历史主口令盐（当前运行时忽略，仅兼容旧文件）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     salt: Option<String>,
 }
@@ -31,48 +27,41 @@ struct SecretVault {
 pub struct SecretStore {
     path: PathBuf,
     vault: SecretVault,
-    /// 主口令模式下的 AES 密钥（内存态，不落盘）
-    master_key: Option<[u8; 32]>,
+    /// 加载时读/解析失败而降级为空库的标记。置位后首次落盘前必须先备份磁盘原文件——
+    /// 否则「空库 + 用户新存的一条」整份覆盖会销毁其余全部密文（与 config 的 init
+    /// fallback 覆盖同类风险）。备份失败则拒绝写入。
+    load_failed: bool,
 }
 
 impl SecretStore {
     pub fn load(path: PathBuf) -> AppResult<Self> {
-        let vault = if path.exists() {
-            let raw = std::fs::read(&path)?;
-            serde_json::from_slice(&raw).unwrap_or_default()
-        } else {
-            SecretVault::default()
-        };
-        Ok(Self { path, vault, master_key: None })
-    }
-
-    #[allow(dead_code)] // 主口令模式能力，前端接线后启用
-    pub fn is_master_mode(&self) -> bool {
-        self.vault.master_mode
-    }
-
-    /// 设置主口令（用于主口令模式解锁/初始化）。
-    /// 首次调用（vault 无盐）时生成随机盐并落盘；之后复用已存盐，保证同口令派生同密钥。
-    #[allow(dead_code)] // 主口令模式能力，前端接线后启用
-    pub fn unlock_with_master(&mut self, password: &str) -> AppResult<()> {
-        let salt = match &self.vault.salt {
-            Some(s) => s.clone(),
-            None => {
-                let s = generate_salt();
-                self.vault.salt = Some(s.clone());
-                // 落盘保存新盐（否则重启后无法用同口令解密已存密钥）
-                self.persist()?;
-                s
+        // 读失败与解析失败都降级为空库并留诊断日志，绝不让 app 起不来：
+        // 旧实现 `std::fs::read(&path)?` 会把瞬时读失败（杀软/备份独占锁、权限抖动）
+        // 一路冒泡到 Store::init().expect → panic、窗口永不创建，用户无从排障。
+        // 降级后 UI 正常、Key 可见，密钥暂不可用（转发时报「密钥缺失」），重启读成功即恢复。
+        let (vault, load_failed) = if path.exists() {
+            match std::fs::read(&path) {
+                Ok(raw) => match serde_json::from_slice::<SecretVault>(&raw) {
+                    Ok(v) => (v, false),
+                    Err(e) => {
+                        tracing::error!("密钥库解析失败,降级为空库(磁盘文件保持原样,不自动覆盖): {e}. 路径={path:?}");
+                        (SecretVault::default(), true)
+                    }
+                },
+                Err(e) => {
+                    tracing::error!("密钥库读取失败,降级为空库(磁盘文件保持原样,不自动覆盖): {e}. 路径={path:?}");
+                    (SecretVault::default(), true)
+                }
             }
+        } else {
+            (SecretVault::default(), false)
         };
-        let key = derive_key(password, &salt)?;
-        self.master_key = Some(key);
-        Ok(())
+        Ok(Self { path, vault, load_failed })
     }
 
     /// 保存一条密钥（加密）
     pub fn set(&mut self, key_id: &str, secret: &str) -> AppResult<()> {
-        let cipher = self.encrypt(secret.as_bytes())?;
+        let cipher = dpapi_encrypt(secret.as_bytes())?;
         self.vault.entries.insert(key_id.to_string(), STANDARD.encode(cipher));
         self.persist()
     }
@@ -83,7 +72,7 @@ impl SecretStore {
             return Ok(None);
         };
         let cipher = STANDARD.decode(b64).map_err(|e| AppError::Crypto(e.to_string()))?;
-        let plain = self.decrypt(&cipher)?;
+        let plain = dpapi_decrypt(&cipher)?;
         Ok(Some(String::from_utf8_lossy(&plain).to_string()))
     }
 
@@ -92,78 +81,25 @@ impl SecretStore {
         self.persist()
     }
 
-    fn persist(&self) -> AppResult<()> {
+    fn persist(&mut self) -> AppResult<()> {
+        // 降级空库后的首次写入：先备份磁盘原文件（内含用户全部既有密文），备份失败则拒绝写，
+        // 防止「空库+单条新密钥」把原密钥库整份覆盖销毁。
+        if self.load_failed {
+            if self.path.exists() {
+                let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+                let bak = self.path.with_extension(format!("enc.corrupt-{ts}"));
+                std::fs::copy(&self.path, &bak).map_err(|e| {
+                    AppError::Other(format!(
+                        "密钥库处于降级态,备份原文件失败,已拒绝覆盖写入(避免销毁既有密文): {e}"
+                    ))
+                })?;
+                tracing::warn!("密钥库降级态首次写入,已备份原文件到 {bak:?}");
+            }
+            self.load_failed = false;
+        }
         let data = serde_json::to_vec_pretty(&self.vault)?;
         atomic_write(&self.path, &data)
     }
-
-    // ---- 加解密分派 ----
-
-    fn encrypt(&self, plain: &[u8]) -> AppResult<Vec<u8>> {
-        if let Some(key) = &self.master_key {
-            aes_encrypt(key, plain)
-        } else {
-            dpapi_encrypt(plain)
-        }
-    }
-
-    fn decrypt(&self, cipher: &[u8]) -> AppResult<Vec<u8>> {
-        if let Some(key) = &self.master_key {
-            aes_decrypt(key, cipher)
-        } else {
-            dpapi_decrypt(cipher)
-        }
-    }
-}
-
-/// 生成随机盐并编码为 b64（存进 vault，与密钥库同寿命）。
-#[allow(dead_code)] // 主口令模式能力，前端接线后启用
-fn generate_salt() -> String {
-    use argon2::password_hash::SaltString;
-    let mut rng = OsRng;
-    SaltString::generate(&mut rng).as_str().to_string()
-}
-
-/// 用 Argon2 从主口令 + 已存随机盐派生 32 字节 AES 密钥。
-/// 盐随 vault 落盘，保证同口令每次派生同一密钥（否则无法解密已存数据），
-/// 同时避免固定盐带来的彩虹表风险。
-#[allow(dead_code)] // 主口令模式能力，前端接线后启用
-fn derive_key(password: &str, salt_b64: &str) -> AppResult<[u8; 32]> {
-    use argon2::{Argon2, PasswordHasher};
-    use argon2::password_hash::SaltString;
-    let salt = SaltString::from_b64(salt_b64)
-        .map_err(|e| AppError::Crypto(format!("盐解析失败: {e}")))?;
-    let argon2 = Argon2::default();
-    let hash = argon2
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| AppError::Crypto(e.to_string()))?;
-    let hash_bytes = hash.hash.ok_or_else(|| AppError::Crypto("派生失败".into()))?;
-    let mut key = [0u8; 32];
-    let src = hash_bytes.as_bytes();
-    key.copy_from_slice(&src[..32.min(src.len())]);
-    Ok(key)
-}
-
-/// AES-256-GCM 加密：输出 [12B nonce | ciphertext]
-fn aes_encrypt(key: &[u8; 32], plain: &[u8]) -> AppResult<Vec<u8>> {
-    let cipher = Aes256Gcm::new(key.into());
-    let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ct = cipher.encrypt(nonce, plain).map_err(|e| AppError::Crypto(e.to_string()))?;
-    let mut out = nonce_bytes.to_vec();
-    out.extend_from_slice(&ct);
-    Ok(out)
-}
-
-fn aes_decrypt(key: &[u8; 32], data: &[u8]) -> AppResult<Vec<u8>> {
-    if data.len() < 12 {
-        return Err(AppError::Crypto("密文过短".into()));
-    }
-    let (nonce_bytes, ct) = data.split_at(12);
-    let cipher = Aes256Gcm::new(key.into());
-    let nonce = Nonce::from_slice(nonce_bytes);
-    cipher.decrypt(nonce, ct).map_err(|e| AppError::Crypto(e.to_string()))
 }
 
 // ---- DPAPI（仅 Windows）----
@@ -211,7 +147,6 @@ fn dpapi_decrypt(cipher: &[u8]) -> AppResult<Vec<u8>> {
 // 非 Windows 平台回退（开发期在其他平台也能编译；正式仅 Windows）
 #[cfg(not(windows))]
 fn dpapi_encrypt(plain: &[u8]) -> AppResult<Vec<u8>> {
-    // 回退：无 DPAPI 时用固定内建密钥，仅供非 Windows 开发调试
     aes_encrypt(&fallback_key(), plain)
 }
 
@@ -223,6 +158,35 @@ fn dpapi_decrypt(cipher: &[u8]) -> AppResult<Vec<u8>> {
 #[cfg(not(windows))]
 fn fallback_key() -> [u8; 32] {
     *b"synaroute-dev-fallback-key-32byte"
+}
+
+/// AES-256-GCM（仅非 Windows 开发回退使用）
+#[cfg(not(windows))]
+fn aes_encrypt(key: &[u8; 32], plain: &[u8]) -> AppResult<Vec<u8>> {
+    use aes_gcm::aead::{Aead, KeyInit, OsRng};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    use rand::RngCore;
+    let cipher = Aes256Gcm::new(key.into());
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ct = cipher.encrypt(nonce, plain).map_err(|e| AppError::Crypto(e.to_string()))?;
+    let mut out = nonce_bytes.to_vec();
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+#[cfg(not(windows))]
+fn aes_decrypt(key: &[u8; 32], data: &[u8]) -> AppResult<Vec<u8>> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    if data.len() < 12 {
+        return Err(AppError::Crypto("密文过短".into()));
+    }
+    let (nonce_bytes, ct) = data.split_at(12);
+    let cipher = Aes256Gcm::new(key.into());
+    let nonce = Nonce::from_slice(nonce_bytes);
+    cipher.decrypt(nonce, ct).map_err(|e| AppError::Crypto(e.to_string()))
 }
 
 /// 原子写：写临时文件再重命名替换，避免半写损坏（NFR-011 / dev-hard-rules）。
@@ -316,4 +280,84 @@ pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> AppResult<()> {
         "原地写(回退)",
         &last_err.unwrap_or_else(|| std::io::Error::other("未知落盘错误")),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("synaroute_secret_test_{}_{}_{}", tag, std::process::id(), seq));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 损坏的密钥库文件:load 不得报错(降级空库,app 能起),磁盘原文件保持原样。
+    #[test]
+    fn corrupt_vault_degrades_without_error_and_keeps_disk() {
+        let dir = temp_dir("corrupt_load");
+        let path = dir.join("secrets.enc");
+        std::fs::write(&path, b"{ not valid json !!").unwrap();
+
+        let store = SecretStore::load(path.clone()).expect("损坏文件不得让 load 报错(否则 init panic,app 打不开)");
+        assert!(store.vault.entries.is_empty(), "应降级为空库");
+        assert!(store.load_failed, "应置降级标记");
+        // 磁盘原文件未被动过
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not valid json !!", "load 阶段不得改写磁盘");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 降级态首次写入:必须先把原文件备份成 .enc.corrupt-*,防「空库+新单条」整份覆盖销毁既有密文。
+    #[test]
+    fn degraded_first_persist_backs_up_original() {
+        let dir = temp_dir("degraded_backup");
+        let path = dir.join("secrets.enc");
+        let original = b"{ corrupted but contains user ciphertexts }".to_vec();
+        std::fs::write(&path, &original).unwrap();
+
+        let mut store = SecretStore::load(path.clone()).unwrap();
+        assert!(store.load_failed);
+        store.set("k_new", "sk-test-secret").expect("降级态写入应成功(先备份后写)");
+
+        // 原文件字节должны保留在 .enc.corrupt-* 备份里
+        let backup = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().contains("enc.corrupt-"))
+            .expect("应生成 corrupt 备份文件");
+        assert_eq!(std::fs::read(backup.path()).unwrap(), original, "备份必须是原文件字节");
+
+        // 新库可解析、含且仅含新条目;标记已清除,二次写不再重复备份
+        let v: SecretVault = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v.entries.len(), 1);
+        assert!(v.entries.contains_key("k_new"));
+        assert!(!store.load_failed, "首次成功写入后应清除降级标记");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 正常路径:文件不存在→空库、无降级标记;写入无备份副作用。
+    #[test]
+    fn fresh_vault_set_get_roundtrip() {
+        let dir = temp_dir("fresh");
+        let path = dir.join("secrets.enc");
+        let mut store = SecretStore::load(path.clone()).unwrap();
+        assert!(!store.load_failed);
+
+        store.set("k1", "sk-abc").unwrap();
+        assert_eq!(store.get("k1").unwrap().as_deref(), Some("sk-abc"), "DPAPI 加解密应可逆");
+        // 无 corrupt 备份产生
+        let has_bak = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("corrupt"));
+        assert!(!has_bak, "正常路径不应产生 corrupt 备份");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

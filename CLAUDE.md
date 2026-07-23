@@ -17,6 +17,16 @@ npm run tauri build -- --no-bundle   # 只出 exe（快速验证）
 
 完整流程、验证判据、部署步骤见 [docs/04-构建部署指南.md](docs/04-构建部署指南.md)。
 
+## ⚠️ MSIX AppData 虚拟化陷阱（本项目最大惨案，务必先读）
+
+**Claude 桌面应用是 MSIX 打包**（包家族 `Claude_pzs8sxrjxfjjc`）。Windows 对包内进程做 AppData 虚拟化：**Claude Code 及其派生的一切子进程**（Bash/powershell/node/它启动的 SynaRoute）读写 `%APPDATA%\SynaRoute\*` 时，被透明重定向到 `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\SynaRoute\*` 的**包内私有副本**。用户双击 exe 无包身份，读写**真实文件**。→ 两个平行宇宙（曾致「用户 UI 4 条 Key vs Claude 处处验证 6 条」多日排查惨案）。
+
+由此的铁律：
+1. **诊断/修改用户真实 `%APPDATA%` 数据必须逃逸包身份**：`schtasks /Create ... /TR "F:\...\x.bat"` + `/Run`（计划任务服务启动无包身份）；bat 与产物放非 AppData 盘（F:\、E:\ 不被虚拟化）。Git Bash 下 schtasks 需 `MSYS_NO_PATHCONV=1`（用完 unset，否则破坏 `taskkill //F`）。
+2. **交付验证必须让用户亲自双击启动**，用共享的 exe 同级 `logs\`（非虚拟化）里的「启动自检」行核对（该日志记录每实例实际配置路径/keys 数/用户/exe，正为此设，勿删）。Claude 自己启动的实例活在虚拟宇宙，其表现不代表用户。
+3. 症状特征（复发速查）：同一 exe 用户开与 Claude 开数据不同；Claude 探针全对但用户仍旧；`%APPDATA%` 目录清单在 Claude 视角与计划任务视角不同。
+4. 不要删包容器里的虚拟副本（可能留 tombstone 遮蔽真实文件）。
+
 ## 其他硬规则
 
 - 改配置/二进制前必先备份（带日期后缀，可回滚）。
@@ -29,3 +39,4 @@ npm run tauri build -- --no-bundle   # 只出 exe（快速验证）
 - [docs/02-技术架构设计文档.md](docs/02-技术架构设计文档.md)
 - [docs/03-UIUX设计文档.md](docs/03-UIUX设计文档.md)
 - [docs/04-构建部署指南.md](docs/04-构建部署指南.md) ← 构建部署坑点与流程
+- [docs/11-MSIX虚拟化踩坑复盘.md](docs/11-MSIX虚拟化踩坑复盘.md) ← 平行宇宙惨案完整复盘与逃逸手段

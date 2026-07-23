@@ -32,26 +32,30 @@ const TYPE_META: Record<
   request: { tKey: "logs.type.request", variant: "neutral", icon: ArrowUpRight },
 };
 
-/** 日志分组：把事件类型归到 4 个用户可辨识的大类。 */
-type LogGroup = "system" | "brain" | "routing" | "error";
+/** 日志分组：把事件类型归到用户可辨识的大类。
+ * 「路由成功」与「故障转移」分开成两组：正常成功归 route（绿）、真正的换 Key 归 failover（橙），
+ * 这样想只看故障时点 failover 组即可，不再被大量正常成功刷屏。
+ * request（调用快照）归 route 组，作为路由链路的明细。 */
+type LogGroup = "system" | "brain" | "route" | "failover" | "error";
 
 const GROUP_OF: Record<EventLogEntry["type"], LogGroup> = {
   config: "system",
   health: "system",
   aggregate: "brain",
   mcp: "brain",
-  route: "routing",
-  failover: "routing",
-  request: "routing",
+  route: "route",
+  request: "route",
+  failover: "failover",
   error: "error",
 };
 
-const GROUP_ORDER: LogGroup[] = ["system", "brain", "routing", "error"];
+const GROUP_ORDER: LogGroup[] = ["system", "brain", "route", "failover", "error"];
 
 const GROUP_META: Record<LogGroup, { tKey: string; icon: LucideIcon; dot: string }> = {
   system: { tKey: "logs.group.system", icon: Settings2, dot: "bg-info" },
   brain: { tKey: "logs.group.brain", icon: Brain, dot: "bg-primary" },
-  routing: { tKey: "logs.group.routing", icon: Radio, dot: "bg-success" },
+  route: { tKey: "logs.group.route", icon: Radio, dot: "bg-success" },
+  failover: { tKey: "logs.group.failover", icon: ArrowLeftRight, dot: "bg-warning" },
   error: { tKey: "logs.group.error", icon: AlertCircle, dot: "bg-danger" },
 };
 
@@ -71,7 +75,7 @@ export function LogsPage() {
 
   // 每组事件计数（供筛选标签展示 + 决定该组是否渲染）。
   const counts = useMemo(() => {
-    const c: Record<LogGroup, number> = { system: 0, brain: 0, routing: 0, error: 0 };
+    const c: Record<LogGroup, number> = { system: 0, brain: 0, route: 0, failover: 0, error: 0 };
     for (const e of events) c[GROUP_OF[e.type] ?? "system"] += 1;
     return c;
   }, [events]);

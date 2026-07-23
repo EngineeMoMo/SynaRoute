@@ -266,7 +266,7 @@ export function BrainPage() {
                 label={t("brain.totalTimeout")}
                 value={config.totalTimeoutMs}
                 min={5000}
-                max={300000}
+                max={600000}
                 step={5000}
                 onChange={(v) => update({ totalTimeoutMs: v })}
               />
@@ -337,7 +337,7 @@ export function BrainPage() {
                   label={t("brain.maxContextTokens")}
                   value={config.maxContextTokens ?? 50000}
                   min={5000}
-                  max={200000}
+                  max={500000}
                   step={5000}
                   onChange={(v) => update({ maxContextTokens: v })}
                 />

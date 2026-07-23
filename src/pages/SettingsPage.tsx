@@ -98,6 +98,24 @@ export function SettingsPage() {
     });
   };
 
+  // MCP 重启：先停后起、强制重绑端口。用于端口变更/冲突排障/强制重连。
+  // 大脑聚合参数是每次调用实时读的，改了保存即生效，不需要走这里。
+  const [restarting, setRestarting] = useState(false);
+  const handleRestartMcp = () => {
+    setRestarting(true);
+    void api
+      .restartMcp()
+      .then((s) => {
+        setMcp(s);
+        showToast("success", t("settings.mcpRestarted", { port: String(s.port ?? mcpPort) }));
+      })
+      .catch((e) => {
+        console.error("restartMcp failed", e);
+        showToast("error", String((e as Error)?.message ?? e));
+      })
+      .finally(() => setRestarting(false));
+  };
+
   const themeOptions: { value: ThemePref; tKey: string; icon: LucideIcon }[] = [
     { value: "light", tKey: "settings.theme.light", icon: Sun },
     { value: "dark", tKey: "settings.theme.dark", icon: Moon },
@@ -281,9 +299,18 @@ export function SettingsPage() {
                   </Button>
                 </div>
 
-                <Button size="sm" variant="outline" onClick={() => setShowWizard(true)}>
-                  <BookOpen size={14} /> {t("settings.mcpWizard")}
-                </Button>
+                <div className="flex flex-wrap gap-2">
+                  <Button size="sm" variant="outline" onClick={() => setShowWizard(true)}>
+                    <BookOpen size={14} /> {t("settings.mcpWizard")}
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={handleRestartMcp} disabled={restarting}>
+                    <RefreshCw size={14} className={restarting ? "animate-spin" : ""} /> {t("settings.mcpRestart")}
+                  </Button>
+                </div>
+                <div className="flex items-start gap-1.5 text-xs text-text-muted">
+                  <Info size={13} className="mt-0.5 shrink-0" />
+                  <span>{t("settings.mcpRestartHint")}</span>
+                </div>
               </>
             )}
           </CardContent>

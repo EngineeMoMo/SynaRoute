@@ -9,11 +9,16 @@ import { type ProviderKey, protocolLabel } from "@/types";
 import { useStore } from "@/store";
 import { formatRelativeTime } from "@/lib/utils";
 import { useT } from "@/lib/useT";
-import { GripVertical, RefreshCw, Pencil, Trash2, ArrowRight } from "lucide-react";
+import { ChevronUp, ChevronDown, RefreshCw, Pencil, Trash2, ArrowRight } from "lucide-react";
 
 /** 单个厂商 Key 卡片（FR-001/003/006/010/011） */
-export function KeyCard({ k, onEdit }: { k: ProviderKey; onEdit: (k: ProviderKey) => void }) {
-  const { toggleKey, deleteKey, checkHealth, vendors } = useStore();
+export function KeyCard({ k, onEdit, isFirst, isLast }: {
+  k: ProviderKey;
+  onEdit: (k: ProviderKey) => void;
+  isFirst: boolean;
+  isLast: boolean;
+}) {
+  const { toggleKey, deleteKey, checkHealth, moveKey, vendors } = useStore();
   const t = useT();
   const vendorIcon = vendors.find((v) => v.id === k.vendor)?.icon;
   // 就地二次确认：不用原生 confirm()（在 Tauri WebView2 里行为不可靠，会导致删除不触发）
@@ -22,13 +27,28 @@ export function KeyCard({ k, onEdit }: { k: ProviderKey; onEdit: (k: ProviderKey
   return (
     <Card className="p-0">
       <div className="flex items-start gap-3 p-4">
-        {/* 拖拽手柄（优先级排序，FR-010） */}
-        <button
-          className="mt-1 cursor-grab text-text-muted hover:text-text-secondary"
-          title={t("key.dragPriority")}
-        >
-          <GripVertical size={16} />
-        </button>
+        {/* 优先级上移/下移（FR-010）：越靠上越优先，故障转移先用它。
+            拖拽在 Tauri WebView 里不稳，改用明确的上/下按钮，点一下与相邻 Key 交换。 */}
+        <div className="mt-0.5 flex flex-col">
+          <button
+            className="text-text-muted hover:text-text-secondary disabled:cursor-not-allowed disabled:opacity-30"
+            title={t("key.moveUp")}
+            aria-label={t("key.moveUp")}
+            disabled={isFirst}
+            onClick={() => void moveKey(k.id, "up")}
+          >
+            <ChevronUp size={15} />
+          </button>
+          <button
+            className="text-text-muted hover:text-text-secondary disabled:cursor-not-allowed disabled:opacity-30"
+            title={t("key.moveDown")}
+            aria-label={t("key.moveDown")}
+            disabled={isLast}
+            onClick={() => void moveKey(k.id, "down")}
+          >
+            <ChevronDown size={15} />
+          </button>
+        </div>
 
         <BrandIcon hint={k.vendor} fallbackLabel={k.name} iconUrl={vendorIcon} size={28} className="mt-0.5" />
 

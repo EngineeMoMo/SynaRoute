@@ -51,6 +51,7 @@ interface AppState {
   loadSettings: () => Promise<void>;
   loadVendors: () => Promise<void>;
   toggleKey: (keyId: string, enabled: boolean) => Promise<void>;
+  moveKey: (keyId: string, direction: "up" | "down") => Promise<void>;
   deleteKey: (keyId: string) => Promise<void>;
   checkHealth: (keyId: string) => Promise<void>;
   startProxy: () => Promise<void>;
@@ -180,6 +181,38 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
     await get().loadCategory(get().activeCategory);
+  },
+
+  // 调整故障转移优先级：在「同分类的全部 Key」按优先级排序后，与相邻 Key 交换位置。
+  // 重排后把整列优先级重新赋为连续值 0,1,2…，一劳永逸消除「全 999 同级」——
+  // 只有优先级互不相同，故障转移才有确定的主/备顺序（否则永远先打第一个 Key，触发限流）。
+  async moveKey(keyId, direction) {
+    const cat = get().activeCategory;
+    const ordered = [...get().keys]
+      .filter((k) => k.categoryId === cat)
+      .sort((a, b) => a.priority - b.priority);
+    const idx = ordered.findIndex((k) => k.id === keyId);
+    if (idx < 0) return;
+    const swapWith = direction === "up" ? idx - 1 : idx + 1;
+    if (swapWith < 0 || swapWith >= ordered.length) return; // 已在两端，无法再移
+
+    [ordered[idx], ordered[swapWith]] = [ordered[swapWith], ordered[idx]];
+    // 规整为连续优先级 0,1,2…（消除全 999 同级），只对优先级真正变化的 Key 落盘。
+    const renumbered = ordered.map((k, i) => ({ ...k, priority: i }));
+    const toPersist = renumbered.filter((k) => {
+      const orig = get().keys.find((o) => o.id === k.id);
+      return orig && orig.priority !== k.priority;
+    });
+    // 乐观更新：立即用新优先级刷新列表。
+    const byId = new Map(renumbered.map((k) => [k.id, k]));
+    set({ keys: get().keys.map((k) => byId.get(k.id) ?? k) });
+    try {
+      await Promise.all(toPersist.map((k) => api.upsertKey(k)));
+    } catch (e) {
+      console.error("moveKey failed", e);
+      get().showToast("error", String((e as Error)?.message ?? e));
+    }
+    await get().loadCategory(cat);
   },
 
   async deleteKey(keyId) {

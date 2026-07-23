@@ -237,14 +237,21 @@ async fn handle_request(
             return;
         }
         let shown_model = if requested_model.is_empty() { "?" } else { &requested_model };
+        // 与路由成功日志同一口径：用 fmt_route_model 生成动词化的模型段，避免两处不一致。
+        // 这里 real_model 由调用方传入（可能是尝试写出去的模型名或 resolve_model 结果），
+        // 若无法从 requested + real 反推 kind，就展示 `客户端要 X → 实际用 Y` / 同名时 `模型 X`。
+        let model_part = if shown_model == real_model.as_str() {
+            format!("模型 {real_model}")
+        } else {
+            format!("客户端要 {shown_model} → 实际用 {real_model}")
+        };
         let detail = if ok {
-            format!("{} · {} → {} · {}ms", key.name, shown_model, real_model, elapsed)
+            format!("{} · {} · {}ms", key.name, model_part, elapsed)
         } else {
             format!(
-                "{} · {} → {} · {}ms · 失败{}",
+                "{} · {} · {}ms · 失败{}",
                 key.name,
-                shown_model,
-                real_model,
+                model_part,
                 elapsed,
                 status.map(|s| format!(" HTTP {s}")).unwrap_or_default()
             )
@@ -273,8 +280,38 @@ async fn handle_request(
     };
 
     let mut last_err = String::new();
-    for key in &candidates {
+    for (i, key) in candidates.iter().enumerate() {
         let started = std::time::Instant::now();
+        let next = candidates.get(i + 1);
+        // 故障转移日志：写清「谁失败（客户端要什么/实际打的什么）→ 转给谁」，避免只写「尝试下一个」看不出链路。
+        let log_failover = |store: &Arc<Store>,
+                            failed: &ProviderKey,
+                            verb: &str,
+                            err: &str,
+                            next: Option<&ProviderKey>| {
+            let failed_model = fmt_route_model_for_key(failed, &requested_model);
+            // 用 · 分隔 Key 名 / 模型段 / 动词，避免视觉黏连产生「Key 上有 X」误读。
+            let detail = match next {
+                Some(n) => {
+                    let next_model = fmt_route_model_for_key(n, &requested_model);
+                    format!(
+                        "{} · {} · {} → 转移 {} · {}",
+                        failed.name, failed_model, verb, n.name, next_model
+                    )
+                }
+                None => format!(
+                    "{} · {} · {}（无后续候选）：{}",
+                    failed.name, failed_model, verb, err
+                ),
+            };
+            // 有后续时附简短原因；无后续时原因已写在 detail 里，避免重复。
+            let detail = if next.is_some() && !err.is_empty() {
+                format!("{detail}（{err}）")
+            } else {
+                detail
+            };
+            store.append_event(category, "failover", Some(&failed.id), &detail);
+        };
 
         // 流式直通分支：下游要 stream 且无需跨协议转换 → 真流式透传（边收边发）。
         // 先探上游状态码：非 2xx 则照常切换下一个 Key（首字节尚未发出，切换安全）；
@@ -288,9 +325,9 @@ async fn handle_request(
                         "route",
                         Some(&key.id),
                         &format!(
-                            "{} 流式返回 {}",
+                            "{} · 流式返回 · {}",
                             key.name,
-                            fmt_route_model(&requested_model, &mapped_model(key, &requested_model))
+                            fmt_route_model_for_key(key, &requested_model)
                         ),
                     );
                     return Ok(resp);
@@ -305,12 +342,16 @@ async fn handle_request(
                         format!("HTTP {status}: {snippet}")
                     };
                     log_request(&store, key, elapsed, url, real_model, downstream_body.clone(), body, Some(status), false);
-                    health::record_live_failure(&store, &key.id);
-                    store.append_event(
-                        category,
-                        "failover",
-                        Some(&key.id),
-                        &format!("{} 失败（{}），尝试下一个", key.name, last_err),
+                    // 429/5xx 临时错误只切、不罚（不熔断好 Key）；4xx 硬错误才计入熔断。
+                    if status_counts_against_breaker(status) {
+                        health::record_live_failure(&store, &key.id);
+                    }
+                    log_failover(
+                        &store,
+                        key,
+                        failover_verb(status),
+                        &last_err,
+                        next,
                     );
                     continue;
                 }
@@ -318,14 +359,9 @@ async fn handle_request(
                 Err(e) => {
                     let elapsed = started.elapsed().as_millis() as u64;
                     last_err = e.to_string();
-                    log_request(&store, key, elapsed, String::new(), mapped_model(key, &requested_model), downstream_body.clone(), last_err.clone(), None, false);
+                    log_request(&store, key, elapsed, String::new(), key.resolve_model(&requested_model), downstream_body.clone(), last_err.clone(), None, false);
                     health::record_live_failure(&store, &key.id);
-                    store.append_event(
-                        category,
-                        "failover",
-                        Some(&key.id),
-                        &format!("{} 失败（{}），尝试下一个", key.name, last_err),
-                    );
+                    log_failover(&store, key, "失败", &last_err, next);
                     continue;
                 }
             }
@@ -336,12 +372,7 @@ async fn handle_request(
         // 跳过该候选，让故障转移去找可流式的 Key；若最终都不可流式，循环结束统一回 502。
         if wants_stream && !can_stream(key) {
             last_err = "流式请求不支持跨协议转换（该 Key 协议与下游不一致）".to_string();
-            store.append_event(
-                category,
-                "failover",
-                Some(&key.id),
-                &format!("{} 跳过（{}），尝试下一个", key.name, last_err),
-            );
+            log_failover(&store, key, "跳过", &last_err, next);
             continue;
         }
 
@@ -367,9 +398,9 @@ async fn handle_request(
                     "route",
                     Some(&key.id),
                     &format!(
-                        "{} 成功返回 {}",
+                        "{} · 成功返回 · {}",
                         key.name,
-                        fmt_route_model(&requested_model, &outcome.real_model)
+                        fmt_route_model_for_key(key, &requested_model)
                     ),
                 );
                 return Ok(json_resp(StatusCode::OK, outcome.bytes));
@@ -394,12 +425,16 @@ async fn handle_request(
                     Some(outcome.status),
                     false,
                 );
-                health::record_live_failure(&store, &key.id);
-                store.append_event(
-                    category,
-                    "failover",
-                    Some(&key.id),
-                    &format!("{} 失败（{}），尝试下一个", key.name, last_err),
+                // 429/5xx 临时错误只切、不罚（不熔断好 Key）；4xx 硬错误才计入熔断。
+                if status_counts_against_breaker(outcome.status) {
+                    health::record_live_failure(&store, &key.id);
+                }
+                log_failover(
+                    &store,
+                    key,
+                    failover_verb(outcome.status),
+                    &last_err,
+                    next,
                 );
             }
             // 连接层失败（无响应）：也记一条日志，response_body 为错误信息
@@ -410,19 +445,14 @@ async fn handle_request(
                     key,
                     elapsed,
                     String::new(),
-                    mapped_model(key, &requested_model),
+                    key.resolve_model(&requested_model),
                     downstream_body.clone(),
                     last_err.clone(),
                     None,
                     false,
                 );
                 health::record_live_failure(&store, &key.id);
-                store.append_event(
-                    category,
-                    "failover",
-                    Some(&key.id),
-                    &format!("{} 失败（{}），尝试下一个", key.name, last_err),
-                );
+                log_failover(&store, key, "失败", &last_err, next);
             }
         }
     }
@@ -843,19 +873,71 @@ fn is_stripped_header(name: &str) -> bool {
     )
 }
 
-/// 解析后真实模型名（日志展示用，与 forward 内解析逻辑一致，见 ProviderKey::resolve_model）。
-fn mapped_model(key: &ProviderKey, requested_model: &str) -> String {
-    key.resolve_model(requested_model)
+/// 上游返回某状态码时，是否该「计入熔断」（惩罚该 Key）。
+///
+/// 429（限流）与 5xx（网关/后端临时故障）都是**临时性**、Key 本身没坏：
+/// - 429 requests-per-minute：这一分钟请求满了，下一分钟自动恢复，不该把好 Key 熔断 60s。
+/// - 502/503/504：中转商网关抖动，同样短暂。
+///
+/// 这类只做「切下一个 Key 应急」，但**不累加 fail_count、不熔断**——下个请求仍优先用它。
+///
+/// 4xx（除 429）才是确定性故障：401/403 鉴权失败、400 参数错、404 模型不存在——
+/// 这种重试/保留都没意义，计入熔断，连续几次后把它熔断掉，避免每个请求都白试。
+fn status_counts_against_breaker(status: u16) -> bool {
+    !matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
-/// 路由成功日志里的模型展示：发生映射时显示「原名 → 真实名」，
-/// 原生透传（两者相同）或原名缺失时只显示单个名字，避免冗余。
-fn fmt_route_model(requested: &str, real: &str) -> String {
-    if requested.is_empty() || requested == real {
-        real.to_string()
+/// 故障转移日志里的动词：临时错误（429/5xx）用「限流/繁忙，暂避」，
+/// 确定性错误用「失败」。让用户一眼区分「Key 坏了」和「Key 只是这一下满了」。
+fn failover_verb(status: u16) -> &'static str {
+    if status_counts_against_breaker(status) {
+        "失败"
     } else {
-        format!("{requested} → {real}")
+        "限流/繁忙，暂避"
     }
+}
+
+/// 路由成功日志里的模型展示，必须一眼看清「客户端要什么 / 实际上游用什么 / 为什么改」。
+///
+/// 旧写法 `百倍 流式返回 请求=grok-4.5 实际=claude-opus-4-7（默认兜底）`：
+/// 「百倍」与「grok-4.5」相邻，读起来像「百倍这个 Key 上有 grok-4.5」，产生歧义。
+///
+/// 新写法用动词把「客户端 → Key」的关系显式化，并对「Key 不支持该模型」明说：
+/// - 原生:          `模型 glm-5.2`
+/// - 透传:          `模型 grok-4.5（未配模型清单，原样透传）`
+/// - 映射:          `客户端要 claude-opus-4-8 → 映射为 glm-5.2`
+/// - 三档:          `客户端要 claude-sonnet-4-5 → 三档命中 glm-4.6`
+/// - 默认兜底:      `客户端要 grok-4.5（此 Key 不支持）→ 兜底改写为 claude-opus-4-7`
+/// - 列表首个:      `客户端要 grok-4.5（此 Key 不支持）→ 取列表首个 claude-opus-4-7`
+fn fmt_route_model(requested: &str, real: &str, kind: crate::model::ModelResolveKind) -> String {
+    use crate::model::ModelResolveKind;
+    // 请求名为空（极少见，正常请求都会带 model 字段）：只报实际用哪个
+    if requested.is_empty() {
+        return format!("模型 {real}（{}）", kind.label_zh());
+    }
+    match kind {
+        // 原生同名：请求什么就用什么，不啰嗦
+        ModelResolveKind::Native => format!("模型 {real}"),
+        // 透传：Key 未配模型清单，原样发出（可能上游不支持）
+        ModelResolveKind::Passthrough => format!("模型 {real}（未配模型清单，原样透传）"),
+        // 精确映射：用户显式配的规则
+        ModelResolveKind::Mapping => format!("客户端要 {requested} → 映射为 {real}"),
+        // 三档匹配：haiku/sonnet/opus 家族级
+        ModelResolveKind::Tier => format!("客户端要 {requested} → 三档命中 {real}"),
+        // 兜底路径：明说「此 Key 不支持」消除歧义
+        ModelResolveKind::Default => {
+            format!("客户端要 {requested}（此 Key 不支持）→ 兜底改写为 {real}")
+        }
+        ModelResolveKind::First => {
+            format!("客户端要 {requested}（此 Key 不支持）→ 取列表首个 {real}")
+        }
+    }
+}
+
+/// 按 Key 解析并格式化路由日志模型段（成功/流式成功共用）。
+fn fmt_route_model_for_key(key: &ProviderKey, requested: &str) -> String {
+    let (real, kind) = key.resolve_model_detail(requested);
+    fmt_route_model(requested, &real, kind)
 }
 
 fn json_resp(status: StatusCode, body: Bytes) -> Response<ResBody> {
@@ -886,6 +968,21 @@ mod tests {
             .join(format!("synaroute_proxy_test_{}_{}_{}", tag, std::process::id(), seq));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn breaker_spares_transient_status_penalizes_hard_errors() {
+        // 429 限流 + 5xx 网关抖动：Key 没坏，只切不罚（不熔断）。
+        for s in [429u16, 500, 502, 503, 504] {
+            assert!(!status_counts_against_breaker(s), "HTTP {s} 不应计入熔断");
+        }
+        // 4xx（除 429）鉴权/参数硬错误：计入熔断。
+        for s in [400u16, 401, 403, 404, 422] {
+            assert!(status_counts_against_breaker(s), "HTTP {s} 应计入熔断");
+        }
+        // 日志动词：临时错误说「暂避」，硬错误说「失败」。
+        assert_eq!(failover_verb(429), "限流/繁忙，暂避");
+        assert_eq!(failover_verb(401), "失败");
     }
 
     fn key(id: &str, priority: i32, base_url: &str) -> ProviderKey {
@@ -1046,13 +1143,44 @@ mod tests {
     }
 
     #[test]
-    fn fmt_route_model_shows_mapping_only_when_differs() {
-        // 发生映射：显示「原名 → 真实名」
-        assert_eq!(fmt_route_model("claude-opus-4-8", "glm-5.2"), "claude-opus-4-8 → glm-5.2");
-        // 原生透传（相同）：只显示单个
-        assert_eq!(fmt_route_model("glm-5.2", "glm-5.2"), "glm-5.2");
-        // 原名缺失：只显示真实名
-        assert_eq!(fmt_route_model("", "glm-5.2"), "glm-5.2");
+    fn fmt_route_model_shows_request_actual_and_reason() {
+        use crate::model::ModelResolveKind;
+        // 默认兜底改写：明说「此 Key 不支持」，消除「Key 上有 grok」的歧义。
+        // 与 Key 名拼接后是 `百倍 流式返回 客户端要 grok-4.5（此 Key 不支持）→ 兜底改写为 claude-opus-4-7`
+        assert_eq!(
+            fmt_route_model("grok-4.5", "claude-opus-4-7", ModelResolveKind::Default),
+            "客户端要 grok-4.5（此 Key 不支持）→ 兜底改写为 claude-opus-4-7"
+        );
+        // 映射改写：动词显式，不再用「请求=/实际=」
+        assert_eq!(
+            fmt_route_model("claude-opus-4-8", "glm-5.2", ModelResolveKind::Mapping),
+            "客户端要 claude-opus-4-8 → 映射为 glm-5.2"
+        );
+        // 三档命中
+        assert_eq!(
+            fmt_route_model("claude-sonnet-4-5", "glm-4.6", ModelResolveKind::Tier),
+            "客户端要 claude-sonnet-4-5 → 三档命中 glm-4.6"
+        );
+        // 原生同名：简洁
+        assert_eq!(
+            fmt_route_model("glm-5.2", "glm-5.2", ModelResolveKind::Native),
+            "模型 glm-5.2"
+        );
+        // 透传：明说未配清单
+        assert_eq!(
+            fmt_route_model("grok-4.5", "grok-4.5", ModelResolveKind::Passthrough),
+            "模型 grok-4.5（未配模型清单，原样透传）"
+        );
+        // 列表首个兜底
+        assert_eq!(
+            fmt_route_model("grok-4.5", "claude-opus-4-7", ModelResolveKind::First),
+            "客户端要 grok-4.5（此 Key 不支持）→ 取列表首个 claude-opus-4-7"
+        );
+        // 请求名为空（罕见）
+        assert_eq!(
+            fmt_route_model("", "glm-5.2", ModelResolveKind::First),
+            "模型 glm-5.2（列表首个）"
+        );
     }
 
     #[tokio::test]

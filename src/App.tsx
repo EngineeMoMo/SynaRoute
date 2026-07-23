@@ -16,7 +16,7 @@ import type { CategoryType, ProviderKey } from "@/types";
 const CATEGORY_KEYS: NavKey[] = ["claude-cli", "claude-desktop", "codex"];
 
 export default function App() {
-  const { activeCategory, setActiveCategory, loadCategory, loadSettings, loadVendors, theme } = useStore();
+  const { activeCategory, setActiveCategory, loadCategory, loadSettings, loadVendors, refreshCategory, theme } = useStore();
   const t = useT();
   const [nav, setNav] = useState<NavKey>("claude-cli");
   const [editorOpen, setEditorOpen] = useState(false);
@@ -29,6 +29,29 @@ export default function App() {
     void loadCategory(activeCategory);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 窗口重新聚焦/可见时立即刷新到磁盘最新（纵深防御）。
+  // 场景：单实例锁二次唤起已有窗口、用户切回窗口、外部改了配置——避免继续展示
+  // 「进程启动那一刻」的陈旧快照（如 Key 数与磁盘背离）。这是对 CategoryPage 5s
+  // 轮询 + 后端 mtime 自愈的补充：把「最坏等 5s」提前到「切回即最新」。
+  useEffect(() => {
+    let last = 0;
+    const refresh = () => {
+      const now = Date.now();
+      if (now - last < 800) return; // 轻防抖：focus 与 visibilitychange 可能同刻触发
+      last = now;
+      void refreshCategory();
+    };
+    const onVis = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [refreshCategory]);
 
   // 跟随系统主题变化
   useEffect(() => {

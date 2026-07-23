@@ -170,4 +170,9 @@ export const api = {
       { categoryId, enabled, port },
       async () => ({ running: enabled, port }),
     ),
+
+  // 手动重启 MCP 服务：先停后起，强制重新绑定端口。用于改端口后立即重绑、端口冲突排障、
+  // 或客户端连不上时强制重连。大脑聚合参数改后保存即生效，不需要走这里。
+  restartMcp: () =>
+    call<McpStatus>("restart_mcp", undefined, async () => ({ running: true })),
 };

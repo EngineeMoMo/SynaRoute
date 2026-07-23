@@ -77,7 +77,15 @@ export function CategoryPage({ onAddKey, onEditKey }: {
         )}
 
         {!loading &&
-          sorted.map((k) => <KeyCard key={k.id} k={k} onEdit={onEditKey} />)}
+          sorted.map((k, i) => (
+            <KeyCard
+              key={k.id}
+              k={k}
+              onEdit={onEditKey}
+              isFirst={i === 0}
+              isLast={i === sorted.length - 1}
+            />
+          ))}
       </div>
     </div>
   );

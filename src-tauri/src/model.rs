@@ -264,6 +264,37 @@ pub struct ProviderKey {
     pub health: HealthState,
 }
 
+/// `resolve_model` 的命中路径，供日志展示「为什么变成这个模型」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelResolveKind {
+    /// 自由映射 exact match
+    Mapping,
+    /// 三档家族（haiku/sonnet/opus）
+    Tier,
+    /// Key 的 models 列表里原生有这个名
+    Native,
+    /// 落到 default_model
+    Default,
+    /// 落到 models 列表首个
+    First,
+    /// 无任何配置，原样透传
+    Passthrough,
+}
+
+impl ModelResolveKind {
+    /// 中文标签，用于路由日志括号说明
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Self::Mapping => "映射",
+            Self::Tier => "三档",
+            Self::Native => "原生",
+            Self::Default => "默认兜底",
+            Self::First => "列表首个",
+            Self::Passthrough => "透传",
+        }
+    }
+}
+
 impl ProviderKey {
     /// 解析故障转移到本 Key 时应实际请求的上游模型名（参考 cc-switch，取长补短）。
     ///
@@ -278,21 +309,26 @@ impl ProviderKey {
     /// 三档放在「原生支持」之前：Claude Code 发的是 `claude-sonnet-4-5-*` 等家族名，
     /// 上游多半不原生支持，应优先落三档；自由映射仍在最前——用户手配精确映射永远赢。
     pub fn resolve_model(&self, requested_model: &str) -> String {
+        self.resolve_model_detail(requested_model).0
+    }
+
+    /// 同 [`Self::resolve_model`]，额外返回命中路径，供日志写清「请求/实际/原因」。
+    pub fn resolve_model_detail(&self, requested_model: &str) -> (String, ModelResolveKind) {
         // 1. 映射命中（精确名，最高优先级）
         if let Some(m) = self
             .mappings
             .iter()
             .find(|m| m.expected_name == requested_model)
         {
-            return m.real_name.clone();
+            return (m.real_name.clone(), ModelResolveKind::Mapping);
         }
         // 2. 三档命中（家族级：按模型名包含 haiku/sonnet/opus 子串匹配，CC 版本号常变故不精确匹配）
         if let Some(tier) = self.match_tier(requested_model) {
-            return tier;
+            return (tier, ModelResolveKind::Tier);
         }
         // 3. 本 Key 原生支持该模型名
         if self.models.iter().any(|m| m.real_name == requested_model) {
-            return requested_model.to_string();
+            return (requested_model.to_string(), ModelResolveKind::Native);
         }
         // 4. 默认兜底模型
         if let Some(dm) = self
@@ -301,14 +337,14 @@ impl ProviderKey {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
         {
-            return dm.to_string();
+            return (dm.to_string(), ModelResolveKind::Default);
         }
         // 5. 第一个模型
         if let Some(first) = self.models.first() {
-            return first.real_name.clone();
+            return (first.real_name.clone(), ModelResolveKind::First);
         }
         // 6. 透传
-        requested_model.to_string()
+        (requested_model.to_string(), ModelResolveKind::Passthrough)
     }
 
     /// 三档家族匹配：`requested` 含 opus/sonnet/haiku 子串且配了对应档位 → 返回该档真实名。
@@ -685,6 +721,10 @@ mod tests {
         // 映射优先级最高，即便该 Key 原生也有同名模型/默认兜底也走映射
         let k = key_with(vec![model("opus-4-8")], vec![mapping("opus-4-8", "glm-5")], Some("kimi-k2"));
         assert_eq!(k.resolve_model("opus-4-8"), "glm-5");
+        assert_eq!(
+            k.resolve_model_detail("opus-4-8"),
+            ("glm-5".into(), ModelResolveKind::Mapping)
+        );
     }
 
     #[test]
@@ -692,6 +732,10 @@ mod tests {
         // 无映射，但该 Key 原生支持请求的模型名 → 原样使用（不误用兜底/首个）
         let k = key_with(vec![model("gpt-4o"), model("gpt-4o-mini")], vec![], Some("gpt-4o-mini"));
         assert_eq!(k.resolve_model("gpt-4o"), "gpt-4o");
+        assert_eq!(
+            k.resolve_model_detail("gpt-4o"),
+            ("gpt-4o".into(), ModelResolveKind::Native)
+        );
     }
 
     #[test]
@@ -699,6 +743,10 @@ mod tests {
         // 请求模型该 Key 没有、无映射 → 用用户配置的默认兜底模型（优先于「第一个模型」）
         let k = key_with(vec![model("glm-4.6"), model("glm-4.5")], vec![], Some("glm-4.6"));
         assert_eq!(k.resolve_model("opus-4-8"), "glm-4.6");
+        assert_eq!(
+            k.resolve_model_detail("opus-4-8"),
+            ("glm-4.6".into(), ModelResolveKind::Default)
+        );
     }
 
     #[test]
@@ -706,6 +754,10 @@ mod tests {
         // 没配默认兜底 → 取模型列表第一个
         let k = key_with(vec![model("deepseek-chat"), model("deepseek-reasoner")], vec![], None);
         assert_eq!(k.resolve_model("opus-4-8"), "deepseek-chat");
+        assert_eq!(
+            k.resolve_model_detail("opus-4-8"),
+            ("deepseek-chat".into(), ModelResolveKind::First)
+        );
     }
 
     #[test]
@@ -713,6 +765,10 @@ mod tests {
         // 什么都没配（未拉模型、无映射、无默认）→ 透传原请求名，保持旧行为
         let k = key_with(vec![], vec![], None);
         assert_eq!(k.resolve_model("opus-4-8"), "opus-4-8");
+        assert_eq!(
+            k.resolve_model_detail("opus-4-8"),
+            ("opus-4-8".into(), ModelResolveKind::Passthrough)
+        );
     }
 
     #[test]

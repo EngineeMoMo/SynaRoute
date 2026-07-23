@@ -42,7 +42,16 @@ impl Serialize for AppError {
 
 impl From<reqwest::Error> for AppError {
     fn from(e: reqwest::Error) -> Self {
-        AppError::Upstream(e.to_string())
+        // 展开错误源链：reqwest 顶层信息常是笼统的「error sending request for url (…)」，
+        // 真因（operation timed out / connection refused / dns error / tls…）藏在 source 链里。
+        // 曾因此把「非流式补全超过 30s 单请求超时」误读成上游不可达，排障半天——必须展开。
+        let mut msg = e.to_string();
+        let mut src = std::error::Error::source(&e);
+        while let Some(s) = src {
+            msg.push_str(&format!(" ← {s}"));
+            src = s.source();
+        }
+        AppError::Upstream(msg)
     }
 }
 

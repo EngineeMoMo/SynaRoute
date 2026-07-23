@@ -37,58 +37,27 @@ pub async fn check_one(store: &Arc<Store>, key_id: &str) {
     };
     let now = Utc::now().timestamp_millis();
 
-    // 探测可能长达 30s，期间 health 可能已被另一次检查（后台定时 / 前端手动）更新。
-    // 用探测「开始前」的旧快照会覆盖更新的结果（例如把刚探测成功的 Key 又基于旧 fail_count
-    // 熔断掉）。故此处重新读取最新 health 作为基线，把 TOCTOU 窗口从 30s 缩到微秒级。
+    // 探测/熔断分离（借鉴 cc-switch）：探测**只观测可达性**，写 status + latency，
+    // 绝不碰 breaker_until / fail_count。可达即 Up、连接层不可达即 Down；此 status 仅供
+    // UI 展示，不参与路由门槛（is_candidate 只看熔断窗口）。故一次探测端点 401 / 探测模型名
+    // 不匹配，再也不会把一个真实流量本可成功的 Key 踢出路由——熔断只由真实流量驱动。
+    // 探测可能长达 30s，期间 health 可能已被真实流量更新 breaker/fail_count，故读最新快照，
+    // 只覆盖 status/latency/last_checked 三个探测字段，其余原样保留。
     let prev = store.get_key(key_id).map(|k| k.health).unwrap_or_default();
-    let fail_count = if ok { 0 } else { prev.fail_count + 1 };
 
-    // 探测失败落日志（归「健康检查」分组）——旧实现丢弃了失败原因，导致探测失败静默、无从排查。
+    // 探测失败落日志（归「健康检查」分组）——供排查，但不触发任何熔断动作。
     if !ok {
         if let Some(reason) = &err {
             store.append_event(
                 key.category_id,
                 "health",
                 Some(key_id),
-                &format!("{} 健康探测失败：{reason}", key.name),
+                &format!("{} 健康探测失败（仅影响可达性展示，不熔断）：{reason}", key.name),
             );
         }
     }
 
-    // 「近期有真实转发成功」的宽限窗口：真实流量才是可用性的最终裁判。若该 Key 在最近
-    // GRACE 内成功服务过真实请求，则后台探测失败**不熔断**——避免探测端点（如 /models
-    // 返 401、或探测模型名与业务不一致）单方面把一个正在成功服务的 Key 熔断掉。
-    let recently_served = prev
-        .last_live_success
-        .map(|t| now - t < LIVE_SUCCESS_GRACE_MS)
-        .unwrap_or(false);
-
-    // 熔断态派生
-    let breaker_until = if ok {
-        None
-    } else if fail_count >= BREAKER_THRESHOLD && !recently_served {
-        Some(now + BREAKER_COOLDOWN_MS)
-    } else {
-        prev.breaker_until
-    };
-
-    // 探测失败但近期有真实成功 → 不判 Down（否则 is_candidate 会拒），保持原状态。
-    let status = if ok {
-        HealthStatus::Up
-    } else if recently_served {
-        prev.status
-    } else {
-        HealthStatus::Down
-    };
-
-    if !ok && recently_served {
-        store.append_event(
-            key.category_id,
-            "health",
-            Some(key_id),
-            &format!("{} 探测失败，但近期有真实请求成功，暂不熔断", key.name),
-        );
-    }
+    let status = if ok { HealthStatus::Up } else { HealthStatus::Down };
 
     let _ = store.update_health(
         key_id,
@@ -96,8 +65,9 @@ pub async fn check_one(store: &Arc<Store>, key_id: &str) {
             status,
             last_checked: Some(now),
             latency_ms: Some(latency),
-            fail_count,
-            breaker_until,
+            // 熔断相关字段原样保留——探测不参与熔断。
+            fail_count: prev.fail_count,
+            breaker_until: prev.breaker_until,
             last_live_success: prev.last_live_success,
         },
     );
@@ -161,42 +131,34 @@ pub fn record_live_success(store: &Arc<Store>, key_id: &str) {
     );
 }
 
-/// 判断某 Key 当前是否可作为路由候选（未熔断且非明确不可用）。
+/// 判断某 Key 当前是否可作为路由候选。
+///
+/// 探测/熔断分离（借鉴 cc-switch）：路由门槛**只看熔断窗口**，不看探测出的 `status`。
+/// 探测（`check_one`）只观测「可达性」用于 UI 展示，绝不影响路由——因为探测端点
+/// （/models 返 401、探测模型名与业务不符）常与真实业务不一致，让它决定路由会误杀
+/// 一个真实流量本可成功的 Key。熔断只由真实转发流量的连续失败驱动（record_live_failure）。
 pub fn is_candidate(health: &HealthState) -> bool {
     let now = Utc::now().timestamp_millis();
-    // 熔断中 → 不可用
-    if let Some(until) = health.breaker_until {
-        if until > now {
-            return false;
-        }
+    // 熔断中 → 不可用；其余（含探测判 Down 的）一律给机会——真实流量才是可用性裁判。
+    match health.breaker_until {
+        Some(until) => until <= now,
+        None => true,
     }
-    // down 明确不可用；up/unknown/checking 都允许尝试（unknown 表示尚未探测，给机会）
-    !matches!(health.status, HealthStatus::Down)
 }
 
-/// 忽略熔断窗口的候选判定（仅排除 Down）：用于「全熔断兜底」。
-/// 当所有候选都在熔断窗口内（如单 Key 场景下该 Key 刚被熔断），严格 is_candidate 会返回空、
-/// 使整个服务不可用。此时退而求其次：无视熔断，只要不是明确 Down 就仍给机会尝试——
-/// 有一个能用的 Key 也比直接 503 强（熔断本是为「多 Key 快速切换」设计，无处可切时不应自杀）。
-pub fn is_candidate_ignoring_breaker(health: &HealthState) -> bool {
-    !matches!(health.status, HealthStatus::Down)
-}
-
-/// 从一组 Key 选路由候选：优先取「未熔断」的；若全被熔断（候选为空），
-/// 则忽略熔断窗口兜底（只排除 Down），避免单 Key / 全熔断时整服务不可用。
+/// 从一组 Key 选路由候选：取「未熔断」的。
+/// 熔断只由真实流量驱动，故全被熔断意味着这些 Key 真实转发都在连续失败——
+/// 但仍返回它们（忽略熔断窗口兜底），避免单 Key / 全熔断时整服务直接 503：
+/// 有一个能试的 Key 也比不可用强（熔断本为「多 Key 快速切换」设计，无处可切时不应自杀）。
 /// 返回 (候选列表, 是否触发了兜底)。
 pub fn select_candidates(keys: Vec<crate::model::ProviderKey>) -> (Vec<crate::model::ProviderKey>, bool) {
     let primary: Vec<_> = keys.iter().filter(|k| is_candidate(&k.health)).cloned().collect();
     if !primary.is_empty() {
         return (primary, false);
     }
-    // 全熔断兜底：忽略熔断窗口，只要不是 Down 就重新纳入。
-    let fallback: Vec<_> = keys
-        .into_iter()
-        .filter(|k| is_candidate_ignoring_breaker(&k.health))
-        .collect();
-    let used_fallback = !fallback.is_empty();
-    (fallback, used_fallback)
+    // 全熔断兜底：忽略熔断窗口，全部重新纳入（探测态不参与门槛，故不再排除 Down）。
+    let used_fallback = !keys.is_empty();
+    (keys, used_fallback)
 }
 
 /// 后台定时健康检查（对某分类**已启用**的 Key）。
@@ -218,11 +180,16 @@ mod tests {
     }
 
     #[test]
-    fn candidate_allows_up_unknown_checking_rejects_down() {
+    fn candidate_gated_only_by_breaker_not_probe_status() {
+        // 探测/熔断分离后：路由门槛只看熔断窗口，探测出的 status 一律不影响候选资格。
+        // 未熔断时，即便探测判 Down（探测端点 401 / 模型名不符）也应给机会——真实流量才是裁判。
         assert!(is_candidate(&hs(HealthStatus::Up, 0, None)));
         assert!(is_candidate(&hs(HealthStatus::Unknown, 0, None)), "未探测应给机会");
         assert!(is_candidate(&hs(HealthStatus::Checking, 0, None)));
-        assert!(!is_candidate(&hs(HealthStatus::Down, 3, None)), "Down 明确不可用");
+        assert!(
+            is_candidate(&hs(HealthStatus::Down, 3, None)),
+            "分离后：探测判 Down 但未熔断 → 仍是候选（探测不再决定路由）"
+        );
     }
 
     #[test]
@@ -262,16 +229,17 @@ mod tests {
     }
 
     #[test]
-    fn select_candidates_excludes_down_even_in_fallback() {
-        // 明确 Down 的 Key 即使在兜底阶段也不纳入（探测确认过不可用）。
+    fn probe_down_key_still_routable_when_not_tripped() {
+        // 探测/熔断分离后：探测判 Down（仅可达性观测）但未被真实流量熔断的 Key，
+        // 仍应是候选——探测端点与真实业务常不一致，不能凭它把 Key 踢出路由。
         let down = {
             let mut k = key("down");
-            k.health = hs(HealthStatus::Down, 5, None);
+            k.health = hs(HealthStatus::Down, 0, None);
             k
         };
         let (cands, used_fallback) = select_candidates(vec![down]);
-        assert!(cands.is_empty(), "Down 不参与兜底");
-        assert!(!used_fallback);
+        assert_eq!(cands.len(), 1, "探测 Down 但未熔断的 Key 仍应可路由");
+        assert!(!used_fallback, "未熔断 → 走主路径，不是兜底");
     }
 
     // ---- 实时失败/成功喂熔断器 ----

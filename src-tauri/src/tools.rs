@@ -191,6 +191,15 @@ fn apply_claude_desktop(endpoint: &str) -> AppResult<String> {
 /// MCP 服务器在客户端配置里的固定名称（不随端口变化，故端口变了只需改 url）。
 const MCP_CLIENT_NAME: &str = "synaroute";
 
+/// 单次 MCP 工具调用超时（毫秒），写进客户端配置的 `timeout` 字段。
+///
+/// SynaRoute 的多模型聚合天然慢（多模型并行 + 决策者二次调用，实测 40~60s）。
+/// Claude Code 对 HTTP MCP 有两层超时：单次工具调用总时长、以及「首字节」per-request
+/// 计时器（默认 60s，请求超时不重试）。聚合逼近甚至超过 60s 就会被客户端判超时、重试。
+/// 官方文档：把 server 的 `timeout` 设为 ≥60s 会**同时**抬高首字节计时器到该值。
+/// 故这里统一写 600000（10 分钟），彻底覆盖聚合耗时，无需用户手动配。
+const MCP_TOOL_TIMEOUT_MS: u64 = 600_000;
+
 /// Claude 全局配置 ~/.claude.json（Claude CLI 的 mcpServers 存放处）。
 fn claude_json_path() -> AppResult<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| AppError::ToolConfig("无法定位用户目录".into()))?;
@@ -232,10 +241,13 @@ fn register_mcp_claude_at(path: &Path, mcp_url: &str) -> AppResult<(String, bool
         .as_object_mut()
         .ok_or_else(|| AppError::ToolConfig("mcpServers 非对象".into()))?;
 
-    // 幂等：已存在且 url 一致 → 不写盘。
+    // 幂等：已存在且 url / type / timeout 全一致 → 不写盘。
+    // 必须比对 timeout：否则老配置（无 timeout 或旧值）会因 url/type 匹配被判「已是最新」
+    // 而永远升不上 600000，超时修复形同虚设。
     if let Some(existing) = servers_obj.get(MCP_CLIENT_NAME) {
         if existing.get("url").and_then(|u| u.as_str()) == Some(mcp_url)
             && existing.get("type").and_then(|t| t.as_str()) == Some("http")
+            && existing.get("timeout").and_then(|t| t.as_u64()) == Some(MCP_TOOL_TIMEOUT_MS)
         {
             return Ok((format!("Claude MCP 已是最新（{mcp_url}），跳过"), false));
         }
@@ -252,11 +264,16 @@ fn register_mcp_claude_at(path: &Path, mcp_url: &str) -> AppResult<(String, bool
     ))
 }
 
-/// Claude 的 HTTP MCP 项：{ "type":"http", "url":"..." }（官方 mcpServers 结构）。
+/// Claude 的 HTTP MCP 项：{ "type":"http", "url":"...", "timeout":600000 }。
+/// timeout（毫秒）：Claude Code 对 HTTP MCP 有两层超时——单次工具调用总时长、以及
+/// 「首字节」per-request timer（默认 60s）。多模型聚合常需 40~60s 才吐首字节，逼近 60s 线
+/// 会被判超时并重试。官方文档：把 timeout 设为 ≥60s 会同时抬高首字节 timer 到该值，
+/// 故写 600000（10 分钟）彻底规避（见 code.claude.com/docs/en/mcp）。
 fn json_http_mcp(mcp_url: &str) -> Value {
     let mut m = serde_json::Map::new();
     m.insert("type".into(), Value::String("http".into()));
     m.insert("url".into(), Value::String(mcp_url.to_string()));
+    m.insert("timeout".into(), Value::Number(MCP_TOOL_TIMEOUT_MS.into()));
     Value::Object(m)
 }
 
@@ -311,16 +328,19 @@ fn register_mcp_codex_at(path: &Path, mcp_url: &str) -> AppResult<(String, bool)
         .as_table_mut()
         .ok_or_else(|| AppError::ToolConfig("mcp_servers 非表".into()))?;
 
-    // 幂等：已存在且 url 一致 → 不写盘。
+    // 幂等：已存在且 url / timeout 全一致 → 不写盘（timeout 必须比对，理由同 Claude 端）。
     if let Some(existing) = servers_table.get(MCP_CLIENT_NAME).and_then(|v| v.as_table()) {
-        if existing.get("url").and_then(|u| u.as_str()) == Some(mcp_url) {
+        if existing.get("url").and_then(|u| u.as_str()) == Some(mcp_url)
+            && existing.get("timeout").and_then(|t| t.as_integer()) == Some(MCP_TOOL_TIMEOUT_MS as i64)
+        {
             return Ok((format!("Codex MCP 已是最新（{mcp_url}），跳过"), false));
         }
     }
 
-    // HTTP transport 最小配置：仅一个 url（官方 config-reference）。
+    // HTTP transport：url + timeout（毫秒，理由见 json_http_mcp 注释）。
     let mut entry = toml::value::Table::new();
     entry.insert("url".to_string(), toml::Value::String(mcp_url.to_string()));
+    entry.insert("timeout".to_string(), toml::Value::Integer(MCP_TOOL_TIMEOUT_MS as i64));
     servers_table.insert(MCP_CLIENT_NAME.to_string(), toml::Value::Table(entry));
 
     let serialized =
@@ -446,6 +466,7 @@ mod tests {
         let entry = &v["mcpServers"]["synaroute"];
         assert_eq!(entry["type"], "http", "必须是官方 http transport");
         assert_eq!(entry["url"], url, "url 应写入");
+        assert_eq!(entry["timeout"], 600000, "必须写入 timeout 抬高客户端首字节超时，避免聚合被判超时");
 
         // 再次相同 url：幂等，不写盘
         let (_, wrote2) = register_mcp_claude_at(&path, url).unwrap();
@@ -520,6 +541,11 @@ mod tests {
             doc["mcp_servers"]["synaroute"]["url"].as_str(),
             Some(url),
             "应写入 http url"
+        );
+        assert_eq!(
+            doc["mcp_servers"]["synaroute"]["timeout"].as_integer(),
+            Some(MCP_TOOL_TIMEOUT_MS as i64),
+            "应写入 timeout（规避 Claude/Codex 60s 首字节超时）"
         );
         assert_eq!(
             doc["mcp_servers"]["codegraph"]["command"].as_str(),

@@ -28,6 +28,9 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
   const [revealing, setRevealing] = useState(false);
   const [temperature, setTemperature] = useState(initial?.params.temperature ?? 1.0);
   const [maxTokens, setMaxTokens] = useState(initial?.params.maxTokens ?? 8192);
+  // 请求超时(ms):空 = 未设(后端默认 30000)。服务非流式转发,慢厂商可调大;
+  // 健康探测/拉模型后端固定封顶 30s,大脑聚合用大脑页「总超时」——均不受此值放大影响。
+  const [timeoutMs, setTimeoutMs] = useState<number | "">(initial?.params.timeoutMs ?? "");
   const [models, setModels] = useState<ModelInfo[]>(initial?.models ?? []);
   const [mappings, setMappings] = useState<ModelMapping[]>(initial?.mappings ?? []);
   const [defaultModel, setDefaultModel] = useState(initial?.defaultModel ?? "");
@@ -81,7 +84,7 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
         hasSecret: initial?.hasSecret || secret.length > 0,
         enabled: initial?.enabled ?? false,
         priority: initial?.priority ?? 999,
-        params: { ...initial?.params, temperature, maxTokens },
+        params: { ...initial?.params, temperature, maxTokens, timeoutMs: typeof timeoutMs === "number" && timeoutMs >= 1000 ? timeoutMs : undefined },
         models,
         mappings,
         defaultModel: defaultModel.trim() || undefined,
@@ -155,7 +158,7 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
       hasSecret: initial?.hasSecret || secret.length > 0,
       enabled: initial?.enabled ?? false,
       priority: initial?.priority ?? 999,
-      params: { ...initial?.params, temperature, maxTokens },
+      params: { ...initial?.params, temperature, maxTokens, timeoutMs: typeof timeoutMs === "number" && timeoutMs >= 1000 ? timeoutMs : undefined },
       models,
       mappings: mappings.filter((m) => m.expectedName && m.realName),
       defaultModel: defaultModel.trim() || undefined,
@@ -277,6 +280,18 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
             </Field>
             <Field label="Max Tokens" className="flex-1">
               <input type="number" className={inputCls} value={maxTokens} onChange={(e) => setMaxTokens(Number(e.target.value))} />
+            </Field>
+            <Field label="请求超时 (ms)" className="flex-1">
+              <input
+                type="number"
+                min={1000}
+                step={1000}
+                placeholder="30000"
+                title="非流式转发的单请求超时,慢厂商可调大;留空=默认 30000。健康探测/拉模型固定≤30s;大脑聚合用大脑页「总超时」,均不受此值影响"
+                className={inputCls}
+                value={timeoutMs}
+                onChange={(e) => setTimeoutMs(e.target.value === "" ? "" : Number(e.target.value))}
+              />
             </Field>
           </div>
 
