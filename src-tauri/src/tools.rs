@@ -220,19 +220,23 @@ fn claude_desktop_config_path() -> AppResult<PathBuf> {
 
 fn apply_claude_desktop(endpoint: &str) -> AppResult<String> {
     let path = claude_desktop_config_path()?;
-    let mut root = read_json_or_empty(&path)?;
-    let obj = root
-        .as_object_mut()
-        .ok_or_else(|| AppError::ToolConfig("claude_desktop_config.json 顶层非对象".into()))?;
+    // 用 with_rollback 包裹：读-改-写若中途失败即恢复原文件，与 Codex 接入保持同一套原子保证
+    // （桌面端配置文件是用户 Claude 桌面端的关键设置，宁可整体回滚也不留半配置）。
+    with_rollback(&[path.clone()], || {
+        let mut root = read_json_or_empty(&path)?;
+        let obj = root
+            .as_object_mut()
+            .ok_or_else(|| AppError::ToolConfig("claude_desktop_config.json 顶层非对象".into()))?;
 
-    // 桌面端以自定义端点字段接入（cc-switch 同款思路）；键名随桌面端版本，写入常见字段
-    obj.insert("baseUrl".into(), Value::String(endpoint.to_string()));
+        // 桌面端以自定义端点字段接入（cc-switch 同款思路）；键名随桌面端版本，写入常见字段
+        obj.insert("baseUrl".into(), Value::String(endpoint.to_string()));
 
-    backup_and_write_json(&path, &root)?;
-    Ok(format!(
-        "已写入 Claude 桌面端配置：{}（baseUrl={endpoint}），原文件已备份。注意：桌面端可能需重启生效",
-        path.display()
-    ))
+        backup_and_write_json(&path, &root)?;
+        Ok(format!(
+            "已写入 Claude 桌面端配置：{}（baseUrl={endpoint}），原文件已备份。注意：桌面端可能需重启生效",
+            path.display()
+        ))
+    })
 }
 
 // ---- MCP 客户端自动注册 ----
