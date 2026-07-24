@@ -329,8 +329,23 @@ async fn handle_request(
         // 2xx 则把上游 SSE 流原样转给下游，正确设置 content-type，直接返回（不再切换）。
         if wants_stream && can_stream(key) {
             match try_stream_to_key(&store, key, &path, &req_json, &requested_model, &fwd_headers).await {
-                Ok(StreamAttempt::Streaming(resp)) => {
+                Ok(StreamAttempt::Streaming { resp, url, real_model, request_body }) => {
                     health::record_live_success(&store, &key.id);
+                    let elapsed = started.elapsed().as_millis() as u64;
+                    // 流式成功也记一条 request 事件（开关开启时）：请求体是转换后发往上游的
+                    // 完整 body（含 reasoning→thinking 等映射，供核对）；响应体因是真流式
+                    // （边收边发、不缓冲）无法完整留存，标注说明，避免用户展开见空以为坏了。
+                    log_request(
+                        &store,
+                        key,
+                        elapsed,
+                        url,
+                        real_model,
+                        request_body,
+                        "（流式响应：边收边发，body 不留存。如需完整响应体，请在客户端侧抓取）".to_string(),
+                        Some(200),
+                        true,
+                    );
                     store.append_event(
                         category,
                         "route",
@@ -563,7 +578,15 @@ fn cap(s: &str) -> String {
 /// 流式转发的尝试结果。
 enum StreamAttempt {
     /// 上游 2xx：已构建好流式响应，直接返回给下游（不再切换 Key）。
-    Streaming(Response<ResBody>),
+    /// 附带诊断快照供调用模型日志：实际请求的上游 URL、映射后模型名、
+    /// **转换后发往上游的请求体**（含 reasoning→thinking 等映射结果，供排障核对）。
+    /// 响应体因是真流式（边收边发）无法完整留存，日志侧标注说明。
+    Streaming {
+        resp: Response<ResBody>,
+        url: String,
+        real_model: String,
+        request_body: String,
+    },
     /// 上游有响应但非 2xx：缓冲错误体，调用方据此切换下一个 Key。
     HttpError {
         status: u16,
@@ -735,7 +758,14 @@ async fn try_stream_to_key(
         .body(body)
         .map_err(|e| AppError::Upstream(e.to_string()))?;
 
-    Ok(StreamAttempt::Streaming(response))
+    // 转换后发往上游的请求体快照（供调用模型日志核对 reasoning→thinking 等映射）。
+    let request_body = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+    Ok(StreamAttempt::Streaming {
+        resp: response,
+        url,
+        real_model,
+        request_body,
+    })
 }
 
 /// 一次转发的完整结果：既供路由决策（bytes/ok），也供调用模型日志（url/model/body 快照）。
