@@ -175,6 +175,17 @@ export interface ToolConfigPreview {
   files: ToolConfigFilePreview[];
 }
 
+/** 检查更新结构化结果（与后端 UpdateCheckResult 对齐） */
+export type UpdateCheckStatus = "available" | "up_to_date" | "error";
+
+export interface UpdateCheckResult {
+  status: UpdateCheckStatus;
+  currentVersion: string;
+  version?: string | null;
+  notes?: string | null;
+  error?: string | null;
+}
+
 /** 一次代理转发的完整链路快照，供「调用模型日志」在页面上展开调试 */
 export interface RequestTrace {
   keyName: string; // 命中的 Key 名称

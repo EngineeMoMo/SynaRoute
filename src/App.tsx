@@ -27,6 +27,10 @@ export default function App() {
     void loadSettings();
     void loadVendors();
     void loadCategory(activeCategory);
+    // 启动后静默检查更新（失败不弹窗，仅供侧栏徽章 / 设置页展示）
+    if (isTauri()) {
+      void useStore.getState().checkForUpdates({ silent: true });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

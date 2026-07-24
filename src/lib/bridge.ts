@@ -15,6 +15,7 @@ import type {
   RecentWorkdir,
   RetrievedFile,
   ToolConfigPreview,
+  UpdateCheckResult,
   Vendor,
 } from "@/types";
 import { mockBridge } from "./mockData";
@@ -119,9 +120,19 @@ export const api = {
     call<void>("save_settings", { settings }, () => mockBridge.saveSettings(settings)),
 
   // ---- 版本与更新 ----
-  getAppVersion: () => call<string>("get_app_version", undefined, () => "0.1.0"),
+  getAppVersion: () => call<string>("get_app_version", undefined, () => "0.2.0"),
 
-  checkForUpdates: () => call<string | null>("check_for_updates", undefined, async () => null),
+  checkForUpdates: () =>
+    call<UpdateCheckResult>("check_for_updates", undefined, async () => ({
+      status: "up_to_date",
+      currentVersion: "0.2.0",
+      version: null,
+      notes: null,
+      error: null,
+    })),
+
+  installUpdate: () =>
+    call<string>("install_update", undefined, async () => "mock: no install in browser"),
 
   // ---- 文件目录选择 ----
   pickDirectory: () => call<string | null>("pick_directory", undefined, async () => null),

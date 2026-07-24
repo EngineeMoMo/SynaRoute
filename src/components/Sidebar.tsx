@@ -1,6 +1,7 @@
 import { cn } from "@/lib/utils";
 import { useT } from "@/lib/useT";
 import { QuickToggles } from "@/components/QuickToggles";
+import { useStore } from "@/store";
 import type { CategoryType } from "@/types";
 import {
   Terminal,
@@ -11,6 +12,7 @@ import {
   Settings,
   Building2,
   Waypoints,
+  ArrowUpCircle,
   type LucideIcon,
 } from "lucide-react";
 
@@ -40,6 +42,10 @@ interface SidebarProps {
 
 export function Sidebar({ active, onSelect }: SidebarProps) {
   const t = useT();
+  const updateCheck = useStore((s) => s.updateCheck);
+  const hasUpdate = updateCheck?.status === "available";
+  const updateVer = updateCheck?.version;
+
   const renderGroup = (group: NavItem["group"], title?: string) => (
     <div className="mb-4">
       {title && (
@@ -50,6 +56,7 @@ export function Sidebar({ active, onSelect }: SidebarProps) {
       {NAV.filter((n) => n.group === group).map((item) => {
         const Icon = item.icon;
         const isActive = active === item.key;
+        const showDot = item.key === "settings" && hasUpdate;
         return (
           <button
             key={item.key}
@@ -61,8 +68,21 @@ export function Sidebar({ active, onSelect }: SidebarProps) {
                 : "text-text-secondary hover:bg-surface-hover hover:text-text-primary"
             )}
           >
-            <Icon size={16} className="shrink-0" />
+            <span className="relative shrink-0">
+              <Icon size={16} />
+              {showDot && (
+                <span
+                  className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-primary ring-2 ring-surface"
+                  aria-hidden
+                />
+              )}
+            </span>
             <span className="truncate">{t(item.tKey)}</span>
+            {showDot && (
+              <span className="ml-auto shrink-0 rounded-full bg-primary/15 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                {updateVer ? `v${updateVer}` : t("settings.updateBadge")}
+              </span>
+            )}
           </button>
         );
       })}
@@ -73,8 +93,16 @@ export function Sidebar({ active, onSelect }: SidebarProps) {
     <aside className="flex h-full w-56 shrink-0 flex-col border-r border-border bg-surface">
       {/* Logo 区 */}
       <div className="flex items-center gap-2 px-4 py-4">
-        <div className="flex h-8 w-8 items-center justify-center rounded-control bg-primary text-primary-foreground">
+        <div className="relative flex h-8 w-8 items-center justify-center rounded-control bg-primary text-primary-foreground">
           <Waypoints size={18} />
+          {hasUpdate && (
+            <span
+              className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-warning text-[10px] text-white shadow"
+              title={t("settings.updateAvailable", { version: updateVer ?? "?" })}
+            >
+              <ArrowUpCircle size={12} />
+            </span>
+          )}
         </div>
         <div className="min-w-0 leading-tight">
           <div className="text-sm font-semibold text-text-primary">SynaRoute</div>

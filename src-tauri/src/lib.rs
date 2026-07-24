@@ -455,16 +455,99 @@ fn get_app_version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
+/// 检查更新的结构化结果（前端徽章 / 设置页共用）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheckResult {
+    /// available | up_to_date | error
+    status: String,
+    current_version: String,
+    /// 远端新版本号（仅 available）
+    version: Option<String>,
+    /// 发布说明（可选）
+    notes: Option<String>,
+    /// 人类可读错误（仅 error）；已对私有仓库 404 等做友好化
+    error: Option<String>,
+}
+
+fn friendly_updater_error(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("could not fetch a valid release json")
+        || lower.contains("404")
+        || lower.contains("not found")
+    {
+        return format!(
+            "无法拉取更新清单 latest.json（常见原因：GitHub 仓库为私有，\
+             公开 URL 返回 404；或尚未上传 Release 资产）。\
+             请把 Release 资产放到可匿名访问的地址，或将仓库设为公开。原始错误: {raw}"
+        );
+    }
+    if lower.contains("signature") || lower.contains("minisign") {
+        return format!("更新包签名校验失败（公钥与发版签名不匹配）。原始错误: {raw}");
+    }
+    format!("检查更新失败: {raw}")
+}
+
 #[tauri::command]
-async fn check_for_updates(app: tauri::AppHandle) -> AppResult<Option<String>> {
+async fn check_for_updates(app: tauri::AppHandle) -> AppResult<UpdateCheckResult> {
     use tauri_plugin_updater::UpdaterExt;
-    let update = app
+    let current_version = app.package_info().version.to_string();
+    let updater = match app.updater() {
+        Ok(u) => u,
+        Err(e) => {
+            return Ok(UpdateCheckResult {
+                status: "error".into(),
+                current_version,
+                version: None,
+                notes: None,
+                error: Some(friendly_updater_error(&e.to_string())),
+            });
+        }
+    };
+    match updater.check().await {
+        Ok(Some(u)) => Ok(UpdateCheckResult {
+            status: "available".into(),
+            current_version,
+            version: Some(u.version.clone()),
+            notes: u.body.clone(),
+            error: None,
+        }),
+        Ok(None) => Ok(UpdateCheckResult {
+            status: "up_to_date".into(),
+            current_version,
+            version: None,
+            notes: None,
+            error: None,
+        }),
+        Err(e) => Ok(UpdateCheckResult {
+            // 不抛 Err：前端永远能渲染结果，避免仅靠 catch 字符串猜原因
+            status: "error".into(),
+            current_version,
+            version: None,
+            notes: None,
+            error: Some(friendly_updater_error(&e.to_string())),
+        }),
+    }
+}
+
+/// 下载并安装已检测到的更新（需先 check 到 available）。安装后由插件触发重启。
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> AppResult<String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app
         .updater()
-        .map_err(|e| error::AppError::Other(format!("{e}")))?
+        .map_err(|e| error::AppError::Other(format!("{e}")))?;
+    let update = updater
         .check()
         .await
-        .map_err(|e| error::AppError::Other(format!("检查更新失败: {e}")))?;
-    Ok(update.map(|u| u.version))
+        .map_err(|e| error::AppError::Other(friendly_updater_error(&e.to_string())))?
+        .ok_or_else(|| error::AppError::Other("当前已是最新版本，无需安装".into()))?;
+    let ver = update.version.clone();
+    update
+        .download_and_install(|_chunk, _total| {}, || {})
+        .await
+        .map_err(|e| error::AppError::Other(format!("下载/安装更新失败: {e}")))?;
+    Ok(format!("已安装 v{ver}，请重启应用完成更新"))
 }
 
 // ============ 文件目录选择 ============
@@ -697,6 +780,7 @@ pub fn run() {
             restart_mcp,
             get_app_version,
             check_for_updates,
+            install_update,
             pick_directory,
             get_default_log_dir,
             list_vendors,

@@ -19,7 +19,10 @@ export function SettingsPage() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [version, setVersion] = useState<string>("");
   const [updateMsg, setUpdateMsg] = useState<string | null>(null);
-  const [checking, setChecking] = useState(false);
+  const [installing, setInstalling] = useState(false);
+  const updateCheck = useStore((s) => s.updateCheck);
+  const updateChecking = useStore((s) => s.updateChecking);
+  const checkForUpdates = useStore((s) => s.checkForUpdates);
   const [defaultLogDir, setDefaultLogDir] = useState<string>("");
   const [mcp, setMcp] = useState<McpStatus | null>(null);
   const [showWizard, setShowWizard] = useState(false);
@@ -70,15 +73,31 @@ export function SettingsPage() {
   };
 
   const handleCheckUpdate = async () => {
-    setChecking(true);
+    setUpdateMsg(null);
+    const result = await checkForUpdates({ silent: true });
+    if (!result) return;
+    if (result.status === "available") {
+      setUpdateMsg(t("settings.updateAvailable", { version: result.version ?? "?" }));
+    } else if (result.status === "up_to_date") {
+      setUpdateMsg(t("settings.upToDate"));
+    } else {
+      setUpdateMsg(t("settings.updateError", { err: result.error ?? "unknown" }));
+    }
+  };
+
+  const handleInstallUpdate = async () => {
+    setInstalling(true);
     setUpdateMsg(null);
     try {
-      const newVer = await api.checkForUpdates();
-      setUpdateMsg(newVer ? t("settings.updateAvailable", { version: newVer }) : t("settings.upToDate"));
+      const msg = await api.installUpdate();
+      setUpdateMsg(msg);
+      showToast("success", msg);
     } catch (e) {
-      setUpdateMsg(t("settings.updateError", { err: String((e as Error)?.message ?? e) }));
+      const err = String((e as Error)?.message ?? e);
+      setUpdateMsg(t("settings.updateInstallError", { err }));
+      showToast("error", err);
     } finally {
-      setChecking(false);
+      setInstalling(false);
     }
   };
 
@@ -135,22 +154,55 @@ export function SettingsPage() {
             <CardTitle>{t("settings.about")}</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="flex items-center justify-between gap-4">
-              <div className="flex gap-2.5">
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex min-w-0 flex-1 gap-2.5">
                 <Info size={16} className="mt-0.5 shrink-0 text-text-secondary" />
-                <div>
-                  <div className="text-sm font-medium text-text-primary">
-                    SynaRoute v{version}
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2 text-sm font-medium text-text-primary">
+                    <span>SynaRoute v{version}</span>
+                    {updateCheck?.status === "available" && (
+                      <span className="rounded-full bg-primary/15 px-2 py-0.5 text-[11px] font-medium text-primary">
+                        {t("settings.updateAvailable", { version: updateCheck.version ?? "?" })}
+                      </span>
+                    )}
                   </div>
-                  {updateMsg && (
-                    <div className="mt-1 text-xs text-text-muted">{updateMsg}</div>
+                  {(updateMsg || updateCheck?.error) && (
+                    <div
+                      className={`mt-1 whitespace-pre-wrap text-xs ${
+                        updateCheck?.status === "error" ? "text-danger" : "text-text-muted"
+                      }`}
+                    >
+                      {updateMsg ?? updateCheck?.error}
+                    </div>
+                  )}
+                  {updateCheck?.status === "available" && updateCheck.notes && (
+                    <div className="mt-1 max-h-24 overflow-y-auto whitespace-pre-wrap text-[11px] text-text-muted">
+                      {updateCheck.notes}
+                    </div>
                   )}
                 </div>
               </div>
-              <Button size="sm" variant="secondary" onClick={() => void handleCheckUpdate()} disabled={checking}>
-                <RefreshCw size={14} className={checking ? "animate-spin" : ""} />
-                {t("settings.checkUpdate")}
-              </Button>
+              <div className="flex shrink-0 flex-col gap-1.5 sm:flex-row">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => void handleCheckUpdate()}
+                  disabled={updateChecking || installing}
+                >
+                  <RefreshCw size={14} className={updateChecking ? "animate-spin" : ""} />
+                  {t("settings.checkUpdate")}
+                </Button>
+                {updateCheck?.status === "available" && (
+                  <Button
+                    size="sm"
+                    onClick={() => void handleInstallUpdate()}
+                    disabled={installing || updateChecking}
+                  >
+                    <RefreshCw size={14} className={installing ? "animate-spin" : ""} />
+                    {t("settings.installUpdate")}
+                  </Button>
+                )}
+              </div>
             </div>
           </CardContent>
         </Card>

@@ -8,6 +8,7 @@ import type {
   ProviderKey,
   ProxyState,
   ThemePref,
+  UpdateCheckResult,
   Vendor,
 } from "@/types";
 import type { Lang } from "@/lib/i18n";
@@ -26,6 +27,12 @@ interface AppState {
   settings: AppSettings | null;
   vendors: Vendor[];
   loading: boolean;
+
+  // 在线更新（侧栏徽章 / 设置页共用）
+  updateCheck: UpdateCheckResult | null;
+  updateChecking: boolean;
+  checkForUpdates: (opts?: { silent?: boolean }) => Promise<UpdateCheckResult | null>;
+  clearUpdateAvailable: () => void;
 
   // 主题（副本，便于即时切换）
   theme: ThemePref;
@@ -72,6 +79,44 @@ export const useStore = create<AppState>((set, get) => ({
   settings: null,
   vendors: [],
   loading: false,
+
+  updateCheck: null,
+  updateChecking: false,
+  checkForUpdates: async (opts) => {
+    const silent = opts?.silent ?? false;
+    set({ updateChecking: true });
+    try {
+      const result = await api.checkForUpdates();
+      set({ updateCheck: result });
+      return result;
+    } catch (e) {
+      const result: UpdateCheckResult = {
+        status: "error",
+        currentVersion: "",
+        error: String((e as Error)?.message ?? e),
+      };
+      set({ updateCheck: result });
+      if (!silent) {
+        get().showToast("error", result.error ?? "检查更新失败");
+      }
+      return result;
+    } finally {
+      set({ updateChecking: false });
+    }
+  },
+  clearUpdateAvailable: () => {
+    const cur = get().updateCheck;
+    if (cur?.status === "available") {
+      set({
+        updateCheck: {
+          ...cur,
+          status: "up_to_date",
+          version: null,
+          notes: null,
+        },
+      });
+    }
+  },
 
   theme: "system",
   setTheme: (t) => {
