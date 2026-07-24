@@ -96,12 +96,28 @@ interface Gap {
   missingKeys: string[];
 }
 
-/** 某个 Key 对外「可服务」的模型名集合（与后端 ProviderKey::serviceable_models 对齐）：
- *  映射的对外名（expectedName）+ 原生真实模型名（realName）。 */
+/**
+ * 某个 Key 对外「可服务」的模型名集合 —— 必须与后端 `ProviderKey::serviceable_models` 同口径：
+ * - 有完整映射 → 只取映射对外名（expectedName），不并入 models 真实名
+ * - 无映射 → 取 models 真实名
+ * - 已配三档 → 追加 claude-*-4-5 家族代表名
+ */
 function keyExpectedSet(k: ProviderKey): Set<string> {
   const set = new Set<string>();
-  for (const mp of k.mappings) set.add(mp.expectedName);
-  for (const m of k.models) set.add(m.realName);
+  const complete = k.mappings.filter(
+    (mp) => mp.expectedName.trim() && mp.realName.trim(),
+  );
+  if (complete.length > 0) {
+    for (const mp of complete) set.add(mp.expectedName.trim());
+  } else {
+    for (const m of k.models) {
+      const n = m.realName.trim();
+      if (n) set.add(n);
+    }
+  }
+  if (k.tierOpus?.trim()) set.add("claude-opus-4-5");
+  if (k.tierSonnet?.trim()) set.add("claude-sonnet-4-5");
+  if (k.tierHaiku?.trim()) set.add("claude-haiku-4-5");
   return set;
 }
 
