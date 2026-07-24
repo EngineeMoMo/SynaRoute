@@ -1525,20 +1525,46 @@ impl SseTranslator {
             return out;
         }
         self.started = false;
-        // function_call 项作为独立 output item 补发
+        // Codex 的 Responses SSE 解析器（codex-api/src/sse/responses.rs）只在
+        // `response.output_item.done` 事件里把 item 反序列化为 ResponseItem::FunctionCall
+        // 并执行工具；`response.completed` 段只读 id/usage/end_turn，**完全忽略 output[]**。
+        // 故每个累积的工具调用都必须作为独立的 output_item.added + output_item.done 事件流式
+        // 投递（此前只塞进 completed.output → Codex 收不到工具调用、卡死等待，纯文本却正常）。
+        // 字段严格对齐 Codex 的 ResponseItem::FunctionCall：name / arguments（JSON 字符串）/
+        // call_id（必填，用上游 tool_use/tool_call 的 id；缺失则兜底生成，保证工具结果可回配）。
         let mut output: Vec<Value> = vec![];
+        // output_index：文本消息占 0（若有），工具调用依次往后排。
+        let tool_base = if self.saw_text { 1u64 } else { 0 };
         if self.saw_text {
             output.push(json!({
                 "type": "message", "id": self.msg_id, "role": "assistant", "status": "completed",
                 "content": [ { "type": "output_text", "text": "", "annotations": [] } ]
             }));
         }
-        for (id, name, args) in &self.tool_calls {
+        for (i, (id, name, args)) in self.tool_calls.iter().enumerate() {
+            let output_index = tool_base + i as u64;
             let fc_id = if id.is_empty() { format!("fc_{}", uuid_like()) } else { id.clone() };
-            output.push(json!({
-                "type": "function_call", "id": fc_id, "call_id": id,
-                "name": name, "arguments": args, "status": "completed"
-            }));
+            // call_id 必填且用于回配工具结果：上游给了 id 就用它，没有则退回生成的 fc_id。
+            let call_id = if id.is_empty() { fc_id.clone() } else { id.clone() };
+            // arguments 必须是可解析的 JSON 字符串：无参工具（args 为空）兜底成 "{}"，
+            // 否则 Codex 侧 serde_json 解析空串失败、工具无法执行。
+            let arguments = if args.trim().is_empty() { "{}" } else { args.as_str() };
+            let item = json!({
+                "type": "function_call", "id": fc_id, "call_id": call_id,
+                "name": name, "arguments": arguments, "status": "completed"
+            });
+            // 关键修复：作为流式事件投递（added 宣告 → done 交付完整调用），Codex 据 done 执行工具。
+            out.push_str(&sse("response.output_item.added", &json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": item.clone()
+            })));
+            out.push_str(&sse("response.output_item.done", &json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": item.clone()
+            })));
+            output.push(item);
         }
         // usage 来源二选一：Chat 上游末尾 chunk 传入 usage（prompt/completion_tokens）；
         // Anthropic 上游无末尾 usage chunk，token 在流中分散累积到字段，此处兜底取字段值。
@@ -2330,6 +2356,13 @@ mod tests {
         assert!(out.contains("get_weather"));
         // arguments 分块应拼接完整
         assert!(out.contains("SF"), "参数分块未拼全");
+        // 关键回归：工具调用必须作为 output_item.done 事件投递——Codex 只从该事件执行工具，
+        // 仅塞进 completed.output 会被忽略、导致客户端卡死（本次修复的根因）。
+        assert!(
+            out.contains("event: response.output_item.done"),
+            "工具调用缺 output_item.done 事件（Codex 据此执行工具）:\n{out}"
+        );
+        assert!(out.contains("\"call_id\":\"call_1\""), "call_id 未带出（工具结果无法回配）");
     }
 
     #[test]
@@ -2444,6 +2477,12 @@ mod tests {
         assert!(out.contains("\"call_id\":\"toolu_1\""), "call_id 未带出");
         // 参数分块应拼接完整
         assert!(out.contains("SF"), "参数分块未拼全");
+        // 关键修复回归：工具调用必须作为 output_item.done 事件投递——Codex 只从该事件取
+        // function_call 执行工具，只塞进 completed.output 会被忽略、客户端卡死等待。
+        assert!(
+            out.contains("event: response.output_item.done"),
+            "工具调用必须走 output_item.done 事件（Codex 据此执行工具）:\n{out}"
+        );
     }
 
     #[test]

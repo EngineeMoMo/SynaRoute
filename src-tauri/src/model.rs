@@ -390,6 +390,14 @@ impl ProviderKey {
     /// 先判 opus、再 sonnet、再 haiku（名称互不包含，顺序不影响结果，仅为可读）。
     /// 返回的档位真实名 trim 后为空视为未配。
     fn match_tier(&self, requested_model: &str) -> Option<String> {
+        // 三档（快/中/强 = haiku/sonnet/opus）是 Claude Code 语义：它按任务发带
+        // opus/sonnet/haiku 子串的模型名才触发档位改写。Codex 发 GPT 名或经应用内下拉
+        // 覆盖的对外名（可能含 claude-*opus* 之类），一旦落到三档会被误改写到无关档位真实名
+        // （如 claude-opus-4-8 → deepseek-reasoner）。故 Codex 分类一律不走三档，从后端根治
+        // 误改写——不依赖前端保存守卫（旧数据可能仍带三档字段）。
+        if matches!(self.category_id, CategoryType::Codex) {
+            return None;
+        }
         let lower = requested_model.to_ascii_lowercase();
         let pick = |v: &Option<String>| {
             v.as_ref()
@@ -958,6 +966,30 @@ mod tests {
     fn serviceable_models_empty_when_nothing_configured() {
         let k = key_with(vec![], vec![], None);
         assert!(k.serviceable_models().is_empty());
+    }
+
+    #[test]
+    fn codex_category_never_matches_tier() {
+        // Codex 分类禁用三档匹配：即使旧数据残留了三档配置，含 opus/sonnet/haiku 子串的
+        // 模型名（如应用内选定的 claude-opus-4-8）也不得被误改写到档位真实名。
+        // 三档是 Claude Code 的 opus/sonnet/haiku 语义，Codex 发不出触发它的意图。
+        let mut k = key_with(vec![model("claude-opus-4-8")], vec![], None);
+        k.category_id = CategoryType::Codex;
+        k.tier_opus = Some("deepseek-reasoner".into());
+        // 含 "opus" 但因分类是 Codex → 不走三档，落到原生同名（Native）。
+        let (real, kind) = k.resolve_model_detail("claude-opus-4-8");
+        assert_eq!(real, "claude-opus-4-8", "Codex 不应把 opus 名改写到 deepseek-reasoner");
+        assert_eq!(kind, ModelResolveKind::Native);
+    }
+
+    #[test]
+    fn non_codex_category_still_matches_tier() {
+        // 对照：Claude CLI 分类三档正常生效（回归保护，勿因 Codex 守卫误伤主场景）。
+        let mut k = key_with(vec![model("glm-4.6")], vec![], None);
+        k.tier_opus = Some("deepseek-reasoner".into());
+        let (real, kind) = k.resolve_model_detail("claude-opus-4-7");
+        assert_eq!(real, "deepseek-reasoner");
+        assert_eq!(kind, ModelResolveKind::Tier);
     }
 
     #[test]

@@ -162,9 +162,11 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
       models,
       mappings: mappings.filter((m) => m.expectedName && m.realName),
       defaultModel: defaultModel.trim() || undefined,
-      tierHaiku: tierHaiku.trim() || undefined,
-      tierSonnet: tierSonnet.trim() || undefined,
-      tierOpus: tierOpus.trim() || undefined,
+      // 三档仅 Claude CLI/桌面端有意义；Codex 一律不落三档，避免 claude-*opus* 类名字被误改写路由
+      // （即使该 Key 早前存过三档，此处也强制清空）。
+      tierHaiku: activeCategory === "codex" ? undefined : tierHaiku.trim() || undefined,
+      tierSonnet: activeCategory === "codex" ? undefined : tierSonnet.trim() || undefined,
+      tierOpus: activeCategory === "codex" ? undefined : tierOpus.trim() || undefined,
       health: initial?.health ?? { status: "unknown", failCount: 0 },
     };
 
@@ -366,7 +368,10 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
             </div>
           </div>
 
-          {/* 三档快捷映射（取自 cc-switch 的 haiku/sonnet/opus 语义，落到运行时代理） */}
+          {/* 三档快捷映射（取自 cc-switch 的 haiku/sonnet/opus 语义，落到运行时代理）。
+              仅 Claude CLI / 桌面端有意义：Claude Code 按任务发带 opus/sonnet/haiku 的模型名才触发档位改写。
+              Codex 发 GPT 名匹配不到三档，且若 models 里有 claude-*opus* 之类名字反而会被误改写 → 故 Codex 隐藏。 */}
+          {activeCategory !== "codex" && (
           <div>
             <div className="mb-1.5">
               <span className="text-xs font-medium text-text-secondary">{t("editor.tierTitle")}</span>
@@ -400,6 +405,7 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
               })}
             </div>
           </div>
+          )}
 
           {/* 模型映射 */}
           <div>
