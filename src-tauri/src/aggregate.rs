@@ -60,6 +60,41 @@ fn trace_for_ref(
     })
 }
 
+/// 决策者阶段的保底预算（毫秒）。
+///
+/// 整轮墙钟预算下，串行的「成员 → 压缩 → 决策者」三阶段共享同一 deadline。为避免前面
+/// 阶段（成员慢/压缩慢）把时间吃光、饿死最重要的决策者综合步骤，给决策者留一块地板：
+/// 整轮预算的 35%，绝对不低于 90s；但小预算时 90s 可能超过整轮总量，故再用 45% 上限夹住
+/// （保证成员+压缩至少还能分到 ~55%）。
+///
+/// 例：total=60000 → 35%=21000<90000，被 45%=27000 夹住 → 27000；
+///     total=257000 → 35%=89950<90000 → 90000（<45%=115650）；
+///     total=540000 → 35%=189000（>90000，<45%=243000）→ 189000；
+///     total=600000 → 35%=210000 → 210000。
+fn decider_floor_ms(total_ms: u64) -> u64 {
+    let pct35 = total_ms * 35 / 100;
+    pct35.max(90_000).min(total_ms * 45 / 100)
+}
+
+/// 成员/压缩阶段的可用预算（毫秒）：在整轮 deadline 剩余时间里扣掉决策者地板。
+///
+/// `remaining_ms` 为此刻距整轮 deadline 的剩余毫秒。扣掉 `decider_floor` 后仍给一个最小
+/// 下限（`min_floor`，默认 5s）——即使前面阶段几乎耗尽预算，也让本阶段有机会发出请求，
+/// 略微越界由客户端超时余量兜底，好过给 0ms 必然超时。
+fn upstream_phase_budget_ms(remaining_ms: u64, decider_floor: u64, min_floor: u64) -> u64 {
+    remaining_ms.saturating_sub(decider_floor).max(min_floor)
+}
+
+/// 决策者阶段的可用预算（毫秒）：整轮剩余时间全给决策者（前面省下的它全拿），
+/// 同样给最小下限保护，避免 0ms。
+fn decider_phase_budget_ms(remaining_ms: u64, min_floor: u64) -> u64 {
+    remaining_ms.max(min_floor)
+}
+
+/// 阶段预算的最小下限（毫秒）：宁可略微越过整轮 deadline，也要让阶段有机会跑一次
+/// （客户端超时留有 +余量，见 tools.rs 的 mcp 客户端超时联动）。
+const PHASE_MIN_BUDGET_MS: u64 = 5_000;
+
 struct MemberAnswer {
     label: String,
     answer: String,
@@ -101,6 +136,16 @@ pub async fn run_plan(
         .clone()
         .ok_or_else(|| AppError::Invalid("未配置最终决策者".into()))?;
 
+    // 整轮墙钟 deadline：串行的「成员 → 压缩 → 决策者」共享同一预算，各阶段按剩余时间递减
+    // 分配，并给决策者留保底（见 decider_floor_ms）。总量始终压在客户端 MCP 超时之下，
+    // 保证服务端能在客户端杀连接前优雅降级返回。
+    let round_start = std::time::Instant::now();
+    let deadline = round_start + Duration::from_millis(brain.total_timeout_ms);
+    let decider_floor = decider_floor_ms(brain.total_timeout_ms);
+    let remaining_ms = |d: std::time::Instant| {
+        d.saturating_duration_since(std::time::Instant::now()).as_millis() as u64
+    };
+
     // 0. 文件检索（work_dir 若开启自动跟随则取最新活跃项目）
     let effective_work_dir = resolve_work_dir(&brain);
     let file_context = if brain.retrieval_enabled {
@@ -120,13 +165,16 @@ pub async fn run_plan(
     // 1. 构建参与者 prompt（只读角色）
     let member_prompt = build_member_prompt(prompt, &file_context);
 
-    // 2. 并行成员解答
-    let gathered = gather_members(store, category, &brain, &member_prompt).await;
+    // 2. 并行成员解答（预算 = 剩余整轮时间 − 决策者保底）
+    let members_budget = upstream_phase_budget_ms(remaining_ms(deadline), decider_floor, PHASE_MIN_BUDGET_MS);
+    let gathered = gather_members(store, category, &brain, &member_prompt, members_budget).await;
     let answers = &gathered.answers;
 
     if answers.is_empty() {
         let fallback_prompt = build_solo_decider_prompt(prompt, &file_context);
-        let fallback = call_ref(store, &decider_ref, &fallback_prompt, brain.total_timeout_ms).await?;
+        // 独答降级：无成员/压缩阶段，决策者独享整轮剩余时间。
+        let solo_budget = decider_phase_budget_ms(remaining_ms(deadline), PHASE_MIN_BUDGET_MS);
+        let fallback = call_ref(store, &decider_ref, &fallback_prompt, solo_budget).await?;
         return Ok(AggregateResult::Plan {
             content: fallback,
             work_dir: effective_work_dir,
@@ -141,7 +189,9 @@ pub async fn run_plan(
                 .summarizer_ref
                 .clone()
                 .unwrap_or_else(|| decider_ref.clone());
-            match compress(store, category, &summarizer_ref, answers, brain.total_timeout_ms).await {
+            // 压缩阶段：成员跑完后重算剩余，仍扣掉决策者保底。
+            let compress_budget = upstream_phase_budget_ms(remaining_ms(deadline), decider_floor, PHASE_MIN_BUDGET_MS);
+            match compress(store, category, &summarizer_ref, answers, compress_budget).await {
                 Ok(s) => s,
                 // 压缩失败（summarizer Key 限流/余额/被删）不作废已成功的成员回答，
                 // 降级为全量拼接，避免整轮聚合白跑。
@@ -170,7 +220,9 @@ pub async fn run_plan(
             format!("## 相关文件\n{}\n\n", file_context)
         }
     );
-    let plan = call_ref(store, &decider_ref, &plan_prompt, brain.total_timeout_ms).await?;
+    // 决策者阶段：整轮剩余时间全给它（前面阶段省下的它全拿，保底 decider_floor 已被保护）。
+    let plan_budget = decider_phase_budget_ms(remaining_ms(deadline), PHASE_MIN_BUDGET_MS);
+    let plan = call_ref(store, &decider_ref, &plan_prompt, plan_budget).await?;
     Ok(AggregateResult::Plan {
         content: plan,
         work_dir: effective_work_dir,
@@ -297,6 +349,14 @@ pub async fn run_mcp(
         .clone()
         .ok_or_else(|| AppError::Invalid("未配置最终决策者".into()))?;
 
+    // 整轮墙钟 deadline（语义同 run_plan）：串行阶段共享预算，决策者留保底。
+    let round_start = std::time::Instant::now();
+    let deadline = round_start + Duration::from_millis(brain.total_timeout_ms);
+    let decider_floor = decider_floor_ms(brain.total_timeout_ms);
+    let remaining_ms = |d: std::time::Instant| {
+        d.saturating_duration_since(std::time::Instant::now()).as_millis() as u64
+    };
+
     // 工作目录优先级：MCP 显式 cwd > brain 配置（auto-follow / 手工 work_dir）
     let effective_work_dir = match cwd {
         Some(c) if !c.trim().is_empty() => Some(c),
@@ -354,8 +414,10 @@ pub async fn run_mcp(
     );
 
     // 1. 参与者并行分析（只读）—— 每个成员固定打自己的 Key+模型，失败不换 Key
+    //    预算 = 剩余整轮时间 − 决策者保底。
     let member_prompt = build_member_prompt(prompt, &file_context);
-    let gathered = gather_members(store, category, &brain, &member_prompt).await;
+    let members_budget = upstream_phase_budget_ms(remaining_ms(deadline), decider_floor, PHASE_MIN_BUDGET_MS);
+    let gathered = gather_members(store, category, &brain, &member_prompt, members_budget).await;
     let answers = &gathered.answers;
     let member_labels: Vec<String> = answers.iter().map(|a| a.label.clone()).collect();
     let members_attempted = gathered.attempted;
@@ -388,7 +450,9 @@ pub async fn run_mcp(
             ),
         );
         let fallback_prompt = build_solo_decider_prompt(prompt, &file_context);
-        let fallback = call_ref(store, &decider_ref, &fallback_prompt, brain.total_timeout_ms).await?;
+        // 独答降级：无成员/压缩阶段，决策者独享整轮剩余时间。
+        let solo_budget = decider_phase_budget_ms(remaining_ms(deadline), PHASE_MIN_BUDGET_MS);
+        let fallback = call_ref(store, &decider_ref, &fallback_prompt, solo_budget).await?;
         store.append_event(
             category,
             "aggregate",
@@ -433,7 +497,9 @@ pub async fn run_mcp(
                     answers.len()
                 ),
             );
-            match compress(store, category, &summarizer_ref, answers, brain.total_timeout_ms).await {
+            // 压缩阶段：成员跑完后重算剩余，仍扣掉决策者保底。
+            let compress_budget = upstream_phase_budget_ms(remaining_ms(deadline), decider_floor, PHASE_MIN_BUDGET_MS);
+            match compress(store, category, &summarizer_ref, answers, compress_budget).await {
                 Ok(s) => s,
                 // 压缩失败（summarizer Key 限流/余额/被删）不作废已成功的成员回答，
                 // 降级为全量拼接，避免整轮聚合白跑。
@@ -489,7 +555,9 @@ pub async fn run_mcp(
         }
     );
     let decider_started = std::time::Instant::now();
-    let analysis = match call_ref(store, &decider_ref, &decider_prompt, brain.total_timeout_ms).await {
+    // 决策者阶段：整轮剩余时间全给它（保底 decider_floor 已在前面阶段被保护）。
+    let decider_budget = decider_phase_budget_ms(remaining_ms(deadline), PHASE_MIN_BUDGET_MS);
+    let analysis = match call_ref(store, &decider_ref, &decider_prompt, decider_budget).await {
         Ok(a) => {
             let latency = decider_started.elapsed().as_millis() as u64;
             // 带 trace：展开可见「喂给决策者的完整入参（原问题+聚合意见+文件）+ 决策者最终答案」。
@@ -606,8 +674,9 @@ async fn gather_members(
     category: CategoryType,
     brain: &BrainConfig,
     prompt: &str,
+    budget_ms: u64,
 ) -> GatherOutcome {
-    let total_timeout = Duration::from_millis(brain.total_timeout_ms);
+    let total_timeout = Duration::from_millis(budget_ms);
     let settings = store.get_settings();
     let retry = settings.upstream_retry_enabled;
     // 重型 trace（成员完整入参/答案，可达数十万字符）受开关控制，默认关，避免每轮聚合都写盘增大磁盘 IO。
@@ -670,7 +739,7 @@ async fn gather_members(
             // 单请求 HTTP 超时给 brain 预算 +5s 余量（此前误用 key 的 30s 代理级超时，
             // 非流式长回答必然被掐死、重试 3 次 ≈ 91s 全灭）；外层 tokio timeout 先到点，
             // 报出干净的「超时（>Xms）」而非 reqwest 的晦涩错误。
-            let req_timeout = Duration::from_millis(brain.total_timeout_ms.saturating_add(5_000));
+            let req_timeout = Duration::from_millis(budget_ms.saturating_add(5_000));
             let started = std::time::Instant::now();
             let mk_meta = |latency_ms: u64| MemberCallMeta {
                 key_name: key.name.clone(),
@@ -699,7 +768,7 @@ async fn gather_members(
                 },
                 Err(_) => MemberOutcome::Failed {
                     label,
-                    reason: format!("超时（>{}ms）", brain.total_timeout_ms),
+                    reason: format!("超时（>{}ms）", budget_ms),
                     meta: Some(mk_meta(started.elapsed().as_millis() as u64)),
                 },
             }
@@ -1049,5 +1118,35 @@ mod tests {
         );
         assert!(fallback.contains("决策者") && fallback.contains("未能完成"), "应有降级标注");
         assert!(fallback.contains("A 的意见") && fallback.contains("B 的意见"), "已聚合内容不应被丢弃");
+    }
+
+    #[test]
+    fn decider_floor_clamped_for_small_and_large_budgets() {
+        // 小预算：35% < 90s，被 45% 上限夹住（否则地板会超过整轮总量，饿死成员+压缩）。
+        assert_eq!(decider_floor_ms(60_000), 27_000); // 35%=21000<90000 → 90000，min 45%=27000
+        // 90s 绝对地板生效区间（35% 恰不足 90s）。
+        assert_eq!(decider_floor_ms(257_000), 90_000); // 35%=89950<90000 → 90000 < 45%=115650
+        // 大预算：35% 主导（>90s 且 <45%）。
+        assert_eq!(decider_floor_ms(540_000), 189_000); // 35%=189000
+        assert_eq!(decider_floor_ms(600_000), 210_000); // 35%=210000
+    }
+
+    #[test]
+    fn upstream_phase_budget_reserves_decider_floor() {
+        // 剩余充足：扣掉决策者地板后剩下的给成员/压缩。
+        assert_eq!(upstream_phase_budget_ms(600_000, 210_000, 5_000), 390_000);
+        // 剩余不足以覆盖地板：触发最小下限保护，不给 0（宁可略越界，靠客户端余量兜底）。
+        assert_eq!(upstream_phase_budget_ms(100_000, 210_000, 5_000), 5_000);
+        // 剩余恰好等于地板：扣完为 0 → 最小下限。
+        assert_eq!(upstream_phase_budget_ms(210_000, 210_000, 5_000), 5_000);
+    }
+
+    #[test]
+    fn decider_phase_budget_takes_all_remaining_with_floor() {
+        // 决策者独享整轮剩余（前面省下的全拿）。
+        assert_eq!(decider_phase_budget_ms(300_000, 5_000), 300_000);
+        // 剩余被前面阶段耗尽：最小下限保护，仍给决策者一次机会。
+        assert_eq!(decider_phase_budget_ms(0, 5_000), 5_000);
+        assert_eq!(decider_phase_budget_ms(2_000, 5_000), 5_000);
     }
 }

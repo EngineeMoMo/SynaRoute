@@ -15,6 +15,13 @@ pub enum CategoryType {
 }
 
 impl CategoryType {
+    /// 全部分类（遍历用，如聚合 MCP 客户端超时联动需取各分类 total_timeout_ms 的最大值）。
+    pub const ALL: [CategoryType; 3] = [
+        CategoryType::ClaudeCli,
+        CategoryType::ClaudeDesktop,
+        CategoryType::Codex,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             CategoryType::ClaudeCli => "claude-cli",

@@ -1,6 +1,6 @@
 # SynaRoute CLI 接入用户手册（试用版）
 
-> 适用版本：SynaRoute 0.2.1 · 面向 Claude Code 命令行（`claude`）用户
+> 适用版本：SynaRoute 0.1.0 · 面向 Claude Code 命令行（`claude`）用户
 > 一句话：SynaRoute 在你本机起一个代理，把 `claude` 的请求按你配的多个 Key 做**故障转移 + 模型映射**，一个挂了自动切下一个。
 
 ---

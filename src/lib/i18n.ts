@@ -166,7 +166,9 @@ const zh: Dict = {
   "brain.modeFullTitle": "B · 全量上下文",
   "brain.modeFullDesc": "将各成员完整答案交决策者（信息最全）",
   "brain.concurrency": "并发上限",
-  "brain.totalTimeout": "总超时 (ms)",
+  "brain.totalTimeout": "整轮总预算 (ms)",
+  "brain.totalTimeoutHint":
+    "整个聚合一轮的墙钟上限（成员 + 压缩 + 决策者共享，决策者留保底配额）。MCP 客户端超时会自动跟随此值（+余量），无需手动配。问题复杂、模型思考久，把此值调大即可。",
   "brain.textOnlyNote": "聚合首版仅支持纯文本响应；多模态与工具调用将在后续迭代支持。",
   "brain.saveConfig": "保存聚合配置",
   "brain.noMembers": "未选择任何参与成员",
@@ -498,7 +500,9 @@ const en: Dict = {
   "brain.modeFullTitle": "B · Full context",
   "brain.modeFullDesc": "Pass full member answers to the decider (most complete)",
   "brain.concurrency": "Concurrency limit",
-  "brain.totalTimeout": "Total timeout (ms)",
+  "brain.totalTimeout": "Whole-round budget (ms)",
+  "brain.totalTimeoutHint":
+    "Wall-clock cap for one full aggregation round (members + compression + decider share it; the decider keeps a reserved floor). The MCP client timeout auto-tracks this value (+ margin), no manual config needed. For complex problems that need longer thinking, just raise this value.",
   "brain.textOnlyNote": "The first aggregation release supports text-only responses; multimodal and tool calls come later.",
   "brain.saveConfig": "Save aggregation config",
   "brain.noMembers": "No members selected",

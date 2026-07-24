@@ -272,11 +272,33 @@ fn mcp_url_for(port: u16) -> String {
     format!("http://127.0.0.1:{port}/mcp")
 }
 
+/// MCP 客户端单次工具调用超时（毫秒）= 各分类整轮预算 total_timeout_ms 的最大值 + 余量，
+/// 且不低于历史兜底下限（tools::MCP_TOOL_TIMEOUT_MS）。
+///
+/// 联动的意义：服务端聚合是整轮墙钟预算（见 aggregate.rs），客户端 MCP 超时必须 ≥ 该预算
+/// + 余量，才能保证服务端总在客户端杀连接**之前**优雅降级返回（哪怕是部分结果）。用户在任一
+/// 分类调大整轮预算，下次注册/端口漂移重写时客户端超时自动跟随。MCP 客户端一个 server 只有
+/// 一个 timeout，而分类各有自己的 total——故取最大值覆盖所有分类。
+fn mcp_client_timeout_ms(store: &Arc<Store>) -> u64 {
+    /// 客户端超时相对服务端整轮预算的余量（毫秒）：留给降级结果序列化 + 网络回传，
+    /// 保证服务端先返回、客户端后到点。
+    const MARGIN_MS: u64 = 30_000;
+    let max_total = CategoryType::ALL
+        .iter()
+        .map(|c| store.get_brain(*c).total_timeout_ms)
+        .max()
+        .unwrap_or(0);
+    max_total
+        .saturating_add(MARGIN_MS)
+        .max(tools::MCP_TOOL_TIMEOUT_MS)
+}
+
 /// 把 synaroute MCP 注册进指定分类对应工具的客户端配置，并把该分类记进
 /// settings.mcp_registered_categories（去重）。写盘/跳过都记一条事件日志，方便用户排查。
 fn register_and_record(state: &AppState, category: CategoryType, port: u16) {
     let url = mcp_url_for(port);
-    match tools::register_mcp_client(category, &url) {
+    let timeout_ms = mcp_client_timeout_ms(&state.store);
+    match tools::register_mcp_client(category, &url, timeout_ms) {
         Ok((msg, _wrote)) => {
             state.store.append_event(category, "config", None, &msg);
             // 走后端专用写入（不能用 get_settings→push→save_settings，会被 save_settings
@@ -297,10 +319,11 @@ fn register_and_record(state: &AppState, category: CategoryType, port: u16) {
 /// 端口漂移后，用新端口重写所有已注册分类的客户端配置（url 里的端口跟着变）。
 fn rewrite_registered_clients(state: &AppState, port: u16) {
     let url = mcp_url_for(port);
+    let timeout_ms = mcp_client_timeout_ms(&state.store);
     let cats = state.store.get_settings().mcp_registered_categories;
     for c in cats {
         if let Some(category) = CategoryType::from_str(&c) {
-            match tools::register_mcp_client(category, &url) {
+            match tools::register_mcp_client(category, &url, timeout_ms) {
                 Ok((msg, wrote)) => {
                     if wrote {
                         state.store.append_event(category, "config", None, &msg);
@@ -721,10 +744,11 @@ pub fn run() {
                             // 客户端配置，使 ~/.claude.json / config.toml 里的 url 端口跟真实端口一致，
                             // 用户重启客户端即可用，无需手动重配（幂等：端口没变则不写盘）。
                             let url = format!("http://127.0.0.1:{bound}/mcp");
+                            let timeout_ms = mcp_client_timeout_ms(&store_bg);
                             let cats = store_bg.get_settings().mcp_registered_categories;
                             for c in cats {
                                 if let Some(category) = CategoryType::from_str(&c) {
-                                    match tools::register_mcp_client(category, &url) {
+                                    match tools::register_mcp_client(category, &url, timeout_ms) {
                                         Ok((msg, wrote)) => {
                                             if wrote {
                                                 store_bg.append_event(category, "config", None, &msg);

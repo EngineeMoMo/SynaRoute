@@ -266,11 +266,12 @@ export function BrainPage() {
                 label={t("brain.totalTimeout")}
                 value={config.totalTimeoutMs}
                 min={5000}
-                max={600000}
+                max={1800000}
                 step={5000}
                 onChange={(v) => update({ totalTimeoutMs: v })}
               />
             </div>
+            <p className="mt-2 text-xs text-text-secondary">{t("brain.totalTimeoutHint")}</p>
           </CardContent>
         </Card>
 

@@ -288,14 +288,17 @@ fn apply_claude_desktop(endpoint: &str) -> AppResult<String> {
 /// MCP 服务器在客户端配置里的固定名称（不随端口变化，故端口变了只需改 url）。
 const MCP_CLIENT_NAME: &str = "synaroute";
 
-/// 单次 MCP 工具调用超时（毫秒），写进客户端配置的 `timeout` 字段。
+/// MCP 单次工具调用超时（毫秒）的**兜底下限**，写进客户端配置的 `timeout` 字段。
 ///
-/// SynaRoute 的多模型聚合天然慢（多模型并行 + 决策者二次调用，实测 40~60s）。
-/// Claude Code 对 HTTP MCP 有两层超时：单次工具调用总时长、以及「首字节」per-request
-/// 计时器（默认 60s，请求超时不重试）。聚合逼近甚至超过 60s 就会被客户端判超时、重试。
-/// 官方文档：把 server 的 `timeout` 设为 ≥60s 会**同时**抬高首字节计时器到该值。
-/// 故这里统一写 600000（10 分钟），彻底覆盖聚合耗时，无需用户手动配。
-const MCP_TOOL_TIMEOUT_MS: u64 = 600_000;
+/// SynaRoute 的多模型聚合天然慢（多模型并行 + 决策者二次调用）。Claude Code 对 HTTP MCP
+/// 有两层超时：单次工具调用总时长、以及「首字节」per-request 计时器（默认 60s，请求超时
+/// 不重试）。官方文档：把 server 的 `timeout` 设为 ≥60s 会**同时**抬高首字节计时器到该值。
+///
+/// 注意：此值仅作**下限兜底**。实际写入的客户端超时由 lib.rs 的 `mcp_client_timeout_ms`
+/// 按「各分类整轮预算 total_timeout_ms 的最大值 + 余量」动态算出，并对本常量取 max——
+/// 保证客户端超时始终 ≥ 服务端整轮预算 + 余量（服务端总在客户端杀连接前优雅降级返回），
+/// 且不会比历史值（10 分钟）更短。
+pub(crate) const MCP_TOOL_TIMEOUT_MS: u64 = 600_000;
 
 /// Claude 全局配置 ~/.claude.json（Claude CLI 的 mcpServers 存放处）。
 fn claude_json_path() -> AppResult<PathBuf> {
@@ -304,12 +307,14 @@ fn claude_json_path() -> AppResult<PathBuf> {
 }
 
 /// 把 SynaRoute MCP 服务器注册进某分类对应工具的客户端配置。
-/// 返回 (人类可读结果, 是否实际写盘)。已是同 url 时不写盘、返回 false。
-pub fn register_mcp_client(category: CategoryType, mcp_url: &str) -> AppResult<(String, bool)> {
+/// `timeout_ms`：写入客户端的单次工具调用超时（由调用方按整轮预算联动算出，见
+/// lib.rs `mcp_client_timeout_ms`）。返回 (人类可读结果, 是否实际写盘)。已是同 url+timeout
+/// 时不写盘、返回 false。
+pub fn register_mcp_client(category: CategoryType, mcp_url: &str, timeout_ms: u64) -> AppResult<(String, bool)> {
     match category {
         // 桌面端的 MCP 也读 ~/.claude.json（与 CLI 同源 mcpServers）。
-        CategoryType::ClaudeCli | CategoryType::ClaudeDesktop => register_mcp_claude(mcp_url),
-        CategoryType::Codex => register_mcp_codex(mcp_url),
+        CategoryType::ClaudeCli | CategoryType::ClaudeDesktop => register_mcp_claude(mcp_url, timeout_ms),
+        CategoryType::Codex => register_mcp_codex(mcp_url, timeout_ms),
     }
 }
 
@@ -321,11 +326,11 @@ pub fn unregister_mcp_client(category: CategoryType) -> AppResult<(String, bool)
     }
 }
 
-fn register_mcp_claude(mcp_url: &str) -> AppResult<(String, bool)> {
-    register_mcp_claude_at(&claude_json_path()?, mcp_url)
+fn register_mcp_claude(mcp_url: &str, timeout_ms: u64) -> AppResult<(String, bool)> {
+    register_mcp_claude_at(&claude_json_path()?, mcp_url, timeout_ms)
 }
 
-fn register_mcp_claude_at(path: &Path, mcp_url: &str) -> AppResult<(String, bool)> {
+fn register_mcp_claude_at(path: &Path, mcp_url: &str, timeout_ms: u64) -> AppResult<(String, bool)> {
     let mut root = read_json_or_empty(path)?;
     let obj = root
         .as_object_mut()
@@ -340,11 +345,11 @@ fn register_mcp_claude_at(path: &Path, mcp_url: &str) -> AppResult<(String, bool
 
     // 幂等：已存在且 url / type / timeout 全一致 → 不写盘。
     // 必须比对 timeout：否则老配置（无 timeout 或旧值）会因 url/type 匹配被判「已是最新」
-    // 而永远升不上 600000，超时修复形同虚设。
+    // 而永远升不上目标值，超时修复形同虚设。
     if let Some(existing) = servers_obj.get(MCP_CLIENT_NAME) {
         if existing.get("url").and_then(|u| u.as_str()) == Some(mcp_url)
             && existing.get("type").and_then(|t| t.as_str()) == Some("http")
-            && existing.get("timeout").and_then(|t| t.as_u64()) == Some(MCP_TOOL_TIMEOUT_MS)
+            && existing.get("timeout").and_then(|t| t.as_u64()) == Some(timeout_ms)
         {
             return Ok((format!("Claude MCP 已是最新（{mcp_url}），跳过"), false));
         }
@@ -352,7 +357,7 @@ fn register_mcp_claude_at(path: &Path, mcp_url: &str) -> AppResult<(String, bool
 
     servers_obj.insert(
         MCP_CLIENT_NAME.to_string(),
-        json_http_mcp(mcp_url),
+        json_http_mcp(mcp_url, timeout_ms),
     );
     backup_and_write_json(path, &root)?;
     Ok((
@@ -361,16 +366,16 @@ fn register_mcp_claude_at(path: &Path, mcp_url: &str) -> AppResult<(String, bool
     ))
 }
 
-/// Claude 的 HTTP MCP 项：{ "type":"http", "url":"...", "timeout":600000 }。
+/// Claude 的 HTTP MCP 项：{ "type":"http", "url":"...", "timeout":<ms> }。
 /// timeout（毫秒）：Claude Code 对 HTTP MCP 有两层超时——单次工具调用总时长、以及
-/// 「首字节」per-request timer（默认 60s）。多模型聚合常需 40~60s 才吐首字节，逼近 60s 线
-/// 会被判超时并重试。官方文档：把 timeout 设为 ≥60s 会同时抬高首字节 timer 到该值，
-/// 故写 600000（10 分钟）彻底规避（见 code.claude.com/docs/en/mcp）。
-fn json_http_mcp(mcp_url: &str) -> Value {
+/// 「首字节」per-request timer（默认 60s）。把 timeout 设为 ≥60s 会同时抬高首字节 timer 到该值
+/// （见 code.claude.com/docs/en/mcp）。此值由调用方按整轮预算联动算出（见
+/// lib.rs `mcp_client_timeout_ms`），保证 ≥ 服务端整轮预算 + 余量。
+fn json_http_mcp(mcp_url: &str, timeout_ms: u64) -> Value {
     let mut m = serde_json::Map::new();
     m.insert("type".into(), Value::String("http".into()));
     m.insert("url".into(), Value::String(mcp_url.to_string()));
-    m.insert("timeout".into(), Value::Number(MCP_TOOL_TIMEOUT_MS.into()));
+    m.insert("timeout".into(), Value::Number(timeout_ms.into()));
     Value::Object(m)
 }
 
@@ -398,11 +403,11 @@ fn unregister_mcp_claude_at(path: &Path) -> AppResult<(String, bool)> {
     Ok((format!("已从 Claude 移除 MCP：{}", path.display()), true))
 }
 
-fn register_mcp_codex(mcp_url: &str) -> AppResult<(String, bool)> {
-    register_mcp_codex_at(&codex_config_path()?, mcp_url)
+fn register_mcp_codex(mcp_url: &str, timeout_ms: u64) -> AppResult<(String, bool)> {
+    register_mcp_codex_at(&codex_config_path()?, mcp_url, timeout_ms)
 }
 
-fn register_mcp_codex_at(path: &Path, mcp_url: &str) -> AppResult<(String, bool)> {
+fn register_mcp_codex_at(path: &Path, mcp_url: &str, timeout_ms: u64) -> AppResult<(String, bool)> {
     let content = if path.exists() {
         std::fs::read_to_string(path)?
     } else {
@@ -428,7 +433,7 @@ fn register_mcp_codex_at(path: &Path, mcp_url: &str) -> AppResult<(String, bool)
     // 幂等：已存在且 url / timeout 全一致 → 不写盘（timeout 必须比对，理由同 Claude 端）。
     if let Some(existing) = servers_table.get(MCP_CLIENT_NAME).and_then(|v| v.as_table()) {
         if existing.get("url").and_then(|u| u.as_str()) == Some(mcp_url)
-            && existing.get("timeout").and_then(|t| t.as_integer()) == Some(MCP_TOOL_TIMEOUT_MS as i64)
+            && existing.get("timeout").and_then(|t| t.as_integer()) == Some(timeout_ms as i64)
         {
             return Ok((format!("Codex MCP 已是最新（{mcp_url}），跳过"), false));
         }
@@ -437,7 +442,7 @@ fn register_mcp_codex_at(path: &Path, mcp_url: &str) -> AppResult<(String, bool)
     // HTTP transport：url + timeout（毫秒，理由见 json_http_mcp 注释）。
     let mut entry = toml::value::Table::new();
     entry.insert("url".to_string(), toml::Value::String(mcp_url.to_string()));
-    entry.insert("timeout".to_string(), toml::Value::Integer(MCP_TOOL_TIMEOUT_MS as i64));
+    entry.insert("timeout".to_string(), toml::Value::Integer(timeout_ms as i64));
     servers_table.insert(MCP_CLIENT_NAME.to_string(), toml::Value::Table(entry));
 
     let serialized =
@@ -812,7 +817,7 @@ mod tests {
         let url = "http://127.0.0.1:9527/mcp";
 
         // 首次注册：写盘
-        let (_, wrote) = register_mcp_claude_at(&path, url).unwrap();
+        let (_, wrote) = register_mcp_claude_at(&path, url, MCP_TOOL_TIMEOUT_MS).unwrap();
         assert!(wrote, "首次注册应写盘");
 
         let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -822,15 +827,41 @@ mod tests {
         assert_eq!(entry["timeout"], 600000, "必须写入 timeout 抬高客户端首字节超时，避免聚合被判超时");
 
         // 再次相同 url：幂等，不写盘
-        let (_, wrote2) = register_mcp_claude_at(&path, url).unwrap();
+        let (_, wrote2) = register_mcp_claude_at(&path, url, MCP_TOOL_TIMEOUT_MS).unwrap();
         assert!(!wrote2, "相同 url 应跳过写盘");
 
         // 换端口：应重写
         let url2 = "http://127.0.0.1:9600/mcp";
-        let (_, wrote3) = register_mcp_claude_at(&path, url2).unwrap();
+        let (_, wrote3) = register_mcp_claude_at(&path, url2, MCP_TOOL_TIMEOUT_MS).unwrap();
         assert!(wrote3, "url 变化应写盘");
         let v2: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(v2["mcpServers"]["synaroute"]["url"], url2);
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn claude_register_writes_coupled_timeout_and_rewrites_on_change() {
+        // 客户端超时联动：写入调用方算出的 timeout（= 整轮预算 + 余量），且 timeout 变化必须重写，
+        // 否则用户调大整轮预算后客户端超时不跟随，聚合仍被客户端提前杀死。
+        let path = temp_file("claude_timeout", ".claude.json");
+        let url = "http://127.0.0.1:9527/mcp";
+
+        // 用一个非默认的联动值（630000 = 600000 整轮 + 30000 余量）。
+        let (_, wrote) = register_mcp_claude_at(&path, url, 630_000).unwrap();
+        assert!(wrote);
+        let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["synaroute"]["timeout"], 630000, "应写入联动算出的 timeout");
+
+        // 同 url 同 timeout：幂等。
+        let (_, wrote2) = register_mcp_claude_at(&path, url, 630_000).unwrap();
+        assert!(!wrote2, "url+timeout 都没变应跳过");
+
+        // url 不变但 timeout 变大（用户调大整轮预算）：必须重写。
+        let (_, wrote3) = register_mcp_claude_at(&path, url, 1_830_000).unwrap();
+        assert!(wrote3, "timeout 变化应重写");
+        let v2: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v2["mcpServers"]["synaroute"]["timeout"], 1830000);
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
@@ -845,7 +876,7 @@ mod tests {
         )
         .unwrap();
 
-        register_mcp_claude_at(&path, "http://127.0.0.1:9527/mcp").unwrap();
+        register_mcp_claude_at(&path, "http://127.0.0.1:9527/mcp", MCP_TOOL_TIMEOUT_MS).unwrap();
         let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(v["numStartups"], 5, "其它顶层键应保留");
         assert_eq!(v["mcpServers"]["other"]["command"], "x", "已有 MCP 应保留");
@@ -886,7 +917,7 @@ mod tests {
         .unwrap();
         let url = "http://127.0.0.1:9527/mcp";
 
-        let (_, wrote) = register_mcp_codex_at(&path, url).unwrap();
+        let (_, wrote) = register_mcp_codex_at(&path, url, MCP_TOOL_TIMEOUT_MS).unwrap();
         assert!(wrote);
 
         let doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
@@ -908,7 +939,7 @@ mod tests {
         assert_eq!(doc["model"].as_str(), Some("gpt-5"), "顶层键应保留");
 
         // 幂等
-        let (_, wrote2) = register_mcp_codex_at(&path, url).unwrap();
+        let (_, wrote2) = register_mcp_codex_at(&path, url, MCP_TOOL_TIMEOUT_MS).unwrap();
         assert!(!wrote2, "相同 url 应跳过");
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
