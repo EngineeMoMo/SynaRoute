@@ -436,11 +436,12 @@ fn status_is_healthy(status: u16) -> bool {
 /// 旧实现用 `fetch_models` 判活：上游若不暴露 /models（404/405）会被误判为不可用、被路由
 /// 排除，即便其 chat 端点完全正常（DeepSeek 等第三方即命中此坑）。现改为：拿到任意 HTTP
 /// 响应即视为可达（鉴权失败 401/403 除外），仅连接层失败（DNS/连接/超时）判为不可达。
-/// 返回 (是否健康, 延迟毫秒)。
-pub async fn health_probe(key: &ProviderKey, secret: &str) -> (bool, u64) {
+/// 返回 (是否健康, 延迟毫秒, 失败原因)。失败原因带出具体状态码或连接错误详情，供落日志排查——
+/// 旧实现只返回 bool，日志只能打一句笼统的「连接层错误或 401/403」，无从定位。
+pub async fn health_probe(key: &ProviderKey, secret: &str) -> (bool, u64, Option<String>) {
     let client = match build_client(key) {
         Ok(c) => c,
-        Err(_) => return (false, 0),
+        Err(e) => return (false, 0, Some(format!("构建 HTTP 客户端失败：{e}"))),
     };
     // 用最便宜的 models 候选端点探测；只关心「有没有回应 + 状态码」，不解析 body。
     let url = model_endpoints(&key.base_url)
@@ -455,12 +456,21 @@ pub async fn health_probe(key: &ProviderKey, secret: &str) -> (bool, u64) {
     }
 
     let start = std::time::Instant::now();
-    let healthy = match req.send().await {
-        Ok(resp) => status_is_healthy(resp.status().as_u16()),
-        Err(_) => false, // 连接层失败（超时/连不上/DNS）：不可达
+    let (healthy, reason) = match req.send().await {
+        Ok(resp) => {
+            let code = resp.status().as_u16();
+            if status_is_healthy(code) {
+                (true, None)
+            } else {
+                // 拿到响应但鉴权失败（401/403）：密钥无效。带出确切状态码与端点。
+                (false, Some(format!("连通探测鉴权失败 HTTP {code}（GET {url}）")))
+            }
+        }
+        // 连接层失败（超时/连不上/DNS）：带出 reqwest 错误详情。
+        Err(e) => (false, Some(format!("连接层失败（GET {url}）：{e}"))),
     };
     let latency = start.elapsed().as_millis() as u64;
-    (healthy, latency)
+    (healthy, latency, reason)
 }
 
 /// 真实补全健康探测（用户开启后使用）：发一个极小的真实 completion 请求，判「业务是否真能出结果」。
@@ -479,8 +489,12 @@ pub async fn health_probe(key: &ProviderKey, secret: &str) -> (bool, u64) {
 pub async fn health_probe_real(key: &ProviderKey, secret: &str) -> (bool, u64, Option<String>) {
     let Some(model) = key.probe_model() else {
         // 该 Key 没有任何可探测的真实模型名 → 无法发补全，退回轻量连通探测。
-        let (ok, latency) = health_probe(key, secret).await;
-        return (ok, latency, (!ok).then(|| "轻量连通探测失败（无可探测模型）".to_string()));
+        let (ok, latency, reason) = health_probe(key, secret).await;
+        return (
+            ok,
+            latency,
+            reason.map(|r| format!("无可探测模型，退回轻量连通探测：{r}")),
+        );
     };
     let start = std::time::Instant::now();
     // 极小请求：一个字 prompt、max_tokens=1。不重试（探测要快、如实反映当下）。

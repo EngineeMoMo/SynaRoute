@@ -32,8 +32,7 @@ pub async fn check_one(store: &Arc<Store>, key_id: &str) {
     let (ok, latency, err) = if real_probe {
         upstream::health_probe_real(&key, &secret).await
     } else {
-        let (ok, latency) = upstream::health_probe(&key, &secret).await;
-        (ok, latency, (!ok).then(|| "连通探测失败（连接层错误或 401/403）".to_string()))
+        upstream::health_probe(&key, &secret).await
     };
     let now = Utc::now().timestamp_millis();
 

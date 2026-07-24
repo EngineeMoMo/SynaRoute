@@ -280,9 +280,28 @@ export const useStore = create<AppState>((set, get) => ({
     });
     try {
       await api.checkHealth(keyId);
-    } finally {
-      // 无论探测成功、失败还是抛错，都刷新列表，避免 Key 永久卡在 "检测中"
-      await get().loadCategory(get().activeCategory);
+    } catch (e) {
+      console.error("checkHealth failed", e);
+    }
+    // 探测完只回写这一条 Key，不走 loadCategory（后者会 set loading=true 并重拉
+    // keys/proxy/brain/events 四样，导致整列表闪烁）。拉最新 keys 后只替换目标那条，
+    // 其余引用不变，不动 loading/proxy/brain/events。
+    try {
+      const latest = await api.listKeys(get().activeCategory);
+      const updated = latest.find((k) => k.id === keyId);
+      set({
+        keys: get().keys.map((k) => (k.id === keyId && updated ? updated : k)),
+      });
+    } catch (e) {
+      console.error("checkHealth refresh failed", e);
+      // 拉取失败：至少把该 Key 从 checking 解除，避免永久卡在"检测中"
+      set({
+        keys: get().keys.map((k) =>
+          k.id === keyId && k.health.status === "checking"
+            ? { ...k, health: { ...k.health, status: "unknown" } }
+            : k
+        ),
+      });
     }
   },
 
