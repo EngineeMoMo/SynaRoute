@@ -7,6 +7,8 @@
 //!
 //! 接入机制（基于接入验证实证）：
 //! - Claude CLI：~/.claude/settings.json 的 env.ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN
+//!   + 借鉴 cc-switch：同步写 ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL
+//!   与顶层 model，清掉切换供应商后的默认残留（避免 Custom model 挂旧 id）
 //! - Codex：~/.codex/config.toml 的 model_provider + [model_providers.synaroute]（base_url/wire_api/requires_openai_auth）
 //!   + ~/.codex/auth.json 的 OPENAI_API_KEY 占位（免手设环境变量，借鉴 cc-switch）
 //! - Claude 桌面端：%APPDATA%/Claude/claude_desktop_config.json（cc-switch 同款思路）
@@ -21,12 +23,14 @@ const BACKUP_SUFFIX: &str = "synaroute.bak";
 
 /// 将某分类的代理端点写入对应目标工具配置。返回人类可读的结果说明。
 ///
-/// `default_model`：仅 Codex 用——写入 config.toml 的 `model` 字段，让 Codex 启动即有默认模型
-/// （借鉴 cc-switch：Codex 不像 Claude CLI 靠 /v1/models 发现，缺 `model` 字段会启动无模型需手选）。
-/// Claude CLI / 桌面端忽略此参数（它们靠网关模型发现填充 /model 选择器）。
+/// `default_model`：当前分类「主 Key」首个可服务对外名（与 `/v1/models` 口径一致）。
+/// - Claude CLI：写入 env.ANTHROPIC_MODEL + ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL
+///   与顶层 `model`，覆盖切换后的默认残留（cc-switch 同款；无此名时不碰这些字段）。
+/// - Codex：写入 config.toml 的 `model` 字段。
+/// - 桌面端：忽略（靠本地路由配置，不写 CLI settings）。
 pub fn apply(category: CategoryType, endpoint: &str, default_model: Option<&str>) -> AppResult<String> {
     match category {
-        CategoryType::ClaudeCli => apply_claude_cli(endpoint),
+        CategoryType::ClaudeCli => apply_claude_cli(endpoint, default_model),
         CategoryType::Codex => apply_codex(endpoint, default_model),
         CategoryType::ClaudeDesktop => apply_claude_desktop(endpoint),
     }
@@ -39,9 +43,18 @@ fn claude_cli_settings_path() -> AppResult<PathBuf> {
     Ok(home.join(".claude").join("settings.json"))
 }
 
-fn apply_claude_cli(endpoint: &str) -> AppResult<String> {
+fn apply_claude_cli(endpoint: &str, default_model: Option<&str>) -> AppResult<String> {
     let path = claude_cli_settings_path()?;
-    let mut root = read_json_or_empty(&path)?;
+    apply_claude_cli_at(&path, endpoint, default_model)
+}
+
+/// 可测入口：写入指定 settings.json（生产走 `claude_cli_settings_path`）。
+fn apply_claude_cli_at(
+    path: &Path,
+    endpoint: &str,
+    default_model: Option<&str>,
+) -> AppResult<String> {
+    let mut root = read_json_or_empty(path)?;
 
     // 确保 env 对象存在
     let env = root
@@ -69,9 +82,31 @@ fn apply_claude_cli(endpoint: &str) -> AppResult<String> {
         Value::String("1".into()),
     );
 
-    backup_and_write_json(&path, &root)?;
+    // 借鉴 cc-switch：启用/应用时同步覆盖默认模型相关字段，避免：
+    // 1) 顶层 `model` 残留旧 id（如 claude-synaroute-grok-4.5）→ /model 出现 Custom model
+    // 2) env.ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_* 仍是上一供应商的真实名 → 内置档位绕过映射
+    // 写入值为「主 Key 首个可服务对外名」（与 /v1/models、故障转移交集口径一致）。
+    // 取不到时不动这些字段，避免空写把用户配置清空。
+    let model_note = if let Some(m) = default_model.map(str::trim).filter(|s| !s.is_empty()) {
+        let v = Value::String(m.to_string());
+        env_obj.insert("ANTHROPIC_MODEL".into(), v.clone());
+        // 三档默认都落到同一对外名：CLI 选 Haiku/Sonnet/Opus 时发这个名，代理再 resolve。
+        // （用户若在 Key 上配了三档真实映射，match_tier 仍优先；这里保证默认不再是残留）
+        env_obj.insert("ANTHROPIC_DEFAULT_HAIKU_MODEL".into(), v.clone());
+        env_obj.insert("ANTHROPIC_DEFAULT_SONNET_MODEL".into(), v.clone());
+        env_obj.insert("ANTHROPIC_DEFAULT_OPUS_MODEL".into(), v.clone());
+        // 顶层 model：/model 的「当前默认」；不写则 CLI 一直挂着上次选中的 Custom
+        if let Some(obj) = root.as_object_mut() {
+            obj.insert("model".into(), Value::String(m.to_string()));
+        }
+        format!("，默认模型={m}")
+    } else {
+        String::new()
+    };
+
+    backup_and_write_json(path, &root)?;
     Ok(format!(
-        "已写入 Claude CLI 配置：{}（ANTHROPIC_BASE_URL={endpoint}），原文件已备份",
+        "已写入 Claude CLI 配置：{}（ANTHROPIC_BASE_URL={endpoint}{model_note}），原文件已备份",
         path.display()
     ))
 }
@@ -659,6 +694,68 @@ mod tests {
         // 幂等
         let (_, wrote2) = register_mcp_codex_at(&path, url).unwrap();
         assert!(!wrote2, "相同 url 应跳过");
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn claude_cli_apply_overwrites_model_defaults_like_cc_switch() {
+        // 回归：应用配置时必须覆盖顶层 model + ANTHROPIC_MODEL + 三档 DEFAULT_*，
+        // 否则切换 Key 后 /model 会残留 claude-synaroute-* · Custom（cc-switch 同款做法）。
+        let path = temp_file("claude_cli_model", "settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://old:1",
+    "ANTHROPIC_MODEL": "claude-synaroute-grok-4.5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "grok-4.5",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "grok-4.5",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "grok-4.5"
+  },
+  "model": "claude-synaroute-grok-4.5"
+}"#,
+        )
+        .unwrap();
+
+        let msg = apply_claude_cli_at(
+            &path,
+            "http://127.0.0.1:8788",
+            Some("claude-opus-4-7"),
+        )
+        .unwrap();
+        assert!(msg.contains("默认模型=claude-opus-4-7"));
+
+        let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["model"], "claude-opus-4-7");
+        assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8788");
+        assert_eq!(v["env"]["ANTHROPIC_MODEL"], "claude-opus-4-7");
+        assert_eq!(v["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "claude-opus-4-7");
+        assert_eq!(v["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-opus-4-7");
+        assert_eq!(v["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-4-7");
+        assert_eq!(v["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], "1");
+        // token 占位保留/补齐
+        assert_eq!(v["env"]["ANTHROPIC_AUTH_TOKEN"], "synaroute-proxy");
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn claude_cli_apply_skips_model_fields_when_no_default() {
+        // 取不到可服务模型时，不碰用户已有 model / ANTHROPIC_* 字段
+        let path = temp_file("claude_cli_skip", "settings.json");
+        std::fs::write(
+            &path,
+            r#"{"env":{"ANTHROPIC_MODEL":"keep-me"},"model":"keep-me"}"#,
+        )
+        .unwrap();
+
+        apply_claude_cli_at(&path, "http://127.0.0.1:8788", None).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["model"], "keep-me");
+        assert_eq!(v["env"]["ANTHROPIC_MODEL"], "keep-me");
+        assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8788");
+        assert!(v["env"].get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none());
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }

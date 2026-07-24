@@ -201,9 +201,10 @@ async fn apply_tool_config(
     // 确保代理已启动
     let port = state.proxy.start(category_id).await?;
     let endpoint = format!("http://127.0.0.1:{port}");
-    // 默认模型（供 Codex 写顶层 model 字段，借鉴 cc-switch）：取该分类首个启用 Key 的
-    // 首个可服务模型（对外名，代理侧 resolve_model 会改写为上游真实名）。取不出则为 None，
-    // apply 不动用户已有 model 字段。仅 Codex 端用到；其余端忽略此参数。
+    // 默认模型（Claude CLI + Codex，借鉴 cc-switch）：取该分类首个启用 Key 的
+    // 首个可服务对外名（与 /v1/models 口径一致）。Claude CLI 用于覆盖
+    // ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_* / 顶层 model，清掉切换后的 Custom 残留；
+    // Codex 写 config.toml 的 model。取不出则为 None，apply 不动用户已有 model 字段。
     let default_model = state
         .store
         .enabled_keys_sorted(category_id)
