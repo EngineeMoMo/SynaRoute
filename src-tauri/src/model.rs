@@ -264,6 +264,34 @@ pub struct ProviderKey {
     pub health: HealthState,
 }
 
+/// Claude Code 网关模型发现：CLI 静默丢弃 id 不以 `claude`/`anthropic` 开头的条目
+///（见官方 llm-gateway-protocol / CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY）。
+/// 非合规名（如 grok-4.5、glm-4.6）在 `/v1/models` 暴露时包一层此外缀，客户端选中后
+/// `resolve_model` 再剥掉还原。
+pub const GATEWAY_ALIAS_PREFIX: &str = "claude-synaroute-";
+
+/// 该模型 id 是否能直接出现在 Claude Code /model 的 From gateway 列表里。
+pub fn is_cli_discoverable_model_id(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    lower.starts_with("claude") || lower.starts_with("anthropic")
+}
+
+/// 把可服务模型名变成 CLI 能展示的网关 id：已合规则原样，否则加 `claude-synaroute-` 前缀。
+/// 仅用于 Claude CLI/桌面端的 `/v1/models` 响应；Codex 不包。
+pub fn to_gateway_model_id(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() || is_cli_discoverable_model_id(name) {
+        name.to_string()
+    } else {
+        format!("{GATEWAY_ALIAS_PREFIX}{name}")
+    }
+}
+
+/// 剥掉网关别名前缀；非别名则原样返回。
+pub fn unwrap_gateway_model_id(name: &str) -> &str {
+    name.strip_prefix(GATEWAY_ALIAS_PREFIX).unwrap_or(name)
+}
+
 /// `resolve_model` 的命中路径，供日志展示「为什么变成这个模型」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelResolveKind {
@@ -314,6 +342,10 @@ impl ProviderKey {
 
     /// 同 [`Self::resolve_model`]，额外返回命中路径，供日志写清「请求/实际/原因」。
     pub fn resolve_model_detail(&self, requested_model: &str) -> (String, ModelResolveKind) {
+        // 0. 网关别名反解：CLI 只能展示 claude/anthropic 前缀 id，/v1/models 对非合规名
+        // 包了 `claude-synaroute-`；选中后客户端发回别名，先剥掉再走映射/三档/原生。
+        let requested_model = unwrap_gateway_model_id(requested_model);
+
         // 1. 映射命中（精确名，最高优先级）
         if let Some(m) = self
             .mappings
@@ -343,7 +375,7 @@ impl ProviderKey {
         if let Some(first) = self.models.first() {
             return (first.real_name.clone(), ModelResolveKind::First);
         }
-        // 6. 透传
+        // 6. 透传（透传剥后的名字，避免把别名原样打给上游）
         (requested_model.to_string(), ModelResolveKind::Passthrough)
     }
 
@@ -863,6 +895,48 @@ mod tests {
     fn serviceable_models_empty_when_nothing_configured() {
         let k = key_with(vec![], vec![], None);
         assert!(k.serviceable_models().is_empty());
+    }
+
+    #[test]
+    fn gateway_alias_wraps_non_claude_names_only() {
+        assert_eq!(to_gateway_model_id("grok-4.5"), "claude-synaroute-grok-4.5");
+        assert_eq!(to_gateway_model_id("glm-4.6"), "claude-synaroute-glm-4.6");
+        // 已合规：原样
+        assert_eq!(to_gateway_model_id("claude-opus-4-5"), "claude-opus-4-5");
+        assert_eq!(to_gateway_model_id("anthropic.claude-v2"), "anthropic.claude-v2");
+        // 空白
+        assert_eq!(to_gateway_model_id("  "), "");
+    }
+
+    #[test]
+    fn gateway_alias_unwrap_roundtrip() {
+        assert_eq!(unwrap_gateway_model_id("claude-synaroute-grok-4.5"), "grok-4.5");
+        assert_eq!(unwrap_gateway_model_id("claude-opus-4-5"), "claude-opus-4-5");
+        assert_eq!(unwrap_gateway_model_id("grok-4.5"), "grok-4.5");
+    }
+
+    #[test]
+    fn resolve_unwraps_gateway_alias_to_native() {
+        // CLI 选中网关包装 id → 剥前缀 → 命中原生列表
+        let k = key_with(vec![model("grok-4.5")], vec![], Some("grok-4.5"));
+        assert_eq!(
+            k.resolve_model_detail("claude-synaroute-grok-4.5"),
+            ("grok-4.5".into(), ModelResolveKind::Native)
+        );
+    }
+
+    #[test]
+    fn resolve_unwraps_gateway_alias_then_mapping() {
+        let k = key_with(
+            vec![model("glm-5.2")],
+            vec![mapping("opus-4-8", "glm-5.2")],
+            None,
+        );
+        // 对外名本身不合规时也会被包成 claude-synaroute-opus-4-8；剥后走映射
+        assert_eq!(
+            k.resolve_model_detail("claude-synaroute-opus-4-8"),
+            ("glm-5.2".into(), ModelResolveKind::Mapping)
+        );
     }
 
     #[test]

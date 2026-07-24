@@ -506,6 +506,8 @@ fn handle_list_models(store: &Arc<Store>, category: CategoryType) -> Response<Re
     let models = discoverable_models(&store.enabled_keys_sorted(category));
 
     // 分类固定了下游协议形态：Codex 用 OpenAI，Claude CLI/桌面端用 Anthropic。
+    // Claude Code 静默丢弃 id 不以 claude/anthropic 开头的条目 → 非合规名包成
+    // `claude-synaroute-<real>`，display_name 仍显示真实名，resolve 时剥前缀。
     let body = if matches!(category, CategoryType::Codex) {
         let data: Vec<Value> = models
             .iter()
@@ -515,13 +517,19 @@ fn handle_list_models(store: &Arc<Store>, category: CategoryType) -> Response<Re
     } else {
         let data: Vec<Value> = models
             .iter()
-            .map(|m| serde_json::json!({"type": "model", "id": m, "display_name": m}))
+            .map(|m| {
+                let id = crate::model::to_gateway_model_id(m);
+                // display_name 用真实名，选择器上用户看到 grok-4.5 而非长前缀
+                serde_json::json!({"type": "model", "id": id, "display_name": m})
+            })
             .collect();
+        let first = models.first().map(|m| crate::model::to_gateway_model_id(m));
+        let last = models.last().map(|m| crate::model::to_gateway_model_id(m));
         serde_json::json!({
             "data": data,
             "has_more": false,
-            "first_id": models.first(),
-            "last_id": models.last(),
+            "first_id": first,
+            "last_id": last,
         })
     };
     let bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
@@ -1212,8 +1220,63 @@ mod tests {
             .iter()
             .map(|m| m["id"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(ids, vec!["opus-4-8"], "应只返回共有的 opus-4-8");
+        // 非 claude/anthropic 前缀的 id 会被包成 claude-synaroute-* 供 CLI 展示
+        assert_eq!(ids, vec!["claude-synaroute-opus-4-8"], "应只返回共有的 opus-4-8（已包装）");
         assert_eq!(body["data"][0]["type"], "model", "Anthropic 形态");
+        assert_eq!(body["data"][0]["display_name"], "opus-4-8", "展示名保持真实名");
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn proxy_v1_models_wraps_non_claude_ids_for_cli() {
+        // 回归：单 Key 只有 grok-4.5 时，CLI /model 必须能看见 From gateway 条目。
+        // 原样返回 grok-4.5 会被 CLI 静默过滤；必须包成 claude-synaroute-grok-4.5。
+        let dir = temp_dir("listmodels-wrap");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let mut k = key("k1", 0, "http://x");
+        k.models = vec![model_info("grok-4.5")];
+        k.default_model = Some("grok-4.5".into());
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"][0]["id"], "claude-synaroute-grok-4.5");
+        assert_eq!(body["data"][0]["display_name"], "grok-4.5");
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn proxy_v1_models_keeps_claude_ids_unwrapped() {
+        // 已合规名不二次包装
+        let dir = temp_dir("listmodels-claude");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let mut k = key("k1", 0, "http://x");
+        k.models = vec![model_info("claude-opus-4-5")];
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"][0]["id"], "claude-opus-4-5");
+        assert_eq!(body["data"][0]["display_name"], "claude-opus-4-5");
         pm.stop(CategoryType::ClaudeCli);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1252,7 +1315,12 @@ mod tests {
             .iter()
             .map(|m| m["id"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(ids, vec!["opus-4-8", "glm-5.2"], "Down 的 Key 也应列出其模型");
+        // 非 claude 前缀会包成 claude-synaroute-*，顺序仍是 映射对外名 → 原生名
+        assert_eq!(
+            ids,
+            vec!["claude-synaroute-opus-4-8", "claude-synaroute-glm-5.2"],
+            "Down 的 Key 也应列出其模型（已包装）"
+        );
         pm.stop(CategoryType::ClaudeCli);
         std::fs::remove_dir_all(&dir).ok();
     }

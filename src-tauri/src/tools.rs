@@ -61,8 +61,9 @@ fn apply_claude_cli(endpoint: &str) -> AppResult<String> {
     // 开启网关模型发现：Claude Code 默认不调用 <base>/v1/models，必须显式置 1 才会拉取代理
     // 暴露的可选模型填充 /model 选择器（需 CLI ≥ v2.1.129）。强制写 1，这正是 SynaRoute
     // 多 Key 路由要生效的前提。
-    // 注意：CLI 只接受 id 以 "claude"/"anthropic" 开头的模型，其它一律被静默过滤 —— 映射对外名
-    // 需以此开头（如 claude-opus-4-8），否则不会出现在选择器里。
+    // CLI 只接受 id 以 "claude"/"anthropic" 开头的模型，其它静默过滤。代理侧对非合规名
+    // （如 grok-4.5）自动包成 `claude-synaroute-<name>` 暴露，resolve 时再剥前缀；映射
+    // 对外名若想出现在选择器里仍可直接写成 claude-*（无需包装）。
     env_obj.insert(
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY".into(),
         Value::String("1".into()),
