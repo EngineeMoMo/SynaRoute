@@ -561,7 +561,33 @@ impl Store {
             // 因此这两个字段一律保留后端持久化值，与前端入参无关。
             settings.mcp_port = cfg.settings.mcp_port;
             settings.mcp_enabled = cfg.settings.mcp_enabled;
+            // active_models 同为后端自管字段：前端 saveSettings 携带的是加载时旧快照，
+            // 用户在应用内改选模型走专用命令 set_active_model 直写，若被这里的旧快照覆盖，
+            // 会把刚选的模型顶回旧值（与 mcp_* 同一保全策略）。始终保留后端持久化值。
+            settings.active_models = std::mem::take(&mut cfg.settings.active_models);
             cfg.settings = settings;
+        }
+        self.persist()
+    }
+
+    /// 设置某分类当前选定的对外模型名（后端自管字段专用写入，绕过 save_settings 的旧快照覆盖）。
+    /// 空串视为清除该分类的选择（回到「透传客户端发来的模型名」）。已是目标值则幂等跳过写盘。
+    pub fn set_active_model(&self, category: &str, model: &str) -> AppResult<()> {
+        {
+            let mut cfg = self.config.write();
+            let trimmed = model.trim();
+            if trimmed.is_empty() {
+                if cfg.settings.active_models.remove(category).is_none() {
+                    return Ok(());
+                }
+            } else {
+                if cfg.settings.active_models.get(category).map(|s| s.as_str()) == Some(trimmed) {
+                    return Ok(());
+                }
+                cfg.settings
+                    .active_models
+                    .insert(category.to_string(), trimmed.to_string());
+            }
         }
         self.persist()
     }
@@ -995,6 +1021,41 @@ mod tests {
             "已注册分类不应被前端空 vec 清空"
         );
         assert_eq!(now.theme, "dark", "非控制面字段应正常更新");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 应用内「对外模型名」选择：set_active_model 直写并持久化；空串清除；
+    /// 且不被前端携带的陈旧 save_settings 快照顶回（与 mcp_* 同一保全策略）。
+    #[test]
+    fn set_active_model_persists_and_survives_stale_save_settings() {
+        let dir = temp_dir("active_model");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        // 用户在应用内为 codex 选定对外模型名。
+        store.set_active_model("codex", "claude-opus-4-8").unwrap();
+        assert_eq!(
+            store.get_settings().active_models.get("codex").map(|s| s.as_str()),
+            Some("claude-opus-4-8"),
+        );
+
+        // 前端切主题时提交的旧快照 active_models 为空：不得清除已选模型。
+        let mut stale = store.get_settings();
+        stale.active_models = std::collections::HashMap::new();
+        stale.theme = "dark".into();
+        store.save_settings(stale).unwrap();
+        assert_eq!(
+            store.get_settings().active_models.get("codex").map(|s| s.as_str()),
+            Some("claude-opus-4-8"),
+            "已选模型应保留，不被前端空快照顶回",
+        );
+        assert_eq!(store.get_settings().theme, "dark", "非自管字段应正常更新");
+
+        // 空串清除该分类选择（回到透传）；重开 Store 后仍为空。
+        store.set_active_model("codex", "").unwrap();
+        assert!(!store.get_settings().active_models.contains_key("codex"));
+        let store2 = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        assert!(!store2.get_settings().active_models.contains_key("codex"), "清除后应持久");
 
         std::fs::remove_dir_all(&dir).ok();
     }

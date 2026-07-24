@@ -179,11 +179,22 @@ async fn handle_request(
     };
 
     let req_json: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
-    let requested_model = req_json
+    let client_model = req_json
         .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
+    // 应用内「对外模型名」覆盖（借鉴 EchoBird）：某些客户端（如 Codex）模型菜单是内置固定
+    // 清单、拉不到中转的真实模型，用户在本应用内选定的模型经此覆盖客户端发来的模型名。
+    // 每请求实时读 get_settings，改选即时生效、免重启客户端。空/未选时透传客户端原值。
+    // 覆盖后的名字仍走下游各 Key 的 resolve_model（映射→三档→原生→兜底），故多 Key 故障转移不受影响。
+    let requested_model = store
+        .get_settings()
+        .active_models
+        .get(category.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(client_model);
 
     // 下游是否要求流式（Claude Code / Codex 默认 stream:true）。
     let wants_stream = req_json

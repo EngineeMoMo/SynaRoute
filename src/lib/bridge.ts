@@ -119,6 +119,11 @@ export const api = {
   saveSettings: (settings: AppSettings) =>
     call<void>("save_settings", { settings }, () => mockBridge.saveSettings(settings)),
 
+  // 设置某分类当前选定的「对外模型名」（应用内模型下拉专用，后端自管字段）。
+  // 空串清除该分类选择，回到透传客户端发来的模型名。每请求实时读取，改选即时生效。
+  setActiveModel: (categoryId: CategoryType, model: string) =>
+    call<void>("set_active_model", { categoryId, model }, async () => {}),
+
   // ---- 版本与更新 ----
   getAppVersion: () => call<string>("get_app_version", undefined, () => "0.2.0"),
 

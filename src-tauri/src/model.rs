@@ -671,6 +671,14 @@ pub struct AppSettings {
     /// 徒增磁盘 IO；状态行（参与者成功/失败、汇总/决策者返回）不受此开关影响，始终记录。
     #[serde(default)]
     pub aggregate_trace_enabled: bool,
+    /// 各分类当前选定的「对外模型名」（key=分类字符串，value=对外模型名）。
+    /// 借鉴 EchoBird：某些客户端（如 Codex）的模型菜单是内置固定清单、拉不到中转的真实模型，
+    /// 故在本应用内选模型，代理转发时用此值覆盖客户端发来的模型名，再走 resolve_model 解析。
+    /// 每请求实时读取（get_settings），改选即时生效、免重启客户端。
+    /// 后端自管字段：由专用命令 set_active_model 更新，不随通用 save_settings 的陈旧快照覆盖
+    /// （与 mcp_* 字段同一保全策略）。
+    #[serde(default)]
+    pub active_models: std::collections::HashMap<String, String>,
 }
 
 fn default_true() -> bool {
@@ -706,6 +714,7 @@ impl Default for AppSettings {
             upstream_retry_enabled: true,
             health_probe_real_completion: false,
             aggregate_trace_enabled: false,
+            active_models: std::collections::HashMap::new(),
         }
     }
 }

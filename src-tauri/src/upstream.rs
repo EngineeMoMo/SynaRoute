@@ -1324,6 +1324,10 @@ pub enum SseDirection {
     ChatToAnthropic,
     /// 上游 Anthropic SSE → 下游 Chat SSE。
     AnthropicToChat,
+    /// 上游 Anthropic SSE → 下游 Responses SSE（Codex 连 Claude/Anthropic 上游，主诉求）。
+    AnthropicToResponses,
+    /// 上游 Responses SSE → 下游 Anthropic SSE（镜像方向，补全 3×3 矩阵）。
+    ResponsesToAnthropic,
 }
 
 /// 根据下游协议(`downstream`)与上游 Key 协议(`upstream`)决定 SSE 翻译方向。
@@ -1335,6 +1339,8 @@ pub fn sse_direction(downstream: Protocol, upstream: Protocol) -> Option<SseDire
         (OpenaiChat, OpenaiResponses) => Some(SseDirection::ResponsesToChat),
         (Anthropic, OpenaiChat) => Some(SseDirection::ChatToAnthropic),
         (OpenaiChat, Anthropic) => Some(SseDirection::AnthropicToChat),
+        (OpenaiResponses, Anthropic) => Some(SseDirection::AnthropicToResponses),
+        (Anthropic, OpenaiResponses) => Some(SseDirection::ResponsesToAnthropic),
         _ => None,
     }
 }
@@ -1355,6 +1361,13 @@ pub struct SseTranslator {
     model: String,
     /// tool_call 增量按 index 累积 (id, name, arguments)。
     tool_calls: Vec<(String, String, String)>,
+    /// Anthropic 上游的 usage 分散在 message_start（input_tokens）与 message_delta
+    /// （output_tokens），需累积后在收尾（Responses response.completed）时统一归位。
+    input_tokens: u64,
+    output_tokens: u64,
+    /// Anthropic content block 的 index → tool_calls 槽位下标映射（tool_use 块与 text 块
+    /// 共用同一 index 空间，需按 content_block_start 记下 tool_use 块落在哪个槽位）。
+    block_tool_slot: std::collections::HashMap<usize, usize>,
 }
 
 impl SseTranslator {
@@ -1368,6 +1381,9 @@ impl SseTranslator {
             saw_text: false,
             model: String::new(),
             tool_calls: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            block_tool_slot: std::collections::HashMap::new(),
         }
     }
 
@@ -1389,8 +1405,12 @@ impl SseTranslator {
     /// 流结束时冲刷收尾事件（Responses 需要 response.completed；Chat 需 [DONE]）。
     pub fn finish(&mut self) -> String {
         match self.dir {
-            SseDirection::ChatToResponses => self.emit_responses_completed(None),
-            SseDirection::ChatToAnthropic => self.emit_anthropic_stop(),
+            SseDirection::ChatToResponses | SseDirection::AnthropicToResponses => {
+                self.emit_responses_completed(None)
+            }
+            SseDirection::ChatToAnthropic | SseDirection::ResponsesToAnthropic => {
+                self.emit_anthropic_stop()
+            }
             SseDirection::ResponsesToChat | SseDirection::AnthropicToChat => {
                 "data: [DONE]\n\n".to_string()
             }
@@ -1417,6 +1437,8 @@ impl SseTranslator {
             SseDirection::ResponsesToChat => Some(self.responses_event_to_chat(&json)),
             SseDirection::ChatToAnthropic => Some(self.chat_chunk_to_anthropic(&json)),
             SseDirection::AnthropicToChat => Some(self.anthropic_event_to_chat(&json)),
+            SseDirection::AnthropicToResponses => Some(self.anthropic_chunk_to_responses(&json)),
+            SseDirection::ResponsesToAnthropic => Some(self.responses_event_to_anthropic(&json)),
         }
     }
 
@@ -1518,12 +1540,15 @@ impl SseTranslator {
                 "name": name, "arguments": args, "status": "completed"
             }));
         }
-        let (it, ot) = usage
-            .map(|u| (
-                u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
-                u.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
-            ))
-            .unwrap_or((0, 0));
+        // usage 来源二选一：Chat 上游末尾 chunk 传入 usage（prompt/completion_tokens）；
+        // Anthropic 上游无末尾 usage chunk，token 在流中分散累积到字段，此处兜底取字段值。
+        let (it, ot) = match usage {
+            Some(u) => (
+                u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(self.input_tokens),
+                u.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(self.output_tokens),
+            ),
+            None => (self.input_tokens, self.output_tokens),
+        };
         let completed = json!({
             "type": "response.completed",
             "response": {
@@ -1625,6 +1650,166 @@ impl SseTranslator {
             }
             _ => String::new(),
         }
+    }
+
+    /// 一个 Anthropic SSE 事件 → Responses 事件序列文本（Codex 连 Claude 上游，主诉求）。
+    /// 覆盖 Codex 重度使用的 function calling：Anthropic 的 tool_use 块 + input_json_delta
+    /// 增量 → Responses function_call output item。用 `block_tool_slot` 把 Anthropic 的
+    /// content block index 映射到 `tool_calls` 槽位（text 块与 tool_use 块共用同一 index 空间）。
+    fn anthropic_chunk_to_responses(&mut self, ev: &Value) -> String {
+        let mut out = String::new();
+        let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match ty {
+            // message_start：捕获 model 与 input_tokens，发起始事件（response.created + output_item.added）
+            "message_start" => {
+                let msg = ev.get("message");
+                if self.model.is_empty() {
+                    if let Some(m) = msg.and_then(|m| m.get("model")).and_then(|m| m.as_str()) {
+                        self.model = m.to_string();
+                    }
+                }
+                if let Some(it) = msg
+                    .and_then(|m| m.get("usage"))
+                    .and_then(|u| u.get("input_tokens"))
+                    .and_then(|t| t.as_u64())
+                {
+                    self.input_tokens = it;
+                }
+                if !self.started {
+                    self.started = true;
+                    let created = json!({
+                        "type": "response.created",
+                        "response": { "id": self.resp_id, "object": "response", "status": "in_progress", "model": self.model }
+                    });
+                    out.push_str(&sse("response.created", &created));
+                    let item_added = json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": { "id": self.msg_id, "type": "message", "role": "assistant", "status": "in_progress", "content": [] }
+                    });
+                    out.push_str(&sse("response.output_item.added", &item_added));
+                }
+            }
+            // content_block_start：tool_use 块 → 记 tool_call 槽位 (id, name)；text 块无需动作
+            "content_block_start" => {
+                let idx = ev.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let block = ev.get("content_block");
+                if block.and_then(|b| b.get("type")).and_then(|t| t.as_str()) == Some("tool_use") {
+                    let id = block
+                        .and_then(|b| b.get("id"))
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = block
+                        .and_then(|b| b.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let slot = self.tool_calls.len();
+                    self.tool_calls.push((id, name, String::new()));
+                    self.block_tool_slot.insert(idx, slot);
+                }
+            }
+            // content_block_delta：text_delta → output_text.delta；input_json_delta → 累加工具参数
+            "content_block_delta" => {
+                let idx = ev.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let delta = ev.get("delta");
+                let dty = delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()).unwrap_or("");
+                match dty {
+                    "text_delta" => {
+                        if let Some(t) = delta.and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
+                            if !t.is_empty() {
+                                self.saw_text = true;
+                                let e = json!({
+                                    "type": "response.output_text.delta",
+                                    "item_id": self.msg_id, "output_index": 0, "content_index": 0, "delta": t
+                                });
+                                out.push_str(&sse("response.output_text.delta", &e));
+                            }
+                        }
+                    }
+                    "input_json_delta" => {
+                        if let Some(pj) = delta.and_then(|d| d.get("partial_json")).and_then(|p| p.as_str()) {
+                            if let Some(&slot) = self.block_tool_slot.get(&idx) {
+                                self.tool_calls[slot].2.push_str(pj);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // message_delta：捕获 output_tokens（收尾 usage 归位）
+            "message_delta" => {
+                if let Some(ot) = ev
+                    .get("usage")
+                    .and_then(|u| u.get("output_tokens"))
+                    .and_then(|t| t.as_u64())
+                {
+                    self.output_tokens = ot;
+                }
+            }
+            // message_stop：发文本 done + response.completed（usage 用累积字段）
+            "message_stop" => {
+                if self.saw_text {
+                    let done = json!({
+                        "type": "response.output_text.done",
+                        "item_id": self.msg_id, "output_index": 0, "content_index": 0, "text": ""
+                    });
+                    out.push_str(&sse("response.output_text.done", &done));
+                }
+                out.push_str(&self.emit_responses_completed(None));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// 一个 Responses SSE 事件 → Anthropic SSE 事件文本（镜像方向，文本+收尾）。
+    /// 与现有反向翻译器（responses_event_to_chat / anthropic_event_to_chat）同等简洁：
+    /// 只覆盖文本增量与收尾，不重建工具（此方向无 Codex 场景需求）。
+    fn responses_event_to_anthropic(&mut self, ev: &Value) -> String {
+        let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let mut out = String::new();
+        match ty {
+            "response.created" => {
+                if self.model.is_empty() {
+                    if let Some(m) = ev
+                        .get("response")
+                        .and_then(|r| r.get("model"))
+                        .and_then(|m| m.as_str())
+                    {
+                        self.model = m.to_string();
+                    }
+                }
+            }
+            "response.output_text.delta" => {
+                if !self.started {
+                    self.started = true;
+                    out.push_str(&sse("message_start", &json!({
+                        "type": "message_start",
+                        "message": { "id": self.resp_id, "type": "message", "role": "assistant", "content": [],
+                            "model": self.model, "usage": { "input_tokens": 0, "output_tokens": 0 } }
+                    })));
+                    out.push_str(&sse("content_block_start", &json!({
+                        "type": "content_block_start", "index": 0,
+                        "content_block": { "type": "text", "text": "" }
+                    })));
+                }
+                let delta = ev.get("delta").and_then(|d| d.as_str()).unwrap_or("");
+                if !delta.is_empty() {
+                    self.saw_text = true;
+                    out.push_str(&sse("content_block_delta", &json!({
+                        "type": "content_block_delta", "index": 0,
+                        "delta": { "type": "text_delta", "text": delta }
+                    })));
+                }
+            }
+            "response.completed" => {
+                out.push_str(&self.emit_anthropic_stop());
+            }
+            _ => {}
+        }
+        out
     }
 }
 
@@ -2090,10 +2275,12 @@ mod tests {
         assert_eq!(sse_direction(OpenaiChat, OpenaiResponses), Some(SseDirection::ResponsesToChat));
         assert_eq!(sse_direction(Anthropic, OpenaiChat), Some(SseDirection::ChatToAnthropic));
         assert_eq!(sse_direction(OpenaiChat, Anthropic), Some(SseDirection::AnthropicToChat));
-        // 同协议 / 无中枢路径的跨协议：None
+        assert_eq!(sse_direction(OpenaiResponses, Anthropic), Some(SseDirection::AnthropicToResponses));
+        assert_eq!(sse_direction(Anthropic, OpenaiResponses), Some(SseDirection::ResponsesToAnthropic));
+        // 同协议：None（原样直通，无需翻译）
         assert_eq!(sse_direction(OpenaiChat, OpenaiChat), None);
-        assert_eq!(sse_direction(Anthropic, OpenaiResponses), None);
-        assert_eq!(sse_direction(OpenaiResponses, Anthropic), None);
+        assert_eq!(sse_direction(Anthropic, Anthropic), None);
+        assert_eq!(sse_direction(OpenaiResponses, OpenaiResponses), None);
     }
 
     #[test]
@@ -2194,5 +2381,97 @@ mod tests {
         let mut tr = SseTranslator::new(SseDirection::ChatToResponses);
         let tail = tr.finish();
         assert!(tail.is_empty(), "未开始的流收尾应为空，实际:\n{tail}");
+    }
+
+    #[test]
+    fn sse_direction_covers_anthropic_responses_pair() {
+        // 新增两方向：Codex(Responses 下游) 连 Claude(Anthropic 上游) 及其镜像。
+        use Protocol::*;
+        assert_eq!(
+            sse_direction(OpenaiResponses, Anthropic),
+            Some(SseDirection::AnthropicToResponses)
+        );
+        assert_eq!(
+            sse_direction(Anthropic, OpenaiResponses),
+            Some(SseDirection::ResponsesToAnthropic)
+        );
+    }
+
+    #[test]
+    fn sse_anthropic_to_responses_reassembles_text_and_usage() {
+        // 主诉求：Codex(Responses 下游) 连 Claude 上游。Anthropic SSE（message_start →
+        // content_block_delta(text) → message_delta(usage) → message_stop）须重组为
+        // Responses 事件序列（created → item.added → text.delta* → text.done → completed）。
+        let mut tr = SseTranslator::new(SseDirection::AnthropicToResponses);
+        let mut out = String::new();
+        out.push_str(&tr.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" there\"}}\n\n"));
+        out.push_str(&tr.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n"));
+        out.push_str(&tr.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+        out.push_str(&tr.finish());
+        // 起始事件
+        assert!(out.contains("event: response.created"), "缺 response.created:\n{out}");
+        assert!(out.contains("event: response.output_item.added"), "缺 output_item.added");
+        assert!(out.contains("\"model\":\"claude-opus-4-8\""), "model 未捕获");
+        // 两段文本增量
+        assert!(out.contains("\"delta\":\"Hi\""), "缺第一段增量");
+        assert!(out.contains("\"delta\":\" there\""), "缺第二段增量");
+        // 收尾：text.done + completed（usage 用 Anthropic 分散字段累积）
+        assert!(out.contains("event: response.output_text.done"), "缺 output_text.done");
+        assert!(out.contains("event: response.completed"), "缺 response.completed");
+        assert!(out.contains("\"input_tokens\":7"), "input_tokens 未归位:\n{out}");
+        assert!(out.contains("\"output_tokens\":3"), "output_tokens 未归位:\n{out}");
+        assert_eq!(out.matches("event: response.completed").count(), 1, "completed 应只出现一次");
+    }
+
+    #[test]
+    fn sse_anthropic_to_responses_maps_tool_use_deltas() {
+        // Codex 重度用 function calling：Anthropic tool_use 块 + input_json_delta 分块累积
+        // → Responses function_call output item，参数拼全。
+        let mut tr = SseTranslator::new(SseDirection::AnthropicToResponses);
+        let mut out = String::new();
+        out.push_str(&tr.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5}}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"ci\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"ty\\\":\\\"SF\\\"}\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"));
+        out.push_str(&tr.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+        out.push_str(&tr.finish());
+        assert!(out.contains("\"type\":\"function_call\""), "缺 function_call item:\n{out}");
+        assert!(out.contains("\"name\":\"get_weather\""), "工具名未重组");
+        assert!(out.contains("\"call_id\":\"toolu_1\""), "call_id 未带出");
+        // 参数分块应拼接完整
+        assert!(out.contains("SF"), "参数分块未拼全");
+    }
+
+    #[test]
+    fn sse_anthropic_to_responses_handles_split_lines() {
+        // Anthropic 一个 chunk 切在半行中间：翻译器按行缓冲，凑齐 \n 才产出，不得丢字符。
+        let mut tr = SseTranslator::new(SseDirection::AnthropicToResponses);
+        let mut out = String::new();
+        out.push_str(&tr.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"AB")); // 半行
+        out.push_str(&tr.push(b"C\"}}\n\n")); // 补齐
+        out.push_str(&tr.finish());
+        assert!(out.contains("\"delta\":\"ABC\""), "半行拼接后应得完整增量:\n{out}");
+    }
+
+    #[test]
+    fn sse_responses_to_anthropic_reassembles_text() {
+        // 镜像方向：Responses 上游 → Anthropic 下游。output_text.delta → content_block_delta；
+        // completed → message_stop 收尾。
+        let mut tr = SseTranslator::new(SseDirection::ResponsesToAnthropic);
+        let mut out = String::new();
+        out.push_str(&tr.push(b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-5.5\"}}\n\n"));
+        out.push_str(&tr.push(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Yo\"}\n\n"));
+        out.push_str(&tr.push(b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"));
+        out.push_str(&tr.finish());
+        assert!(out.contains("event: message_start"), "缺 message_start:\n{out}");
+        assert!(out.contains("event: content_block_start"), "缺 content_block_start");
+        assert!(out.contains("\"type\":\"text_delta\""), "缺 text_delta");
+        assert!(out.contains("\"text\":\"Yo\""), "文本增量丢失");
+        assert!(out.contains("event: message_stop"), "缺 message_stop");
     }
 }

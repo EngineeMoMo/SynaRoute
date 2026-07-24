@@ -86,6 +86,10 @@ const zh: Dict = {
   "category.mappingGapItem": "模型 {expected} 在 {keys} 上缺映射，故未进入选择器",
   "category.empty": "还没有配置任何 Key",
   "category.addFirst": "添加第一个 Key",
+  "category.activeModel": "当前模型",
+  "category.activeModelHint": "Codex 的模型菜单是内置固定清单、拉不到中转模型，请在此选择实际使用的模型（即时生效，免重启）",
+  "category.activeModelAuto": "跟随客户端（透传）",
+  "category.activeModelEmpty": "先添加并启用 Key 才有可选模型",
 
   // Key 卡片
   "key.primary": "主",
@@ -423,6 +427,10 @@ const en: Dict = {
   "category.mappingGapItem": "Model {expected} has no mapping on {keys}, so it’s not in the picker",
   "category.empty": "No keys configured yet",
   "category.addFirst": "Add your first key",
+  "category.activeModel": "Active model",
+  "category.activeModelHint": "Codex's model menu is a fixed built-in list and can't see relayed models. Pick the model to actually use here (takes effect immediately, no restart).",
+  "category.activeModelAuto": "Follow client (passthrough)",
+  "category.activeModelEmpty": "Add and enable a key first to get selectable models",
 
   "key.primary": "Primary",
   "key.protocolSuffix": "protocol",

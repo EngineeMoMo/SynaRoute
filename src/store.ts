@@ -63,6 +63,9 @@ interface AppState {
   checkHealth: (keyId: string) => Promise<void>;
   startProxy: () => Promise<void>;
   stopProxy: () => Promise<void>;
+  // 应用内「对外模型名」选择（借鉴 EchoBird）：客户端菜单拉不到中转模型时在应用内选，
+  // 代理转发时覆盖客户端发来的模型名。走后端专用命令直写，即时生效、免重启客户端。
+  setActiveModel: (category: CategoryType, model: string) => Promise<void>;
 }
 
 export const useStore = create<AppState>((set, get) => ({
@@ -331,6 +334,25 @@ export const useStore = create<AppState>((set, get) => ({
   async stopProxy() {
     const proxy = await api.stopProxy(get().activeCategory);
     set({ proxy });
+  },
+
+  async setActiveModel(category, model) {
+    // 乐观更新本地 settings.activeModels，让下拉即时反映选择
+    const s = get().settings;
+    if (s) {
+      const next = { ...(s.activeModels ?? {}) };
+      if (model.trim()) next[category] = model.trim();
+      else delete next[category];
+      set({ settings: { ...s, activeModels: next } });
+    }
+    try {
+      await api.setActiveModel(category, model);
+    } catch (e) {
+      console.error("setActiveModel failed", e);
+      get().showToast("error", String((e as Error)?.message ?? e));
+      // 落盘失败：重新拉后端权威值回滚乐观更新，避免 UI 与实际不一致
+      await get().loadSettings();
+    }
   },
 }));
 

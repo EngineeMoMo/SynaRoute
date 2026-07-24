@@ -255,6 +255,19 @@ async fn save_settings(
     state.store.save_settings(settings)
 }
 
+/// 设置某分类当前选定的「对外模型名」（应用内模型下拉专用）。
+/// 走后端专用写入而非 save_settings —— 后者会被前端携带的陈旧 settings 快照顶回
+/// （与 mcp_* 同一保全策略）。空串清除该分类选择，回到「透传客户端发来的模型名」。
+/// 每请求实时读取，改选即时生效、免重启客户端。
+#[tauri::command]
+async fn set_active_model(
+    state: tauri::State<'_, AppState>,
+    category_id: CategoryType,
+    model: String,
+) -> AppResult<()> {
+    state.store.set_active_model(category_id.as_str(), &model)
+}
+
 // ============ MCP 服务器 ============
 
 /// MCP 服务器运行状态（供设置页展示连接指示灯）
@@ -799,6 +812,7 @@ pub fn run() {
             list_events,
             get_settings,
             save_settings,
+            set_active_model,
             mcp_status,
             set_mcp_enabled,
             restart_mcp,

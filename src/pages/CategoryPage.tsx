@@ -3,6 +3,7 @@ import { useStore } from "@/store";
 import { KeyCard } from "@/components/KeyCard";
 import { ProxyStatusBar } from "@/components/ProxyStatusBar";
 import { Button } from "@/components/ui/Button";
+import { Combobox } from "@/components/ui/Combobox";
 import { useT } from "@/lib/useT";
 import type { ProviderKey } from "@/types";
 import { Plus, AlertTriangle, Inbox, X } from "lucide-react";
@@ -12,7 +13,7 @@ export function CategoryPage({ onAddKey, onEditKey }: {
   onAddKey: () => void;
   onEditKey: (k: ProviderKey) => void;
 }) {
-  const { activeCategory, keys, proxy, loading, refreshCategory } = useStore();
+  const { activeCategory, keys, proxy, loading, refreshCategory, settings, setActiveModel } = useStore();
   const t = useT();
   const [gapDialogOpen, setGapDialogOpen] = useState(false);
 
@@ -30,6 +31,14 @@ export function CategoryPage({ onAddKey, onEditKey }: {
   // 模型映射兜底检查（FR-006a）：统计启用 Key 中，各期望模型的覆盖缺口
   const gaps = useMemo(() => detectMappingGaps(keys.filter((k) => k.enabled)), [keys]);
 
+  // 应用内「当前模型」下拉：仅 Codex 需要（其模型菜单是内置固定清单、拉不到中转模型）。
+  // 候选与后端 /v1/models「交集」口径一致（discoverableModels），故选中的名字在所有候选 Key 都能路由。
+  const discoverable = useMemo(
+    () => discoverableModels(keys.filter((k) => k.enabled)),
+    [keys]
+  );
+  const activeModel = settings?.activeModels?.[activeCategory] ?? "";
+
   return (
     <div className="flex h-full flex-col">
       <ProxyStatusBar proxy={proxy} />
@@ -45,6 +54,35 @@ export function CategoryPage({ onAddKey, onEditKey }: {
           <Plus size={18} />
         </Button>
       </div>
+
+      {/* 应用内「当前模型」下拉（仅 Codex）：其模型菜单是内置固定清单、拉不到中转模型，
+          在此选定实际使用的对外模型名，代理转发时覆盖客户端发来的模型名，即时生效免重启。 */}
+      {activeCategory === "codex" && (
+        <div className="mx-6 mb-2 rounded-control border border-border bg-surface px-3 py-2.5">
+          <div className="mb-1.5 flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-text-secondary">{t("category.activeModel")}</span>
+            {activeModel && (
+              <button
+                type="button"
+                onClick={() => void setActiveModel(activeCategory, "")}
+                className="text-xs text-text-muted underline underline-offset-2 hover:text-text-secondary"
+              >
+                {t("category.activeModelAuto")}
+              </button>
+            )}
+          </div>
+          <Combobox
+            value={activeModel}
+            options={discoverable}
+            onChange={(v) => void setActiveModel(activeCategory, v)}
+            allowCustom={false}
+            placeholder={t("category.activeModelAuto")}
+            emptyHint={t("category.activeModelEmpty")}
+            className="w-full rounded-control border border-border bg-surface-hover px-3 py-1.5 font-mono text-xs text-text-primary outline-none focus:border-primary"
+          />
+          <p className="mt-1.5 text-[11px] leading-relaxed text-text-muted">{t("category.activeModelHint")}</p>
+        </div>
+      )}
 
       {/* 映射缺口提示（FR-006a）：只保留一行精简条，明细收进弹窗，避免条目过多撑爆页面 */}
       {gaps.length > 0 && (
@@ -119,6 +157,23 @@ function keyExpectedSet(k: ProviderKey): Set<string> {
   if (k.tierSonnet?.trim()) set.add("claude-sonnet-4-5");
   if (k.tierHaiku?.trim()) set.add("claude-haiku-4-5");
   return set;
+}
+
+/**
+ * 应用内「当前模型」下拉的候选集 —— 与后端 `discoverable_models`（GET /v1/models）同口径：
+ * 主 Key（优先级最高的启用 Key）可服务模型集，与各备用 Key 取交集；空交集时回退主 Key。
+ * 保证选中的任意名字在所有候选 Key 都能 resolve、故障转移无感。
+ */
+function discoverableModels(enabledKeys: ProviderKey[]): string[] {
+  const sorted = [...enabledKeys].sort((a, b) => a.priority - b.priority);
+  const primary = sorted[0];
+  if (!primary) return [];
+  const primaryModels = [...keyExpectedSet(primary)];
+  const backups = sorted.slice(1).map((k) => keyExpectedSet(k));
+  if (backups.length === 0) return primaryModels;
+  const intersection = primaryModels.filter((m) => backups.every((s) => s.has(m)));
+  // 空交集：对外名不统一，回退主 Key（与后端一致，保证下拉不空且主 Key 一定能路由）
+  return intersection.length > 0 ? intersection : primaryModels;
 }
 
 /**
