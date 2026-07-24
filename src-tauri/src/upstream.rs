@@ -538,6 +538,48 @@ fn copy_through(src: &Value, dst: &mut serde_json::Map<String, Value>, keys: &[&
     }
 }
 
+/// 从请求体里读出 OpenAI Responses 的推理强度档位（reasoning.effort）。
+/// Codex 用它承载「推理强度」（minimal/low/medium/high/xhigh）。
+fn read_reasoning_effort(body: &Value) -> Option<String> {
+    body.get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(|e| e.as_str())
+        .map(|s| s.to_string())
+}
+
+/// OpenAI 推理强度档位 → Anthropic thinking 的 budget_tokens。
+/// 两套机制不同：OpenAI 用离散档位，Anthropic 用 token 预算。取常见推荐区间做映射，
+/// 并按 max_tokens 钳制（budget 必须 < max_tokens，且留出足够输出空间，否则 Anthropic 400）。
+/// minimal → 不开思考（返回 None）；其余档位给递增预算。
+fn effort_to_thinking_budget(effort: &str, max_tokens: u64) -> Option<u64> {
+    let base = match effort.to_ascii_lowercase().as_str() {
+        "minimal" => return None, // 最低档：不启用扩展思考，直接普通回答
+        "low" => 2048,
+        "medium" => 8192,
+        "high" => 16384,
+        "xhigh" => 32768,
+        _ => return None, // 未知档位：不擅自开思考
+    };
+    // Anthropic 要求 thinking.budget_tokens < max_tokens，且要给最终回答留空间。
+    // 取 max_tokens 的一半为上限钳制；若 max_tokens 过小（<2048）则不开思考。
+    if max_tokens < 2048 {
+        return None;
+    }
+    let cap = max_tokens / 2;
+    Some(base.min(cap).max(1024))
+}
+
+/// Anthropic thinking.budget_tokens → OpenAI 推理强度档位（反向，补全对称）。
+/// 按预算落到最接近的档位，供下游 Chat/Responses 客户端连 Anthropic-thinking 上游时还原语义。
+fn thinking_budget_to_effort(budget: u64) -> &'static str {
+    match budget {
+        0..=3072 => "low",
+        3073..=12288 => "medium",
+        12289..=24576 => "high",
+        _ => "xhigh",
+    }
+}
+
 /// Anthropic tools → OpenAI tools。
 fn anthropic_tools_to_openai(tools: &Value) -> Option<Value> {
     let arr = tools.as_array()?;
@@ -663,6 +705,16 @@ pub fn anthropic_to_openai(body: &Value) -> Value {
 
     // 采样/控制字段透传（键名两协议一致）
     copy_through(body, &mut out, &["temperature", "top_p", "stream"]);
+    // Anthropic thinking.budget_tokens → OpenAI reasoning.effort（反向映射，补全对称）：
+    // 下游 Anthropic 客户端开了扩展思考、上游是 OpenAI 协议时，把 token 预算落到最近的推理档位，
+    // 使推理强度语义不在跨协议时丢失。
+    if let Some(budget) = body
+        .get("thinking")
+        .and_then(|t| t.get("budget_tokens"))
+        .and_then(|b| b.as_u64())
+    {
+        out.insert("reasoning".into(), json!({ "effort": thinking_budget_to_effort(budget) }));
+    }
     // Anthropic stop_sequences → OpenAI stop
     if let Some(s) = body.get("stop_sequences") {
         out.insert("stop".into(), s.clone());
@@ -769,6 +821,24 @@ pub fn openai_to_anthropic(body: &Value) -> Value {
     }
 
     copy_through(body, &mut out, &["temperature", "top_p", "stream"]);
+    // 推理强度：OpenAI reasoning.effort → Anthropic thinking.budget_tokens（两套机制的语义映射）。
+    // Codex 改推理强度经此落到 Claude 上游的扩展思考预算；minimal/未知档不开思考。
+    // 注意 Anthropic 开 thinking 时要求 temperature=1（否则 400），故一并归一。
+    if let Some(effort) = read_reasoning_effort(body) {
+        let max_tokens = out
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(4096);
+        if let Some(budget) = effort_to_thinking_budget(&effort, max_tokens) {
+            out.insert(
+                "thinking".into(),
+                json!({ "type": "enabled", "budget_tokens": budget }),
+            );
+            // Anthropic 扩展思考要求 temperature 固定为 1（top_p 亦不可与 thinking 同用）。
+            out.insert("temperature".into(), json!(1));
+            out.remove("top_p");
+        }
+    }
     // OpenAI stop → Anthropic stop_sequences（Anthropic 要求数组）
     if let Some(s) = body.get("stop") {
         let seqs = match s {
@@ -1011,6 +1081,12 @@ pub fn responses_to_chat(body: &Value) -> Value {
         out.insert("max_tokens".into(), mt.clone());
     }
     copy_through(body, &mut out, &["temperature", "top_p", "stream"]);
+    // reasoning（Codex 推理强度）透传到 Chat 中枢：中枢→上游那一跳按上游协议决定如何落地
+    // （Anthropic 上游映射成 thinking.budget_tokens；原生 Responses 上游原样带回）。此前被丢弃
+    // 导致「改了推理强度还走默认」。
+    if let Some(r) = body.get("reasoning") {
+        out.insert("reasoning".into(), r.clone());
+    }
     // tools：Responses 扁平形态 → Chat 嵌套形态
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         let mapped: Vec<Value> = tools
@@ -1197,6 +1273,11 @@ pub fn chat_to_responses(body: &Value) -> Value {
         out.insert("max_output_tokens".into(), mt.clone());
     }
     copy_through(body, &mut out, &["temperature", "top_p", "stream"]);
+    // reasoning：Chat 中枢里若带 reasoning（来自 Codex Responses 透传或 Anthropic thinking 反映射），
+    // 原样带给 Responses 上游——它原生认 reasoning.effort，推理强度直达。
+    if let Some(r) = body.get("reasoning") {
+        out.insert("reasoning".into(), r.clone());
+    }
     // tools：Chat 嵌套 {type:function,function:{name,..}} → Responses 扁平 {type:function,name,..}
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         let mapped: Vec<Value> = tools
@@ -2212,6 +2293,90 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[0]["content"], "hi there");
+    }
+
+    #[test]
+    fn responses_to_chat_preserves_reasoning() {
+        // Codex 发的推理强度（reasoning.effort）必须透传到 Chat 中枢，供下游映射/透传，
+        // 不能在第一跳就丢（此前 copy_through 只带 temperature/top_p/stream，导致强度失效）。
+        let req = json!({
+            "model": "m",
+            "input": "hi",
+            "reasoning": { "effort": "high" }
+        });
+        let chat = responses_to_chat(&req);
+        assert_eq!(chat["reasoning"]["effort"], "high", "reasoning 应透传到 Chat 中枢");
+    }
+
+    #[test]
+    fn openai_to_anthropic_maps_effort_to_thinking() {
+        // 主链路：Codex(Responses,reasoning.effort) → Chat 中枢 → Anthropic 上游。
+        // effort 档位须映射成 Anthropic thinking.budget_tokens，并归一 temperature=1、去 top_p。
+        let chat = json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 20000,
+            "messages": [ { "role": "user", "content": "hi" } ],
+            "reasoning": { "effort": "high" },
+            "temperature": 0.5,
+            "top_p": 0.9
+        });
+        let a = openai_to_anthropic(&chat);
+        assert_eq!(a["thinking"]["type"], "enabled", "high 档应开启扩展思考");
+        assert!(a["thinking"]["budget_tokens"].as_u64().unwrap() > 0, "应有正的思考预算");
+        assert_eq!(a["temperature"], 1, "开思考时 temperature 须归一为 1");
+        assert!(a.get("top_p").is_none(), "开思考时须去掉 top_p（Anthropic 不允许同用）");
+    }
+
+    #[test]
+    fn openai_to_anthropic_minimal_effort_no_thinking() {
+        // minimal 档：不启用扩展思考，保持普通回答（不注入 thinking）。
+        let chat = json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 20000,
+            "messages": [ { "role": "user", "content": "hi" } ],
+            "reasoning": { "effort": "minimal" }
+        });
+        let a = openai_to_anthropic(&chat);
+        assert!(a.get("thinking").is_none(), "minimal 档不应开思考");
+    }
+
+    #[test]
+    fn openai_to_anthropic_thinking_budget_clamped_by_max_tokens() {
+        // budget 必须 < max_tokens 且留输出空间：high(16384) 在 max_tokens=6000 时应被钳到 ≤3000。
+        let chat = json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 6000,
+            "messages": [ { "role": "user", "content": "hi" } ],
+            "reasoning": { "effort": "high" }
+        });
+        let a = openai_to_anthropic(&chat);
+        let budget = a["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert!(budget <= 3000, "预算应被 max_tokens/2 钳制，实际 {budget}");
+    }
+
+    #[test]
+    fn chat_to_responses_passes_reasoning_through() {
+        // 上游若是原生 Responses：reasoning 直接透传（它认 effort 档位，无需映射）。
+        let chat = json!({
+            "model": "gpt-5.1",
+            "messages": [ { "role": "user", "content": "hi" } ],
+            "reasoning": { "effort": "medium" }
+        });
+        let r = chat_to_responses(&chat);
+        assert_eq!(r["reasoning"]["effort"], "medium", "原生 Responses 上游应原样收到 reasoning");
+    }
+
+    #[test]
+    fn anthropic_to_openai_maps_thinking_to_effort() {
+        // 反向：Anthropic thinking.budget_tokens → Chat 中枢 reasoning.effort（补全对称）。
+        let a = json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 20000,
+            "messages": [ { "role": "user", "content": "hi" } ],
+            "thinking": { "type": "enabled", "budget_tokens": 16384 }
+        });
+        let chat = anthropic_to_openai(&a);
+        assert_eq!(chat["reasoning"]["effort"], "high", "16384 预算应映射为 high 档");
     }
 
     #[test]
