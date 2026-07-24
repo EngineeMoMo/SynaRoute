@@ -5,13 +5,15 @@
 //! 2. 原子写（临时文件 → 重命名替换）
 //! 3. 路径全部动态解析（dirs / env），禁止硬编码本机路径
 //!
-//! 接入机制（基于接入验证实证）：
-//! - Claude CLI：~/.claude/settings.json 的 env.ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN
-//!   + 借鉴 cc-switch：同步写 ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL
-//!   与顶层 model，清掉切换供应商后的默认残留（避免 Custom model 挂旧 id）
-//! - Codex：~/.codex/config.toml 的 model_provider + [model_providers.synaroute]（base_url/wire_api/requires_openai_auth）
-//!   + ~/.codex/auth.json 的 OPENAI_API_KEY 占位（免手设环境变量，借鉴 cc-switch）
-//! - Claude 桌面端：%APPDATA%/Claude/claude_desktop_config.json（cc-switch 同款思路）
+//! 接入机制（三端严格分离，禁止混写）：
+//! - **Claude CLI**：`~/.claude/settings.json`
+//!   - 写：env.ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN(占位) / GATEWAY_MODEL_DISCOVERY
+//!   - 写：env.ANTHROPIC_MODEL + 顶层 `model`（主 Key 首个可服务**对外名**；策略 A）
+//!   - **不写** ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL（避免 /model 三个 Custom 同名）
+//!   - 应用时**删除** env 里残留的三档 DEFAULT_*（清 cc-switch/旧版写入）
+//! - **Codex**：`~/.codex/config.toml` + `auth.json`（OpenAI 形态，无 ANTHROPIC_*）
+//!   - 写：model_provider=synaroute、[model_providers.synaroute]、可选顶层 model、OPENAI_API_KEY 占位
+//! - **Claude 桌面端**：`claude_desktop_config.json`（MCP/本地入口，不写 CLI settings、不写 DEFAULT_*）
 
 use crate::error::{AppError, AppResult};
 use crate::model::CategoryType;
@@ -24,10 +26,9 @@ const BACKUP_SUFFIX: &str = "synaroute.bak";
 /// 将某分类的代理端点写入对应目标工具配置。返回人类可读的结果说明。
 ///
 /// `default_model`：当前分类「主 Key」首个可服务对外名（与 `/v1/models` 口径一致）。
-/// - Claude CLI：写入 env.ANTHROPIC_MODEL + ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL
-///   与顶层 `model`，覆盖切换后的默认残留（cc-switch 同款；无此名时不碰这些字段）。
-/// - Codex：写入 config.toml 的 `model` 字段。
-/// - 桌面端：忽略（靠本地路由配置，不写 CLI settings）。
+/// - **Claude CLI only**：env.ANTHROPIC_MODEL + 顶层 `model`；并清除三档 DEFAULT_* 残留。
+/// - **Codex only**：config.toml 顶层 `model`（Responses 形态，与 Claude 字段无关）。
+/// - **桌面端**：忽略（不写 settings.json，不写 ANTHROPIC_*）。
 pub fn apply(category: CategoryType, endpoint: &str, default_model: Option<&str>) -> AppResult<String> {
     match category {
         CategoryType::ClaudeCli => apply_claude_cli(endpoint, default_model),
@@ -82,24 +83,25 @@ fn apply_claude_cli_at(
         Value::String("1".into()),
     );
 
-    // 借鉴 cc-switch：启用/应用时同步覆盖默认模型相关字段，避免：
-    // 1) 顶层 `model` 残留旧 id（如 claude-synaroute-grok-4.5）→ /model 出现 Custom model
-    // 2) env.ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_* 仍是上一供应商的真实名 → 内置档位绕过映射
-    // 写入值为「主 Key 首个可服务对外名」（与 /v1/models、故障转移交集口径一致）。
-    // 取不到时不动这些字段，避免空写把用户配置清空。
+    // 策略 A（用户拍板）：只写 ANTHROPIC_MODEL + 顶层 model（对外名），
+    // 不写 ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL —— 内置三档靠代理 resolve_model，
+    // 避免 /model 出现三个「Custom * 都是同一个 id」。
+    // 同时删除 env 里残留的三档 DEFAULT_*（旧版/cc-switch 可能写入）。
+    for k in [
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    ] {
+        env_obj.remove(k);
+    }
+
     let model_note = if let Some(m) = default_model.map(str::trim).filter(|s| !s.is_empty()) {
-        let v = Value::String(m.to_string());
-        env_obj.insert("ANTHROPIC_MODEL".into(), v.clone());
-        // 三档默认都落到同一对外名：CLI 选 Haiku/Sonnet/Opus 时发这个名，代理再 resolve。
-        // （用户若在 Key 上配了三档真实映射，match_tier 仍优先；这里保证默认不再是残留）
-        env_obj.insert("ANTHROPIC_DEFAULT_HAIKU_MODEL".into(), v.clone());
-        env_obj.insert("ANTHROPIC_DEFAULT_SONNET_MODEL".into(), v.clone());
-        env_obj.insert("ANTHROPIC_DEFAULT_OPUS_MODEL".into(), v.clone());
-        // 顶层 model：/model 的「当前默认」；不写则 CLI 一直挂着上次选中的 Custom
+        env_obj.insert("ANTHROPIC_MODEL".into(), Value::String(m.to_string()));
+        // 顶层 model：/model 当前默认；覆盖 claude-synaroute-* 等 Custom 残留
         if let Some(obj) = root.as_object_mut() {
             obj.insert("model".into(), Value::String(m.to_string()));
         }
-        format!("，默认模型={m}")
+        format!("，默认模型={m}（未写三档 DEFAULT_*）")
     } else {
         String::new()
     };
@@ -576,6 +578,212 @@ pub fn restore(category: CategoryType) -> AppResult<String> {
     Ok(format!("已从备份还原：{}", path.display()))
 }
 
+// ---- 只读预览（阶段 2：不编辑，只展示路径与脱敏正文）----
+
+/// 某分类对应「目标工具」配置文件的只读快照。
+/// 三端路径/格式不同：Claude CLI=settings.json；Codex=config.toml+auth.json；桌面=claude_desktop_config.json。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolConfigPreview {
+    pub category_id: CategoryType,
+    /// 人类可读说明：本分类写哪些文件、不写哪些
+    pub summary: String,
+    pub files: Vec<ToolConfigFilePreview>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolConfigFilePreview {
+    pub path: String,
+    pub exists: bool,
+    /// json | toml | text
+    pub format: String,
+    /// 脱敏后的文件正文；不存在时为 None
+    pub content: Option<String>,
+}
+
+/// 读取当前分类工具配置的只读预览（token 脱敏，不修改磁盘）。
+pub fn preview(category: CategoryType) -> AppResult<ToolConfigPreview> {
+    match category {
+        CategoryType::ClaudeCli => preview_claude_cli(),
+        CategoryType::Codex => preview_codex(),
+        CategoryType::ClaudeDesktop => preview_claude_desktop(),
+    }
+}
+
+fn preview_claude_cli() -> AppResult<ToolConfigPreview> {
+    let path = claude_cli_settings_path()?;
+    let (exists, content) = read_preview_text(&path, true)?;
+    Ok(ToolConfigPreview {
+        category_id: CategoryType::ClaudeCli,
+        summary: "Claude CLI：~/.claude/settings.json。写入 BASE_URL / AUTH_TOKEN(占位) / 发现开关 / ANTHROPIC_MODEL / 顶层 model；不写三档 DEFAULT_*，不写 Codex/桌面端文件。".into(),
+        files: vec![ToolConfigFilePreview {
+            path: path.display().to_string(),
+            exists,
+            format: "json".into(),
+            content,
+        }],
+    })
+}
+
+fn preview_codex() -> AppResult<ToolConfigPreview> {
+    let cfg = codex_config_path()?;
+    let auth = codex_auth_path()?;
+    let (cfg_exists, cfg_content) = read_preview_text(&cfg, false)?;
+    let (auth_exists, auth_content) = read_preview_text(&auth, true)?;
+    Ok(ToolConfigPreview {
+        category_id: CategoryType::Codex,
+        summary: "Codex：~/.codex/config.toml + auth.json。写入 model_provider=synaroute、[model_providers.synaroute]、可选 model、OPENAI_API_KEY 占位。不写任何 ANTHROPIC_* / settings.json。".into(),
+        files: vec![
+            ToolConfigFilePreview {
+                path: cfg.display().to_string(),
+                exists: cfg_exists,
+                format: "toml".into(),
+                content: cfg_content,
+            },
+            ToolConfigFilePreview {
+                path: auth.display().to_string(),
+                exists: auth_exists,
+                format: "json".into(),
+                content: auth_content,
+            },
+        ],
+    })
+}
+
+fn preview_claude_desktop() -> AppResult<ToolConfigPreview> {
+    let path = claude_desktop_config_path()?;
+    let (exists, content) = read_preview_text(&path, true)?;
+    Ok(ToolConfigPreview {
+        category_id: CategoryType::ClaudeDesktop,
+        summary: "Claude 桌面端：claude_desktop_config.json。写入 baseUrl 指向本机代理。不写 Claude CLI 的 settings.json，不写 ANTHROPIC_DEFAULT_*。".into(),
+        files: vec![ToolConfigFilePreview {
+            path: path.display().to_string(),
+            exists,
+            format: "json".into(),
+            content,
+        }],
+    })
+}
+
+fn read_preview_text(path: &Path, redact_secrets: bool) -> AppResult<(bool, Option<String>)> {
+    if !path.exists() {
+        return Ok((false, None));
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| AppError::ToolConfig(format!("读取 {} 失败: {e}", path.display())))?;
+    let text = if redact_secrets {
+        redact_config_secrets(&raw)
+    } else {
+        raw
+    };
+    // 预览截断，避免超大配置撑爆前端
+    const CAP: usize = 32_000;
+    let text = if text.len() > CAP {
+        format!("{}…\n/* truncated {} bytes */", &text[..CAP], text.len() - CAP)
+    } else {
+        text
+    };
+    Ok((true, Some(text)))
+}
+
+/// 脱敏：避免预览面板泄露 token（不用 regex 依赖，按键名扫描 JSON/简单文本）。
+fn redact_config_secrets(s: &str) -> String {
+    let mut out = s.to_string();
+    for key in [
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "api_key",
+        "apiKey",
+    ] {
+        out = redact_json_string_field(&out, key);
+    }
+    // bare sk- tokens（至少 12 字符后缀）
+    let mut result = String::with_capacity(out.len());
+    let bytes = out.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 3 < bytes.len() && &out[i..i + 3] == "sk-" {
+            let mut j = i + 3;
+            while j < bytes.len() {
+                let c = bytes[j] as char;
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if j - i >= 12 {
+                result.push_str("sk-***");
+                i = j;
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    result
+}
+
+/// 把 `"key": "...."` 的值换成 `***`（仅处理双引号 JSON 字段）。
+fn redact_json_string_field(s: &str, key: &str) -> String {
+    let needle = format!("\"{key}\"");
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(idx) = rest.find(&needle) {
+        out.push_str(&rest[..idx]);
+        out.push_str(&needle);
+        let after_key = &rest[idx + needle.len()..];
+        // skip whitespace + colon + whitespace + opening quote
+        let mut chars = after_key.char_indices().peekable();
+        let mut pos = 0;
+        // copy whitespace
+        while let Some(&(i, c)) = chars.peek() {
+            if c.is_whitespace() {
+                pos = i + c.len_utf8();
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        out.push_str(&after_key[..pos]);
+        let after_ws = &after_key[pos..];
+        if !after_ws.starts_with(':') {
+            rest = after_key;
+            continue;
+        }
+        out.push(':');
+        let after_colon = &after_ws[1..];
+        let mut p2 = 0;
+        let mut c2 = after_colon.char_indices().peekable();
+        while let Some(&(i, c)) = c2.peek() {
+            if c.is_whitespace() {
+                p2 = i + c.len_utf8();
+                c2.next();
+            } else {
+                break;
+            }
+        }
+        out.push_str(&after_colon[..p2]);
+        let after_ws2 = &after_colon[p2..];
+        if !after_ws2.starts_with('"') {
+            rest = after_colon;
+            continue;
+        }
+        // find closing quote (no escape handling for simplicity — secrets rarely have \")
+        if let Some(end) = after_ws2[1..].find('"') {
+            out.push_str("\"***\"");
+            rest = &after_ws2[1 + end + 1..];
+        } else {
+            out.push_str(after_ws2);
+            rest = "";
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,8 +908,8 @@ mod tests {
 
     #[test]
     fn claude_cli_apply_overwrites_model_defaults_like_cc_switch() {
-        // 回归：应用配置时必须覆盖顶层 model + ANTHROPIC_MODEL + 三档 DEFAULT_*，
-        // 否则切换 Key 后 /model 会残留 claude-synaroute-* · Custom（cc-switch 同款做法）。
+        // 策略 A：只写 ANTHROPIC_MODEL + 顶层 model；并清除三档 DEFAULT_* 残留。
+        // 不写 DEFAULT_*，避免 /model 出现三个 Custom 同名。仅 Claude CLI 路径。
         let path = temp_file("claude_cli_model", "settings.json");
         std::fs::write(
             &path,
@@ -725,16 +933,17 @@ mod tests {
         )
         .unwrap();
         assert!(msg.contains("默认模型=claude-opus-4-7"));
+        assert!(msg.contains("未写三档 DEFAULT_*"));
 
         let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(v["model"], "claude-opus-4-7");
         assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8788");
         assert_eq!(v["env"]["ANTHROPIC_MODEL"], "claude-opus-4-7");
-        assert_eq!(v["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "claude-opus-4-7");
-        assert_eq!(v["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-opus-4-7");
-        assert_eq!(v["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-4-7");
+        // 策略 A：必须清除三档 DEFAULT_*
+        assert!(v["env"].get("ANTHROPIC_DEFAULT_HAIKU_MODEL").is_none());
+        assert!(v["env"].get("ANTHROPIC_DEFAULT_SONNET_MODEL").is_none());
+        assert!(v["env"].get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none());
         assert_eq!(v["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], "1");
-        // token 占位保留/补齐
         assert_eq!(v["env"]["ANTHROPIC_AUTH_TOKEN"], "synaroute-proxy");
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
@@ -742,11 +951,11 @@ mod tests {
 
     #[test]
     fn claude_cli_apply_skips_model_fields_when_no_default() {
-        // 取不到可服务模型时，不碰用户已有 model / ANTHROPIC_* 字段
+        // 取不到可服务模型时，不碰用户已有 model / ANTHROPIC_MODEL；但仍清 DEFAULT_* 残留
         let path = temp_file("claude_cli_skip", "settings.json");
         std::fs::write(
             &path,
-            r#"{"env":{"ANTHROPIC_MODEL":"keep-me"},"model":"keep-me"}"#,
+            r#"{"env":{"ANTHROPIC_MODEL":"keep-me","ANTHROPIC_DEFAULT_OPUS_MODEL":"stale"},"model":"keep-me"}"#,
         )
         .unwrap();
 
@@ -755,7 +964,10 @@ mod tests {
         assert_eq!(v["model"], "keep-me");
         assert_eq!(v["env"]["ANTHROPIC_MODEL"], "keep-me");
         assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8788");
-        assert!(v["env"].get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none());
+        assert!(
+            v["env"].get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none(),
+            "即无 default_model 也应清掉 DEFAULT_* 残留"
+        );
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
@@ -763,6 +975,7 @@ mod tests {
     #[test]
     fn codex_apply_writes_custom_provider_not_anthropic_env() {
         // 核心修复回归：Codex 不认 ANTHROPIC_BASE_URL，必须写标准自定义 provider。
+        // Codex 路径不得写入任何 ANTHROPIC_*（与 Claude CLI 完全分离）。
         let path = temp_file("codex_apply", "config.toml");
         // 预置其它表，验证不被破坏。
         std::fs::write(

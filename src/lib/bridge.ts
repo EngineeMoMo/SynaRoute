@@ -14,6 +14,7 @@ import type {
   ProxyState,
   RecentWorkdir,
   RetrievedFile,
+  ToolConfigPreview,
   Vendor,
 } from "@/types";
 import { mockBridge } from "./mockData";
@@ -98,6 +99,14 @@ export const api = {
   // 生成/写入目标工具接入配置（FR-008，会先备份，dev-hard-rules）
   applyToolConfig: (categoryId: CategoryType) =>
     call<string>("apply_tool_config", { categoryId }, () => mockBridge.applyToolConfig(categoryId)),
+
+  /** 只读预览：三端路径/内容不同（CLI settings / Codex toml+auth / 桌面 config），token 已脱敏 */
+  getToolConfigPreview: (categoryId: CategoryType) =>
+    call<ToolConfigPreview>(
+      "get_tool_config_preview",
+      { categoryId },
+      () => mockBridge.getToolConfigPreview(categoryId),
+    ),
 
   // ---- 日志（FR-020） ----
   listEvents: (categoryId: CategoryType) =>

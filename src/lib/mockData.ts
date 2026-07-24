@@ -397,6 +397,60 @@ export const mockBridge = {
     const p = proxyStates[categoryId];
     return `已（模拟）写入 ${categoryId} 接入配置，端点 http://127.0.0.1:${p.port ?? 8790}（真实环境会先备份原配置再原子写入）`;
   },
+  async getToolConfigPreview(categoryId: CategoryType) {
+    await delay();
+    const p = proxyStates[categoryId];
+    const port = p.port ?? 8790;
+    if (categoryId === "codex") {
+      return {
+        categoryId,
+        summary:
+          "Codex：config.toml + auth.json。写入 model_provider=synaroute 与 OPENAI_API_KEY 占位。不写 ANTHROPIC_*。",
+        files: [
+          {
+            path: "~/.codex/config.toml",
+            exists: true,
+            format: "toml",
+            content: `model_provider = "synaroute"\nmodel = "gpt-5"\n\n[model_providers.synaroute]\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = true\n`,
+          },
+          {
+            path: "~/.codex/auth.json",
+            exists: true,
+            format: "json",
+            content: '{\n  "OPENAI_API_KEY": "***"\n}\n',
+          },
+        ],
+      };
+    }
+    if (categoryId === "claude-desktop") {
+      return {
+        categoryId,
+        summary: "Claude 桌面端：claude_desktop_config.json。写入 baseUrl。不写 CLI settings.json。",
+        files: [
+          {
+            path: "%APPDATA%/Claude/claude_desktop_config.json",
+            exists: true,
+            format: "json",
+            content: `{\n  "baseUrl": "http://127.0.0.1:${port}"\n}\n`,
+          },
+        ],
+      };
+    }
+    // claude-cli
+    return {
+      categoryId,
+      summary:
+        "Claude CLI：settings.json。写入 BASE_URL / AUTH_TOKEN(占位) / 发现开关 / ANTHROPIC_MODEL / 顶层 model；不写三档 DEFAULT_*。",
+      files: [
+        {
+          path: "~/.claude/settings.json",
+          exists: true,
+          format: "json",
+          content: `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "http://127.0.0.1:${port}",\n    "ANTHROPIC_AUTH_TOKEN": "***",\n    "ANTHROPIC_MODEL": "claude-opus-4-7",\n    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"\n  },\n  "model": "claude-opus-4-7"\n}\n`,
+        },
+      ],
+    };
+  },
   async listEvents(categoryId: CategoryType) {
     await delay();
     return clone(events.filter((e) => e.categoryId === categoryId));

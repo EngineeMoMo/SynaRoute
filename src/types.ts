@@ -160,6 +160,21 @@ export interface ProxyState {
   message?: string;
 }
 
+/** 目标工具配置只读预览（按分类三端分离，禁止混用字段语义） */
+export interface ToolConfigFilePreview {
+  path: string;
+  exists: boolean;
+  format: "json" | "toml" | "text" | string;
+  content?: string | null;
+}
+
+export interface ToolConfigPreview {
+  categoryId: CategoryType;
+  /** 本分类写哪些文件、不写哪些 */
+  summary: string;
+  files: ToolConfigFilePreview[];
+}
+
 /** 一次代理转发的完整链路快照，供「调用模型日志」在页面上展开调试 */
 export interface RequestTrace {
   keyName: string; // 命中的 Key 名称

@@ -51,6 +51,16 @@ const zh: Dict = {
   "proxy.configAppliedDesc": "已自动将代理端点写入 {tool} 的配置文件。请退出并重启 {tool} 客户端，以使新配置生效。",
   "proxy.stop": "停止",
   "proxy.start": "启动",
+  "proxy.viewConfig": "查看工具配置",
+
+  "toolConfig.title": "目标工具配置（只读）",
+  "toolConfig.button": "配置预览",
+  "toolConfig.exists": "存在",
+  "toolConfig.missing": "尚无文件",
+  "toolConfig.empty": "（空文件）",
+  "toolConfig.fileMissingHint": "文件尚不存在。启动代理并「应用配置」后才会创建。",
+  "toolConfig.copy": "复制内容",
+  "common.refresh": "刷新",
 
   // 健康状态
   "health.breaking": "● 熔断中",
@@ -375,6 +385,16 @@ const en: Dict = {
   "proxy.configAppliedDesc": "The proxy endpoint has been written to {tool}'s configuration. Please quit and restart {tool} to apply the new settings.",
   "proxy.stop": "Stop",
   "proxy.start": "Start",
+  "proxy.viewConfig": "View tool config",
+
+  "toolConfig.title": "Target tool config (read-only)",
+  "toolConfig.button": "Config preview",
+  "toolConfig.exists": "Exists",
+  "toolConfig.missing": "Missing",
+  "toolConfig.empty": "(empty)",
+  "toolConfig.fileMissingHint": "File not created yet. Start the proxy and apply config first.",
+  "toolConfig.copy": "Copy content",
+  "common.refresh": "Refresh",
 
   "health.breaking": "● Tripped",
   "health.breakingRemain": "● Tripped·{sec}s left",

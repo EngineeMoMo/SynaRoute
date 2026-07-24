@@ -3,6 +3,7 @@ import type { ProxyState } from "@/types";
 import { useStore } from "@/store";
 import { useT } from "@/lib/useT";
 import { Play, Square, Copy, Waypoints, ArrowRight } from "lucide-react";
+import { ToolConfigPreviewButton } from "@/components/ToolConfigPreview";
 
 /** 顶部代理状态条：显示端点、运行状态，提供启停（FR-008/FR-019） */
 export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
@@ -58,6 +59,7 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
       </div>
 
       <div className="ml-auto flex items-center gap-2">
+        <ToolConfigPreviewButton />
         {running ? (
           <Button size="sm" variant="outline" onClick={() => void stopProxy()}>
             <Square size={14} /> {t("proxy.stop")}

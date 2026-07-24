@@ -201,10 +201,10 @@ async fn apply_tool_config(
     // 确保代理已启动
     let port = state.proxy.start(category_id).await?;
     let endpoint = format!("http://127.0.0.1:{port}");
-    // 默认模型（Claude CLI + Codex，借鉴 cc-switch）：取该分类首个启用 Key 的
-    // 首个可服务对外名（与 /v1/models 口径一致）。Claude CLI 用于覆盖
-    // ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_* / 顶层 model，清掉切换后的 Custom 残留；
-    // Codex 写 config.toml 的 model。取不出则为 None，apply 不动用户已有 model 字段。
+    // 默认模型（三端语义不同，禁止混写）：
+    // - Claude CLI：env.ANTHROPIC_MODEL + 顶层 model（对外名；策略 A 不写 DEFAULT_*）
+    // - Codex：config.toml 的 model（OpenAI 形态，无 ANTHROPIC_*）
+    // - 桌面端：忽略 default_model
     let default_model = state
         .store
         .enabled_keys_sorted(category_id)
@@ -215,6 +215,13 @@ async fn apply_tool_config(
         .store
         .append_event(category_id, "config", None, &format!("写入工具配置: {endpoint}"));
     Ok(msg)
+}
+
+/// 只读预览：当前分类对应工具的配置路径 + 磁盘原文（token 脱敏）。
+/// Claude CLI / 桌面 / Codex 路径与格式完全不同，前端按 category 展示，禁止混用字段名。
+#[tauri::command]
+fn get_tool_config_preview(category_id: CategoryType) -> AppResult<tools::ToolConfigPreview> {
+    tools::preview(category_id)
 }
 
 #[tauri::command]
@@ -680,6 +687,7 @@ pub fn run() {
             start_proxy,
             stop_proxy,
             apply_tool_config,
+            get_tool_config_preview,
             restore_tool_config,
             list_events,
             get_settings,
