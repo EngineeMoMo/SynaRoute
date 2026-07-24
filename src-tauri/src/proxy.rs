@@ -1122,8 +1122,8 @@ mod tests {
         let mut k = key("k1", 0, "http://x");
         k.mappings = vec![mapping("opus-4-8", "glm-5.2")];
         k.models = vec![model_info("glm-5.2"), model_info("glm-5.1")];
-        // 单 Key：对外映射名 + 原生名，去重保序
-        assert_eq!(discoverable_models(&[k]), vec!["opus-4-8", "glm-5.2", "glm-5.1"]);
+        // 有映射：只暴露对外名，不并入真实名
+        assert_eq!(discoverable_models(&[k]), vec!["opus-4-8"]);
     }
 
     #[test]
@@ -1315,11 +1315,11 @@ mod tests {
             .iter()
             .map(|m| m["id"].as_str().unwrap().to_string())
             .collect();
-        // 非 claude 前缀会包成 claude-synaroute-*，顺序仍是 映射对外名 → 原生名
+        // 有映射：只暴露对外名；非 claude 前缀包成 claude-synaroute-*
         assert_eq!(
             ids,
-            vec!["claude-synaroute-opus-4-8", "claude-synaroute-glm-5.2"],
-            "Down 的 Key 也应列出其模型（已包装）"
+            vec!["claude-synaroute-opus-4-8"],
+            "Down 的 Key 也应列出其映射对外名（已包装）"
         );
         pm.stop(CategoryType::ClaudeCli);
         std::fs::remove_dir_all(&dir).ok();

@@ -402,12 +402,17 @@ impl ProviderKey {
         None
     }
 
-    /// 本 Key 可安全「服务」的对外模型名集合 —— 即客户端发来后能被 `resolve_model`
-    /// 命中（映射命中 / 原生支持），而非落到兜底/首个的那些名字。
+    /// 本 Key 对客户端「可点选」的对外模型名集合，供 `/v1/models` 发现端点使用。
     ///
-    /// = 每条映射的对外名（expected_name）∪ 每个模型的真实名（real_name）
-    ///   ∪ 已配三档所对应的 Claude 家族代表名（如 claude-sonnet-4-5）。
-    /// 保持出现顺序、去重。供 `/v1/models` 发现端点计算「可选模型」用。
+    /// 对齐 cc-switch：映射表是对外列表的主来源，避免「映射对外名 + 上游真实名」双暴露
+    /// （用户配了 `opus-4-7→grok-4.5` 时，选择器只应看到对外名，不该再冒出 `grok-4.5`）。
+    ///
+    /// 规则（有序、去重）：
+    /// 1. **有任意非空映射** → 只暴露映射的 `expected_name`（对外名）；
+    ///    `models` 真实名仅作上游解析/探测素材，不进发现列表。
+    /// 2. **无映射** → 暴露 `models` 的 `real_name`（直连/原生场景）。
+    /// 3. 不论 1/2，已配的三档仍追加 Claude 家族代表名（`claude-*-4-5`），
+    ///    因为 CLI 内置档会发这些名，需能被 `match_tier` 命中且在 From gateway 可见。
     pub fn serviceable_models(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut push = |name: &str| {
@@ -416,11 +421,21 @@ impl ProviderKey {
                 out.push(name.to_string());
             }
         };
-        for mp in &self.mappings {
-            push(&mp.expected_name);
-        }
-        for m in &self.models {
-            push(&m.real_name);
+        let has_mapping = self
+            .mappings
+            .iter()
+            .any(|mp| !mp.expected_name.trim().is_empty() && !mp.real_name.trim().is_empty());
+        if has_mapping {
+            for mp in &self.mappings {
+                if mp.real_name.trim().is_empty() {
+                    continue;
+                }
+                push(&mp.expected_name);
+            }
+        } else {
+            for m in &self.models {
+                push(&m.real_name);
+            }
         }
         // 三档配了就把对应 Claude 家族代表名纳入——CC 会发这些名，能被 match_tier 命中。
         if self.tier_opus.as_ref().is_some_and(|s| !s.trim().is_empty()) {
@@ -876,18 +891,50 @@ mod tests {
     }
 
     #[test]
-    fn serviceable_models_union_dedup_and_order() {
-        // 对外名（映射）在前、原生模型名在后；重复的只留一次，空白剔除。
+    fn serviceable_models_mappings_only_when_present() {
+        // 有映射：只暴露对外名，不并入 models 真实名（避免 /model 双轨）
         let k = key_with(
             vec![model("glm-5.1"), model("glm-5.2"), model("opus-4-7")],
             vec![mapping("opus-4-7", "glm-5.1"), mapping("opus-4-8", "glm-5.2")],
             None,
         );
-        // 期望：映射对外名 opus-4-7, opus-4-8；再补原生里未出现过的 glm-5.1, glm-5.2
-        // opus-4-7 既是映射对外名又是原生模型 → 去重后只出现一次（在映射位置）
+        assert_eq!(k.serviceable_models(), vec!["opus-4-7", "opus-4-8"]);
+    }
+
+    #[test]
+    fn serviceable_models_falls_back_to_model_list_without_mappings() {
+        // 无映射：暴露原生模型列表（直连场景）
+        let k = key_with(vec![model("grok-4.5"), model("glm-4.6")], vec![], None);
+        assert_eq!(k.serviceable_models(), vec!["grok-4.5", "glm-4.6"]);
+    }
+
+    #[test]
+    fn serviceable_models_skips_incomplete_mapping_rows() {
+        // 缺 expected 或 real 的半成品映射不进发现列表
+        let k = key_with(
+            vec![model("grok-4.5")],
+            vec![
+                mapping("claude-opus-4-7", "grok-4.5"),
+                mapping("", "grok-4.5"),
+                mapping("orphan", ""),
+            ],
+            None,
+        );
+        assert_eq!(k.serviceable_models(), vec!["claude-opus-4-7"]);
+    }
+
+    #[test]
+    fn serviceable_models_mappings_plus_tiers() {
+        // 有映射 + 配了 sonnet 档 → 对外名 ∪ 家族代表名
+        let mut k = key_with(
+            vec![model("glm-4.6")],
+            vec![mapping("claude-opus-4-7", "glm-4.6")],
+            None,
+        );
+        k.tier_sonnet = Some("glm-4.6".into());
         assert_eq!(
             k.serviceable_models(),
-            vec!["opus-4-7", "opus-4-8", "glm-5.1", "glm-5.2"]
+            vec!["claude-opus-4-7", "claude-sonnet-4-5"]
         );
     }
 
