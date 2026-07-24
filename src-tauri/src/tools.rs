@@ -707,30 +707,30 @@ fn redact_config_secrets(s: &str) -> String {
     ] {
         out = redact_json_string_field(&out, key);
     }
-    // bare sk- tokens（至少 12 字符后缀）
+    // bare sk- tokens（含 "sk-" 在内至少 12 字符）。按字符边界扫描：不能用字节索引切片，
+    // 否则配置里出现多字节 UTF-8（如中文路径）时 &s[i..i+3] 会切在字符中间 panic，
+    // 且 `byte as char` 会把多字节序列拆成乱码。
     let mut result = String::with_capacity(out.len());
-    let bytes = out.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 3 < bytes.len() && &out[i..i + 3] == "sk-" {
-            let mut j = i + 3;
-            while j < bytes.len() {
-                let c = bytes[j] as char;
-                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                    j += 1;
-                } else {
-                    break;
-                }
-            }
-            if j - i >= 12 {
-                result.push_str("sk-***");
-                i = j;
-                continue;
-            }
+    let mut rest = out.as_str();
+    while let Some(pos) = rest.find("sk-") {
+        result.push_str(&rest[..pos]);
+        let after = &rest[pos + 3..];
+        // 连续的 token 字符（字母数字 / _ / -）长度，按字符边界累加。
+        let tok_len: usize = after
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .map(|(idx, c)| idx + c.len_utf8())
+            .last()
+            .unwrap_or(0);
+        let total = 3 + tok_len; // 含 "sk-" 的完整 token 长度
+        if total >= 12 {
+            result.push_str("sk-***");
+        } else {
+            result.push_str(&rest[pos..pos + total]);
         }
-        result.push(bytes[i] as char);
-        i += 1;
+        rest = &rest[pos + total..];
     }
+    result.push_str(rest);
     result
 }
 
@@ -923,6 +923,32 @@ mod tests {
         assert!(!out.contains("sk-abc1234567890"));
         assert!(!out.contains("secret"));
         assert!(out.contains(r#""model":"x""#) || out.contains(r#""model": "x""#));
+    }
+
+    #[test]
+    fn redact_handles_non_ascii_without_panic() {
+        // 配置常含中文路径/工作目录（本机 Windows 用户名即中文）。脱敏必须按字符边界扫描，
+        // 不得因 sk- 扫描的字节切片切在多字节字符中间而 panic，且非 ASCII 不能被拆成乱码。
+        let raw = r#"{"cwd":"C:\\Users\\莫海明\\项目","OPENAI_API_KEY":"sk-abcdefghijklmnop","note":"路径含中文🚀"}"#;
+        let out = redact_config_secrets(raw);
+        // 已知字段脱敏
+        assert!(!out.contains("sk-abcdefghijklmnop"));
+        assert!(out.contains("***"));
+        // 非 ASCII 原样保留（未乱码）
+        assert!(out.contains("莫海明"));
+        assert!(out.contains("项目"));
+        assert!(out.contains("路径含中文🚀"));
+    }
+
+    #[test]
+    fn redact_bare_sk_token_only_when_long_enough() {
+        // 短 sk- 串（不足 12 字符）不脱敏；达到阈值才脱敏。
+        let short = redact_config_secrets("prefix sk-abc done");
+        assert!(short.contains("sk-abc"), "短 token 应原样保留: {short}");
+        let long = redact_config_secrets("prefix sk-abcdefghij done");
+        assert!(long.contains("sk-***"));
+        assert!(!long.contains("sk-abcdefghij"));
+        assert!(long.contains("prefix ") && long.contains(" done"), "周边文本应保留");
     }
 
     #[test]
