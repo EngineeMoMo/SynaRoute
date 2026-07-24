@@ -1,7 +1,7 @@
 {
   "name": "synaroute",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "SynaRoute - 智能 API Key 路由代理与配置管理桌面软件",
   "scripts": {

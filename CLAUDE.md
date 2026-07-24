@@ -40,3 +40,4 @@ npm run tauri build -- --no-bundle   # 只出 exe（快速验证）
 - [docs/03-UIUX设计文档.md](docs/03-UIUX设计文档.md)
 - [docs/04-构建部署指南.md](docs/04-构建部署指南.md) ← 构建部署坑点与流程
 - [docs/11-MSIX虚拟化踩坑复盘.md](docs/11-MSIX虚拟化踩坑复盘.md) ← 平行宇宙惨案完整复盘与逃逸手段
+- [docs/12-CLI用户手册.md](docs/12-CLI用户手册.md) ← 面向试用用户的 Claude Code CLI 接入手册
