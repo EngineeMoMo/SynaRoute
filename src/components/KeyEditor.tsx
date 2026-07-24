@@ -173,19 +173,22 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
     try {
       await api.upsertKey(key);
       if (secret) await api.saveSecret(key.id, secret);
-      // 保存成功后默认跑一次可用性检查并回写 health（探测失败不阻断保存，仅标记 health=down）
-      try {
-        await api.checkHealth(key.id);
-      } catch {
-        // 探测异常忽略：Key 已保存，后台定时健康检查仍会兜底刷新
-      }
       await loadCategory(activeCategory);
-      onClose(); // 仅在成功后关闭
+      onClose(); // 落盘即关闭：健康探测移出关键路径，避免等上游往返「像卡住」
+      // 保存成功后后台跑一次可用性检查并回写 health（不阻塞关窗；探测失败仅标记 health=down）。
+      // loadCategory 来自 store，本组件已卸载后仍可安全调用（更新的是全局状态，非本组件 state）。
+      void (async () => {
+        try {
+          await api.checkHealth(key.id);
+          await loadCategory(activeCategory);
+        } catch {
+          // 探测异常忽略：Key 已保存，后台定时健康检查仍会兜底刷新
+        }
+      })();
     } catch (e) {
       // 失败时保留抽屉并显示错误，避免"报错后窗口卡住、列表不刷新"
       setError(t("editor.errSave", { err: String(e) }));
       await loadCategory(activeCategory); // 刷新以反映可能的部分写入
-    } finally {
       setSaving(false);
     }
   };
