@@ -677,10 +677,18 @@ fn read_preview_text(path: &Path, redact_secrets: bool) -> AppResult<(bool, Opti
     } else {
         raw
     };
-    // 预览截断，避免超大配置撑爆前端
+    // 预览截断：按 char 边界截，避免切在 UTF-8 多字节中间 panic
     const CAP: usize = 32_000;
     let text = if text.len() > CAP {
-        format!("{}…\n/* truncated {} bytes */", &text[..CAP], text.len() - CAP)
+        let mut end = CAP;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!(
+            "{}…\n/* truncated {} bytes */",
+            &text[..end],
+            text.len() - end
+        )
     } else {
         text
     };
@@ -903,6 +911,34 @@ mod tests {
         let (_, wrote2) = register_mcp_codex_at(&path, url).unwrap();
         assert!(!wrote2, "相同 url 应跳过");
 
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn redact_json_string_field_masks_known_secrets() {
+        let raw = r#"{"ANTHROPIC_AUTH_TOKEN":"sk-abc1234567890","OPENAI_API_KEY":"secret","model":"x"}"#;
+        let out = redact_config_secrets(raw);
+        assert!(out.contains(r#""ANTHROPIC_AUTH_TOKEN": "***""#) || out.contains(r#""ANTHROPIC_AUTH_TOKEN":"***""#));
+        assert!(out.contains("***"));
+        assert!(!out.contains("sk-abc1234567890"));
+        assert!(!out.contains("secret"));
+        assert!(out.contains(r#""model":"x""#) || out.contains(r#""model": "x""#));
+    }
+
+    #[test]
+    fn preview_truncate_respects_utf8_boundary() {
+        // 构造刚好跨 CAP 的多字节字符，截断不得 panic
+        let mut s = "a".repeat(31_998);
+        s.push('中'); // 3 bytes UTF-8
+        s.push_str("tail");
+        let path = temp_file("preview_utf8", "settings.json");
+        std::fs::write(&path, &s).unwrap();
+        let (exists, content) = read_preview_text(&path, false).unwrap();
+        assert!(exists);
+        let c = content.unwrap();
+        assert!(c.contains("truncated"));
+        // 必须是合法 UTF-8（unwrap 已保证）且不含 panic
+        assert!(c.is_char_boundary(c.len()));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
