@@ -177,6 +177,11 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
       if (secret) await api.saveSecret(key.id, secret);
       await loadCategory(activeCategory);
       onClose(); // 落盘即关闭：健康探测移出关键路径，避免等上游往返「像卡住」
+      // Codex 分类的 Key 改动可能变更可服务模型集 → 托盘「Codex 模型」子菜单候选需同步重建
+      // （托盘菜单静态构建，不自动跟数据变）。仅 Codex 需要，其余分类无此子菜单。
+      if (activeCategory === "codex") {
+        void api.rebuildTrayMenu().catch((e) => console.error("rebuildTrayMenu failed", e));
+      }
       // 保存成功后后台跑一次可用性检查并回写 health（不阻塞关窗；探测失败仅标记 health=down）。
       // loadCategory 来自 store，本组件已卸载后仍可安全调用（更新的是全局状态，非本组件 state）。
       void (async () => {

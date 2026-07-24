@@ -687,6 +687,10 @@ pub struct AppSettings {
     /// （与 mcp_* 字段同一保全策略）。
     #[serde(default)]
     pub active_models: std::collections::HashMap<String, String>,
+    /// 托盘「Codex 模型」快切子菜单开关。开启后右键托盘可直接切换 Codex 当前对外模型，
+    /// 免打开主窗口（借鉴 cc-switch 托盘切换范式）。默认开。关闭则托盘只留显示/退出。
+    #[serde(default = "default_true")]
+    pub tray_model_switch_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -723,6 +727,7 @@ impl Default for AppSettings {
             health_probe_real_completion: false,
             aggregate_trace_enabled: false,
             active_models: std::collections::HashMap::new(),
+            tray_model_switch_enabled: true,
         }
     }
 }
@@ -1118,5 +1123,16 @@ mod tests {
         }"#;
         let k: ProviderKey = serde_json::from_str(json).unwrap();
         assert_eq!(k.protocol, Protocol::OpenaiChat);
+    }
+
+    #[test]
+    fn app_settings_tray_toggle_defaults_true_for_legacy_config() {
+        // 旧 config.json 无 trayModelSwitchEnabled 字段：反序列化应默认为 true，
+        // 避免升级用户的托盘快切被意外关掉（default_true）。
+        let json = r#"{"theme":"system","language":"zh"}"#;
+        let s: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(s.tray_model_switch_enabled, "旧配置缺该字段应默认开启");
+        // active_models 缺失应为空 map（不 panic）。
+        assert!(s.active_models.is_empty());
     }
 }

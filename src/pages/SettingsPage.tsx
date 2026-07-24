@@ -9,7 +9,7 @@ import { LANGS } from "@/lib/i18n";
 import type { AppSettings, McpStatus, ThemePref } from "@/types";
 import {
   Sun, Moon, Monitor, ShieldCheck, KeyRound, Languages, ScrollText,
-  Activity, RefreshCw, FolderOpen, Info, Plug, BookOpen, Copy, Check, X, Brain, type LucideIcon,
+  Activity, RefreshCw, FolderOpen, Info, Plug, BookOpen, Copy, Check, X, Brain, MousePointerClick, type LucideIcon,
 } from "lucide-react";
 
 /** 设置页（主题 / 语言 / 自启 / 加密方式 / 局域网暴露 / 版本更新 / 日志路径） */
@@ -414,6 +414,17 @@ export function SettingsPage() {
               desc={t("settings.aggTraceDesc")}
               checked={settings?.aggregateTraceEnabled ?? false}
               onChange={(v) => update({ aggregateTraceEnabled: v })}
+            />
+            <ToggleRow
+              icon={MousePointerClick}
+              title={t("settings.trayModelTitle")}
+              desc={t("settings.trayModelDesc")}
+              checked={settings?.trayModelSwitchEnabled ?? true}
+              onChange={(v) => {
+                update({ trayModelSwitchEnabled: v });
+                // 托盘菜单静态构建：开关改动后须主动重建，否则子菜单不随开关增减。
+                void api.rebuildTrayMenu().catch((e) => console.error("rebuildTrayMenu failed", e));
+              }}
             />
           </CardContent>
         </Card>

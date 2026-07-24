@@ -261,11 +261,23 @@ async fn save_settings(
 /// 每请求实时读取，改选即时生效、免重启客户端。
 #[tauri::command]
 async fn set_active_model(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     category_id: CategoryType,
     model: String,
 ) -> AppResult<()> {
-    state.store.set_active_model(category_id.as_str(), &model)
+    state.store.set_active_model(category_id.as_str(), &model)?;
+    // 主窗口下拉改选后，同步刷新托盘子菜单的勾选态（托盘菜单静态构建，需主动重建）。
+    let _ = rebuild_tray(&app);
+    Ok(())
+}
+
+/// 重建托盘菜单：主窗口里改了 Key 模型列表 / 切了 active_model / 改了托盘开关后，
+/// 前端调此命令让托盘子菜单候选与勾选态跟最新数据一致（托盘菜单不自动跟数据变）。
+#[tauri::command]
+async fn rebuild_tray_menu(app: tauri::AppHandle) -> AppResult<()> {
+    let _ = rebuild_tray(&app);
+    Ok(())
 }
 
 // ============ MCP 服务器 ============
@@ -813,6 +825,7 @@ pub fn run() {
             get_settings,
             save_settings,
             set_active_model,
+            rebuild_tray_menu,
             mcp_status,
             set_mcp_enabled,
             restart_mcp,
@@ -834,13 +847,98 @@ pub fn run() {
 }
 
 /// 构建系统托盘（FR-022）
-fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
-    use tauri::menu::{Menu, MenuItem};
-    use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+/// 托盘菜单的 Codex 模型项 id 前缀：`model::<对外模型名>`，空名（`model::`）= 跟随客户端透传。
+const TRAY_MODEL_PREFIX: &str = "model::";
+
+/// 构建托盘菜单：显示主窗口 +（可选）Codex 模型快切子菜单 + 退出。
+/// 候选与 /v1/models、应用内下拉同源（discoverable_models 交集口径），当前选中项打勾。
+/// 借鉴 cc-switch 托盘切换范式：右键托盘即可切 Codex 当前对外模型，免打开主窗口。
+fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    let state = app.state::<AppState>();
+    let settings = state.store.get_settings();
+
+    let menu = Menu::new(app)?;
+    menu.append(&show)?;
+
+    // Codex 模型快切子菜单（开关开启时）：列出 Codex 启用 Key 可服务模型的交集，当前项打勾，
+    // 末尾附「跟随客户端（透传）」。关闭开关则托盘只留显示/退出，不构建此段。
+    if settings.tray_model_switch_enabled {
+        let candidates = state.store.enabled_keys_sorted(CategoryType::Codex);
+        let models = proxy::discoverable_models(&candidates);
+        let active = settings
+            .active_models
+            .get(CategoryType::Codex.as_str())
+            .cloned()
+            .unwrap_or_default();
+
+        menu.append(&PredefinedMenuItem::separator(app)?)?;
+        let submenu = Submenu::new(app, "Codex 模型", true)?;
+        if models.is_empty() {
+            // 无候选：给一个禁用提示项，避免空子菜单让用户以为坏了。
+            let empty = MenuItem::with_id(app, "noop", "（无可用模型，先加并启用 Key）", false, None::<&str>)?;
+            submenu.append(&empty)?;
+        } else {
+            for m in &models {
+                let item = CheckMenuItem::with_id(
+                    app,
+                    format!("{TRAY_MODEL_PREFIX}{m}"),
+                    m,
+                    true,
+                    &active == m,
+                    None::<&str>,
+                )?;
+                submenu.append(&item)?;
+            }
+            submenu.append(&PredefinedMenuItem::separator(app)?)?;
+            // 跟随客户端（透传）：空名，选中即清除 active override，回到透传客户端原模型名。
+            let follow = CheckMenuItem::with_id(
+                app,
+                TRAY_MODEL_PREFIX,
+                "跟随客户端（透传）",
+                true,
+                active.is_empty(),
+                None::<&str>,
+            )?;
+            submenu.append(&follow)?;
+        }
+        menu.append(&submenu)?;
+    }
+
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&quit)?;
+    Ok(menu)
+}
+
+/// 托盘 tooltip：附带当前 Codex 选定模型，让用户悬停即知当前用哪个（无需展开菜单）。
+fn tray_tooltip(app: &tauri::AppHandle) -> String {
+    let state = app.state::<AppState>();
+    let settings = state.store.get_settings();
+    match settings.active_models.get(CategoryType::Codex.as_str()) {
+        Some(m) if !m.trim().is_empty() => format!("SynaRoute · Codex: {m}"),
+        _ => "SynaRoute".to_string(),
+    }
+}
+
+/// 重建托盘菜单 + 刷新 tooltip（Tauri 托盘菜单静态构建，数据变动后须显式重建）。
+/// 触发时机：托盘内切换模型后、主窗口改动 Key 模型列表后（前端调 rebuild_tray_menu 命令）。
+fn rebuild_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    if let Some(tray) = app.tray_by_id("main") {
+        let menu = build_tray_menu(app)?;
+        tray.set_menu(Some(menu))?;
+        let _ = tray.set_tooltip(Some(tray_tooltip(app)));
+    }
+    Ok(())
+}
+
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+
+    let menu = build_tray_menu(app)?;
 
     // 使用应用打包时的默认窗口图标，避免出现空白托盘图标
     let icon = app
@@ -851,11 +949,38 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let _tray = TrayIconBuilder::with_id("main")
         .icon(icon)
         .menu(&menu)
-        .tooltip("SynaRoute")
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => show_main_window(app),
-            "quit" => app.exit(0),
-            _ => {}
+        .tooltip(tray_tooltip(app))
+        .on_menu_event(|app, event| {
+            let id = event.id.as_ref();
+            match id {
+                "show" => show_main_window(app),
+                "quit" => app.exit(0),
+                _ if id.starts_with(TRAY_MODEL_PREFIX) => {
+                    // model::<名> → 切 Codex 当前对外模型（空名=跟随客户端透传）。
+                    // 复用 set_active_model：每请求实时重读，切换即时生效、免重启 Codex。
+                    let model = id.strip_prefix(TRAY_MODEL_PREFIX).unwrap_or("");
+                    let state = app.state::<AppState>();
+                    if let Err(e) = state.store.set_active_model(CategoryType::Codex.as_str(), model) {
+                        state.store.append_event(
+                            CategoryType::Codex,
+                            "error",
+                            None,
+                            &format!("托盘切换模型失败: {e}"),
+                        );
+                        return;
+                    }
+                    let shown = if model.is_empty() { "跟随客户端（透传）" } else { model };
+                    state.store.append_event(
+                        CategoryType::Codex,
+                        "config",
+                        None,
+                        &format!("托盘切换 Codex 模型 → {shown}（即时生效）"),
+                    );
+                    // 重建菜单以刷新勾选与 tooltip。
+                    let _ = rebuild_tray(app);
+                }
+                _ => {}
+            }
         })
         // 左键单击托盘图标 = 显示/聚焦主窗口（Windows 常见交互）
         .on_tray_icon_event(|tray, event| {

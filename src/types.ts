@@ -240,6 +240,7 @@ export interface AppSettings {
   healthProbeRealCompletion?: boolean; // 健康探测用真实补全请求（默认关，消耗少量额度）
   aggregateTraceEnabled?: boolean; // 大脑聚合详细快照：开启后落盘成员答案/汇总/决策者入参出参（默认关，避免大 IO）
   activeModels?: Record<string, string>; // 各分类当前选定的对外模型名（key=分类）。借鉴 EchoBird：客户端菜单拉不到中转模型时，在应用内选、代理转发时覆盖。后端自管，走 setActiveModel 专用命令
+  trayModelSwitchEnabled?: boolean; // 托盘快切 Codex 模型子菜单开关（默认开）。开启后右键托盘可直接切 Codex 当前对外模型，免打开主窗口
 }
 
 /** MCP 服务器运行状态（供设置页展示连接指示灯与故障原因） */

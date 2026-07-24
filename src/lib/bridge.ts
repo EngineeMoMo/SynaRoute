@@ -124,6 +124,11 @@ export const api = {
   setActiveModel: (categoryId: CategoryType, model: string) =>
     call<void>("set_active_model", { categoryId, model }, async () => {}),
 
+  // 重建托盘菜单：改了 Key 模型列表 / 切了 active_model / 改了托盘开关后调用，
+  // 让托盘 Codex 模型子菜单候选与勾选态跟最新数据一致（托盘菜单不自动跟数据变）。
+  rebuildTrayMenu: () =>
+    call<void>("rebuild_tray_menu", undefined, async () => {}),
+
   // ---- 版本与更新 ----
   getAppVersion: () => call<string>("get_app_version", undefined, () => "0.2.0"),
 

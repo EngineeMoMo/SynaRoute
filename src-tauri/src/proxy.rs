@@ -481,7 +481,7 @@ async fn handle_request(
 /// - 多个候选 → 各 Key 可服务模型集的**交集**（共有），保证选任意模型都能在所有候选上路由，
 ///   不会「模型不存在」。顺序以主 Key（candidates[0]，已按 priority 升序）为准。
 /// - 交集为空（多 Key 对外名不统一）→ 回退主 Key 的可服务模型集。
-fn discoverable_models(candidates: &[ProviderKey]) -> Vec<String> {
+pub(crate) fn discoverable_models(candidates: &[ProviderKey]) -> Vec<String> {
     let Some((primary, rest)) = candidates.split_first() else {
         return Vec::new();
     };
