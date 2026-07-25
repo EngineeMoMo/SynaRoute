@@ -332,16 +332,21 @@ async fn handle_request(
                 Ok(StreamAttempt::Streaming { resp, url, real_model, request_body }) => {
                     health::record_live_success(&store, &key.id);
                     let elapsed = started.elapsed().as_millis() as u64;
-                    // 流式成功也记一条 request 事件（开关开启时）：请求体是转换后发往上游的
-                    // 完整 body（含 reasoning→thinking 等映射，供核对）；响应体因是真流式
+                    // 流式成功也记一条 request 事件（开关开启时）。请求体同时呈现两段以便核对：
+                    // ①下游原始 body（Codex 发来、转换前，用于确认它到底发没发 reasoning.effort）；
+                    // ②转换后发往上游的 body（含 reasoning→thinking 映射结果）。响应体因真流式
                     // （边收边发、不缓冲）无法完整留存，标注说明，避免用户展开见空以为坏了。
+                    let combined_req = format!(
+                        "==== 下游原始请求（转换前，Codex 发来）====\n{}\n\n==== 转换后发往上游 ====\n{}",
+                        downstream_body, request_body
+                    );
                     log_request(
                         &store,
                         key,
                         elapsed,
                         url,
                         real_model,
-                        request_body,
+                        combined_req,
                         "（流式响应：边收边发，body 不留存。如需完整响应体，请在客户端侧抓取）".to_string(),
                         Some(200),
                         true,
