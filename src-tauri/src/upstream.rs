@@ -1449,6 +1449,10 @@ pub struct SseTranslator {
     /// Anthropic content block 的 index → tool_calls 槽位下标映射（tool_use 块与 text 块
     /// 共用同一 index 空间，需按 content_block_start 记下 tool_use 块落在哪个槽位）。
     block_tool_slot: std::collections::HashMap<usize, usize>,
+    /// 累积 assistant 文本全文。Codex 靠 `response.output_item.done`（带完整 message item）
+    /// 把 assistant 回复持久化进会话；仅发 output_text.delta（实时增量）只够即时显示、
+    /// 重开会话就丢。故这里累积全文，在收尾时回填进 message 的 output_item.done。
+    text_accum: String,
 }
 
 impl SseTranslator {
@@ -1465,6 +1469,7 @@ impl SseTranslator {
             input_tokens: 0,
             output_tokens: 0,
             block_tool_slot: std::collections::HashMap::new(),
+            text_accum: String::new(),
         }
     }
 
@@ -1552,6 +1557,7 @@ impl SseTranslator {
         if let Some(t) = delta.and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
             if !t.is_empty() {
                 self.saw_text = true;
+                self.text_accum.push_str(t); // 累积全文，收尾时回填 output_item.done 供 Codex 落盘
                 let ev = json!({
                     "type": "response.output_text.delta",
                     "item_id": self.msg_id, "output_index": 0, "content_index": 0, "delta": t
@@ -1581,21 +1587,40 @@ impl SseTranslator {
         }
         // finish_reason + usage：Chat 末尾 chunk。usage 常在最后一个（stream_options）chunk。
         let finished = choice0.and_then(|c| c.get("finish_reason")).and_then(|r| r.as_str()).is_some();
-        if finished {
-            // 文本 done + content_part/item done
-            if self.saw_text {
-                let done = json!({
-                    "type": "response.output_text.done",
-                    "item_id": self.msg_id, "output_index": 0, "content_index": 0, "text": ""
-                });
-                out.push_str(&sse("response.output_text.done", &done));
-            }
+        if finished && self.saw_text {
+            // 文本 done：带完整全文（此前空串，Codex 落盘需要正文）。
+            let done = json!({
+                "type": "response.output_text.done",
+                "item_id": self.msg_id, "output_index": 0, "content_index": 0, "text": self.text_accum
+            });
+            out.push_str(&sse("response.output_text.done", &done));
+            // 关键修复：文本 message 也发 output_item.done（带完整 text）——Codex 靠该事件把
+            // assistant 回复持久化进会话；此前只发 delta（实时流），重开对话文本回复全丢。
+            out.push_str(&self.emit_text_item_done());
         }
         // usage 单独出现（无 choices 或 choices 空）时，触发 completed
         if chunk.get("usage").is_some() && chunk.get("usage") != Some(&Value::Null) {
             out.push_str(&self.emit_responses_completed(chunk.get("usage")));
         }
         out
+    }
+
+    /// 发文本 message 的 output_item.done（带累积全文）。Codex 靠此事件把 assistant 文本回复
+    /// 持久化进会话；此前只发 output_text.delta（实时流），重开对话文本回复全丢（工具调用因已
+    /// 发 output_item.done 而正常保存）。text/message item 固定占 output_index 0。
+    fn emit_text_item_done(&self) -> String {
+        let item = json!({
+            "type": "message",
+            "id": self.msg_id,
+            "role": "assistant",
+            "status": "completed",
+            "content": [ { "type": "output_text", "text": self.text_accum, "annotations": [] } ]
+        });
+        sse("response.output_item.done", &json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": item
+        }))
     }
 
     /// 冲刷 Responses 收尾：先补 function_call item（若有），再 response.completed。
@@ -1619,7 +1644,7 @@ impl SseTranslator {
         if self.saw_text {
             output.push(json!({
                 "type": "message", "id": self.msg_id, "role": "assistant", "status": "completed",
-                "content": [ { "type": "output_text", "text": "", "annotations": [] } ]
+                "content": [ { "type": "output_text", "text": self.text_accum, "annotations": [] } ]
             }));
         }
         for (i, (id, name, args)) in self.tool_calls.iter().enumerate() {
@@ -1827,6 +1852,7 @@ impl SseTranslator {
                         if let Some(t) = delta.and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
                             if !t.is_empty() {
                                 self.saw_text = true;
+                                self.text_accum.push_str(t); // 累积全文，供收尾 message output_item.done 落盘
                                 let e = json!({
                                     "type": "response.output_text.delta",
                                     "item_id": self.msg_id, "output_index": 0, "content_index": 0, "delta": t
@@ -1855,14 +1881,17 @@ impl SseTranslator {
                     self.output_tokens = ot;
                 }
             }
-            // message_stop：发文本 done + response.completed（usage 用累积字段）
+            // message_stop：发文本 done + message 的 output_item.done（关键：Codex 靠此落盘
+            // assistant 文本回复，仅发 delta 不落盘会导致重开对话文本丢失）+ response.completed。
             "message_stop" => {
                 if self.saw_text {
                     let done = json!({
                         "type": "response.output_text.done",
-                        "item_id": self.msg_id, "output_index": 0, "content_index": 0, "text": ""
+                        "item_id": self.msg_id, "output_index": 0, "content_index": 0,
+                        "text": self.text_accum
                     });
                     out.push_str(&sse("response.output_text.done", &done));
+                    out.push_str(&self.emit_text_item_done());
                 }
                 out.push_str(&self.emit_responses_completed(None));
             }
@@ -2490,6 +2519,16 @@ mod tests {
         // 两段文本增量
         assert!(out.contains("\"delta\":\"Hel\""), "缺第一段增量");
         assert!(out.contains("\"delta\":\"lo\""), "缺第二段增量");
+        // 关键回归：文本 message 必须发 output_item.done 且带完整全文——Codex 靠该事件把
+        // assistant 回复持久化进会话（此前只发 delta，重开对话文本回复全丢，只剩用户问题）。
+        assert!(
+            out.contains("event: response.output_item.done"),
+            "文本缺 output_item.done（Codex 据此持久化 assistant 回复）:\n{out}"
+        );
+        assert!(
+            out.contains("\"type\":\"message\"") && out.contains("\"text\":\"Hello\""),
+            "output_item.done 的 message 未带完整全文 Hello:\n{out}"
+        );
         // 收尾（usage 触发 completed，finish 幂等不重复）
         assert!(out.contains("event: response.completed"), "缺 response.completed");
         assert!(out.contains("\"input_tokens\":2"), "usage 未映射");
@@ -2618,6 +2657,16 @@ mod tests {
         assert!(out.contains("\"delta\":\" there\""), "缺第二段增量");
         // 收尾：text.done + completed（usage 用 Anthropic 分散字段累积）
         assert!(out.contains("event: response.output_text.done"), "缺 output_text.done");
+        // 关键回归：文本 message 必须发 output_item.done 且带完整全文（Hi there）——Codex 靠该事件
+        // 持久化 assistant 回复；此前只发 delta，重开对话文本回复全丢，只剩用户问题。
+        assert!(
+            out.contains("event: response.output_item.done"),
+            "文本缺 output_item.done（Codex 据此持久化 assistant 回复）:\n{out}"
+        );
+        assert!(
+            out.contains("\"type\":\"message\"") && out.contains("\"text\":\"Hi there\""),
+            "output_item.done 的 message 未带完整全文 Hi there:\n{out}"
+        );
         assert!(out.contains("event: response.completed"), "缺 response.completed");
         assert!(out.contains("\"input_tokens\":7"), "input_tokens 未归位:\n{out}");
         assert!(out.contains("\"output_tokens\":3"), "output_tokens 未归位:\n{out}");
