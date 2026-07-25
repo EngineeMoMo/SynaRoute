@@ -565,6 +565,8 @@ impl Store {
             // 用户在应用内改选模型走专用命令 set_active_model 直写，若被这里的旧快照覆盖，
             // 会把刚选的模型顶回旧值（与 mcp_* 同一保全策略）。始终保留后端持久化值。
             settings.active_models = std::mem::take(&mut cfg.settings.active_models);
+            // active_efforts 同为后端自管字段（Codex 默认推理强度），策略同 active_models。
+            settings.active_efforts = std::mem::take(&mut cfg.settings.active_efforts);
             cfg.settings = settings;
         }
         self.persist()
@@ -586,6 +588,29 @@ impl Store {
                 }
                 cfg.settings
                     .active_models
+                    .insert(category.to_string(), trimmed.to_string());
+            }
+        }
+        self.persist()
+    }
+
+    /// 设置某分类的「默认推理强度」（Codex 用；后端自管字段专用写入，绕过 save_settings 旧快照覆盖）。
+    /// 空串视为清除（回到不注入、保持上游默认）。已是目标值则幂等跳过写盘。
+    /// 取值：low/medium/high/xhigh（minimal 亦可，映射侧按不开思考处理）。
+    pub fn set_active_effort(&self, category: &str, effort: &str) -> AppResult<()> {
+        {
+            let mut cfg = self.config.write();
+            let trimmed = effort.trim();
+            if trimmed.is_empty() {
+                if cfg.settings.active_efforts.remove(category).is_none() {
+                    return Ok(());
+                }
+            } else {
+                if cfg.settings.active_efforts.get(category).map(|s| s.as_str()) == Some(trimmed) {
+                    return Ok(());
+                }
+                cfg.settings
+                    .active_efforts
                     .insert(category.to_string(), trimmed.to_string());
             }
         }
@@ -1056,6 +1081,39 @@ mod tests {
         assert!(!store.get_settings().active_models.contains_key("codex"));
         let store2 = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
         assert!(!store2.get_settings().active_models.contains_key("codex"), "清除后应持久");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 方案 A：Codex 默认推理强度是后端自管字段，与 active_models 同一保全策略：
+    /// 专用命令直写、前端 save_settings 的陈旧空快照不得顶掉、空串清除、重开持久。
+    #[test]
+    fn set_active_effort_persists_and_survives_stale_save_settings() {
+        let dir = temp_dir("active_effort");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        store.set_active_effort("codex", "xhigh").unwrap();
+        assert_eq!(
+            store.get_settings().active_efforts.get("codex").map(|s| s.as_str()),
+            Some("xhigh"),
+        );
+
+        // 前端切主题携带的旧快照 active_efforts 为空：不得清除已配强度。
+        let mut stale = store.get_settings();
+        stale.active_efforts = std::collections::HashMap::new();
+        stale.theme = "dark".into();
+        store.save_settings(stale).unwrap();
+        assert_eq!(
+            store.get_settings().active_efforts.get("codex").map(|s| s.as_str()),
+            Some("xhigh"),
+            "已配强度应保留，不被前端空快照顶回",
+        );
+
+        // 空串清除；重开 Store 后仍为空。
+        store.set_active_effort("codex", "").unwrap();
+        assert!(!store.get_settings().active_efforts.contains_key("codex"));
+        let store2 = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        assert!(!store2.get_settings().active_efforts.contains_key("codex"), "清除后应持久");
 
         std::fs::remove_dir_all(&dir).ok();
     }

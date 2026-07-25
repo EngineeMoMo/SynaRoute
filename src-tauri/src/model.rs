@@ -650,6 +650,12 @@ pub struct AppSettings {
     /// 调用模型日志：开启后每次代理转发记一条 request 事件（默认关，避免噪音）
     #[serde(default)]
     pub request_log_enabled: bool,
+    /// 诊断：在 request 日志里额外附「下游原始请求体」（转换前 Codex 发来的原样）。
+    /// 默认关——下游原始 body 可达十几万字符（Codex 带大量 system/skills 清单），
+    /// 常态记录既占日志又会把「转换后发往上游」段挤出截断窗口。仅排障（如核对推理强度
+    /// 注入、reasoning 字段）时开启。关闭时 request 只记转换后 body（含 thinking 映射结果）。
+    #[serde(default)]
+    pub log_downstream_raw_enabled: bool,
     /// 后台定时健康检查间隔（秒）。用户可配置，默认 60s。
     #[serde(default = "default_health_interval")]
     pub health_check_interval_secs: u64,
@@ -691,6 +697,15 @@ pub struct AppSettings {
     /// 免打开主窗口（借鉴 cc-switch 托盘切换范式）。默认开。关闭则托盘只留显示/退出。
     #[serde(default = "default_true")]
     pub tray_model_switch_enabled: bool,
+    /// 各分类的「默认推理强度」（key=分类字符串，value=effort 档位 low/medium/high/xhigh）。
+    /// 缘由：Codex Desktop 对自定义 provider 不下发 reasoning.effort（只发 reasoning.summary），
+    /// 客户端 UI 设的强度传不到上游。故在此配一个默认值，转发时若下游 body 无 effort 就注入，
+    /// 让 Codex→Claude(thinking)/Chat(reasoning_effort) 的推理强度能真正生效。
+    /// 仅在下游为 Responses(Codex) 且上游非原生 Responses 时注入（OpenAI 官方 Responses 直通不碰）。
+    /// 后端自管字段：由专用命令 set_active_effort 更新，不随通用 save_settings 的陈旧快照覆盖
+    /// （与 active_models / mcp_* 同一保全策略）。空/未配 = 不注入，保持现状。
+    #[serde(default)]
+    pub active_efforts: std::collections::HashMap<String, String>,
 }
 
 fn default_true() -> bool {
@@ -718,6 +733,7 @@ impl Default for AppSettings {
             master_password_enabled: false,
             lan_exposure: false,
             request_log_enabled: false,
+            log_downstream_raw_enabled: false,
             health_check_interval_secs: default_health_interval(),
             log_dir: None,
             mcp_enabled: false,
@@ -727,6 +743,7 @@ impl Default for AppSettings {
             health_probe_real_completion: false,
             aggregate_trace_enabled: false,
             active_models: std::collections::HashMap::new(),
+            active_efforts: std::collections::HashMap::new(),
             tray_model_switch_enabled: true,
         }
     }

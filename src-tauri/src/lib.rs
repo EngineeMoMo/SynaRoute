@@ -272,6 +272,19 @@ async fn set_active_model(
     Ok(())
 }
 
+/// 设置某分类的「默认推理强度」（方案 A，Codex 专用）。
+/// Codex 对自定义 provider 不发 reasoning.effort，故由此配置在转发时补进请求体。
+/// 取值 minimal/low/medium/high/xhigh；空串或 "off" 清除（回到不注入、保持现状）。
+/// 后端自管字段，走专用命令直写，不随 save_settings 的陈旧快照覆盖。
+#[tauri::command]
+async fn set_active_effort(
+    state: tauri::State<'_, AppState>,
+    category_id: CategoryType,
+    effort: String,
+) -> AppResult<()> {
+    state.store.set_active_effort(category_id.as_str(), &effort)
+}
+
 /// 重建托盘菜单：主窗口里改了 Key 模型列表 / 切了 active_model / 改了托盘开关后，
 /// 前端调此命令让托盘子菜单候选与勾选态跟最新数据一致（托盘菜单不自动跟数据变）。
 #[tauri::command]
@@ -825,6 +838,7 @@ pub fn run() {
             get_settings,
             save_settings,
             set_active_model,
+            set_active_effort,
             rebuild_tray_menu,
             mcp_status,
             set_mcp_enabled,

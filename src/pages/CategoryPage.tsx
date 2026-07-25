@@ -13,7 +13,7 @@ export function CategoryPage({ onAddKey, onEditKey }: {
   onAddKey: () => void;
   onEditKey: (k: ProviderKey) => void;
 }) {
-  const { activeCategory, keys, proxy, loading, refreshCategory, settings, setActiveModel } = useStore();
+  const { activeCategory, keys, proxy, loading, refreshCategory, settings, setActiveModel, setActiveEffort } = useStore();
   const t = useT();
   const [gapDialogOpen, setGapDialogOpen] = useState(false);
 
@@ -38,6 +38,7 @@ export function CategoryPage({ onAddKey, onEditKey }: {
     [keys]
   );
   const activeModel = settings?.activeModels?.[activeCategory] ?? "";
+  const activeEffort = settings?.activeEfforts?.[activeCategory] ?? "";
 
   return (
     <div className="flex h-full flex-col">
@@ -81,6 +82,25 @@ export function CategoryPage({ onAddKey, onEditKey }: {
             className="w-full rounded-control border border-border bg-surface-hover px-3 py-1.5 font-mono text-xs text-text-primary outline-none focus:border-primary"
           />
           <p className="mt-1.5 text-[11px] leading-relaxed text-text-muted">{t("category.activeModelHint")}</p>
+
+          {/* 推理强度（方案 A）：Codex 对自定义 provider 不发 reasoning.effort，故在此配默认强度，
+              转发时补进请求体（Anthropic 上游映射成 thinking / Chat 上游映射成 reasoning_effort）。
+              选「跟随（不注入）」则保持现状不补。 */}
+          <div className="mt-3 border-t border-border pt-2.5">
+            <span className="text-xs font-medium text-text-secondary">{t("category.effortTitle")}</span>
+            <select
+              value={activeEffort}
+              onChange={(e) => void setActiveEffort(activeCategory, e.target.value)}
+              className="mt-1.5 w-full rounded-control border border-border bg-surface-hover px-3 py-1.5 text-xs text-text-primary outline-none focus:border-primary"
+            >
+              <option value="">{t("category.effort.off")}</option>
+              <option value="low">{t("category.effort.low")}</option>
+              <option value="medium">{t("category.effort.medium")}</option>
+              <option value="high">{t("category.effort.high")}</option>
+              <option value="xhigh">{t("category.effort.xhigh")}</option>
+            </select>
+            <p className="mt-1.5 text-[11px] leading-relaxed text-text-muted">{t("category.effortHint")}</p>
+          </div>
         </div>
       )}
 

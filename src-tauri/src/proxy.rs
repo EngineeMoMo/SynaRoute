@@ -332,14 +332,20 @@ async fn handle_request(
                 Ok(StreamAttempt::Streaming { resp, url, real_model, request_body }) => {
                     health::record_live_success(&store, &key.id);
                     let elapsed = started.elapsed().as_millis() as u64;
-                    // 流式成功也记一条 request 事件（开关开启时）。请求体同时呈现两段以便核对：
-                    // ①下游原始 body（Codex 发来、转换前，用于确认它到底发没发 reasoning.effort）；
-                    // ②转换后发往上游的 body（含 reasoning→thinking 映射结果）。响应体因真流式
-                    // （边收边发、不缓冲）无法完整留存，标注说明，避免用户展开见空以为坏了。
-                    let combined_req = format!(
-                        "==== 下游原始请求（转换前，Codex 发来）====\n{}\n\n==== 转换后发往上游 ====\n{}",
-                        downstream_body, request_body
-                    );
+                    // 流式成功也记一条 request 事件（开关开启时）。请求体以「转换后发往上游」为主
+                    // （含 reasoning→thinking 映射结果，排障核心），单独完整保留、放最前；
+                    // 「下游原始 body」（Codex 发来、转换前）体量极大（可达十几万字符），仅在
+                    // log_downstream_raw_enabled 开关开启时追加、且单独截到小额度，避免把转换后段挤没
+                    // ——此前双段直接拼接后被整体 cap(20000) 截断，转换后段常被下游原始段整段吞掉。
+                    let combined_req = if store.get_settings().log_downstream_raw_enabled {
+                        format!(
+                            "==== 转换后发往上游 ====\n{}\n\n==== 下游原始请求（转换前，Codex 发来）====\n{}",
+                            cap_to(&request_body, 8000),
+                            cap_to(&downstream_body, 4000)
+                        )
+                    } else {
+                        request_body
+                    };
                     log_request(
                         &store,
                         key,
@@ -572,10 +578,15 @@ const REQ_LOG_CAP: usize = 20_000;
 
 /// 截断超长文本，附省略提示。
 fn cap(s: &str) -> String {
-    if s.chars().count() <= REQ_LOG_CAP {
+    cap_to(s, REQ_LOG_CAP)
+}
+
+/// 按指定上限截断（供双段日志分别控额度：转换后段须完整可见，下游原始段太大只留头部）。
+fn cap_to(s: &str, limit: usize) -> String {
+    if s.chars().count() <= limit {
         s.to_string()
     } else {
-        let head: String = s.chars().take(REQ_LOG_CAP).collect();
+        let head: String = s.chars().take(limit).collect();
         format!("{head}\n…（已截断，共 {} 字符）", s.chars().count())
     }
 }
@@ -631,6 +642,7 @@ async fn try_stream_to_key(
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("model".into(), Value::String(real_model.clone()));
     }
+    inject_default_effort(store, &mut payload, downstream, key.protocol);
     let payload = crate::upstream::convert_request(&payload, downstream, key.protocol);
 
     // SSE 翻译方向：同协议为 None（原样透传）；跨协议按方向重组事件流。
@@ -802,6 +814,69 @@ fn downstream_protocol(path: &str) -> Protocol {
     }
 }
 
+/// 方案 A：为 Codex 注入「默认推理强度」。
+///
+/// 背景：Codex Desktop 对自定义 provider **不下发** `reasoning.effort`（实测 body 里
+/// 只有 `reasoning:{summary:auto}`，effort 缺失），故用户在 Codex UI 里设的强度传不到上游。
+/// 本函数在转发前，按分类配置（active_efforts["codex"]）把 effort 注入进 payload 的
+/// `reasoning.effort`，后续转换链（responses_to_chat 透传 → openai_to_anthropic 映射 thinking，
+/// 或原生 Responses 上游直接用）即可让强度生效。
+///
+/// 严格的不影响边界：
+/// - **仅下游为 OpenAI Responses（Codex）时注入**：其它下游（Claude Code /messages、
+///   /chat/completions 客户端）根本不经过这里的判断，零影响。
+/// - **仅当上游需要转换（downstream != upstream）时注入**：下游=上游=Responses 时
+///   `convert_request` 走 from==to 直通、body 原样透传，此处也跳过——**绝不碰 OpenAI 官方
+///   Responses 上游**（它该用 Codex 原生 effort 机制）。
+/// - **已有 effort 则不覆盖**：只在缺失时补默认，将来 Codex 真发了 effort 也不破坏。
+/// - 配置为空 / 未设 → 完全不注入，保持现状。
+fn inject_default_effort(
+    store: &Arc<Store>,
+    payload: &mut Value,
+    downstream: Protocol,
+    upstream: Protocol,
+) {
+    // 只作用于 Codex（下游 Responses）且需跨协议转换的场景。
+    if downstream != Protocol::OpenaiResponses || downstream == upstream {
+        return;
+    }
+    let category = downstream_category_for_effort();
+    let effort = match store
+        .get_settings()
+        .active_efforts
+        .get(category)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(e) => e,
+        None => return, // 未配默认强度：保持现状，不注入
+    };
+    let Some(obj) = payload.as_object_mut() else { return };
+    // 已带 effort（无论 Codex 何时开始下发）→ 尊重下游，不覆盖。
+    let has_effort = obj
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .map(|e| !e.is_null())
+        .unwrap_or(false);
+    if has_effort {
+        return;
+    }
+    // 注入到 reasoning.effort（保留已有的 reasoning.summary 等字段）。
+    match obj.get_mut("reasoning").and_then(|r| r.as_object_mut()) {
+        Some(r) => {
+            r.insert("effort".into(), Value::String(effort));
+        }
+        None => {
+            obj.insert("reasoning".into(), serde_json::json!({ "effort": effort }));
+        }
+    }
+}
+
+/// 推理强度注入目前只服务 Codex 分类（其模型/推理菜单对自定义 provider 不下发 effort）。
+fn downstream_category_for_effort() -> &'static str {
+    CategoryType::Codex.as_str()
+}
+
 /// 转发到单个 Key：套用模型映射 + 协议适配。
 /// 返回完整 outcome（含发往上游的请求体、响应体、状态），供路由与调用模型日志共用。
 /// 注意：非 2xx 不再直接返回 Err，而是照常返回 outcome（ok=false），
@@ -829,6 +904,7 @@ async fn forward_to_key(
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("model".into(), Value::String(real_model.clone()));
     }
+    inject_default_effort(store, &mut payload, downstream, key.protocol);
 
     // 跨协议转换（下游协议 → 上游 Key 协议；同协议时 convert_request 内部直接返回克隆）
     let payload = crate::upstream::convert_request(&payload, downstream, key.protocol);

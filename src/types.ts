@@ -232,6 +232,7 @@ export interface AppSettings {
   masterPasswordEnabled: boolean; // 加密增强：主口令（默认关，DPAPI 免口令）
   lanExposure: boolean; // 局域网暴露（默认关，NFR-007）
   requestLogEnabled: boolean; // 调用模型日志（默认关，开启后记录每次转发）
+  logDownstreamRawEnabled?: boolean; // 诊断：request 日志额外记「下游原始请求体」（转换前，体量大，默认关，仅排障用）
   healthCheckIntervalSecs: number;
   logDir?: string;
   mcpEnabled?: boolean; // 内置 MCP 服务器：开启即随应用启动
@@ -240,6 +241,7 @@ export interface AppSettings {
   healthProbeRealCompletion?: boolean; // 健康探测用真实补全请求（默认关，消耗少量额度）
   aggregateTraceEnabled?: boolean; // 大脑聚合详细快照：开启后落盘成员答案/汇总/决策者入参出参（默认关，避免大 IO）
   activeModels?: Record<string, string>; // 各分类当前选定的对外模型名（key=分类）。借鉴 EchoBird：客户端菜单拉不到中转模型时，在应用内选、代理转发时覆盖。后端自管，走 setActiveModel 专用命令
+  activeEfforts?: Record<string, string>; // 各分类默认推理强度（key=分类，值 minimal/low/medium/high/xhigh）。Codex 对自定义 provider 不发 reasoning.effort，故在此配置、转发时注入。后端自管，走 setActiveEffort 专用命令
   trayModelSwitchEnabled?: boolean; // 托盘快切 Codex 模型子菜单开关（默认开）。开启后右键托盘可直接切 Codex 当前对外模型，免打开主窗口
 }
 

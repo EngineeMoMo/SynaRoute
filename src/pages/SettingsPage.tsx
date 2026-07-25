@@ -381,6 +381,13 @@ export function SettingsPage() {
               checked={settings?.requestLogEnabled ?? false}
               onChange={(v) => update({ requestLogEnabled: v })}
             />
+            <ToggleRow
+              icon={ScrollText}
+              title={t("settings.rawLogTitle")}
+              desc={t("settings.rawLogDesc")}
+              checked={settings?.logDownstreamRawEnabled ?? false}
+              onChange={(v) => update({ logDownstreamRawEnabled: v })}
+            />
             <div className="flex items-start justify-between gap-4">
               <div className="flex gap-2.5">
                 <Activity size={16} className="mt-0.5 shrink-0 text-text-secondary" />

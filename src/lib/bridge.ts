@@ -124,6 +124,11 @@ export const api = {
   setActiveModel: (categoryId: CategoryType, model: string) =>
     call<void>("set_active_model", { categoryId, model }, async () => {}),
 
+  // 设置某分类「默认推理强度」（方案 A，Codex 专用）。Codex 对自定义 provider 不发
+  // reasoning.effort，故在此配置、转发时补进请求体。取值 off/minimal/low/medium/high/xhigh。
+  setActiveEffort: (categoryId: CategoryType, effort: string) =>
+    call<void>("set_active_effort", { categoryId, effort }, async () => {}),
+
   // 重建托盘菜单：改了 Key 模型列表 / 切了 active_model / 改了托盘开关后调用，
   // 让托盘 Codex 模型子菜单候选与勾选态跟最新数据一致（托盘菜单不自动跟数据变）。
   rebuildTrayMenu: () =>
