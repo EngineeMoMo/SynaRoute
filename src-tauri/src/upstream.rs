@@ -1453,6 +1453,15 @@ pub struct SseTranslator {
     /// 把 assistant 回复持久化进会话；仅发 output_text.delta（实时增量）只够即时显示、
     /// 重开会话就丢。故这里累积全文，在收尾时回填进 message 的 output_item.done。
     text_accum: String,
+    /// Anthropic thinking 块的 content block index 集合（type=thinking / redacted_thinking）。
+    /// 用于把 thinking_delta 与普通 text_delta 区分开——thinking 增量要转成 Codex 的
+    /// reasoning_summary 事件（让 Codex 显示 Claude 的思考过程），而非 output_text。
+    thinking_blocks: std::collections::HashSet<usize>,
+    /// 是否已发出 reasoning summary 的起始事件（part.added）。Codex 的 ReasoningSummaryDelta
+    /// 需先有 part.added 起头；用此标志保证只发一次。
+    reasoning_started: bool,
+    /// 累积 thinking 全文，供收尾时发 reasoning_summary_text.done（带完整文本）。
+    reasoning_accum: String,
 }
 
 impl SseTranslator {
@@ -1470,6 +1479,9 @@ impl SseTranslator {
             output_tokens: 0,
             block_tool_slot: std::collections::HashMap::new(),
             text_accum: String::new(),
+            thinking_blocks: std::collections::HashSet::new(),
+            reasoning_started: false,
+            reasoning_accum: String::new(),
         }
     }
 
@@ -1822,24 +1834,44 @@ impl SseTranslator {
                     out.push_str(&sse("response.output_item.added", &item_added));
                 }
             }
-            // content_block_start：tool_use 块 → 记 tool_call 槽位 (id, name)；text 块无需动作
+            // content_block_start：tool_use 块 → 记 tool_call 槽位 (id, name)；
+            // thinking / redacted_thinking 块 → 记入 thinking_blocks，其增量转 reasoning summary；
+            // text 块无需动作。
             "content_block_start" => {
                 let idx = ev.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                 let block = ev.get("content_block");
-                if block.and_then(|b| b.get("type")).and_then(|t| t.as_str()) == Some("tool_use") {
-                    let id = block
-                        .and_then(|b| b.get("id"))
-                        .and_then(|i| i.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let name = block
-                        .and_then(|b| b.get("name"))
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let slot = self.tool_calls.len();
-                    self.tool_calls.push((id, name, String::new()));
-                    self.block_tool_slot.insert(idx, slot);
+                match block.and_then(|b| b.get("type")).and_then(|t| t.as_str()) {
+                    Some("tool_use") => {
+                        let id = block
+                            .and_then(|b| b.get("id"))
+                            .and_then(|i| i.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = block
+                            .and_then(|b| b.get("name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let slot = self.tool_calls.len();
+                        self.tool_calls.push((id, name, String::new()));
+                        self.block_tool_slot.insert(idx, slot);
+                    }
+                    // 扩展思考块（Claude thinking / redacted_thinking）：Codex(Responses) 支持显示
+                    // 推理摘要，故把它翻成 reasoning_summary 事件。首个 thinking 块发一次 part.added 起头。
+                    Some("thinking") | Some("redacted_thinking") => {
+                        self.thinking_blocks.insert(idx);
+                        if !self.reasoning_started {
+                            self.reasoning_started = true;
+                            out.push_str(&sse(
+                                "response.reasoning_summary_part.added",
+                                &json!({
+                                    "type": "response.reasoning_summary_part.added",
+                                    "item_id": self.msg_id, "summary_index": 0
+                                }),
+                            ));
+                        }
+                    }
+                    _ => {}
                 }
             }
             // content_block_delta：text_delta → output_text.delta；input_json_delta → 累加工具参数
@@ -1868,6 +1900,24 @@ impl SseTranslator {
                             }
                         }
                     }
+                    // thinking_delta：Claude 扩展思考的增量 → Codex reasoning_summary 增量事件，
+                    // 让 Codex 显示思考过程。仅当该 index 是 thinking 块时才转（与普通文本区分）。
+                    "thinking_delta" => {
+                        if self.thinking_blocks.contains(&idx) {
+                            if let Some(t) = delta.and_then(|d| d.get("thinking")).and_then(|t| t.as_str()) {
+                                if !t.is_empty() {
+                                    self.reasoning_accum.push_str(t);
+                                    out.push_str(&sse(
+                                        "response.reasoning_summary_text.delta",
+                                        &json!({
+                                            "type": "response.reasoning_summary_text.delta",
+                                            "item_id": self.msg_id, "summary_index": 0, "delta": t
+                                        }),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1884,6 +1934,18 @@ impl SseTranslator {
             // message_stop：发文本 done + message 的 output_item.done（关键：Codex 靠此落盘
             // assistant 文本回复，仅发 delta 不落盘会导致重开对话文本丢失）+ response.completed。
             "message_stop" => {
+                // 思考摘要收尾：发 reasoning_summary_text.done（带累积全文），让 Codex 完成
+                // 该 summary 段。放在文本 done 之前（推理先于回答）。
+                if self.reasoning_started {
+                    out.push_str(&sse(
+                        "response.reasoning_summary_text.done",
+                        &json!({
+                            "type": "response.reasoning_summary_text.done",
+                            "item_id": self.msg_id, "summary_index": 0,
+                            "text": self.reasoning_accum
+                        }),
+                    ));
+                }
                 if self.saw_text {
                     let done = json!({
                         "type": "response.output_text.done",
@@ -2697,6 +2759,35 @@ mod tests {
             out.contains("event: response.output_item.done"),
             "工具调用必须走 output_item.done 事件（Codex 据此执行工具）:\n{out}"
         );
+    }
+
+    #[test]
+    fn sse_anthropic_to_responses_maps_thinking_to_reasoning_summary() {
+        // Claude 扩展思考（thinking 块）→ Codex Responses reasoning_summary 事件，
+        // 让 Codex 显示思考过程（也据此可判推理强度是否真生效）。
+        let mut tr = SseTranslator::new(SseDirection::AnthropicToResponses);
+        let mut out = String::new();
+        out.push_str(&tr.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5}}}\n\n"));
+        // thinking 块：start → 两段 thinking_delta → stop
+        out.push_str(&tr.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Let me\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" think\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"));
+        // 随后普通文本块（回答）
+        out.push_str(&tr.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n"));
+        out.push_str(&tr.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+        out.push_str(&tr.finish());
+        // 思考起始 + 增量 + 收尾（Codex 认的三个 reasoning summary 事件名）
+        assert!(out.contains("event: response.reasoning_summary_part.added"), "缺 reasoning summary 起始:\n{out}");
+        assert!(out.contains("event: response.reasoning_summary_text.delta"), "缺 reasoning summary 增量");
+        assert!(out.contains("event: response.reasoning_summary_text.done"), "缺 reasoning summary 收尾");
+        // 思考增量应拼全
+        assert!(out.contains("Let me") && out.contains(" think"), "思考增量未透传");
+        // 思考不能混进正文 output_text（thinking_delta 不该走 output_text.delta）
+        assert!(!out.contains("\"delta\":\"Let me\"") || out.contains("reasoning_summary_text.delta"), "思考不应作为普通文本增量");
+        // 普通文本仍正常
+        assert!(out.contains("\"delta\":\"Hi\""), "回答文本未透传");
     }
 
     #[test]
