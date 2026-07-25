@@ -243,6 +243,7 @@ export interface AppSettings {
   activeModels?: Record<string, string>; // 各分类当前选定的对外模型名（key=分类）。借鉴 EchoBird：客户端菜单拉不到中转模型时，在应用内选、代理转发时覆盖。后端自管，走 setActiveModel 专用命令
   activeEfforts?: Record<string, string>; // 各分类默认推理强度（key=分类，值 minimal/low/medium/high/xhigh）。Codex 对自定义 provider 不发 reasoning.effort，故在此配置、转发时注入。后端自管，走 setActiveEffort 专用命令
   trayModelSwitchEnabled?: boolean; // 托盘快切 Codex 模型子菜单开关（默认开）。开启后右键托盘可直接切 Codex 当前对外模型，免打开主窗口
+  proxyPorts?: Record<string, number>; // 各分类代理首选监听端口（key=分类）。粘滞固定端口：默认 CLI=47100/Codex=47101/Desktop=47102，改端口走 setProxyPort（重启代理+重写客户端 config）
 }
 
 /** MCP 服务器运行状态（供设置页展示连接指示灯与故障原因） */

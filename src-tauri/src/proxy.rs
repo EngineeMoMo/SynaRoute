@@ -42,6 +42,9 @@ struct RunningProxy {
     shutdown: tokio::sync::watch::Sender<bool>,
 }
 
+/// 首选端口被占时，在 [preferred, preferred+RANGE] 内向上兜底寻找可用端口（与 MCP 同策略）。
+const PROXY_PORT_FALLBACK_RANGE: u16 = 20;
+
 /// 代理管理器：管理各分类的代理生命周期
 pub struct ProxyManager {
     store: Arc<Store>,
@@ -66,17 +69,44 @@ impl ProxyManager {
         if let Some(p) = self.port_of(category) {
             return Ok(p);
         }
-        let lan = self.store.get_settings().lan_exposure;
+        let settings = self.store.get_settings();
+        let lan = settings.lan_exposure;
         let host = if lan { [0, 0, 0, 0] } else { [127, 0, 0, 1] };
 
-        // 端口 0 = 由 OS 分配可用端口，避免冲突（FR-008 端口冲突自动改用）
-        let listener = TcpListener::bind(SocketAddr::from((host, 0)))
-            .await
-            .map_err(|e| AppError::Proxy(format!("绑定端口失败: {e}")))?;
+        // 粘滞固定端口：首选端口取配置里该分类的值（缺省用 default_proxy_port）。
+        // 从首选端口起在 [preferred, preferred+FALLBACK_RANGE] 内逐个尝试，绑上即用；
+        // 全被占才报错提示改端口。避免早期「bind 0 随机端口」导致每次重启端口漂移、
+        // 客户端追不上（config 只在客户端启动时读一次）。
+        let preferred = settings
+            .proxy_ports
+            .get(category.as_str())
+            .copied()
+            .unwrap_or_else(|| crate::model::default_proxy_port(category.as_str()));
+        let end = preferred.saturating_add(PROXY_PORT_FALLBACK_RANGE);
+        let mut listener = None;
+        let mut last_err = String::new();
+        for candidate in preferred..=end {
+            match TcpListener::bind(SocketAddr::from((host, candidate))).await {
+                Ok(l) => {
+                    listener = Some(l);
+                    break;
+                }
+                Err(e) => last_err = format!("{candidate}: {e}"),
+            }
+        }
+        let listener = listener.ok_or_else(|| {
+            AppError::Proxy(format!(
+                "端口 {preferred}~{end} 全部被占用（最后错误 {last_err}）。请在设置里换一个端口。"
+            ))
+        })?;
         let port = listener
             .local_addr()
             .map_err(|e| AppError::Proxy(e.to_string()))?
             .port();
+        // 端口粘滞：实际绑定端口若与首选不同（回退了），写回配置作为下次首选，避免每次都回退漂移。
+        if settings.proxy_ports.get(category.as_str()).copied() != Some(port) {
+            let _ = self.store.set_proxy_port(category.as_str(), port);
+        }
 
         // 关闭信号通道：stop() 时 send(true)，accept 循环退出、每个连接任务 select 到即断开。
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1226,6 +1256,94 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 502, "全部失败应回 502");
         pm.stop(CategoryType::ClaudeCli);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 起一个**捕获请求体**的 mock 上游：把收到的 body 存进共享 Vec，返回固定 200。
+    /// 用于端到端验证「发往上游的 body 里到底有没有 thinking」。
+    async fn spawn_capture_mock(captured: std::sync::Arc<parking_lot::Mutex<Vec<String>>>) -> String {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let cap = captured.clone();
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let cap = cap.clone();
+                        async move {
+                            let bytes = req.into_body().collect().await.unwrap().to_bytes();
+                            cap.lock().push(String::from_utf8_lossy(&bytes).to_string());
+                            let resp = Response::builder()
+                                .status(200)
+                                .header("content-type", "application/json")
+                                .body(full_body(Bytes::from_static(
+                                    br#"{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}"#,
+                                )))
+                                .unwrap();
+                            Ok::<_, hyper::Error>(resp)
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// 端到端复现：Codex（下游 /v1/responses，body 无 effort）→ Anthropic 上游，配了 codex:xhigh，
+    /// 断言上游实际收到的 body 里带 thinking.budget_tokens。这条覆盖真实链路的 path→downstream 判定
+    /// + inject_default_effort + convert_request，是定位「推理强度没生效」的决定性测试。
+    #[tokio::test]
+    async fn codex_effort_injected_end_to_end() {
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let upstream = spawn_capture_mock(captured.clone()).await;
+
+        let dir = temp_dir("effort_e2e");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // Codex 分类的 Anthropic 上游 Key（跨协议：下游 Responses → 上游 Anthropic）。
+        let mut k = key("k1", 0, &upstream);
+        k.category_id = CategoryType::Codex;
+        k.protocol = Protocol::Anthropic;
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        // 用户在 Codex 分类设了 xhigh。
+        store.set_active_effort("codex", "xhigh").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::Codex).await.unwrap();
+
+        // Codex 真实形态：POST /v1/responses，input 数组 + reasoning:{summary:auto}（无 effort），非流式。
+        let _ = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .json(&json!({
+                "model": "claude-opus-4-7",
+                "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+                "reasoning": {"summary": "auto"},
+                "max_output_tokens": 8192,
+                "stream": false
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        pm.stop(CategoryType::Codex);
+        let bodies = captured.lock().clone();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(bodies.len(), 1, "上游应收到 1 个请求");
+        let up: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert!(
+            up.get("thinking").and_then(|t| t.get("budget_tokens")).is_some(),
+            "上游 body 应含 thinking.budget_tokens（xhigh 注入 + 映射），实际收到:\n{}",
+            serde_json::to_string_pretty(&up).unwrap()
+        );
     }
 
     // ---- /v1/models 模型发现 ----

@@ -567,6 +567,9 @@ impl Store {
             settings.active_models = std::mem::take(&mut cfg.settings.active_models);
             // active_efforts 同为后端自管字段（Codex 默认推理强度），策略同 active_models。
             settings.active_efforts = std::mem::take(&mut cfg.settings.active_efforts);
+            // proxy_ports 同为后端自管字段（粘滞端口）：由 set_proxy_port（用户改端口 / 占用回退写回）
+            // 直写，前端 saveSettings 的旧快照不得覆盖，否则粘滞端口被顶回、下次重启又漂移。
+            settings.proxy_ports = std::mem::take(&mut cfg.settings.proxy_ports);
             cfg.settings = settings;
         }
         self.persist()
@@ -613,6 +616,21 @@ impl Store {
                     .active_efforts
                     .insert(category.to_string(), trimmed.to_string());
             }
+        }
+        self.persist()
+    }
+
+    /// 设置某分类代理的首选端口（粘滞：绑定回退后写回实际端口作下次首选，或前端手改端口）。
+    /// 后端自管字段专用写入，绕过 save_settings 旧快照覆盖。已是目标值则幂等跳过写盘。
+    pub fn set_proxy_port(&self, category: &str, port: u16) -> AppResult<()> {
+        {
+            let mut cfg = self.config.write();
+            if cfg.settings.proxy_ports.get(category).copied() == Some(port) {
+                return Ok(());
+            }
+            cfg.settings
+                .proxy_ports
+                .insert(category.to_string(), port);
         }
         self.persist()
     }

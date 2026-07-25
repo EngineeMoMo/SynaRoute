@@ -6,7 +6,7 @@ import { Switch } from "@/components/ui/Switch";
 import { Button } from "@/components/ui/Button";
 import { useT } from "@/lib/useT";
 import { LANGS } from "@/lib/i18n";
-import type { AppSettings, McpStatus, ThemePref } from "@/types";
+import type { AppSettings, McpStatus, ThemePref, CategoryType } from "@/types";
 import {
   Sun, Moon, Monitor, ShieldCheck, KeyRound, Languages, ScrollText,
   Activity, RefreshCw, FolderOpen, Info, Plug, BookOpen, Copy, Check, X, Brain, MousePointerClick, type LucideIcon,
@@ -133,6 +133,38 @@ export function SettingsPage() {
         showToast("error", String((e as Error)?.message ?? e));
       })
       .finally(() => setRestarting(false));
+  };
+
+  // 各分类代理端口的草稿输入（受控），失焦/回车时提交 setProxyPort（落盘+重启代理+重写客户端配置）。
+  const [portDrafts, setPortDrafts] = useState<Record<string, string>>({});
+  const [savingPort, setSavingPort] = useState<string | null>(null);
+  const PROXY_CATS: { id: CategoryType; def: number }[] = [
+    { id: "claude-cli", def: 47100 },
+    { id: "codex", def: 47101 },
+    { id: "claude-desktop", def: 47102 },
+  ];
+  const commitProxyPort = (cat: CategoryType, raw: string, def: number) => {
+    const port = Number(raw);
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+      showToast("error", t("settings.proxyPortInvalid"));
+      setPortDrafts((d) => ({ ...d, [cat]: String(settings?.proxyPorts?.[cat] ?? def) }));
+      return;
+    }
+    if (port === (settings?.proxyPorts?.[cat] ?? def)) return; // 未变，跳过
+    setSavingPort(cat);
+    void api
+      .setProxyPort(cat, port)
+      .then((st) => {
+        const bound = st.port ?? port;
+        setSettings((s) => (s ? { ...s, proxyPorts: { ...(s.proxyPorts ?? {}), [cat]: bound } } : s));
+        setPortDrafts((d) => ({ ...d, [cat]: String(bound) }));
+        showToast("success", t("settings.proxyPortSaved", { port: String(bound) }));
+      })
+      .catch((e) => {
+        console.error("setProxyPort failed", e);
+        showToast("error", String((e as Error)?.message ?? e));
+      })
+      .finally(() => setSavingPort(null));
   };
 
   const themeOptions: { value: ThemePref; tKey: string; icon: LucideIcon }[] = [
@@ -365,6 +397,47 @@ export function SettingsPage() {
                 </div>
               </>
             )}
+          </CardContent>
+        </Card>
+
+        {/* 代理端口（每分类固定端口，可配；改后自动重启代理并重写客户端配置） */}
+        <Card>
+          <CardHeader>
+            <CardTitle>{t("settings.proxyPortTitle")}</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="flex items-start gap-1.5 text-xs text-text-muted">
+              <Info size={13} className="mt-0.5 shrink-0" />
+              <span>{t("settings.proxyPortDesc")}</span>
+            </div>
+            {PROXY_CATS.map(({ id, def }) => {
+              const current = settings?.proxyPorts?.[id] ?? def;
+              const draft = portDrafts[id] ?? String(current);
+              return (
+                <div key={id} className="flex items-center justify-between gap-4">
+                  <div className="flex gap-2.5">
+                    <Plug size={16} className="mt-0.5 shrink-0 text-text-secondary" />
+                    <div>
+                      <div className="text-sm font-medium text-text-primary">{t(`nav.${id}`)}</div>
+                      <div className="font-mono text-xs text-text-muted">http://127.0.0.1:{current}</div>
+                    </div>
+                  </div>
+                  <input
+                    type="number"
+                    min={1024}
+                    max={65535}
+                    className="w-24 shrink-0 rounded-control border border-border bg-surface px-2.5 py-1.5 text-xs text-text-primary outline-none focus:border-primary disabled:opacity-50"
+                    value={draft}
+                    disabled={savingPort === id}
+                    onChange={(e) => setPortDrafts((d) => ({ ...d, [id]: e.target.value }))}
+                    onBlur={(e) => commitProxyPort(id, e.target.value, def)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                    }}
+                  />
+                </div>
+              );
+            })}
           </CardContent>
         </Card>
 

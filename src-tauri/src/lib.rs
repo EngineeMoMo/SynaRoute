@@ -192,6 +192,52 @@ fn stop_proxy(state: tauri::State<AppState>, category_id: CategoryType) -> AppRe
     })
 }
 
+/// 设置某分类代理的首选监听端口（粘滞固定端口）。
+/// 持久化新端口 → 停当前代理 → 用新端口重启 → 重写该分类客户端 config（指向新端口）。
+/// 端口是启动时绑定的，故改端口必须重启代理才生效；重写 config 让客户端下次读到新端口。
+/// 客户端（Codex/Claude）需重启才会重读 config —— 但因端口从此固定，仅此一次。
+#[tauri::command]
+async fn set_proxy_port(
+    state: tauri::State<'_, AppState>,
+    category_id: CategoryType,
+    port: u16,
+) -> AppResult<ProxyState> {
+    // 先落盘新首选端口，再重启代理使其按新端口绑定。
+    state.store.set_proxy_port(category_id.as_str(), port)?;
+    let was_running = state.proxy.is_running(category_id);
+    state.proxy.stop(category_id);
+    let bound = state.proxy.start(category_id).await?;
+    // 重写该分类客户端 config，指向实际绑定端口（可能因占用回退，用真实值）。
+    let endpoint = format!("http://127.0.0.1:{bound}");
+    let default_model = state
+        .store
+        .enabled_keys_sorted(category_id)
+        .first()
+        .and_then(|k| k.serviceable_models().into_iter().next());
+    if let Err(e) = tools::apply(category_id, &endpoint, default_model.as_deref()) {
+        state.store.append_event(
+            category_id,
+            "error",
+            None,
+            &format!("改端口后重写客户端配置失败: {e}"),
+        );
+    } else {
+        state.store.append_event(
+            category_id,
+            "config",
+            None,
+            &format!("代理端口已改为 {bound}，已重写客户端配置（客户端需重启读取新端口）"),
+        );
+    }
+    let _ = was_running;
+    Ok(ProxyState {
+        category_id,
+        port: Some(bound),
+        status: "running".into(),
+        message: None,
+    })
+}
+
 /// 生成代理端点并写入目标工具配置（会先备份，dev-hard-rules）
 #[tauri::command]
 async fn apply_tool_config(
@@ -831,6 +877,7 @@ pub fn run() {
             get_proxy_state,
             start_proxy,
             stop_proxy,
+            set_proxy_port,
             apply_tool_config,
             get_tool_config_preview,
             restore_tool_config,

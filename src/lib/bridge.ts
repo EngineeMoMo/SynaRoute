@@ -97,6 +97,10 @@ export const api = {
   stopProxy: (categoryId: CategoryType) =>
     call<ProxyState>("stop_proxy", { categoryId }, () => mockBridge.stopProxy(categoryId)),
 
+  // 设置某分类代理的首选端口（粘滞固定）：持久化 → 重启代理绑新端口 → 重写客户端 config
+  setProxyPort: (categoryId: CategoryType, port: number) =>
+    call<ProxyState>("set_proxy_port", { categoryId, port }, () => mockBridge.getProxyState(categoryId)),
+
   // 生成/写入目标工具接入配置（FR-008，会先备份，dev-hard-rules）
   applyToolConfig: (categoryId: CategoryType) =>
     call<string>("apply_tool_config", { categoryId }, () => mockBridge.applyToolConfig(categoryId)),

@@ -706,6 +706,25 @@ pub struct AppSettings {
     /// （与 active_models / mcp_* 同一保全策略）。空/未配 = 不注入，保持现状。
     #[serde(default)]
     pub active_efforts: std::collections::HashMap<String, String>,
+    /// 各分类代理的「首选监听端口」（key=分类字符串，value=端口）。
+    /// 缘由：早期用 OS 随机端口（bind 0），SynaRoute 每次重启端口都变，而客户端
+    /// （Codex/Claude）只在自身启动时读一次 config，不追踪端口变化 → 重启后客户端仍打旧端口、
+    /// 连不上（error sending request）。改为「粘滞固定端口」：各分类有稳定默认端口，
+    /// config.toml 写一次即长期有效；端口被占时在 [port, port+FALLBACK] 内向上兜底并写回此处
+    /// 作为下次首选（与 mcp_port 同一粘滞策略）。缺省时用 default_proxy_port(category)。
+    #[serde(default)]
+    pub proxy_ports: std::collections::HashMap<String, u16>,
+}
+
+/// 各分类代理的默认首选端口。选用冷门段避开常见软件占用
+/// （避开 8080/8888/3000/5173/7890/9527 等），且三分类连续好记。
+pub fn default_proxy_port(category: &str) -> u16 {
+    match category {
+        "claude-cli" => 47100,
+        "codex" => 47101,
+        "claude-desktop" => 47102,
+        _ => 47103,
+    }
 }
 
 fn default_true() -> bool {
@@ -745,6 +764,7 @@ impl Default for AppSettings {
             active_models: std::collections::HashMap::new(),
             active_efforts: std::collections::HashMap::new(),
             tray_model_switch_enabled: true,
+            proxy_ports: std::collections::HashMap::new(),
         }
     }
 }
