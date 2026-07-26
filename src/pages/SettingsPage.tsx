@@ -179,7 +179,7 @@ export function SettingsPage() {
         <h1 className="text-lg font-semibold text-text-primary">{t("settings.title")}</h1>
       </div>
 
-      <div className="max-w-2xl space-y-4 p-6">
+      <div className="space-y-4 p-6">
         {/* 版本与更新 */}
         <Card>
           <CardHeader>
@@ -474,7 +474,7 @@ export function SettingsPage() {
                 value={settings?.healthCheckIntervalSecs ?? 60}
                 onChange={(e) => update({ healthCheckIntervalSecs: Number(e.target.value) })}
               >
-                {[30, 60, 120, 300].map((s) => (
+                {[0, 30, 60, 120, 300].map((s) => (
                   <option key={s} value={s}>
                     {t(`settings.health.${s}`)}
                   </option>

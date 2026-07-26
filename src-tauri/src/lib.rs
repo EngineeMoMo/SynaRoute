@@ -324,11 +324,15 @@ async fn set_active_model(
 /// 后端自管字段，走专用命令直写，不随 save_settings 的陈旧快照覆盖。
 #[tauri::command]
 async fn set_active_effort(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     category_id: CategoryType,
     effort: String,
 ) -> AppResult<()> {
-    state.store.set_active_effort(category_id.as_str(), &effort)
+    state.store.set_active_effort(category_id.as_str(), &effort)?;
+    // 主窗口改推理强度后，同步刷新托盘子菜单勾选态（与 set_active_model 对称，托盘菜单静态构建需主动重建）。
+    let _ = rebuild_tray(&app);
+    Ok(())
 }
 
 /// 重建托盘菜单：主窗口里改了 Key 模型列表 / 切了 active_model / 改了托盘开关后，
@@ -777,7 +781,16 @@ pub fn run() {
             let rt = tokio::runtime::Runtime::new().expect("tokio rt");
             rt.block_on(async move {
                 const MIN_INTERVAL_SECS: u64 = 10;
+                // 间隔为 0 = 用户关闭定时健康检查（有的用户不需要后台探测）。此时不探测，
+                // 只按此固定节奏轮询配置，用户在设置里改回非 0 档后最多这么久即恢复自动探测。
+                const DISABLED_POLL_SECS: u64 = 30;
                 loop {
+                    let interval = store_bg.get_settings().health_check_interval_secs;
+                    if interval == 0 {
+                        // 关闭：跳过本轮探测（保留各 Key 现有健康态，不改动），仅轮询配置等待重新开启。
+                        tokio::time::sleep(std::time::Duration::from_secs(DISABLED_POLL_SECS)).await;
+                        continue;
+                    }
                     for cat in [
                         CategoryType::ClaudeCli,
                         CategoryType::ClaudeDesktop,
@@ -785,11 +798,8 @@ pub fn run() {
                     ] {
                         health::check_category(&store_bg, cat).await;
                     }
-                    let interval = store_bg
-                        .get_settings()
-                        .health_check_interval_secs
-                        .max(MIN_INTERVAL_SECS);
-                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                    // 每轮结束重读最新配置，改设置即时生效；设 10s 下限防误配把上游打爆。
+                    tokio::time::sleep(std::time::Duration::from_secs(interval.max(MIN_INTERVAL_SECS))).await;
                 }
             });
         });
@@ -911,6 +921,19 @@ pub fn run() {
 /// 托盘菜单的 Codex 模型项 id 前缀：`model::<对外模型名>`，空名（`model::`）= 跟随客户端透传。
 const TRAY_MODEL_PREFIX: &str = "model::";
 
+/// 托盘菜单的 Codex 推理强度项 id 前缀：`effort::<档位>`，空档（`effort::`）= 关（不注入、保持现状）。
+/// 取值与应用内下拉同源：low/medium/high/xhigh，空串=关。
+const TRAY_EFFORT_PREFIX: &str = "effort::";
+
+/// Codex 推理强度托盘候选：(id 档位, 中文显示名)。空档=关，与 CategoryPage 下拉一致。
+const TRAY_EFFORT_OPTIONS: &[(&str, &str)] = &[
+    ("", "关"),
+    ("low", "低"),
+    ("medium", "中"),
+    ("high", "高"),
+    ("xhigh", "极高"),
+];
+
 /// 构建托盘菜单：显示主窗口 +（可选）Codex 模型快切子菜单 + 退出。
 /// 候选与 /v1/models、应用内下拉同源（discoverable_models 交集口径），当前选中项打勾。
 /// 借鉴 cc-switch 托盘切换范式：右键托盘即可切 Codex 当前对外模型，免打开主窗口。
@@ -968,6 +991,28 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<ta
             submenu.append(&follow)?;
         }
         menu.append(&submenu)?;
+
+        // Codex 推理强度快切子菜单：与模型快切同一开关，右键即切。
+        // Codex 对自定义 provider 不下发 reasoning.effort，故此处配默认强度、转发时注入。
+        // 当前项打勾（active_efforts["codex"]，空=关）。切换复用 set_active_effort，每请求实时重读、免重启。
+        let active_effort = settings
+            .active_efforts
+            .get(CategoryType::Codex.as_str())
+            .cloned()
+            .unwrap_or_default();
+        let effort_submenu = Submenu::new(app, "Codex 推理强度", true)?;
+        for (id, label) in TRAY_EFFORT_OPTIONS {
+            let item = CheckMenuItem::with_id(
+                app,
+                format!("{TRAY_EFFORT_PREFIX}{id}"),
+                label,
+                true,
+                active_effort.as_str() == *id,
+                None::<&str>,
+            )?;
+            effort_submenu.append(&item)?;
+        }
+        menu.append(&effort_submenu)?;
     }
 
     menu.append(&PredefinedMenuItem::separator(app)?)?;
@@ -1038,6 +1083,33 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                         &format!("托盘切换 Codex 模型 → {shown}（即时生效）"),
                     );
                     // 重建菜单以刷新勾选与 tooltip。
+                    let _ = rebuild_tray(app);
+                }
+                _ if id.starts_with(TRAY_EFFORT_PREFIX) => {
+                    // effort::<档位> → 切 Codex 默认推理强度（空档=关，不注入）。
+                    // 复用 set_active_effort：每请求实时重读，切换即时生效、免重启 Codex。
+                    let effort = id.strip_prefix(TRAY_EFFORT_PREFIX).unwrap_or("");
+                    let state = app.state::<AppState>();
+                    if let Err(e) = state.store.set_active_effort(CategoryType::Codex.as_str(), effort) {
+                        state.store.append_event(
+                            CategoryType::Codex,
+                            "error",
+                            None,
+                            &format!("托盘切换推理强度失败: {e}"),
+                        );
+                        return;
+                    }
+                    let shown = TRAY_EFFORT_OPTIONS
+                        .iter()
+                        .find(|(v, _)| *v == effort)
+                        .map(|(_, l)| *l)
+                        .unwrap_or(effort);
+                    state.store.append_event(
+                        CategoryType::Codex,
+                        "config",
+                        None,
+                        &format!("托盘切换 Codex 推理强度 → {shown}（即时生效）"),
+                    );
                     let _ = rebuild_tray(app);
                 }
                 _ => {}

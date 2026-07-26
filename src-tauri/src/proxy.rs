@@ -855,10 +855,12 @@ fn downstream_protocol(path: &str) -> Protocol {
 /// 严格的不影响边界：
 /// - **仅下游为 OpenAI Responses（Codex）时注入**：其它下游（Claude Code /messages、
 ///   /chat/completions 客户端）根本不经过这里的判断，零影响。
-/// - **仅当上游需要转换（downstream != upstream）时注入**：下游=上游=Responses 时
-///   `convert_request` 走 from==to 直通、body 原样透传，此处也跳过——**绝不碰 OpenAI 官方
-///   Responses 上游**（它该用 Codex 原生 effort 机制）。
-/// - **已有 effort 则不覆盖**：只在缺失时补默认，将来 Codex 真发了 effort 也不破坏。
+/// - **上游协议不限**：Anthropic / Chat 上游经转换链映射 thinking / reasoning_effort；
+///   同协议 Responses 上游直通、也补默认 effort——经 SynaRoute 转发的一律是自定义 provider，
+///   Codex 对自定义 provider 不下发 effort，故此路径同样需要补，否则接 Responses 协议第三方
+///   中转商时配置的推理强度不生效（这正是方案 A 的前提，不区分上游协议）。
+/// - **已有 effort 则不覆盖**：只在缺失时补默认，将来 Codex 真发了 effort 也不破坏；
+///   若确实接了 OpenAI 官方 Responses 端点，官方客户端会自带 effort，has_effort 命中即跳过。
 /// - 配置为空 / 未设 → 完全不注入，保持现状。
 fn inject_default_effort(
     store: &Arc<Store>,
@@ -866,8 +868,12 @@ fn inject_default_effort(
     downstream: Protocol,
     upstream: Protocol,
 ) {
-    // 只作用于 Codex（下游 Responses）且需跨协议转换的场景。
-    if downstream != Protocol::OpenaiResponses || downstream == upstream {
+    // 只作用于 Codex（下游 Responses）。含同协议 Responses 上游：经 SynaRoute 转发的一律是
+    // 自定义 provider，Codex 对自定义 provider 不下发 effort（方案 A 的前提），故同协议直通场景
+    // 也需补默认强度，否则接 Responses 协议第三方中转商时配置的推理强度不生效。
+    // （upstream 参数保留以备将来按上游细分策略，当前不再据此跳过。）
+    let _ = upstream;
+    if downstream != Protocol::OpenaiResponses {
         return;
     }
     let category = downstream_category_for_effort();
@@ -1342,6 +1348,56 @@ mod tests {
         assert!(
             up.get("thinking").and_then(|t| t.get("budget_tokens")).is_some(),
             "上游 body 应含 thinking.budget_tokens（xhigh 注入 + 映射），实际收到:\n{}",
+            serde_json::to_string_pretty(&up).unwrap()
+        );
+    }
+
+    /// 同协议链路：Codex（下游 /v1/responses，无 effort）→ **OpenAI Responses 协议上游**（第三方
+    /// 中转商），配了 codex:high。convert_request 对同协议直通不动 body，故若注入被 `downstream==upstream`
+    /// 跳过则 effort 丢失。断言上游实际收到 reasoning.effort=high——锁住「同协议 Responses 上游也注入」修复。
+    #[tokio::test]
+    async fn codex_effort_injected_same_protocol_responses() {
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let upstream = spawn_capture_mock(captured.clone()).await;
+
+        let dir = temp_dir("effort_e2e_resp");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // Codex 分类的 Responses 上游 Key（同协议：下游 Responses → 上游 Responses，convert_request 直通）。
+        let mut k = key("k1", 0, &upstream);
+        k.category_id = CategoryType::Codex;
+        k.protocol = Protocol::OpenaiResponses;
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        store.set_active_effort("codex", "high").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::Codex).await.unwrap();
+
+        let _ = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .json(&json!({
+                "model": "gpt-5",
+                "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+                "reasoning": {"summary": "auto"},
+                "max_output_tokens": 8192,
+                "stream": false
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        pm.stop(CategoryType::Codex);
+        let bodies = captured.lock().clone();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(bodies.len(), 1, "上游应收到 1 个请求");
+        let up: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(
+            up.get("reasoning").and_then(|r| r.get("effort")).and_then(|e| e.as_str()),
+            Some("high"),
+            "同协议 Responses 上游 body 应含注入的 reasoning.effort=high，实际收到:\n{}",
             serde_json::to_string_pretty(&up).unwrap()
         );
     }

@@ -122,7 +122,7 @@ export function VendorPage() {
         )}
       </div>
 
-      <div className="max-w-2xl space-y-4 p-6">
+      <div className="space-y-4 p-6">
         {editing && (
           <Card>
             <CardContent className="space-y-3 pt-5">

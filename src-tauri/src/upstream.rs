@@ -538,12 +538,15 @@ fn copy_through(src: &Value, dst: &mut serde_json::Map<String, Value>, keys: &[&
     }
 }
 
-/// 从请求体里读出 OpenAI Responses 的推理强度档位（reasoning.effort）。
-/// Codex 用它承载「推理强度」（minimal/low/medium/high/xhigh）。
+/// 从请求体里读出 OpenAI 推理强度档位。
+/// Codex/Responses 用 `reasoning.effort`（对象），Chat Completions 用顶层 `reasoning_effort`
+/// （字符串）。两种形态都读，取值 minimal/low/medium/high/xhigh，让下游是 Chat 客户端时
+/// 顶层 reasoning_effort 也能被 openai_to_anthropic 映射成 thinking 预算，不丢推理强度。
 fn read_reasoning_effort(body: &Value) -> Option<String> {
     body.get("reasoning")
         .and_then(|r| r.get("effort"))
         .and_then(|e| e.as_str())
+        .or_else(|| body.get("reasoning_effort").and_then(|e| e.as_str()))
         .map(|s| s.to_string())
 }
 
@@ -577,6 +580,20 @@ fn thinking_budget_to_effort(budget: u64) -> &'static str {
         3073..=12288 => "medium",
         12289..=24576 => "high",
         _ => "xhigh",
+    }
+}
+
+/// Chat Completions API 的顶层 `reasoning_effort` 只认 minimal/low/medium/high（无 xhigh），
+/// 且是**字符串**而非 Responses 的 `reasoning:{effort}` 对象。把中枢里的档位归一到 Chat 认的集合：
+/// xhigh 钳到 high，其余原样；未知值返回 None（不落字段，避免上游 400）。
+fn effort_for_chat_completions(effort: &str) -> Option<&'static str> {
+    match effort.to_ascii_lowercase().as_str() {
+        "minimal" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" => Some("high"), // Chat API 无 xhigh 档，钳到 high
+        _ => None,
     }
 }
 
@@ -993,7 +1010,25 @@ pub fn convert_request(body: &Value, from: Protocol, to: Protocol) -> Value {
     // 2. Chat 中枢 → 上游
     match to {
         Protocol::Anthropic => openai_to_anthropic(&chat),
-        Protocol::OpenaiChat => chat,
+        // Chat 上游：中枢携带的是 Responses 风格 `reasoning:{effort}` 对象，而 Chat Completions
+        // API 认的是顶层 `reasoning_effort` 字符串（minimal/low/medium/high，无 xhigh）。若原样把
+        // reasoning 对象发给 Chat 上游，推理强度会被忽略，严格上游还可能因未知字段报 400。
+        // 故在此把 reasoning.effort 归一并落成顶层 reasoning_effort，同时移除 reasoning 对象。
+        Protocol::OpenaiChat => {
+            let mut chat = chat;
+            if let Some(obj) = chat.as_object_mut() {
+                let effort = obj
+                    .get("reasoning")
+                    .and_then(|r| r.get("effort"))
+                    .and_then(|e| e.as_str())
+                    .and_then(effort_for_chat_completions);
+                if let Some(e) = effort {
+                    obj.insert("reasoning_effort".into(), Value::String(e.to_string()));
+                }
+                obj.remove("reasoning");
+            }
+            chat
+        }
         Protocol::OpenaiResponses => chat_to_responses(&chat),
     }
 }
@@ -2468,6 +2503,37 @@ mod tests {
         });
         let chat = anthropic_to_openai(&a);
         assert_eq!(chat["reasoning"]["effort"], "high", "16384 预算应映射为 high 档");
+    }
+
+    #[test]
+    fn convert_request_responses_to_chat_lowers_effort_to_top_level() {
+        // Codex(Responses,reasoning.effort=xhigh) → Chat 上游：Chat Completions 认的是顶层
+        // reasoning_effort 字符串（无 xhigh 档），不认 Responses 的 reasoning:{effort} 对象。
+        // 故转换须落成顶层 reasoning_effort 且 xhigh 钳到 high，并移除 reasoning 对象，
+        // 否则推理强度被 Chat 上游忽略、严格上游还可能 400。
+        let req = json!({
+            "model": "gpt-5.1",
+            "input": "hi",
+            "reasoning": { "effort": "xhigh" }
+        });
+        let chat = convert_request(&req, Protocol::OpenaiResponses, Protocol::OpenaiChat);
+        assert_eq!(chat["reasoning_effort"], "high", "xhigh 应钳到 high 并落顶层 reasoning_effort");
+        assert!(chat.get("reasoning").is_none(), "Chat 上游不应残留 reasoning 对象");
+    }
+
+    #[test]
+    fn convert_request_chat_downstream_effort_maps_to_anthropic_thinking() {
+        // Chat 下游客户端发顶层 reasoning_effort 字符串 → Anthropic 上游：须被读到并映射成
+        // thinking.budget_tokens（此前 read_reasoning_effort 只读对象形态，顶层字符串会丢）。
+        let req = json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 20000,
+            "messages": [ { "role": "user", "content": "hi" } ],
+            "reasoning_effort": "high"
+        });
+        let a = convert_request(&req, Protocol::OpenaiChat, Protocol::Anthropic);
+        assert_eq!(a["thinking"]["type"], "enabled", "顶层 reasoning_effort=high 应开启扩展思考");
+        assert!(a["thinking"]["budget_tokens"].as_u64().unwrap() > 0, "应有正的思考预算");
     }
 
     #[test]
