@@ -747,7 +747,12 @@ async fn try_stream_to_key(
         // 用 stream::unfold 承载状态机（不引 async_stream 依赖）：累加器持有翻译器、上游流、
         // 以及「是否已冲刷收尾」标志。每步产出一个 Frame。
         Some(dir) => {
-            let translator = crate::upstream::SseTranslator::new(dir);
+            // 从下游请求 tools 收集 namespace 名（Codex 把 MCP 工具折叠成 type:"namespace"）。
+            // 响应侧回填 function_call 时据此把全名 <ns>__<sub> 拆回 {name, namespace} 两字段——
+            // Codex router 用结构化 ToolName{namespace,name} 查表，不拆 name 字符串，缺 namespace
+            // 字段就报 unsupported call（大脑聚合失效根因）。
+            let namespaces = crate::upstream::collect_tool_namespaces(req_json);
+            let translator = crate::upstream::SseTranslator::with_namespaces(dir, namespaces);
             let upstream = resp.bytes_stream();
             struct StreamState<S> {
                 translator: crate::upstream::SseTranslator,

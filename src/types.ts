@@ -173,6 +173,8 @@ export interface ToolConfigPreview {
   /** 本分类写哪些文件、不写哪些 */
   summary: string;
   files: ToolConfigFilePreview[];
+  /** 本分类是否已接入 MCP 大脑聚合（目标配置里已含 synaroute MCP 段），与全局开关无关 */
+  mcpRegistered: boolean;
 }
 
 /** 检查更新结构化结果（与后端 UpdateCheckResult 对齐） */

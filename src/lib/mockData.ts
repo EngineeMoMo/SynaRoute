@@ -420,6 +420,7 @@ export const mockBridge = {
             content: '{\n  "OPENAI_API_KEY": "***"\n}\n',
           },
         ],
+        mcpRegistered: false,
       };
     }
     if (categoryId === "claude-desktop") {
@@ -434,6 +435,7 @@ export const mockBridge = {
             content: `{\n  "baseUrl": "http://127.0.0.1:${port}"\n}\n`,
           },
         ],
+        mcpRegistered: false,
       };
     }
     // claude-cli
@@ -449,6 +451,7 @@ export const mockBridge = {
           content: `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "http://127.0.0.1:${port}",\n    "ANTHROPIC_AUTH_TOKEN": "***",\n    "ANTHROPIC_MODEL": "claude-opus-4-7",\n    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"\n  },\n  "model": "claude-opus-4-7"\n}\n`,
         },
       ],
+      mcpRegistered: false,
     };
   },
   async listEvents(categoryId: CategoryType) {

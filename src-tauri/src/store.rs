@@ -653,6 +653,21 @@ impl Store {
         Ok(true)
     }
 
+    /// 移除单个已注册分类记录并落盘（per-category 注销 MCP 时用）。后端专用，
+    /// 与 add_registered_category 对称。返回 true 表示确实移除，false 表示原本不含（幂等跳过写盘）。
+    pub fn remove_registered_category(&self, category: &str) -> AppResult<bool> {
+        {
+            let mut cfg = self.config.write();
+            let before = cfg.settings.mcp_registered_categories.len();
+            cfg.settings.mcp_registered_categories.retain(|c| c != category);
+            if cfg.settings.mcp_registered_categories.len() == before {
+                return Ok(false);
+            }
+        }
+        self.persist()?;
+        Ok(true)
+    }
+
     /// 清空已注册分类记录并落盘（关闭 MCP 开关时用）。后端专用。
     /// 已为空则跳过写盘（幂等）。
     pub fn clear_registered_categories(&self) -> AppResult<()> {

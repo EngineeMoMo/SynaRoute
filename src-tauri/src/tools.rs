@@ -288,6 +288,16 @@ fn apply_claude_desktop(endpoint: &str) -> AppResult<String> {
 /// MCP 服务器在客户端配置里的固定名称（不随端口变化，故端口变了只需改 url）。
 const MCP_CLIENT_NAME: &str = "synaroute";
 
+/// Codex 顶层实验开关：启用支持 HTTP/streamable 传输的 rmcp MCP 客户端。
+/// Codex 默认 MCP 客户端仅支持 stdio；不开此开关时 HTTP 型（url）MCP server 连不上
+/// （表现为「命名空间空壳、tools/list 拿不到工具」）。接入 Codex 大脑聚合时自动写入。
+/// Codex stdio MCP 的 args：`synaroute.exe --mcp-stdio`，进入无 UI 的 stdio JSON-RPC 模式。
+const MCP_STDIO_FLAG: &str = "--mcp-stdio";
+
+/// Codex stdio MCP 的每工具调用超时（秒），写进 `tool_timeout_sec`。默认 60s 不够大脑聚合
+/// 跑完（多模型并行 + 决策者综合常 30s+，偶尔超 60s → `user cancelled MCP tool call`），放大到 600s。
+const MCP_TOOL_TIMEOUT_SEC: i64 = 600;
+
 /// MCP 单次工具调用超时（毫秒）的**兜底下限**，写进客户端配置的 `timeout` 字段。
 ///
 /// SynaRoute 的多模型聚合天然慢（多模型并行 + 决策者二次调用）。Claude Code 对 HTTP MCP
@@ -323,6 +333,36 @@ pub fn unregister_mcp_client(category: CategoryType) -> AppResult<(String, bool)
     match category {
         CategoryType::ClaudeCli | CategoryType::ClaudeDesktop => unregister_mcp_claude(),
         CategoryType::Codex => unregister_mcp_codex(),
+    }
+}
+
+/// 检测某分类对应工具的客户端配置里是否已注册 synaroute MCP（供配置预览显示接入状态）。
+/// 读各端真实 MCP 客户端文件（Claude=~/.claude.json 的 mcpServers，Codex=config.toml 的
+/// mcp_servers），只判存在性、不改盘。文件不存在或解析失败均视为未注册。
+pub fn is_mcp_registered(category: CategoryType) -> bool {
+    match category {
+        CategoryType::ClaudeCli | CategoryType::ClaudeDesktop => {
+            let Ok(path) = claude_json_path() else { return false };
+            if !path.exists() {
+                return false;
+            }
+            let Ok(raw) = std::fs::read_to_string(&path) else { return false };
+            let Ok(v) = serde_json::from_str::<Value>(&raw) else { return false };
+            v.get("mcpServers")
+                .and_then(|s| s.get(MCP_CLIENT_NAME))
+                .is_some()
+        }
+        CategoryType::Codex => {
+            let Ok(path) = codex_config_path() else { return false };
+            if !path.exists() {
+                return false;
+            }
+            let Ok(raw) = std::fs::read_to_string(&path) else { return false };
+            let Ok(v) = raw.parse::<toml::Value>() else { return false };
+            v.get("mcp_servers")
+                .and_then(|s| s.get(MCP_CLIENT_NAME))
+                .is_some()
+        }
     }
 }
 
@@ -403,11 +443,21 @@ fn unregister_mcp_claude_at(path: &Path) -> AppResult<(String, bool)> {
     Ok((format!("已从 Claude 移除 MCP：{}", path.display()), true))
 }
 
-fn register_mcp_codex(mcp_url: &str, timeout_ms: u64) -> AppResult<(String, bool)> {
-    register_mcp_codex_at(&codex_config_path()?, mcp_url, timeout_ms)
+/// Codex 走 **stdio** MCP（而非 HTTP）：Codex 对 HTTP/streamable MCP 仅实验性支持
+/// （需 experimental_use_rmcp_client、握手挑剔、易「空壳」），而 stdio 是其一等公民
+/// （codegraph/sqlcl 等均为 stdio），稳定、无端口漂移、无首字节超时。故写成:
+///   [mcp_servers.synaroute]
+///   command = "<synaroute.exe 绝对路径>"
+///   args = ["--mcp-stdio"]
+/// 由 Codex 以子进程拉起 synaroute.exe --mcp-stdio，用 stdin/stdout 传 JSON-RPC。
+/// `_timeout_ms` 于 stdio 不需要（无 HTTP 首字节超时），保留形参与 Claude 端签名一致。
+fn register_mcp_codex(_mcp_url: &str, _timeout_ms: u64) -> AppResult<(String, bool)> {
+    let exe = std::env::current_exe()
+        .map_err(|e| AppError::ToolConfig(format!("无法定位 synaroute 可执行文件: {e}")))?;
+    register_mcp_codex_at(&codex_config_path()?, &exe.display().to_string())
 }
 
-fn register_mcp_codex_at(path: &Path, mcp_url: &str, timeout_ms: u64) -> AppResult<(String, bool)> {
+fn register_mcp_codex_at(path: &Path, exe_path: &str) -> AppResult<(String, bool)> {
     let content = if path.exists() {
         std::fs::read_to_string(path)?
     } else {
@@ -423,6 +473,33 @@ fn register_mcp_codex_at(path: &Path, mcp_url: &str, timeout_ms: u64) -> AppResu
     let table = doc
         .as_table_mut()
         .ok_or_else(|| AppError::ToolConfig("config.toml 顶层非表".into()))?;
+
+    // 幂等：mcp_servers.synaroute 已是 stdio 形态（command 指向当前 exe、args=["--mcp-stdio"]）
+    // → 跳过写盘。exe 路径变化（升级换目录）时会重写，保证 command 始终指向现役 exe。
+    let already = table
+        .get("mcp_servers")
+        .and_then(|v| v.as_table())
+        .and_then(|s| s.get(MCP_CLIENT_NAME))
+        .and_then(|v| v.as_table())
+        .map(|e| {
+            e.get("command").and_then(|c| c.as_str()) == Some(exe_path)
+                && e.get("args")
+                    .and_then(|a| a.as_array())
+                    .map(|a| a.len() == 1 && a[0].as_str() == Some(MCP_STDIO_FLAG))
+                    .unwrap_or(false)
+                // type="stdio" 必须纳入幂等：Codex 桌面端靠此字段识别 stdio MCP，缺了就不加载
+                // 该 MCP（CLI 宽松、不需要也能识别，但桌面端严格）。老配置缺 type 时须重写补上，
+                // 不能因 command/args 一致就判「已最新」跳过。
+                && e.get("type").and_then(|t| t.as_str()) == Some("stdio")
+                // tool_timeout_sec 同样纳入幂等：默认 60s 不够聚合跑（多模型并行+决策者常需 30s+，
+                // 偶尔超 60s → `user cancelled MCP tool call`）。老配置缺此字段时须重写补上。
+                && e.get("tool_timeout_sec").and_then(|t| t.as_integer()) == Some(MCP_TOOL_TIMEOUT_SEC)
+        })
+        .unwrap_or(false);
+    if already {
+        return Ok(("Codex MCP（stdio）已是最新，跳过".into(), false));
+    }
+
     let servers = table
         .entry("mcp_servers".to_string())
         .or_insert_with(|| toml::Value::Table(Default::default()));
@@ -430,26 +507,28 @@ fn register_mcp_codex_at(path: &Path, mcp_url: &str, timeout_ms: u64) -> AppResu
         .as_table_mut()
         .ok_or_else(|| AppError::ToolConfig("mcp_servers 非表".into()))?;
 
-    // 幂等：已存在且 url / timeout 全一致 → 不写盘（timeout 必须比对，理由同 Claude 端）。
-    if let Some(existing) = servers_table.get(MCP_CLIENT_NAME).and_then(|v| v.as_table()) {
-        if existing.get("url").and_then(|u| u.as_str()) == Some(mcp_url)
-            && existing.get("timeout").and_then(|t| t.as_integer()) == Some(timeout_ms as i64)
-        {
-            return Ok((format!("Codex MCP 已是最新（{mcp_url}），跳过"), false));
-        }
-    }
-
-    // HTTP transport：url + timeout（毫秒，理由见 json_http_mcp 注释）。
+    // stdio transport：command + args + type。无 url、无 timeout、无 experimental 开关。
+    // type="stdio" 不可省：Codex 桌面端靠它识别 stdio MCP（CLI 宽松、缺了也识别，但桌面端
+    // 缺了就不加载该 MCP，表现为「对话里根本没有该工具」——与能用的 codegraph/sqlcl 的唯一差异）。
     let mut entry = toml::value::Table::new();
-    entry.insert("url".to_string(), toml::Value::String(mcp_url.to_string()));
-    entry.insert("timeout".to_string(), toml::Value::Integer(timeout_ms as i64));
+    entry.insert("command".to_string(), toml::Value::String(exe_path.to_string()));
+    entry.insert(
+        "args".to_string(),
+        toml::Value::Array(vec![toml::Value::String(MCP_STDIO_FLAG.to_string())]),
+    );
+    entry.insert("type".to_string(), toml::Value::String("stdio".to_string()));
+    // tool_timeout_sec：大脑聚合要跑多模型并行 + 决策者综合，常 30s+，偶尔更久。Codex 默认
+    // 每工具调用超时仅 60s，不够 → 表现为「synaroute_ai started 后 user cancelled」。放大到 600s。
+    // startup_timeout_sec：子进程启动握手超时，默认 10s，给足 30s 稳妥。
+    entry.insert("tool_timeout_sec".to_string(), toml::Value::Integer(MCP_TOOL_TIMEOUT_SEC));
+    entry.insert("startup_timeout_sec".to_string(), toml::Value::Integer(30));
     servers_table.insert(MCP_CLIENT_NAME.to_string(), toml::Value::Table(entry));
 
     let serialized =
         toml::to_string_pretty(&doc).map_err(|e| AppError::ToolConfig(e.to_string()))?;
     backup_and_write_bytes(path, serialized.as_bytes())?;
     Ok((
-        format!("已注册 MCP 到 Codex：{}（{mcp_url}），重启客户端生效", path.display()),
+        format!("已接入大脑聚合到 Codex（stdio）：{}，重启 Codex 生效", path.display()),
         true,
     ))
 }
@@ -594,6 +673,9 @@ pub struct ToolConfigPreview {
     /// 人类可读说明：本分类写哪些文件、不写哪些
     pub summary: String,
     pub files: Vec<ToolConfigFilePreview>,
+    /// 本分类是否已接入 MCP 大脑聚合（目标配置文件里已含 synaroute MCP 段）。
+    /// 供前端「接入/移除大脑聚合」按钮判定当前态，与全局 mcp_enabled 开关无关。
+    pub mcp_registered: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -622,6 +704,7 @@ fn preview_claude_cli() -> AppResult<ToolConfigPreview> {
     Ok(ToolConfigPreview {
         category_id: CategoryType::ClaudeCli,
         summary: "Claude CLI：~/.claude/settings.json。写入 BASE_URL / AUTH_TOKEN(占位) / 发现开关 / ANTHROPIC_MODEL / 顶层 model；不写三档 DEFAULT_*，不写 Codex/桌面端文件。".into(),
+        mcp_registered: is_mcp_registered(CategoryType::ClaudeCli),
         files: vec![ToolConfigFilePreview {
             path: path.display().to_string(),
             exists,
@@ -639,6 +722,7 @@ fn preview_codex() -> AppResult<ToolConfigPreview> {
     Ok(ToolConfigPreview {
         category_id: CategoryType::Codex,
         summary: "Codex：~/.codex/config.toml + auth.json。写入 model_provider=synaroute、[model_providers.synaroute]、可选 model、OPENAI_API_KEY 占位。不写任何 ANTHROPIC_* / settings.json。".into(),
+        mcp_registered: is_mcp_registered(CategoryType::Codex),
         files: vec![
             ToolConfigFilePreview {
                 path: cfg.display().to_string(),
@@ -662,6 +746,7 @@ fn preview_claude_desktop() -> AppResult<ToolConfigPreview> {
     Ok(ToolConfigPreview {
         category_id: CategoryType::ClaudeDesktop,
         summary: "Claude 桌面端：claude_desktop_config.json。写入 baseUrl 指向本机代理。不写 Claude CLI 的 settings.json，不写 ANTHROPIC_DEFAULT_*。".into(),
+        mcp_registered: is_mcp_registered(CategoryType::ClaudeDesktop),
         files: vec![ToolConfigFilePreview {
             path: path.display().to_string(),
             exists,
@@ -908,28 +993,43 @@ mod tests {
     }
 
     #[test]
-    fn codex_register_writes_url_and_preserves_other_tables() {
+    fn codex_register_writes_stdio_command_and_preserves_other_tables() {
         let path = temp_file("codex_reg", "config.toml");
         std::fs::write(
             &path,
             "model = \"gpt-5\"\n\n[mcp_servers.codegraph]\ncommand = \"codegraph\"\n",
         )
         .unwrap();
-        let url = "http://127.0.0.1:9527/mcp";
+        let exe = "C:\\Program Files\\SynaRoute\\synaroute.exe";
 
-        let (_, wrote) = register_mcp_codex_at(&path, url, MCP_TOOL_TIMEOUT_MS).unwrap();
+        let (_, wrote) = register_mcp_codex_at(&path, exe).unwrap();
         assert!(wrote);
 
         let doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        // stdio 形态：command 指向 exe、args=["--mcp-stdio"]，无 url/timeout/实验开关。
         assert_eq!(
-            doc["mcp_servers"]["synaroute"]["url"].as_str(),
-            Some(url),
-            "应写入 http url"
+            doc["mcp_servers"]["synaroute"]["command"].as_str(),
+            Some(exe),
+            "应写入 stdio command 指向 synaroute.exe"
         );
         assert_eq!(
-            doc["mcp_servers"]["synaroute"]["timeout"].as_integer(),
-            Some(MCP_TOOL_TIMEOUT_MS as i64),
-            "应写入 timeout（规避 Claude/Codex 60s 首字节超时）"
+            doc["mcp_servers"]["synaroute"]["args"][0].as_str(),
+            Some(MCP_STDIO_FLAG),
+            "args 应为 [--mcp-stdio]"
+        );
+        assert!(
+            doc["mcp_servers"]["synaroute"].get("url").is_none(),
+            "stdio 形态不应有 url"
+        );
+        assert_eq!(
+            doc["mcp_servers"]["synaroute"]["type"].as_str(),
+            Some("stdio"),
+            "必须写 type=stdio（Codex 桌面端靠它识别 stdio MCP，缺了就不加载）"
+        );
+        assert_eq!(
+            doc["mcp_servers"]["synaroute"]["tool_timeout_sec"].as_integer(),
+            Some(MCP_TOOL_TIMEOUT_SEC),
+            "必须写 tool_timeout_sec（默认 60s 不够聚合跑，会 user cancelled）"
         );
         assert_eq!(
             doc["mcp_servers"]["codegraph"]["command"].as_str(),
@@ -938,9 +1038,69 @@ mod tests {
         );
         assert_eq!(doc["model"].as_str(), Some("gpt-5"), "顶层键应保留");
 
-        // 幂等
-        let (_, wrote2) = register_mcp_codex_at(&path, url, MCP_TOOL_TIMEOUT_MS).unwrap();
-        assert!(!wrote2, "相同 url 应跳过");
+        // 幂等：command/args 一致 → 跳过
+        let (_, wrote2) = register_mcp_codex_at(&path, exe).unwrap();
+        assert!(!wrote2, "相同 stdio 配置应跳过");
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// 回归：老配置是旧的 HTTP 形态（url+timeout+experimental 开关）。再次接入必须迁移成
+    /// stdio 形态（command+args），不能因残留 url 而误判已最新——否则 Codex 仍连不上。
+    #[test]
+    fn codex_register_migrates_http_to_stdio() {
+        let path = temp_file("codex_migrate", "config.toml");
+        let exe = "C:\\Program Files\\SynaRoute\\synaroute.exe";
+        // 预置：旧 HTTP 形态。
+        std::fs::write(
+            &path,
+            "model = \"gpt-5\"\nexperimental_use_rmcp_client = true\n\n[mcp_servers.synaroute]\nurl = \"http://127.0.0.1:9530/mcp\"\ntimeout = 600000\n",
+        )
+        .unwrap();
+
+        let (_, wrote) = register_mcp_codex_at(&path, exe).unwrap();
+        assert!(wrote, "旧 HTTP 形态必须被重写为 stdio");
+
+        let doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(
+            doc["mcp_servers"]["synaroute"]["command"].as_str(),
+            Some(exe),
+            "应迁移为 stdio command"
+        );
+        assert!(
+            doc["mcp_servers"]["synaroute"].get("url").is_none(),
+            "旧 url 应被替换掉（stdio 条目整体覆盖）"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// 回归：老配置已是 stdio（command/args 都对）但**缺 type="stdio"**（首版接入按钮漏写）。
+    /// 再次接入必须补上 type，不能因 command/args 一致就判「已最新」跳过——否则 Codex 桌面端
+    /// 靠 type 识别 stdio MCP，缺了就不加载该工具（对话里根本没有 synaroute_ai）。
+    #[test]
+    fn codex_register_backfills_missing_type_stdio() {
+        let path = temp_file("codex_type_backfill", "config.toml");
+        let exe = "C:\\Program Files\\SynaRoute\\synaroute.exe";
+        // 预置：stdio 形态但缺 type 字段。
+        std::fs::write(
+            &path,
+            format!(
+                "model = \"gpt-5\"\n\n[mcp_servers.synaroute]\ncommand = '{}'\nargs = [\"--mcp-stdio\"]\n",
+                exe
+            ),
+        )
+        .unwrap();
+
+        let (_, wrote) = register_mcp_codex_at(&path, exe).unwrap();
+        assert!(wrote, "缺 type 时即便 command/args 一致也必须重写补上");
+
+        let doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(
+            doc["mcp_servers"]["synaroute"]["type"].as_str(),
+            Some("stdio"),
+            "type=stdio 应被补上（Codex 桌面端识别 stdio MCP 的关键字段）"
+        );
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }

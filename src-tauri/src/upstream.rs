@@ -175,6 +175,20 @@ const RETRY_MAX_ATTEMPTS: u32 = 3;
 /// 重试基础退避（毫秒），按尝试次数线性递增（300 / 600 ...）。
 const RETRY_BASE_BACKOFF_MS: u64 = 300;
 
+/// 聚合自建请求的客户端标识头。部分中转渠道靠 UA / originator 做客户端准入校验，不带会被判
+/// `detected: unknown` 而 403（channel:client_restricted）。这里对齐**官方客户端真实格式**，
+/// 使聚合请求也能通过准入（见 [`apply_client_identity`]）。
+///
+/// - OpenAI 侧对齐 Codex CLI：UA 形如 `codex_cli_rs/<ver> (<os>; <arch>) <term>`，并附带
+///   独立 `originator: codex_cli_rs` 头——new-api 类中转的 client_restricted 检测通常查的就是
+///   originator / UA 里的 `codex_cli_rs` 标识（源自 codex-rs default_client.rs 的 get_codex_user_agent）。
+/// - Anthropic 侧对齐 Claude Code CLI 真实 UA 形态。
+const ANTHROPIC_CLIENT_UA: &str = "claude-cli/1.0.0 (external, cli)";
+const OPENAI_CLIENT_UA: &str =
+    "codex_cli_rs/0.55.0 (Windows 11; x86_64) SynaRoute";
+/// Codex 的客户端来源标识头值（default_client.rs `DEFAULT_ORIGINATOR`）。
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+
 /// 判断上游错误是否「临时性、值得重试」：502/503/504 网关错误、429 限流、连接层失败。
 /// 4xx（除 429）多为鉴权/参数问题，重试无意义，不重试。
 pub fn is_retriable_upstream_error(e: &AppError) -> bool {
@@ -368,6 +382,7 @@ async fn anthropic_message(
     let mut req = client.post(&url).json(&payload).timeout(request_timeout);
     req = req.header("anthropic-version", "2023-06-01");
     req = apply_auth(req, key, secret);
+    req = apply_client_identity(req, key.protocol);
 
     let resp = req.send().await?;
     let status = resp.status();
@@ -404,6 +419,7 @@ async fn openai_chat(
     });
     let mut req = client.post(&url).json(&payload).timeout(request_timeout);
     req = apply_auth(req, key, secret);
+    req = apply_client_identity(req, key.protocol);
 
     let resp = req.send().await?;
     let status = resp.status();
@@ -618,27 +634,102 @@ fn anthropic_tools_to_openai(tools: &Value) -> Option<Value> {
     (!out.is_empty()).then(|| json!(out))
 }
 
+/// 从请求 tools 收集所有 Codex namespace 折叠工具的 namespace 名（如 `mcp__synaroute`）。
+/// 供响应侧把上游模型回调的全名 `<ns>__<sub>` 拆回 Codex router 需要的 {name, namespace} 两字段。
+/// 按长度降序排列，保证前缀匹配时优先匹配更长（更具体）的 namespace。
+pub fn collect_tool_namespaces(body: &Value) -> Vec<String> {
+    let mut names: Vec<String> = body
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|t| t.get("type").and_then(|ty| ty.as_str()) == Some("namespace"))
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    // 长的在前：`a__b` 与 `a` 同时存在时，`a__b__x` 应归到 `a__b` 而非 `a`。
+    names.sort_by(|a, b| b.len().cmp(&a.len()));
+    names
+}
+
+/// 把上游模型回调的工具全名按已知 namespace 列表拆回 (namespace, sub_name)。
+/// 全名形如 `<ns>__<sub>`；命中某 namespace 前缀则返回 (Some(ns), sub)，否则 (None, 原名)。
+/// 平铺工具（如 Codex 内置 update_plan）无 namespace 前缀，原样返回，不受影响。
+pub fn split_namespaced_tool_name(full: &str, namespaces: &[String]) -> (Option<String>, String) {
+    for ns in namespaces {
+        let prefix = format!("{ns}__");
+        if let Some(sub) = full.strip_prefix(&prefix) {
+            if !sub.is_empty() {
+                return (Some(ns.clone()), sub.to_string());
+            }
+        }
+    }
+    (None, full.to_string())
+}
+
 /// OpenAI tools → Anthropic tools。
+///
+/// 支持三种上游工具形态,统一转成 Anthropic 的 `{name, description, input_schema}`:
+/// 1. **Chat 嵌套**:`{type:"function", function:{name, description, parameters}}`。
+/// 2. **Responses 扁平**:`{type:"function", name, description, parameters}`（无 function 包一层）。
+/// 3. **Codex namespace 折叠**:`{type:"namespace", name:"mcp__x", tools:[{type:"function",
+///    name:"foo", parameters}]}`——Codex 把 MCP 工具折叠进 namespace 容器,子工具在 `tools[]` 里。
+///    原生 OpenAI 模型认识 namespace 并会用全名 `mcp__x__foo` 调用;但 Anthropic 无 namespace
+///    概念,故在此**展开**:每个子工具提升为独立工具,名字拼成 `<namespace>__<子工具>`
+///    （正是上游模型回调时用的名）。响应侧再靠 [`split_namespaced_tool_name`] 拆回
+///    {name, namespace} 两字段——Codex router 用结构化 ToolName{namespace, name} 查表，
+///    **不拆 name 字符串**，故必须分开填，否则查 {namespace:None, name:全名} 匹配不上 → `unsupported call`。
 fn openai_tools_to_anthropic(tools: &Value) -> Option<Value> {
     let arr = tools.as_array()?;
-    let out: Vec<Value> = arr
-        .iter()
-        .filter_map(|t| {
-            let f = t.get("function")?;
-            let name = f.get("name")?.as_str()?;
-            let mut a = serde_json::Map::new();
-            a.insert("name".into(), json!(name));
-            if let Some(d) = f.get("description") {
-                a.insert("description".into(), d.clone());
+    let mut out: Vec<Value> = vec![];
+    for t in arr {
+        match t.get("type").and_then(|ty| ty.as_str()) {
+            // Codex namespace 折叠工具:展开 tools[] 里的每个子工具为 <namespace>__<子工具>。
+            Some("namespace") => {
+                let ns = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let Some(subs) = t.get("tools").and_then(|s| s.as_array()) else { continue };
+                for sub in subs {
+                    // 子工具可能是扁平 {name,parameters} 或嵌套 {function:{..}}——都兼容。
+                    let inner = sub.get("function").unwrap_or(sub);
+                    let Some(sub_name) = inner.get("name").and_then(|n| n.as_str()) else { continue };
+                    // 全名:namespace 非空时拼 `<ns>__<sub>`,否则退化为子工具名本身。
+                    let full = if ns.is_empty() {
+                        sub_name.to_string()
+                    } else {
+                        format!("{ns}__{sub_name}")
+                    };
+                    let mut a = serde_json::Map::new();
+                    a.insert("name".into(), json!(full));
+                    if let Some(d) = inner.get("description") {
+                        a.insert("description".into(), d.clone());
+                    }
+                    a.insert(
+                        "input_schema".into(),
+                        inner.get("parameters").cloned().unwrap_or_else(|| json!({ "type": "object" })),
+                    );
+                    out.push(Value::Object(a));
+                }
             }
-            // Anthropic 要求 input_schema 至少是个 object schema
-            a.insert(
-                "input_schema".into(),
-                f.get("parameters").cloned().unwrap_or_else(|| json!({ "type": "object" })),
-            );
-            Some(Value::Object(a))
-        })
-        .collect();
+            // 普通函数:Chat 嵌套（有 function 子对象）或 Responses 扁平（顶层直接带 name）。
+            _ => {
+                let f = t.get("function").unwrap_or(t);
+                let Some(name) = f.get("name").and_then(|n| n.as_str()) else { continue };
+                let mut a = serde_json::Map::new();
+                a.insert("name".into(), json!(name));
+                if let Some(d) = f.get("description") {
+                    a.insert("description".into(), d.clone());
+                }
+                // Anthropic 要求 input_schema 至少是个 object schema
+                a.insert(
+                    "input_schema".into(),
+                    f.get("parameters").cloned().unwrap_or_else(|| json!({ "type": "object" })),
+                );
+                out.push(Value::Object(a));
+            }
+        }
+    }
     (!out.is_empty()).then(|| json!(out))
 }
 
@@ -1122,24 +1213,46 @@ pub fn responses_to_chat(body: &Value) -> Value {
     if let Some(r) = body.get("reasoning") {
         out.insert("reasoning".into(), r.clone());
     }
-    // tools：Responses 扁平形态 → Chat 嵌套形态
+    // tools：Responses 扁平形态 → Chat 嵌套形态。
+    // 含 Codex 的 namespace 折叠工具（{type:"namespace", name:"mcp__x", tools:[{function}]}）：
+    // 必须把内部 tools[] 展开成一个个 `mcp__<ns>__<子工具>` 独立 function，否则只会得到一个
+    // 无参数的 `mcp__x` 假工具，下游模型（如经 SynaRoute 路由的 Claude）拿不到真正的子工具、
+    // 只能瞎调裸 `mcp__x` → Codex router 报 `unsupported call`。展开后的全名正是 Codex 期望的调用名。
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
-        let mapped: Vec<Value> = tools
-            .iter()
-            .filter_map(|t| {
-                // Responses function tool：{type:"function", name, description, parameters}
-                let name = t.get("name").and_then(|n| n.as_str())?;
-                let mut f = serde_json::Map::new();
-                f.insert("name".into(), json!(name));
-                if let Some(d) = t.get("description") {
-                    f.insert("description".into(), d.clone());
+        let mut mapped: Vec<Value> = Vec::new();
+        for t in tools {
+            // namespace 折叠工具：展开内部 tools[]，名字拼成 <ns>__<子工具>。
+            if t.get("type").and_then(|ty| ty.as_str()) == Some("namespace") {
+                let ns = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                if let Some(subs) = t.get("tools").and_then(|s| s.as_array()) {
+                    for sub in subs {
+                        let Some(sub_name) = sub.get("name").and_then(|n| n.as_str()) else { continue };
+                        let full = if ns.is_empty() { sub_name.to_string() } else { format!("{ns}__{sub_name}") };
+                        let mut f = serde_json::Map::new();
+                        f.insert("name".into(), json!(full));
+                        if let Some(d) = sub.get("description") {
+                            f.insert("description".into(), d.clone());
+                        }
+                        if let Some(p) = sub.get("parameters") {
+                            f.insert("parameters".into(), p.clone());
+                        }
+                        mapped.push(json!({ "type": "function", "function": f }));
+                    }
                 }
-                if let Some(p) = t.get("parameters") {
-                    f.insert("parameters".into(), p.clone());
-                }
-                Some(json!({ "type": "function", "function": f }))
-            })
-            .collect();
+                continue;
+            }
+            // Responses function tool：{type:"function", name, description, parameters}
+            let Some(name) = t.get("name").and_then(|n| n.as_str()) else { continue };
+            let mut f = serde_json::Map::new();
+            f.insert("name".into(), json!(name));
+            if let Some(d) = t.get("description") {
+                f.insert("description".into(), d.clone());
+            }
+            if let Some(p) = t.get("parameters") {
+                f.insert("parameters".into(), p.clone());
+            }
+            mapped.push(json!({ "type": "function", "function": f }));
+        }
         if !mapped.is_empty() {
             out.insert("tools".into(), json!(mapped));
         }
@@ -1497,10 +1610,21 @@ pub struct SseTranslator {
     reasoning_started: bool,
     /// 累积 thinking 全文，供收尾时发 reasoning_summary_text.done（带完整文本）。
     reasoning_accum: String,
+    /// 请求里 Codex namespace 折叠工具的 namespace 名列表（如 `mcp__synaroute`），按长度降序。
+    /// 收尾生成 Responses function_call 时，用它把上游回调的全名 `<ns>__<sub>` 拆回
+    /// {name, namespace} 两字段（Codex router 用结构化 ToolName 查表，不拆 name 字符串）。
+    tool_namespaces: Vec<String>,
 }
 
 impl SseTranslator {
+    #[allow(dead_code)] // 仅测试与非 Codex 场景用；Codex 流式走 with_namespaces。
     pub fn new(dir: SseDirection) -> Self {
+        Self::with_namespaces(dir, Vec::new())
+    }
+
+    /// 带 namespace 列表构造：Codex（Responses 下游）跨协议流式时传入请求里的 namespace 名，
+    /// 使响应侧能把折叠工具的全名拆回 {name, namespace}。其余场景用 [`SseTranslator::new`] 即可。
+    pub fn with_namespaces(dir: SseDirection, tool_namespaces: Vec<String>) -> Self {
         Self {
             dir,
             buf: String::new(),
@@ -1517,6 +1641,7 @@ impl SseTranslator {
             thinking_blocks: std::collections::HashSet::new(),
             reasoning_started: false,
             reasoning_accum: String::new(),
+            tool_namespaces,
         }
     }
 
@@ -1702,10 +1827,21 @@ impl SseTranslator {
             // arguments 必须是可解析的 JSON 字符串：无参工具（args 为空）兜底成 "{}"，
             // 否则 Codex 侧 serde_json 解析空串失败、工具无法执行。
             let arguments = if args.trim().is_empty() { "{}" } else { args.as_str() };
-            let item = json!({
-                "type": "function_call", "id": fc_id, "call_id": call_id,
-                "name": name, "arguments": arguments, "status": "completed"
-            });
+            // 关键：Codex router 用结构化 {namespace, name} 查工具注册表，不拆 name 字符串。
+            // 上游模型按展开的全名 `mcp__x__foo` 回调，这里必须拆回 name="foo" + namespace="mcp__x"
+            // 两个独立字段，否则 router 查 {namespace:None, name:"mcp__x__foo"} 匹配不到 → unsupported call。
+            let (ns, real_name) = split_namespaced_tool_name(name, &self.tool_namespaces);
+            let mut item_map = serde_json::Map::new();
+            item_map.insert("type".into(), json!("function_call"));
+            item_map.insert("id".into(), json!(fc_id));
+            item_map.insert("call_id".into(), json!(call_id));
+            item_map.insert("name".into(), json!(real_name));
+            if let Some(ns) = ns {
+                item_map.insert("namespace".into(), json!(ns));
+            }
+            item_map.insert("arguments".into(), json!(arguments));
+            item_map.insert("status".into(), json!("completed"));
+            let item = Value::Object(item_map);
             // 关键修复：作为流式事件投递（added 宣告 → done 交付完整调用），Codex 据 done 执行工具。
             out.push_str(&sse("response.output_item.added", &json!({
                 "type": "response.output_item.added",
@@ -2128,6 +2264,30 @@ fn apply_auth(
     }
 }
 
+/// 为聚合成员/决策者的**自建请求**注入客户端身份头（User-Agent 等）。
+///
+/// 为什么需要：透传路径会转发下游客户端（Claude Code / Codex）的原始 UA/x-app 等头，
+/// 部分中转渠道靠这些做客户端准入校验。但聚合调用是本应用自建请求，若不带任何客户端标识，
+/// 会被这类渠道判为 `detected: unknown` 而 403（channel:client_restricted）。这里按协议
+/// 补一个与官方客户端一致的 UA（及 Anthropic 的 anthropic-beta / x-app），使聚合请求也能
+/// 通过客户端准入。仅注入身份头，不动鉴权与业务字段。
+fn apply_client_identity(
+    req: reqwest::RequestBuilder,
+    protocol: Protocol,
+) -> reqwest::RequestBuilder {
+    if protocol.is_openai() {
+        // Codex CLI 风格 UA + originator 头——中转渠道的 client_restricted 检测通常查这两者里的
+        // `codex_cli_rs` 标识；缺失即被判 detected:unknown 而 403。
+        req.header("user-agent", OPENAI_CLIENT_UA)
+            .header("originator", CODEX_ORIGINATOR)
+    } else {
+        // Claude Code CLI 风格 UA + 常见随附头，匹配"仅放行 Claude Code"类渠道。
+        req.header("user-agent", ANTHROPIC_CLIENT_UA)
+            .header("x-app", "cli")
+            .header("anthropic-beta", "claude-code-20250219")
+    }
+}
+
 /// /models 探测专用鉴权：同时带 `Authorization: Bearer` 与 `x-api-key`。
 /// 兼容厂商（DeepSeek/Kimi/GLM 等）把 Anthropic 协议挂在子路径、但模型列表是 OpenAI 风格
 /// （需 Bearer）；而真 Anthropic 的 /v1/models 需 x-api-key。GET /models 只读，多带一个
@@ -2256,6 +2416,92 @@ mod tests {
         assert_eq!(o["tools"][0]["type"], "function");
         assert_eq!(o["tools"][0]["function"]["name"], "get_weather");
         assert_eq!(o["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn o2a_expands_codex_namespace_tools() {
+        // Codex（Responses）把 MCP 工具折叠进 type:"namespace" 容器的 tools[] 里。
+        // 原生 OpenAI 模型认识这种折叠；但转发给 Anthropic 上游（Claude）时必须展开成
+        // 独立的 type:function 工具、且用全名 <namespace>__<子工具>——否则 openai_tools_to_anthropic
+        // 只认 type:function 会把整个 namespace 丢弃，Claude 收不到工具、只能瞎调 mcp__synaroute
+        // 空参数，Codex router 报 unsupported call。这条测试锁住展开 + 全名。
+        let tools = json!([
+            { "type": "function", "name": "shell", "parameters": { "type": "object" } },
+            {
+                "type": "namespace",
+                "name": "mcp__synaroute",
+                "description": "ns",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "synaroute_ai",
+                        "description": "多模型聚合",
+                        "parameters": { "type": "object", "properties": { "prompt": { "type": "string" } }, "required": ["prompt"] }
+                    }
+                ]
+            }
+        ]);
+        let out = openai_tools_to_anthropic(&tools).expect("应产出工具");
+        let arr = out.as_array().unwrap();
+        // 顶层 function（Responses 扁平形态）保留
+        assert!(arr.iter().any(|t| t["name"] == "shell"), "扁平 function 工具应保留");
+        // namespace 子工具展开为全名，且带 input_schema
+        let sub = arr
+            .iter()
+            .find(|t| t["name"] == "mcp__synaroute__synaroute_ai")
+            .expect("namespace 子工具应展开为全名 mcp__synaroute__synaroute_ai");
+        assert_eq!(sub["description"], "多模型聚合", "子工具描述应保留");
+        assert_eq!(
+            sub["input_schema"]["properties"]["prompt"]["type"],
+            "string",
+            "子工具 parameters 应映射为 input_schema"
+        );
+        // 空壳 namespace 本身不应作为工具留下
+        assert!(
+            !arr.iter().any(|t| t["name"] == "mcp__synaroute"),
+            "namespace 容器本身不应作为工具"
+        );
+    }
+
+    #[test]
+    fn convert_request_responses_to_anthropic_expands_namespace_tools() {
+        // 真实链路：Codex（Responses）→ Anthropic 上游，走 responses_to_chat → openai_to_anthropic
+        // 两跳。namespace 折叠工具必须在第一跳就展开成 <ns>__<子工具> 全名，最终到达 Anthropic body
+        // 的 tools 里、带 input_schema。这是「Codex 用中转 Claude 调 MCP 大脑聚合」调通的关键。
+        let req = json!({
+            "model": "claude-opus-4-7",
+            "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }],
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "mcp__synaroute",
+                    "description": "ns",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "synaroute_ai",
+                            "description": "多模型聚合",
+                            "parameters": { "type": "object", "properties": { "prompt": { "type": "string" } }, "required": ["prompt"] }
+                        }
+                    ]
+                }
+            ]
+        });
+        let out = convert_request(&req, Protocol::OpenaiResponses, Protocol::Anthropic);
+        let tools = out["tools"].as_array().expect("Anthropic body 应含 tools");
+        let t = tools
+            .iter()
+            .find(|t| t["name"] == "mcp__synaroute__synaroute_ai")
+            .expect("namespace 子工具应展开为全名到达 Anthropic tools");
+        assert_eq!(
+            t["input_schema"]["properties"]["prompt"]["type"],
+            "string",
+            "子工具 schema 应完整到达 Anthropic input_schema"
+        );
+        assert!(
+            !tools.iter().any(|t| t["name"] == "mcp__synaroute"),
+            "空壳 namespace 不应到达 Anthropic tools"
+        );
     }
 
     #[test]
@@ -2825,6 +3071,52 @@ mod tests {
             out.contains("event: response.output_item.done"),
             "工具调用必须走 output_item.done 事件（Codex 据此执行工具）:\n{out}"
         );
+    }
+
+    #[test]
+    fn sse_anthropic_to_responses_splits_namespaced_tool_call() {
+        // Codex 大脑聚合根因回归：上游模型按展开全名 `mcp__synaroute__synaroute_ai` 回调工具，
+        // 翻译器必须拆回 name="synaroute_ai" + namespace="mcp__synaroute" 两个独立字段。
+        // Codex router 用结构化 ToolName{namespace,name} 查注册表，不拆 name 字符串——缺 namespace
+        // 字段就查 {namespace:None, name:"mcp__synaroute__synaroute_ai"} 匹配不到 → unsupported call。
+        let mut tr = SseTranslator::with_namespaces(
+            SseDirection::AnthropicToResponses,
+            vec!["mcp__synaroute".to_string()],
+        );
+        let mut out = String::new();
+        out.push_str(&tr.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5}}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"mcp__synaroute__synaroute_ai\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"prompt\\\":\\\"hi\\\"}\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"));
+        out.push_str(&tr.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+        out.push_str(&tr.finish());
+        assert!(out.contains("\"type\":\"function_call\""), "缺 function_call item:\n{out}");
+        // 关键：name 拆成裸子工具名，namespace 单独成字段。
+        assert!(out.contains("\"name\":\"synaroute_ai\""), "name 未拆成裸子工具名:\n{out}");
+        assert!(out.contains("\"namespace\":\"mcp__synaroute\""), "缺 namespace 独立字段:\n{out}");
+        // 不能再把全名塞进 name（那正是 unsupported call 的根因）。
+        assert!(
+            !out.contains("\"name\":\"mcp__synaroute__synaroute_ai\""),
+            "name 仍是未拆的全名（会导致 Codex unsupported call）:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sse_anthropic_to_responses_flat_tool_call_keeps_no_namespace() {
+        // 平铺工具（Codex 内置 update_plan，无 namespace 前缀）不受拆名影响：name 原样、无 namespace 字段。
+        let mut tr = SseTranslator::with_namespaces(
+            SseDirection::AnthropicToResponses,
+            vec!["mcp__synaroute".to_string()],
+        );
+        let mut out = String::new();
+        out.push_str(&tr.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5}}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_5\",\"name\":\"update_plan\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"));
+        out.push_str(&tr.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+        out.push_str(&tr.finish());
+        assert!(out.contains("\"name\":\"update_plan\""), "平铺工具名应原样:\n{out}");
+        assert!(!out.contains("\"namespace\""), "平铺工具不应带 namespace 字段:\n{out}");
     }
 
     #[test]

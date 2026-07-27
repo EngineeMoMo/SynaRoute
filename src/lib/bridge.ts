@@ -214,4 +214,21 @@ export const api = {
   // 或客户端连不上时强制重连。大脑聚合参数改后保存即生效，不需要走这里。
   restartMcp: () =>
     call<McpStatus>("restart_mcp", undefined, async () => ({ running: true })),
+
+  // 单分类接入大脑聚合 MCP：只给该分类写客户端配置（Codex=config.toml / CLI=~/.claude.json），
+  // 不影响其它分类。服务未跑则先启动。可让 CLI 与 Codex 各自独立接入。
+  registerMcpForCategory: (categoryId: CategoryType) =>
+    call<McpStatus>(
+      "register_mcp_for_category",
+      { categoryId },
+      async () => ({ running: true }),
+    ),
+
+  // 单分类断开：只从该分类客户端配置移除 synaroute，不停服务、不动其它分类。
+  unregisterMcpForCategory: (categoryId: CategoryType) =>
+    call<McpStatus>(
+      "unregister_mcp_for_category",
+      { categoryId },
+      async () => ({ running: true }),
+    ),
 };

@@ -59,6 +59,7 @@ interface AppState {
   loadVendors: () => Promise<void>;
   toggleKey: (keyId: string, enabled: boolean) => Promise<void>;
   moveKey: (keyId: string, direction: "up" | "down") => Promise<void>;
+  setPrimaryKey: (keyId: string) => Promise<void>;
   deleteKey: (keyId: string) => Promise<void>;
   checkHealth: (keyId: string) => Promise<void>;
   startProxy: () => Promise<void>;
@@ -259,6 +260,33 @@ export const useStore = create<AppState>((set, get) => ({
       await Promise.all(toPersist.map((k) => api.upsertKey(k)));
     } catch (e) {
       console.error("moveKey failed", e);
+      get().showToast("error", String((e as Error)?.message ?? e));
+    }
+    await get().loadCategory(cat);
+  },
+
+  // 一键设为主：把目标 Key 提到 priority 0（其余保持原相对顺序顺延），
+  // 免去连点上移箭头。与 moveKey 同样规整为连续优先级、只对变动的 Key 落盘。
+  async setPrimaryKey(keyId) {
+    const cat = get().activeCategory;
+    const ordered = [...get().keys]
+      .filter((k) => k.categoryId === cat)
+      .sort((a, b) => a.priority - b.priority);
+    const idx = ordered.findIndex((k) => k.id === keyId);
+    if (idx <= 0) return; // 不存在或已是主，无需处理
+    const [target] = ordered.splice(idx, 1);
+    ordered.unshift(target);
+    const renumbered = ordered.map((k, i) => ({ ...k, priority: i }));
+    const toPersist = renumbered.filter((k) => {
+      const orig = get().keys.find((o) => o.id === k.id);
+      return orig && orig.priority !== k.priority;
+    });
+    const byId = new Map(renumbered.map((k) => [k.id, k]));
+    set({ keys: get().keys.map((k) => byId.get(k.id) ?? k) });
+    try {
+      await Promise.all(toPersist.map((k) => api.upsertKey(k)));
+    } catch (e) {
+      console.error("setPrimaryKey failed", e);
       get().showToast("error", String((e as Error)?.message ?? e));
     }
     await get().loadCategory(cat);

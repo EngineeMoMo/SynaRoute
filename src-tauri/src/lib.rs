@@ -428,6 +428,83 @@ fn rewrite_registered_clients(state: &AppState, port: u16) {
     }
 }
 
+/// 单分类接入 MCP 大脑聚合：只给指定分类写入客户端 MCP 配置（Claude CLI=~/.claude.json，
+/// Codex=config.toml，桌面端=claude_desktop_config），不影响其它分类。
+/// 与 set_mcp_enabled 的区别：后者是全局开关且只认「当前活跃分类」，做不到多端同时接入；
+/// 本命令 per-category 独立，可让 CLI 与 Codex 各自接入、互不干扰。
+/// 前置：MCP 服务必须在运行（未运行则先按首选端口启动），否则客户端写了地址也连不上。
+#[tauri::command]
+async fn register_mcp_for_category(
+    state: tauri::State<'_, AppState>,
+    category_id: CategoryType,
+) -> AppResult<McpStatus> {
+    // 确保服务在跑：未运行则以首选端口启动（复用粘滞端口逻辑）。
+    let bound = match state.mcp.running_port() {
+        Some(p) => p,
+        None => {
+            let port = state.store.get_settings().mcp_port;
+            match state.mcp.start(port).await {
+                Ok(b) => {
+                    // 启动即视为 MCP 开启，持久化 enabled=true 并粘住实际端口。
+                    let _ = state.store.set_mcp_enabled_flag(true);
+                    if b != port {
+                        rewrite_registered_clients(&state, b);
+                        let _ = state.store.set_mcp_port(b);
+                    }
+                    b
+                }
+                Err(e) => {
+                    state.store.append_event(
+                        category_id,
+                        "error",
+                        None,
+                        &format!("MCP 启动失败，无法接入 {}: {e}", category_id.as_str()),
+                    );
+                    return Err(error::AppError::Proxy(e));
+                }
+            }
+        }
+    };
+    // 只给这一个分类注册 + 记入已注册集合（供端口漂移时重写、关闭时注销）。
+    register_and_record(&state, category_id, bound);
+    Ok(McpStatus {
+        running: state.mcp.is_running(),
+        port: state.mcp.running_port(),
+        last_error: state.mcp.last_error(),
+    })
+}
+
+/// 单分类断开 MCP 大脑聚合：只从指定分类的客户端配置移除 synaroute，并从已注册集合剔除。
+/// 不停 MCP 服务、不动其它分类——与 register_mcp_for_category 对称。
+#[tauri::command]
+async fn unregister_mcp_for_category(
+    state: tauri::State<'_, AppState>,
+    category_id: CategoryType,
+) -> AppResult<McpStatus> {
+    match tools::unregister_mcp_client(category_id) {
+        Ok((msg, wrote)) => {
+            if wrote {
+                state.store.append_event(category_id, "config", None, &msg);
+            }
+        }
+        Err(e) => {
+            state.store.append_event(
+                category_id,
+                "error",
+                None,
+                &format!("MCP 断开失败: {e}"),
+            );
+            return Err(e);
+        }
+    }
+    let _ = state.store.remove_registered_category(category_id.as_str());
+    Ok(McpStatus {
+        running: state.mcp.is_running(),
+        port: state.mcp.running_port(),
+        last_error: state.mcp.last_error(),
+    })
+}
+
 /// 启用/停用 MCP 并自动注册到「当前活跃分类」对应的工具。
 /// 前端 MCP 开关走这里（携带 activeCategory），而非通用 save_settings。
 #[tauri::command]
@@ -738,6 +815,18 @@ fn detect_recent_workdirs() -> AppResult<Vec<workdirs::RecentWorkdir>> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Codex 大脑聚合走 stdio MCP：Codex 以子进程拉起 `synaroute.exe --mcp-stdio`，
+    // 用 stdin/stdout 传 JSON-RPC。此模式不启动 Tauri UI、不开窗口、不监听端口，
+    // 读到 stdin EOF（Codex 结束子进程）即退出。必须最先判定，早于任何 UI 初始化。
+    if std::env::args().any(|a| a == "--mcp-stdio") {
+        // 转发模式：不初始化 Store（避免读到 MSIX 虚拟化的错误配置宇宙——被 Codex 桌面端等
+        // 打包应用拉起时，子进程读的是包容器里的空/旧配置）。tools/call 转发到运行中主应用的
+        // HTTP MCP 端口，由持有真实配置的主应用执行聚合。TCP 端口不受 MSIX 虚拟化影响。
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(mcp::run_stdio());
+        return;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -899,6 +988,8 @@ pub fn run() {
             rebuild_tray_menu,
             mcp_status,
             set_mcp_enabled,
+            register_mcp_for_category,
+            unregister_mcp_for_category,
             restart_mcp,
             get_app_version,
             check_for_updates,

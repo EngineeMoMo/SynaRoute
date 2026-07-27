@@ -18,7 +18,7 @@ export function KeyCard({ k, onEdit, isFirst, isLast }: {
   isFirst: boolean;
   isLast: boolean;
 }) {
-  const { toggleKey, deleteKey, checkHealth, moveKey, vendors } = useStore();
+  const { toggleKey, deleteKey, checkHealth, moveKey, setPrimaryKey, vendors } = useStore();
   const t = useT();
   const vendorIcon = vendors.find((v) => v.id === k.vendor)?.icon;
   // 就地二次确认：不用原生 confirm()（在 Tauri WebView2 里行为不可靠，会导致删除不触发）
@@ -58,7 +58,18 @@ export function KeyCard({ k, onEdit, isFirst, isLast }: {
             <span className="truncate text-sm font-semibold text-text-primary">
               {k.name}
             </span>
-            {k.priority === 0 && <Badge variant="primary">{t("key.primary")}</Badge>}
+            {k.priority === 0 ? (
+              <Badge variant="primary">{t("key.primary")}</Badge>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void setPrimaryKey(k.id)}
+                className="shrink-0 rounded-control border border-border px-1.5 py-0.5 text-[11px] text-text-muted hover:border-primary hover:text-primary"
+                title={t("key.setPrimaryHint")}
+              >
+                {t("key.setPrimary")}
+              </button>
+            )}
             <HealthBadge health={k.health} />
           </div>
 

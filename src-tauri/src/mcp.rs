@@ -34,6 +34,32 @@ struct RunningMcp {
     handle: JoinHandle<()>,
 }
 
+/// stdio 子进程发现主应用 MCP 端口用的文件名（放在 exe 同级目录）。
+/// 关键：exe 同级目录（如 F:\SynaRoute\）不受 MSIX AppData 虚拟化影响，
+/// 无论主应用/子进程被谁以什么包身份拉起，读到的都是同一份真实端口。
+const MCP_PORT_FILE: &str = "mcp-port";
+
+/// 主应用 MCP 端口写到 exe 同级文件，供 stdio 子进程发现（见 [`run_stdio`]）。
+/// 写失败不致命（子进程会退回端口扫描），仅记日志。
+fn write_mcp_port_file(port: u16) {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let path = dir.join(MCP_PORT_FILE);
+            if let Err(e) = std::fs::write(&path, port.to_string()) {
+                tracing::warn!("写 MCP 端口文件失败({}): {e}", path.display());
+            }
+        }
+    }
+}
+
+/// 读 exe 同级的 MCP 端口文件（stdio 子进程用）。读不到返回 None。
+fn read_mcp_port_file() -> Option<u16> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let content = std::fs::read_to_string(dir.join(MCP_PORT_FILE)).ok()?;
+    content.trim().parse::<u16>().ok()
+}
+
 /// 端口占用时，向上探测的最大候选数（configured .. configured+FALLBACK_RANGE）。
 /// 9527 等常用端口在部分 Windows 机器上被系统进程（WUDFHost / GoodixSessionService 等）占用，
 /// 单端口硬绑定会静默失败，故自动向上找一个可用端口，并把真实端口暴露给 UI。
@@ -134,6 +160,11 @@ impl McpManager {
         if bound != port {
             tracing::warn!("MCP 请求端口 {port} 被占用，已改用 {bound}");
         }
+        // 把实际端口写到 exe 同级的 mcp-port 文件：stdio 子进程（--mcp-stdio）据此找到运行中的
+        // 主应用并转发 tools/call。写 exe 同级（如 F:\SynaRoute\）而非 %APPDATA%——后者会被
+        // MSIX 虚拟化（Claude/Codex 等包应用读到的是包容器私有副本，与真实文件是平行宇宙），
+        // exe 同级目录不虚拟化，任何身份的进程读到的都是同一份真实端口。
+        write_mcp_port_file(bound);
         tracing::info!("MCP 服务器已启动: http://127.0.0.1:{bound}/mcp");
         Ok(bound)
     }
@@ -143,6 +174,180 @@ impl McpManager {
             r.handle.abort();
             tracing::info!("MCP 服务器已停止");
         }
+    }
+}
+
+// ─── stdio 层（Codex 专用）─────────────────────────────────────────────────
+//
+// Codex 对 HTTP/streamable MCP 支持是实验性的（需 experimental_use_rmcp_client，且
+// 握手挑剔、易「空壳」）。stdio 是 Codex 一等公民（codegraph/sqlcl 等均为 stdio），
+// 稳定、无端口漂移、无首字节超时。故 Codex 走 stdio：由 Codex 以子进程拉起
+// `synaroute.exe --mcp-stdio`，用 stdin/stdout 传 JSON-RPC（每行一条，LSP 无框架式）。
+//
+// 复用与 HTTP 完全相同的 dispatch（initialize / tools/list / tools/call / ping），
+// 只是传输层换成标准输入输出。通知（无 id）不回响应，与 HTTP 语义一致。
+
+/// stdio MCP 主循环：逐行读 stdin 的 JSON-RPC 请求，处理后把响应逐行写 stdout。
+/// 阻塞直到 stdin 关闭（Codex 结束子进程时）。返回后进程应退出。
+///
+/// **关键设计（MSIX 宇宙错位的根治）**：本子进程**不读配置、不跑聚合**。
+/// 早期版本让子进程自己 `dispatch`（含跑聚合），但 stdio 子进程被 Codex 桌面端
+/// （MSIX 包）拉起时，继承其包身份 → 读 %APPDATA% 被虚拟化到包容器私有副本，
+/// 那份配置没有用户在真实应用里配的 codex 聚合成员 → 永远「未启用大脑聚合」。
+///
+/// 现在改为**纯转发**：initialize/tools/list/ping 用本地静态响应（不依赖配置，
+/// 且 Codex 启动即能握手拿到工具）；`tools/call` 转发到**运行中主应用**的 HTTP MCP
+/// （127.0.0.1:{port}/mcp）。主应用是用户双击启动的、读真实配置，聚合在那里跑。
+/// localhost TCP 端口不受 MSIX 虚拟化影响（系统全局），故转发能跨包身份连通。
+pub async fn run_stdio() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin);
+    let mut stdout = tokio::io::stdout();
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break, // EOF：Codex 关闭了管道，退出循环 → 进程结束
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let msg: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue, // 非法 JSON：忽略该行（无 id 无从回错）
+        };
+
+        let id = msg.get("id").cloned();
+        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        // 通知（无 id，如 notifications/initialized）：不回响应。
+        if id.is_none() {
+            continue;
+        }
+        let id = id.unwrap();
+        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+        let resp = match local_static_response(method, &params) {
+            // 握手/列举/心跳/资源探测：本地静态响应（与 HTTP dispatch 共用同一表），
+            // 不依赖主应用是否已启动，保证 Codex 启动即能完成握手、看到 synaroute_ai。
+            Some(Ok(result)) => rpc_ok(id, result),
+            Some(Err((code, msg))) => rpc_error(id, code, &msg),
+            // tools/call：转发到运行中主应用（持有真实配置）。
+            None => match forward_tool_call_to_main(&params).await {
+                Ok(value) => rpc_ok(id, value),
+                Err(msg) => rpc_ok(id, tool_error_content(&msg)),
+            },
+        };
+        let mut out = serde_json::to_vec(&resp).unwrap_or_default();
+        out.push(b'\n');
+        if stdout.write_all(&out).await.is_err() {
+            break;
+        }
+        let _ = stdout.flush().await;
+    }
+}
+
+/// 把 stdio 收到的 `tools/call` 转发到运行中主应用的 HTTP MCP。
+/// 端口发现：先读 exe 同级端口文件（主应用启动时写，不受 MSIX 虚拟化影响），
+/// 读不到再扫描默认端口范围。主应用未运行时返回可读错误，提示用户启动应用。
+async fn forward_tool_call_to_main(params: &Value) -> Result<Value, String> {
+    let port = discover_main_mcp_port()
+        .await
+        .ok_or_else(|| "未找到运行中的 SynaRoute 主程序，请先启动 SynaRoute 桌面应用".to_string())?;
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    // 组装标准 MCP tools/call 请求（JSON-RPC over HTTP），转发给主应用。
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": params,
+    });
+    // 聚合可能耗时较久（多模型并行 + 决策者），给足超时（与 tool_timeout_sec 对齐留余量）。
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| format!("构造 HTTP 客户端失败: {e}"))?;
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("连接 SynaRoute 主程序失败({url}): {e}"))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("解析主程序响应失败: {e}"))?;
+    // JSON-RPC 响应：优先取 result（工具结果），有 error 则透出其 message。
+    if let Some(result) = v.get("result") {
+        Ok(result.clone())
+    } else if let Some(err) = v.get("error") {
+        let m = err.get("message").and_then(|m| m.as_str()).unwrap_or("主程序返回错误");
+        Err(m.to_string())
+    } else {
+        Err("主程序响应缺少 result/error".into())
+    }
+}
+
+/// 发现运行中主应用的 MCP 端口：先读 exe 同级端口文件，再扫描默认端口范围探活。
+async fn discover_main_mcp_port() -> Option<u16> {
+    // 1. 端口文件（主应用启动时写，最可靠）。读到后探活确认真的是 SynaRoute MCP。
+    if let Some(p) = read_mcp_port_file() {
+        if probe_mcp_alive(p).await {
+            return Some(p);
+        }
+    }
+    // 2. 兜底：扫描默认端口范围（端口文件缺失/过期时）。默认起始端口 9527，与 default_mcp_port
+    //    对齐；主应用端口占用回退时也在 [9527, 9527+FALLBACK_RANGE] 内，故这里同范围扫描能覆盖。
+    let start = 9527u16;
+    for p in start..=start.saturating_add(FALLBACK_RANGE) {
+        if probe_mcp_alive(p).await {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// 探活：向候选端口发一个最小 initialize，确认对面是活着的 SynaRoute MCP。
+async fn probe_mcp_alive(port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": PROTOCOL_VERSION }
+    });
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    else {
+        return false;
+    };
+    match client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            // 确认是 SynaRoute（serverInfo.name），避免误连其它占用同端口的服务。
+            if let Ok(v) = resp.json::<Value>().await {
+                return v
+                    .get("result")
+                    .and_then(|r| r.get("serverInfo"))
+                    .and_then(|s| s.get("name"))
+                    .and_then(|n| n.as_str())
+                    == Some("SynaRoute");
+            }
+            false
+        }
+        Err(_) => false,
     }
 }
 
@@ -215,15 +420,40 @@ async fn handle_http(
     let id = id.unwrap();
 
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
+    let is_initialize = method == "initialize";
     let result = dispatch(&store, method, params).await;
 
     match result {
-        Ok(value) => Ok(json_response(StatusCode::OK, rpc_ok(id, value))),
+        Ok(value) => {
+            let mut resp = json_response(StatusCode::OK, rpc_ok(id, value));
+            // Streamable HTTP 规范：服务器在 initialize 响应里通过 `Mcp-Session-Id` 头下发会话 ID，
+            // 客户端（rmcp / Codex）后续请求带回。缺此头时严格客户端认为握手未完成、不发 tools/list
+            // ——表现为「连上了但工具是空壳」。我们无状态，会话 ID 仅作握手合规用，不校验其回传。
+            if is_initialize {
+                if let Ok(v) = hyper::header::HeaderValue::from_str(&new_session_id()) {
+                    resp.headers_mut().insert("mcp-session-id", v);
+                }
+            }
+            Ok(resp)
+        }
         Err((code, message)) => Ok(json_response(
             StatusCode::OK,
             rpc_error(id, code, &message),
         )),
     }
+}
+
+/// 生成一个会话 ID（Streamable HTTP 的 Mcp-Session-Id）。无状态服务，仅为握手合规。
+fn new_session_id() -> String {
+    // 用时间戳 + 进程内自增，避免引入 uuid 依赖；唯一性对本用途足够。
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("synaroute-{ts:x}-{n:x}")
 }
 
 // ─── JSON-RPC 分发 ───────────────────────────────────────────────────────────
@@ -236,21 +466,51 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
+/// 不依赖运行态（Store / 主应用）的静态 MCP 方法：握手、心跳、工具/资源/提示词列举。
+/// stdio 与 HTTP 两条路径共用此表，保证行为一致、单一事实源。
+///
+/// 返回 `Some(..)` 表示已处理；`None` 表示交由调用方处理（目前仅 `tools/call`，
+/// 因两条路径去向不同：stdio 转发到主应用，HTTP 本地执行）。
+///
+/// 关键：`resources/list`、`resources/templates/list`、`prompts/list` 即便本服务
+/// 不提供，也必须返回**空列表**而非 -32601。Codex 桌面端（protocol 2025-06-18）在
+/// initialize 后会探测这些方法，收到 error 会判定 server 启动失败并 cancel 整个连接，
+/// 导致 synaroute_ai 进不了工具目录（模型侧表现为「没有这个工具」）。
+fn local_static_response(method: &str, params: &Value) -> Option<Result<Value, (i64, String)>> {
+    match method {
+        // 回显客户端请求的 protocolVersion：rmcp（Codex 用的客户端）会协商版本，服务器硬编码
+        // 旧版而客户端要更新版时，握手被判不完整、后续 tools/list 拿不到工具。回显即对齐；
+        // 客户端未带时兜底用我们支持的默认版本。
+        "initialize" => {
+            let ver = params
+                .get("protocolVersion")
+                .and_then(|v| v.as_str())
+                .unwrap_or(PROTOCOL_VERSION);
+            Some(Ok(json!({
+                "protocolVersion": ver,
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "SynaRoute", "version": env!("CARGO_PKG_VERSION") }
+            })))
+        }
+        "ping" => Some(Ok(json!({}))),
+        "tools/list" => Some(Ok(json!({ "tools": [tool_schema()] }))),
+        "resources/list" => Some(Ok(json!({ "resources": [] }))),
+        "resources/templates/list" => Some(Ok(json!({ "resourceTemplates": [] }))),
+        "prompts/list" => Some(Ok(json!({ "prompts": [] }))),
+        "tools/call" => None,
+        other => Some(Err((-32601, format!("未知方法: {other}")))),
+    }
+}
+
 async fn dispatch(
     store: &Arc<Store>,
     method: &str,
     params: Value,
 ) -> Result<Value, (i64, String)> {
-    match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "SynaRoute", "version": env!("CARGO_PKG_VERSION") }
-        })),
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": [tool_schema()] })),
-        "tools/call" => handle_tool_call(store, params).await,
-        other => Err((-32601, format!("未知方法: {other}"))),
+    match local_static_response(method, &params) {
+        Some(res) => res,
+        // tools/call：HTTP 路径本地执行（主应用持有真实配置）。
+        None => handle_tool_call(store, params).await,
     }
 }
 
@@ -470,4 +730,106 @@ fn tool_error_content(text: &str) -> Value {
         "content": [ { "type": "text", "text": text } ],
         "isError": true
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // initialize 必须回显客户端请求的 protocolVersion（而非硬编码旧版）。
+    // rmcp/Codex 协商更新版本时，服务器回显旧版会致握手不完整、tools/list 拿不到工具。
+    #[tokio::test]
+    async fn initialize_echoes_client_protocol_version() {
+        let dir = std::env::temp_dir().join(format!("mcp_init_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let store = Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let params = json!({ "protocolVersion": "2025-06-18" });
+        let res = dispatch(&store, "initialize", params).await.unwrap();
+        assert_eq!(
+            res.get("protocolVersion").and_then(|v| v.as_str()),
+            Some("2025-06-18"),
+            "应回显客户端请求的协议版本"
+        );
+        assert!(res.get("capabilities").and_then(|c| c.get("tools")).is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // 客户端未带 protocolVersion 时回落到服务器默认版本（不 panic、不返回 null）。
+    #[tokio::test]
+    async fn initialize_falls_back_to_default_version() {
+        let dir = std::env::temp_dir().join(format!("mcp_initf_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let store = Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let res = dispatch(&store, "initialize", Value::Null).await.unwrap();
+        assert_eq!(
+            res.get("protocolVersion").and_then(|v| v.as_str()),
+            Some(PROTOCOL_VERSION),
+            "无客户端版本时用默认版本兜底"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // tools/list 必须返回 synaroute_ai 工具及必填参数 schema（Codex 据此才能真正挂上工具）。
+    #[tokio::test]
+    async fn tools_list_exposes_synaroute_ai() {
+        let dir = std::env::temp_dir().join(format!("mcp_tools_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let store = Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let res = dispatch(&store, "tools/list", Value::Null).await.unwrap();
+        let tools = res.get("tools").and_then(|t| t.as_array()).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].get("name").and_then(|n| n.as_str()), Some("synaroute_ai"));
+        let required = tools[0]
+            .get("inputSchema")
+            .and_then(|s| s.get("required"))
+            .and_then(|r| r.as_array())
+            .unwrap();
+        assert!(required.iter().any(|v| v.as_str() == Some("prompt")), "prompt 必填");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Codex 桌面端（protocol 2025-06-18）在 initialize 后会探测 resources/prompts。
+    // 这些方法即便我们不提供也必须返回空列表——返回 -32601 会被客户端判定为启动失败并
+    // cancel 整个连接，synaroute_ai 就进不了工具目录（曾致「工具不存在」惨案）。
+    // 用 local_static_response（stdio 与 HTTP dispatch 共用同一表）锁死此行为。
+    #[test]
+    fn capability_probes_never_error() {
+        for (method, key) in [
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resourceTemplates"),
+            ("prompts/list", "prompts"),
+        ] {
+            let res = local_static_response(method, &Value::Null)
+                .unwrap_or_else(|| panic!("{method} 应由静态表处理，而非落到 tools/call"))
+                .unwrap_or_else(|e| panic!("{method} 不得返回 error（会致客户端 cancel）: {e:?}"));
+            let arr = res.get(key).and_then(|v| v.as_array());
+            assert!(arr.is_some(), "{method} 应返回 {{{key}: []}}");
+            assert!(arr.unwrap().is_empty(), "{method} 默认返回空列表");
+        }
+    }
+
+    // 未知方法仍应返回 -32601（回归保护：容错只针对已知能力探测，不是无脑吞所有方法）。
+    #[test]
+    fn unknown_method_still_errors() {
+        let res = local_static_response("does/not/exist", &Value::Null);
+        match res {
+            Some(Err((code, _))) => assert_eq!(code, -32601),
+            other => panic!("未知方法应返回 -32601，实际: {other:?}"),
+        }
+    }
+
+    // session id 唯一（每次 initialize 下发不同值，供严格客户端完成握手）。
+    #[test]
+    fn session_ids_are_unique() {
+        let a = new_session_id();
+        let b = new_session_id();
+        assert_ne!(a, b);
+        assert!(a.starts_with("synaroute-"));
+    }
 }

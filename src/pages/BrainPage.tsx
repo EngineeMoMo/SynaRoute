@@ -11,7 +11,7 @@ import { useT } from "@/lib/useT";
 import type { TFunc } from "@/lib/i18n";
 import type { AggregateMode, BrainConfig, CategoryType, ProviderKey } from "@/types";
 import type { RecentWorkdir } from "@/types";
-import { Brain, Info, Save, Plus, X, FolderOpen, Play, CheckCircle, History, Activity, ChevronDown } from "lucide-react";
+import { Brain, Info, Save, Plus, X, FolderOpen, Play, CheckCircle, History, Activity, ChevronDown, Wand2, Plug } from "lucide-react";
 
 const CATEGORIES: { value: CategoryType; tKey: string }[] = [
   { value: "claude-cli", tKey: "nav.claude-cli" },
@@ -32,6 +32,10 @@ export function BrainPage() {
   const [saved, setSaved] = useState(false);
 
   const [checkingId, setCheckingId] = useState<string | null>(null);
+  // 本分类是否已把 synaroute MCP 写进对应客户端配置（Codex config.toml / CLI ~/.claude.json）。
+  // 与聚合配置分开：聚合配好只是「有内容」，还得接入客户端，客户端才能调 synaroute_ai。
+  const [mcpRegistered, setMcpRegistered] = useState<boolean | null>(null);
+  const [mcpBusy, setMcpBusy] = useState(false);
 
   // 自定义厂商图标查找（成员行的品牌图标用）
   const vendorIcon = (vid?: string) => vendors.find((v) => v.id === vid)?.icon;
@@ -43,13 +47,34 @@ export function BrainPage() {
   useEffect(() => {
     setConfig(null);
     setSaved(false);
-    void Promise.all([api.getBrainConfig(category), api.listKeys(category)]).then(
-      ([cfg, ks]) => {
+    setMcpRegistered(null);
+    void Promise.all([api.getBrainConfig(category), api.listKeys(category), api.getToolConfigPreview(category)]).then(
+      ([cfg, ks, preview]) => {
         setConfig(cfg);
         setKeys(ks);
+        setMcpRegistered(preview.mcpRegistered);
       }
     );
   }, [category]);
+
+  // 一键接入/断开：把本分类的 synaroute MCP 写入（或移出）对应客户端配置。
+  // 免去用户绕到「配置预览」弹窗底部——配好聚合的地方直接接入。
+  const toggleMcp = async () => {
+    setMcpBusy(true);
+    try {
+      if (mcpRegistered) {
+        await api.unregisterMcpForCategory(category);
+        setMcpRegistered(false);
+      } else {
+        await api.registerMcpForCategory(category);
+        setMcpRegistered(true);
+      }
+    } catch (e) {
+      showToast("error", String((e as Error)?.message ?? e));
+    } finally {
+      setMcpBusy(false);
+    }
+  };
 
   // 对单个 Key 触发健康检测并就地刷新（本页维护独立 keys 状态，不走全局 store）
   const checkKeyHealth = async (keyId: string) => {
@@ -98,6 +123,34 @@ export function BrainPage() {
     update({ members: config.members.filter((m) => !(m.keyId === keyId && m.modelName === model)) });
   };
 
+  // 一键快速配置：把当前分类所有启用 Key 各取首个模型加为成员，并自动选第一个作决策者。
+  // 解决空白配置无从下手的门槛——用户点一下即得可用配置，再按需微调。
+  // 已有配置时不覆盖决策者/成员，只补齐缺的（幂等、不破坏用户已调的选择）。
+  const quickFill = () => {
+    if (!config) return;
+    // 候选：启用且有已知模型的 Key（没拉到模型的没法自动选，跳过）。
+    const usable = keys.filter((k) => k.enabled && k.models.length > 0);
+    if (usable.length === 0) {
+      showToast("error", t("brain.quickFillNoKeys"));
+      return;
+    }
+    // 成员：每个可用 Key 首个模型，跳过已在成员里的（幂等）。
+    const existing = new Set(config.members.map((m) => `${m.keyId}::${m.modelName}`));
+    const added = [...config.members];
+    for (const k of usable) {
+      const model = k.models[0].realName;
+      const ref = `${k.id}::${model}`;
+      if (!existing.has(ref)) {
+        added.push({ id: `bm_${k.id}_${model}`, keyId: k.id, modelName: model });
+        existing.add(ref);
+      }
+    }
+    // 决策者：未选则默认第一个可用 Key 的首个模型。
+    const decider = config.deciderRef || `${usable[0].id}::${usable[0].models[0].realName}`;
+    update({ members: added, deciderRef: decider, enabled: true });
+    showToast("success", t("brain.quickFillDone", { n: added.length }));
+  };
+
   // 就地改成员模型（无需删了重加）。避免与同 Key 下已有成员重复。
   const updateMemberModel = (memberId: string, newModel: string) => {
     if (!config || !newModel.trim()) return;
@@ -134,10 +187,47 @@ export function BrainPage() {
           </CardContent>
         </Card>
 
+        {/* 接入到客户端：配好聚合后一键把 synaroute MCP 写进对应客户端配置（本分类），
+            免去绕到「配置预览」弹窗底部。这是「客户端能不能调 synaroute_ai」的关键一步。 */}
+        <Card>
+          <CardContent className="flex items-center justify-between pt-4">
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2 text-sm font-medium text-text-primary">
+                {t("brain.mcpConnectTitle")}
+                {mcpRegistered != null && (
+                  <Badge variant={mcpRegistered ? "success" : "neutral"}>
+                    {mcpRegistered ? t("brain.mcpConnected") : t("brain.mcpNotConnected")}
+                  </Badge>
+                )}
+              </div>
+              <div className="mt-0.5 text-xs text-text-muted">
+                {t("brain.mcpConnectDesc", { client: t(`nav.${category}`) })}
+              </div>
+            </div>
+            <Button
+              size="sm"
+              variant={mcpRegistered ? "outline" : "primary"}
+              disabled={mcpBusy || mcpRegistered == null}
+              onClick={() => void toggleMcp()}
+            >
+              <Plug size={14} />
+              {mcpBusy
+                ? t("common.loading")
+                : mcpRegistered
+                  ? t("brain.mcpDisconnect")
+                  : t("brain.mcpConnect")}
+            </Button>
+          </CardContent>
+        </Card>
+
         {/* 成员选择（FR-014）——先选 Key 再二级选模型，不默认带入所有 Key */}
         <Card>
-          <CardHeader>
+          <CardHeader className="flex flex-row items-center justify-between space-y-0">
             <CardTitle>{t("brain.membersTitle")}</CardTitle>
+            {/* 一键快速配置：新用户免去逐个手选，点一下自动填成员 + 决策者 */}
+            <Button size="sm" variant="secondary" onClick={quickFill} title={t("brain.quickFillHint")}>
+              <Wand2 size={14} /> {t("brain.quickFill")}
+            </Button>
           </CardHeader>
           <CardContent className="space-y-3">
             {keys.length === 0 ? (
