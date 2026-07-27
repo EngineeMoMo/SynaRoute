@@ -361,8 +361,20 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async stopProxy() {
-    const proxy = await api.stopProxy(get().activeCategory);
+    const cat = get().activeCategory;
+    const proxy = await api.stopProxy(cat);
     set({ proxy });
+    // 停止即退出接入态：还原目标工具配置（Codex 会连同 auth.json 一起复原，
+    // 用户官方 OAuth 登录立即恢复，无需手动拷备份或重新登录）。
+    // 还原失败不阻断停止（代理已停），仅弹提示告知。
+    try {
+      await api.restoreToolConfig(cat);
+      if (get().configAppliedCategory === cat) set({ configAppliedCategory: null });
+      await get().loadCategory(cat);
+    } catch (e) {
+      console.error("restoreToolConfig after stop failed", e);
+      get().showToast("error", String((e as Error)?.message ?? e));
+    }
   },
 
   async setActiveModel(category, model) {

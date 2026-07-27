@@ -23,6 +23,10 @@ use std::path::{Path, PathBuf};
 /// 备份文件后缀
 const BACKUP_SUFFIX: &str = "synaroute.bak";
 
+/// Codex auth.json 的 `OPENAI_API_KEY` 占位值。接入时写入（Codex 需非空 key 才走鉴权流程），
+/// 真实密钥由代理按路由 Key 注入、代理侧不校验此值。还原时用它识别「接入凭空新建的 auth.json」。
+const CODEX_AUTH_PLACEHOLDER: &str = "synaroute-proxy";
+
 /// 将某分类的代理端点写入对应目标工具配置。返回人类可读的结果说明。
 ///
 /// `default_model`：当前分类「主 Key」首个可服务对外名（与 `/v1/models` 口径一致）。
@@ -149,22 +153,25 @@ fn apply_codex(endpoint: &str, default_model: Option<&str>) -> AppResult<String>
     })
 }
 
-/// 幂等合并写入 Codex auth.json：仅设置/补齐 `OPENAI_API_KEY` 占位，保留其余字段。
-/// 已是目标占位值则不写盘。
+/// 写入 Codex auth.json 的 `OPENAI_API_KEY` 占位（接入需非空 key 才走鉴权流程）。
+///
+/// **整份替换为纯占位，不 merge 进原有字段**——关键修复：
+/// ChatGPT OAuth 用户的 auth.json 含 `tokens.*`（access/refresh/id_token）且 `OPENAI_API_KEY` 为空。
+/// 若把占位符 merge 进去，会造出「OAuth tokens + 占位 key」混合态：Codex 桌面端据此判定为 api-key 模式、
+/// 不再认 ChatGPT 账号的 Codex 权限 → 账号门「You don't have access to Codex」。
+/// 故这里整份替换为 `{OPENAI_API_KEY: 占位}`，让 Codex 干净地走 api-key 模式（经 synaroute provider 到本地代理）。
+/// 原 OAuth 字段由 backup_and_write_bytes 完整存入 `.synaroute.bak`，停止代理还原时凭它恢复官方登录。
 fn write_codex_auth(path: &Path) -> AppResult<()> {
-    const PLACEHOLDER: &str = "synaroute-proxy";
-    let mut root = read_json_or_empty(path)?;
-    let obj = root
-        .as_object_mut()
-        .ok_or_else(|| AppError::ToolConfig("auth.json 顶层非对象".into()))?;
-    // 幂等：已有任意非空 OPENAI_API_KEY 则保留不动（避免覆盖用户真实 key / 反复写盘）。
-    if let Some(Value::String(existing)) = obj.get("OPENAI_API_KEY") {
+    let root = read_json_or_empty(path)?;
+    // 幂等/保护：已有任意非空 OPENAI_API_KEY（用户真实 api-key，或上次写的占位）则不动，
+    // 避免覆盖用户真实 key、反复写盘、以及把已接入内容再拷进 .bak。
+    if let Some(Value::String(existing)) = root.as_object().and_then(|o| o.get("OPENAI_API_KEY")) {
         if !existing.trim().is_empty() {
             return Ok(());
         }
     }
-    obj.insert("OPENAI_API_KEY".into(), Value::String(PLACEHOLDER.into()));
-    backup_and_write_json(path, &root)
+    let pure = serde_json::json!({ "OPENAI_API_KEY": CODEX_AUTH_PLACEHOLDER });
+    backup_and_write_json(path, &pure)
 }
 
 /// 写入 Codex 的自定义 provider 指向本地代理。
@@ -181,7 +188,8 @@ fn write_codex_auth(path: &Path) -> AppResult<()> {
 ///   OPENAI_API_KEY（由 write_codex_auth 写占位），故**不写 env_key**——避免让 Codex 改从
 ///   环境变量读 key、重新引入「用户手设环境变量」负担。真实密钥仍由代理按路由 Key 注入。
 ///
-/// 幂等：目标值已写则不重复。保留 config.toml 其余表（mcp_servers 等）不动。
+/// 幂等：序列化结果与磁盘现有内容一致时，backup_and_write_bytes 会短路（不备份不写），
+/// 故重复接入不会把已接入的 config 覆盖进 .synaroute.bak。保留 config.toml 其余表（mcp_servers 等）不动。
 fn apply_codex_at(path: &Path, endpoint: &str, default_model: Option<&str>) -> AppResult<String> {
     let content = if path.exists() {
         std::fs::read_to_string(path)?
@@ -589,13 +597,20 @@ fn backup_and_write_bytes(path: &Path, data: &[u8]) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // 幂等 + 保护备份：新内容与磁盘现有内容完全一致时，不备份也不写盘。
+    // 关键：杜绝「重复接入」把已接入的内容再拷进 .synaroute.bak，冲掉用户接入前的原始备份
+    // （否则 restore 只能还原出「已接入」态，官方 config / OAuth 登录再也回不来）。
+    // 首次接入时新旧内容不同 → 正常备份原文件；此后再接入内容相同 → 直接跳过，.bak 保持原始态。
+    if path.exists() {
+        if let Ok(current) = std::fs::read(path) {
+            if current == data {
+                return Ok(());
+            }
+        }
+    }
     // 规则1：改写前备份原文件
     if path.exists() {
-        let backup = path.with_extension(match path.extension().and_then(|e| e.to_str()) {
-            Some(ext) => format!("{ext}.{BACKUP_SUFFIX}"),
-            None => BACKUP_SUFFIX.to_string(),
-        });
-        std::fs::copy(path, &backup)?;
+        std::fs::copy(path, backup_path_for(path))?;
     }
     // 规则2：原子写
     crate::secret::atomic_write(path, data)
@@ -643,23 +658,76 @@ fn with_rollback<T>(
     }
 }
 
-/// 还原某工具配置（从 .synaroute.bak 恢复）
+/// 某文件对应的 `.synaroute.bak` 备份路径。
+fn backup_path_for(path: &Path) -> PathBuf {
+    path.with_extension(match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.{BACKUP_SUFFIX}"),
+        None => BACKUP_SUFFIX.to_string(),
+    })
+}
+
+/// 从 `.synaroute.bak` 还原单个文件；备份不存在则返回 false（跳过，不报错）。
+fn restore_one(path: &Path) -> AppResult<bool> {
+    let backup = backup_path_for(path);
+    if !backup.exists() {
+        return Ok(false);
+    }
+    let data = std::fs::read(&backup)?;
+    crate::secret::atomic_write(path, &data)?;
+    Ok(true)
+}
+
+/// auth.json 是否为「接入凭空新建的纯占位符文件」：顶层对象恰好只有 `OPENAI_API_KEY` 且值为占位符。
+/// 用于还原时安全清理——严格要求无其它字段（尤其不能含 OAuth 的 `tokens` 段），杜绝误删真实凭证。
+fn is_placeholder_only_auth(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    obj.len() == 1
+        && matches!(obj.get("OPENAI_API_KEY"), Some(Value::String(v)) if v == CODEX_AUTH_PLACEHOLDER)
+}
+
+/// 还原某工具配置（从 .synaroute.bak 恢复）。
+///
+/// 与接入对称：接入时 Codex 双文件写（config.toml + auth.json，见 apply_codex），
+/// 故还原也必须双文件——否则断开后 config.toml 复原、auth.json 仍卡在占位符，
+/// 用户官方登录（ChatGPT OAuth 令牌）不会自动回来。
+///
+/// 「无备份」不视为错误：还原由「停止代理」自动触发，从未接入过的分类本就没有 .bak，
+/// 此时已处于接入前状态，返回成功（无需还原），避免每次停止都弹误报错。
+/// Codex 的 auth.json 备份仅在存在时还原（用户接入前无 auth.json 则本就无此备份）。
 pub fn restore(category: CategoryType) -> AppResult<String> {
     let path = match category {
         CategoryType::ClaudeCli => claude_cli_settings_path()?,
         CategoryType::Codex => codex_config_path()?,
         CategoryType::ClaudeDesktop => claude_desktop_config_path()?,
     };
-    let backup = path.with_extension(match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.{BACKUP_SUFFIX}"),
-        None => BACKUP_SUFFIX.to_string(),
-    });
-    if !backup.exists() {
-        return Err(AppError::ToolConfig("未找到备份文件".into()));
+    let mut restored = Vec::new();
+    if restore_one(&path)? {
+        restored.push(path.display().to_string());
     }
-    let data = std::fs::read(&backup)?;
-    crate::secret::atomic_write(&path, &data)?;
-    Ok(format!("已从备份还原：{}", path.display()))
+    // Codex 接入会额外覆盖 auth.json（写占位 OPENAI_API_KEY，原 OAuth 令牌被拷入 .bak）。
+    // 还原须一并把 auth.json 复原，用户官方登录才会立即恢复、无需重新登录。
+    if category == CategoryType::Codex {
+        let auth_path = codex_auth_path()?;
+        if restore_one(&auth_path)? {
+            restored.push(auth_path.display().to_string());
+        } else if is_placeholder_only_auth(&auth_path) {
+            // 无 .bak 说明接入前本无 auth.json（接入凭空建了纯占位符文件）。删除它，
+            // 让用户回到接入前的「无 auth.json」态，避免残留占位符 key 干扰官方鉴权。
+            // 严格守卫已确保只删纯占位符文件、不碰含 OAuth tokens 的真实凭证。
+            std::fs::remove_file(&auth_path)?;
+            restored.push(format!("{}（清除占位）", auth_path.display()));
+        }
+    }
+    if restored.is_empty() {
+        Ok("无备份，无需还原（未接入或已还原）".into())
+    } else {
+        Ok(format!("已从备份还原：{}", restored.join("、")))
+    }
 }
 
 // ---- 只读预览（阶段 2：不编辑，只展示路径与脱敏正文）----
@@ -794,6 +862,11 @@ fn redact_config_secrets(s: &str) -> String {
         "OPENAI_API_KEY",
         "api_key",
         "apiKey",
+        // Codex 官方 ChatGPT OAuth 登录的令牌（auth.json 的 tokens.* 段）：均为 JWT，
+        // 不带 sk- 前缀，故按键名单独脱敏，避免只读预览面板把访问/刷新令牌明文回传前端。
+        "access_token",
+        "refresh_token",
+        "id_token",
     ] {
         out = redact_json_string_field(&out, key);
     }
@@ -1285,6 +1358,163 @@ mod tests {
             "其它 MCP 应保留"
         );
 
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn restore_one_recovers_from_backup() {
+        // backup_and_write_bytes 先备份原文件、再写新内容；restore_one 应把原内容还原回来。
+        let path = temp_file("restore_one", "auth.json");
+        std::fs::write(&path, b"ORIGINAL_OAUTH").unwrap();
+
+        // 模拟接入：备份原文件并写入占位内容。
+        backup_and_write_bytes(&path, b"PLACEHOLDER").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"PLACEHOLDER");
+
+        // 断开还原：应从 .synaroute.bak 拿回原内容。
+        let ok = restore_one(&path).unwrap();
+        assert!(ok, "备份存在应还原并返回 true");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"ORIGINAL_OAUTH",
+            "restore_one 应还原到接入前的原始内容"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn restore_one_skips_when_no_backup() {
+        // 备份不存在（如用户接入前无 auth.json）：应返回 false 且不报错、不动目标文件。
+        let path = temp_file("restore_none", "auth.json");
+        std::fs::write(&path, b"UNTOUCHED").unwrap();
+
+        let ok = restore_one(&path).unwrap();
+        assert!(!ok, "无备份应返回 false");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"UNTOUCHED",
+            "无备份时不应改动目标文件"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn repeated_apply_does_not_clobber_backup() {
+        // Q4 回归：重复接入（内容相同）不得把已接入内容再拷进 .bak，否则冲掉接入前的原始备份。
+        let path = temp_file("no_clobber", "config.toml");
+        std::fs::write(&path, b"OFFICIAL_CONFIG").unwrap();
+
+        // 首次接入：原始官方内容进 .bak，写入「已接入」内容。
+        backup_and_write_bytes(&path, b"SYNAROUTE_CONFIG").unwrap();
+        let backup = backup_path_for(&path);
+        assert_eq!(std::fs::read(&backup).unwrap(), b"OFFICIAL_CONFIG");
+
+        // 二次接入（内容相同）：内容相等守卫应短路，.bak 必须仍是官方内容、不被覆盖。
+        backup_and_write_bytes(&path, b"SYNAROUTE_CONFIG").unwrap();
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"OFFICIAL_CONFIG",
+            "重复接入不得把已接入内容覆盖进 .bak（否则官方配置备份永久丢失）"
+        );
+
+        // 还原应拿回官方内容。
+        assert!(restore_one(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"OFFICIAL_CONFIG");
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn restore_removes_placeholder_only_auth_without_backup() {
+        // Q3 回归：接入前无 auth.json → 接入凭空建纯占位符文件 → 无 .bak。
+        // 还原应删除该占位符文件，让用户回到接入前「无 auth.json」态。
+        let path = temp_file("ph_auth", "auth.json");
+        std::fs::write(&path, br#"{"OPENAI_API_KEY":"synaroute-proxy"}"#).unwrap();
+
+        assert!(
+            is_placeholder_only_auth(&path),
+            "纯占位符文件应被识别"
+        );
+
+        // 含 OAuth tokens 的真实凭证绝不能被识别为占位符（防误删）。
+        let real = temp_file("real_auth", "auth.json");
+        std::fs::write(
+            &real,
+            br#"{"OPENAI_API_KEY":"synaroute-proxy","tokens":{"access_token":"x"}}"#,
+        )
+        .unwrap();
+        assert!(
+            !is_placeholder_only_auth(&real),
+            "含 tokens 的文件不得被当作纯占位符（否则会误删 OAuth 凭证）"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        std::fs::remove_dir_all(real.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn redact_masks_oauth_tokens() {
+        // Q5 回归：ChatGPT OAuth 令牌（JWT，非 sk- 前缀）必须按键名脱敏，不得明文出现在预览里。
+        let raw = r#"{"tokens":{"access_token":"eyJhbGciOiJ.SECRET.SIG","refresh_token":"rt-abc123","id_token":"eyJ.id.tok"}}"#;
+        let out = redact_config_secrets(raw);
+        assert!(!out.contains("eyJhbGciOiJ.SECRET.SIG"), "access_token 明文不得残留");
+        assert!(!out.contains("rt-abc123"), "refresh_token 明文不得残留");
+        assert!(!out.contains("eyJ.id.tok"), "id_token 明文不得残留");
+        assert!(out.contains("***"), "应替换为脱敏占位");
+    }
+
+    #[test]
+    fn write_codex_auth_replaces_oauth_with_pure_placeholder() {
+        // ChatGPT OAuth 用户：auth.json 含 tokens.* 且 OPENAI_API_KEY 为空。
+        // 接入应写「纯占位」（不 merge 进 tokens，避免 Codex 账号门混合态），OAuth 原文完整进 .bak。
+        let path = temp_file("codex_auth_pure", "auth.json");
+        std::fs::write(
+            &path,
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"eyJ.a.b","refresh_token":"rt-1","id_token":"eyJ.c.d","account_id":"acc-1"}}"#,
+        )
+        .unwrap();
+
+        write_codex_auth(&path).unwrap();
+
+        // 活文件：纯占位，无任何 OAuth 残留。
+        let live: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let obj = live.as_object().unwrap();
+        assert_eq!(obj.len(), 1, "活 auth.json 应只剩纯占位");
+        assert_eq!(obj["OPENAI_API_KEY"], Value::String(CODEX_AUTH_PLACEHOLDER.into()));
+        assert!(live.get("tokens").is_none(), "活文件不得残留 OAuth tokens");
+
+        // 备份：完整 OAuth，供还原恢复官方登录。
+        let bak: Value =
+            serde_json::from_slice(&std::fs::read(backup_path_for(&path)).unwrap()).unwrap();
+        assert_eq!(bak["auth_mode"], Value::String("chatgpt".into()));
+        assert!(bak["tokens"]["access_token"].is_string(), "备份应含完整 OAuth tokens");
+
+        // 幂等：再次接入不动（占位已非空）。
+        write_codex_auth(&path).unwrap();
+        let live2: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(live2, live, "重复接入应幂等、不改动活文件");
+        // .bak 仍是 OAuth（未被占位覆盖）。
+        let bak2: Value =
+            serde_json::from_slice(&std::fs::read(backup_path_for(&path)).unwrap()).unwrap();
+        assert!(bak2["tokens"]["access_token"].is_string(), "幂等重入后 .bak 仍须是 OAuth");
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn write_codex_auth_preserves_real_api_key() {
+        // api-key 用户：已有真实非空 OPENAI_API_KEY → 幂等不动，不覆盖用户真实 key。
+        let path = temp_file("codex_auth_real", "auth.json");
+        std::fs::write(&path, br#"{"OPENAI_API_KEY":"sk-real-user-key-value"}"#).unwrap();
+        write_codex_auth(&path).unwrap();
+        let live: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            live["OPENAI_API_KEY"],
+            Value::String("sk-real-user-key-value".into()),
+            "真实 api-key 不得被占位覆盖"
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

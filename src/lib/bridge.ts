@@ -105,6 +105,11 @@ export const api = {
   applyToolConfig: (categoryId: CategoryType) =>
     call<string>("apply_tool_config", { categoryId }, () => mockBridge.applyToolConfig(categoryId)),
 
+  // 从 .synaroute.bak 还原目标工具配置（停止代理时调用，恢复接入前状态）。
+  // Codex 会一并还原 auth.json，让被占位符覆盖的官方 OAuth 登录自动回来。
+  restoreToolConfig: (categoryId: CategoryType) =>
+    call<string>("restore_tool_config", { categoryId }, async () => ""),
+
   /** 只读预览：三端路径/内容不同（CLI settings / Codex toml+auth / 桌面 config），token 已脱敏 */
   getToolConfigPreview: (categoryId: CategoryType) =>
     call<ToolConfigPreview>(
