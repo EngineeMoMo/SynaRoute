@@ -209,12 +209,14 @@ async fn set_proxy_port(
     let bound = state.proxy.start(category_id).await?;
     // 重写该分类客户端 config，指向实际绑定端口（可能因占用回退，用真实值）。
     let endpoint = format!("http://127.0.0.1:{bound}");
-    let default_model = state
+    // 主 Key 可服务对外名列表：CLI/Codex 内部取首个；桌面端整份写进 inferenceModels。
+    let models = state
         .store
         .enabled_keys_sorted(category_id)
         .first()
-        .and_then(|k| k.serviceable_models().into_iter().next());
-    if let Err(e) = tools::apply(category_id, &endpoint, default_model.as_deref()) {
+        .map(|k| k.serviceable_models())
+        .unwrap_or_default();
+    if let Err(e) = tools::apply(category_id, &endpoint, &models) {
         state.store.append_event(
             category_id,
             "error",
@@ -247,16 +249,17 @@ async fn apply_tool_config(
     // 确保代理已启动
     let port = state.proxy.start(category_id).await?;
     let endpoint = format!("http://127.0.0.1:{port}");
-    // 默认模型（三端语义不同，禁止混写）：
-    // - Claude CLI：env.ANTHROPIC_MODEL + 顶层 model（对外名；策略 A 不写 DEFAULT_*）
-    // - Codex：config.toml 的 model（OpenAI 形态，无 ANTHROPIC_*）
-    // - 桌面端：忽略 default_model
-    let default_model = state
+    // 可服务对外名列表（三端语义不同，禁止混写）：
+    // - Claude CLI：取首个写 env.ANTHROPIC_MODEL + 顶层 model（对外名；策略 A 不写 DEFAULT_*）
+    // - Codex：取首个写 config.toml 的 model（OpenAI 形态，无 ANTHROPIC_*）
+    // - 桌面端：整份写进 gateway 档的 inferenceModels（3p 部署模式，见 tools::apply_claude_desktop）
+    let models = state
         .store
         .enabled_keys_sorted(category_id)
         .first()
-        .and_then(|k| k.serviceable_models().into_iter().next());
-    let msg = tools::apply(category_id, &endpoint, default_model.as_deref())?;
+        .map(|k| k.serviceable_models())
+        .unwrap_or_default();
+    let msg = tools::apply(category_id, &endpoint, &models)?;
     state
         .store
         .append_event(category_id, "config", None, &format!("写入工具配置: {endpoint}"));

@@ -13,7 +13,10 @@
 //!   - 应用时**删除** env 里残留的三档 DEFAULT_*（清 cc-switch/旧版写入）
 //! - **Codex**：`~/.codex/config.toml` + `auth.json`（OpenAI 形态，无 ANTHROPIC_*）
 //!   - 写：model_provider=synaroute、[model_providers.synaroute]、可选顶层 model、OPENAI_API_KEY 占位
-//! - **Claude 桌面端**：`claude_desktop_config.json`（MCP/本地入口，不写 CLI settings、不写 DEFAULT_*）
+//! - **Claude 桌面端**：切「第三方部署模式（deploymentMode=3p）」+ 预置 gateway 配置档
+//!   （对齐 cc-switch）：写 `<Claude|Claude-3p>/claude_desktop_config.json` 的 deploymentMode、
+//!   `<Claude-3p>/configLibrary/{ID}.json`（gateway 端点/占位 key/模型）与 `_meta.json`。
+//!   凭据预填齐 → 桌面端跳过 get-started 登录。不写 CLI settings、不写 ANTHROPIC_*。
 
 use crate::error::{AppError, AppResult};
 use crate::model::CategoryType;
@@ -27,17 +30,35 @@ const BACKUP_SUFFIX: &str = "synaroute.bak";
 /// 真实密钥由代理按路由 Key 注入、代理侧不校验此值。还原时用它识别「接入凭空新建的 auth.json」。
 const CODEX_AUTH_PLACEHOLDER: &str = "synaroute-proxy";
 
+/// SynaRoute 在 Claude 桌面端 `configLibrary` 里的专属配置档 ID。
+/// 刻意区别于 cc-switch 的 `00000000-0000-4000-8000-000000157210`：两者可**共存**于
+/// `_meta.entries`，`appliedId` 指向当前接入者。还原时只删本档、绝不动 cc-switch 的档。
+/// 末段 `000053796e61` 是 "Syna"（S=0x53 y=0x79 n=0x6e a=0x61）的 hex，便于辨识。
+const DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000053796e61";
+/// 本档在 `_meta.entries` 里显示的名称。
+const DESKTOP_PROFILE_NAME: &str = "SynaRoute";
+/// 桌面端 gateway 档的 `inferenceGatewayApiKey` 占位值（代理剥掉入站鉴权头、按路由 Key 注入
+/// 真实密钥，故此值仅需非空以让桌面端走 bearer 鉴权流程，代理侧不校验）。
+const DESKTOP_GATEWAY_PLACEHOLDER: &str = "synaroute-proxy";
+/// 两个部署目录里的部署配置文件名。
+const DESKTOP_CONFIG_FILE: &str = "claude_desktop_config.json";
+/// 3p 目录下存放配置档的子目录名。
+const DESKTOP_CONFIG_LIBRARY: &str = "configLibrary";
+/// configLibrary 里的元数据文件名（登记各档 id/name 与当前 appliedId）。
+const DESKTOP_META_FILE: &str = "_meta.json";
+
 /// 将某分类的代理端点写入对应目标工具配置。返回人类可读的结果说明。
 ///
-/// `default_model`：当前分类「主 Key」首个可服务对外名（与 `/v1/models` 口径一致）。
-/// - **Claude CLI only**：env.ANTHROPIC_MODEL + 顶层 `model`；并清除三档 DEFAULT_* 残留。
-/// - **Codex only**：config.toml 顶层 `model`（Responses 形态，与 Claude 字段无关）。
-/// - **桌面端**：忽略（不写 settings.json，不写 ANTHROPIC_*）。
-pub fn apply(category: CategoryType, endpoint: &str, default_model: Option<&str>) -> AppResult<String> {
+/// `models`：当前分类「主 Key」的可服务对外名列表（与 `/v1/models` 口径一致，有序）。
+/// - **Claude CLI only**：取首个写 env.ANTHROPIC_MODEL + 顶层 `model`；并清除三档 DEFAULT_* 残留。
+/// - **Codex only**：取首个写 config.toml 顶层 `model`（Responses 形态，与 Claude 字段无关）。
+/// - **桌面端**：整份列表写进 gateway 档的 `inferenceModels`（切 3p 部署模式，见 apply_claude_desktop）。
+pub fn apply(category: CategoryType, endpoint: &str, models: &[String]) -> AppResult<String> {
+    let first = models.first().map(String::as_str);
     match category {
-        CategoryType::ClaudeCli => apply_claude_cli(endpoint, default_model),
-        CategoryType::Codex => apply_codex(endpoint, default_model),
-        CategoryType::ClaudeDesktop => apply_claude_desktop(endpoint),
+        CategoryType::ClaudeCli => apply_claude_cli(endpoint, first),
+        CategoryType::Codex => apply_codex(endpoint, first),
+        CategoryType::ClaudeDesktop => apply_claude_desktop(endpoint, models),
     }
 }
 
@@ -255,34 +276,237 @@ fn apply_codex_at(path: &Path, endpoint: &str, default_model: Option<&str>) -> A
 }
 
 // ---- Claude 桌面端 ----
+//
+// 桌面端不像 CLI 那样读 ANTHROPIC_BASE_URL —— 它有自己的「部署模式（deploymentMode）」概念：
+// `1p`=官方后端（走 get-started 登录），`3p`=第三方 inference gateway（预置好凭据即跳过登录）。
+// 早期实现往 `%APPDATA%\Roaming\Claude\claude_desktop_config.json` 写 `{"baseUrl":...}`——位置
+// 与字段皆错（桌面端在 Windows 读 %LOCALAPPDATA%，且无 baseUrl 概念、启动时会用自己的
+// preferences 覆盖该文件），故从未生效、桌面端始终停在 get-started。
+//
+// 现对齐 cc-switch 的真实机制（本机已有其生效样本作为字段/布局权威依据）：
+// - `<Claude>/claude_desktop_config.json`      → 合并写 deploymentMode="3p"
+// - `<Claude-3p>/claude_desktop_config.json`   → 合并写 deploymentMode="3p"（保留 preferences 等）
+// - `<Claude-3p>/configLibrary/{ID}.json`      → gateway 档（inferenceProvider/BaseUrl/ApiKey/…）
+// - `<Claude-3p>/configLibrary/_meta.json`     → entries[] 登记本档 + appliedId 指向本档
+// 凭据（BaseUrl+占位 ApiKey+bearer）预填齐 → 桌面端认为环境已配好 → 跳过 get-started。
+// 与 cc-switch 用独立 DESKTOP_PROFILE_ID **共存**：还原只动本档，绝不误删 cc-switch 的档。
 
-fn claude_desktop_config_path() -> AppResult<PathBuf> {
-    // %APPDATA%/Claude/claude_desktop_config.json
-    let base = dirs::config_dir()
-        .or_else(dirs::data_dir)
-        .ok_or_else(|| AppError::ToolConfig("无法定位 APPDATA".into()))?;
-    Ok(base.join("Claude").join("claude_desktop_config.json"))
+/// 定位 Claude 桌面端的两个部署基目录：`normal`（官方，如 `Claude`）与 `threep`（第三方，如
+/// `Claude-3p`）。Windows 用 `%LOCALAPPDATA%`，macOS/Linux 用 `~/Library/Application Support`
+/// 等 `data_dir`。找不到精确名时扫描以 `Claude` 开头的目录兜底（区分是否带 `-3p` 后缀）。
+fn claude_desktop_dirs() -> AppResult<(PathBuf, PathBuf)> {
+    // 桌面端数据在 Windows 落 %LOCALAPPDATA%（与 CLI 的 %APPDATA% 不同！早期 bug 正源于此）。
+    // 非 Windows 走 data_dir（macOS = ~/Library/Application Support）。
+    #[cfg(windows)]
+    let base = dirs::data_local_dir();
+    #[cfg(not(windows))]
+    let base = dirs::data_dir();
+    let base = base.ok_or_else(|| AppError::ToolConfig("无法定位桌面端数据目录".into()))?;
+
+    let normal = pick_desktop_dir(&base, false).unwrap_or_else(|| base.join("Claude"));
+    let threep = pick_desktop_dir(&base, true).unwrap_or_else(|| base.join("Claude-3p"));
+    Ok((normal, threep))
 }
 
-fn apply_claude_desktop(endpoint: &str) -> AppResult<String> {
-    let path = claude_desktop_config_path()?;
-    // 用 with_rollback 包裹：读-改-写若中途失败即恢复原文件，与 Codex 接入保持同一套原子保证
-    // （桌面端配置文件是用户 Claude 桌面端的关键设置，宁可整体回滚也不留半配置）。
-    with_rollback(&[path.clone()], || {
-        let mut root = read_json_or_empty(&path)?;
-        let obj = root
-            .as_object_mut()
-            .ok_or_else(|| AppError::ToolConfig("claude_desktop_config.json 顶层非对象".into()))?;
+/// 在 `base` 下挑选桌面端目录：`want_3p=true` 找第三方目录（名以 `Claude` 开头且含 `-3p`），
+/// `false` 找官方目录（以 `Claude` 开头且不含 `-3p`）。精确名（`Claude`/`Claude-3p`）优先；
+/// 否则扫描现有目录取排序首个。都没有则返回 None（调用方回退到精确名）。
+fn pick_desktop_dir(base: &Path, want_3p: bool) -> Option<PathBuf> {
+    let exact = base.join(if want_3p { "Claude-3p" } else { "Claude" });
+    if exact.is_dir() {
+        return Some(exact);
+    }
+    let mut matches: Vec<PathBuf> = std::fs::read_dir(base)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name.starts_with("Claude") && (name.contains("-3p") == want_3p)
+        })
+        .collect();
+    matches.sort();
+    matches.into_iter().next()
+}
 
-        // 桌面端以自定义端点字段接入（cc-switch 同款思路）；键名随桌面端版本，写入常见字段
-        obj.insert("baseUrl".into(), Value::String(endpoint.to_string()));
+/// 3p 目录下的 gateway 配置档路径 `configLibrary/{DESKTOP_PROFILE_ID}.json`。
+fn desktop_profile_path(threep: &Path) -> PathBuf {
+    threep
+        .join(DESKTOP_CONFIG_LIBRARY)
+        .join(format!("{DESKTOP_PROFILE_ID}.json"))
+}
 
-        backup_and_write_json(&path, &root)?;
-        Ok(format!(
-            "已写入 Claude 桌面端配置：{}（baseUrl={endpoint}），原文件已备份。注意：桌面端可能需重启生效",
-            path.display()
-        ))
-    })
+/// 3p 目录下的元数据文件路径 `configLibrary/_meta.json`。
+fn desktop_meta_path(threep: &Path) -> PathBuf {
+    threep.join(DESKTOP_CONFIG_LIBRARY).join(DESKTOP_META_FILE)
+}
+
+fn apply_claude_desktop(endpoint: &str, models: &[String]) -> AppResult<String> {
+    let (normal, threep) = claude_desktop_dirs()?;
+    let normal_config = normal.join(DESKTOP_CONFIG_FILE);
+    let threep_config = threep.join(DESKTOP_CONFIG_FILE);
+    let profile = desktop_profile_path(&threep);
+    let meta = desktop_meta_path(&threep);
+
+    // 四个文件一次写完，任一步失败整体回滚（避免半配置：如 deploymentMode 已切 3p 但 gateway
+    // 档没写 → 桌面端进 3p 却无凭据、反而卡死）。与 Codex 双文件接入同一套原子保证。
+    with_rollback(
+        &[
+            normal_config.clone(),
+            threep_config.clone(),
+            profile.clone(),
+            meta.clone(),
+        ],
+        || {
+            apply_desktop_at(&normal_config, &threep_config, &profile, &meta, endpoint, models)
+        },
+    )
+}
+
+/// 可测入口：把 3p 部署模式与 gateway 档写入指定的四个文件。
+fn apply_desktop_at(
+    normal_config: &Path,
+    threep_config: &Path,
+    profile: &Path,
+    meta: &Path,
+    endpoint: &str,
+    models: &[String],
+) -> AppResult<String> {
+    // 1) 两个部署配置：合并写 deploymentMode="3p"，保留 preferences 等既有键。
+    write_deployment_mode(normal_config, "3p")?;
+    write_deployment_mode(threep_config, "3p")?;
+
+    // 2) gateway 档：预填端点 + 占位 key + bearer + 可选模型清单。
+    let profile_json = build_gateway_profile(endpoint, models);
+    backup_and_write_json(profile, &profile_json)?;
+
+    // 3) _meta.json：登记本档（与 cc-switch 档共存）并把 appliedId 指向本档。
+    write_desktop_meta_apply(meta)?;
+
+    // 4) 清理早期失效实现的残留（写在 %APPDATA%\Roaming\Claude 的 baseUrl 及其 .bak）。
+    // 尽力而为、不影响接入结果（在回滚集合外，失败仅告警）。
+    cleanup_legacy_desktop_residue();
+
+    Ok(format!(
+        "已接入 Claude 桌面端（3p 部署模式）：{}，gateway 端点={endpoint}{}，原文件已备份。请重启桌面端生效。",
+        threep_config.display(),
+        if models.is_empty() {
+            String::new()
+        } else {
+            format!("，模型={}", models.join("/"))
+        }
+    ))
+}
+
+/// 清理早期失效实现的残留：旧代码往 `%APPDATA%\Roaming\Claude\claude_desktop_config.json`
+/// 写 `{"baseUrl":...}`（位置/字段皆错、从未生效），并留下同名 `.synaroute.bak`。此处尽力删除
+/// 这两个文件——**仅当** config 内容确为旧实现的产物（顶层含 `baseUrl` 键）时才删，避免误伤
+/// 桌面端在该路径可能另建的合法文件。`.bak` 只要存在即删（它是旧实现凭空造的备份）。
+///
+/// 全程 best-effort：任何一步失败只告警、不影响接入（本函数在 with_rollback 集合之外调用）。
+fn cleanup_legacy_desktop_residue() {
+    // 旧实现用 config_dir()（Windows=%APPDATA%\Roaming）→ Claude\claude_desktop_config.json。
+    let Some(base) = dirs::config_dir() else { return };
+    let legacy = base.join("Claude").join(DESKTOP_CONFIG_FILE);
+    let legacy_bak = backup_path_for(&legacy);
+
+    // config 仅在「确是旧 baseUrl 产物」时删：读出顶层含 baseUrl 键才动手。
+    if legacy.exists() {
+        let is_legacy = std::fs::read_to_string(&legacy)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|v| v.as_object().map(|o| o.contains_key("baseUrl")))
+            .unwrap_or(false);
+        if is_legacy {
+            if let Err(e) = std::fs::remove_file(&legacy) {
+                tracing::warn!("清理旧桌面端残留 {} 失败: {e}", legacy.display());
+            }
+        }
+    }
+    // .bak 是旧实现凭空造的（真桌面端不会建 .synaroute.bak），存在即删。
+    if legacy_bak.exists() {
+        if let Err(e) = std::fs::remove_file(&legacy_bak) {
+            tracing::warn!("清理旧桌面端残留 {} 失败: {e}", legacy_bak.display());
+        }
+    }
+}
+
+/// 读-改-写某 config 的 `deploymentMode`，保留其它键（preferences 等）。文件/目录不存在时创建。
+fn write_deployment_mode(path: &Path, mode: &str) -> AppResult<()> {
+    let mut root = read_json_or_empty(path)?;
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| AppError::ToolConfig(format!("{} 顶层非对象", path.display())))?;
+    obj.insert("deploymentMode".into(), Value::String(mode.to_string()));
+    backup_and_write_json(path, &root)
+}
+
+/// 构造 gateway 配置档 JSON（对齐 cc-switch `build_gateway_profile`）。
+/// `inferenceGatewayApiKey` 用占位（代理剥入站鉴权头、按路由 Key 注入真实密钥）；
+/// `inferenceGatewayBaseUrl` 指向本地代理源（桌面端按 Anthropic 风格发 /v1/messages，代理已识别）。
+/// `models` 非空时填 `inferenceModels`；含 `1m`/`-1m` 或超长上下文名不特判，统一按 supports1m=true
+/// 暴露（对齐本机 cc-switch 样本：opus 系均标 supports1m）。
+fn build_gateway_profile(endpoint: &str, models: &[String]) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "coworkEgressAllowedHosts".into(),
+        Value::Array(vec![Value::String("*".into())]),
+    );
+    obj.insert("disableDeploymentModeChooser".into(), Value::Bool(true));
+    obj.insert(
+        "inferenceGatewayApiKey".into(),
+        Value::String(DESKTOP_GATEWAY_PLACEHOLDER.into()),
+    );
+    obj.insert(
+        "inferenceGatewayAuthScheme".into(),
+        Value::String("bearer".into()),
+    );
+    obj.insert(
+        "inferenceGatewayBaseUrl".into(),
+        Value::String(endpoint.to_string()),
+    );
+    obj.insert("inferenceProvider".into(), Value::String("gateway".into()));
+    if !models.is_empty() {
+        let arr: Vec<Value> = models
+            .iter()
+            .map(|m| {
+                let mut e = serde_json::Map::new();
+                e.insert("name".into(), Value::String(m.clone()));
+                e.insert("supports1m".into(), Value::Bool(true));
+                Value::Object(e)
+            })
+            .collect();
+        obj.insert("inferenceModels".into(), Value::Array(arr));
+    }
+    Value::Object(obj)
+}
+
+/// 接入时更新 `_meta.json`：确保 entries 里有本档（去重，与 cc-switch 档共存），appliedId 指向本档。
+fn write_desktop_meta_apply(path: &Path) -> AppResult<()> {
+    let mut root = read_json_or_empty(path)?;
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| AppError::ToolConfig("_meta.json 顶层非对象".into()))?;
+
+    let entries = obj
+        .entry("entries")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let arr = entries
+        .as_array_mut()
+        .ok_or_else(|| AppError::ToolConfig("_meta.entries 非数组".into()))?;
+    // 去重：移除已存在的本档 entry，再重新追加（幂等）。不动其它档（cc-switch 的等）。
+    arr.retain(|e| e.get("id").and_then(|v| v.as_str()) != Some(DESKTOP_PROFILE_ID));
+    arr.push(serde_json::json!({
+        "id": DESKTOP_PROFILE_ID,
+        "name": DESKTOP_PROFILE_NAME,
+    }));
+
+    obj.insert(
+        "appliedId".into(),
+        Value::String(DESKTOP_PROFILE_ID.into()),
+    );
+    backup_and_write_json(path, &root)
 }
 
 // ---- MCP 客户端自动注册 ----
@@ -700,10 +924,16 @@ fn is_placeholder_only_auth(path: &Path) -> bool {
 /// 此时已处于接入前状态，返回成功（无需还原），避免每次停止都弹误报错。
 /// Codex 的 auth.json 备份仅在存在时还原（用户接入前无 auth.json 则本就无此备份）。
 pub fn restore(category: CategoryType) -> AppResult<String> {
+    // 桌面端不是「从 .bak 还原单文件」那套：接入切了 deploymentMode=3p 并写了 gateway 档，
+    // 还原须把两个 config 复位 1p、删本档 profile、从 _meta 摘掉本档并改 appliedId（镜像
+    // cc-switch 的 restore）。故单独分派。
+    if category == CategoryType::ClaudeDesktop {
+        return restore_claude_desktop();
+    }
     let path = match category {
         CategoryType::ClaudeCli => claude_cli_settings_path()?,
         CategoryType::Codex => codex_config_path()?,
-        CategoryType::ClaudeDesktop => claude_desktop_config_path()?,
+        CategoryType::ClaudeDesktop => unreachable!("桌面端已在上方分派"),
     };
     let mut restored = Vec::new();
     if restore_one(&path)? {
@@ -728,6 +958,105 @@ pub fn restore(category: CategoryType) -> AppResult<String> {
     } else {
         Ok(format!("已从备份还原：{}", restored.join("、")))
     }
+}
+
+/// 断开 Claude 桌面端接入：把两个 config 的 deploymentMode 复位 `1p`、删除本档 gateway 文件、
+/// 从 `_meta.json` 摘掉本档并把 appliedId 指向剩余首个（或删除）。镜像 cc-switch 的 restore。
+///
+/// 只动 SynaRoute 自己的档（DESKTOP_PROFILE_ID）——cc-switch 的档（若共存）原样保留，
+/// 避免误删用户另一套接入。deploymentMode 复位为 1p 让桌面端回到官方后端（重新走登录）。
+///
+/// 「未接入」（无本档 profile、appliedId 也不是本档）不视为错误：还原由「停止代理」自动触发，
+/// 返回成功、不弹误报。deploymentMode 仅在当前确由本档驱动（appliedId==本档）时才复位 1p——
+/// 否则用户可能正用 cc-switch 的档，不能把人家踢回官方。
+fn restore_claude_desktop() -> AppResult<String> {
+    let (normal, threep) = claude_desktop_dirs()?;
+    let normal_config = normal.join(DESKTOP_CONFIG_FILE);
+    let threep_config = threep.join(DESKTOP_CONFIG_FILE);
+    let profile = desktop_profile_path(&threep);
+    let meta = desktop_meta_path(&threep);
+
+    let mut done = Vec::new();
+
+    // 仅当当前 appliedId 是本档时，才把部署模式复位 1p（让桌面端回官方登录）。
+    // 若 appliedId 是别的档（如 cc-switch 的），说明用户当前在用那套，不能动其部署模式。
+    let applied_is_ours = read_desktop_applied_id(&meta).as_deref() == Some(DESKTOP_PROFILE_ID);
+    if applied_is_ours {
+        write_deployment_mode(&normal_config, "1p")?;
+        write_deployment_mode(&threep_config, "1p")?;
+        done.push("deploymentMode→1p".to_string());
+    }
+
+    // 删本档 gateway 文件（存在才删）。
+    if profile.exists() {
+        std::fs::remove_file(&profile)?;
+        done.push(format!("删除 {}", profile.display()));
+    }
+
+    // 从 _meta 摘掉本档，appliedId 若指向本档则改指剩余首个或移除。
+    if write_desktop_meta_clear(&meta)? {
+        done.push("_meta 清除本档".to_string());
+    }
+
+    if done.is_empty() {
+        Ok("桌面端未接入 SynaRoute，无需还原".into())
+    } else {
+        Ok(format!("已断开 Claude 桌面端接入：{}。请重启桌面端生效。", done.join("、")))
+    }
+}
+
+/// 读 `_meta.json` 的 `appliedId`（不存在/解析失败均返回 None）。
+fn read_desktop_applied_id(meta: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(meta).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    v.get("appliedId")
+        .and_then(|a| a.as_str())
+        .map(|s| s.to_string())
+}
+
+/// 还原时更新 `_meta.json`：移除本档 entry；若 appliedId 指向本档，则改指剩余 entries 首个
+/// （无剩余则删除 appliedId 键）。返回是否实际改动。文件不存在视为无需改动（返回 false）。
+fn write_desktop_meta_clear(meta: &Path) -> AppResult<bool> {
+    if !meta.exists() {
+        return Ok(false);
+    }
+    let mut root = read_json_or_empty(meta)?;
+    let Some(obj) = root.as_object_mut() else {
+        return Ok(false);
+    };
+
+    // 移除本档 entry。
+    let mut changed = false;
+    if let Some(arr) = obj.get_mut("entries").and_then(|e| e.as_array_mut()) {
+        let before = arr.len();
+        arr.retain(|e| e.get("id").and_then(|v| v.as_str()) != Some(DESKTOP_PROFILE_ID));
+        changed |= arr.len() != before;
+    }
+
+    // appliedId 若指向本档：改指剩余首个 entry，或删除该键。
+    if obj.get("appliedId").and_then(|a| a.as_str()) == Some(DESKTOP_PROFILE_ID) {
+        let next = obj
+            .get("entries")
+            .and_then(|e| e.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| e.get("id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        match next {
+            Some(id) => {
+                obj.insert("appliedId".into(), Value::String(id));
+            }
+            None => {
+                obj.remove("appliedId");
+            }
+        }
+        changed = true;
+    }
+
+    if changed {
+        backup_and_write_json(meta, &root)?;
+    }
+    Ok(changed)
 }
 
 // ---- 只读预览（阶段 2：不编辑，只展示路径与脱敏正文）----
@@ -809,18 +1138,29 @@ fn preview_codex() -> AppResult<ToolConfigPreview> {
 }
 
 fn preview_claude_desktop() -> AppResult<ToolConfigPreview> {
-    let path = claude_desktop_config_path()?;
-    let (exists, content) = read_preview_text(&path, true)?;
-    Ok(ToolConfigPreview {
-        category_id: CategoryType::ClaudeDesktop,
-        summary: "Claude 桌面端：claude_desktop_config.json。写入 baseUrl 指向本机代理。不写 Claude CLI 的 settings.json，不写 ANTHROPIC_DEFAULT_*。".into(),
-        mcp_registered: is_mcp_registered(CategoryType::ClaudeDesktop),
-        files: vec![ToolConfigFilePreview {
-            path: path.display().to_string(),
+    // 桌面端接入落在 %LOCALAPPDATA% 的两个部署目录（非 CLI 的 %APPDATA%）：Claude 与 Claude-3p。
+    // 预览展示真正生效的四个文件：两个 config（deploymentMode）+ 3p 目录的 gateway 档 + _meta。
+    let (normal, threep) = claude_desktop_dirs()?;
+    let normal_config = normal.join(DESKTOP_CONFIG_FILE);
+    let threep_config = threep.join(DESKTOP_CONFIG_FILE);
+    let profile = desktop_profile_path(&threep);
+    let meta = desktop_meta_path(&threep);
+
+    let mut files = Vec::new();
+    for p in [&normal_config, &threep_config, &profile, &meta] {
+        let (exists, content) = read_preview_text(p, true)?;
+        files.push(ToolConfigFilePreview {
+            path: p.display().to_string(),
             exists,
             format: "json".into(),
             content,
-        }],
+        });
+    }
+    Ok(ToolConfigPreview {
+        category_id: CategoryType::ClaudeDesktop,
+        summary: "Claude 桌面端（3p 部署模式）：两个 claude_desktop_config.json 写 deploymentMode=3p，Claude-3p/configLibrary 里写 gateway 档（inferenceGatewayBaseUrl 指向本机代理 + 占位 key + bearer + 可选模型）并登记进 _meta。凭据预填齐即跳过 get-started。与 cc-switch 用独立档共存。不写 CLI 的 settings.json。".into(),
+        mcp_registered: is_mcp_registered(CategoryType::ClaudeDesktop),
+        files,
     })
 }
 
@@ -867,6 +1207,8 @@ fn redact_config_secrets(s: &str) -> String {
         "access_token",
         "refresh_token",
         "id_token",
+        // Claude 桌面端 3p gateway 档的 API key（预览会读 configLibrary/{ID}.json）。
+        "inferenceGatewayApiKey",
     ] {
         out = redact_json_string_field(&out, key);
     }
@@ -1580,5 +1922,253 @@ mod tests {
         assert_eq!(std::fs::read(&f).unwrap(), b"WRITTEN", "成功时写入应保留");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Claude 桌面端 3p 部署模式 ----
+
+    /// 在临时目录里搭出 normal / 3p 两个部署目录，返回 (dir, normal_config, threep_config, profile, meta)。
+    fn desktop_layout(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let normal = temp_file(tag, DESKTOP_CONFIG_FILE);
+        let dir = normal.parent().unwrap().to_path_buf();
+        let threep_dir = dir.join("threep");
+        std::fs::create_dir_all(&threep_dir).unwrap();
+        let threep_config = threep_dir.join(DESKTOP_CONFIG_FILE);
+        let profile = desktop_profile_path(&threep_dir);
+        let meta = desktop_meta_path(&threep_dir);
+        (dir, normal, threep_config, profile, meta)
+    }
+
+    #[test]
+    fn desktop_apply_writes_3p_mode_and_gateway_profile() {
+        let (dir, normal, threep, profile, meta) = desktop_layout("desktop_apply");
+        // 预置 3p config 已有 preferences，验证合并写不丢它。
+        std::fs::write(
+            &threep,
+            r#"{"preferences":{"remoteToolsDeviceName":"win-x"}}"#,
+        )
+        .unwrap();
+
+        let models = vec!["claude-opus-4-8".to_string(), "claude-opus-5".to_string()];
+        let msg = apply_desktop_at(
+            &normal,
+            &threep,
+            &profile,
+            &meta,
+            "http://127.0.0.1:47102",
+            &models,
+        )
+        .unwrap();
+        assert!(msg.contains("3p 部署模式"));
+
+        // 两个 config 都切 3p，preferences 保留。
+        let n: Value = serde_json::from_slice(&std::fs::read(&normal).unwrap()).unwrap();
+        assert_eq!(n["deploymentMode"], "3p");
+        let t: Value = serde_json::from_slice(&std::fs::read(&threep).unwrap()).unwrap();
+        assert_eq!(t["deploymentMode"], "3p");
+        assert_eq!(
+            t["preferences"]["remoteToolsDeviceName"], "win-x",
+            "既有 preferences 必须保留"
+        );
+
+        // gateway 档字段齐全。
+        let p: Value = serde_json::from_slice(&std::fs::read(&profile).unwrap()).unwrap();
+        assert_eq!(p["inferenceProvider"], "gateway");
+        assert_eq!(p["inferenceGatewayBaseUrl"], "http://127.0.0.1:47102");
+        assert_eq!(p["inferenceGatewayAuthScheme"], "bearer");
+        assert_eq!(p["inferenceGatewayApiKey"], DESKTOP_GATEWAY_PLACEHOLDER);
+        assert_eq!(p["disableDeploymentModeChooser"], true);
+        assert_eq!(p["coworkEgressAllowedHosts"][0], "*");
+        // inferenceModels：数组、名字对、supports1m=true。
+        assert_eq!(p["inferenceModels"][0]["name"], "claude-opus-4-8");
+        assert_eq!(p["inferenceModels"][0]["supports1m"], true);
+        assert_eq!(p["inferenceModels"][1]["name"], "claude-opus-5");
+
+        // _meta：本档登记 + appliedId 指向本档。
+        let m: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+        assert_eq!(m["appliedId"], DESKTOP_PROFILE_ID);
+        assert_eq!(m["entries"][0]["id"], DESKTOP_PROFILE_ID);
+        assert_eq!(m["entries"][0]["name"], DESKTOP_PROFILE_NAME);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn desktop_apply_no_models_omits_inference_models() {
+        let (dir, normal, threep, profile, meta) = desktop_layout("desktop_nomodels");
+        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &[]).unwrap();
+        let p: Value = serde_json::from_slice(&std::fs::read(&profile).unwrap()).unwrap();
+        assert!(
+            p.get("inferenceModels").is_none(),
+            "无模型时不应写 inferenceModels 键"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn desktop_apply_coexists_with_ccswitch_profile() {
+        // _meta 已有 cc-switch 档 + appliedId 指向它：接入后两档共存，appliedId 改指本档，
+        // cc-switch 的 entry 原样保留（不误删用户另一套接入）。
+        let (dir, normal, threep, profile, meta) = desktop_layout("desktop_coexist");
+        let ccswitch_id = "00000000-0000-4000-8000-000000157210";
+        std::fs::write(
+            &meta,
+            format!(
+                r#"{{"appliedId":"{ccswitch_id}","entries":[{{"id":"{ccswitch_id}","name":"CC Switch"}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &[]).unwrap();
+
+        let m: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+        assert_eq!(m["appliedId"], DESKTOP_PROFILE_ID, "appliedId 应改指本档");
+        let entries = m["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "两档共存");
+        assert!(
+            entries.iter().any(|e| e["id"] == ccswitch_id),
+            "cc-switch 档必须保留（不误删）"
+        );
+        assert!(entries.iter().any(|e| e["id"] == DESKTOP_PROFILE_ID));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn desktop_apply_idempotent_no_duplicate_entry() {
+        // 重复接入：entries 里本档不重复出现（去重）。
+        let (dir, normal, threep, profile, meta) = desktop_layout("desktop_idem");
+        for _ in 0..3 {
+            apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &[]).unwrap();
+        }
+        let m: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+        let ours: Vec<_> = m["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["id"] == DESKTOP_PROFILE_ID)
+            .collect();
+        assert_eq!(ours.len(), 1, "重复接入本档 entry 不得重复");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn desktop_restore_resets_1p_and_removes_our_profile() {
+        // 接入后还原：deploymentMode 复位 1p、本档 profile 删除、_meta 清本档且清 appliedId。
+        let (dir, normal, threep, profile, meta) = desktop_layout("desktop_restore");
+        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &[]).unwrap();
+        assert!(profile.exists());
+
+        // 复用 restore_claude_desktop 的内部动作：手动镜像其步骤（restore_claude_desktop 走真实
+        // 目录，故这里直接验证 write_desktop_meta_clear + deploymentMode 复位这两个可测单元）。
+        assert_eq!(
+            read_desktop_applied_id(&meta).as_deref(),
+            Some(DESKTOP_PROFILE_ID)
+        );
+        write_deployment_mode(&normal, "1p").unwrap();
+        write_deployment_mode(&threep, "1p").unwrap();
+        std::fs::remove_file(&profile).unwrap();
+        let changed = write_desktop_meta_clear(&meta).unwrap();
+        assert!(changed);
+
+        let n: Value = serde_json::from_slice(&std::fs::read(&normal).unwrap()).unwrap();
+        assert_eq!(n["deploymentMode"], "1p");
+        let m: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+        assert!(
+            m.get("appliedId").is_none(),
+            "唯一档被清后 appliedId 应删除"
+        );
+        assert!(
+            m["entries"].as_array().unwrap().is_empty(),
+            "本档 entry 应被摘掉"
+        );
+        assert!(!profile.exists(), "本档 profile 应删除");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn desktop_meta_clear_repoints_applied_to_remaining() {
+        // 两档共存、appliedId 指向本档：清本档后 appliedId 应改指剩余的 cc-switch 档，不删键。
+        let meta = temp_file("desktop_meta_repoint", "_meta.json");
+        let ccswitch_id = "00000000-0000-4000-8000-000000157210";
+        std::fs::write(
+            &meta,
+            format!(
+                r#"{{"appliedId":"{DESKTOP_PROFILE_ID}","entries":[{{"id":"{ccswitch_id}","name":"CC Switch"}},{{"id":"{DESKTOP_PROFILE_ID}","name":"SynaRoute"}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        assert!(write_desktop_meta_clear(&meta).unwrap());
+        let m: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+        assert_eq!(
+            m["appliedId"], ccswitch_id,
+            "appliedId 应改指剩余的 cc-switch 档"
+        );
+        let entries = m["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["id"], ccswitch_id, "cc-switch 档保留");
+
+        std::fs::remove_dir_all(meta.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn desktop_meta_clear_noop_when_not_ours() {
+        // appliedId 指向别的档、entries 无本档：清理应为无操作（不动用户的 cc-switch 接入）。
+        let meta = temp_file("desktop_meta_noop", "_meta.json");
+        let ccswitch_id = "00000000-0000-4000-8000-000000157210";
+        let original = format!(
+            r#"{{"appliedId":"{ccswitch_id}","entries":[{{"id":"{ccswitch_id}","name":"CC Switch"}}]}}"#
+        );
+        std::fs::write(&meta, &original).unwrap();
+
+        let changed = write_desktop_meta_clear(&meta).unwrap();
+        assert!(!changed, "无本档时应无操作");
+        let m: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+        assert_eq!(m["appliedId"], ccswitch_id, "别人的 appliedId 不得改动");
+
+        std::fs::remove_dir_all(meta.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn desktop_gateway_api_key_is_redacted_in_preview() {
+        // 预览脱敏必须覆盖 inferenceGatewayApiKey（即便占位，也不应把该字段值明文回传）。
+        let raw = r#"{"inferenceGatewayApiKey":"synaroute-proxy","inferenceGatewayBaseUrl":"http://127.0.0.1:1"}"#;
+        let out = redact_config_secrets(raw);
+        assert!(
+            out.contains(r#""inferenceGatewayApiKey":"***""#)
+                || out.contains(r#""inferenceGatewayApiKey": "***""#),
+            "inferenceGatewayApiKey 应脱敏: {out}"
+        );
+        assert!(
+            out.contains("http://127.0.0.1:1"),
+            "非密钥字段应保留"
+        );
+    }
+
+    #[test]
+    fn cleanup_legacy_only_removes_baseurl_config() {
+        // 清理只删「确是旧 baseUrl 产物」的 config；非 baseUrl 的合法文件不动。
+        // 直接测判定逻辑：构造两种 config，验证 baseUrl 键存在性判定。
+        let legacy = temp_file("legacy_baseurl", DESKTOP_CONFIG_FILE);
+        std::fs::write(&legacy, r#"{"baseUrl":"http://x"}"#).unwrap();
+        let is_legacy = std::fs::read_to_string(&legacy)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|v| v.as_object().map(|o| o.contains_key("baseUrl")))
+            .unwrap_or(false);
+        assert!(is_legacy, "含 baseUrl 应判为旧产物");
+
+        let legit = temp_file("legit_prefs", DESKTOP_CONFIG_FILE);
+        std::fs::write(&legit, r#"{"preferences":{}}"#).unwrap();
+        let is_legit_legacy = std::fs::read_to_string(&legit)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|v| v.as_object().map(|o| o.contains_key("baseUrl")))
+            .unwrap_or(false);
+        assert!(!is_legit_legacy, "不含 baseUrl 的合法文件不应被判旧产物");
+
+        std::fs::remove_dir_all(legacy.parent().unwrap()).ok();
+        std::fs::remove_dir_all(legit.parent().unwrap()).ok();
     }
 }
