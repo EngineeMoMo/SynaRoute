@@ -253,12 +253,11 @@ async fn apply_tool_config(
     // - Claude CLI：取首个写 env.ANTHROPIC_MODEL + 顶层 model（对外名；策略 A 不写 DEFAULT_*）
     // - Codex：取首个写 config.toml 的 model（OpenAI 形态，无 ANTHROPIC_*）
     // - 桌面端：整份写进 gateway 档的 inferenceModels（3p 部署模式，见 tools::apply_claude_desktop）
-    let models = state
-        .store
-        .enabled_keys_sorted(category_id)
-        .first()
-        .map(|k| k.serviceable_models())
-        .unwrap_or_default();
+    //
+    // 口径必须与 GET /v1/models 完全一致 —— 用 proxy::discoverable_models（多 Key 取交集），
+    // 而非主 Key 的 serviceable_models()：否则桌面端选择器会列出备用 Key 无法服务的对外名，
+    // 故障转移到备用 Key 后该模型必然 404。
+    let models = crate::proxy::discoverable_models(&state.store.enabled_keys_sorted(category_id));
     let msg = tools::apply(category_id, &endpoint, &models)?;
     state
         .store
