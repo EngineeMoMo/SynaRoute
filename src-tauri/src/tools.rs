@@ -388,12 +388,22 @@ fn apply_desktop_at(
     endpoint: &str,
     models: &[String],
 ) -> AppResult<String> {
-    // 空模型列表直接拒绝接入，不留「进了 3p 却没模型」的死局：
-    // 桌面端在 3p 模式下靠 gateway 档的 inferenceModels 列出可选模型（cc-switch 样本恒带 6 个）。
-    // 若省略该键，桌面端只能依赖「启动那一刻本地代理在线」的运行时发现，一旦发现失败就
-    // adminList/discovered 双空 → models_not_discovered → 连会话都开不起来，症状与
-    // 「卡在 get-started」同样难排查。宁可在此明确报错，让用户先配模型。
-    if models.is_empty() {
+    // gateway 档读一次，用于合并写 + 缺省模型回退。
+    let existing = read_json_or_empty(profile)?;
+
+    // 有效模型：优先用入参；入参为空（如改端口时主 Key 恰无可服务模型）时回退到档内已有的
+    // inferenceModels，避免把之前接入写好的模型清单擦掉、或让「仅改端点」的重写失败。
+    let effective: Vec<String> = if models.is_empty() {
+        existing_inference_model_names(&existing)
+    } else {
+        models.to_vec()
+    };
+
+    // 仍为空 → 真正的死局（首次接入且无任何可服务模型）：桌面端在 3p 模式下靠 gateway 档的
+    // inferenceModels 列出可选模型（cc-switch 样本恒带 6 个）。若空，桌面端只能依赖「启动那一刻
+    // 本地代理在线」的运行时发现，一旦失败就 adminList/discovered 双空 → models_not_discovered
+    // → 连会话都开不起来，症状与「卡在 get-started」同样难排查。宁可明确报错，让用户先配模型。
+    if effective.is_empty() {
         return Err(AppError::ToolConfig(
             "桌面端接入需要至少一个可服务模型：当前分类启用的 Key 未配置任何模型（或多 Key 对外名无交集）。\
              请先在「模型映射」里为该分类配置模型后重试。"
@@ -406,8 +416,7 @@ fn apply_desktop_at(
     write_deployment_mode(threep_config, "3p")?;
 
     // 2) gateway 档：预填端点 + 占位 key + bearer + 模型清单（合并写，保留档内其它既有键）。
-    let existing = read_json_or_empty(profile)?;
-    let profile_json = build_gateway_profile(existing, endpoint, models);
+    let profile_json = build_gateway_profile(existing, endpoint, &effective);
     backup_and_write_json(profile, &profile_json)?;
 
     // 3) _meta.json：登记本档（与 cc-switch 档共存）并把 appliedId 指向本档。
@@ -416,9 +425,31 @@ fn apply_desktop_at(
     Ok(format!(
         "已接入 Claude 桌面端（3p 部署模式）：{}，gateway 端点={endpoint}，模型={}，原文件已备份。请重启桌面端生效。",
         threep_config.display(),
-        models.join("/")
+        effective.join("/")
     ))
 }
+
+/// 从 gateway 档 JSON 里取出 `inferenceModels[].name`（缺失/格式不符返回空）。
+/// 用于改端口等「入参模型为空」的场景回退到档内已有清单，不擦掉之前写好的模型。
+fn existing_inference_model_names(profile: &Value) -> Vec<String> {
+    profile
+        .get("inferenceModels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 测试可观测的「真实目录清理」调用计数：仅在 `#[cfg(test)]` 下由
+/// [`cleanup_legacy_desktop_residue`]（会触碰真实用户 %APPDATA% 的那个无参版本）自增。
+/// 用于断言 hermetic 的可测入口 [`apply_desktop_at`] **绝不**触发它——一旦有人把清理误挪进
+/// 可测核心，计数变化即让 `apply_desktop_at_does_not_trigger_real_cleanup` 变红。
+#[cfg(test)]
+static REAL_CLEANUP_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// 清理早期失效实现的残留：旧代码往 `%APPDATA%\Roaming\Claude\claude_desktop_config.json`
 /// 写 `{"baseUrl":...}`（位置/字段皆错、从未生效），并留下同名 `.synaroute.bak`。
@@ -434,6 +465,10 @@ fn apply_desktop_at(
 ///
 /// 全程 best-effort：任何一步失败只告警、不影响接入（本函数在 with_rollback 集合之外调用）。
 fn cleanup_legacy_desktop_residue() {
+    // 测试观测点：记录「触碰真实用户目录的清理」被调用（用于 hermetic 断言，见 REAL_CLEANUP_CALLS）。
+    #[cfg(test)]
+    REAL_CLEANUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
     // 旧实现用 config_dir()（Windows=%APPDATA%\Roaming）→ Claude\claude_desktop_config.json。
     let Some(base) = dirs::config_dir() else { return };
     let legacy = base.join("Claude").join(DESKTOP_CONFIG_FILE);
@@ -646,16 +681,33 @@ fn desktop_mcp_config_path() -> AppResult<PathBuf> {
     Ok(threep.join(DESKTOP_CONFIG_FILE))
 }
 
+/// 某 Claude 系分类的 MCP 客户端配置文件路径的**唯一决策点**：
+/// - CLI → `~/.claude.json`
+/// - 桌面端 → `Claude-3p/claude_desktop_config.json`（与 CLI 分离，见 [`desktop_mcp_config_path`]）
+///
+/// register / unregister / is_registered 三处都经此路由，保证「CLI vs 桌面端写哪个文件」的判定
+/// 永远一致、且可被单测直接覆盖：一旦有人把桌面端臂改回 `claude_json_path()`（两端共用一份文件、
+/// 端口互相覆盖的原始 bug），针对本函数的测试立即失败。Codex 不走 Claude 系 MCP，显式报错而非
+/// 静默落到某文件。
+fn claude_mcp_config_path(category: CategoryType) -> AppResult<PathBuf> {
+    match category {
+        CategoryType::ClaudeCli => claude_json_path(),
+        CategoryType::ClaudeDesktop => desktop_mcp_config_path(),
+        CategoryType::Codex => {
+            Err(AppError::ToolConfig("Codex 不使用 Claude 系 MCP 配置路径".into()))
+        }
+    }
+}
+
 /// 把 SynaRoute MCP 服务器注册进某分类对应工具的客户端配置。
 /// `timeout_ms`：写入客户端的单次工具调用超时（由调用方按整轮预算联动算出，见
 /// lib.rs `mcp_client_timeout_ms`）。返回 (人类可读结果, 是否实际写盘)。已是同 url+timeout
 /// 时不写盘、返回 false。
 pub fn register_mcp_client(category: CategoryType, mcp_url: &str, timeout_ms: u64) -> AppResult<(String, bool)> {
     match category {
-        CategoryType::ClaudeCli => register_mcp_claude(mcp_url, timeout_ms),
-        // 桌面端写自己部署目录的 claude_desktop_config.json（与 CLI 的 ~/.claude.json 分离）。
-        CategoryType::ClaudeDesktop => {
-            register_mcp_claude_at(&desktop_mcp_config_path()?, mcp_url, timeout_ms)
+        // CLI 与桌面端同为 JSON mcpServers 形态，但落**不同文件**（经 claude_mcp_config_path 路由）。
+        CategoryType::ClaudeCli | CategoryType::ClaudeDesktop => {
+            register_mcp_claude_at(&claude_mcp_config_path(category)?, mcp_url, timeout_ms)
         }
         CategoryType::Codex => register_mcp_codex(mcp_url, timeout_ms),
     }
@@ -664,8 +716,9 @@ pub fn register_mcp_client(category: CategoryType, mcp_url: &str, timeout_ms: u6
 /// 从某分类对应工具的客户端配置移除 synaroute MCP 项（关闭开关时）。
 pub fn unregister_mcp_client(category: CategoryType) -> AppResult<(String, bool)> {
     match category {
-        CategoryType::ClaudeCli => unregister_mcp_claude(),
-        CategoryType::ClaudeDesktop => unregister_mcp_claude_at(&desktop_mcp_config_path()?),
+        CategoryType::ClaudeCli | CategoryType::ClaudeDesktop => {
+            unregister_mcp_claude_at(&claude_mcp_config_path(category)?)
+        }
         CategoryType::Codex => unregister_mcp_codex(),
     }
 }
@@ -676,11 +729,7 @@ pub fn unregister_mcp_client(category: CategoryType) -> AppResult<(String, bool)
 /// 失败均视为未注册。
 pub fn is_mcp_registered(category: CategoryType) -> bool {
     match category {
-        CategoryType::ClaudeCli => claude_json_path()
-            .ok()
-            .map(|p| json_has_mcp_server(&p))
-            .unwrap_or(false),
-        CategoryType::ClaudeDesktop => desktop_mcp_config_path()
+        CategoryType::ClaudeCli | CategoryType::ClaudeDesktop => claude_mcp_config_path(category)
             .ok()
             .map(|p| json_has_mcp_server(&p))
             .unwrap_or(false),
@@ -708,10 +757,6 @@ fn json_has_mcp_server(path: &Path) -> bool {
     v.get("mcpServers")
         .and_then(|s| s.get(MCP_CLIENT_NAME))
         .is_some()
-}
-
-fn register_mcp_claude(mcp_url: &str, timeout_ms: u64) -> AppResult<(String, bool)> {
-    register_mcp_claude_at(&claude_json_path()?, mcp_url, timeout_ms)
 }
 
 fn register_mcp_claude_at(path: &Path, mcp_url: &str, timeout_ms: u64) -> AppResult<(String, bool)> {
@@ -761,10 +806,6 @@ fn json_http_mcp(mcp_url: &str, timeout_ms: u64) -> Value {
     m.insert("url".into(), Value::String(mcp_url.to_string()));
     m.insert("timeout".into(), Value::Number(timeout_ms.into()));
     Value::Object(m)
-}
-
-fn unregister_mcp_claude() -> AppResult<(String, bool)> {
-    unregister_mcp_claude_at(&claude_json_path()?)
 }
 
 fn unregister_mcp_claude_at(path: &Path) -> AppResult<(String, bool)> {
@@ -1642,29 +1683,38 @@ mod tests {
     }
 
     #[test]
-    fn desktop_and_cli_mcp_use_separate_files() {
-        // 回归护栏：桌面端与 CLI 的 MCP 必须写到**不同文件**，否则两分类端口不同会互相覆盖
-        // （接入桌面端把 CLI 的 synaroute 指到桌面端端口，反之亦然）。此处模拟两份独立配置文件，
-        // 各写各的端口，断言互不干扰。
-        let cli = temp_file("mcp_split_cli", ".claude.json");
-        let desktop = temp_file("mcp_split_desktop", DESKTOP_CONFIG_FILE);
-
-        register_mcp_claude_at(&cli, "http://127.0.0.1:9527/mcp", MCP_TOOL_TIMEOUT_MS).unwrap();
-        register_mcp_claude_at(&desktop, "http://127.0.0.1:9600/mcp", MCP_TOOL_TIMEOUT_MS).unwrap();
-
-        let cli_v: Value = serde_json::from_slice(&std::fs::read(&cli).unwrap()).unwrap();
-        let desk_v: Value = serde_json::from_slice(&std::fs::read(&desktop).unwrap()).unwrap();
+    fn claude_mcp_path_routes_cli_and_desktop_to_distinct_files() {
+        // 回归护栏（真能证伪版）：经**真正的分派点** claude_mcp_config_path 验证两分类落到不同
+        // 文件。旧版 desktop_and_cli_mcp_use_separate_files 直调 register_mcp_claude_at(手工分好
+        // 的两个路径)，绕过了分派逻辑——若有人把 ClaudeDesktop 臂改回 claude_json_path，旧测试
+        // 仍绿（审查 F3）。此处直接断言分派结果：
+        // 1) 两分类解析出的路径必须不同；
+        // 2) 桌面端路径必须是 Claude-3p 侧的 claude_desktop_config.json，CLI 必须是 ~/.claude.json；
+        // 3) 二者文件名虽同（claude_desktop_config.json vs .claude.json 不同，但即便同名）也须不同目录。
+        // 一旦桌面端臂被改回 claude_json_path()，两路径相等，断言立即失败。
+        let cli = claude_mcp_config_path(CategoryType::ClaudeCli).unwrap();
+        let desktop = claude_mcp_config_path(CategoryType::ClaudeDesktop).unwrap();
+        assert_ne!(cli, desktop, "CLI 与桌面端 MCP 必须落到不同文件，否则端口互相覆盖");
         assert_eq!(
-            cli_v["mcpServers"]["synaroute"]["url"], "http://127.0.0.1:9527/mcp",
-            "CLI 端口不应被桌面端注册覆盖"
+            cli.file_name().and_then(|n| n.to_str()),
+            Some(".claude.json"),
+            "CLI 应写 ~/.claude.json"
         );
         assert_eq!(
-            desk_v["mcpServers"]["synaroute"]["url"], "http://127.0.0.1:9600/mcp",
-            "桌面端写自己的文件、自己的端口"
+            desktop.file_name().and_then(|n| n.to_str()),
+            Some(DESKTOP_CONFIG_FILE),
+            "桌面端应写 claude_desktop_config.json"
         );
-
-        std::fs::remove_dir_all(cli.parent().unwrap()).ok();
-        std::fs::remove_dir_all(desktop.parent().unwrap()).ok();
+        // 桌面端路径应在 3p 部署目录（父目录名含 Claude-3p 或至少不是 CLI 的 home 根）。
+        assert!(
+            desktop.parent() != cli.parent(),
+            "两分类不能共用同一目录"
+        );
+        // Codex 不走 Claude 系路径，应报错而非静默落到某文件。
+        assert!(
+            claude_mcp_config_path(CategoryType::Codex).is_err(),
+            "Codex 不应解析出 Claude 系 MCP 路径"
+        );
     }
 
     #[test]
@@ -2278,8 +2328,9 @@ mod tests {
 
     #[test]
     fn desktop_apply_rejects_empty_model_list() {
-        // 空模型列表必须报错而非静默接入：省略 inferenceModels 会让桌面端进了 3p 却无模型可选，
-        // 运行时发现一失败就 models_not_discovered、连会话都开不起来（与「卡 get-started」同级的死局）。
+        // 空模型列表且档内也无既有模型 → 必须报错而非静默接入：省略 inferenceModels 会让桌面端
+        // 进了 3p 却无模型可选，运行时发现一失败就 models_not_discovered、连会话都开不起来
+        // （与「卡 get-started」同级的死局）。
         let (dir, normal, threep, profile, meta) = desktop_layout("desktop_nomodels");
         let err = apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &[])
             .unwrap_err();
@@ -2291,6 +2342,41 @@ mod tests {
         assert!(!profile.exists(), "报错不应写出 gateway 档");
         assert!(!normal.exists(), "报错不应改动部署配置");
         assert!(!meta.exists(), "报错不应写 _meta");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn desktop_apply_empty_models_falls_back_to_existing_profile() {
+        // 改端口场景（审查 F1 附带项）：入参 models 为空，但档内已有 inferenceModels 时，
+        // 应回退用档内清单、只更新端点，而不是报错让「仅改端点」失败或擦掉已有模型。
+        let (dir, normal, threep, profile, meta) = desktop_layout("desktop_empty_fallback");
+        // 先以非空模型接入（写入 gateway 档 + inferenceModels=[A]）。
+        apply_desktop_at(
+            &normal,
+            &threep,
+            &profile,
+            &meta,
+            "http://127.0.0.1:1",
+            &["claude-opus-4-8".to_string()],
+        )
+        .unwrap();
+
+        // 再以空模型「改端口」重写：应成功、端点更新、模型清单保留。
+        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:2", &[]).unwrap();
+
+        let p: Value = serde_json::from_slice(&std::fs::read(&profile).unwrap()).unwrap();
+        assert_eq!(
+            p["inferenceGatewayBaseUrl"], "http://127.0.0.1:2",
+            "端点应更新为新端口"
+        );
+        let names: Vec<&str> = p["inferenceModels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["claude-opus-4-8"], "空入参应回退档内既有模型，不擦掉");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2640,22 +2726,47 @@ mod tests {
     }
 
     #[test]
-    fn apply_desktop_at_is_hermetic_no_legacy_cleanup() {
-        // 护栏：可测入口不得触碰用户真实 %APPDATA%（cleanup 只能挂在解析真实目录的
-        // apply_claude_desktop 上）。此处以「legacy 残留文件在 apply_desktop_at 后仍在」
-        // 反证 apply_desktop_at 没有顺带执行清理。
-        let legacy = temp_file("hermetic_legacy", DESKTOP_CONFIG_FILE);
-        std::fs::write(&legacy, r#"{"baseUrl":"http://x"}"#).unwrap();
+    fn apply_desktop_at_does_not_trigger_real_cleanup() {
+        // 护栏（真能证伪版）：可测入口 apply_desktop_at 绝不能触发触碰真实 %APPDATA% 的
+        // cleanup_legacy_desktop_residue()。用调用计数器观测——若有人把无参 cleanup 误挪回
+        // apply_desktop_at，计数会 +1，本测试变红。
+        // 旧版此测试断言的是 temp legacy 文件仍在，但那文件与真实 cleanup 操作的 config_dir()
+        // 路径永不相交、恒真，无法捕获回归（审查 F2）。
+        //
+        // 计数器是进程全局，与其它并发测试隔离靠 _CLEANUP_TEST_LOCK 串行化。
+        let _guard = cleanup_test_lock();
+        let before = REAL_CLEANUP_CALLS.load(std::sync::atomic::Ordering::SeqCst);
 
         let (dir, normal, threep, profile, meta) = desktop_layout("hermetic_apply");
-        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models()).unwrap();
+        apply_desktop_at(
+            &normal,
+            &threep,
+            &profile,
+            &meta,
+            "http://127.0.0.1:1",
+            &desktop_test_models(),
+        )
+        .unwrap();
 
-        assert!(
-            legacy.exists(),
-            "apply_desktop_at 不应执行 legacy 清理（否则单测会删用户真实 AppData 文件）"
+        let after = REAL_CLEANUP_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            after, before,
+            "apply_desktop_at 触发了真实目录清理（+{}）——它会删用户真实 %APPDATA%，必须只挂在 apply_claude_desktop 上",
+            after - before
         );
 
-        std::fs::remove_dir_all(legacy.parent().unwrap()).ok();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // 注：不为「apply_claude_desktop 确实调用 cleanup」写正向测试——那需要往真实
+    // %LOCALAPPDATA%\Claude* 写盘，恰是本轮在修的「测试污染真实 AppData」反面。cleanup 挂在
+    // apply_claude_desktop 的调用是一行显式代码（审查可见），加上上面的计数器护栏保证它不在
+    // 可测核心 apply_desktop_at 内，两者已足够锁定挂载位置。
+
+    /// 串行化会读写进程全局 REAL_CLEANUP_CALLS 的测试，避免与未来可能触发 cleanup 的并发测试
+    /// 互扰导致计数误判。
+    fn cleanup_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 }

@@ -209,13 +209,11 @@ async fn set_proxy_port(
     let bound = state.proxy.start(category_id).await?;
     // 重写该分类客户端 config，指向实际绑定端口（可能因占用回退，用真实值）。
     let endpoint = format!("http://127.0.0.1:{bound}");
-    // 主 Key 可服务对外名列表：CLI/Codex 内部取首个；桌面端整份写进 inferenceModels。
-    let models = state
-        .store
-        .enabled_keys_sorted(category_id)
-        .first()
-        .map(|k| k.serviceable_models())
-        .unwrap_or_default();
+    // 模型列表必须与 apply_tool_config、GET /v1/models 完全同源——多 Key 取交集
+    // （proxy::discoverable_models），而非主 Key 的 serviceable_models() 超集。否则改端口会把
+    // 桌面端 gateway 档的 inferenceModels 从接入时的安全交集重写回超集，故障转移到备用 Key 后
+    // 选中备用 Key 无法服务的模型必然 404（与 apply_tool_config 的修复自相矛盾）。
+    let models = crate::proxy::discoverable_models(&state.store.enabled_keys_sorted(category_id));
     if let Err(e) = tools::apply(category_id, &endpoint, &models) {
         state.store.append_event(
             category_id,
