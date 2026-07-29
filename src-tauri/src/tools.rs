@@ -634,14 +634,29 @@ fn claude_json_path() -> AppResult<PathBuf> {
     Ok(home.join(".claude.json"))
 }
 
+/// Claude 桌面端的 MCP 配置文件：3p 部署目录下的 `claude_desktop_config.json`。
+///
+/// 桌面端 MCP **必须与 CLI 分离**：CLI 读 `~/.claude.json`，桌面端读它自己部署目录里的
+/// `claude_desktop_config.json`（`mcpServers` 段，形态同 CLI）。二者若共用一份文件同一个
+/// `synaroute` 项，两分类端口不同就会互相覆盖——接入桌面端会把 CLI 的 MCP 指到桌面端端口，
+/// 反之亦然。桌面端在 3p 模式下活跃实例读 `Claude-3p/claude_desktop_config.json`（与
+/// `deploymentMode` 同一文件，`mcpServers` 是并列键、互不干扰）。
+fn desktop_mcp_config_path() -> AppResult<PathBuf> {
+    let (_normal, threep) = claude_desktop_dirs()?;
+    Ok(threep.join(DESKTOP_CONFIG_FILE))
+}
+
 /// 把 SynaRoute MCP 服务器注册进某分类对应工具的客户端配置。
 /// `timeout_ms`：写入客户端的单次工具调用超时（由调用方按整轮预算联动算出，见
 /// lib.rs `mcp_client_timeout_ms`）。返回 (人类可读结果, 是否实际写盘)。已是同 url+timeout
 /// 时不写盘、返回 false。
 pub fn register_mcp_client(category: CategoryType, mcp_url: &str, timeout_ms: u64) -> AppResult<(String, bool)> {
     match category {
-        // 桌面端的 MCP 也读 ~/.claude.json（与 CLI 同源 mcpServers）。
-        CategoryType::ClaudeCli | CategoryType::ClaudeDesktop => register_mcp_claude(mcp_url, timeout_ms),
+        CategoryType::ClaudeCli => register_mcp_claude(mcp_url, timeout_ms),
+        // 桌面端写自己部署目录的 claude_desktop_config.json（与 CLI 的 ~/.claude.json 分离）。
+        CategoryType::ClaudeDesktop => {
+            register_mcp_claude_at(&desktop_mcp_config_path()?, mcp_url, timeout_ms)
+        }
         CategoryType::Codex => register_mcp_codex(mcp_url, timeout_ms),
     }
 }
@@ -649,27 +664,26 @@ pub fn register_mcp_client(category: CategoryType, mcp_url: &str, timeout_ms: u6
 /// 从某分类对应工具的客户端配置移除 synaroute MCP 项（关闭开关时）。
 pub fn unregister_mcp_client(category: CategoryType) -> AppResult<(String, bool)> {
     match category {
-        CategoryType::ClaudeCli | CategoryType::ClaudeDesktop => unregister_mcp_claude(),
+        CategoryType::ClaudeCli => unregister_mcp_claude(),
+        CategoryType::ClaudeDesktop => unregister_mcp_claude_at(&desktop_mcp_config_path()?),
         CategoryType::Codex => unregister_mcp_codex(),
     }
 }
 
 /// 检测某分类对应工具的客户端配置里是否已注册 synaroute MCP（供配置预览显示接入状态）。
-/// 读各端真实 MCP 客户端文件（Claude=~/.claude.json 的 mcpServers，Codex=config.toml 的
-/// mcp_servers），只判存在性、不改盘。文件不存在或解析失败均视为未注册。
+/// 读各端真实 MCP 客户端文件（CLI=~/.claude.json、桌面端=Claude-3p/claude_desktop_config.json
+/// 的 mcpServers；Codex=config.toml 的 mcp_servers），只判存在性、不改盘。文件不存在或解析
+/// 失败均视为未注册。
 pub fn is_mcp_registered(category: CategoryType) -> bool {
     match category {
-        CategoryType::ClaudeCli | CategoryType::ClaudeDesktop => {
-            let Ok(path) = claude_json_path() else { return false };
-            if !path.exists() {
-                return false;
-            }
-            let Ok(raw) = std::fs::read_to_string(&path) else { return false };
-            let Ok(v) = serde_json::from_str::<Value>(&raw) else { return false };
-            v.get("mcpServers")
-                .and_then(|s| s.get(MCP_CLIENT_NAME))
-                .is_some()
-        }
+        CategoryType::ClaudeCli => claude_json_path()
+            .ok()
+            .map(|p| json_has_mcp_server(&p))
+            .unwrap_or(false),
+        CategoryType::ClaudeDesktop => desktop_mcp_config_path()
+            .ok()
+            .map(|p| json_has_mcp_server(&p))
+            .unwrap_or(false),
         CategoryType::Codex => {
             let Ok(path) = codex_config_path() else { return false };
             if !path.exists() {
@@ -682,6 +696,18 @@ pub fn is_mcp_registered(category: CategoryType) -> bool {
                 .is_some()
         }
     }
+}
+
+/// 某 JSON 配置文件的 `mcpServers` 里是否含 synaroute 项（CLI/桌面端同形态）。
+fn json_has_mcp_server(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(path) else { return false };
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else { return false };
+    v.get("mcpServers")
+        .and_then(|s| s.get(MCP_CLIENT_NAME))
+        .is_some()
 }
 
 fn register_mcp_claude(mcp_url: &str, timeout_ms: u64) -> AppResult<(String, bool)> {
@@ -1369,8 +1395,15 @@ fn read_preview_text(path: &Path, redact_secrets: bool) -> AppResult<(bool, Opti
     if !path.exists() {
         return Ok((false, None));
     }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| AppError::ToolConfig(format!("读取 {} 失败: {e}", path.display())))?;
+    // 读取失败不上抛：预览是只读展示，某个文件因编码/ACL/被独占锁而读不出时，应降级为
+    // 「存在但无法读取」的占位，让其余文件照常显示——而非让整份预览返回 Err、前端丢掉全部
+    // 路径、聚合页永久卡「加载中」。
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok((true, Some(format!("/* 无法读取该文件: {e} */"))));
+        }
+    };
     let text = if redact_secrets {
         redact_config_secrets(&raw)
     } else {
@@ -1606,6 +1639,50 @@ mod tests {
         assert!(!wrote2, "已无 synaroute，应不写盘");
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn desktop_and_cli_mcp_use_separate_files() {
+        // 回归护栏：桌面端与 CLI 的 MCP 必须写到**不同文件**，否则两分类端口不同会互相覆盖
+        // （接入桌面端把 CLI 的 synaroute 指到桌面端端口，反之亦然）。此处模拟两份独立配置文件，
+        // 各写各的端口，断言互不干扰。
+        let cli = temp_file("mcp_split_cli", ".claude.json");
+        let desktop = temp_file("mcp_split_desktop", DESKTOP_CONFIG_FILE);
+
+        register_mcp_claude_at(&cli, "http://127.0.0.1:9527/mcp", MCP_TOOL_TIMEOUT_MS).unwrap();
+        register_mcp_claude_at(&desktop, "http://127.0.0.1:9600/mcp", MCP_TOOL_TIMEOUT_MS).unwrap();
+
+        let cli_v: Value = serde_json::from_slice(&std::fs::read(&cli).unwrap()).unwrap();
+        let desk_v: Value = serde_json::from_slice(&std::fs::read(&desktop).unwrap()).unwrap();
+        assert_eq!(
+            cli_v["mcpServers"]["synaroute"]["url"], "http://127.0.0.1:9527/mcp",
+            "CLI 端口不应被桌面端注册覆盖"
+        );
+        assert_eq!(
+            desk_v["mcpServers"]["synaroute"]["url"], "http://127.0.0.1:9600/mcp",
+            "桌面端写自己的文件、自己的端口"
+        );
+
+        std::fs::remove_dir_all(cli.parent().unwrap()).ok();
+        std::fs::remove_dir_all(desktop.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn desktop_mcp_config_shares_file_with_deployment_mode() {
+        // 桌面端 MCP 与 deploymentMode 是同一个 claude_desktop_config.json 里的并列键，
+        // 互不干扰：先接入（写 deploymentMode=3p），再注册 MCP，两键应共存。
+        let (dir, _normal, threep, _profile, _meta) = desktop_layout("mcp_coexist_deploy");
+        write_deployment_mode(&threep, "3p").unwrap();
+        register_mcp_claude_at(&threep, "http://127.0.0.1:9600/mcp", MCP_TOOL_TIMEOUT_MS).unwrap();
+
+        let v: Value = serde_json::from_slice(&std::fs::read(&threep).unwrap()).unwrap();
+        assert_eq!(v["deploymentMode"], "3p", "deploymentMode 应保留");
+        assert_eq!(
+            v["mcpServers"]["synaroute"]["type"], "http",
+            "mcpServers 与 deploymentMode 并列共存"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

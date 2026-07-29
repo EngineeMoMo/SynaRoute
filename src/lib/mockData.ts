@@ -426,13 +426,32 @@ export const mockBridge = {
     if (categoryId === "claude-desktop") {
       return {
         categoryId,
-        summary: "Claude 桌面端：claude_desktop_config.json。写入 baseUrl。不写 CLI settings.json。",
+        summary:
+          "Claude 桌面端（3p 部署模式）：两个 claude_desktop_config.json 写 deploymentMode=3p，Claude-3p/configLibrary 里写 gateway 档（inferenceGatewayBaseUrl 指向本机代理 + 占位 key + bearer + 模型清单）并登记进 _meta。凭据预填齐即跳过 get-started。与 cc-switch 用独立档共存。不写 CLI 的 settings.json。",
         files: [
           {
-            path: "%APPDATA%/Claude/claude_desktop_config.json",
+            path: "%LOCALAPPDATA%/Claude/claude_desktop_config.json",
             exists: true,
             format: "json",
-            content: `{\n  "baseUrl": "http://127.0.0.1:${port}"\n}\n`,
+            content: `{\n  "deploymentMode": "3p"\n}\n`,
+          },
+          {
+            path: "%LOCALAPPDATA%/Claude-3p/claude_desktop_config.json",
+            exists: true,
+            format: "json",
+            content: `{\n  "deploymentMode": "3p",\n  "preferences": { "…": "（用户既有偏好，原样保留）" }\n}\n`,
+          },
+          {
+            path: "%LOCALAPPDATA%/Claude-3p/configLibrary/00000000-0000-4000-8000-000053796e61.json",
+            exists: true,
+            format: "json",
+            content: `{\n  "inferenceProvider": "gateway",\n  "inferenceGatewayBaseUrl": "http://127.0.0.1:${port}",\n  "inferenceGatewayApiKey": "***",\n  "inferenceGatewayAuthScheme": "bearer",\n  "disableDeploymentModeChooser": true,\n  "coworkEgressAllowedHosts": ["*"],\n  "inferenceModels": [{ "name": "claude-opus-4-8", "supports1m": true }]\n}\n`,
+          },
+          {
+            path: "%LOCALAPPDATA%/Claude-3p/configLibrary/_meta.json",
+            exists: true,
+            format: "json",
+            content: `{\n  "appliedId": "00000000-0000-4000-8000-000053796e61",\n  "entries": [{ "id": "00000000-0000-4000-8000-000053796e61", "name": "SynaRoute" }]\n}\n`,
           },
         ],
         mcpRegistered: false,
