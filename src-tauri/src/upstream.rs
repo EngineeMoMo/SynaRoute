@@ -502,7 +502,11 @@ pub async fn health_probe(key: &ProviderKey, secret: &str) -> (bool, u64, Option
 ///
 /// 返回 (是否成功, 延迟毫秒, 失败原因)。失败原因供调用方落日志——旧实现丢弃了它，导致探测
 /// 失败静默、无从排查。
-pub async fn health_probe_real(key: &ProviderKey, secret: &str) -> (bool, u64, Option<String>) {
+pub async fn health_probe_real(
+    key: &ProviderKey,
+    secret: &str,
+    message: &str,
+) -> (bool, u64, Option<String>) {
     let Some(model) = key.probe_model() else {
         // 该 Key 没有任何可探测的真实模型名 → 无法发补全，退回轻量连通探测。
         let (ok, latency, reason) = health_probe(key, secret).await;
@@ -516,7 +520,7 @@ pub async fn health_probe_real(key: &ProviderKey, secret: &str) -> (bool, u64, O
     // 极小请求：一个字 prompt、max_tokens=1。不重试（探测要快、如实反映当下）。
     // 探测超时封顶 30s（fast_timeout）：1 token 秒回,不跟随用户为慢厂商设的长超时,
     // 否则串行探测循环会被一个挂掉的慢 Key 拖住几分钟。
-    let result = text_completion(key, secret, &model, "hi", 1, false, fast_timeout(key)).await;
+    let result = text_completion(key, secret, &model, message, 1, false, fast_timeout(key)).await;
     let latency = start.elapsed().as_millis() as u64;
     match result {
         Ok(_) => (true, latency, None),
@@ -654,6 +658,55 @@ pub fn collect_tool_namespaces(body: &Value) -> Vec<String> {
     names
 }
 
+/// 从请求 tools 收集所有 Codex `type:"custom"` 工具名（如 `apply_patch`）。
+/// Codex 对这类工具期望响应侧回程 item type 为 `custom_tool_call`（非 `function_call`），
+/// 否则 Codex router 认不出、工具执行失败。响应侧据此集合判定每个工具调用该发哪种 item type。
+pub fn collect_custom_tools(body: &Value) -> std::collections::HashSet<String> {
+    body.get("tools")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|t| t.get("type").and_then(|ty| ty.as_str()) == Some("custom"))
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 把 custom 工具的 Chat 形态参数（JSON 字符串 `arguments`）解包成 Codex 期望的裸字符串 `input`。
+///
+/// Codex 的 `custom_tool_call` item 携带的是**裸字符串** `input` 字段（如 apply_patch 的 patch 正文、
+/// exec 的命令），而非 `function_call` 那样的 JSON `arguments`。上游模型（走 Anthropic 标准 tool_use）
+/// 拿到的是 `{type:object, properties:{input:{type:string}}}` 之类 schema，回来的 arguments 通常形如
+/// `{"input":"*** Begin Patch\n..."}`。此处按优先级解包：
+/// 1. 能解析成 JSON 对象且含字符串键 `input` → 取该字符串（最常见）；
+/// 2. 对象只有单个字符串值字段 → 取该值（模型用了别的键名时兜底）；
+/// 3. 本身就是 JSON 字符串标量 → 取其内容；
+/// 4. 其余（无法解析/结构不符）→ 原样返回（避免吞掉内容）。
+pub fn unpack_custom_tool_input(arguments: &str) -> String {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::Object(map)) => {
+            if let Some(s) = map.get("input").and_then(|v| v.as_str()) {
+                return s.to_string();
+            }
+            // 单字段对象且值为字符串：容忍模型换了键名
+            if map.len() == 1 {
+                if let Some(s) = map.values().next().and_then(|v| v.as_str()) {
+                    return s.to_string();
+                }
+            }
+            arguments.to_string()
+        }
+        Ok(Value::String(s)) => s,
+        _ => arguments.to_string(),
+    }
+}
+
 /// 把上游模型回调的工具全名按已知 namespace 列表拆回 (namespace, sub_name)。
 /// 全名形如 `<ns>__<sub>`；命中某 namespace 前缀则返回 (Some(ns), sub)，否则 (None, 原名)。
 /// 平铺工具（如 Codex 内置 update_plan）无 namespace 前缀，原样返回，不受影响。
@@ -689,7 +742,8 @@ fn openai_tools_to_anthropic(tools: &Value) -> Option<Value> {
             // Codex namespace 折叠工具:展开 tools[] 里的每个子工具为 <namespace>__<子工具>。
             Some("namespace") => {
                 let ns = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let Some(subs) = t.get("tools").and_then(|s| s.as_array()) else { continue };
+                let empty_vec = vec![];
+                let subs = t.get("tools").and_then(|s| s.as_array()).unwrap_or(&empty_vec);
                 for sub in subs {
                     // 子工具可能是扁平 {name,parameters} 或嵌套 {function:{..}}——都兼容。
                     let inner = sub.get("function").unwrap_or(sub);
@@ -721,10 +775,15 @@ fn openai_tools_to_anthropic(tools: &Value) -> Option<Value> {
                 if let Some(d) = f.get("description") {
                     a.insert("description".into(), d.clone());
                 }
-                // Anthropic 要求 input_schema 至少是个 object schema
+                // Anthropic 要求 input_schema 至少是个 object schema。
+                // Codex 的 type:"custom" 工具（apply_patch 等）用驼峰 `inputSchema` 承载 schema，
+                // 普通 function 用 `parameters`；两者都兜底，避免 custom 工具丢 schema → 上游拿到空对象。
                 a.insert(
                     "input_schema".into(),
-                    f.get("parameters").cloned().unwrap_or_else(|| json!({ "type": "object" })),
+                    f.get("parameters")
+                        .or_else(|| f.get("inputSchema"))
+                        .cloned()
+                        .unwrap_or_else(|| json!({ "type": "object" })),
                 );
                 out.push(Value::Object(a));
             }
@@ -1126,21 +1185,34 @@ pub fn convert_request(body: &Value, from: Protocol, to: Protocol) -> Value {
 
 /// 跨协议**响应体**转换：上游协议 `from` → 下游协议 `to`，以 Chat Completions 为中枢。
 /// 同协议直通。用于非流式响应回写给下游客户端。
+/// 生产非流式路径统一走 [`convert_response_ext`]（可带 custom 工具集合）；此简单签名保留供测试
+/// 与无 custom 工具场景，等价于 `convert_response_ext(.., &空集合)`。
+#[allow(dead_code)]
 pub fn convert_response(body: &Value, from: Protocol, to: Protocol) -> Value {
+    convert_response_ext(body, from, to, &std::collections::HashSet::new())
+}
+
+/// 同 [`convert_response`]，但在 Chat→Responses 路径上用 [`chat_resp_to_responses_ext`]，
+/// 把 `custom_tools` 集合内工具的回程 item type 改写为 `custom_tool_call`。
+/// 非流式路径专用；流式路径在 [`SseTranslator`] 内直接判定。
+pub fn convert_response_ext(
+    body: &Value,
+    from: Protocol,
+    to: Protocol,
+    custom_tools: &std::collections::HashSet<String>,
+) -> Value {
     if from == to {
         return body.clone();
     }
-    // 1. 上游 → Chat 中枢
     let chat = match from {
         Protocol::Anthropic => anthropic_resp_to_openai(body),
         Protocol::OpenaiChat => body.clone(),
         Protocol::OpenaiResponses => responses_resp_to_chat(body),
     };
-    // 2. Chat 中枢 → 下游
     match to {
         Protocol::Anthropic => openai_resp_to_anthropic(&chat),
         Protocol::OpenaiChat => chat,
-        Protocol::OpenaiResponses => chat_resp_to_responses(&chat),
+        Protocol::OpenaiResponses => chat_resp_to_responses_ext(&chat, custom_tools),
     }
 }
 
@@ -1189,6 +1261,40 @@ pub fn responses_to_chat(body: &Value) -> Value {
                             "content": it.get("output").and_then(|o| o.as_str()).unwrap_or(""),
                         }));
                     }
+                    // Codex 多轮会把上一轮的 custom 工具调用（apply_patch/exec）作为历史带回。
+                    // custom_tool_call 携带裸字符串 `input`；还原成 assistant.tool_calls 时把 arguments
+                    // 重新包成 {"input":"<裸串>"}，与响应侧解包（unpack_custom_tool_input）对称——
+                    // 模型看到自己上一轮产出的同一形态。不处理会落到 `_` 分支被当成空 user 消息，
+                    // 多轮里工具调用与结果全丢失，模型失去上下文。
+                    Some("custom_tool_call") => {
+                        let call_id = it
+                            .get("call_id")
+                            .or_else(|| it.get("id"))
+                            .cloned()
+                            .unwrap_or(json!(""));
+                        let input_str = it.get("input").and_then(|i| i.as_str()).unwrap_or("");
+                        let arguments = json!({ "input": input_str }).to_string();
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": Value::Null,
+                            "tool_calls": [ {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": it.get("name").cloned().unwrap_or(json!("")),
+                                    "arguments": arguments,
+                                }
+                            } ]
+                        }));
+                    }
+                    // custom 工具执行结果回传：同 function_call_output → role:"tool"。
+                    Some("custom_tool_call_output") => {
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": it.get("call_id").cloned().unwrap_or(json!("")),
+                            "content": it.get("output").and_then(|o| o.as_str()).unwrap_or(""),
+                        }));
+                    }
                     // 普通 message item：role + content 分块
                     _ => {
                         let role = it.get("role").and_then(|r| r.as_str()).unwrap_or("user");
@@ -1221,23 +1327,42 @@ pub fn responses_to_chat(body: &Value) -> Value {
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         let mut mapped: Vec<Value> = Vec::new();
         for t in tools {
+            // Codex type:"custom" 工具（apply_patch 等）：schema 在驼峰 `inputSchema`（也兜底 parameters）。
+            // 转成标准 Chat function，让上游模型拿到真实 schema。响应侧靠 collect_custom_tools
+            // 集合把回程 item type 还原为 custom_tool_call。放在 namespace 判定之前，避免误入其他分支。
+            if t.get("type").and_then(|ty| ty.as_str()) == Some("custom") {
+                let Some(name) = t.get("name").and_then(|n| n.as_str()) else { continue };
+                let mut f = serde_json::Map::new();
+                f.insert("name".into(), json!(name));
+                if let Some(d) = t.get("description") {
+                    f.insert("description".into(), d.clone());
+                }
+                let schema = t
+                    .get("inputSchema")
+                    .or_else(|| t.get("parameters"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "type": "object" }));
+                f.insert("parameters".into(), schema);
+                mapped.push(json!({ "type": "function", "function": f }));
+                continue;
+            }
             // namespace 折叠工具：展开内部 tools[]，名字拼成 <ns>__<子工具>。
             if t.get("type").and_then(|ty| ty.as_str()) == Some("namespace") {
                 let ns = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                if let Some(subs) = t.get("tools").and_then(|s| s.as_array()) {
-                    for sub in subs {
-                        let Some(sub_name) = sub.get("name").and_then(|n| n.as_str()) else { continue };
-                        let full = if ns.is_empty() { sub_name.to_string() } else { format!("{ns}__{sub_name}") };
-                        let mut f = serde_json::Map::new();
-                        f.insert("name".into(), json!(full));
-                        if let Some(d) = sub.get("description") {
-                            f.insert("description".into(), d.clone());
-                        }
-                        if let Some(p) = sub.get("parameters") {
-                            f.insert("parameters".into(), p.clone());
-                        }
-                        mapped.push(json!({ "type": "function", "function": f }));
+                let empty_vec2 = vec![];
+                let subs2 = t.get("tools").and_then(|s| s.as_array()).unwrap_or(&empty_vec2);
+                for sub in subs2 {
+                    let Some(sub_name) = sub.get("name").and_then(|n| n.as_str()) else { continue };
+                    let full = if ns.is_empty() { sub_name.to_string() } else { format!("{ns}__{sub_name}") };
+                    let mut f = serde_json::Map::new();
+                    f.insert("name".into(), json!(full));
+                    if let Some(d) = sub.get("description") {
+                        f.insert("description".into(), d.clone());
                     }
+                    if let Some(p) = sub.get("parameters").or_else(|| sub.get("inputSchema")) {
+                        f.insert("parameters".into(), p.clone());
+                    }
+                    mapped.push(json!({ "type": "function", "function": f }));
                 }
                 continue;
             }
@@ -1248,7 +1373,7 @@ pub fn responses_to_chat(body: &Value) -> Value {
             if let Some(d) = t.get("description") {
                 f.insert("description".into(), d.clone());
             }
-            if let Some(p) = t.get("parameters") {
+            if let Some(p) = t.get("parameters").or_else(|| t.get("inputSchema")) {
                 f.insert("parameters".into(), p.clone());
             }
             mapped.push(json!({ "type": "function", "function": f }));
@@ -1343,6 +1468,44 @@ pub fn chat_resp_to_responses(body: &Value) -> Value {
             "total_tokens": input_tokens + output_tokens
         }
     })
+}
+
+/// 同 [`chat_resp_to_responses`]，但把 `custom_tools` 集合内工具的回程 item type 从
+/// `function_call` 改写为 `custom_tool_call`（Codex 的 apply_patch 等 type:"custom" 工具）。
+/// 以基函数产出为底，仅对 output[] 里命中的工具调用项改 type 字段——避免复制整段逻辑。
+/// 非流式路径专用；流式路径在 [`SseTranslator::emit_responses_completed`] 内直接判定。
+pub fn chat_resp_to_responses_ext(
+    body: &Value,
+    custom_tools: &std::collections::HashSet<String>,
+) -> Value {
+    let mut resp = chat_resp_to_responses(body);
+    if custom_tools.is_empty() {
+        return resp;
+    }
+    if let Some(output) = resp.get_mut("output").and_then(|o| o.as_array_mut()) {
+        for item in output.iter_mut() {
+            let is_fc = item.get("type").and_then(|t| t.as_str()) == Some("function_call");
+            let name_hit = item
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| custom_tools.contains(n))
+                .unwrap_or(false);
+            if is_fc && name_hit {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("type".into(), json!("custom_tool_call"));
+                    // 同流式路径：custom_tool_call 用裸字符串 `input`，不用 JSON `arguments`。
+                    let args = obj
+                        .get("arguments")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    obj.insert("input".into(), json!(unpack_custom_tool_input(&args)));
+                    obj.remove("arguments");
+                }
+            }
+        }
+    }
+    resp
 }
 
 /// Chat Completions 请求体 → Responses 请求体。
@@ -1614,6 +1777,9 @@ pub struct SseTranslator {
     /// 收尾生成 Responses function_call 时，用它把上游回调的全名 `<ns>__<sub>` 拆回
     /// {name, namespace} 两字段（Codex router 用结构化 ToolName 查表，不拆 name 字符串）。
     tool_namespaces: Vec<String>,
+    /// 请求里 type:"custom" 工具名集合（apply_patch 等）。
+    /// 响应侧据此把对应工具调用的 item type 输出为 "custom_tool_call" 而非 "function_call"。
+    custom_tools: std::collections::HashSet<String>,
 }
 
 impl SseTranslator {
@@ -1642,7 +1808,21 @@ impl SseTranslator {
             reasoning_started: false,
             reasoning_accum: String::new(),
             tool_namespaces,
+            custom_tools: std::collections::HashSet::new(),
         }
+    }
+
+    /// 在 [`with_namespaces`] 基础上带上 type:"custom" 工具名集合（Codex 的 apply_patch 等）。
+    /// Codex（Responses 下游）跨协议流式时传入，使响应侧把这些工具的调用回程输出为
+    /// `custom_tool_call` item type，而非默认的 `function_call`——否则 Codex router 认不出。
+    pub fn with_namespaces_and_custom(
+        dir: SseDirection,
+        tool_namespaces: Vec<String>,
+        custom_tools: std::collections::HashSet<String>,
+    ) -> Self {
+        let mut s = Self::with_namespaces(dir, tool_namespaces);
+        s.custom_tools = custom_tools;
+        s
     }
 
     /// 喂入一块上游字节，返回应发给下游的 SSE 文本（可能为空）。
@@ -1832,14 +2012,29 @@ impl SseTranslator {
             // 两个独立字段，否则 router 查 {namespace:None, name:"mcp__x__foo"} 匹配不到 → unsupported call。
             let (ns, real_name) = split_namespaced_tool_name(name, &self.tool_namespaces);
             let mut item_map = serde_json::Map::new();
-            item_map.insert("type".into(), json!("function_call"));
+            // Codex 的 type:"custom" 工具（apply_patch 等）期望 item type 为 custom_tool_call；
+            // 其余（含 namespace 展开的 MCP 工具、普通 function）用 function_call。用请求侧收集的
+            // custom_tools 集合按拆出的真实名判定，否则 Codex router 认不出 custom 工具 → 执行失败。
+            let item_type = if self.custom_tools.contains(&real_name) {
+                "custom_tool_call"
+            } else {
+                "function_call"
+            };
+            item_map.insert("type".into(), json!(item_type));
             item_map.insert("id".into(), json!(fc_id));
             item_map.insert("call_id".into(), json!(call_id));
             item_map.insert("name".into(), json!(real_name));
             if let Some(ns) = ns {
                 item_map.insert("namespace".into(), json!(ns));
             }
-            item_map.insert("arguments".into(), json!(arguments));
+            // custom_tool_call 的 payload 是裸字符串 `input`（apply_patch 的 patch 正文、exec 的命令），
+            // 而非 function_call 的 JSON `arguments`。否则 Codex 反序列化 custom_tool_call 拿不到 input
+            // → 工具空跑或被拒（type 改对了但字段名不对，等于没修）。从 {"input":"..."} 解包成裸串。
+            if item_type == "custom_tool_call" {
+                item_map.insert("input".into(), json!(unpack_custom_tool_input(arguments)));
+            } else {
+                item_map.insert("arguments".into(), json!(arguments));
+            }
             item_map.insert("status".into(), json!("completed"));
             let item = Value::Object(item_map);
             // 关键修复：作为流式事件投递（added 宣告 → done 交付完整调用），Codex 据 done 执行工具。
@@ -3175,5 +3370,187 @@ mod tests {
         assert!(out.contains("\"type\":\"text_delta\""), "缺 text_delta");
         assert!(out.contains("\"text\":\"Yo\""), "文本增量丢失");
         assert!(out.contains("event: message_stop"), "缺 message_stop");
+    }
+
+    #[test]
+    fn collect_custom_tools_finds_custom_type() {
+        let body = json!({
+            "tools": [
+                { "type": "custom", "name": "apply_patch" },
+                { "type": "function", "name": "read_file" },
+                { "type": "namespace", "name": "mcp__x" },
+                { "type": "custom", "name": "exec" },
+            ]
+        });
+        let result = collect_custom_tools(&body);
+        assert_eq!(result.len(), 2);
+        assert!(result.contains("apply_patch"));
+        assert!(result.contains("exec"));
+        assert!(!result.contains("read_file"));
+    }
+
+    #[test]
+    fn openai_tools_to_anthropic_uses_input_schema() {
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "inputSchema": { "type": "object", "properties": { "patch": { "type": "string" } } }
+            }
+        }]);
+        let result = openai_tools_to_anthropic(&tools).unwrap();
+        let tool = &result[0];
+        assert_eq!(tool["name"], "apply_patch");
+        let schema = &tool["input_schema"];
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["patch"].is_object(), "inputSchema 应被读取为 input_schema");
+    }
+
+    #[test]
+    fn responses_to_chat_maps_custom_tool_with_input_schema() {
+        let body = json!({
+            "model": "[REDACTED]",
+            "input": [],
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "inputSchema": { "type": "object", "properties": { "patch": { "type": "string" } } }
+            }]
+        });
+        let result = responses_to_chat(&body);
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        let f = &tools[0]["function"];
+        assert_eq!(f["name"], "apply_patch");
+        assert_eq!(f["parameters"]["type"], "object", "inputSchema 应映射到 parameters");
+    }
+
+    #[test]
+    fn chat_resp_to_responses_ext_custom_type() {
+        let body = json!({
+            "choices": [{ "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{ "id": "tc1", "type": "function", "function": { "name": "apply_patch", "arguments": "{\"input\":\"*** Begin Patch\"}" } }]
+            }, "finish_reason": "tool_calls" }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
+        });
+        let custom = std::collections::HashSet::from(["apply_patch".to_string()]);
+        let result = chat_resp_to_responses_ext(&body, &custom);
+        let output = result["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "custom_tool_call", "apply_patch 应输出 custom_tool_call");
+        assert_eq!(output[0]["name"], "apply_patch");
+        // custom_tool_call 必须携带裸字符串 input，且不得再带 arguments（Codex 反序列化按 input）
+        assert_eq!(output[0]["input"], "*** Begin Patch", "input 应从 input 键解包成裸串");
+        assert!(output[0].get("arguments").is_none(), "custom_tool_call 不应再带 arguments");
+    }
+
+    #[test]
+    fn chat_resp_to_responses_ext_function_type() {
+        let body = json!({
+            "choices": [{ "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{ "id": "tc2", "type": "function", "function": { "name": "read_file", "arguments": "{}" } }]
+            }, "finish_reason": "tool_calls" }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
+        });
+        let custom = std::collections::HashSet::from(["apply_patch".to_string()]);
+        let result = chat_resp_to_responses_ext(&body, &custom);
+        let output = result["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "function_call", "非 custom 工具应保持 function_call");
+    }
+
+    #[test]
+    fn unpack_custom_tool_input_variants() {
+        // 1. 最常见：{"input":"<裸串>"} → 取 input
+        assert_eq!(
+            unpack_custom_tool_input("{\"input\":\"*** Begin Patch\\nhi\"}"),
+            "*** Begin Patch\nhi"
+        );
+        // 2. 单字段对象换了键名 → 取该字符串值
+        assert_eq!(unpack_custom_tool_input("{\"cmd\":\"ls -la\"}"), "ls -la");
+        // 3. JSON 字符串标量 → 取其内容
+        assert_eq!(unpack_custom_tool_input("\"raw string\""), "raw string");
+        // 4. 空串 → 空串
+        assert_eq!(unpack_custom_tool_input("   "), "");
+        // 5. 非 JSON（本身就是裸串）→ 原样返回，不吞内容
+        assert_eq!(unpack_custom_tool_input("*** Begin Patch"), "*** Begin Patch");
+        // 6. 多字段对象无 input → 原样返回整串（避免误取）
+        let multi = "{\"a\":\"x\",\"b\":\"y\"}";
+        assert_eq!(unpack_custom_tool_input(multi), multi);
+    }
+
+    #[test]
+    fn sse_emits_custom_tool_call_with_input_not_arguments() {
+        // 流式：custom 工具集合命中 apply_patch 时，output_item 必须是 custom_tool_call
+        // 且携带裸字符串 input（从 {"input":".."} 解包），不得携带 arguments。
+        let custom = std::collections::HashSet::from(["apply_patch".to_string()]);
+        let mut tr = SseTranslator::with_namespaces_and_custom(
+            SseDirection::AnthropicToResponses,
+            vec![],
+            custom,
+        );
+        let mut out = String::new();
+        out.push_str(&tr.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"apply_patch\",\"input\":{}}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"input\\\":\\\"PATCH\\\"}\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"));
+        out.push_str(&tr.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n"));
+        out.push_str(&tr.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+        out.push_str(&tr.finish());
+        assert!(out.contains("\"type\":\"custom_tool_call\""), "应输出 custom_tool_call:\n{out}");
+        assert!(out.contains("\"input\":\"PATCH\""), "应携带解包后的裸字符串 input:\n{out}");
+        assert!(!out.contains("\"arguments\""), "custom_tool_call 不应携带 arguments:\n{out}");
+    }
+
+    #[test]
+    fn sse_emits_function_call_with_arguments_for_non_custom() {
+        // 对照：非 custom 工具仍走 function_call + arguments。
+        let mut tr = SseTranslator::with_namespaces_and_custom(
+            SseDirection::AnthropicToResponses,
+            vec![],
+            std::collections::HashSet::new(),
+        );
+        let mut out = String::new();
+        out.push_str(&tr.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"read_file\",\"input\":{}}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"));
+        out.push_str(&tr.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n"));
+        out.push_str(&tr.finish());
+        assert!(out.contains("\"type\":\"function_call\""), "非 custom 工具应输出 function_call:\n{out}");
+        assert!(out.contains("\"arguments\""), "function_call 应携带 arguments:\n{out}");
+        assert!(!out.contains("custom_tool_call"), "不应误判为 custom_tool_call:\n{out}");
+    }
+
+    #[test]
+    fn responses_to_chat_maps_custom_tool_history_items() {
+        // 多轮：Codex 把上一轮 custom 工具调用与结果作为历史带回（custom_tool_call +
+        // custom_tool_call_output）。必须还原成 assistant.tool_calls + role:tool，否则丢上下文。
+        let body = json!({
+            "model": "[REDACTED]",
+            "input": [
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "改一下" }] },
+                { "type": "custom_tool_call", "call_id": "c1", "name": "apply_patch", "input": "*** Begin Patch" },
+                { "type": "custom_tool_call_output", "call_id": "c1", "output": "done" }
+            ]
+        });
+        let result = responses_to_chat(&body);
+        let msgs = result["messages"].as_array().unwrap();
+        // user + assistant(tool_calls) + tool
+        let assistant = msgs.iter().find(|m| m["role"] == "assistant").expect("缺 assistant 消息");
+        let tc = &assistant["tool_calls"][0];
+        assert_eq!(tc["id"], "c1");
+        assert_eq!(tc["function"]["name"], "apply_patch");
+        // arguments 重新包成 {"input":".."}，与响应侧解包对称
+        assert_eq!(tc["function"]["arguments"], "{\"input\":\"*** Begin Patch\"}");
+        let tool_msg = msgs.iter().find(|m| m["role"] == "tool").expect("缺 tool 结果消息");
+        assert_eq!(tool_msg["tool_call_id"], "c1");
+        assert_eq!(tool_msg["content"], "done");
     }
 }

@@ -458,6 +458,10 @@ export const mockBridge = {
     await delay();
     return clone(events.filter((e) => e.categoryId === categoryId));
   },
+  async listAllEvents() {
+    await delay();
+    return clone(events);
+  },
   async getSettings() {
     await delay();
     return clone(settings);

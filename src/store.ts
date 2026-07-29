@@ -162,12 +162,12 @@ export const useStore = create<AppState>((set, get) => ({
       api.listKeys(c),
       api.getProxyState(c),
       api.getBrainConfig(c),
-      api.listEvents(c),
+      api.listAllEvents(),
     ]);
     if (keysR.status === "rejected") console.error("listKeys failed", keysR.reason);
     if (proxyR.status === "rejected") console.error("getProxyState failed", proxyR.reason);
     if (brainR.status === "rejected") console.error("getBrainConfig failed", brainR.reason);
-    if (eventsR.status === "rejected") console.error("listEvents failed", eventsR.reason);
+    if (eventsR.status === "rejected") console.error("listAllEvents failed", eventsR.reason);
     set((s) => ({
       keys: keysR.status === "fulfilled" ? keysR.value : s.keys,
       proxy: proxyR.status === "fulfilled" ? proxyR.value : s.proxy,
@@ -194,10 +194,10 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   // 轻量刷新：仅拉事件日志（运行日志页 2s 轮询用），不动 keys/proxy/brain，避免整页重载闪烁。
+  // 合并全部分类，切换活动分类时日志连续不裁剪；分类过滤交给前端页面按 categoryId 客户端筛选。
   async refreshEvents() {
-    const c = get().activeCategory;
     try {
-      const events = await api.listEvents(c);
+      const events = await api.listAllEvents();
       set({ events });
     } catch (e) {
       console.error("refreshEvents failed", e);

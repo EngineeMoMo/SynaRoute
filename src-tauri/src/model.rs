@@ -680,6 +680,11 @@ pub struct AppSettings {
     /// 开启后健康「可用/熔断」与真实业务一致，不再出现「连通正常却熔断」的割裂。
     #[serde(default)]
     pub health_probe_real_completion: bool,
+    /// 真实补全探测使用的「测试消息」候选列表（全局共享）。每次探测从中随机取一条作为 prompt，
+    /// 避免上游对完全相同的极短请求做缓存/风控误判。空列表时回退到内置 "hi"。
+    /// 仅 health_probe_real_completion 开启时生效。
+    #[serde(default)]
+    pub health_probe_test_messages: Vec<String>,
     /// 大脑聚合详细快照：开启后每次聚合把成员完整答案、汇总产物、决策者入参/回答
     /// 落进可展开 trace（体量可达数十万字符）。默认关，避免每轮聚合都写重型日志、
     /// 徒增磁盘 IO；状态行（参与者成功/失败、汇总/决策者返回）不受此开关影响，始终记录。
@@ -760,6 +765,7 @@ impl Default for AppSettings {
             mcp_registered_categories: Vec::new(),
             upstream_retry_enabled: true,
             health_probe_real_completion: false,
+            health_probe_test_messages: Vec::new(),
             aggregate_trace_enabled: false,
             active_models: std::collections::HashMap::new(),
             active_efforts: std::collections::HashMap::new(),

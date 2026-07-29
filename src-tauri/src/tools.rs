@@ -2010,6 +2010,8 @@ mod tests {
         // cc-switch 的 entry 原样保留（不误删用户另一套接入）。
         let (dir, normal, threep, profile, meta) = desktop_layout("desktop_coexist");
         let ccswitch_id = "00000000-0000-4000-8000-000000157210";
+        // _meta.json 位于 configLibrary/ 下；desktop_layout 未建该子目录，直接写会 NotFound。
+        std::fs::create_dir_all(meta.parent().unwrap()).unwrap();
         std::fs::write(
             &meta,
             format!(

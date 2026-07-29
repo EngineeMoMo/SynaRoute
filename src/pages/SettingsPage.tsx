@@ -488,6 +488,20 @@ export function SettingsPage() {
               checked={settings?.healthProbeRealCompletion ?? false}
               onChange={(v) => update({ healthProbeRealCompletion: v })}
             />
+            {settings?.healthProbeRealCompletion && (
+              <div className="ml-8 space-y-1.5">
+                <div className="text-sm font-medium text-text-primary">{t("settings.probeMsgTitle")}</div>
+                <div className="text-xs text-text-muted">{t("settings.probeMsgDesc")}</div>
+                <textarea
+                  className="min-h-[80px] w-full resize-y rounded-control border border-border bg-surface px-2.5 py-1.5 font-mono text-xs text-text-primary placeholder:text-text-muted"
+                  placeholder={t("settings.probeMsgPlaceholder")}
+                  value={(settings?.healthProbeTestMessages ?? []).join("\n")}
+                  onChange={(e) =>
+                    update({ healthProbeTestMessages: e.target.value.split("\n") })
+                  }
+                />
+              </div>
+            )}
             <ToggleRow
               icon={Brain}
               title={t("settings.aggTraceTitle")}

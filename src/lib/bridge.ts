@@ -122,6 +122,10 @@ export const api = {
   listEvents: (categoryId: CategoryType) =>
     call<EventLogEntry[]>("list_events", { categoryId }, () => mockBridge.listEvents(categoryId)),
 
+  /** 合并全部分类的事件日志（不按分类过滤），供运行日志页连续展示；每条自带 categoryId 标签。 */
+  listAllEvents: () =>
+    call<EventLogEntry[]>("list_all_events", undefined, () => mockBridge.listAllEvents()),
+
   // ---- 设置 ----
   getSettings: () => call<AppSettings>("get_settings", undefined, () => mockBridge.getSettings()),
 

@@ -239,6 +239,12 @@ impl Store {
             .collect()
     }
 
+    /// 合并全部分类的事件日志（不按分类过滤），供「运行日志」页连续展示。
+    /// 切换活动分类时日志不再被裁剪，每条自带 category_id 标签，前端可再做客户端过滤。
+    pub fn list_all_events(&self) -> Vec<EventLogEntry> {
+        self.events.read().iter().cloned().collect()
+    }
+
     /// 读取 config 文件当前磁盘状态快照 (mtime, 字节数)；文件不存在/不可读时返回 (None, 0)。
     fn read_disk_stamp(path: &std::path::Path) -> (Option<SystemTime>, u64) {
         match std::fs::metadata(path) {

@@ -14,6 +14,17 @@ const BREAKER_COOLDOWN_MS: i64 = 60_000;
 /// 「近期有真实转发成功」宽限窗口（毫秒）：窗口内后台探测失败不熔断，因真实流量证明该 Key 可用。
 const LIVE_SUCCESS_GRACE_MS: i64 = 120_000;
 
+/// 从「测试消息列表」随机取一条作为真实补全探测的 prompt。
+/// 列表为空（用户未配置）时回退内置 "hi"，保持旧行为。空白项过滤掉后仍为空也回退。
+fn pick_probe_message(messages: &[String]) -> String {
+    use rand::seq::SliceRandom;
+    let candidates: Vec<&String> = messages.iter().filter(|m| !m.trim().is_empty()).collect();
+    match candidates.choose(&mut rand::thread_rng()) {
+        Some(m) => (*m).clone(),
+        None => "hi".to_string(),
+    }
+}
+
 /// 对单个 Key 执行一次健康检查并更新其状态。
 pub async fn check_one(store: &Arc<Store>, key_id: &str) {
     let Some(key) = store.get_key(key_id) else { return };
@@ -28,9 +39,12 @@ pub async fn check_one(store: &Arc<Store>, key_id: &str) {
     };
 
     // 探测方式按设置切换：默认轻量连通探测；开启后用真实补全探测（与业务一致，消耗少量额度）。
-    let real_probe = store.get_settings().health_probe_real_completion;
+    let settings = store.get_settings();
+    let real_probe = settings.health_probe_real_completion;
     let (ok, latency, err) = if real_probe {
-        upstream::health_probe_real(&key, &secret).await
+        // 真实补全探测用「测试消息列表」随机取一条（空则回退内置 "hi"）——见 pick_probe_message。
+        let msg = pick_probe_message(&settings.health_probe_test_messages);
+        upstream::health_probe_real(&key, &secret, &msg).await
     } else {
         upstream::health_probe(&key, &secret).await
     };

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useStore } from "@/store";
 import { Badge } from "@/components/ui/Badge";
 import { useT } from "@/lib/useT";
-import type { EventLogEntry } from "@/types";
+import type { CategoryType, EventLogEntry } from "@/types";
 import {
   ArrowLeftRight,
   Activity,
@@ -59,12 +59,18 @@ const GROUP_META: Record<LogGroup, { tKey: string; icon: LucideIcon; dot: string
   error: { tKey: "logs.group.error", icon: AlertCircle, dot: "bg-danger" },
 };
 
-/** 运行日志 / 可观测性视图（FR-020）。按「系统 / 大脑聚合 / 路由 / 错误」分组，顶部可筛选。 */
+/** 分类维度：日志现已合并全部分类连续展示，每条自带来源分类标签，顶部可按分类再筛选。
+ * 复用左侧导航的分类名（nav.*），Badge 用中性色以免与类型徽标抢视觉。 */
+const CATEGORY_ORDER: CategoryType[] = ["claude-cli", "claude-desktop", "codex"];
+
+/** 运行日志 / 可观测性视图（FR-020）。合并全部分类连续展示，按「类型分组」与「来源分类」两维筛选。 */
 export function LogsPage() {
   const { events, lang, refreshEvents } = useStore();
   const t = useT();
-  // 当前筛选：null = 全部；否则只看某一组。
+  // 类型分组筛选：null = 全部；否则只看某一组。
   const [filter, setFilter] = useState<LogGroup | null>(null);
+  // 分类筛选：null = 全部分类；否则只看某一来源分类。与分组筛选正交。
+  const [catFilter, setCatFilter] = useState<CategoryType | null>(null);
 
   // 实时刷新：每 2s 拉一次事件（仅事件，不重载 keys/proxy，开销小）。
   useEffect(() => {
@@ -73,18 +79,45 @@ export function LogsPage() {
     return () => clearInterval(id);
   }, [refreshEvents]);
 
-  // 每组事件计数（供筛选标签展示 + 决定该组是否渲染）。
+  // 每组事件计数（在「当前分类筛选」范围内统计，交叉联动）。
   const counts = useMemo(() => {
     const c: Record<LogGroup, number> = { system: 0, brain: 0, route: 0, failover: 0, error: 0 };
-    for (const e of events) c[GROUP_OF[e.type] ?? "system"] += 1;
+    for (const e of events) {
+      if (catFilter && e.categoryId !== catFilter) continue;
+      c[GROUP_OF[e.type] ?? "system"] += 1;
+    }
     return c;
-  }, [events]);
+  }, [events, catFilter]);
 
-  // 最新在前；按筛选裁剪。
+  // 每分类事件计数（在「当前分组筛选」范围内统计，交叉联动）。
+  const catCounts = useMemo(() => {
+    const c: Record<CategoryType, number> = { "claude-cli": 0, "claude-desktop": 0, codex: 0 };
+    for (const e of events) {
+      if (filter && (GROUP_OF[e.type] ?? "system") !== filter) continue;
+      c[e.categoryId] += 1;
+    }
+    return c;
+  }, [events, filter]);
+
+  // 「全部」标签计数：分别落在各自维度的另一维筛选范围内。
+  const allByGroup = useMemo(
+    () => events.filter((e) => !catFilter || e.categoryId === catFilter).length,
+    [events, catFilter],
+  );
+  const allByCat = useMemo(
+    () => events.filter((e) => !filter || (GROUP_OF[e.type] ?? "system") === filter).length,
+    [events, filter],
+  );
+
+  // 最新在前；同时按两个维度裁剪。
   const visible = useMemo(() => {
     const ordered = [...events].reverse();
-    return filter ? ordered.filter((e) => (GROUP_OF[e.type] ?? "system") === filter) : ordered;
-  }, [events, filter]);
+    return ordered.filter(
+      (e) =>
+        (!filter || (GROUP_OF[e.type] ?? "system") === filter) &&
+        (!catFilter || e.categoryId === catFilter),
+    );
+  }, [events, filter, catFilter]);
 
   return (
     <div className="flex h-full flex-col">
@@ -92,11 +125,30 @@ export function LogsPage() {
         <h1 className="text-lg font-semibold text-text-primary">{t("logs.title")}</h1>
         <p className="mt-1 text-xs text-text-muted">{t("logs.subtitle")}</p>
 
-        {/* 筛选标签：全部 + 4 个分组（带计数） */}
+        {/* 分类筛选：全部 + 三个来源分类（带计数）。日志已合并连续展示，切换活动分类不再裁剪。 */}
         <div className="mt-3 flex flex-wrap gap-1.5">
           <FilterTab
+            label={t("logs.filter.allCategories")}
+            count={allByCat}
+            active={catFilter === null}
+            onClick={() => setCatFilter(null)}
+          />
+          {CATEGORY_ORDER.map((cat) => (
+            <FilterTab
+              key={cat}
+              label={t(`nav.${cat}`)}
+              count={catCounts[cat]}
+              active={catFilter === cat}
+              onClick={() => setCatFilter(cat)}
+            />
+          ))}
+        </div>
+
+        {/* 类型分组筛选：全部 + 4 个分组（带计数） */}
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          <FilterTab
             label={t("logs.filter.all")}
-            count={events.length}
+            count={allByGroup}
             active={filter === null}
             onClick={() => setFilter(null)}
           />
@@ -192,6 +244,7 @@ function LogRow({ entry, lang }: { entry: EventLogEntry; lang: string }) {
           <span className="w-[14px] shrink-0" />
         )}
         <span className="font-mono text-[11px] text-text-muted">{time}</span>
+        <Badge variant="neutral">{t(`nav.${entry.categoryId}`)}</Badge>
         <Badge variant={meta.variant}>
           <Icon size={10} />
           {t(meta.tKey)}

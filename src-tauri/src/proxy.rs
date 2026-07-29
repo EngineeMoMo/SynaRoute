@@ -752,7 +752,8 @@ async fn try_stream_to_key(
             // Codex router 用结构化 ToolName{namespace,name} 查表，不拆 name 字符串，缺 namespace
             // 字段就报 unsupported call（大脑聚合失效根因）。
             let namespaces = crate::upstream::collect_tool_namespaces(req_json);
-            let translator = crate::upstream::SseTranslator::with_namespaces(dir, namespaces);
+            let custom_tools = crate::upstream::collect_custom_tools(req_json);
+            let translator = crate::upstream::SseTranslator::with_namespaces_and_custom(dir, namespaces, custom_tools);
             let upstream = resp.bytes_stream();
             struct StreamState<S> {
                 translator: crate::upstream::SseTranslator,
@@ -1000,7 +1001,11 @@ async fn forward_to_key(
     let bytes = if status.is_success() && !same_protocol {
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(v) => {
-                let translated = crate::upstream::convert_response(&v, key.protocol, downstream);
+                // 传入 custom 工具集合：Chat→Responses 时把 apply_patch 等的回程 item type
+                // 改写为 custom_tool_call（否则 Codex router 认不出）。其他协议对不涉及此逻辑。
+                let custom_tools = crate::upstream::collect_custom_tools(req_json);
+                let translated =
+                    crate::upstream::convert_response_ext(&v, key.protocol, downstream, &custom_tools);
                 Bytes::from(serde_json::to_vec(&translated).unwrap_or_else(|_| bytes.to_vec()))
             }
             Err(_) => bytes, // 解析失败（非 JSON）：原样透传

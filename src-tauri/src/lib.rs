@@ -286,6 +286,11 @@ fn list_events(state: tauri::State<AppState>, category_id: CategoryType) -> Vec<
 }
 
 #[tauri::command]
+fn list_all_events(state: tauri::State<AppState>) -> Vec<EventLogEntry> {
+    state.store.list_all_events()
+}
+
+#[tauri::command]
 fn get_settings(state: tauri::State<AppState>) -> AppSettings {
     state.store.get_settings()
 }
@@ -984,6 +989,7 @@ pub fn run() {
             get_tool_config_preview,
             restore_tool_config,
             list_events,
+            list_all_events,
             get_settings,
             save_settings,
             set_active_model,
