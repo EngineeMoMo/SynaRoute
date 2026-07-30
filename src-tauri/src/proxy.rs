@@ -230,9 +230,22 @@ async fn handle_request(
     // 用 path（去掉 query）的路径部分判定，避免把补全端点误判进来。
     let path_only = req.uri().path();
     if req.method() == hyper::Method::GET
-        && (path_only == "/v1/models" || path_only == "/models" || path_only.starts_with("/v1/models/"))
+        && (path_only == "/v1/models" || path_only == "/models")
     {
         return Ok(handle_list_models(&store, category));
+    }
+    // 单模型检索 `GET /v1/models/{id}`（Anthropic SDK 的 models.retrieve）：必须返回**单个模型
+    // 对象**，不能返回列表形状——此前统一走列表分支，客户端拿到 `{"data":[…]}` 解不出 id。
+    if req.method() == hyper::Method::GET {
+        if let Some(raw_id) = path_only.strip_prefix("/v1/models/") {
+            return Ok(handle_retrieve_model(&store, category, raw_id));
+        }
+    }
+    // 官方 gateway 协议里的**非推理端点**（判据：claude.exe v2.1.219 内嵌的 llm-gateway-protocol
+    // 规范）。它们必须由代理自己应答，绝不能落进故障转移逻辑被 POST 给上游 AI 中转商——
+    // 那样等于把策略查询 / OTLP 遥测体当成补全请求打出去，白烧一次额度还必然报错。
+    if let Some(resp) = handle_gateway_side_endpoints(req.method(), path_only) {
+        return Ok(resp);
     }
 
     // 透传下游（Claude Code / CLI 等客户端）的原始请求头，供中转商做客户端身份校验
@@ -434,7 +447,9 @@ async fn handle_request(
         // 先探上游状态码：非 2xx 则照常切换下一个 Key（首字节尚未发出，切换安全）；
         // 2xx 则把上游 SSE 流原样转给下游，正确设置 content-type，直接返回（不再切换）。
         if wants_stream && can_stream(key) {
-            match try_stream_to_key(&store, key, &path, &req_json, &requested_model, &fwd_headers).await {
+            match try_stream_to_key(&store, category, key, &path, &req_json, &requested_model, &fwd_headers)
+                .await
+            {
                 Ok(StreamAttempt::Streaming { resp, url, real_model, request_body }) => {
                     health::record_live_success(&store, &key.id);
                     // 有 Key 能用了 → 立即解除「全部失败」短路，不等窗口自然到期。
@@ -521,7 +536,9 @@ async fn handle_request(
             continue;
         }
 
-        let result = forward_to_key(&store, key, &path, &req_json, &requested_model, &fwd_headers).await;
+        let result =
+            forward_to_key(&store, category, key, &path, &req_json, &requested_model, &fwd_headers)
+                .await;
         let elapsed = started.elapsed().as_millis() as u64;
         match result {
             Ok(outcome) if outcome.ok => {
@@ -611,6 +628,70 @@ async fn handle_request(
         StatusCode::BAD_GATEWAY,
         &format!("全部 Key 不可用：{last_err}"),
     ))
+}
+
+/// 单模型检索 `GET /v1/models/{id}`：返回**单个**模型对象（Anthropic SDK 的 models.retrieve
+/// 期望的形状），查不到则按官方规范返回 404 + 标准错误信封。
+fn handle_retrieve_model(
+    store: &Arc<Store>,
+    category: CategoryType,
+    raw_id: &str,
+) -> Response<ResBody> {
+    // 去掉可能的 query（`?beta=true`）与尾斜杠；SDK 会做 URL 编码，这里解一层百分号。
+    let id = raw_id.split('?').next().unwrap_or("").trim_end_matches('/');
+    if id.is_empty() {
+        return handle_list_models(store, category);
+    }
+    let models = discoverable_models(&store.enabled_keys_sorted(category));
+    // 客户端可能用对外名，也可能用我们暴露的 gateway 别名（claude-synaroute-*），两者都接。
+    let hit = models.iter().find(|m| {
+        m.as_str() == id || crate::model::to_gateway_model_id(m) == id
+    });
+    match hit {
+        Some(m) => {
+            let body = if matches!(category, CategoryType::Codex) {
+                serde_json::json!({ "id": m, "object": "model", "owned_by": "synaroute" })
+            } else {
+                serde_json::json!({
+                    "type": "model",
+                    "id": crate::model::to_gateway_model_id(m),
+                    "display_name": m,
+                })
+            };
+            json_resp(StatusCode::OK, Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))
+        }
+        None => error_resp(StatusCode::NOT_FOUND, &format!("未知模型: {id}")),
+    }
+}
+
+/// 官方 gateway 协议里的非推理端点，由代理本地应答。
+///
+/// 判据全部来自 claude.exe v2.1.219 内嵌的 llm-gateway-protocol 规范原文：
+/// - `GET /managed/settings`（可选）：「Return `404` for "no managed policy"；
+///   `200 {}` means "this user has an empty policy" — they're not the same」。
+///   SynaRoute 不做企业策略下发，故返 404（干净的「未实现」）。
+/// - `POST /v1/{metrics,logs,traces}`（可选，OTLP）：「Return `200` whether you forward or
+///   discard — `404` makes the client's exporter log an error on every flush」。
+///   故一律 200 丢弃，避免客户端每次 flush 刷错误日志。
+///
+/// 返回 `None` 表示「不是这些端点」，交由原有故障转移逻辑继续处理。
+fn handle_gateway_side_endpoints(
+    method: &hyper::Method,
+    path_only: &str,
+) -> Option<Response<ResBody>> {
+    if method == hyper::Method::GET && path_only == "/managed/settings" {
+        return Some(error_resp(
+            StatusCode::NOT_FOUND,
+            "SynaRoute 不下发企业管控策略（managed settings 未实现）",
+        ));
+    }
+    if method == hyper::Method::POST
+        && matches!(path_only, "/v1/metrics" | "/v1/logs" | "/v1/traces")
+    {
+        // 明确丢弃但回 200：规范要求如此，否则客户端 OTLP exporter 每次 flush 记一条错误。
+        return Some(json_resp(StatusCode::OK, Bytes::from_static(b"{}")));
+    }
+    None
 }
 
 /// 计算 `/model` 选择器应展示的可选模型集（用户约定）：
@@ -733,6 +814,7 @@ enum StreamAttempt {
 /// - 仅在下游协议与 Key 协议一致时调用（无需跨协议转换），跨协议 SSE 翻译属已知限制。
 async fn try_stream_to_key(
     store: &Arc<Store>,
+    category: CategoryType,
     key: &ProviderKey,
     path: &str,
     req_json: &Value,
@@ -754,7 +836,7 @@ async fn try_stream_to_key(
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("model".into(), Value::String(real_model.clone()));
     }
-    inject_default_effort(store, &mut payload, downstream, key.protocol);
+    inject_default_effort(store, category, &mut payload, downstream, key.protocol);
     let payload = crate::upstream::convert_request(&payload, downstream, key.protocol);
 
     // SSE 翻译方向：同协议为 None（原样透传）；跨协议按方向重组事件流。
@@ -961,23 +1043,26 @@ fn downstream_protocol(path: &str) -> Protocol {
 /// - 配置为空 / 未设 → 完全不注入，保持现状。
 fn inject_default_effort(
     store: &Arc<Store>,
+    category: CategoryType,
     payload: &mut Value,
     downstream: Protocol,
     upstream: Protocol,
 ) {
-    // 只作用于 Codex（下游 Responses）。含同协议 Responses 上游：经 SynaRoute 转发的一律是
-    // 自定义 provider，Codex 对自定义 provider 不下发 effort（方案 A 的前提），故同协议直通场景
-    // 也需补默认强度，否则接 Responses 协议第三方中转商时配置的推理强度不生效。
+    // 只作用于「下游是 Responses 协议」的请求（实际就是 Codex）。含同协议 Responses 上游：
+    // 经 SynaRoute 转发的一律是自定义 provider，Codex 对自定义 provider 不下发 effort
+    //（方案 A 的前提），故同协议直通场景也需补默认强度，否则接 Responses 协议第三方中转商
+    // 时配置的推理强度不生效。
     // （upstream 参数保留以备将来按上游细分策略，当前不再据此跳过。）
     let _ = upstream;
     if downstream != Protocol::OpenaiResponses {
         return;
     }
-    let category = downstream_category_for_effort();
+    // 用**本请求所属分类**取 effort，而非硬编码 Codex：分类各有独立端口与独立设置，
+    // 硬编码会让「把某个 Responses 客户端接到别的分类端口」时读到 Codex 的强度（口径串台）。
     let effort = match store
         .get_settings()
         .active_efforts
-        .get(category)
+        .get(category.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
@@ -1005,17 +1090,13 @@ fn inject_default_effort(
     }
 }
 
-/// 推理强度注入目前只服务 Codex 分类（其模型/推理菜单对自定义 provider 不下发 effort）。
-fn downstream_category_for_effort() -> &'static str {
-    CategoryType::Codex.as_str()
-}
-
 /// 转发到单个 Key：套用模型映射 + 协议适配。
 /// 返回完整 outcome（含发往上游的请求体、响应体、状态），供路由与调用模型日志共用。
 /// 注意：非 2xx 不再直接返回 Err，而是照常返回 outcome（ok=false），
 /// 由调用方决定是否切换——这样失败也能被完整记进调用模型日志。
 async fn forward_to_key(
     store: &Arc<Store>,
+    category: CategoryType,
     key: &ProviderKey,
     path: &str,
     req_json: &Value,
@@ -1037,7 +1118,7 @@ async fn forward_to_key(
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("model".into(), Value::String(real_model.clone()));
     }
-    inject_default_effort(store, &mut payload, downstream, key.protocol);
+    inject_default_effort(store, category, &mut payload, downstream, key.protocol);
 
     // 跨协议转换（下游协议 → 上游 Key 协议；同协议时 convert_request 内部直接返回克隆）
     let payload = crate::upstream::convert_request(&payload, downstream, key.protocol);
@@ -1154,12 +1235,22 @@ fn is_stripped_header(name: &str) -> bool {
 /// - 429 requests-per-minute：这一分钟请求满了，下一分钟自动恢复，不该把好 Key 熔断 60s。
 /// - 502/503/504：中转商网关抖动，同样短暂。
 ///
+/// **400 也不计入**（2026-07-31 实机复盘的结论）：400 的语义是「这个请求不合法」，
+/// 而请求是下游客户端发的、或经我们的协议转换构造的——它与用哪个 Key 无关，
+/// 换任何 Key 都会同样 400。此前把 400 计入熔断，导致：
+/// - 客户端的空探测请求（`{"messages":[],"model":null}`）连打三次就把**完好的 Key** 熔断；
+/// - 我们自己的跨协议转换 bug（上游报 "model is required" / "Failed to parse request body"）
+///   会把整池好 Key 逐个刷成熔断，进而触发全熔断兜底、把所有 Key 反复重打。
+///
+/// 实测那天 68 条失败请求里近半是这两类。
+///
 /// 这类只做「切下一个 Key 应急」，但**不累加 fail_count、不熔断**——下个请求仍优先用它。
 ///
-/// 4xx（除 429）才是确定性故障：401/403 鉴权失败、400 参数错、404 模型不存在——
-/// 这种重试/保留都没意义，计入熔断，连续几次后把它熔断掉，避免每个请求都白试。
+/// 仍然计入熔断的是**确定属于这个 Key** 的故障：
+/// 401/403 鉴权失败（密钥错/被封）、404 端点或模型不存在——换 Key 才有意义，
+/// 重试同一个只是白试，连续几次后熔断掉它，避免每个请求都从它开始。
 fn status_counts_against_breaker(status: u16) -> bool {
-    !matches!(status, 429 | 500 | 502 | 503 | 504)
+    !matches!(status, 400 | 429 | 500 | 502 | 503 | 504)
 }
 
 /// 是否为「无内容探测请求」：消息载荷为空**且**未解析出任何模型名。
@@ -1258,8 +1349,41 @@ fn json_resp(status: StatusCode, body: Bytes) -> Response<ResBody> {
         .unwrap()
 }
 
+/// HTTP status → Anthropic 错误信封的 `error.type`。
+///
+/// 判据来自 Claude Code 内嵌的官方 gateway 协议规范（claude.exe v2.1.219 里的
+/// llm-gateway-protocol 文档）给出的对应表。用错的 type 会让下游 SDK 走错重试策略
+/// （例如把限流当参数错、不再退避重试）。
+fn anthropic_error_type(status: u16) -> &'static str {
+    match status {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        501 => "not_supported",
+        529 => "overloaded_error",
+        s if s >= 500 => "api_error",
+        _ => "invalid_request_error",
+    }
+}
+
+/// 统一错误响应。
+///
+/// 形状必须是 Anthropic 官方错误信封 `{"type":"error","error":{"type","message"}}`——
+/// 三个端的客户端都用 Anthropic SDK 解析错误：缺 `type` 时 SDK 拿不到错误分类，
+/// 只能当未知错误处理（表现为界面上一句无意义的报错、且重试策略失效）。
+/// 额外保留 `source` 便于用户一眼看出这条错误是代理产生的、不是上游返回的。
 fn error_resp(status: StatusCode, msg: &str) -> Response<ResBody> {
-    let body = serde_json::json!({ "error": { "message": msg, "source": "synaroute" } });
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": anthropic_error_type(status.as_u16()),
+            "message": msg,
+            "source": "synaroute",
+        }
+    });
     json_resp(status, Bytes::from(serde_json::to_vec(&body).unwrap()))
 }
 
@@ -1286,13 +1410,136 @@ mod tests {
         for s in [429u16, 500, 502, 503, 504] {
             assert!(!status_counts_against_breaker(s), "HTTP {s} 不应计入熔断");
         }
-        // 4xx（除 429）鉴权/参数硬错误：计入熔断。
-        for s in [400u16, 401, 403, 404, 422] {
+        // 400「请求不合法」与 Key 无关（换任何 Key 都同样 400）：不得因客户端空探测
+        // 或我们自己的协议转换 bug 把完好的 Key 刷成熔断。
+        assert!(
+            !status_counts_against_breaker(400),
+            "HTTP 400 是请求问题、不是 Key 问题，不应计入熔断"
+        );
+        // 确定属于该 Key 的故障：鉴权失败 / 端点或模型不存在 → 计入熔断。
+        for s in [401u16, 403, 404, 422] {
             assert!(status_counts_against_breaker(s), "HTTP {s} 应计入熔断");
         }
         // 日志动词：临时错误说「暂避」，硬错误说「失败」。
         assert_eq!(failover_verb(429), "限流/繁忙，暂避");
         assert_eq!(failover_verb(401), "失败");
+    }
+
+    #[tokio::test]
+    async fn error_resp_uses_official_anthropic_envelope() {
+        // 三个端的客户端都用 Anthropic SDK 解错误：缺 type 会让 SDK 归类不出错误、
+        // 重试策略失效。判据来自 claude.exe 内嵌的官方 gateway 规范对应表。
+        async fn body_json(resp: Response<ResBody>) -> Value {
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        let cases = [
+            (400u16, "invalid_request_error"),
+            (401, "authentication_error"),
+            (403, "permission_error"),
+            (413, "request_too_large"),
+            (429, "rate_limit_error"),
+            (501, "not_supported"),
+            (503, "api_error"),
+            // 529 是 Anthropic 特有的过载码，规范要求客户端退避重试。
+            (529, "overloaded_error"),
+        ];
+        for (code, want) in cases {
+            let status = StatusCode::from_u16(code).unwrap();
+            let resp = error_resp(status, "boom");
+            assert_eq!(resp.status(), status);
+            let v = body_json(resp).await;
+            assert_eq!(v["type"], "error", "顶层必须是 type:error");
+            assert_eq!(v["error"]["type"], want, "status {code} 的 error.type 不对");
+            assert_eq!(v["error"]["message"], "boom");
+            assert_eq!(v["error"]["source"], "synaroute", "保留来源标记便于分辨是代理产生的");
+        }
+    }
+
+    /// 推理强度必须取**本请求所属分类**的设置，不能硬编码 Codex。
+    /// 硬编码时把任一 Responses 客户端接到别的分类端口，就会读到 Codex 的强度（口径串台）。
+    #[test]
+    fn effort_injection_reads_requesting_category_not_hardcoded_codex() {
+        let dir = temp_dir("effort_cat");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // active_efforts 是后端自管字段：save_settings 会刻意剥掉入参里的它（防前端旧快照
+        // 顶回用户刚选的值），故必须走专用写入方法 set_active_effort。
+        store.set_active_effort(CategoryType::Codex.as_str(), "high").unwrap();
+        store.set_active_effort(CategoryType::ClaudeDesktop.as_str(), "low").unwrap();
+        let inject = |cat: CategoryType| -> Value {
+            let mut payload = json!({ "model": "m", "input": [] });
+            inject_default_effort(
+                &store,
+                cat,
+                &mut payload,
+                Protocol::OpenaiResponses,
+                Protocol::OpenaiResponses,
+            );
+            payload
+        };
+        assert_eq!(inject(CategoryType::Codex)["reasoning"]["effort"], "high");
+        assert_eq!(
+            inject(CategoryType::ClaudeDesktop)["reasoning"]["effort"],
+            "low",
+            "桌面端分类必须用自己的强度，不得拿 Codex 的"
+        );
+        // 未配该分类 → 完全不注入（保持现状，别凭空造字段）。
+        assert!(
+            inject(CategoryType::ClaudeCli).get("reasoning").is_none(),
+            "未配强度的分类不应注入 reasoning"
+        );
+
+        // 下游非 Responses（Claude 系走 /v1/messages）→ 一律不注入。
+        let mut anth = json!({ "model": "m", "messages": [] });
+        inject_default_effort(
+            &store,
+            CategoryType::Codex,
+            &mut anth,
+            Protocol::Anthropic,
+            Protocol::Anthropic,
+        );
+        assert!(anth.get("reasoning").is_none(), "Anthropic 下游不该被注入 reasoning");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 三端链路矩阵：每个分类的规范下游路径 → 协议判定，以及「下游协议 × 上游 Key 协议」
+    /// 九种组合都必须能流式（同协议直通 or 有跨协议翻译方向）。
+    ///
+    /// 这条锁住「流式不得退化成缓冲」：proxy 对「要 stream 却没有翻译方向」的组合会直接报错，
+    /// 若某个组合漏了方向，用户侧表现是该分类一开流式就失败，而不是慢一点。
+    #[test]
+    fn three_category_chain_matrix_is_complete() {
+        // 各端真实发出的路径（含 count_tokens 子路径与带 query 的形态）。
+        let cases = [
+            ("/v1/messages", Protocol::Anthropic, "Claude CLI / 桌面端 补全"),
+            ("/v1/messages/count_tokens?beta=true", Protocol::Anthropic, "桌面端 token 计数"),
+            ("/v1/responses", Protocol::OpenaiResponses, "Codex 补全"),
+            ("/v1/chat/completions", Protocol::OpenaiChat, "OpenAI 兼容客户端"),
+        ];
+        for (path, want, who) in cases {
+            assert_eq!(downstream_protocol(path), want, "{who} 的路径协议判定错: {path}");
+        }
+
+        use crate::upstream::sse_direction;
+        let all = [Protocol::Anthropic, Protocol::OpenaiChat, Protocol::OpenaiResponses];
+        for down in all {
+            for up in all {
+                if down == up {
+                    assert!(
+                        sse_direction(down, up).is_none(),
+                        "同协议应直通（无需翻译方向）: {down:?}"
+                    );
+                } else {
+                    assert!(
+                        sse_direction(down, up).is_some(),
+                        "跨协议缺流式翻译方向 → 该组合一开流式就失败: {down:?} ← {up:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1857,6 +2104,100 @@ mod tests {
         assert_eq!(ids, vec!["claude-synaroute-opus-4-8"], "应只返回共有的 opus-4-8（已包装）");
         assert_eq!(body["data"][0]["type"], "model", "Anthropic 形态");
         assert_eq!(body["data"][0]["display_name"], "opus-4-8", "展示名保持真实名");
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `GET /v1/models/{id}`（Anthropic SDK 的 models.retrieve）必须返回**单个模型对象**。
+    /// 此前该路径落进列表分支，客户端拿到 `{"data":[…]}` 解不出 id。
+    #[tokio::test]
+    async fn proxy_retrieve_single_model_returns_object_not_list() {
+        let dir = temp_dir("retrievemodel");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let mut a = key("a", 0, "http://x");
+        a.mappings = vec![mapping("opus-4-8", "glm-5.2")];
+        store.upsert_key(a).unwrap();
+        store.secrets.write().set("a", "x").unwrap();
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let cli = reqwest::Client::new();
+
+        // 用我们对外暴露的 gateway 别名检索（CLI 从 /v1/models 拿到的就是这个 id）。
+        let resp = cli
+            .get(format!("http://127.0.0.1:{port}/v1/models/claude-synaroute-opus-4-8"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body.get("data").is_none(), "单模型检索不得返回列表形状: {body}");
+        assert_eq!(body["id"], "claude-synaroute-opus-4-8");
+        assert_eq!(body["display_name"], "opus-4-8");
+        assert_eq!(body["type"], "model");
+
+        // 用真实对外名也能检索到（两种写法都接）。
+        let resp2 = cli
+            .get(format!("http://127.0.0.1:{port}/v1/models/opus-4-8"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp2.status().as_u16(), 200);
+
+        // 未知模型 → 404 + 标准 Anthropic 错误信封，而不是把请求打去上游。
+        let miss = cli
+            .get(format!("http://127.0.0.1:{port}/v1/models/does-not-exist"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(miss.status().as_u16(), 404);
+        let mb: serde_json::Value = miss.json().await.unwrap();
+        assert_eq!(mb["type"], "error");
+        assert_eq!(mb["error"]["type"], "not_found_error");
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 官方 gateway 协议的非推理端点必须本地应答，**绝不能** POST 给上游 AI 中转商。
+    /// 判据：claude.exe v2.1.219 内嵌的 llm-gateway-protocol 规范。
+    #[tokio::test]
+    async fn proxy_handles_managed_settings_and_otlp_locally() {
+        let dir = temp_dir("sideendpoints");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // 故意配一个**指向黑洞的** Key：若这些端点被误当成补全请求转发，
+        // 就会去连 base_url 而后失败——用 404/200 的即时应答证明它们没走转发路径。
+        store.upsert_key(key("a", 0, "http://127.0.0.1:9")).unwrap();
+        store.secrets.write().set("a", "x").unwrap();
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let cli = reqwest::Client::new();
+
+        // GET /managed/settings → 404（规范：404 = 无策略，与 200 {} 语义不同）
+        let ms = cli
+            .get(format!("http://127.0.0.1:{port}/managed/settings"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ms.status().as_u16(), 404, "无策略必须是 404 而非 200 {{}}");
+        let mb: serde_json::Value = ms.json().await.unwrap();
+        assert_eq!(mb["error"]["type"], "not_found_error");
+
+        // POST /v1/{metrics,logs,traces} → 200（规范：404 会让 exporter 每次 flush 记错误）
+        for sig in ["metrics", "logs", "traces"] {
+            let r = cli
+                .post(format!("http://127.0.0.1:{port}/v1/{sig}"))
+                .header("content-type", "application/x-protobuf")
+                .body(vec![0u8, 1, 2, 3])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 200, "/v1/{sig} 必须回 200（丢弃但不报错）");
+        }
+
         pm.stop(CategoryType::ClaudeCli);
         std::fs::remove_dir_all(&dir).ok();
     }

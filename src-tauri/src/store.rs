@@ -243,10 +243,25 @@ impl Store {
                 return;
             }
         };
+        // 行尾换行必须与正文拼成**同一个 buffer 一次写完**。
+        // 曾用 `writeln!(f, "{line}")`：它经 write_fmt 拆成「写正文」+「写\n」两次系统调用，
+        // 并发写同一 append 句柄时会插进别人的正文 → 落盘出现 `{…}{…}` 粘在一行、
+        // 且丢掉换行。实测 2026-07-30 的日志 543 行里 14 行是粘连的（26 条记录被解析器漏掉）。
+        // 再加一把进程级锁把多线程的追加串行化，杜绝交错。
+        let mut buf = line.into_bytes();
+        buf.push(b'\n');
         use std::io::Write;
+        static LOG_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _guard = LOG_LOCK.lock();
         match std::fs::OpenOptions::new().create(true).append(true).open(&log_file) {
-            Ok(mut f) => { let _ = writeln!(f, "{line}"); }
-            Err(e) => { tracing::warn!("写入日志文件失败: {e}"); }
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(&buf) {
+                    tracing::warn!("写入日志文件失败: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("打开日志文件失败: {e}");
+            }
         }
     }
 
@@ -1004,6 +1019,62 @@ mod tests {
         let raw = std::fs::read(&cfg_path).unwrap();
         let parsed: AppConfig = serde_json::from_slice(&raw).expect("config.json 应为完整合法 JSON");
         assert_eq!(parsed.keys.len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 并发写事件日志：落盘的 jsonl **每行必须是且仅是一个完整 JSON 对象**。
+    ///
+    /// 回归 2026-07-31 复盘定位的真 bug：旧实现用 `writeln!(f, "{line}")`，
+    /// 它经 write_fmt 拆成「写正文」+「写 \n」两次系统调用，并发追加时会插进别人的正文，
+    /// 落盘出现 `{…}{…}` 粘在一行并丢换行。实测那天 543 行里有 14 行粘连，
+    /// 导致按行解析的日志工具漏掉 26 条记录（排查时统计口径直接错掉）。
+    #[test]
+    fn concurrent_event_log_writes_stay_one_json_per_line() {
+        let dir = temp_dir("lograce");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let log_dir = dir.join("logs");
+        let mut settings = store.get_settings();
+        settings.log_dir = Some(log_dir.display().to_string());
+        store.save_settings(settings).unwrap();
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 60;
+        let mut handles = vec![];
+        for t in 0..THREADS {
+            let s = store.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    // detail 里塞长文本，放大「正文与换行分两次写」的交错窗口。
+                    s.append_event(
+                        CategoryType::ClaudeCli,
+                        "test",
+                        None,
+                        &format!("t{t}-i{i}-{}", "x".repeat(200)),
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let date = chrono::Utc::now().format("%Y-%m-%d");
+        let file = log_dir.join(format!("{date}.jsonl"));
+        let raw = std::fs::read_to_string(&file).expect("应产出当天日志文件");
+        let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            THREADS * PER_THREAD,
+            "行数必须等于事件数——少了就说明有多条被粘进同一行"
+        );
+        for (n, line) in lines.iter().enumerate() {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("第 {} 行不是单个完整 JSON: {e}\n{line}", n + 1));
+            assert!(v.get("id").is_some() && v.get("detail").is_some(), "第 {} 行字段缺失", n + 1);
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

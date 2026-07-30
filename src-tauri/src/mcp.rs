@@ -373,10 +373,58 @@ fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
+/// 是否允许该 `Origin` 访问本地 MCP（DNS rebinding 防护）。
+///
+/// MCP Streamable HTTP 规范要求本地服务器校验 `Origin`：否则用户随便打开的网页可以用
+/// `fetch('http://127.0.0.1:9527/mcp')` 直接驱动本机 MCP —— 对 SynaRoute 尤其危险，
+/// 因为 `synaroute_ai` 会消耗用户上游额度，且它的 `cwd` 参数会让服务端去检索该目录下的文件。
+///
+/// 判据：
+/// - **无 Origin 头** → 放行。非浏览器客户端（Codex 的 rmcp、Claude CLI、curl）不发 Origin，
+///   而浏览器发起的跨源请求一定带 Origin，故「无 Origin」不是绕过口子。
+/// - 有 Origin → 仅放行 loopback 源（`http(s)://localhost|127.0.0.1|[::1]`，可带端口）
+///   与 `null`（file:// 页面 / sandbox iframe，本机开发调试用）。
+fn origin_allowed(origin: Option<&str>) -> bool {
+    let Some(origin) = origin else { return true };
+    let o = origin.trim();
+    if o.is_empty() || o.eq_ignore_ascii_case("null") {
+        return true;
+    }
+    let rest = match o.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") => rest,
+        // 非 http(s) 源（tauri://、app:// 等自有壳）一律放行：不是浏览器可伪造的跨源场景。
+        _ => return true,
+    };
+    // 去掉端口后比对主机名。IPv6 形如 `[::1]:9527`。
+    let host = if let Some(stripped) = rest.strip_prefix('[') {
+        match stripped.split_once(']') {
+            Some((h, _)) => format!("[{h}]"),
+            None => return false,
+        }
+    } else {
+        rest.split(':').next().unwrap_or("").to_string()
+    };
+    matches!(host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "[::1]")
+}
+
 async fn handle_http(
     store: Arc<Store>,
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Origin 校验放在最前：非法源连 OPTIONS 预检都不该拿到 CORS 许可，
+    // 否则等于告诉网页「可以来调」。
+    let origin = req
+        .headers()
+        .get(hyper::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    if !origin_allowed(origin.as_deref()) {
+        tracing::warn!("拒绝非本机来源的 MCP 请求: Origin={:?}", origin);
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            rpc_error(Value::Null, -32600, "仅允许本机来源访问 MCP（Origin 校验未通过）"),
+        ));
+    }
     // CORS 预检
     if req.method() == hyper::Method::OPTIONS {
         return Ok(empty_response(StatusCode::NO_CONTENT));
@@ -798,6 +846,41 @@ mod tests {
     // 这些方法即便我们不提供也必须返回空列表——返回 -32601 会被客户端判定为启动失败并
     // cancel 整个连接，synaroute_ai 就进不了工具目录（曾致「工具不存在」惨案）。
     // 用 local_static_response（stdio 与 HTTP dispatch 共用同一表）锁死此行为。
+    #[test]
+    fn origin_gate_blocks_web_pages_but_not_native_clients() {
+        // 无 Origin：Codex 的 rmcp / Claude CLI / curl 都不发，必须放行，
+        // 否则等于把整个 MCP 关掉（这是最容易改错的一侧）。
+        assert!(origin_allowed(None), "原生客户端不发 Origin，必须放行");
+        assert!(origin_allowed(Some("")), "空 Origin 视为无");
+        assert!(origin_allowed(Some("null")), "file:// 页面的 null 源放行（本机调试）");
+
+        // 本机来源放行（含端口、含 IPv6、大小写不敏感）。
+        for ok in [
+            "http://localhost",
+            "http://localhost:1420",
+            "http://127.0.0.1:9527",
+            "https://127.0.0.1",
+            "http://[::1]:9527",
+            "HTTP://LocalHost:5173",
+            "tauri://localhost",
+        ] {
+            assert!(origin_allowed(Some(ok)), "本机来源应放行: {ok}");
+        }
+
+        // 外部网页一律拒绝——否则用户随手打开的页面就能驱动聚合烧额度、
+        // 并借 synaroute_ai 的 cwd 参数让服务端去读任意目录。
+        for bad in [
+            "http://evil.example",
+            "https://evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://localhost.evil.example:80",
+            "https://sub.100xlabs.space",
+            "http://[2001:db8::1]:9527",
+        ] {
+            assert!(!origin_allowed(Some(bad)), "外部来源必须拒绝: {bad}");
+        }
+    }
+
     #[test]
     fn capability_probes_never_error() {
         for (method, key) in [
