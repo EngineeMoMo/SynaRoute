@@ -1456,7 +1456,11 @@ fn preview_claude_cli() -> AppResult<ToolConfigPreview> {
 fn preview_codex() -> AppResult<ToolConfigPreview> {
     let cfg = codex_config_path()?;
     let auth = codex_auth_path()?;
-    let (cfg_exists, cfg_content) = read_preview_text(&cfg, false)?;
+    // config.toml 必须脱敏：它可能含 env_key/api_key 等密钥字段（用户手配的其它
+    // model_providers、MCP server 的环境变量等）。此前传 false 整份明文回显 —— 同一段密钥放
+    // settings.json 会打码、放 config.toml 却不打码，口径分叉且泄露。
+    // redact_config_secrets 同时覆盖 TOML 的 `key = "value"` 形态（见该函数）。
+    let (cfg_exists, cfg_content) = read_preview_text(&cfg, true)?;
     let (auth_exists, auth_content) = read_preview_text(&auth, true)?;
     Ok(ToolConfigPreview {
         category_id: CategoryType::Codex,
@@ -1542,7 +1546,16 @@ fn read_preview_text(path: &Path, redact_secrets: bool) -> AppResult<(bool, Opti
     Ok((true, Some(text)))
 }
 
-/// 脱敏：避免预览面板泄露 token（不用 regex 依赖，按键名扫描 JSON/简单文本）。
+/// 脱敏：避免预览面板泄露 token（不用 regex 依赖，按键名扫描 JSON/TOML/简单文本）。
+///
+/// 三层策略：
+/// 1. **精确键名**：已知的固定字段（ANTHROPIC_AUTH_TOKEN 等）。
+/// 2. **后缀模式**：任意含 `_TOKEN` / `_SECRET` / `_KEY` / `APIKEY` 等的键名（大小写不敏感），
+///    覆盖用户手配的第三方厂商字段（如 `MOONSHOT_API_KEY`、`myVendorToken`）——此前只认固定
+///    白名单，变体命名一律明文回显。
+/// 3. **裸 token 兜底**：`sk-` 前缀长串。
+///
+/// JSON（`"key": "value"`）与 TOML（`key = "value"`）两种形态都处理。
 fn redact_config_secrets(s: &str) -> String {
     let mut out = s.to_string();
     for key in [
@@ -1560,6 +1573,12 @@ fn redact_config_secrets(s: &str) -> String {
         "inferenceGatewayApiKey",
     ] {
         out = redact_json_string_field(&out, key);
+        out = redact_toml_field(&out, key);
+    }
+    // 按后缀模式脱敏所有「看起来是密钥」的键名（用户手配的第三方字段用什么名都覆盖）。
+    for key in secretish_keys(&out) {
+        out = redact_json_string_field(&out, &key);
+        out = redact_toml_field(&out, &key);
     }
     // bare sk- tokens（含 "sk-" 在内至少 12 字符）。按字符边界扫描：不能用字节索引切片，
     // 否则配置里出现多字节 UTF-8（如中文路径）时 &s[i..i+3] 会切在字符中间 panic，
@@ -1588,7 +1607,129 @@ fn redact_config_secrets(s: &str) -> String {
     result
 }
 
-/// 把 `"key": "...."` 的值换成 `***`（仅处理双引号 JSON 字段）。
+/// 扫出文本里所有「看起来是密钥」的键名（JSON `"k":` 与 TOML `k =` 两种形态）。
+///
+/// 判据：键名（大小写不敏感）含 `token` / `secret` / `password` / `passwd` / `credential`，
+/// 或以 `key` 结尾/含 `apikey`（`key` 用后缀而非包含，避免误伤 `keyId` / `keychain_path`
+/// 这类非密钥字段被打码后让用户看不到自己的配置）。
+fn secretish_keys(s: &str) -> Vec<String> {
+    fn is_secretish(name: &str) -> bool {
+        let l = name.to_ascii_lowercase();
+        const CONTAINS: [&str; 6] = [
+            "token",
+            "secret",
+            "password",
+            "passwd",
+            "credential",
+            "apikey",
+        ];
+        if CONTAINS.iter().any(|p| l.contains(p)) {
+            return true;
+        }
+        // `..._key` / `...Key` 结尾（api_key、gatewayKey、AUTH_KEY 等）。
+        l.ends_with("key") || l.ends_with("_key")
+    }
+
+    let mut found: Vec<String> = Vec::new();
+    let push = |name: &str, found: &mut Vec<String>| {
+        if is_secretish(name) && !found.iter().any(|x| x == name) {
+            found.push(name.to_string());
+        }
+    };
+
+    // JSON 形态：`"key"` 紧跟（可含空白）`:`。
+    let bytes = s.as_char_indices_quotes();
+    for (name, followed_by_colon) in bytes {
+        if followed_by_colon {
+            push(&name, &mut found);
+        }
+    }
+
+    // TOML 形态：行首（可含缩进）裸键名 + `=`。
+    for line in s.lines() {
+        let t = line.trim_start();
+        if t.starts_with('#') || t.starts_with('[') {
+            continue;
+        }
+        if let Some((lhs, _)) = t.split_once('=') {
+            let name = lhs.trim().trim_matches('"');
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+            {
+                push(name, &mut found);
+            }
+        }
+    }
+    found
+}
+
+/// 提取文本里所有双引号字符串及其后是否紧跟 `:`（用于识别 JSON 键）。
+/// 独立成 trait 方法以便 [`secretish_keys`] 读起来更直白；不处理转义（密钥键名不含 `\"`）。
+trait QuotedKeys {
+    fn as_char_indices_quotes(&self) -> Vec<(String, bool)>;
+}
+
+impl QuotedKeys for str {
+    fn as_char_indices_quotes(&self) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        let mut rest = self;
+        while let Some(open) = rest.find('"') {
+            let after_open = &rest[open + 1..];
+            let Some(close) = after_open.find('"') else { break };
+            let name = &after_open[..close];
+            let tail = &after_open[close + 1..];
+            let followed_by_colon = tail.trim_start().starts_with(':');
+            out.push((name.to_string(), followed_by_colon));
+            rest = tail;
+        }
+        out
+    }
+}
+
+/// 把 `key = "...."`（TOML）的值换成 `***`。按行处理：跳过注释与表头，
+/// 只在 `=` 左侧裸键名（可带引号）恰为 `key` 时替换右侧字符串字面量。
+/// TOML 的键不带引号，故 JSON 版的 `"key"` 查找匹配不到，必须单独处理。
+fn redact_toml_field(s: &str, key: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, line) in s.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || trimmed.starts_with('[') {
+            out.push_str(line);
+            continue;
+        }
+        let Some((lhs, rhs)) = line.split_once('=') else {
+            out.push_str(line);
+            continue;
+        };
+        if lhs.trim().trim_matches('"') != key {
+            out.push_str(line);
+            continue;
+        }
+        let rhs_trim = rhs.trim_start();
+        // 只替换字符串字面量（`"..."`）；数字/布尔等非密钥值原样保留。
+        if !rhs_trim.starts_with('"') {
+            out.push_str(line);
+            continue;
+        }
+        let lead_ws = &rhs[..rhs.len() - rhs_trim.len()];
+        out.push_str(lhs);
+        out.push('=');
+        out.push_str(lead_ws);
+        out.push_str("\"***\"");
+    }
+    // 保留原文末尾换行（lines() 会吃掉）。
+    if s.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// 把 `"key": "...."` 的值换成 `***`（JSON 形态；TOML 见 [`redact_toml_field`]）。
 fn redact_json_string_field(s: &str, key: &str) -> String {
     let needle = format!("\"{key}\"");
     let mut out = String::with_capacity(s.len());
@@ -2264,6 +2405,57 @@ mod tests {
         assert!(!out.contains("rt-abc123"), "refresh_token 明文不得残留");
         assert!(!out.contains("eyJ.id.tok"), "id_token 明文不得残留");
         assert!(out.contains("***"), "应替换为脱敏占位");
+    }
+
+    #[test]
+    fn redact_covers_toml_and_variant_key_names() {
+        // 安全回归（审计 #19 + #18）：
+        // 1) Codex config.toml 此前整份明文回显（preview_codex 传 redact_secrets=false）；
+        // 2) 脱敏只认固定白名单 + sk- 前缀，用户手配的变体命名密钥一律漏网。
+        // TOML 形态：键不带引号，JSON 版的 `"key"` 查找匹配不到，必须走 redact_toml_field。
+        let toml_raw = r#"
+model = "gpt-5"
+
+[model_providers.other]
+name = "Vendor"
+env_key = "MOONSHOT_API_KEY"
+MOONSHOT_API_KEY = "ms-plaintext-secret-value"
+myVendorToken = "tok-plaintext-1234567890"
+CLIENT_SECRET = "cs-plaintext-abcdef"
+base_url = "https://api.example.com"
+tool_timeout_sec = 600
+"#;
+        let out = redact_config_secrets(toml_raw);
+        assert!(
+            !out.contains("ms-plaintext-secret-value"),
+            "TOML 里 *_API_KEY 的值必须脱敏: {out}"
+        );
+        assert!(
+            !out.contains("tok-plaintext-1234567890"),
+            "变体命名 *Token 必须脱敏: {out}"
+        );
+        assert!(
+            !out.contains("cs-plaintext-abcdef"),
+            "*_SECRET 必须脱敏: {out}"
+        );
+        // 非密钥字段必须原样保留，否则用户看不到自己的配置。
+        assert!(out.contains("https://api.example.com"), "base_url 应保留");
+        assert!(out.contains(r#"model = "gpt-5""#), "model 应保留");
+        assert!(out.contains("tool_timeout_sec = 600"), "数字值应保留");
+        assert!(
+            out.contains("[model_providers.other]"),
+            "表头应保留"
+        );
+    }
+
+    #[test]
+    fn redact_spares_non_secret_key_like_names() {
+        // 反向护栏：`key` 只按后缀判定，不能把 keyId / keychain_path 这类非密钥字段打码，
+        // 否则用户在预览里看不到自己的配置标识。
+        let raw = r#"{"keyId":"k_123456","keychain_path":"C:\\x\\y","monkey":"not-secret"}"#;
+        let out = redact_config_secrets(raw);
+        assert!(out.contains("k_123456"), "keyId 不应被脱敏: {out}");
+        assert!(out.contains("C:\\\\x\\\\y"), "keychain_path 不应被脱敏: {out}");
     }
 
     #[test]

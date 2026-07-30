@@ -1145,15 +1145,17 @@ pub fn openai_to_anthropic(body: &Value) -> Value {
     Value::Object(out)
 }
 
-/// 将 OpenAI Chat Completions 响应体转为 Anthropic Messages 响应体（MVP：纯文本）。
+/// 将 OpenAI Chat Completions 响应体转为 Anthropic Messages 响应体。
+/// 文本与**工具调用**都转（tool_calls → tool_use 块）。
 /// 用于下游是 Anthropic 客户端、上游 Key 是 OpenAI 协议的跨协议故障转移。
 pub fn openai_resp_to_anthropic(body: &Value) -> Value {
-    // OpenAI: choices[0].message.content（文本）、finish_reason、usage.{prompt,completion}_tokens
-    let text = body
+    // OpenAI: choices[0].message.{content,tool_calls}、finish_reason、usage.{prompt,completion}_tokens
+    let choice0 = body
         .get("choices")
         .and_then(|c| c.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|c| c.get("message"))
+        .and_then(|arr| arr.first());
+    let message = choice0.and_then(|c| c.get("message"));
+    let text = message
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
         .unwrap_or("");
@@ -1163,10 +1165,7 @@ pub fn openai_resp_to_anthropic(body: &Value) -> Value {
         .and_then(|i| i.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("msg_{}", uuid_like()));
-    let finish = body
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|arr| arr.first())
+    let finish = choice0
         .and_then(|c| c.get("finish_reason"))
         .and_then(|r| r.as_str())
         .unwrap_or("end_turn");
@@ -1187,22 +1186,63 @@ pub fn openai_resp_to_anthropic(body: &Value) -> Value {
         .and_then(|u| u.get("completion_tokens"))
         .and_then(|t| t.as_u64())
         .unwrap_or(0);
+    // content 块：文本（非空才发）+ 每个 tool_call 一个 tool_use 块。
+    // 工具必须翻译：早期实现只取文本，却把 finish_reason:"tool_calls" 映射成
+    // stop_reason:"tool_use"，产出「声明了工具调用但 content 里没有 tool_use 块」的自相矛盾响应
+    // → 下游客户端（Claude 桌面端 / CLI）无工具可执行，表现为模型从不调用工具。
+    let mut content: Vec<Value> = vec![];
+    if !text.is_empty() {
+        content.push(json!({ "type": "text", "text": text }));
+    }
+    if let Some(tcs) = message.and_then(|m| m.get("tool_calls")).and_then(|t| t.as_array()) {
+        for tc in tcs {
+            let f = tc.get("function");
+            let name = f
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let raw_args = f
+                .and_then(|f| f.get("arguments"))
+                .and_then(|a| a.as_str())
+                .unwrap_or("");
+            // Anthropic 的 tool_use.input 必须是 JSON **对象**；Chat 的 arguments 是 JSON 字符串。
+            // 解析失败/为空时兜底空对象，避免下游 schema 校验直接报错。
+            let input = serde_json::from_str::<Value>(raw_args.trim())
+                .ok()
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| json!({}));
+            let id = tc
+                .get("id")
+                .and_then(|i| i.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("toolu_{}", uuid_like()));
+            content.push(json!({ "type": "tool_use", "id": id, "name": name, "input": input }));
+        }
+    }
+    // 全空（既无文本又无工具）时保留一个空文本块：Anthropic 响应的 content 不应为空数组。
+    if content.is_empty() {
+        content.push(json!({ "type": "text", "text": "" }));
+    }
     json!({
         "id": id,
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [ { "type": "text", "text": text } ],
+        "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": Value::Null,
         "usage": { "input_tokens": input_tokens, "output_tokens": output_tokens }
     })
 }
 
-/// 将 Anthropic Messages 响应体转为 OpenAI Chat Completions 响应体（MVP：纯文本）。
+/// 将 Anthropic Messages 响应体转为 OpenAI Chat Completions 响应体。
+/// 文本与**工具调用**都转（tool_use 块 → tool_calls）。
 /// 用于下游是 OpenAI 客户端、上游 Key 是 Anthropic 协议的跨协议故障转移。
 pub fn anthropic_resp_to_openai(body: &Value) -> Value {
-    // Anthropic: content[].text（拼接）、stop_reason、usage.{input,output}_tokens
+    // Anthropic: content[].{text,tool_use}、stop_reason、usage.{input,output}_tokens
     let text = extract_text_content(body.get("content"));
     let model = body.get("model").cloned().unwrap_or(Value::Null);
     let id = body
@@ -1231,6 +1271,48 @@ pub fn anthropic_resp_to_openai(body: &Value) -> Value {
         .and_then(|u| u.get("output_tokens"))
         .and_then(|t| t.as_u64())
         .unwrap_or(0);
+    // content[] 里的 tool_use 块 → Chat 的 tool_calls（input 对象序列化回 arguments JSON 字符串）。
+    // 与 [`openai_resp_to_anthropic`] 对称：任一侧只搬文本，跨协议故障转移就会静默吃掉工具调用。
+    let mut tool_calls: Vec<Value> = vec![];
+    if let Some(blocks) = body.get("content").and_then(|c| c.as_array()) {
+        for b in blocks {
+            if b.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                continue;
+            }
+            let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let arguments = b
+                .get("input")
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "{}".to_string());
+            let call_id = b
+                .get("id")
+                .and_then(|i| i.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("call_{}", uuid_like()));
+            tool_calls.push(json!({
+                "id": call_id,
+                "type": "function",
+                "function": { "name": name, "arguments": arguments }
+            }));
+        }
+    }
+    let mut message = serde_json::Map::new();
+    message.insert("role".into(), json!("assistant"));
+    // Chat 语义：有工具调用时 content 可为 null；无则给文本（可能是空串）。
+    message.insert(
+        "content".into(),
+        if text.is_empty() && !tool_calls.is_empty() {
+            Value::Null
+        } else {
+            json!(text)
+        },
+    );
+    if !tool_calls.is_empty() {
+        message.insert("tool_calls".into(), json!(tool_calls));
+    }
     json!({
         "id": id,
         "object": "chat.completion",
@@ -1238,7 +1320,7 @@ pub fn anthropic_resp_to_openai(body: &Value) -> Value {
         "model": model,
         "choices": [ {
             "index": 0,
-            "message": { "role": "assistant", "content": text },
+            "message": Value::Object(message),
             "finish_reason": finish
         } ],
         "usage": {
@@ -1607,6 +1689,22 @@ pub fn responses_to_chat(body: &Value) -> Value {
             out.insert("tools".into(), json!(mapped));
         }
     }
+    // tool_choice：Responses 扁平 {type:function,name} → Chat 嵌套 {type:function,function:{name}}；
+    // 字符串档两协议同名，原样透传。丢掉它会让「强制调用某工具」降级成自由选择。
+    if let Some(tc) = body.get("tool_choice") {
+        let mapped = match tc {
+            Value::Object(o) if o.get("type").and_then(|t| t.as_str()) == Some("function") => {
+                let name = o
+                    .get("name")
+                    .or_else(|| o.get("function").and_then(|f| f.get("name")))
+                    .cloned()
+                    .unwrap_or(json!(""));
+                json!({ "type": "function", "function": { "name": name } })
+            }
+            other => other.clone(),
+        };
+        out.insert("tool_choice".into(), mapped);
+    }
     Value::Object(out)
 }
 
@@ -1897,6 +1995,23 @@ pub fn chat_to_responses(body: &Value) -> Value {
             out.insert("tools".into(), json!(mapped));
         }
     }
+    // tool_choice：Chat 的 {type:function,function:{name}} → Responses 扁平 {type:function,name}；
+    // 字符串档（auto/none/required）两协议同名，原样透传。丢掉它会让「强制调用某工具」降级成自由选择。
+    if let Some(tc) = body.get("tool_choice") {
+        let mapped = match tc {
+            Value::Object(o) if o.get("type").and_then(|t| t.as_str()) == Some("function") => {
+                let name = o
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .or_else(|| o.get("name"))
+                    .cloned()
+                    .unwrap_or(json!(""));
+                json!({ "type": "function", "name": name })
+            }
+            other => other.clone(),
+        };
+        out.insert("tool_choice".into(), mapped);
+    }
     Value::Object(out)
 }
 
@@ -2071,6 +2186,16 @@ pub struct SseTranslator {
     /// 响应侧据此把对应调用输出为 `tool_search_call`（Codex 本地执行 BM25 检索），
     /// 否则 Codex 认不出、延迟加载的 MCP 工具永远解锁不了。
     search_tools: std::collections::HashSet<String>,
+    /// Anthropic 下游方向的 content block 游标（下一个可用 index）。Anthropic 要求同一条
+    /// 消息内 block index 唯一且**递增出现**，故 text 块与 tool_use 块共用这一个游标。
+    anthropic_next_block: usize,
+    /// Anthropic 下游方向：当前打开着的 text 块 index（None = 无打开的 text 块）。
+    /// 发 tool_use 块前必须先 stop 它；收尾时也要兜底 stop。
+    anthropic_text_open: Option<usize>,
+    /// Anthropic 下游方向：已登记的工具调用去重键（call_id，缺失时退化为 name+arguments）。
+    /// `response.output_item.done` 与 `response.completed.output[]` 可能重复携带同一个调用，
+    /// 靠它保证同一个工具调用只翻成一个 tool_use 块。
+    anthropic_tool_seen: std::collections::HashSet<String>,
 }
 
 impl SseTranslator {
@@ -2101,6 +2226,9 @@ impl SseTranslator {
             tool_namespaces,
             custom_tools: std::collections::HashSet::new(),
             search_tools: std::collections::HashSet::new(),
+            anthropic_next_block: 0,
+            anthropic_text_open: None,
+            anthropic_tool_seen: std::collections::HashSet::new(),
         }
     }
 
@@ -2375,6 +2503,9 @@ impl SseTranslator {
     }
 
     /// 一个 Responses SSE 事件 → Chat SSE chunk 文本。
+    ///
+    /// 覆盖文本增量与**工具调用**（Responses `function_call` item → Chat `delta.tool_calls`）。
+    /// 工具必须翻译，理由同其余方向：丢掉工具调用，下游 Chat 客户端只见纯文本、永不执行工具。
     fn responses_event_to_chat(&mut self, ev: &Value) -> String {
         let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match ty {
@@ -2386,68 +2517,287 @@ impl SseTranslator {
                 });
                 sse_data(&chunk)
             }
+            // 工具调用：Responses 在 output_item.done 时给出完整 item（arguments 已齐），
+            // 一次性翻成 Chat 的单片 tool_calls 增量（id+name+完整 arguments）。
+            "response.output_item.done" => ev
+                .get("item")
+                .map(|item| self.chat_tool_call_chunk_from_item(item))
+                .unwrap_or_default(),
             "response.completed" => {
-                let chunk = json!({
+                // 兜底：部分上游只在 completed.output[] 给工具调用；靠 chat_tool_seen 去重。
+                let mut out = String::new();
+                if let Some(items) = ev
+                    .get("response")
+                    .and_then(|r| r.get("output"))
+                    .and_then(|o| o.as_array())
+                {
+                    let items = items.clone();
+                    for item in &items {
+                        out.push_str(&self.chat_tool_call_chunk_from_item(item));
+                    }
+                }
+                let finish = if self.tool_calls.is_empty() { "stop" } else { "tool_calls" };
+                out.push_str(&sse_data(&json!({
                     "object": "chat.completion.chunk",
-                    "choices": [ { "index": 0, "delta": {}, "finish_reason": "stop" } ]
-                });
-                sse_data(&chunk)
+                    "choices": [ { "index": 0, "delta": {}, "finish_reason": finish } ]
+                })));
+                out
             }
             _ => String::new(),
         }
     }
 
-    /// 一个 Chat SSE chunk → Anthropic SSE 事件文本（文本增量 → content_block_delta）。
+    /// 把一个 Responses 输出 item 翻成 Chat 的一片 `delta.tool_calls` 增量（非工具 item 返回空串）。
+    /// 用 `anthropic_tool_seen`（本方向复用同一去重集合）保证 output_item.done 与
+    /// completed.output[] 重复携带时只发一次。
+    fn chat_tool_call_chunk_from_item(&mut self, item: &Value) -> String {
+        let ity = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if !matches!(ity, "function_call" | "custom_tool_call" | "tool_search_call") {
+            return String::new();
+        }
+        let name = join_namespaced_tool_name(item);
+        if name.is_empty() {
+            return String::new();
+        }
+        let arguments = if ity == "custom_tool_call" {
+            let input = item.get("input").and_then(|i| i.as_str()).unwrap_or("");
+            json!({ "input": input }).to_string()
+        } else {
+            match item.get("arguments") {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => v.to_string(),
+                None => String::new(),
+            }
+        };
+        let call_id = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let dedup_key = if call_id.is_empty() {
+            format!("{name}\u{0}{arguments}")
+        } else {
+            call_id.clone()
+        };
+        if !self.anthropic_tool_seen.insert(dedup_key) {
+            return String::new();
+        }
+        let slot = self.tool_calls.len();
+        let id = if call_id.is_empty() {
+            format!("call_{}", uuid_like())
+        } else {
+            call_id
+        };
+        let args = if arguments.trim().is_empty() { "{}".to_string() } else { arguments };
+        self.tool_calls.push((id.clone(), name.clone(), args.clone()));
+        sse_data(&json!({
+            "object": "chat.completion.chunk",
+            "choices": [ { "index": 0, "finish_reason": Value::Null, "delta": {
+                "tool_calls": [ {
+                    "index": slot,
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": args }
+                } ]
+            } } ]
+        }))
+    }
+
+    /// 一个 Chat SSE chunk → Anthropic SSE 事件文本。
+    ///
+    /// 覆盖文本增量与**工具调用**。工具必须翻译，理由同 [`SseTranslator::responses_event_to_anthropic`]：
+    /// Anthropic 下游（Claude CLI / 桌面端）转到 Chat 上游时，模型的 `delta.tool_calls` 增量若被丢弃，
+    /// 下游只见纯文本 → 工具永远不被调用。Chat 的 tool_calls 是**分片增量**（name 与 arguments 逐块到达），
+    /// 故先按 index 累积到 `tool_calls`，在 finish_reason 到达时才成块发出。
     fn chat_chunk_to_anthropic(&mut self, chunk: &Value) -> String {
         let mut out = String::new();
+        if self.model.is_empty() {
+            if let Some(m) = chunk.get("model").and_then(|m| m.as_str()) {
+                self.model = m.to_string();
+            }
+        }
         let choice0 = chunk.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first());
         let delta = choice0.and_then(|c| c.get("delta"));
-        if !self.started {
-            self.started = true;
-            out.push_str(&sse("message_start", &json!({
-                "type": "message_start",
-                "message": { "id": self.resp_id, "type": "message", "role": "assistant", "content": [],
-                    "model": chunk.get("model").cloned().unwrap_or(Value::Null),
-                    "usage": { "input_tokens": 0, "output_tokens": 0 } }
-            })));
-            out.push_str(&sse("content_block_start", &json!({
-                "type": "content_block_start", "index": 0,
-                "content_block": { "type": "text", "text": "" }
-            })));
-        }
+        out.push_str(&self.ensure_anthropic_started());
         if let Some(t) = delta.and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
             if !t.is_empty() {
+                let idx = self.ensure_anthropic_text_block(&mut out);
                 self.saw_text = true;
                 out.push_str(&sse("content_block_delta", &json!({
-                    "type": "content_block_delta", "index": 0,
+                    "type": "content_block_delta", "index": idx,
                     "delta": { "type": "text_delta", "text": t }
                 })));
+            }
+        }
+        // tool_call 增量：按 index 累积 (id, name, arguments)，与 chat_chunk_to_responses 同构。
+        if let Some(tcs) = delta.and_then(|d| d.get("tool_calls")).and_then(|t| t.as_array()) {
+            for tc in tcs {
+                let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                while self.tool_calls.len() <= idx {
+                    self.tool_calls.push((String::new(), String::new(), String::new()));
+                }
+                if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                    if !id.is_empty() {
+                        self.tool_calls[idx].0 = id.to_string();
+                    }
+                }
+                if let Some(f) = tc.get("function") {
+                    if let Some(n) = f.get("name").and_then(|n| n.as_str()) {
+                        if !n.is_empty() {
+                            self.tool_calls[idx].1 = n.to_string();
+                        }
+                    }
+                    if let Some(a) = f.get("arguments").and_then(|a| a.as_str()) {
+                        self.tool_calls[idx].2.push_str(a);
+                    }
+                }
+            }
+        }
+        // finish_reason 到达 → tool_calls 已完整，成块发出（收尾事件由 finish()/message_stop 负责）。
+        if choice0.and_then(|c| c.get("finish_reason")).and_then(|r| r.as_str()).is_some() {
+            out.push_str(&self.flush_anthropic_tool_calls());
+        }
+        // usage（Chat 末尾 chunk，需 stream_options）→ 收尾时由 message_delta 带给 Anthropic 下游。
+        if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
+            if let Some(pt) = u.get("prompt_tokens").and_then(|t| t.as_u64()) {
+                self.input_tokens = pt;
+            }
+            if let Some(ct) = u.get("completion_tokens").and_then(|t| t.as_u64()) {
+                self.output_tokens = ct;
             }
         }
         out
     }
 
-    /// Anthropic 流收尾：content_block_stop + message_delta(stop) + message_stop。
+    /// 把累积的 Chat 风格 `tool_calls` 一次性翻成 Anthropic `tool_use` 块序列。
+    /// 复用 [`SseTranslator::emit_anthropic_tool_block`]（同一套去重/命名/兜底口径），
+    /// 故重复调用安全（第二次全部命中去重、返回空串）。
+    fn flush_anthropic_tool_calls(&mut self) -> String {
+        if self.tool_calls.is_empty() {
+            return String::new();
+        }
+        let pending: Vec<(String, String, String)> = self.tool_calls.clone();
+        let mut out = String::new();
+        for (id, name, args) in pending {
+            if name.is_empty() {
+                continue;
+            }
+            out.push_str(&self.emit_anthropic_tool_block(&json!({
+                "type": "function_call",
+                "call_id": id,
+                "name": name,
+                "arguments": args,
+            })));
+        }
+        out
+    }
+
+    /// Anthropic 流收尾：收 text 块 + 补发工具块 + message_delta(stop_reason) + message_stop。
+    ///
+    /// `stop_reason` 必须按是否有工具调用区分：发了 tool_use 块却报 `end_turn`，
+    /// 下游客户端（Claude 桌面端 / CLI）会认为「本轮已结束」而不执行工具。
     fn emit_anthropic_stop(&mut self) -> String {
         if !self.started {
             return String::new();
         }
+        // 上游没给 finish_reason 就断流时，累积的 tool_calls 还没成块，这里兜底冲刷。
+        let mut out = self.flush_anthropic_tool_calls();
         self.started = false;
-        let mut out = String::new();
-        out.push_str(&sse("content_block_stop", &json!({ "type": "content_block_stop", "index": 0 })));
+        out.push_str(&self.close_anthropic_text_block());
+        let stop_reason = if self.anthropic_tool_seen.is_empty() {
+            "end_turn"
+        } else {
+            "tool_use"
+        };
         out.push_str(&sse("message_delta", &json!({
-            "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": 0 }
+            "type": "message_delta",
+            "delta": { "stop_reason": stop_reason },
+            "usage": { "output_tokens": self.output_tokens }
         })));
         out.push_str(&sse("message_stop", &json!({ "type": "message_stop" })));
         out
     }
 
     /// 一个 Anthropic SSE 事件 → Chat SSE chunk 文本。
+    ///
+    /// 覆盖文本增量与**工具调用**（Anthropic `tool_use` 块 → Chat `delta.tool_calls` 增量）。
+    /// 工具必须翻译，理由同另外两个 →Anthropic/→Chat 方向：丢掉工具调用会让下游客户端
+    /// 只见纯文本、以为模型没打算用工具。复用 `block_tool_slot`（block index → tool_calls 槽位）
+    /// 与 `tool_calls` 累积，与 [`SseTranslator::anthropic_chunk_to_responses`] 同构。
     fn anthropic_event_to_chat(&mut self, ev: &Value) -> String {
         let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match ty {
+            "content_block_start" => {
+                let idx = ev.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let block = ev.get("content_block");
+                if block.and_then(|b| b.get("type")).and_then(|t| t.as_str()) == Some("tool_use") {
+                    let id = block
+                        .and_then(|b| b.get("id"))
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = block
+                        .and_then(|b| b.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let slot = self.tool_calls.len();
+                    self.tool_calls.push((id.clone(), name.clone(), String::new()));
+                    self.block_tool_slot.insert(idx, slot);
+                    // Chat 的 tool_calls 增量：首片带 id/name（arguments 随后逐片补）。
+                    let chunk = json!({
+                        "object": "chat.completion.chunk",
+                        "choices": [ { "index": 0, "finish_reason": Value::Null, "delta": {
+                            "tool_calls": [ {
+                                "index": slot,
+                                "id": id,
+                                "type": "function",
+                                "function": { "name": name, "arguments": "" }
+                            } ]
+                        } } ]
+                    });
+                    return sse_data(&chunk);
+                }
+                String::new()
+            }
             "content_block_delta" => {
-                let t = ev.get("delta").and_then(|d| d.get("text")).and_then(|t| t.as_str()).unwrap_or("");
+                let idx = ev.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let delta = ev.get("delta");
+                let dty = delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()).unwrap_or("");
+                // tool_use 块的参数增量 → Chat 的 function.arguments 分片。
+                if dty == "input_json_delta" {
+                    let Some(&slot) = self.block_tool_slot.get(&idx) else {
+                        return String::new();
+                    };
+                    let pj = delta
+                        .and_then(|d| d.get("partial_json"))
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
+                    if pj.is_empty() {
+                        return String::new();
+                    }
+                    self.tool_calls[slot].2.push_str(pj);
+                    let chunk = json!({
+                        "object": "chat.completion.chunk",
+                        "choices": [ { "index": 0, "finish_reason": Value::Null, "delta": {
+                            "tool_calls": [ {
+                                "index": slot,
+                                "type": "function",
+                                "function": { "arguments": pj }
+                            } ]
+                        } } ]
+                    });
+                    return sse_data(&chunk);
+                }
+                // thinking_delta 不属于对话正文，不当作 content 泄漏给 Chat 下游。
+                if dty == "thinking_delta" {
+                    return String::new();
+                }
+                let t = delta.and_then(|d| d.get("text")).and_then(|t| t.as_str()).unwrap_or("");
+                if t.is_empty() {
+                    return String::new();
+                }
                 let chunk = json!({
                     "object": "chat.completion.chunk",
                     "choices": [ { "index": 0, "delta": { "content": t }, "finish_reason": Value::Null } ]
@@ -2455,9 +2805,12 @@ impl SseTranslator {
                 sse_data(&chunk)
             }
             "message_stop" => {
+                // 有工具调用时 finish_reason 必须是 tool_calls：报 stop 会让下游客户端
+                // 认定本轮结束而不执行工具（与 →Anthropic 方向的 stop_reason 同一道理）。
+                let finish = if self.tool_calls.is_empty() { "stop" } else { "tool_calls" };
                 let chunk = json!({
                     "object": "chat.completion.chunk",
-                    "choices": [ { "index": 0, "delta": {}, "finish_reason": "stop" } ]
+                    "choices": [ { "index": 0, "delta": {}, "finish_reason": finish }]
                 });
                 sse_data(&chunk)
             }
@@ -2631,9 +2984,13 @@ impl SseTranslator {
         out
     }
 
-    /// 一个 Responses SSE 事件 → Anthropic SSE 事件文本（镜像方向，文本+收尾）。
-    /// 与现有反向翻译器（responses_event_to_chat / anthropic_event_to_chat）同等简洁：
-    /// 只覆盖文本增量与收尾，不重建工具（此方向无 Codex 场景需求）。
+    /// 一个 Responses SSE 事件 → Anthropic SSE 事件文本。
+    ///
+    /// 覆盖文本增量、**工具调用**与收尾。工具调用必须翻译（2026-07-30 实机根因）：
+    /// Claude 桌面端（Anthropic 下游）故障转移到 Responses 上游时，上游模型对 MCP 工具的调用
+    /// 走 `response.output_item.added/.done` 的 `function_call` item 投递；早期实现只认
+    /// `output_text.delta` / `completed`，其余落进 `_ => {}` 被静默丢弃 → 桌面端只收到纯文本 +
+    /// end_turn，表现为「模型从不调用 synaroute_ai」，MCP 侧永远等不到 tools/call。
     fn responses_event_to_anthropic(&mut self, ev: &Value) -> String {
         let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let mut out = String::new();
@@ -2650,32 +3007,162 @@ impl SseTranslator {
                 }
             }
             "response.output_text.delta" => {
-                if !self.started {
-                    self.started = true;
-                    out.push_str(&sse("message_start", &json!({
-                        "type": "message_start",
-                        "message": { "id": self.resp_id, "type": "message", "role": "assistant", "content": [],
-                            "model": self.model, "usage": { "input_tokens": 0, "output_tokens": 0 } }
-                    })));
-                    out.push_str(&sse("content_block_start", &json!({
-                        "type": "content_block_start", "index": 0,
-                        "content_block": { "type": "text", "text": "" }
-                    })));
-                }
+                out.push_str(&self.ensure_anthropic_started());
                 let delta = ev.get("delta").and_then(|d| d.as_str()).unwrap_or("");
                 if !delta.is_empty() {
+                    let idx = self.ensure_anthropic_text_block(&mut out);
                     self.saw_text = true;
                     out.push_str(&sse("content_block_delta", &json!({
-                        "type": "content_block_delta", "index": 0,
+                        "type": "content_block_delta", "index": idx,
                         "delta": { "type": "text_delta", "text": delta }
                     })));
                 }
             }
+            // 工具调用：Responses 用独立 output item 承载。`added` 时 item 尚无完整 arguments
+            // （上游可能后续用 function_call_arguments.delta 补），故只在 `done` 落块——彼时
+            // arguments 已完整，Anthropic 侧可一次性发出 start + input_json_delta + stop。
+            "response.output_item.done" => {
+                if let Some(item) = ev.get("item") {
+                    out.push_str(&self.emit_anthropic_tool_block(item));
+                }
+            }
             "response.completed" => {
+                // usage 归位：Responses 的 usage 在 completed 里，Anthropic 由 message_delta 承载。
+                if let Some(u) = ev.get("response").and_then(|r| r.get("usage")) {
+                    if let Some(it) = u.get("input_tokens").and_then(|t| t.as_u64()) {
+                        self.input_tokens = it;
+                    }
+                    if let Some(ot) = u.get("output_tokens").and_then(|t| t.as_u64()) {
+                        self.output_tokens = ot;
+                    }
+                }
+                // 兜底：部分上游只在 completed.output[] 里给工具调用，不发独立 output_item.done
+                // （或事件被中间层裁剪）。这里补扫一遍，靠 anthropic_tool_seen 去重。
+                if let Some(items) = ev
+                    .get("response")
+                    .and_then(|r| r.get("output"))
+                    .and_then(|o| o.as_array())
+                {
+                    let items = items.clone();
+                    for item in &items {
+                        out.push_str(&self.emit_anthropic_tool_block(item));
+                    }
+                }
                 out.push_str(&self.emit_anthropic_stop());
             }
             _ => {}
         }
+        out
+    }
+
+    /// 确保 Anthropic 下游流已发 `message_start`（幂等）。
+    /// 文本与工具调用都可能是流里第一个内容，故两处都先调它。
+    fn ensure_anthropic_started(&mut self) -> String {
+        if self.started {
+            return String::new();
+        }
+        self.started = true;
+        sse("message_start", &json!({
+            "type": "message_start",
+            "message": { "id": self.resp_id, "type": "message", "role": "assistant", "content": [],
+                "model": self.model, "usage": { "input_tokens": 0, "output_tokens": 0 } }
+        }))
+    }
+
+    /// 确保有一个打开着的 text 块，返回其 index。没有则新开一个（占用游标）。
+    fn ensure_anthropic_text_block(&mut self, out: &mut String) -> usize {
+        if let Some(idx) = self.anthropic_text_open {
+            return idx;
+        }
+        let idx = self.anthropic_next_block;
+        self.anthropic_next_block += 1;
+        self.anthropic_text_open = Some(idx);
+        out.push_str(&sse("content_block_start", &json!({
+            "type": "content_block_start", "index": idx,
+            "content_block": { "type": "text", "text": "" }
+        })));
+        idx
+    }
+
+    /// 关闭当前打开的 text 块（若有）。发 tool_use 块前与收尾时调用。
+    fn close_anthropic_text_block(&mut self) -> String {
+        match self.anthropic_text_open.take() {
+            Some(idx) => sse(
+                "content_block_stop",
+                &json!({ "type": "content_block_stop", "index": idx }),
+            ),
+            None => String::new(),
+        }
+    }
+
+    /// 把一个 Responses 输出 item 翻成 Anthropic 的 `tool_use` 内容块（非工具 item 返回空串）。
+    ///
+    /// 产出完整三段：`content_block_start`（带 id/name）+ `content_block_delta`
+    /// （`input_json_delta` 承载 arguments JSON）+ `content_block_stop`。同时记住
+    /// `stop_reason` 要改成 `tool_use`（见 [`SseTranslator::emit_anthropic_stop`]）。
+    ///
+    /// 工具名还原：Responses item 可能把名字拆成 `{name, namespace}` 两字段（Codex 范式），
+    /// 而 Anthropic 下游客户端认的是**全名**，故用 [`join_namespaced_tool_name`] 拼回。
+    fn emit_anthropic_tool_block(&mut self, item: &Value) -> String {
+        let ity = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        // function_call / custom_tool_call / tool_search_call 都是「模型要调工具」，
+        // 对 Anthropic 下游一律呈现为标准 tool_use 块。
+        if !matches!(ity, "function_call" | "custom_tool_call" | "tool_search_call") {
+            return String::new();
+        }
+        let name = join_namespaced_tool_name(item);
+        // custom_tool_call 的 payload 是裸字符串 `input`；包回 {"input": "..."} 使其成为
+        // 合法的 tool_use.input 对象（Anthropic 要求 input 是 JSON 对象）。
+        let raw_args = if ity == "custom_tool_call" {
+            let input = item.get("input").and_then(|i| i.as_str()).unwrap_or("");
+            json!({ "input": input }).to_string()
+        } else {
+            match item.get("arguments") {
+                Some(Value::String(s)) => s.clone(),
+                // tool_search_call 的 arguments 是**对象**（非 JSON 字符串），原样序列化。
+                Some(v) => v.to_string(),
+                None => String::new(),
+            }
+        };
+        let call_id = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // 去重键：有 call_id 用它（上游保证唯一），否则退化为 name+arguments。
+        let dedup_key = if call_id.is_empty() {
+            format!("{name}\u{0}{raw_args}")
+        } else {
+            call_id.clone()
+        };
+        if !self.anthropic_tool_seen.insert(dedup_key) {
+            return String::new();
+        }
+        let tool_id = if call_id.is_empty() {
+            format!("toolu_{}", uuid_like())
+        } else {
+            call_id
+        };
+        let mut out = self.ensure_anthropic_started();
+        // tool_use 块不能嵌在打开的 text 块里，先收尾 text。
+        out.push_str(&self.close_anthropic_text_block());
+        let idx = self.anthropic_next_block;
+        self.anthropic_next_block += 1;
+        out.push_str(&sse("content_block_start", &json!({
+            "type": "content_block_start", "index": idx,
+            "content_block": { "type": "tool_use", "id": tool_id, "name": name, "input": {} }
+        })));
+        // 无参工具兜底成 "{}"：Anthropic 客户端会 JSON.parse 累积的 partial_json，空串会炸。
+        let args = if raw_args.trim().is_empty() { "{}" } else { raw_args.as_str() };
+        out.push_str(&sse("content_block_delta", &json!({
+            "type": "content_block_delta", "index": idx,
+            "delta": { "type": "input_json_delta", "partial_json": args }
+        })));
+        out.push_str(&sse(
+            "content_block_stop",
+            &json!({ "type": "content_block_stop", "index": idx }),
+        ));
         out
     }
 }
@@ -3358,6 +3845,139 @@ mod tests {
         assert!(msgs.iter().any(|m| m["content"] == "roundtrip test"));
     }
 
+    /// Claude 桌面端（3p）真实请求骨架：Anthropic 协议，顶层 `tools` 里带 MCP 工具全名，
+    /// 历史里含一轮完整的 tool_use → tool_result。这是 2026-07-30 实机场景的最小复现。
+    fn claude_desktop_request_with_mcp_tool() -> Value {
+        json!({
+            "model": "claude-opus-4-7",
+            "max_tokens": 4096,
+            "tools": [ {
+                "name": "mcp__synaroute__synaroute_ai",
+                "description": "多模型大脑聚合",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "prompt": { "type": "string" } },
+                    "required": ["prompt"]
+                }
+            } ],
+            "tool_choice": { "type": "auto" },
+            "messages": [
+                { "role": "user", "content": "调用 synaroute_ai 比较快排和归并" },
+                { "role": "assistant", "content": [
+                    { "type": "text", "text": "好，我问一下" },
+                    { "type": "tool_use", "id": "toolu_1",
+                      "name": "mcp__synaroute__synaroute_ai",
+                      "input": { "prompt": "快排 vs 归并" } }
+                ] },
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_1", "content": "两者各有取舍" }
+                ] }
+            ]
+        })
+    }
+
+    #[test]
+    fn desktop_anthropic_to_responses_carries_mcp_tool_and_history() {
+        // 桌面端故障转移到 Responses 上游（实机命中的正是这条路）：
+        // 工具声明、历史里的工具调用与结果都必须完整过去，否则模型无从知道能调什么、
+        // 也读不到上一轮工具的返回。
+        let out = convert_request(
+            &claude_desktop_request_with_mcp_tool(),
+            Protocol::Anthropic,
+            Protocol::OpenaiResponses,
+        );
+        let tools = out["tools"].as_array().expect("Responses 请求须带 tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0]["name"], "mcp__synaroute__synaroute_ai",
+            "MCP 工具全名须原样保留"
+        );
+        assert_eq!(
+            tools[0]["parameters"]["properties"]["prompt"]["type"], "string",
+            "input_schema 须映射为 Responses 的 parameters"
+        );
+        assert_eq!(out["tool_choice"], json!("auto"), "tool_choice 须透传");
+
+        // 历史：function_call（带 call_id）+ function_call_output 都要在。
+        let input = out["input"].as_array().expect("须有 input");
+        let call = input
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .expect("历史里的工具调用丢失");
+        assert_eq!(call["call_id"], "toolu_1", "call_id 须守恒，结果才能回配");
+        assert_eq!(call["name"], "mcp__synaroute__synaroute_ai");
+        assert_eq!(
+            serde_json::from_str::<Value>(call["arguments"].as_str().unwrap()).unwrap(),
+            json!({ "prompt": "快排 vs 归并" })
+        );
+        let output = input
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .expect("历史里的工具结果丢失");
+        assert_eq!(output["call_id"], "toolu_1");
+        assert_eq!(output["output"], "两者各有取舍");
+    }
+
+    #[test]
+    fn desktop_anthropic_to_chat_carries_mcp_tool_and_history() {
+        // 同一请求转到 Chat-only 上游：口径必须与 →Responses 一致（不能只修一条路）。
+        let out = convert_request(
+            &claude_desktop_request_with_mcp_tool(),
+            Protocol::Anthropic,
+            Protocol::OpenaiChat,
+        );
+        let tools = out["tools"].as_array().expect("Chat 请求须带 tools");
+        assert_eq!(tools[0]["function"]["name"], "mcp__synaroute__synaroute_ai");
+        assert_eq!(out["tool_choice"], json!("auto"));
+        let msgs = out["messages"].as_array().unwrap();
+        let asst = msgs
+            .iter()
+            .find(|m| m.get("tool_calls").is_some())
+            .expect("历史里的 assistant 工具调用丢失");
+        assert_eq!(asst["tool_calls"][0]["id"], "toolu_1");
+        assert_eq!(
+            asst["tool_calls"][0]["function"]["name"],
+            "mcp__synaroute__synaroute_ai"
+        );
+        let tool_msg = msgs
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("历史里的工具结果丢失");
+        assert_eq!(tool_msg["tool_call_id"], "toolu_1");
+    }
+
+    #[test]
+    fn forced_tool_choice_survives_all_cross_protocol_hops() {
+        // 「强制调用某工具」不能在任何一跳降级成自由选择——降级后模型可能干脆不调，
+        // 而调用方（如桌面端某些编排）是按「必调」预期写的。
+        let anthropic = json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [ { "role": "user", "content": "go" } ],
+            "tools": [ { "name": "f", "input_schema": { "type": "object" } } ],
+            "tool_choice": { "type": "tool", "name": "f" }
+        });
+        let to_chat = convert_request(&anthropic, Protocol::Anthropic, Protocol::OpenaiChat);
+        assert_eq!(
+            to_chat["tool_choice"],
+            json!({ "type": "function", "function": { "name": "f" } }),
+            "Anthropic→Chat 强制档丢失"
+        );
+        let to_resp = convert_request(&anthropic, Protocol::Anthropic, Protocol::OpenaiResponses);
+        assert_eq!(
+            to_resp["tool_choice"],
+            json!({ "type": "function", "name": "f" }),
+            "Anthropic→Responses 强制档丢失（Responses 用扁平 name）"
+        );
+        // Responses 扁平形态 → Chat 嵌套形态，往返不失真。
+        let back = convert_request(&to_resp, Protocol::OpenaiResponses, Protocol::OpenaiChat);
+        assert_eq!(
+            back["tool_choice"],
+            json!({ "type": "function", "function": { "name": "f" } }),
+            "Responses→Chat 强制档丢失"
+        );
+    }
+
     // ---- 流式 SSE 翻译（Task #16）----
 
     #[test]
@@ -3673,6 +4293,428 @@ mod tests {
         assert!(out.contains("\"type\":\"text_delta\""), "缺 text_delta");
         assert!(out.contains("\"text\":\"Yo\""), "文本增量丢失");
         assert!(out.contains("event: message_stop"), "缺 message_stop");
+        // 纯文本流不得声明工具：stop_reason 必须是 end_turn。
+        assert!(out.contains("\"stop_reason\":\"end_turn\""), "纯文本应 end_turn:\n{out}");
+    }
+
+    /// 把 SSE 文本里的所有 `data:` 行解析成 JSON 值，便于对结构做精确断言
+    /// （避免用子串匹配蒙对——子串能被无关字段碰巧满足）。
+    fn sse_events(raw: &str) -> Vec<Value> {
+        raw.lines()
+            .filter_map(|l| l.trim().strip_prefix("data:"))
+            .map(str::trim)
+            .filter(|d| !d.is_empty() && *d != "[DONE]")
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .collect()
+    }
+
+    /// 取出 Anthropic 流里所有 `tool_use` 型 content_block_start 的 (index, id, name)。
+    fn anthropic_tool_blocks(raw: &str) -> Vec<(u64, String, String)> {
+        sse_events(raw)
+            .into_iter()
+            .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("content_block_start"))
+            .filter_map(|e| {
+                let b = e.get("content_block")?;
+                if b.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                    return None;
+                }
+                Some((
+                    e.get("index").and_then(|i| i.as_u64()).unwrap_or(u64::MAX),
+                    b.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string(),
+                    b.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sse_responses_to_anthropic_translates_tool_call() {
+        // 2026-07-30 实机根因回归：Claude 桌面端（Anthropic 下游）转到 Responses 上游时，
+        // 上游的 function_call item 必须翻成 Anthropic 的 tool_use 块，否则桌面端只收到文本，
+        // MCP 工具永远等不到 tools/call。
+        let mut tr = SseTranslator::new(SseDirection::ResponsesToAnthropic);
+        let mut out = String::new();
+        out.push_str(&tr.push(b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-5.6\"}}\n\n"));
+        out.push_str(&tr.push(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"let me ask\"}\n\n"));
+        out.push_str(&tr.push(
+            br#"event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","call_id":"call_abc","name":"synaroute_ai","arguments":"{\"prompt\":\"hi\"}","status":"completed"}}
+
+"#,
+        ));
+        out.push_str(&tr.push(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":7}}}\n\n"));
+        out.push_str(&tr.finish());
+
+        let blocks = anthropic_tool_blocks(&out);
+        assert_eq!(blocks.len(), 1, "应恰好一个 tool_use 块:\n{out}");
+        let (idx, id, name) = &blocks[0];
+        assert_eq!(name, "synaroute_ai");
+        assert_eq!(id, "call_abc", "tool_use.id 须用上游 call_id，工具结果才能回配");
+        assert_eq!(*idx, 1, "text 块占 0，tool_use 应排到 1");
+
+        // 参数以 input_json_delta 承载，且是可解析的 JSON。
+        let arg_delta = sse_events(&out)
+            .into_iter()
+            .find(|e| {
+                e.get("delta").and_then(|d| d.get("type")).and_then(|t| t.as_str())
+                    == Some("input_json_delta")
+            })
+            .expect("缺 input_json_delta");
+        let pj = arg_delta
+            .get("delta")
+            .and_then(|d| d.get("partial_json"))
+            .and_then(|p| p.as_str())
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(pj).unwrap(),
+            json!({ "prompt": "hi" }),
+            "参数须原样送达"
+        );
+
+        // 有工具调用 → stop_reason 必须是 tool_use，否则下游认为本轮已结束、不执行工具。
+        assert!(
+            out.contains("\"stop_reason\":\"tool_use\""),
+            "有工具调用应 tool_use，实际:\n{out}"
+        );
+        assert!(out.contains("\"output_tokens\":7"), "usage 应从 completed 归位:\n{out}");
+    }
+
+    #[test]
+    fn sse_responses_to_anthropic_dedups_tool_call_from_completed() {
+        // 同一个工具调用既出现在 output_item.done、又出现在 completed.output[] 时只能翻一次，
+        // 否则下游会执行两遍（重复副作用）。
+        let mut tr = SseTranslator::new(SseDirection::ResponsesToAnthropic);
+        let mut out = String::new();
+        out.push_str(&tr.push(
+            br#"event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"t","arguments":"{}"}}
+
+"#,
+        ));
+        out.push_str(&tr.push(
+            br#"event: response.completed
+data: {"type":"response.completed","response":{"output":[{"type":"function_call","call_id":"c1","name":"t","arguments":"{}"}]}}
+
+"#,
+        ));
+        out.push_str(&tr.finish());
+        assert_eq!(anthropic_tool_blocks(&out).len(), 1, "重复投递应去重:\n{out}");
+    }
+
+    #[test]
+    fn sse_responses_to_anthropic_recovers_tool_call_only_from_completed() {
+        // 上游只在 completed.output[] 给工具调用（不发独立 output_item.done）时也要能捞到。
+        let mut tr = SseTranslator::new(SseDirection::ResponsesToAnthropic);
+        let mut out = String::new();
+        out.push_str(&tr.push(
+            br#"event: response.completed
+data: {"type":"response.completed","response":{"output":[{"type":"function_call","call_id":"c9","name":"only_in_completed","arguments":"{\"a\":1}"}]}}
+
+"#,
+        ));
+        out.push_str(&tr.finish());
+        let blocks = anthropic_tool_blocks(&out);
+        assert_eq!(blocks.len(), 1, "completed 兜底应捞出工具调用:\n{out}");
+        assert_eq!(blocks[0].2, "only_in_completed");
+        assert!(out.contains("\"stop_reason\":\"tool_use\""));
+    }
+
+    #[test]
+    fn sse_responses_to_anthropic_rejoins_namespaced_tool_name() {
+        // Codex 范式的 {name, namespace} 两字段 → Anthropic 下游认全名，须拼回。
+        let mut tr = SseTranslator::new(SseDirection::ResponsesToAnthropic);
+        let mut out = String::new();
+        out.push_str(&tr.push(
+            br#"event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"c2","name":"synaroute_ai","namespace":"mcp__synaroute","arguments":"{}"}}
+
+"#,
+        ));
+        out.push_str(&tr.finish());
+        assert_eq!(
+            anthropic_tool_blocks(&out)[0].2,
+            "mcp__synaroute__synaroute_ai",
+            "须拼回全名:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sse_responses_to_anthropic_wraps_custom_tool_input() {
+        // custom_tool_call 的裸字符串 input 要包成 {"input": …}，因 Anthropic 的 tool_use.input
+        // 必须是 JSON 对象；无参调用要兜底 "{}"（空串会让下游 JSON.parse 失败）。
+        let mut tr = SseTranslator::new(SseDirection::ResponsesToAnthropic);
+        let mut out = String::new();
+        out.push_str(&tr.push(
+            br#"event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"c3","name":"apply_patch","input":"*** Begin Patch"}}
+
+"#,
+        ));
+        out.push_str(&tr.push(
+            br#"event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"c4","name":"no_args"}}
+
+"#,
+        ));
+        out.push_str(&tr.finish());
+        let deltas: Vec<String> = sse_events(&out)
+            .into_iter()
+            .filter_map(|e| {
+                let d = e.get("delta")?;
+                if d.get("type").and_then(|t| t.as_str()) != Some("input_json_delta") {
+                    return None;
+                }
+                Some(d.get("partial_json")?.as_str()?.to_string())
+            })
+            .collect();
+        assert_eq!(deltas.len(), 2, "两个工具各一段参数:\n{out}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&deltas[0]).unwrap(),
+            json!({ "input": "*** Begin Patch" }),
+            "custom 裸串须包成对象"
+        );
+        assert_eq!(deltas[1], "{}", "无参工具须兜底空对象，不能是空串");
+    }
+
+    #[test]
+    fn sse_chat_to_anthropic_translates_tool_call_deltas() {
+        // Chat 上游 → Anthropic 下游：tool_calls 是分片增量（name/arguments 逐块到达），
+        // 须累积后成块发出，且 stop_reason 改 tool_use。
+        let mut tr = SseTranslator::new(SseDirection::ChatToAnthropic);
+        let mut out = String::new();
+        out.push_str(&tr.push(b"data: {\"model\":\"glm-4.6\",\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n"));
+        out.push_str(&tr.push(br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"synaroute_ai","arguments":"{\"pro"}}]}}]}
+
+"#));
+        out.push_str(&tr.push(br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"mpt\":\"hi\"}"}}]}}]}
+
+"#));
+        out.push_str(&tr.push(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"));
+        out.push_str(&tr.finish());
+
+        let blocks = anthropic_tool_blocks(&out);
+        assert_eq!(blocks.len(), 1, "应恰好一个 tool_use 块:\n{out}");
+        assert_eq!(blocks[0].2, "synaroute_ai");
+        assert_eq!(blocks[0].1, "call_x");
+        let pj = sse_events(&out)
+            .into_iter()
+            .find_map(|e| {
+                let d = e.get("delta")?;
+                if d.get("type").and_then(|t| t.as_str()) != Some("input_json_delta") {
+                    return None;
+                }
+                Some(d.get("partial_json")?.as_str()?.to_string())
+            })
+            .expect("缺 input_json_delta");
+        assert_eq!(
+            serde_json::from_str::<Value>(&pj).unwrap(),
+            json!({ "prompt": "hi" }),
+            "分片参数须拼完整"
+        );
+        assert!(out.contains("\"stop_reason\":\"tool_use\""), "应 tool_use:\n{out}");
+    }
+
+    #[test]
+    fn sse_chat_to_anthropic_flushes_tool_calls_without_finish_reason() {
+        // 上游没给 finish_reason 就断流：收尾时必须兜底冲刷累积的工具调用，不能整个丢掉。
+        let mut tr = SseTranslator::new(SseDirection::ChatToAnthropic);
+        let mut out = String::new();
+        out.push_str(&tr.push(br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c5","function":{"name":"t","arguments":"{}"}}]}}]}
+
+"#));
+        out.push_str(&tr.finish());
+        assert_eq!(anthropic_tool_blocks(&out).len(), 1, "断流也应交付工具:\n{out}");
+        assert!(out.contains("\"stop_reason\":\"tool_use\""));
+    }
+
+    #[test]
+    fn sse_anthropic_to_chat_translates_tool_use() {
+        // Anthropic 上游 → Chat 下游：tool_use 块 → delta.tool_calls 增量，finish_reason 改 tool_calls。
+        let mut tr = SseTranslator::new(SseDirection::AnthropicToChat);
+        let mut out = String::new();
+        out.push_str(&tr.push(br#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"synaroute_ai","input":{}}}
+
+"#));
+        out.push_str(&tr.push(br#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"prompt\":\"hi\"}"}}
+
+"#));
+        out.push_str(&tr.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+        out.push_str(&tr.finish());
+
+        let evs = sse_events(&out);
+        let first = evs
+            .iter()
+            .find_map(|e| e.pointer("/choices/0/delta/tool_calls/0"))
+            .expect("缺 tool_calls 增量");
+        assert_eq!(first.pointer("/function/name").unwrap(), &json!("synaroute_ai"));
+        assert_eq!(first.get("id").unwrap(), &json!("toolu_1"));
+        // 参数分片拼起来须是完整 JSON。
+        let args: String = evs
+            .iter()
+            .filter_map(|e| {
+                e.pointer("/choices/0/delta/tool_calls/0/function/arguments")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            serde_json::from_str::<Value>(&args).unwrap(),
+            json!({ "prompt": "hi" })
+        );
+        assert!(
+            out.contains("\"finish_reason\":\"tool_calls\""),
+            "有工具应 tool_calls:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sse_responses_to_chat_translates_tool_call() {
+        // Responses 上游 → Chat 下游：function_call item → delta.tool_calls。
+        let mut tr = SseTranslator::new(SseDirection::ResponsesToChat);
+        let mut out = String::new();
+        out.push_str(&tr.push(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hm\"}\n\n"));
+        out.push_str(&tr.push(
+            br#"event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"c7","name":"synaroute_ai","arguments":"{\"prompt\":\"x\"}"}}
+
+"#,
+        ));
+        out.push_str(&tr.push(b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"));
+        out.push_str(&tr.finish());
+
+        let tc = sse_events(&out)
+            .into_iter()
+            .find_map(|e| e.pointer("/choices/0/delta/tool_calls/0").cloned())
+            .expect("缺 tool_calls:\n");
+        assert_eq!(tc.pointer("/function/name").unwrap(), &json!("synaroute_ai"));
+        assert_eq!(tc.get("id").unwrap(), &json!("c7"));
+        assert!(
+            out.contains("\"finish_reason\":\"tool_calls\""),
+            "有工具应 tool_calls:\n{out}"
+        );
+    }
+
+    #[test]
+    fn openai_resp_to_anthropic_carries_tool_calls() {
+        // 非流式同口径：Chat 响应的 tool_calls 必须变成 Anthropic 的 tool_use 块。
+        // 早期实现只搬文本却报 stop_reason:"tool_use" → 自相矛盾，下游无工具可执行。
+        let body = json!({
+            "id": "chatcmpl-1",
+            "model": "gpt-5.6",
+            "choices": [ {
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": "查一下",
+                    "tool_calls": [ {
+                        "id": "call_z",
+                        "type": "function",
+                        "function": { "name": "synaroute_ai", "arguments": "{\"prompt\":\"hi\"}" }
+                    } ]
+                }
+            } ],
+            "usage": { "prompt_tokens": 3, "completion_tokens": 4 }
+        });
+        let out = openai_resp_to_anthropic(&body);
+        assert_eq!(out["stop_reason"], json!("tool_use"));
+        let blocks = out["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "文本 + 工具各一块: {out}");
+        assert_eq!(blocks[0]["type"], json!("text"));
+        assert_eq!(blocks[1]["type"], json!("tool_use"));
+        assert_eq!(blocks[1]["id"], json!("call_z"));
+        assert_eq!(blocks[1]["name"], json!("synaroute_ai"));
+        // input 必须是**对象**（不是 JSON 字符串），否则下游 schema 校验失败。
+        assert_eq!(blocks[1]["input"], json!({ "prompt": "hi" }));
+    }
+
+    #[test]
+    fn openai_resp_to_anthropic_tool_only_has_no_empty_text_block() {
+        // 纯工具调用（content 为 null）：不应塞入空文本块，只留 tool_use。
+        let body = json!({
+            "choices": [ {
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": [ {
+                        "id": "c8", "type": "function",
+                        "function": { "name": "t", "arguments": "not json" }
+                    } ]
+                }
+            } ]
+        });
+        let out = openai_resp_to_anthropic(&body);
+        let blocks = out["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "不应有空文本块: {out}");
+        assert_eq!(blocks[0]["type"], json!("tool_use"));
+        // arguments 不是合法 JSON 对象时兜底空对象，不能把裸串塞进 input。
+        assert_eq!(blocks[0]["input"], json!({}), "非法参数须兜底空对象");
+    }
+
+    #[test]
+    fn anthropic_resp_to_openai_carries_tool_use() {
+        // 反方向非流式：Anthropic 的 tool_use 块 → Chat 的 tool_calls。
+        let body = json!({
+            "id": "msg_1",
+            "model": "claude-opus-4-7",
+            "stop_reason": "tool_use",
+            "content": [
+                { "type": "text", "text": "稍等" },
+                { "type": "tool_use", "id": "toolu_9", "name": "synaroute_ai", "input": { "prompt": "hi" } }
+            ],
+            "usage": { "input_tokens": 5, "output_tokens": 6 }
+        });
+        let out = anthropic_resp_to_openai(&body);
+        assert_eq!(out["choices"][0]["finish_reason"], json!("tool_calls"));
+        let tc = &out["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(tc["id"], json!("toolu_9"));
+        assert_eq!(tc["function"]["name"], json!("synaroute_ai"));
+        // arguments 必须是 JSON **字符串**（Chat 语义），内容可解析回原对象。
+        let args = tc["function"]["arguments"].as_str().expect("arguments 须为字符串");
+        assert_eq!(
+            serde_json::from_str::<Value>(args).unwrap(),
+            json!({ "prompt": "hi" })
+        );
+        assert_eq!(out["choices"][0]["message"]["content"], json!("稍等"));
+    }
+
+    #[test]
+    fn anthropic_resp_to_openai_tool_only_nulls_content() {
+        // 纯工具调用：Chat 语义下 content 为 null（而非空串），避免下游把空串当成回答。
+        let body = json!({
+            "stop_reason": "tool_use",
+            "content": [ { "type": "tool_use", "id": "t1", "name": "f", "input": {} } ]
+        });
+        let out = anthropic_resp_to_openai(&body);
+        assert_eq!(out["choices"][0]["message"]["content"], Value::Null);
+        assert_eq!(out["choices"][0]["message"]["tool_calls"][0]["id"], json!("t1"));
+    }
+
+    #[test]
+    fn tool_calls_survive_full_roundtrip_both_ways() {
+        // 端到端口径一致：Anthropic 下游 ↔ Chat 上游往返后，工具名与参数不失真。
+        // 这条锁住「两个方向的非流式转换互为逆运算」，防止只修一侧造成新的单向丢失。
+        let anthropic = json!({
+            "stop_reason": "tool_use",
+            "content": [
+                { "type": "text", "text": "hi" },
+                { "type": "tool_use", "id": "t1", "name": "mcp__synaroute__synaroute_ai",
+                  "input": { "prompt": "p", "n": 2 } }
+            ]
+        });
+        let back = openai_resp_to_anthropic(&anthropic_resp_to_openai(&anthropic));
+        assert_eq!(back["stop_reason"], json!("tool_use"));
+        let tu = back["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == json!("tool_use"))
+            .expect("往返后工具块丢失");
+        assert_eq!(tu["name"], json!("mcp__synaroute__synaroute_ai"));
+        assert_eq!(tu["input"], json!({ "prompt": "p", "n": 2 }));
+        assert_eq!(tu["id"], json!("t1"), "call id 须守恒，否则工具结果回配不上");
     }
 
     #[test]

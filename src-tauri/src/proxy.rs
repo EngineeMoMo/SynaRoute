@@ -282,6 +282,22 @@ async fn handle_request(
     // 下游请求协议（按 path 判定）：/messages=Anthropic，/responses=OpenAI Responses，否则 Chat。
     let downstream = downstream_protocol(&path);
 
+    // 空探测请求短路：客户端（实测为 Claude 桌面端）会发 `{"messages":[],"model":null}` 这类
+    // **无内容**的探测请求。它转发到任何上游都必然 400（实测 "Failed to parse request body"），
+    // 而 400 被 status_counts_against_breaker 判为硬错误 → record_live_failure → 攒够 3 次把
+    // **完好的 Key** 刷成熔断，进而触发全熔断兜底、把所有 Key 反复重打（问题3 的更深一层根因：
+    // 实测 68 条失败请求里近半是这种空探测）。
+    //
+    // 故在此直接回 400，且**不打上游、不计熔断、不记 error 事件**：既不白耗上游额度，也不让
+    // 客户端的探测行为污染健康状态。判据要求「无内容」与「无模型」同时成立，避免误伤
+    // count_tokens 等合法的无 model 子路径请求（它们带真实 messages）。
+    if is_contentless_probe(&req_json, &requested_model) {
+        return Ok(error_resp(
+            StatusCode::BAD_REQUEST,
+            "空探测请求（无消息内容且未指定模型）：已在代理侧拒绝，未转发上游",
+        ));
+    }
+
     // 候选：启用 + 未熔断，按优先级。全被熔断时（如单 Key 刚熔断）忽略熔断兜底，
     // 避免无处可切却直接 503——熔断本为多 Key 快速切换，无候选可切时不应自杀。
     let (candidates, used_breaker_fallback) =
@@ -1146,6 +1162,41 @@ fn status_counts_against_breaker(status: u16) -> bool {
     !matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
+/// 是否为「无内容探测请求」：消息载荷为空**且**未解析出任何模型名。
+///
+/// 两条件必须同时成立：
+/// - 只看「空内容」会误伤 —— 上游偶尔要求 model 由代理注入，但请求带真实 messages，属正常请求。
+/// - 只看「无模型」会误伤 `count_tokens` 等合法子路径（不带 model 但带真实 messages）。
+///
+/// 覆盖三种协议的载荷字段：Anthropic/Chat 用 `messages`，OpenAI Responses 用 `input`
+/// （字符串形态的 `input` 只要非空即算有内容）。非对象 body（如 `Value::Null`，解析失败）
+/// 不算探测——那是坏请求，交由既有路径处理，避免把「body 解析失败」误报成探测。
+fn is_contentless_probe(req_json: &Value, requested_model: &str) -> bool {
+    let Some(obj) = req_json.as_object() else {
+        return false;
+    };
+    if !requested_model.trim().is_empty() {
+        return false;
+    }
+    // 有任一非空载荷字段 → 不是空探测。
+    let has_content = ["messages", "input", "prompt", "contents"].iter().any(|k| {
+        match obj.get(*k) {
+            Some(Value::Array(a)) => !a.is_empty(),
+            Some(Value::String(s)) => !s.trim().is_empty(),
+            Some(Value::Object(o)) => !o.is_empty(),
+            _ => false,
+        }
+    });
+    if has_content {
+        return false;
+    }
+    // 载荷字段全空/缺失 + 无模型：要求至少出现过一个载荷键，避免把结构完全无关的
+    // 请求（如未来新增端点）误判为探测。
+    ["messages", "input", "prompt", "contents"]
+        .iter()
+        .any(|k| obj.contains_key(*k))
+}
+
 /// 故障转移日志里的动词：临时错误（429/5xx）用「限流/繁忙，暂避」，
 /// 确定性错误用「失败」。让用户一眼区分「Key 坏了」和「Key 只是这一下满了」。
 fn failover_verb(status: u16) -> &'static str {
@@ -1290,6 +1341,53 @@ mod tests {
         );
 
         clear_all_failed_gate(a);
+    }
+
+    #[test]
+    fn contentless_probe_detected_and_real_requests_spared() {
+        // 回归护栏（用户日志实证：68 条失败请求近半是这种空探测）：
+        // 桌面端发 {"messages":[],"model":null} → 转发上游必然 400 → 400 被判硬错误计入熔断
+        // → 把完好的 Key 刷成熔断 → 触发全熔断兜底反复重打。必须在代理侧直接拒绝。
+
+        // 1) 用户真实抓到的形态：空 messages + model:null（requested_model 解析为空串）。
+        let probe = json!({"max_tokens":4096,"messages":[],"model":null});
+        assert!(
+            is_contentless_probe(&probe, ""),
+            "用户实测的空探测形态必须被识别"
+        );
+
+        // 2) Responses 协议的空 input 同样是探测。
+        assert!(is_contentless_probe(&json!({"input":[]}), ""));
+
+        // ---- 以下都不得误伤 ----
+
+        // 3) 有真实 messages 但无 model：count_tokens 等合法子路径，必须放行。
+        let count_tokens = json!({"messages":[{"role":"user","content":"hi"}]});
+        assert!(
+            !is_contentless_probe(&count_tokens, ""),
+            "带真实消息的无 model 请求（count_tokens）不得被拒"
+        );
+
+        // 4) 空 messages 但指定了模型：不是探测（交由上游判定），放行。
+        assert!(
+            !is_contentless_probe(&json!({"messages":[]}), "claude-opus-4-8"),
+            "已指定模型的请求不得被判为探测"
+        );
+
+        // 5) 字符串形态的非空 input。
+        assert!(!is_contentless_probe(&json!({"input":"hello"}), ""));
+
+        // 6) body 解析失败（Value::Null）：不是探测，交既有路径处理，避免误报。
+        assert!(
+            !is_contentless_probe(&Value::Null, ""),
+            "非对象 body 不应被判为空探测"
+        );
+
+        // 7) 完全无载荷键的请求（未来新端点）：不判探测，避免误伤。
+        assert!(
+            !is_contentless_probe(&json!({"foo":1}), ""),
+            "无任何载荷键的请求不应被判为空探测"
+        );
     }
 
     fn key(id: &str, priority: i32, base_url: &str) -> ProviderKey {
