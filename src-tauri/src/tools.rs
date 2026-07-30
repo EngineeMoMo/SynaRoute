@@ -701,14 +701,20 @@ fn claude_mcp_config_path(category: CategoryType) -> AppResult<PathBuf> {
 
 /// 把 SynaRoute MCP 服务器注册进某分类对应工具的客户端配置。
 /// `timeout_ms`：写入客户端的单次工具调用超时（由调用方按整轮预算联动算出，见
-/// lib.rs `mcp_client_timeout_ms`）。返回 (人类可读结果, 是否实际写盘)。已是同 url+timeout
-/// 时不写盘、返回 false。
+/// lib.rs `mcp_client_timeout_ms`）。返回 (人类可读结果, 是否实际写盘)。已是最新时不写盘、返回 false。
+///
+/// **三端 transport 形态各异，禁止混写**：
+/// - Claude CLI → JSON `mcpServers.synaroute` = `{type:"http", url, timeout}`（CLI 支持 HTTP）
+/// - Claude 桌面端 → JSON `mcpServers.synaroute` = `{command, args:["--mcp-stdio"]}`
+///   （桌面端**只认 stdio**；写 HTTP 形态会被判 "not valid MCP server configurations" 并跳过）
+/// - Codex → TOML `mcp_servers.synaroute` = stdio（command + args + type + 超时）
 pub fn register_mcp_client(category: CategoryType, mcp_url: &str, timeout_ms: u64) -> AppResult<(String, bool)> {
     match category {
-        // CLI 与桌面端同为 JSON mcpServers 形态，但落**不同文件**（经 claude_mcp_config_path 路由）。
-        CategoryType::ClaudeCli | CategoryType::ClaudeDesktop => {
+        CategoryType::ClaudeCli => {
             register_mcp_claude_at(&claude_mcp_config_path(category)?, mcp_url, timeout_ms)
         }
+        // 桌面端走 stdio：它不支持 HTTP transport（见 register_mcp_claude_desktop_at）。
+        CategoryType::ClaudeDesktop => register_mcp_claude_desktop(),
         CategoryType::Codex => register_mcp_codex(mcp_url, timeout_ms),
     }
 }
@@ -796,6 +802,7 @@ fn register_mcp_claude_at(path: &Path, mcp_url: &str, timeout_ms: u64) -> AppRes
 }
 
 /// Claude 的 HTTP MCP 项：{ "type":"http", "url":"...", "timeout":<ms> }。
+/// **仅 CLI 用**——桌面端不支持 HTTP transport，见 [`json_stdio_mcp`]。
 /// timeout（毫秒）：Claude Code 对 HTTP MCP 有两层超时——单次工具调用总时长、以及
 /// 「首字节」per-request timer（默认 60s）。把 timeout 设为 ≥60s 会同时抬高首字节 timer 到该值
 /// （见 code.claude.com/docs/en/mcp）。此值由调用方按整轮预算联动算出（见
@@ -806,6 +813,73 @@ fn json_http_mcp(mcp_url: &str, timeout_ms: u64) -> Value {
     m.insert("url".into(), Value::String(mcp_url.to_string()));
     m.insert("timeout".into(), Value::Number(timeout_ms.into()));
     Value::Object(m)
+}
+
+/// Claude 桌面端的 stdio MCP 项：{ "command": "<synaroute.exe>", "args": ["--mcp-stdio"] }。
+///
+/// 桌面端的 `claude_desktop_config.json` **只接受 stdio transport**：写 CLI 那套
+/// `{type:"http", url, timeout}` 会被判「not valid MCP server configurations」整项跳过
+/// （用户可见弹窗：`The following entries ... were skipped: synaroute`）。
+/// 形态与 Codex stdio 注册同源（`synaroute.exe --mcp-stdio` 进无 UI 的 stdio JSON-RPC 模式），
+/// 差别是这里是 JSON、且不写 `type`/超时字段（桌面端 schema 只需 command+args；无 HTTP 首字节
+/// 计时器，故 timeout 无处可写——聚合慢由服务端自身优雅降级保证）。
+fn json_stdio_mcp(exe_path: &str) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("command".into(), Value::String(exe_path.to_string()));
+    m.insert(
+        "args".into(),
+        Value::Array(vec![Value::String(MCP_STDIO_FLAG.to_string())]),
+    );
+    Value::Object(m)
+}
+
+/// 把 SynaRoute 注册为 Claude 桌面端的 **stdio** MCP（桌面端不支持 HTTP，见 [`json_stdio_mcp`]）。
+/// command 指向当前运行的 synaroute.exe，故升级换目录后重新接入会自动改写为现役路径。
+fn register_mcp_claude_desktop() -> AppResult<(String, bool)> {
+    let exe = std::env::current_exe()
+        .map_err(|e| AppError::ToolConfig(format!("无法定位 synaroute 可执行文件: {e}")))?;
+    register_mcp_claude_desktop_at(
+        &claude_mcp_config_path(CategoryType::ClaudeDesktop)?,
+        &exe.display().to_string(),
+    )
+}
+
+/// 可测入口：把 stdio 形态的 synaroute MCP 写进指定的桌面端 config。
+///
+/// 幂等：已是同 command + args 时不写盘。此外**主动清除**旧 HTTP 形态残留（老版本写的
+/// `type:"http"`/`url`/`timeout` 键）——桌面端见到这些非法键就整项跳过，必须整项替换而非合并。
+fn register_mcp_claude_desktop_at(path: &Path, exe_path: &str) -> AppResult<(String, bool)> {
+    let mut root = read_json_or_empty(path)?;
+    let obj = root.as_object_mut().ok_or_else(|| {
+        AppError::ToolConfig(format!("{} 顶层非对象", path.display()))
+    })?;
+
+    let servers = obj
+        .entry("mcpServers")
+        .or_insert_with(|| Value::Object(Default::default()));
+    let servers_obj = servers
+        .as_object_mut()
+        .ok_or_else(|| AppError::ToolConfig("mcpServers 非对象".into()))?;
+
+    let desired = json_stdio_mcp(exe_path);
+    // 幂等：整项完全相等才跳过。用整项比对（而非逐字段）顺带保证旧 HTTP 残留键必被判为不同 →
+    // 触发重写，把非法项换成合法 stdio 项。
+    if servers_obj.get(MCP_CLIENT_NAME) == Some(&desired) {
+        return Ok((
+            format!("Claude 桌面端 MCP（stdio）已是最新，跳过"),
+            false,
+        ));
+    }
+
+    servers_obj.insert(MCP_CLIENT_NAME.to_string(), desired);
+    backup_and_write_json(path, &root)?;
+    Ok((
+        format!(
+            "已注册 MCP 到 Claude 桌面端（stdio）：{}，重启桌面端生效",
+            path.display()
+        ),
+        true,
+    ))
 }
 
 fn unregister_mcp_claude_at(path: &Path) -> AppResult<(String, bool)> {
@@ -1718,17 +1792,74 @@ mod tests {
     }
 
     #[test]
+    fn desktop_mcp_writes_stdio_not_http() {
+        // 回归护栏（用户实测 bug）：桌面端只认 stdio；写 CLI 那套 type:"http"+url 会被判
+        // 「not valid MCP server configurations」整项跳过（弹窗 skipped: synaroute）。
+        let (dir, _normal, threep, _profile, _meta) = desktop_layout("mcp_stdio");
+        let exe = r"C:\Program Files\SynaRoute\synaroute.exe";
+
+        let (_, wrote) = register_mcp_claude_desktop_at(&threep, exe).unwrap();
+        assert!(wrote, "首次注册应写盘");
+
+        let v: Value = serde_json::from_slice(&std::fs::read(&threep).unwrap()).unwrap();
+        let entry = &v["mcpServers"]["synaroute"];
+        assert_eq!(entry["command"], exe, "command 应指向当前 exe");
+        assert_eq!(
+            entry["args"],
+            serde_json::json!(["--mcp-stdio"]),
+            "args 应为 --mcp-stdio"
+        );
+        // 关键：绝不能出现 HTTP 形态的键，否则桌面端整项跳过。
+        assert!(entry.get("type").is_none(), "stdio 项不应带 type");
+        assert!(entry.get("url").is_none(), "stdio 项不应带 url");
+        assert!(entry.get("timeout").is_none(), "stdio 项不应带 timeout");
+
+        // 幂等：同 exe 再注册不写盘。
+        let (_, wrote2) = register_mcp_claude_desktop_at(&threep, exe).unwrap();
+        assert!(!wrote2, "同 exe 重复注册应跳过");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn desktop_mcp_replaces_legacy_http_entry() {
+        // 升级路径：老版本写的 HTTP 形态残留必须被整项替换成 stdio（不能合并留下非法键）。
+        let (dir, _normal, threep, _profile, _meta) = desktop_layout("mcp_stdio_migrate");
+        std::fs::write(
+            &threep,
+            r#"{"deploymentMode":"3p","mcpServers":{"synaroute":{"type":"http","url":"http://127.0.0.1:9600/mcp","timeout":600000},"other":{"command":"keep"}}}"#,
+        )
+        .unwrap();
+
+        let exe = r"C:\Program Files\SynaRoute\synaroute.exe";
+        let (_, wrote) = register_mcp_claude_desktop_at(&threep, exe).unwrap();
+        assert!(wrote, "HTTP 残留必须触发重写");
+
+        let v: Value = serde_json::from_slice(&std::fs::read(&threep).unwrap()).unwrap();
+        let entry = &v["mcpServers"]["synaroute"];
+        assert_eq!(entry["command"], exe);
+        assert!(entry.get("url").is_none(), "旧 url 键必须被清除");
+        assert!(entry.get("type").is_none(), "旧 type 键必须被清除");
+        assert!(entry.get("timeout").is_none(), "旧 timeout 键必须被清除");
+        // 邻居配置与 deploymentMode 不受影响。
+        assert_eq!(v["mcpServers"]["other"]["command"], "keep", "其它 MCP 应保留");
+        assert_eq!(v["deploymentMode"], "3p", "deploymentMode 应保留");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn desktop_mcp_config_shares_file_with_deployment_mode() {
         // 桌面端 MCP 与 deploymentMode 是同一个 claude_desktop_config.json 里的并列键，
         // 互不干扰：先接入（写 deploymentMode=3p），再注册 MCP，两键应共存。
         let (dir, _normal, threep, _profile, _meta) = desktop_layout("mcp_coexist_deploy");
         write_deployment_mode(&threep, "3p").unwrap();
-        register_mcp_claude_at(&threep, "http://127.0.0.1:9600/mcp", MCP_TOOL_TIMEOUT_MS).unwrap();
+        register_mcp_claude_desktop_at(&threep, r"C:\x\synaroute.exe").unwrap();
 
         let v: Value = serde_json::from_slice(&std::fs::read(&threep).unwrap()).unwrap();
         assert_eq!(v["deploymentMode"], "3p", "deploymentMode 应保留");
         assert_eq!(
-            v["mcpServers"]["synaroute"]["type"], "http",
+            v["mcpServers"]["synaroute"]["command"], r"C:\x\synaroute.exe",
             "mcpServers 与 deploymentMode 并列共存"
         );
 

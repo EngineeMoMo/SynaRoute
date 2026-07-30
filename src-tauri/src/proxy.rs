@@ -45,6 +45,54 @@ struct RunningProxy {
 /// 首选端口被占时，在 [preferred, preferred+RANGE] 内向上兜底寻找可用端口（与 MCP 同策略）。
 const PROXY_PORT_FALLBACK_RANGE: u16 = 20;
 
+/// 「全部 Key 均失败」后的短路窗口（毫秒）：窗口内该分类的新请求**直接返回失败**，
+/// 不再逐个重打上游。
+///
+/// 为什么必须有：`health::select_candidates` 在「所有 Key 都已熔断」时会**忽略熔断窗口、
+/// 把全部 Key 原样返回**（避免单 Key 场景无处可切就自杀）。副作用是熔断在「全坏」这个最需要
+/// 它的场景下形同虚设——`record_live_failure` 攒够 3 次设了 `breaker_until`，但下一个请求照旧
+/// 把所有 Key 完整重打一遍。客户端（Claude 桌面端等）收到 5xx 会自动重发，于是表现为
+/// 「一直轮询」：实测单次故障窗口内 3 条并发链各走完全部候选、共 16 条事件，
+/// 相邻两次「全部 Key 失败」间隔低至 0.2s，白耗上游额度且刷爆日志。
+///
+/// 取 5s：足够把客户端连环重发的尖峰压平（0.2~0.5s 级的重试全部被挡），又短到 Key 恢复后
+/// 几乎无感。任何一次转发成功都会**立即**解除短路（见 `clear_all_failed_gate`），
+/// 故不会延误恢复。
+const ALL_FAILED_SHORT_CIRCUIT_MS: i64 = 5_000;
+
+/// 各分类的「全部 Key 失败」短路截止时刻（epoch ms）。进程内状态，重启即清。
+fn all_failed_gate() -> &'static Mutex<HashMap<String, i64>> {
+    static GATE: std::sync::OnceLock<Mutex<HashMap<String, i64>>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 记一次「全部 Key 失败」，武装短路窗口。
+fn arm_all_failed_gate(category: CategoryType) {
+    let until = chrono::Utc::now().timestamp_millis() + ALL_FAILED_SHORT_CIRCUIT_MS;
+    all_failed_gate()
+        .lock()
+        .insert(category.as_str().to_string(), until);
+}
+
+/// 短路窗口是否仍有效。有效则返回剩余毫秒（>0），否则 None（并顺手清理过期项）。
+fn all_failed_gate_remaining(category: CategoryType) -> Option<i64> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut gate = all_failed_gate().lock();
+    match gate.get(category.as_str()).copied() {
+        Some(until) if until > now => Some(until - now),
+        Some(_) => {
+            gate.remove(category.as_str());
+            None
+        }
+        None => None,
+    }
+}
+
+/// 转发成功 → 立即解除短路（Key 恢复后无需等窗口自然到期）。
+fn clear_all_failed_gate(category: CategoryType) {
+    all_failed_gate().lock().remove(category.as_str());
+}
+
 /// 代理管理器：管理各分类的代理生命周期
 pub struct ProxyManager {
     store: Arc<Store>,
@@ -254,6 +302,18 @@ async fn handle_request(
         );
     }
 
+    // 「全部 Key 失败」短路：上一次已确认全部候选都打不通，且仍在短路窗口内 →
+    // 直接返回失败，不再逐个重打上游。见 ALL_FAILED_SHORT_CIRCUIT_MS 的完整理由。
+    if let Some(remaining_ms) = all_failed_gate_remaining(category) {
+        return Ok(error_resp(
+            StatusCode::BAD_GATEWAY,
+            &format!(
+                "全部 Key 不可用：上次尝试已确认全部候选均失败，{}s 内不再重试（任一次成功即恢复）",
+                (remaining_ms as f64 / 1000.0).ceil() as i64
+            ),
+        ));
+    }
+
     // 调用模型日志开关（默认关）：开启后每次转发尝试记一条 request 事件（含完整链路快照）
     let req_log = store.get_settings().request_log_enabled;
 
@@ -361,6 +421,8 @@ async fn handle_request(
             match try_stream_to_key(&store, key, &path, &req_json, &requested_model, &fwd_headers).await {
                 Ok(StreamAttempt::Streaming { resp, url, real_model, request_body }) => {
                     health::record_live_success(&store, &key.id);
+                    // 有 Key 能用了 → 立即解除「全部失败」短路，不等窗口自然到期。
+                    clear_all_failed_gate(category);
                     let elapsed = started.elapsed().as_millis() as u64;
                     // 流式成功也记一条 request 事件（开关开启时）。请求体以「转换后发往上游」为主
                     // （含 reasoning→thinking 映射结果，排障核心），单独完整保留、放最前；
@@ -460,6 +522,8 @@ async fn handle_request(
                     true,
                 );
                 health::record_live_success(&store, &key.id);
+                // 有 Key 能用了 → 立即解除「全部失败」短路，不等窗口自然到期。
+                clear_all_failed_gate(category);
                 store.append_event(
                     category,
                     "route",
@@ -525,6 +589,8 @@ async fn handle_request(
     }
 
     store.append_event(category, "error", None, &format!("全部 Key 失败: {last_err}"));
+    // 武装短路窗口：窗口内后续请求（含客户端自动重发）直接失败，不再重打全部上游。
+    arm_all_failed_gate(category);
     Ok(error_resp(
         StatusCode::BAD_GATEWAY,
         &format!("全部 Key 不可用：{last_err}"),
@@ -1176,6 +1242,54 @@ mod tests {
         // 日志动词：临时错误说「暂避」，硬错误说「失败」。
         assert_eq!(failover_verb(429), "限流/繁忙，暂避");
         assert_eq!(failover_verb(401), "失败");
+    }
+
+    #[test]
+    fn all_failed_gate_arms_blocks_then_clears_on_success() {
+        // 回归护栏（用户实测「一直轮询」）：全部候选失败后必须短路，窗口内不再重打上游。
+        // 实测现场：单次故障窗口 3 条并发链各走完全部候选、16 条事件，相邻两次「全部 Key 失败」
+        // 间隔低至 0.2s —— 因为 select_candidates 在「全熔断」时忽略熔断窗口把所有 Key 原样返回，
+        // 熔断在最需要它的场景形同虚设，客户端 5xx 自动重发于是无限放大。
+        //
+        // 用独立分类避免与其它并发测试共享 gate 状态。
+        let cat = CategoryType::Codex;
+        clear_all_failed_gate(cat);
+        assert!(
+            all_failed_gate_remaining(cat).is_none(),
+            "初始不应处于短路"
+        );
+
+        arm_all_failed_gate(cat);
+        let remaining = all_failed_gate_remaining(cat).expect("武装后应处于短路窗口");
+        assert!(
+            remaining > 0 && remaining <= ALL_FAILED_SHORT_CIRCUIT_MS,
+            "剩余窗口应在 (0, {ALL_FAILED_SHORT_CIRCUIT_MS}] 内，实际 {remaining}"
+        );
+
+        // 任一次转发成功 → 立即解除，不等窗口自然到期（Key 恢复不被延误）。
+        clear_all_failed_gate(cat);
+        assert!(
+            all_failed_gate_remaining(cat).is_none(),
+            "成功后必须立即解除短路，否则 Key 恢复了却仍被拒"
+        );
+    }
+
+    #[test]
+    fn all_failed_gate_is_per_category() {
+        // 分类隔离：Claude 桌面端全挂不能连带把 Codex 的请求也短路掉。
+        let a = CategoryType::ClaudeDesktop;
+        let b = CategoryType::ClaudeCli;
+        clear_all_failed_gate(a);
+        clear_all_failed_gate(b);
+
+        arm_all_failed_gate(a);
+        assert!(all_failed_gate_remaining(a).is_some(), "A 分类应短路");
+        assert!(
+            all_failed_gate_remaining(b).is_none(),
+            "B 分类不应被 A 的失败牵连"
+        );
+
+        clear_all_failed_gate(a);
     }
 
     fn key(id: &str, priority: i32, base_url: &str) -> ProviderKey {

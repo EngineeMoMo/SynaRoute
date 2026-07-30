@@ -29,14 +29,34 @@ const MAX_EVENTS: usize = 500;
 /// 默认日志目录：安装目录（exe 同级）下的 `logs/`。
 /// 路径动态解析（current_exe），禁止硬编码（dev-hard-rules 规则2）。
 /// 若安装目录不可写（如装在 Program Files 需管理员权限），回退到 %APPDATA%\SynaRoute\logs。
+///
+/// **结果进程内缓存一次**（`OnceLock`）：本函数原先每写一行日志都被调一次，每次都做
+/// 「建 `.write-probe` → 写 → 删」的探测；而日志写入是并发的（代理转发、健康检查各自的 tokio
+/// 任务），多线程共用同一探针文件名会互删对方的探针，导致偶发探测失败 → 个别日志行漏回退到
+/// `%APPDATA%`，日志被劈成两处（实测 368 行落安装目录、1 行漏到 AppData）。缓存后每进程只探测
+/// 一次，路径从此稳定；探针名另加进程 id + 随机后缀，杜绝同机多实例互删。
 pub fn default_log_dir() -> PathBuf {
+    static CACHED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CACHED.get_or_init(resolve_default_log_dir).clone()
+}
+
+/// 实际探测逻辑（仅由 [`default_log_dir`] 缓存调用一次）。
+fn resolve_default_log_dir() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let logs = dir.join("logs");
             // 探测可写性：能创建目录即认为可写，用它
             if std::fs::create_dir_all(&logs).is_ok() {
-                // 进一步验证真的能写入（Program Files 下 create_dir_all 可能因已存在而成功，但写入失败）
-                let probe = logs.join(".write-probe");
+                // 进一步验证真的能写入（Program Files 下 create_dir_all 可能因已存在而成功，但写入失败）。
+                // 探针名带 pid + 纳秒时间戳：同机多实例/并发调用各用各的文件，不会互删。
+                let probe = logs.join(format!(
+                    ".write-probe-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.subsec_nanos())
+                        .unwrap_or(0)
+                ));
                 if std::fs::write(&probe, b"ok").is_ok() {
                     let _ = std::fs::remove_file(&probe);
                     return logs;
@@ -786,6 +806,42 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_log_dir_is_stable_across_concurrent_calls() {
+        // 回归护栏（用户实测：368 行落安装目录、1 行漏到 %APPDATA%）：
+        // 原实现每写一行日志都重跑一次可写性探测，并发下多线程共用同名 `.write-probe`
+        // 互删对方探针 → 个别调用探测失败 → 那一行日志漏回退到 %APPDATA%，日志被劈两处。
+        // 现在结果 OnceLock 缓存，任意并发下必须返回同一路径。
+        let first = default_log_dir();
+        let handles: Vec<_> = (0..16)
+            .map(|_| std::thread::spawn(default_log_dir))
+            .collect();
+        for h in handles {
+            assert_eq!(
+                h.join().unwrap(),
+                first,
+                "并发调用必须返回同一日志目录（否则日志会被劈到两处）"
+            );
+        }
+        // 探针不得残留在日志目录里。
+        if first.is_dir() {
+            let leftover: Vec<_> = std::fs::read_dir(&first)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| {
+                            e.file_name()
+                                .to_str()
+                                .map(|n| n.starts_with(".write-probe"))
+                                .unwrap_or(false)
+                        })
+                        .map(|e| e.path())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(leftover.is_empty(), "可写性探针不应残留: {leftover:?}");
+        }
+    }
 
     /// 唯一临时目录（不引第三方 crate）：temp_dir + pid + 原子计数。
     fn temp_dir(tag: &str) -> PathBuf {

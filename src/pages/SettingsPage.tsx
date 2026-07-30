@@ -9,7 +9,7 @@ import { LANGS } from "@/lib/i18n";
 import type { AppSettings, McpStatus, ThemePref, CategoryType } from "@/types";
 import {
   Sun, Moon, Monitor, ShieldCheck, KeyRound, Languages, ScrollText,
-  Activity, RefreshCw, FolderOpen, Info, Plug, BookOpen, Copy, Check, X, Brain, MousePointerClick, type LucideIcon,
+  Activity, RefreshCw, FolderOpen, Info, Plug, BookOpen, Copy, Check, X, Brain, MousePointerClick, MessageSquareDot, type LucideIcon,
 } from "lucide-react";
 
 /** 设置页（主题 / 语言 / 自启 / 加密方式 / 局域网暴露 / 版本更新 / 日志路径） */
@@ -482,7 +482,10 @@ export function SettingsPage() {
               </select>
             </div>
             <ToggleRow
-              icon={Activity}
+              // MessageSquareDot：会话气泡 + 探测点，同时表达「发一条真实消息」与「在探测」。
+              // 不用 Activity —— 上面「定时健康检查间隔」已占用它（同为健康检查族，图标相同会让
+              // 两项在视觉上黏成一条，看不出这项才是「用真实请求」的开关）。
+              icon={MessageSquareDot}
               title={t("settings.realProbeTitle")}
               desc={t("settings.realProbeDesc")}
               checked={settings?.healthProbeRealCompletion ?? false}
