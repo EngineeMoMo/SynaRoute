@@ -270,3 +270,47 @@ export interface McpStatus {
   port?: number; // 实际绑定端口（可能与配置端口不同——占用时自动 fallback）
   lastError?: string; // 最近一次启动失败原因（成功时为空）
 }
+
+// ---- 从 cc-switch 导入历史 Key ----
+//
+// cc-switch（另一款 Key 切换工具）把各端供应商档存在 ~/.cc-switch/cc-switch.db。
+// SynaRoute 只读它，映射成自己的 Key + 加密密钥。**导入不接入**：不改任何客户端配置。
+
+/** 一条可导入（或明确不可导入）的候选 */
+export interface CcSwitchCandidate {
+  sourceId: string; // cc-switch providers.id，导入时按它回查
+  appType: string; // cc-switch 原值：claude / claude-desktop / codex / gemini
+  categoryId: CategoryType | null; // 映射到的分类；null = 无对应分类
+  name: string;
+  baseUrl: string;
+  protocol: Protocol | null;
+  defaultModel: string | null; // codex 的 config.toml 顶层 model
+  isCurrent: boolean; // 该档在 cc-switch 里是否为当前生效项
+  secretMasked: string; // 掩码（前6…后4 (长度)）；明文不出后端
+  duplicateOf: string | null; // 与 SynaRoute 已有 Key 重复时给出对方名称
+  skipReason: string | null; // 不可导入原因；为 null 才可导入
+}
+
+/** 扫描结果 */
+export interface CcSwitchScanResult {
+  dbPath: string; // 数据来源，供 UI 展示
+  total: number; // 库里 providers 总数
+  candidates: CcSwitchCandidate[];
+}
+
+/** 单条导入结局 */
+export interface CcSwitchImportOutcome {
+  sourceId: string;
+  name: string;
+  status: "imported" | "skipped" | "failed";
+  detail: string;
+  keyId: string | null;
+}
+
+/** 导入汇总 */
+export interface CcSwitchImportReport {
+  imported: number;
+  skipped: number;
+  failed: number;
+  outcomes: CcSwitchImportOutcome[];
+}

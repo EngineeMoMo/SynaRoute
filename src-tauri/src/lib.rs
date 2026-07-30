@@ -2,6 +2,7 @@
 //! IPC 命令名与前端 src/lib/bridge.ts 严格对齐。
 
 mod aggregate;
+mod ccswitch;
 mod codegraph;
 mod error;
 mod health;
@@ -71,6 +72,27 @@ fn save_secret(state: tauri::State<AppState>, key_id: String, secret: String) ->
 #[tauri::command]
 fn toggle_key(state: tauri::State<AppState>, key_id: String, enabled: bool) -> AppResult<()> {
     state.store.toggle_key(&key_id, enabled)
+}
+
+// ============ 从 cc-switch 导入历史 Key ============
+//
+// 只读 cc-switch 的 SQLite 库（先复制到临时文件再打开），把它的供应商档映射成
+// SynaRoute 的 Key + 加密密钥。**导入不接入**：不写任何客户端配置、不改接入状态。
+
+/// 扫描 cc-switch 库，返回可导入候选（含掩码密钥、重复标记、不可导入原因）。
+/// 明文密钥不出后端——前端只拿到掩码。
+#[tauri::command]
+fn scan_ccswitch(state: tauri::State<AppState>) -> AppResult<ccswitch::ScanResult> {
+    ccswitch::scan(&state.store)
+}
+
+/// 按 sourceIds 导入选中的档。逐条独立处理，返回每条结局。
+#[tauri::command]
+fn import_from_ccswitch(
+    state: tauri::State<AppState>,
+    source_ids: Vec<String>,
+) -> AppResult<ccswitch::ImportReport> {
+    ccswitch::import(&state.store, &source_ids)
 }
 
 #[tauri::command]
@@ -995,6 +1017,8 @@ pub fn run() {
             save_secret,
             reveal_secret,
             toggle_key,
+            scan_ccswitch,
+            import_from_ccswitch,
             fetch_models,
             fetch_models_draft,
             check_health,

@@ -2,11 +2,12 @@ import { useEffect, useMemo, useState } from "react";
 import { useStore } from "@/store";
 import { KeyCard } from "@/components/KeyCard";
 import { ProxyStatusBar } from "@/components/ProxyStatusBar";
+import { CcSwitchImportDialog } from "@/components/CcSwitchImportDialog";
 import { Button } from "@/components/ui/Button";
 import { Combobox } from "@/components/ui/Combobox";
 import { useT } from "@/lib/useT";
 import type { ProviderKey } from "@/types";
-import { Plus, AlertTriangle, Inbox, X } from "lucide-react";
+import { Plus, AlertTriangle, Inbox, X, Database } from "lucide-react";
 
 /** 分类主页：代理状态条 + 模型映射兜底提示 + Key 卡片列表 */
 export function CategoryPage({ onAddKey, onEditKey }: {
@@ -16,6 +17,7 @@ export function CategoryPage({ onAddKey, onEditKey }: {
   const { activeCategory, keys, proxy, loading, refreshCategory, settings, setActiveModel, setActiveEffort } = useStore();
   const t = useT();
   const [gapDialogOpen, setGapDialogOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
 
   useEffect(() => {
     const id = setInterval(() => void refreshCategory(), 5000);
@@ -55,6 +57,14 @@ export function CategoryPage({ onAddKey, onEditKey }: {
           <Plus size={18} />
         </Button>
       </div>
+
+      {/* 从 cc-switch 导入历史 Key：只读对方库、导入后不接入（详见 CcSwitchImportDialog） */}
+      {importOpen && (
+        <CcSwitchImportDialog
+          onClose={() => setImportOpen(false)}
+          onImported={() => void refreshCategory()}
+        />
+      )}
 
       {/* 应用内「当前模型」下拉（仅 Codex）：其模型菜单是内置固定清单、拉不到中转模型，
           在此选定实际使用的对外模型名，代理转发时覆盖客户端发来的模型名，即时生效免重启。 */}
@@ -128,8 +138,22 @@ export function CategoryPage({ onAddKey, onEditKey }: {
           <div className="flex flex-col items-center justify-center gap-3 py-16 text-text-muted">
             <Inbox size={40} />
             <p className="text-sm">{t("category.empty")}</p>
-            <Button variant="secondary" onClick={onAddKey}>
-              <Plus size={16} /> {t("category.addFirst")}
+            <div className="flex gap-2">
+              <Button variant="secondary" onClick={onAddKey}>
+                <Plus size={16} /> {t("category.addFirst")}
+              </Button>
+              {/* 空列表是最需要「从 cc-switch 导入」的场景：老用户往往已在 cc-switch 里配好了 */}
+              <Button variant="outline" onClick={() => setImportOpen(true)}>
+                <Database size={16} /> 从 cc-switch 导入
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {!loading && sorted.length > 0 && (
+          <div className="flex justify-end pb-1">
+            <Button variant="ghost" size="sm" onClick={() => setImportOpen(true)}>
+              <Database size={14} /> 从 cc-switch 导入
             </Button>
           </div>
         )}

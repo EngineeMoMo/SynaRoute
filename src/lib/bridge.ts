@@ -7,6 +7,8 @@ import type {
   AppSettings,
   BrainConfig,
   CategoryType,
+  CcSwitchImportReport,
+  CcSwitchScanResult,
   CodegraphState,
   EventLogEntry,
   McpStatus,
@@ -68,6 +70,14 @@ export const api = {
   // 切换启用状态
   toggleKey: (keyId: string, enabled: boolean) =>
     call<void>("toggle_key", { keyId, enabled }, () => mockBridge.toggleKey(keyId, enabled)),
+
+  // ---- 从 cc-switch 导入历史 Key（只读对方库；导入后不接入）----
+  scanCcswitch: () =>
+    call<CcSwitchScanResult>("scan_ccswitch", undefined, () => mockBridge.scanCcswitch()),
+  importFromCcswitch: (sourceIds: string[]) =>
+    call<CcSwitchImportReport>("import_from_ccswitch", { sourceIds }, () =>
+      mockBridge.importFromCcswitch(sourceIds),
+    ),
 
   // 拉取模型列表（FR-004）——已保存 Key 按 id 探测
   fetchModels: (keyId: string) =>

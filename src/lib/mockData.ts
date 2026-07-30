@@ -349,6 +349,85 @@ export const mockBridge = {
       if (k) k.enabled = enabled;
     }
   },
+
+  // 浏览器预览态：给出一份覆盖各种分支的假候选（可导入 / 重复 / 官方档 / 不支持端），
+  // 让 UI 的每种状态都能在 npm run dev 下被看到。
+  async scanCcswitch() {
+    await delay();
+    return {
+      dbPath: "C:\\Users\\demo\\.cc-switch\\cc-switch.db",
+      total: 4,
+      candidates: [
+        {
+          sourceId: "demo-claude",
+          appType: "claude",
+          categoryId: "claude-cli" as CategoryType,
+          name: "Sub2API",
+          baseUrl: "https://sub.example.com",
+          protocol: "anthropic" as const,
+          defaultModel: null,
+          isCurrent: true,
+          secretMasked: "sk-abc…1111 (48)",
+          duplicateOf: null,
+          skipReason: null,
+        },
+        {
+          sourceId: "demo-codex",
+          appType: "codex",
+          categoryId: "codex" as CategoryType,
+          name: "公益站",
+          baseUrl: "https://muyuan.example/v1",
+          protocol: "openai_responses" as const,
+          defaultModel: "gpt-5.6-sol",
+          isCurrent: false,
+          secretMasked: "sk-def…3333 (48)",
+          duplicateOf: null,
+          skipReason: null,
+        },
+        {
+          sourceId: "demo-dup",
+          appType: "claude-desktop",
+          name: "百倍（已存在）",
+          categoryId: "claude-desktop" as CategoryType,
+          baseUrl: "https://sub.example.com",
+          protocol: "anthropic" as const,
+          defaultModel: null,
+          isCurrent: false,
+          secretMasked: "sk-abc…1111 (48)",
+          duplicateOf: "百倍",
+          skipReason: "SynaRoute 里已有同站点同密钥的 Key",
+        },
+        {
+          sourceId: "demo-official",
+          appType: "codex",
+          categoryId: "codex" as CategoryType,
+          name: "OpenAI Official",
+          baseUrl: "",
+          protocol: null,
+          defaultModel: null,
+          isCurrent: false,
+          secretMasked: "",
+          duplicateOf: null,
+          skipReason: "ChatGPT 官方登录档（只有 OAuth token，无 API Key）",
+        },
+      ],
+    };
+  },
+  async importFromCcswitch(sourceIds: string[]) {
+    await delay();
+    return {
+      imported: sourceIds.length,
+      skipped: 0,
+      failed: 0,
+      outcomes: sourceIds.map((id) => ({
+        sourceId: id,
+        name: id,
+        status: "imported" as const,
+        detail: "已导入（预览态模拟）",
+        keyId: `k_mock_${id}`,
+      })),
+    };
+  },
   async fetchModels(keyId: string): Promise<ModelInfo[]> {
     await delay(600);
     for (const cat of Object.keys(store) as CategoryType[]) {

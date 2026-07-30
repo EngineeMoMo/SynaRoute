@@ -34,6 +34,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 
+# 读 cc-switch 的历史配置库（SQLite）以导入既有 Key。只读、绝不写回。
+# bundled：自带 SQLite C 源码一起编，免去用户机器上装 sqlite3 运行库。
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # 加密：Windows 用 DPAPI；非 Windows 开发回退用 AES-GCM
 aes-gcm = "0.10"
 rand = "0.8"
