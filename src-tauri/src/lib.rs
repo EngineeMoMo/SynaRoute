@@ -2,6 +2,7 @@
 //! IPC 命令名与前端 src/lib/bridge.ts 严格对齐。
 
 mod aggregate;
+mod codegraph;
 mod error;
 mod health;
 mod mcp;
@@ -818,6 +819,27 @@ fn detect_recent_workdirs() -> AppResult<Vec<workdirs::RecentWorkdir>> {
     workdirs::scan()
 }
 
+/// 检测 codegraph 可用状态（未安装 / 孤岛 / 未索引 / 就绪）。
+/// `work_dir` 为空则只判可执行是否就绪，不判项目索引。
+#[tauri::command]
+async fn detect_codegraph(work_dir: Option<String>) -> codegraph::CodegraphState {
+    let dir = work_dir
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    codegraph::detect(dir.as_deref()).await
+}
+
+/// 为指定项目建立 codegraph 索引（`codegraph init <path>`）。
+/// 会在项目根创建 `.codegraph/`（SQLite 索引，纯本地、不出网）。
+#[tauri::command]
+async fn codegraph_init(work_dir: String) -> AppResult<String> {
+    codegraph::init_project(std::path::Path::new(&work_dir))
+        .await
+        .map_err(error::AppError::Invalid)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Codex 大脑聚合走 stdio MCP：Codex 以子进程拉起 `synaroute.exe --mcp-stdio`，
@@ -1009,6 +1031,8 @@ pub fn run() {
             aggregate_execute,
             retrieve_files,
             detect_recent_workdirs,
+            detect_codegraph,
+            codegraph_init,
         ])
         .run(tauri::generate_context!())
         .expect("运行 SynaRoute 失败");

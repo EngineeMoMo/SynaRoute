@@ -36,3 +36,4 @@ secrets.enc
 *.pem
 *.key
 .tmp-release/
+.codegraph/

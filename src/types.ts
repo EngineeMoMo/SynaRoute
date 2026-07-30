@@ -145,6 +145,21 @@ export interface RecentWorkdir {
   label?: string; // 展示用简短名（可选，通常为目录名）
 }
 
+/**
+ * codegraph（可选的本地代码索引工具）可用状态。
+ *
+ * 四态各对应不同的用户动作，故必须区分「没装」与「装了但项目没索引」：
+ * - notInstalled：给安装入口
+ * - stranded：能调但不在 PATH（常见于 nvm 升级后旧版本目录残留），提示重装
+ * - notIndexed：可执行就绪、项目缺 .codegraph/，给建索引按钮
+ * - ready：可用，检索走符号级链路
+ */
+export type CodegraphState =
+  | { state: "notInstalled" }
+  | { state: "stranded"; path: string; version: string }
+  | { state: "notIndexed"; path: string; version: string }
+  | { state: "ready"; path: string; version: string; nodes?: number | null; edges?: number | null };
+
 /** 聚合成员（FR-014） */
 export interface BrainMember {
   id: string;

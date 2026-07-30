@@ -9,7 +9,7 @@ import { HealthBadge } from "@/components/HealthBadge";
 import { BrandIcon } from "@/components/BrandIcon";
 import { useT } from "@/lib/useT";
 import type { TFunc } from "@/lib/i18n";
-import type { AggregateMode, BrainConfig, CategoryType, ProviderKey } from "@/types";
+import type { AggregateMode, BrainConfig, CategoryType, CodegraphState, ProviderKey } from "@/types";
 import type { RecentWorkdir } from "@/types";
 import { Brain, Info, Save, Plus, X, FolderOpen, Play, CheckCircle, History, Activity, ChevronDown, Wand2, Plug } from "lucide-react";
 
@@ -432,6 +432,8 @@ export function BrainPage() {
                   step={5000}
                   onChange={(v) => update({ maxContextTokens: v })}
                 />
+
+                <CodegraphPanel t={t} workDir={config.workDir} autoFollow={config.autoFollowActive ?? false} />
               </>
             )}
           </CardContent>
@@ -907,6 +909,131 @@ function ActiveProjectDisplay({ t }: { t: TFunc }) {
       ) : (
         <div className="mt-1 text-xs text-text-muted">{t("brain.noActiveProject")}</div>
       )}
+    </div>
+  );
+}
+
+/**
+ * codegraph 可用状态面板 —— 装了就让检索走「符号 + 调用链」精确切片，没装则退化为按文件检索。
+ *
+ * 刻意**不做自动安装**：往用户机器装第三方 CLI 属于要明确确认的动作，这里只给出命令让用户自己跑，
+ * 装完点「重新检测」。建索引是本地操作（在项目里生成 .codegraph/），故提供一键按钮。
+ *
+ * 自动跟随开启时工作目录由运行时决定（读会话历史），此处拿不到具体路径，
+ * 故只判可执行是否就绪、不判项目索引——避免显示一个与实际检索目录无关的索引状态。
+ */
+function CodegraphPanel({
+  t,
+  workDir,
+  autoFollow,
+}: {
+  t: TFunc;
+  workDir?: string;
+  autoFollow: boolean;
+}) {
+  const [state, setState] = useState<CodegraphState | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [building, setBuilding] = useState(false);
+  const [msg, setMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+
+  // 自动跟随时不传目录：索引状态无从判定（运行时才知道用哪个项目）
+  const effectiveDir = autoFollow ? undefined : workDir?.trim() || undefined;
+
+  const check = async () => {
+    setChecking(true);
+    try {
+      setState(await api.detectCodegraph(effectiveDir));
+    } catch (e) {
+      setMsg({ kind: "err", text: String((e as Error)?.message ?? e) });
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  // 目录变化时重新检测（换项目后索引状态会变）
+  useEffect(() => {
+    void check();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effectiveDir]);
+
+  const build = async () => {
+    if (!effectiveDir) return;
+    setBuilding(true);
+    setMsg(null);
+    try {
+      const summary = await api.codegraphInit(effectiveDir);
+      setMsg({ kind: "ok", text: summary });
+      await check();
+    } catch (e) {
+      setMsg({ kind: "err", text: String((e as Error)?.message ?? e) });
+    } finally {
+      setBuilding(false);
+    }
+  };
+
+  const s = state?.state;
+  const desc =
+    s === "ready"
+      ? t("brain.cgDescReady")
+      : s === "notIndexed"
+        ? t("brain.cgDescNotIndexed")
+        : s === "stranded"
+          ? t("brain.cgDescStranded")
+          : t("brain.cgDescNotInstalled");
+
+  return (
+    <div className="space-y-2 border-t border-border pt-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium text-text-primary">{t("brain.cgTitle")}</span>
+            {s === "ready" && (
+              <Badge variant="success">
+                <CheckCircle size={10} /> {state && "version" in state ? `v${state.version}` : ""}
+              </Badge>
+            )}
+            {s === "notIndexed" && <Badge variant="warning">{t("brain.cgBadgeNotIndexed")}</Badge>}
+            {s === "stranded" && <Badge variant="warning">PATH</Badge>}
+            {s === "notInstalled" && <Badge variant="neutral">{t("brain.cgBadgeNotInstalled")}</Badge>}
+          </div>
+          <div className="mt-1 text-xs text-text-muted">{desc}</div>
+        </div>
+        <Button size="sm" variant="secondary" onClick={() => void check()} disabled={checking}>
+          <Activity size={13} /> {t("brain.cgRecheck")}
+        </Button>
+      </div>
+
+      {/* 未安装 / 孤岛：给命令让用户自己装，不代劳 */}
+      {(s === "notInstalled" || s === "stranded") && (
+        <div className="space-y-1">
+          <div className="text-xs text-text-secondary">{t("brain.cgInstallHint")}</div>
+          <code className="block select-all rounded-control border border-border bg-surface px-2.5 py-1.5 font-mono text-xs text-text-primary">
+            npm i -g @colbymchenry/codegraph
+          </code>
+        </div>
+      )}
+
+      {/* 已安装但项目未索引：一键建索引（纯本地） */}
+      {s === "notIndexed" && (
+        <div className="flex items-center gap-2">
+          <Button size="sm" onClick={() => void build()} disabled={building || !effectiveDir}>
+            <Wand2 size={13} /> {building ? t("brain.cgBuilding") : t("brain.cgBuildIndex")}
+          </Button>
+          {!effectiveDir && (
+            <span className="text-xs text-warning">{t("brain.cgNeedWorkDir")}</span>
+          )}
+        </div>
+      )}
+
+      {msg && (
+        <div className={`text-xs ${msg.kind === "ok" ? "text-success" : "text-danger"}`}>
+          {msg.text}
+        </div>
+      )}
+
+      <div className="flex items-center gap-1.5 text-xs text-text-muted">
+        <Info size={12} /> {t("brain.cgLocalNote")}
+      </div>
     </div>
   );
 }

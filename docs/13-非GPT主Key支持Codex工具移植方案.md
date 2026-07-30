@@ -58,7 +58,7 @@ flat 名 `<ns>__<sub>` 回程拆回 `{namespace, name}` 两字段。
 | **custom/freeform 工具识别** | ✅ `freeform:true` | ❌ 无 |
 | **freeform 回程转 custom_tool_call** | ✅ | ❌ 无 |
 | **tool_search 处理** | ✅ | ❌ 无 |
-| **developer 消息内嵌 tools 解析** | ✅(顶层 tools) | ❌ 未解析 developer 内嵌 |
+| **developer 消息内嵌 tools 解析** | ✅(顶层 tools) | ✅ 已补(见下「六、桌面端请求结构已抓实」) |
 | SSE 流式 tool_use↔custom_tool_call 翻译 | ✅ | ⚠️ 部分(namespace 已做,freeform 未做) |
 
 **差距聚焦**:freeform 那条链(识别 → 转发暴露 → 回程转 custom_tool_call)+ 可能的 developer 内嵌 tools 解析。
@@ -96,3 +96,56 @@ flat 名 `<ns>__<sub>` 回程拆回 `{namespace, name}` 两字段。
 - **要做本方案**:先补 WP1 抓桌面端完整请求确认 tools 结构,再决定;核心代码差距不大(freeform 链),但桌面端 exec 编排的未知项需实测降险。直接参考 opencodex `parser.ts` + `bridge.ts` + `anthropic.ts` 移植,不从零写。
 
 参考:opencodex https://github.com/lidge-jun/opencodex(`src/responses/parser.ts`、`src/adapters/anthropic.ts`、`src/bridge.ts`)
+
+---
+
+## 六、桌面端请求结构已抓实(2026-07-30)
+
+WP1 里「需再抓一次桌面端完整请求确认 tools 到底在哪」这项已完成，**风险 1 关闭**。
+
+### 取证手段(可复现)
+
+Codex 把发给 SynaRoute 的完整请求体记在 `~/.codex/logs_2.sqlite`，`target='codex_http_client::transport'` 的行，正文形如 `POST to http://127.0.0.1:47101/v1/responses: {…}`（未截断）。该库有 WAL、体量数百 MB，用 `node:sqlite` 以 `readOnly: true` 直接打开即可，不必拷贝：
+
+```
+SELECT ts, feedback_log_body FROM logs
+WHERE target='codex_http_client::transport' ORDER BY ts DESC LIMIT 1
+```
+
+### 确认的结构
+
+**顶层没有 `tools` 字段**。工具全在 `input` 数组第 0 项，且**不是**嵌在 developer 消息的 `content` 里，而是一个独立 item type：
+
+```json
+{ "type": "additional_tools", "role": "developer", "tools": [ … ] }
+```
+
+该 item 只有 `type` / `role` / `tools` 三个键（**无 `content`**）。当次会话的 4 个声明工具：
+
+| type | name | 载荷形态 |
+|---|---|---|
+| `custom` | `exec` | 有 `format: {type:"grammar", syntax:"lark", …}`，**无** `inputSchema`/`parameters` —— 载荷是裸 JS 源码 |
+| `function` | `wait` | 常规 `parameters` JSON schema |
+| `function` | `request_user_input` | 常规 `parameters` |
+| `namespace` | `collaboration` | 内嵌 6 个子工具(`spawn_agent` 等)，各带 `parameters` |
+
+`shell` / `exec_command` / `apply_patch` / `update_plan` / MCP 工具**都不是独立声明的工具**——它们只作为文字出现在 `exec` 那 14 KB 描述里，实际只能在 V8 沙箱内经全局 `tools` 对象调用（`await tools.exec_command(…)`、`await tools.mcp__synaroute__synaroute_ai(…)`）。`synaroute` 一词连描述里都没有，沙箱内靠 `ALL_TOOLS` 运行时枚举。
+
+其余：`tool_choice: "auto"`、`parallel_tool_calls: false`、无 `tool_search` 类型工具（故 WP1 的 tool_search 分支暂不需要）。
+
+### 由此定位的根因与修复
+
+`collect_declared_tools`/`collect_custom_tools`/`collect_tool_namespaces` 与 `responses_to_chat` 原先只读顶层 `tools` → 收到空集 → 转换后发往上游的 Anthropic 请求**不带任何 tools**。模型侧铁证（同库 `codex_api::sse::responses` 行，opus 的推理摘要原文）：
+
+> I'm realizing I don't actually have access to file reading tools in this context—there's no tool schema provided for me to invoke.
+
+于是 opus 改为让用户手动跑 PowerShell，表现为「工具与 MCP 全都调不起来」。修复两处：
+
+1. **提升 `additional_tools`**：新增 `collect_declared_tools`，取「顶层 `tools` ∪ 所有 `additional_tools` 项的 `tools`」，三个收集器与 `responses_to_chat` 全改走它；该 item 在消息循环里跳过，不再残留成空 developer 消息。
+2. **freeform custom 工具兜底 schema**：`exec` 只有 `format` 没有 schema，原先兜底成 `{"type":"object"}`（无 properties），模型拿到一个「没有入参」的工具、无处安放代码。改为兜底 `{input: string}`，与响应侧 `unpack_custom_tool_input` 的解包口径对称。
+
+WP2（freeform 回程转 `custom_tool_call` + 裸串 `input`，流式与非流式）在 v0.1.3/v0.1.4 已落地，此前只是因为收集器读不到 `exec` 而从未生效。
+
+### 仍未闭合的风险 2
+
+工具已能到达 opus，但 `exec` 本质仍是「写 JS 编排」范式：要读文件/调 MCP，opus 必须发一次 `exec` 调用、`input` 里是 JS 源码。它**能否稳定选择这条路**属模型行为，需实测。若不稳定，下一步是把沙箱内的工具拍平成一等公民 function 工具（opencodex 的降维思路），而非继续依赖模型理解 exec 契约。

@@ -638,40 +638,123 @@ fn anthropic_tools_to_openai(tools: &Value) -> Option<Value> {
     (!out.is_empty()).then(|| json!(out))
 }
 
+/// Codex 桌面端把工具声明塞进 `input` 数组里的这种 item type，而**不用**顶层 `tools`。
+const ADDITIONAL_TOOLS_ITEM: &str = "additional_tools";
+
+/// Codex 「延迟工具检索器」的 Responses 工具 type。该 type 的声明**没有 `name` 字段**，
+/// 名字即 type 本身；`execution:"client"` 表示由 Codex 客户端本地用 BM25 执行、不经上游。
+const TOOL_SEARCH_TYPE: &str = "tool_search";
+
+/// Codex 客户端执行完检索后回传的结果 item type：其 `tools[]` 才带回 MCP 工具的**真 schema**。
+const TOOL_SEARCH_OUTPUT_ITEM: &str = "tool_search_output";
+
+/// 模型发起检索的 item type（对应上游模型对 `tool_search` 的一次工具调用）。
+const TOOL_SEARCH_CALL_ITEM: &str = "tool_search_call";
+
+/// 收集本次 Responses 请求**声明**的全部工具（保持 Responses 原始形态，不做转换）。
+///
+/// 三处都要收：
+/// 1. 顶层 `tools`；
+/// 2. `input[]` 里 `type=="additional_tools"` 项的 `tools`（Codex 桌面端 exec 编排范式）；
+/// 3. `input[]` 里 `type=="tool_search_output"` 项的 `tools`（**MCP 工具的唯一来源**）。
+///
+/// 为什么必须收第 2 处（2026-07-30 实测）：Codex 桌面端在 `tool_mode="code_mode_only"` 的模型
+/// （gpt-5.6 系）下**顶层根本没有 `tools` 字段**，工具全在
+/// `input[0] = {"type":"additional_tools","role":"developer","tools":[…]}` 里。
+///
+/// 为什么必须收第 3 处（2026-07-30 实测）：Codex 把 MCP 工具标 `defer_loading:true` **扣在客户端
+/// 本地**，顶层 `tools` 里**永远不出现** `mcp__*` namespace（59 条含 `mcp__synaroute` 的抓包请求中，
+/// 顶层命中数为 0）。模型必须先调 `tool_search`，Codex 本地检索后把真 schema 放进
+/// `tool_search_output.tools[]` 回灌历史——该 item 是「下一次模型调用可用工具」的唯一载体。
+/// 不收这一处，即使模型成功检索过，下一轮发往上游的请求里依旧没有 `synaroute_ai`，
+/// 表现为「MCP 服务端握手正常、但模型坚称没有这个工具」。
+///
+/// 顶层在前，保证既有（CLI 等把工具放顶层的客户端）行为与顺序不变。
+pub fn collect_declared_tools(body: &Value) -> Vec<Value> {
+    let mut out: Vec<Value> = body
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(items) = body.get("input").and_then(|i| i.as_array()) {
+        for it in items {
+            let hoist = matches!(
+                it.get("type").and_then(|t| t.as_str()),
+                Some(ADDITIONAL_TOOLS_ITEM) | Some(TOOL_SEARCH_OUTPUT_ITEM)
+            );
+            if !hoist {
+                continue;
+            }
+            if let Some(arr) = it.get("tools").and_then(|t| t.as_array()) {
+                out.extend(arr.iter().cloned());
+            }
+        }
+    }
+    out
+}
+
+/// 某个 Responses 工具声明对上游模型暴露的名字。
+///
+/// 多数工具带 `name`；`tool_search` 这类**无 `name`** 的 Codex 内置类型，名字即其 `type`。
+/// 此前请求侧统一 `let Some(name) = t.get("name") else { continue }`，直接把 `tool_search`
+/// 跳过 → 模型不知道有检索器可用 → 永远发不出 `tool_search_call` → MCP 工具永远拿不到 schema。
+///
+/// 只对**白名单内**的无名类型放行（当前仅 `tool_search`）。刻意不放行 `web_search`：
+/// 那是**服务商侧**执行的内置工具（Codex 侧无 `execution` 字段、由 OpenAI 后端跑），
+/// 经 SynaRoute 转到 Anthropic 上游后没有任何一方能执行它，暴露只会诱导模型空调。
+fn declared_tool_name(t: &Value) -> Option<String> {
+    if let Some(n) = t.get("name").and_then(|n| n.as_str()) {
+        if !n.is_empty() {
+            return Some(n.to_string());
+        }
+    }
+    match t.get("type").and_then(|ty| ty.as_str()) {
+        Some(TOOL_SEARCH_TYPE) => Some(TOOL_SEARCH_TYPE.to_string()),
+        _ => None,
+    }
+}
+
+/// 收集本次请求声明的「客户端执行型检索工具」名字集合（当前即 `tool_search`）。
+/// 供响应侧判定：模型对该名字的调用要回程成 `tool_search_call` item（而非 `function_call`），
+/// 否则 Codex 认不出、检索发不起来，延迟加载的 MCP 工具就永远解锁不了。
+pub fn collect_search_tools(body: &Value) -> std::collections::HashSet<String> {
+    collect_declared_tools(body)
+        .iter()
+        .filter(|t| t.get("type").and_then(|ty| ty.as_str()) == Some(TOOL_SEARCH_TYPE))
+        .filter_map(declared_tool_name)
+        .collect()
+}
+
 /// 从请求 tools 收集所有 Codex namespace 折叠工具的 namespace 名（如 `mcp__synaroute`）。
 /// 供响应侧把上游模型回调的全名 `<ns>__<sub>` 拆回 Codex router 需要的 {name, namespace} 两字段。
 /// 按长度降序排列，保证前缀匹配时优先匹配更长（更具体）的 namespace。
+/// 经 [`collect_declared_tools`] 取工具，故顶层 `tools`、`additional_tools`、`tool_search_output`
+/// 三种承载都覆盖——尤其第三种：MCP 的 `mcp__*` namespace **只**出现在那里，漏了就拆不回
+/// `{namespace:"mcp__synaroute", name:"synaroute_ai"}`，Codex router 查表失败报 unsupported call。
 pub fn collect_tool_namespaces(body: &Value) -> Vec<String> {
-    let mut names: Vec<String> = body
-        .get("tools")
-        .and_then(|t| t.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter(|t| t.get("type").and_then(|ty| ty.as_str()) == Some("namespace"))
-                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut names: Vec<String> = collect_declared_tools(body)
+        .iter()
+        .filter(|t| t.get("type").and_then(|ty| ty.as_str()) == Some("namespace"))
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())
+        .collect();
     // 长的在前：`a__b` 与 `a` 同时存在时，`a__b__x` 应归到 `a__b` 而非 `a`。
     names.sort_by(|a, b| b.len().cmp(&a.len()));
+    names.dedup();
     names
 }
 
-/// 从请求 tools 收集所有 Codex `type:"custom"` 工具名（如 `apply_patch`）。
+/// 从请求 tools 收集所有 Codex `type:"custom"` 工具名（如 `apply_patch`、桌面端的 `exec`）。
 /// Codex 对这类工具期望响应侧回程 item type 为 `custom_tool_call`（非 `function_call`），
 /// 否则 Codex router 认不出、工具执行失败。响应侧据此集合判定每个工具调用该发哪种 item type。
+/// 经 [`collect_declared_tools`] 取工具，故三种承载都覆盖。
 pub fn collect_custom_tools(body: &Value) -> std::collections::HashSet<String> {
-    body.get("tools")
-        .and_then(|t| t.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter(|t| t.get("type").and_then(|ty| ty.as_str()) == Some("custom"))
-                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+    collect_declared_tools(body)
+        .iter()
+        .filter(|t| t.get("type").and_then(|ty| ty.as_str()) == Some("custom"))
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// 把 custom 工具的 Chat 形态参数（JSON 字符串 `arguments`）解包成 Codex 期望的裸字符串 `input`。
@@ -720,6 +803,34 @@ pub fn split_namespaced_tool_name(full: &str, namespaces: &[String]) -> (Option<
         }
     }
     (None, full.to_string())
+}
+
+/// [`split_namespaced_tool_name`] 的逆运算：把 Codex 历史 item 的 `{name, namespace}` 两字段
+/// 拼回上游模型看到的**全名** `<ns>__<sub>`。无 `namespace` 字段时原样返回 `name`。
+///
+/// 为什么必需（2026-07-30 实测 `unsupported call` 根因）：请求侧把 namespace 折叠工具展开成
+/// 全名（`mcp__synaroute__synaroute_ai`）暴露给上游模型，但历史里 Codex 存的是拆开的两字段
+/// （`name:"synaroute_ai"` + `namespace:"mcp__synaroute"`）。若还原历史时只取 `name`，模型看到
+/// 「我上一轮用 `synaroute_ai` 这个名字调用过」，下一轮就照抄这个短名 → 响应侧
+/// `split_namespaced_tool_name` 拆不出 namespace（短名无前缀）→ 回程 item 缺 `namespace` 字段
+/// → Codex router 查 `{namespace:None, name:"synaroute_ai"}` 匹配不到 → `unsupported call`。
+/// 实机 rollout 三次调用中，唯一失败的那次正是 `ns=-`（模型抄了短名）。
+///
+/// 已是全名（`name` 本身就带 `<ns>__` 前缀）时不重复拼接，避免 `mcp__x__mcp__x__foo`。
+fn join_namespaced_tool_name(item: &Value) -> String {
+    let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let Some(ns) = item.get("namespace").and_then(|n| n.as_str()) else {
+        return name.to_string();
+    };
+    if ns.is_empty() || name.is_empty() {
+        return name.to_string();
+    }
+    let prefix = format!("{ns}__");
+    if name.starts_with(&prefix) {
+        name.to_string()
+    } else {
+        format!("{prefix}{name}")
+    }
 }
 
 /// OpenAI tools → Anthropic tools。
@@ -1185,21 +1296,29 @@ pub fn convert_request(body: &Value, from: Protocol, to: Protocol) -> Value {
 
 /// 跨协议**响应体**转换：上游协议 `from` → 下游协议 `to`，以 Chat Completions 为中枢。
 /// 同协议直通。用于非流式响应回写给下游客户端。
-/// 生产非流式路径统一走 [`convert_response_ext`]（可带 custom 工具集合）；此简单签名保留供测试
-/// 与无 custom 工具场景，等价于 `convert_response_ext(.., &空集合)`。
+/// 生产非流式路径统一走 [`convert_response_ext`]（可带 custom / search 工具集合）；此简单签名
+/// 保留供测试与无特殊工具场景，等价于 `convert_response_ext(.., &空集合, &空集合)`。
 #[allow(dead_code)]
 pub fn convert_response(body: &Value, from: Protocol, to: Protocol) -> Value {
-    convert_response_ext(body, from, to, &std::collections::HashSet::new())
+    convert_response_ext(
+        body,
+        from,
+        to,
+        &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
+    )
 }
 
-/// 同 [`convert_response`]，但在 Chat→Responses 路径上用 [`chat_resp_to_responses_ext`]，
-/// 把 `custom_tools` 集合内工具的回程 item type 改写为 `custom_tool_call`。
+/// 同 [`convert_response`]，但在 Chat→Responses 路径上用 [`chat_resp_to_responses_ext`]：
+/// 把 `custom_tools` 命中的回程 item type 改写为 `custom_tool_call`、
+/// `search_tools` 命中的改写为 `tool_search_call`。
 /// 非流式路径专用；流式路径在 [`SseTranslator`] 内直接判定。
 pub fn convert_response_ext(
     body: &Value,
     from: Protocol,
     to: Protocol,
     custom_tools: &std::collections::HashSet<String>,
+    search_tools: &std::collections::HashSet<String>,
 ) -> Value {
     if from == to {
         return body.clone();
@@ -1212,7 +1331,9 @@ pub fn convert_response_ext(
     match to {
         Protocol::Anthropic => openai_resp_to_anthropic(&chat),
         Protocol::OpenaiChat => chat,
-        Protocol::OpenaiResponses => chat_resp_to_responses_ext(&chat, custom_tools),
+        Protocol::OpenaiResponses => {
+            chat_resp_to_responses_ext(&chat, custom_tools, search_tools)
+        }
     }
 }
 
@@ -1248,7 +1369,10 @@ pub fn responses_to_chat(body: &Value) -> Value {
                                 "id": call_id,
                                 "type": "function",
                                 "function": {
-                                    "name": it.get("name").cloned().unwrap_or(json!("")),
+                                    // 必须拼回全名（见 join_namespaced_tool_name）：历史里 Codex 把
+                                    // MCP 工具存成 {name, namespace} 两字段，只取 name 会让模型下一轮
+                                    // 照抄短名，回程拆不出 namespace → Codex 报 unsupported call。
+                                    "name": join_namespaced_tool_name(it),
                                     "arguments": it.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}"),
                                 }
                             } ]
@@ -1281,7 +1405,9 @@ pub fn responses_to_chat(body: &Value) -> Value {
                                 "id": call_id,
                                 "type": "function",
                                 "function": {
-                                    "name": it.get("name").cloned().unwrap_or(json!("")),
+                                    // 同 function_call：带 namespace 时拼回全名，与请求侧暴露的工具名一致。
+                                    // custom 工具（apply_patch/exec）通常平铺无 namespace，此时等价于取 name。
+                                    "name": join_namespaced_tool_name(it),
                                     "arguments": arguments,
                                 }
                             } ]
@@ -1295,8 +1421,86 @@ pub fn responses_to_chat(body: &Value) -> Value {
                             "content": it.get("output").and_then(|o| o.as_str()).unwrap_or(""),
                         }));
                     }
+                    // 模型上一轮对延迟工具检索器的调用。`arguments` 在此 item 上是**对象**
+                    // （`{"query":"…","limit":8}`），而 Chat 的 tool_calls.function.arguments 要求
+                    // JSON **字符串**，故序列化后再放。不处理会落到 `_` 分支成空消息，模型看不到
+                    // 自己检索过什么 → 反复用同义词重复检索（实测同一会话 5 次同义查询）。
+                    Some(TOOL_SEARCH_CALL_ITEM) => {
+                        let call_id = it
+                            .get("call_id")
+                            .or_else(|| it.get("id"))
+                            .cloned()
+                            .unwrap_or(json!(""));
+                        let arguments = match it.get("arguments") {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(v) => v.to_string(),
+                            None => "{}".to_string(),
+                        };
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": Value::Null,
+                            "tool_calls": [ {
+                                "id": call_id,
+                                "type": "function",
+                                "function": { "name": TOOL_SEARCH_TYPE, "arguments": arguments }
+                            } ]
+                        }));
+                    }
+                    // Codex 客户端本地检索的结果。该 item **无 `output` 字段**，检索到的工具在
+                    // `tools[]` 里（也是 MCP 真 schema 的唯一来源，已由 collect_declared_tools 提升
+                    // 成真正的工具声明）。这里额外给模型一条 role:"tool" 回执，说明检索命中了什么——
+                    // 否则模型发出调用却收不到结果，会认为检索失败而放弃、或重复检索。
+                    // 只列名字不塞完整 schema：schema 已在 tools 里，重复塞会白烧大量 token。
+                    Some(TOOL_SEARCH_OUTPUT_ITEM) => {
+                        let mut found: Vec<String> = Vec::new();
+                        if let Some(arr) = it.get("tools").and_then(|t| t.as_array()) {
+                            for t in arr {
+                                let ns = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                                match t.get("tools").and_then(|s| s.as_array()) {
+                                    // namespace 折叠容器：列出展开后的全名（模型据此调用）
+                                    Some(subs) => {
+                                        for sub in subs {
+                                            if let Some(sn) =
+                                                sub.get("name").and_then(|n| n.as_str())
+                                            {
+                                                found.push(if ns.is_empty() {
+                                                    sn.to_string()
+                                                } else {
+                                                    format!("{ns}__{sn}")
+                                                });
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        if let Some(n) = declared_tool_name(t) {
+                                            found.push(n);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let content = if found.is_empty() {
+                            "No matching tools found.".to_string()
+                        } else {
+                            format!(
+                                "Matched tools now available for use: {}",
+                                found.join(", ")
+                            )
+                        };
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": it.get("call_id").cloned().unwrap_or(json!("")),
+                            "content": content,
+                        }));
+                    }
                     // 普通 message item：role + content 分块
                     _ => {
+                        // Codex 桌面端的工具声明项（{type:"additional_tools",role:"developer",tools:[…]}）
+                        // 没有 content，落到这里会变成一条空 developer 消息（纯噪音）。它的 tools 由
+                        // collect_declared_tools 单独提取转成真正的工具，故此处直接跳过。
+                        if it.get("type").and_then(|t| t.as_str()) == Some(ADDITIONAL_TOOLS_ITEM) {
+                            continue;
+                        }
                         let role = it.get("role").and_then(|r| r.as_str()).unwrap_or("user");
                         let text = responses_content_text(it.get("content"));
                         messages.push(json!({ "role": role, "content": text }));
@@ -1319,14 +1523,17 @@ pub fn responses_to_chat(body: &Value) -> Value {
     if let Some(r) = body.get("reasoning") {
         out.insert("reasoning".into(), r.clone());
     }
-    // tools：Responses 扁平形态 → Chat 嵌套形态。
+    // tools：Responses 扁平形态 → Chat 嵌套形态。经 collect_declared_tools 取工具，故顶层 `tools`、
+    // Codex 桌面端的 `input[].additional_tools`、以及 `input[].tool_search_output` 三种承载都覆盖
+    // （后两者分别是「桌面端工具全调不起来」与「MCP 工具永远调不起来」的根因）。
     // 含 Codex 的 namespace 折叠工具（{type:"namespace", name:"mcp__x", tools:[{function}]}）：
     // 必须把内部 tools[] 展开成一个个 `mcp__<ns>__<子工具>` 独立 function，否则只会得到一个
     // 无参数的 `mcp__x` 假工具，下游模型（如经 SynaRoute 路由的 Claude）拿不到真正的子工具、
     // 只能瞎调裸 `mcp__x` → Codex router 报 `unsupported call`。展开后的全名正是 Codex 期望的调用名。
-    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+    {
+        let declared = collect_declared_tools(body);
         let mut mapped: Vec<Value> = Vec::new();
-        for t in tools {
+        for t in &declared {
             // Codex type:"custom" 工具（apply_patch 等）：schema 在驼峰 `inputSchema`（也兜底 parameters）。
             // 转成标准 Chat function，让上游模型拿到真实 schema。响应侧靠 collect_custom_tools
             // 集合把回程 item type 还原为 custom_tool_call。放在 namespace 判定之前，避免误入其他分支。
@@ -1341,7 +1548,7 @@ pub fn responses_to_chat(body: &Value) -> Value {
                     .get("inputSchema")
                     .or_else(|| t.get("parameters"))
                     .cloned()
-                    .unwrap_or_else(|| json!({ "type": "object" }));
+                    .unwrap_or_else(freeform_custom_tool_schema);
                 f.insert("parameters".into(), schema);
                 mapped.push(json!({ "type": "function", "function": f }));
                 continue;
@@ -1367,7 +1574,10 @@ pub fn responses_to_chat(body: &Value) -> Value {
                 continue;
             }
             // Responses function tool：{type:"function", name, description, parameters}
-            let Some(name) = t.get("name").and_then(|n| n.as_str()) else { continue };
+            // 也覆盖 `tool_search` 这类**无 name** 的 Codex 内置类型（名字取自 type，见
+            // declared_tool_name）：此前一律 continue 跳过，模型不知道有检索器 → 发不出
+            // tool_search_call → 延迟加载的 MCP 工具永远解锁不了。
+            let Some(name) = declared_tool_name(t) else { continue };
             let mut f = serde_json::Map::new();
             f.insert("name".into(), json!(name));
             if let Some(d) = t.get("description") {
@@ -1378,11 +1588,46 @@ pub fn responses_to_chat(body: &Value) -> Value {
             }
             mapped.push(json!({ "type": "function", "function": f }));
         }
+        // 同名去重：`tool_search_output` 会在多轮里反复回灌同一批工具（每轮一份），
+        // 不去重会让同一个 `mcp__synaroute__synaroute_ai` 在 tools 里出现 N 份，
+        // 既白烧 token 又可能触发上游「重复工具名」校验失败。保留首次出现（顶层优先）。
+        {
+            let mut seen = std::collections::HashSet::new();
+            mapped.retain(|t| {
+                let name = t
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                seen.insert(name)
+            });
+        }
         if !mapped.is_empty() {
             out.insert("tools".into(), json!(mapped));
         }
     }
     Value::Object(out)
+}
+
+/// freeform（无 JSON schema）custom 工具在 Chat/Anthropic 侧的兜底 schema。
+///
+/// Codex 桌面端的 `exec` 是 `{"type":"custom","format":{"type":"grammar",…}}`——载荷是**裸文本**
+/// （一段 JS 源码），没有 `inputSchema`/`parameters`。若兜底成 `{"type":"object"}`（无 properties），
+/// 上游模型拿到一个「没有任何入参」的工具，压根无处安放要执行的代码 → 要么不调、要么调了空参。
+/// 故给出单字符串入参 `input`，与响应侧 [`unpack_custom_tool_input`] 的解包口径对称：
+/// 模型回 `{"input":"<裸文本>"}` → 解包成裸串 → 作为 `custom_tool_call.input` 交还 Codex。
+fn freeform_custom_tool_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "input": {
+                "type": "string",
+                "description": "The raw text payload for this tool, passed through verbatim."
+            }
+        },
+        "required": ["input"]
+    })
 }
 
 /// 抽取 Responses content 分块（input_text / output_text / text）为纯文本。
@@ -1470,42 +1715,82 @@ pub fn chat_resp_to_responses(body: &Value) -> Value {
     })
 }
 
-/// 同 [`chat_resp_to_responses`]，但把 `custom_tools` 集合内工具的回程 item type 从
-/// `function_call` 改写为 `custom_tool_call`（Codex 的 apply_patch 等 type:"custom" 工具）。
-/// 以基函数产出为底，仅对 output[] 里命中的工具调用项改 type 字段——避免复制整段逻辑。
+/// 同 [`chat_resp_to_responses`]，但按请求侧收集的两个集合改写回程 item type：
+/// - `custom_tools` 命中 → `custom_tool_call`（Codex 的 apply_patch / exec 等 type:"custom" 工具）；
+/// - `search_tools` 命中 → `tool_search_call`（Codex 的延迟工具检索器，客户端本地执行）。
+///
+/// 以基函数产出为底，仅对 output[] 里命中的工具调用项改写——避免复制整段逻辑。
 /// 非流式路径专用；流式路径在 [`SseTranslator::emit_responses_completed`] 内直接判定。
 pub fn chat_resp_to_responses_ext(
     body: &Value,
     custom_tools: &std::collections::HashSet<String>,
+    search_tools: &std::collections::HashSet<String>,
 ) -> Value {
     let mut resp = chat_resp_to_responses(body);
-    if custom_tools.is_empty() {
+    if custom_tools.is_empty() && search_tools.is_empty() {
         return resp;
     }
     if let Some(output) = resp.get_mut("output").and_then(|o| o.as_array_mut()) {
         for item in output.iter_mut() {
-            let is_fc = item.get("type").and_then(|t| t.as_str()) == Some("function_call");
-            let name_hit = item
+            if item.get("type").and_then(|t| t.as_str()) != Some("function_call") {
+                continue;
+            }
+            let name = item
                 .get("name")
                 .and_then(|n| n.as_str())
-                .map(|n| custom_tools.contains(n))
-                .unwrap_or(false);
-            if is_fc && name_hit {
-                if let Some(obj) = item.as_object_mut() {
-                    obj.insert("type".into(), json!("custom_tool_call"));
-                    // 同流式路径：custom_tool_call 用裸字符串 `input`，不用 JSON `arguments`。
-                    let args = obj
-                        .get("arguments")
-                        .and_then(|a| a.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    obj.insert("input".into(), json!(unpack_custom_tool_input(&args)));
-                    obj.remove("arguments");
-                }
+                .unwrap_or("")
+                .to_string();
+            let Some(obj) = item.as_object_mut() else { continue };
+            if search_tools.contains(&name) {
+                rewrite_to_tool_search_call(obj);
+            } else if custom_tools.contains(&name) {
+                obj.insert("type".into(), json!("custom_tool_call"));
+                // 同流式路径：custom_tool_call 用裸字符串 `input`，不用 JSON `arguments`。
+                let args = obj
+                    .get("arguments")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                obj.insert("input".into(), json!(unpack_custom_tool_input(&args)));
+                obj.remove("arguments");
             }
         }
     }
     resp
+}
+
+/// 把一个已构造好的 `function_call` item 原地改写成 Codex 的 `tool_search_call` 形态。
+///
+/// 与 `function_call` 的差异（对齐抓包实证，`~/.codex/logs_2.sqlite`）：
+/// - `type` = `tool_search_call`，且 `id` 用 `tsc_` 前缀（Codex 自身产出即此前缀）；
+/// - **无 `name` 字段**（工具身份由 type 表达，多一个 name 反而与 Codex 的反序列化结构不符）；
+/// - `execution: "client"` —— 声明该调用由 Codex 客户端本地执行（BM25 检索），不回上游；
+/// - `arguments` 是**对象**（`{"query":…,"limit":…}`），而非 function_call 的 JSON 字符串。
+///   上游模型按 schema 回的是 JSON 字符串，此处解析回对象；解析失败则退化为 `{"query": 原文}`，
+///   保证检索仍能带着模型意图跑起来（宁可查得糙，不要静默丢调用）。
+fn rewrite_to_tool_search_call(obj: &mut serde_json::Map<String, Value>) {
+    obj.insert("type".into(), json!(TOOL_SEARCH_CALL_ITEM));
+    obj.insert("execution".into(), json!("client"));
+    obj.remove("name");
+    let raw = obj
+        .get("arguments")
+        .and_then(|a| a.as_str())
+        .unwrap_or("")
+        .to_string();
+    let parsed = match serde_json::from_str::<Value>(raw.trim()) {
+        Ok(v @ Value::Object(_)) => v,
+        _ => json!({ "query": raw }),
+    };
+    obj.insert("arguments".into(), parsed);
+    // id 用 Codex 同款前缀，避免其内部按前缀分派时认不出。
+    let need_prefix = obj
+        .get("id")
+        .and_then(|i| i.as_str())
+        .map(|s| !s.starts_with("tsc_"))
+        .unwrap_or(true);
+    if need_prefix {
+        obj.insert("id".into(), json!(format!("tsc_{}", uuid_like())));
+    }
 }
 
 /// Chat Completions 请求体 → Responses 请求体。
@@ -1646,7 +1931,9 @@ pub fn responses_resp_to_chat(body: &Value) -> Value {
                         "id": item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(json!("")),
                         "type": "function",
                         "function": {
-                            "name": item.get("name").cloned().unwrap_or(json!("")),
+                            // 同请求侧：带 namespace 时拼回全名，保证下游客户端看到的工具名
+                            // 与工具声明一致（见 join_namespaced_tool_name）。
+                            "name": join_namespaced_tool_name(item),
                             "arguments": item.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}"),
                         }
                     }));
@@ -1780,6 +2067,10 @@ pub struct SseTranslator {
     /// 请求里 type:"custom" 工具名集合（apply_patch 等）。
     /// 响应侧据此把对应工具调用的 item type 输出为 "custom_tool_call" 而非 "function_call"。
     custom_tools: std::collections::HashSet<String>,
+    /// 请求里 type:"tool_search" 客户端检索工具名集合（当前即 `tool_search`）。
+    /// 响应侧据此把对应调用输出为 `tool_search_call`（Codex 本地执行 BM25 检索），
+    /// 否则 Codex 认不出、延迟加载的 MCP 工具永远解锁不了。
+    search_tools: std::collections::HashSet<String>,
 }
 
 impl SseTranslator {
@@ -1809,19 +2100,25 @@ impl SseTranslator {
             reasoning_accum: String::new(),
             tool_namespaces,
             custom_tools: std::collections::HashSet::new(),
+            search_tools: std::collections::HashSet::new(),
         }
     }
 
-    /// 在 [`with_namespaces`] 基础上带上 type:"custom" 工具名集合（Codex 的 apply_patch 等）。
-    /// Codex（Responses 下游）跨协议流式时传入，使响应侧把这些工具的调用回程输出为
-    /// `custom_tool_call` item type，而非默认的 `function_call`——否则 Codex router 认不出。
+    /// 在 [`with_namespaces`] 基础上带上两个工具集合：
+    /// - `custom_tools`（Codex 的 apply_patch / exec 等 type:"custom"）→ 回程发 `custom_tool_call`；
+    /// - `search_tools`（Codex 的 `tool_search` 延迟检索器）→ 回程发 `tool_search_call`。
+    ///
+    /// Codex（Responses 下游）跨协议流式时传入。不改写的话 Codex router 认不出这两类调用：
+    /// custom 工具执行失败；检索发不起来 → MCP 工具（`mcp__*`）永远拿不到 schema。
     pub fn with_namespaces_and_custom(
         dir: SseDirection,
         tool_namespaces: Vec<String>,
         custom_tools: std::collections::HashSet<String>,
+        search_tools: std::collections::HashSet<String>,
     ) -> Self {
         let mut s = Self::with_namespaces(dir, tool_namespaces);
         s.custom_tools = custom_tools;
+        s.search_tools = search_tools;
         s
     }
 
@@ -2036,6 +2333,12 @@ impl SseTranslator {
                 item_map.insert("arguments".into(), json!(arguments));
             }
             item_map.insert("status".into(), json!("completed"));
+            // `tool_search` 调用要改写成 Codex 的 `tool_search_call`（客户端本地执行 BM25 检索）。
+            // 放在最后统一改写，复用上面已填好的 id/call_id/status，只调整 type/arguments/execution
+            // 并去掉 name —— 与非流式路径 [`chat_resp_to_responses_ext`] 同一个函数，口径不分叉。
+            if self.search_tools.contains(&real_name) {
+                rewrite_to_tool_search_call(&mut item_map);
+            }
             let item = Value::Object(item_map);
             // 关键修复：作为流式事件投递（added 宣告 → done 交付完整调用），Codex 据 done 执行工具。
             out.push_str(&sse("response.output_item.added", &json!({
@@ -3389,6 +3692,723 @@ mod tests {
         assert!(!result.contains("read_file"));
     }
 
+    /// Codex 桌面端（26.x / gpt-5.6 系）真实请求骨架：顶层**没有** `tools`，工具全在
+    /// `input[0] = {"type":"additional_tools","role":"developer","tools":[…]}`。
+    /// 抓包来源：`~/.codex/logs_2.sqlite` 的 `codex_http_client::transport` 行（2026-07-30）。
+    fn codex_desktop_request() -> Value {
+        json!({
+            "model": "gpt-5.6-sol",
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "exec",
+                            "description": "Run JavaScript code to orchestrate/compose tool calls",
+                            "format": { "type": "grammar", "syntax": "lark", "definition": "start: SOURCE" }
+                        },
+                        {
+                            "type": "function",
+                            "name": "wait",
+                            "description": "Wait for a running exec cell.",
+                            "parameters": { "type": "object", "properties": { "cell_id": { "type": "string" } } }
+                        },
+                        {
+                            "type": "namespace",
+                            "name": "collaboration",
+                            "description": "Agent collaboration",
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "name": "spawn_agent",
+                                    "description": "Spawn a sub-agent.",
+                                    "parameters": { "type": "object", "properties": { "task": { "type": "string" } } }
+                                }
+                            ]
+                        }
+                    ]
+                },
+                { "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": "系统提示" }] },
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "读一下这个文件" }] }
+            ]
+        })
+    }
+
+    #[test]
+    fn collect_declared_tools_hoists_additional_tools_item() {
+        // 根因回归护栏：顶层无 tools 时必须从 additional_tools 项里取。
+        // 若退回只读顶层 `tools`，这里立即变红——那正是「Codex 桌面端工具/MCP 全调不起来」的成因。
+        let body = codex_desktop_request();
+        assert!(body.get("tools").is_none(), "夹具前提：顶层不应有 tools");
+        let declared = collect_declared_tools(&body);
+        let names: Vec<&str> = declared
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(names, vec!["exec", "wait", "collaboration"], "三个声明工具都要收到");
+    }
+
+    #[test]
+    fn collect_declared_tools_merges_top_level_and_additional() {
+        // 两种承载并存时都收，且顶层在前（保持既有客户端行为与顺序不变）。
+        let body = json!({
+            "tools": [{ "type": "function", "name": "top_level_fn" }],
+            "input": [
+                { "type": "additional_tools", "role": "developer", "tools": [{ "type": "custom", "name": "exec" }] },
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }
+            ]
+        });
+        let names: Vec<String> = collect_declared_tools(&body)
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+            .collect();
+        assert_eq!(names, vec!["top_level_fn", "exec"]);
+    }
+
+    #[test]
+    fn custom_and_namespace_collectors_see_additional_tools() {
+        // 响应侧两个收集器也必须覆盖 additional_tools：
+        // - custom 集合缺 exec → 回程发 function_call + JSON arguments，Codex router 认不出；
+        // - namespace 列表缺 collaboration → 子工具全名拆不回 {namespace,name}，报 unsupported call。
+        let body = codex_desktop_request();
+        let custom = collect_custom_tools(&body);
+        assert!(custom.contains("exec"), "exec 必须被识别为 custom 工具");
+        let ns = collect_tool_namespaces(&body);
+        assert_eq!(ns, vec!["collaboration"], "namespace 必须被收集");
+    }
+
+    #[test]
+    fn responses_to_chat_converts_codex_desktop_additional_tools() {
+        // 端到端（请求侧）：桌面端形态请求转 Chat 后必须带上三个工具，
+        // 且 additional_tools 项不得残留成一条空 developer 消息。
+        let chat = responses_to_chat(&codex_desktop_request());
+        let tools = chat["tools"].as_array().expect("转换后必须有 tools");
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["exec", "wait", "collaboration__spawn_agent"],
+            "custom 原名保留、function 原名保留、namespace 子工具展开为 <ns>__<sub>"
+        );
+
+        // freeform custom 工具（exec 只有 format、无 schema）须拿到单字符串入参 input，
+        // 否则模型没有地方放要执行的代码。
+        let exec_params = &tools[0]["function"]["parameters"];
+        assert_eq!(exec_params["type"], "object");
+        assert_eq!(
+            exec_params["properties"]["input"]["type"], "string",
+            "freeform custom 工具应兜底 {{input:string}} schema"
+        );
+
+        // 消息：只应有 developer 系统提示 + user 两条，没有空壳消息。
+        let msgs = chat["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "additional_tools 项不应残留成消息: {msgs:?}");
+        assert!(
+            !msgs.iter().any(|m| m["content"].as_str() == Some("")),
+            "不应出现空 content 消息"
+        );
+    }
+
+    #[test]
+    fn convert_request_codex_desktop_to_anthropic_carries_tools() {
+        // 真正发往上游（Anthropic 主 Key，如 opus）的请求必须带 tools —— 此前为空，
+        // 模型自述「没有可调用的工具 schema」，于 Codex 里表现为工具与 MCP 全调不起来。
+        let out = convert_request(
+            &codex_desktop_request(),
+            Protocol::OpenaiResponses,
+            Protocol::Anthropic,
+        );
+        let tools = out["tools"].as_array().expect("Anthropic 请求必须带 tools");
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["exec", "wait", "collaboration__spawn_agent"]);
+        assert_eq!(
+            tools[0]["input_schema"]["properties"]["input"]["type"], "string",
+            "exec 的裸文本载荷要有 input 字符串入参"
+        );
+    }
+
+    /// Codex direct 模式（`tool_mode: null` 的模型，如 gpt-5.5）真实请求骨架。
+    /// 抓包来源：`~/.codex/logs_2.sqlite` 的 `codex_http_client::transport` 行（2026-07-30）。
+    ///
+    /// 两个关键实证：
+    /// 1. `tool_search` 声明**没有 `name` 字段**（名字即 type），`execution:"client"`；
+    /// 2. MCP 工具（`mcp__*` namespace）**从不出现在顶层 tools**——59 条含 `mcp__synaroute`
+    ///    的抓包请求里顶层命中数为 0；它只在 `tool_search_output.tools[]` 里回灌。
+    fn codex_direct_request_with_search() -> Value {
+        json!({
+            "model": "gpt-5.5",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "shell_command",
+                    "description": "Run a shell command.",
+                    "parameters": { "type": "object", "properties": { "cmd": { "type": "string" } } }
+                },
+                {
+                    "type": "tool_search",
+                    "execution": "client",
+                    "description": "# Tool discovery\n\nSearches over deferred tool metadata with BM25.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string", "description": "Search query for deferred tools." },
+                            "limit": { "type": "number", "description": "Maximum number of tools to return." }
+                        },
+                        "required": ["query"],
+                        "additionalProperties": false
+                    }
+                },
+                { "type": "web_search", "external_web_access": false, "search_content_types": ["text"] }
+            ],
+            "input": [
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "用 synaroute_ai 审查代码" }] },
+                {
+                    "type": "tool_search_call",
+                    "id": "tsc_abc",
+                    "call_id": "call_search1",
+                    "status": "completed",
+                    "execution": "client",
+                    "arguments": { "query": "synaroute_ai 多模型会诊", "limit": 8 }
+                },
+                {
+                    "type": "tool_search_output",
+                    "id": "tso_xyz",
+                    "call_id": "call_search1",
+                    "status": "completed",
+                    "execution": "client",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "mcp__synaroute",
+                        "description": "Tools in the mcp__synaroute namespace.",
+                        "tools": [{
+                            "type": "function",
+                            "name": "synaroute_ai",
+                            "description": "调用 SynaRoute 多模型大脑聚合",
+                            "defer_loading": true,
+                            "parameters": {
+                                "type": "object",
+                                "properties": { "prompt": { "type": "string" }, "category": { "type": "string" } },
+                                "required": ["prompt"]
+                            }
+                        }]
+                    }]
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn tool_search_is_exposed_despite_having_no_name() {
+        // 根因护栏一：`tool_search` 声明无 `name` 字段。请求侧此前一律
+        // `let Some(name) = t.get("name") else { continue }` 跳过它 → 模型不知道有检索器
+        // → 永远发不出 tool_search_call → 延迟加载的 MCP 工具永远解锁不了。
+        let chat = responses_to_chat(&codex_direct_request_with_search());
+        let names: Vec<&str> = chat["tools"]
+            .as_array()
+            .expect("必须有 tools")
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"tool_search"),
+            "tool_search 必须暴露给上游模型（名字取自 type），实际: {names:?}"
+        );
+        // schema 要带过去，否则模型不知道要传 query。
+        let ts = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["function"]["name"] == "tool_search")
+            .unwrap();
+        assert_eq!(ts["function"]["parameters"]["properties"]["query"]["type"], "string");
+        // web_search 是服务商侧执行的内置工具，经 SynaRoute 到 Anthropic 上游无人能执行，
+        // 刻意不暴露（否则诱导模型空调）。
+        assert!(
+            !names.contains(&"web_search"),
+            "web_search 不应暴露（无执行方），实际: {names:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_tools_hoisted_from_tool_search_output() {
+        // 根因护栏二：MCP 工具的真 schema **只**在 tool_search_output.tools[] 里回灌，
+        // 顶层 tools 永远没有 mcp__*。不提升这一处，模型即使检索过，下一轮依旧看不到
+        // synaroute_ai —— 正是「MCP 服务端握手正常、模型坚称没这个工具」的成因。
+        let body = codex_direct_request_with_search();
+        let top_names: Vec<String> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        assert!(
+            !top_names.iter().any(|n| n.contains("synaroute")),
+            "夹具前提：顶层 tools 不含 synaroute"
+        );
+
+        let chat = responses_to_chat(&body);
+        let names: Vec<&str> = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"mcp__synaroute__synaroute_ai"),
+            "namespace 子工具应展开为全名并暴露，实际: {names:?}"
+        );
+        // namespace 也要被收集，否则回程拆不回 {namespace, name} → Codex router 报 unsupported call。
+        assert_eq!(collect_tool_namespaces(&body), vec!["mcp__synaroute"]);
+        // 检索器本身也在集合里，供响应侧判定回程 item type。
+        assert!(collect_search_tools(&body).contains("tool_search"));
+    }
+
+    #[test]
+    fn tool_search_history_preserved_as_tool_calls() {
+        // 根因护栏三：tool_search_call / tool_search_output 此前 type 未知 → 落默认分支 →
+        // 取不存在的 content → 变成空消息。模型看不到自己检索过什么，会反复同义重复检索
+        // （实测同一会话 5 次同义查询）。
+        let chat = responses_to_chat(&codex_direct_request_with_search());
+        let msgs = chat["messages"].as_array().unwrap();
+
+        // 检索调用还原为 assistant.tool_calls，arguments 从对象序列化成 JSON 字符串
+        // （Chat 协议要求字符串；该 item 上原本是对象）。
+        let call = msgs
+            .iter()
+            .find(|m| m["tool_calls"][0]["function"]["name"] == "tool_search")
+            .expect("缺 tool_search 调用消息");
+        assert_eq!(call["tool_calls"][0]["id"], "call_search1");
+        let args = call["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments 必须是 JSON 字符串");
+        let parsed: Value = serde_json::from_str(args).expect("arguments 应可解析");
+        assert_eq!(parsed["query"], "synaroute_ai 多模型会诊");
+
+        // 检索结果给一条 role:"tool" 回执，列出命中的工具全名（该 item 无 output 字段）。
+        let out = msgs
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == "call_search1")
+            .expect("缺 tool_search 结果回执");
+        let text = out["content"].as_str().unwrap();
+        assert!(
+            text.contains("mcp__synaroute__synaroute_ai"),
+            "回执应列出命中的工具全名，实际: {text}"
+        );
+
+        // 不得残留空 content 消息（旧行为的症状）。
+        assert!(
+            !msgs.iter().any(|m| m["content"].as_str() == Some("")),
+            "不应出现空 content 消息: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn declared_tools_dedup_across_repeated_search_outputs() {
+        // 多轮里 Codex 会反复回灌同一批工具（每轮一份 tool_search_output）。
+        // 不去重则同名工具在 tools 里出现 N 份：白烧 token，且可能触发上游「重复工具名」校验失败。
+        let mut body = codex_direct_request_with_search();
+        let dup = body["input"][2].clone();
+        body["input"].as_array_mut().unwrap().push(dup);
+
+        let chat = responses_to_chat(&body);
+        let names: Vec<&str> = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        let hits = names.iter().filter(|n| **n == "mcp__synaroute__synaroute_ai").count();
+        assert_eq!(hits, 1, "同名工具应去重，实际出现 {hits} 次: {names:?}");
+        // namespace 列表同样不应重复。
+        assert_eq!(collect_tool_namespaces(&body), vec!["mcp__synaroute"]);
+    }
+
+    #[test]
+    fn non_stream_rewrites_tool_search_call() {
+        // 回程（非流式）：模型对 tool_search 的调用必须改写成 tool_search_call，
+        // 且 arguments 变回**对象**、带 execution:"client"、去掉 name、id 用 tsc_ 前缀。
+        // 否则 Codex 认不出，本地 BM25 检索发不起来 → MCP 工具永远拿不到 schema。
+        let body = json!({
+            "choices": [{ "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{ "id": "tc_s", "type": "function", "function": {
+                    "name": "tool_search",
+                    "arguments": "{\"query\":\"synaroute_ai\",\"limit\":8}"
+                } }]
+            }, "finish_reason": "tool_calls" }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+        });
+        let search = std::collections::HashSet::from(["tool_search".to_string()]);
+        let result = chat_resp_to_responses_ext(&body, &Default::default(), &search);
+        let item = &result["output"][0];
+        assert_eq!(item["type"], "tool_search_call", "应改写为 tool_search_call");
+        assert_eq!(item["execution"], "client", "须标明客户端执行");
+        assert!(item.get("name").is_none(), "tool_search_call 不应带 name");
+        assert!(item["arguments"].is_object(), "arguments 必须是对象而非字符串");
+        assert_eq!(item["arguments"]["query"], "synaroute_ai");
+        assert_eq!(item["arguments"]["limit"], 8);
+        assert_eq!(item["call_id"], "tc_s", "call_id 须保留以回配结果");
+        assert!(
+            item["id"].as_str().unwrap().starts_with("tsc_"),
+            "id 应用 Codex 同款 tsc_ 前缀，实际 {}", item["id"]
+        );
+    }
+
+    #[test]
+    fn non_stream_tool_search_falls_back_on_unparsable_arguments() {
+        // 模型没按 schema 回 JSON（回了裸文本）时，不能静默丢掉调用：
+        // 退化成 {"query": 原文}，宁可查得糙也要让检索跑起来。
+        let body = json!({
+            "choices": [{ "message": {
+                "role": "assistant", "content": null,
+                "tool_calls": [{ "id": "tc_s2", "type": "function", "function": {
+                    "name": "tool_search", "arguments": "synaroute_ai"
+                } }]
+            }, "finish_reason": "tool_calls" }]
+        });
+        let search = std::collections::HashSet::from(["tool_search".to_string()]);
+        let result = chat_resp_to_responses_ext(&body, &Default::default(), &search);
+        let item = &result["output"][0];
+        assert_eq!(item["type"], "tool_search_call");
+        assert_eq!(item["arguments"]["query"], "synaroute_ai", "不可解析时退化为 query 原文");
+    }
+
+    #[test]
+    fn sse_rewrites_tool_search_call() {
+        // 流式与非流式必须同口径（共用 rewrite_to_tool_search_call）：
+        // Codex 只在 response.output_item.done 里执行工具，故流式路径漏改写等于没修。
+        let search = std::collections::HashSet::from(["tool_search".to_string()]);
+        let mut tr = SseTranslator::with_namespaces_and_custom(
+            SseDirection::AnthropicToResponses,
+            vec![],
+            Default::default(),
+            search,
+        );
+        let mut out = String::new();
+        out.push_str(&tr.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_s\",\"name\":\"tool_search\",\"input\":{}}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"synaroute_ai\\\"}\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"));
+        out.push_str(&tr.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n"));
+        out.push_str(&tr.finish());
+        assert!(out.contains("\"type\":\"tool_search_call\""), "流式应输出 tool_search_call:\n{out}");
+        assert!(out.contains("\"execution\":\"client\""), "须标明客户端执行:\n{out}");
+        assert!(out.contains("\"query\":\"synaroute_ai\""), "arguments 应为对象且含 query:\n{out}");
+        // Codex 据 output_item.done 执行，必须走流式事件而非只塞 completed.output。
+        assert!(out.contains("event: response.output_item.done"), "缺 output_item.done:\n{out}");
+    }
+
+    #[test]
+    fn sse_non_search_tool_unaffected() {
+        // 对照：普通 MCP 工具（namespace 展开的全名）仍走 function_call + arguments 字符串，
+        // 且 name/namespace 正确拆分——不得被 tool_search 改写逻辑误伤。
+        let mut tr = SseTranslator::with_namespaces_and_custom(
+            SseDirection::AnthropicToResponses,
+            vec!["mcp__synaroute".to_string()],
+            Default::default(),
+            std::collections::HashSet::from(["tool_search".to_string()]),
+        );
+        let mut out = String::new();
+        out.push_str(&tr.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_m\",\"name\":\"mcp__synaroute__synaroute_ai\",\"input\":{}}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"prompt\\\":\\\"hi\\\"}\"}}\n\n"));
+        out.push_str(&tr.push(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"));
+        out.push_str(&tr.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n"));
+        out.push_str(&tr.finish());
+        assert!(out.contains("\"type\":\"function_call\""), "普通工具应保持 function_call:\n{out}");
+        assert!(!out.contains("tool_search_call"), "不应误改写:\n{out}");
+        assert!(out.contains("\"name\":\"synaroute_ai\""), "name 应拆为子工具名:\n{out}");
+        assert!(out.contains("\"namespace\":\"mcp__synaroute\""), "namespace 应独立字段:\n{out}");
+    }
+
+    #[test]
+    fn convert_request_direct_mode_carries_mcp_tool_to_anthropic() {
+        // 端到端：真正发往 Anthropic 上游（opus）的请求里必须同时有检索器与 MCP 工具。
+        // 这是「opus 作 Codex 主 Key 能否用 MCP」的最终判据。
+        let out = convert_request(
+            &codex_direct_request_with_search(),
+            Protocol::OpenaiResponses,
+            Protocol::Anthropic,
+        );
+        let tools = out["tools"].as_array().expect("必须带 tools");
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"tool_search"), "缺检索器: {names:?}");
+        assert!(
+            names.contains(&"mcp__synaroute__synaroute_ai"),
+            "缺 MCP 工具: {names:?}"
+        );
+        let syna = tools
+            .iter()
+            .find(|t| t["name"] == "mcp__synaroute__synaroute_ai")
+            .unwrap();
+        assert_eq!(
+            syna["input_schema"]["properties"]["prompt"]["type"], "string",
+            "MCP 工具的真 schema 要带到上游"
+        );
+    }
+
+    // ---- 真实抓包回放（非手写夹具）----
+    //
+    // 上面的用例用手写夹具，风险是「把结构写成我以为的样子」。这里直接回放 Codex 真发出来的
+    // 请求体：来自 `~/.codex/logs_2.sqlite` 的 `codex_http_client::transport` 行
+    // （2026-07-30 实机会话，Codex 桌面端 26.721 / gpt-5.4 direct 模式）。
+    // 仅截短了超长 description/text 文本，**所有字段名与结构一字未改**。
+    // include_str! 保证内容不会被测试代码悄悄改写。
+    const REAL_CODEX_CAPTURE: &str = include_str!("testdata/codex_real_direct_request.json");
+
+    fn real_codex_request() -> Value {
+        serde_json::from_str(REAL_CODEX_CAPTURE).expect("真实抓包应为合法 JSON")
+    }
+
+    #[test]
+    fn real_capture_matches_the_shape_we_claim() {
+        // 先钉住「事实前提」：若 Codex 以后改了形态，这条先红，提醒重新抓包而非盲改逻辑。
+        let body = real_codex_request();
+        let tools = body["tools"].as_array().expect("顶层应有 tools");
+
+        let ts = tools
+            .iter()
+            .find(|t| t["type"] == "tool_search")
+            .expect("真实请求含 tool_search 声明");
+        assert!(
+            ts.get("name").is_none(),
+            "前提：tool_search 声明无 name 字段（名字即 type），实际: {ts}"
+        );
+        assert_eq!(ts["execution"], "client", "前提：tool_search 由客户端执行");
+
+        let top_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(
+            !top_names.iter().any(|n| n.starts_with("mcp__")),
+            "前提：MCP 工具从不出现在顶层 tools，实际: {top_names:?}"
+        );
+
+        let tso = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "tool_search_output")
+            .expect("真实请求含 tool_search_output");
+        assert!(tso.get("output").is_none(), "前提：该 item 无 output 字段");
+        let inner: Vec<&str> = tso["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(
+            inner.contains(&"mcp__synaroute"),
+            "前提：MCP namespace 只在 tool_search_output 里，实际: {inner:?}"
+        );
+    }
+
+    #[test]
+    fn real_capture_delivers_search_and_mcp_tools_upstream() {
+        // 核心验收（真实数据）：转换后发往上游的请求必须同时带检索器与 MCP 工具真 schema。
+        let body = real_codex_request();
+
+        let chat = responses_to_chat(&body);
+        let names: Vec<&str> = chat["tools"]
+            .as_array()
+            .expect("转换后必须有 tools")
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"tool_search"), "真实数据下缺检索器: {names:?}");
+        assert!(
+            names.contains(&"mcp__synaroute__synaroute_ai"),
+            "真实数据下缺从 tool_search_output 提升的 MCP 工具: {names:?}"
+        );
+        assert!(collect_search_tools(&body).contains("tool_search"));
+        assert!(
+            collect_tool_namespaces(&body).contains(&"mcp__synaroute".to_string()),
+            "namespace 须收集，否则回程拆不回 {{namespace,name}}"
+        );
+
+        let up = convert_request(&body, Protocol::OpenaiResponses, Protocol::Anthropic);
+        let up_tools = up["tools"].as_array().expect("上游请求必须带 tools");
+        let up_names: Vec<&str> = up_tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(up_names.contains(&"tool_search"), "上游缺检索器: {up_names:?}");
+        assert!(
+            up_names.contains(&"mcp__synaroute__synaroute_ai"),
+            "上游缺 MCP 工具: {up_names:?}"
+        );
+        let syna = up_tools
+            .iter()
+            .find(|t| t["name"] == "mcp__synaroute__synaroute_ai")
+            .unwrap();
+        assert_eq!(
+            syna["input_schema"]["properties"]["prompt"]["type"], "string",
+            "MCP 工具的真 schema（prompt 参数）要完整带到上游"
+        );
+        // apply_patch 是 freeform custom 工具（只有 format、无 schema）→ 兜底 {input:string}。
+        let ap = up_tools.iter().find(|t| t["name"] == "apply_patch").unwrap();
+        assert_eq!(ap["input_schema"]["properties"]["input"]["type"], "string");
+    }
+
+    #[test]
+    fn real_capture_preserves_search_history() {
+        // 检索调用与结果不得退化成空消息，否则模型反复同义重复检索（实测同会话 5 次）。
+        let chat = responses_to_chat(&real_codex_request());
+        let msgs = chat["messages"].as_array().unwrap();
+
+        let call = msgs
+            .iter()
+            .find(|m| m["tool_calls"][0]["function"]["name"] == "tool_search")
+            .expect("缺 tool_search 调用消息");
+        let args = call["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("Chat 协议要求 arguments 为 JSON 字符串");
+        let parsed: Value = serde_json::from_str(args).expect("arguments 应可解析");
+        assert!(
+            parsed["query"].as_str().unwrap().contains("synaroute_ai"),
+            "检索 query 应保留，实际: {parsed}"
+        );
+
+        let receipt = msgs
+            .iter()
+            .find(|m| {
+                m["role"] == "tool"
+                    && m["content"]
+                        .as_str()
+                        .map(|c| c.contains("mcp__synaroute__synaroute_ai"))
+                        .unwrap_or(false)
+            })
+            .expect("缺检索结果回执（应列出命中的工具全名）");
+        assert!(receipt["tool_call_id"].is_string());
+
+        assert!(
+            !msgs.iter().any(|m| m["content"].as_str() == Some("")),
+            "不应出现空 content 消息（旧行为症状）"
+        );
+    }
+
+    // ---- namespace 全名往返（unsupported call 根因）----
+
+    #[test]
+    fn join_namespaced_name_rejoins_two_fields() {
+        // Codex 历史里 MCP 工具存成 {name, namespace} 两字段，须拼回上游模型看到的全名。
+        assert_eq!(
+            join_namespaced_tool_name(&json!({ "name": "synaroute_ai", "namespace": "mcp__synaroute" })),
+            "mcp__synaroute__synaroute_ai"
+        );
+        // 无 namespace（平铺工具，如 Codex 内置 update_plan）：原样返回。
+        assert_eq!(
+            join_namespaced_tool_name(&json!({ "name": "update_plan" })),
+            "update_plan"
+        );
+        // 空 namespace 视作无。
+        assert_eq!(
+            join_namespaced_tool_name(&json!({ "name": "foo", "namespace": "" })),
+            "foo"
+        );
+        // 已是全名时不得重复拼接（否则 mcp__x__mcp__x__foo）。
+        assert_eq!(
+            join_namespaced_tool_name(
+                &json!({ "name": "mcp__synaroute__synaroute_ai", "namespace": "mcp__synaroute" })
+            ),
+            "mcp__synaroute__synaroute_ai"
+        );
+        // 缺 name：不 panic，返回空串。
+        assert_eq!(
+            join_namespaced_tool_name(&json!({ "namespace": "mcp__x" })),
+            ""
+        );
+    }
+
+    #[test]
+    fn history_function_call_keeps_namespace_as_full_name() {
+        // 根因回归护栏（实机 unsupported call）：历史里的 function_call 若只取 `name`，
+        // 模型看到「我上一轮用 synaroute_ai 调用过」→ 下一轮照抄短名 → 响应侧
+        // split_namespaced_tool_name 拆不出 namespace → Codex router 报 unsupported call。
+        // 实机 rollout 三次调用中失败的那次正是 ns=- （模型抄了短名）。
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [
+                { "type": "function_call", "call_id": "c1", "name": "synaroute_ai",
+                  "namespace": "mcp__synaroute", "arguments": "{\"prompt\":\"hi\"}" },
+                { "type": "function_call_output", "call_id": "c1", "output": "done" },
+                // 对照：平铺工具无 namespace，不得被改名
+                { "type": "function_call", "call_id": "c2", "name": "update_plan", "arguments": "{}" }
+            ]
+        });
+        let chat = responses_to_chat(&body);
+        let msgs = chat["messages"].as_array().unwrap();
+        let names: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| m["tool_calls"][0]["function"]["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["mcp__synaroute__synaroute_ai", "update_plan"],
+            "带 namespace 的须拼回全名、平铺的须原样保留"
+        );
+        // arguments 与 call_id 不受影响
+        let first = msgs
+            .iter()
+            .find(|m| m["tool_calls"][0]["function"]["name"] == "mcp__synaroute__synaroute_ai")
+            .unwrap();
+        assert_eq!(first["tool_calls"][0]["id"], "c1");
+        assert_eq!(first["tool_calls"][0]["function"]["arguments"], "{\"prompt\":\"hi\"}");
+    }
+
+    #[test]
+    fn history_custom_tool_call_keeps_namespace() {
+        // custom_tool_call 历史同理（通常平铺，但带 namespace 时也要拼回，口径不分叉）。
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [
+                { "type": "custom_tool_call", "call_id": "c1", "name": "sub",
+                  "namespace": "mcp__ns", "input": "PATCH" },
+                { "type": "custom_tool_call", "call_id": "c2", "name": "apply_patch", "input": "P2" }
+            ]
+        });
+        let chat = responses_to_chat(&body);
+        let names: Vec<&str> = chat["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["tool_calls"][0]["function"]["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["mcp__ns__sub", "apply_patch"]);
+    }
+
+    #[test]
+    fn namespace_name_round_trips_through_split() {
+        // 闭环：拼回的全名必须能被响应侧 split_namespaced_tool_name 原样拆开，
+        // 否则回程 item 依旧缺 namespace 字段。这条把请求侧与响应侧的口径钉在一起。
+        let item = json!({ "name": "synaroute_ai", "namespace": "mcp__synaroute" });
+        let full = join_namespaced_tool_name(&item);
+        let (ns, sub) = split_namespaced_tool_name(&full, &["mcp__synaroute".to_string()]);
+        assert_eq!(ns.as_deref(), Some("mcp__synaroute"), "namespace 应能拆回");
+        assert_eq!(sub, "synaroute_ai", "子工具名应能拆回");
+    }
+
+    #[test]
+    fn responses_resp_to_chat_function_call_keeps_namespace() {
+        // 响应体方向（Responses 上游 → Chat 中枢）同样要拼全名：
+        // 下游客户端看到的工具名须与工具声明一致，否则它同样查不到工具。
+        let resp = json!({
+            "id": "resp_1",
+            "model": "gpt-5.5",
+            "output": [
+                { "type": "function_call", "call_id": "c1", "name": "synaroute_ai",
+                  "namespace": "mcp__synaroute", "arguments": "{\"prompt\":\"hi\"}" }
+            ]
+        });
+        let chat = responses_resp_to_chat(&resp);
+        assert_eq!(
+            chat["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "mcp__synaroute__synaroute_ai"
+        );
+    }
+
     #[test]
     fn openai_tools_to_anthropic_uses_input_schema() {
         let tools = json!([{
@@ -3438,7 +4458,7 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
         });
         let custom = std::collections::HashSet::from(["apply_patch".to_string()]);
-        let result = chat_resp_to_responses_ext(&body, &custom);
+        let result = chat_resp_to_responses_ext(&body, &custom, &Default::default());
         let output = result["output"].as_array().unwrap();
         assert_eq!(output.len(), 1);
         assert_eq!(output[0]["type"], "custom_tool_call", "apply_patch 应输出 custom_tool_call");
@@ -3459,7 +4479,7 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
         });
         let custom = std::collections::HashSet::from(["apply_patch".to_string()]);
-        let result = chat_resp_to_responses_ext(&body, &custom);
+        let result = chat_resp_to_responses_ext(&body, &custom, &Default::default());
         let output = result["output"].as_array().unwrap();
         assert_eq!(output.len(), 1);
         assert_eq!(output[0]["type"], "function_call", "非 custom 工具应保持 function_call");
@@ -3494,6 +4514,7 @@ mod tests {
             SseDirection::AnthropicToResponses,
             vec![],
             custom,
+            Default::default(),
         );
         let mut out = String::new();
         out.push_str(&tr.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\"}}\n\n"));
@@ -3515,6 +4536,7 @@ mod tests {
             SseDirection::AnthropicToResponses,
             vec![],
             std::collections::HashSet::new(),
+            Default::default(),
         );
         let mut out = String::new();
         out.push_str(&tr.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\"}}\n\n"));

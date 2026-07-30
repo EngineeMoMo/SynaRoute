@@ -151,10 +151,17 @@ pub async fn run_plan(
     let file_context = if brain.retrieval_enabled {
         if let Some(ref work_dir) = effective_work_dir {
             let max_tokens = brain.max_context_tokens;
-            let files = retrieval::retrieve(work_dir, prompt, max_tokens)
-                .await
-                .unwrap_or_default();
-            format_file_context(&files)
+            let outcome = retrieval::retrieve_detailed(work_dir, prompt, max_tokens).await;
+            store.append_event(
+                category,
+                "aggregate",
+                None,
+                &format!("检索 · {} · 目录={work_dir}", outcome.summary),
+            );
+            for d in &outcome.diagnostics {
+                store.append_event(category, "aggregate", None, &format!("检索诊断 · {d}"));
+            }
+            format_file_context(&outcome.files)
         } else {
             String::new()
         }
@@ -253,8 +260,9 @@ pub async fn run_apply(
     // 重新获取文件上下文
     let file_context = if brain.retrieval_enabled {
         if let Some(ref work_dir) = effective_work_dir {
-            let files = retrieval::retrieve(work_dir, prompt, brain.max_context_tokens).await.unwrap_or_default();
-            format_file_context(&files)
+            let outcome =
+                retrieval::retrieve_detailed(work_dir, prompt, brain.max_context_tokens).await;
+            format_file_context(&outcome.files)
         } else {
             String::new()
         }
@@ -366,10 +374,27 @@ pub async fn run_mcp(
     // 文件检索
     let files = if brain.retrieval_enabled {
         if let Some(ref work_dir) = effective_work_dir {
-            retrieval::retrieve(work_dir, prompt, brain.max_context_tokens)
-                .await
-                .unwrap_or_default()
+            let outcome =
+                retrieval::retrieve_detailed(work_dir, prompt, brain.max_context_tokens).await;
+            // 检索路径与降级原因必须可见：旧实现里 codegraph 失败静默返回空，
+            // 导致「集成从未生效」看起来像「没有命中」，排查无从下手。
+            store.append_event(
+                category,
+                "aggregate",
+                None,
+                &format!("检索 · {} · 目录={work_dir}", outcome.summary),
+            );
+            for d in &outcome.diagnostics {
+                store.append_event(category, "aggregate", None, &format!("检索诊断 · {d}"));
+            }
+            outcome.files
         } else {
+            store.append_event(
+                category,
+                "aggregate",
+                None,
+                "检索已启用但无工作目录（未传 cwd、未开自动跟随、也未填手工目录），跳过",
+            );
             vec![]
         }
     } else {
@@ -614,8 +639,11 @@ pub async fn run_mcp(
 // ─── 内部辅助 ───────────────────────────────────────────────────────────────
 
 /// 解析实际使用的工作目录。
-/// 若 auto_follow_active 为真，则从各工具会话历史中挑选最近活跃的目录；
-/// 否则使用用户在配置中手工填写的 work_dir。
+///
+/// 优先级：`auto_follow_active` 开启时用会话历史里最近活跃的目录；否则用手工 `work_dir`。
+/// **两者都拿不到时兜底去扫会话历史**——旧实现在此直接返回 None，于是「开了检索但没填目录、
+/// 也没勾自动跟随」这个最常见的默认状态下检索整段跳过、且无任何提示。既然 [`crate::workdirs`]
+/// 已经能从 Claude CLI / Codex / 桌面端会话历史里读出 cwd，就该用它兜底而不是干脆不检索。
 fn resolve_work_dir(brain: &BrainConfig) -> Option<String> {
     if brain.auto_follow_active {
         if let Ok(list) = crate::workdirs::scan() {
@@ -624,7 +652,14 @@ fn resolve_work_dir(brain: &BrainConfig) -> Option<String> {
             }
         }
     }
-    brain.work_dir.clone()
+    if let Some(w) = brain.work_dir.clone().filter(|s| !s.trim().is_empty()) {
+        return Some(w);
+    }
+    // 兜底：没勾自动跟随也没填目录 → 仍尝试会话历史，避免「静默不检索」。
+    crate::workdirs::scan()
+        .ok()
+        .and_then(|l| l.into_iter().next())
+        .map(|w| w.path)
 }
 
 fn build_member_prompt(prompt: &str, file_context: &str) -> String {

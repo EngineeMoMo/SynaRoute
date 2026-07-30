@@ -12,7 +12,7 @@ import type {
   Vendor,
 } from "@/types";
 import type { Lang } from "@/lib/i18n";
-import { api } from "@/lib/bridge";
+import { api, isTauri } from "@/lib/bridge";
 
 interface AppState {
   // 当前选中分类
@@ -415,7 +415,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 }));
 
-/** 应用主题到 <html> class（shadcn/ui 深色约定） */
+/** 应用主题到 <html> class（shadcn/ui 深色约定）+ 同步系统窗口装饰（标题栏）。 */
 export function applyTheme(theme: ThemePref) {
   const root = document.documentElement;
   const isDark =
@@ -423,4 +423,19 @@ export function applyTheme(theme: ThemePref) {
     (theme === "system" &&
       window.matchMedia("(prefers-color-scheme: dark)").matches);
   root.classList.toggle("dark", isDark);
+  // 标题栏由**系统**绘制，不在 WebView 里，故 CSS 变量管不到它——深色下顶部会留一条白条。
+  // 必须显式告知窗口当前主题，Windows 才会把标题栏换成深色（Tauri v2 Window.setTheme）。
+  // 浏览器预览模式没有 Tauri 注入，跳过；失败只告警不影响页面主题。
+  void syncWindowTheme(isDark);
+}
+
+/** 把主题同步给系统窗口装饰（标题栏）。仅 Tauri 环境生效。 */
+async function syncWindowTheme(isDark: boolean) {
+  if (!isTauri()) return;
+  try {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    await getCurrentWindow().setTheme(isDark ? "dark" : "light");
+  } catch (e) {
+    console.warn("setTheme(window) failed", e);
+  }
 }

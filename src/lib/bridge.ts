@@ -7,6 +7,7 @@ import type {
   AppSettings,
   BrainConfig,
   CategoryType,
+  CodegraphState,
   EventLogEntry,
   McpStatus,
   ModelInfo,
@@ -205,6 +206,17 @@ export const api = {
   // ---- 最近工作目录（从 Claude CLI / Codex 会话中检测） ----
   detectRecentWorkdirs: () =>
     call<RecentWorkdir[]>("detect_recent_workdirs", undefined, async () => []),
+
+  // ---- codegraph（可选本地代码索引工具） ----
+  // workDir 为空则只判可执行是否就绪，不判项目索引。
+  detectCodegraph: (workDir?: string) =>
+    call<CodegraphState>("detect_codegraph", { workDir }, async () => ({
+      state: "notInstalled" as const,
+    })),
+
+  // 为指定项目建索引（codegraph init）。大仓库可能耗时分钟级，调用方需给 loading 态。
+  codegraphInit: (workDir: string) =>
+    call<string>("codegraph_init", { workDir }, async () => "浏览器预览模式：未实际建索引"),
 
   // ---- MCP 服务器 ----
   mcpStatus: () =>

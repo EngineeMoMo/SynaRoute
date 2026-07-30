@@ -753,7 +753,16 @@ async fn try_stream_to_key(
             // 字段就报 unsupported call（大脑聚合失效根因）。
             let namespaces = crate::upstream::collect_tool_namespaces(req_json);
             let custom_tools = crate::upstream::collect_custom_tools(req_json);
-            let translator = crate::upstream::SseTranslator::with_namespaces_and_custom(dir, namespaces, custom_tools);
+            // Codex 的延迟工具检索器（type:"tool_search"）：模型对它的调用必须回程成
+            // tool_search_call，Codex 才会本地跑 BM25 检索并在下一轮把 MCP 工具真 schema
+            // 灌进 tool_search_output —— 那是 mcp__* 工具唯一的来源。
+            let search_tools = crate::upstream::collect_search_tools(req_json);
+            let translator = crate::upstream::SseTranslator::with_namespaces_and_custom(
+                dir,
+                namespaces,
+                custom_tools,
+                search_tools,
+            );
             let upstream = resp.bytes_stream();
             struct StreamState<S> {
                 translator: crate::upstream::SseTranslator,
@@ -1001,11 +1010,19 @@ async fn forward_to_key(
     let bytes = if status.is_success() && !same_protocol {
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(v) => {
-                // 传入 custom 工具集合：Chat→Responses 时把 apply_patch 等的回程 item type
-                // 改写为 custom_tool_call（否则 Codex router 认不出）。其他协议对不涉及此逻辑。
+                // 传入两个工具集合：Chat→Responses 时把 apply_patch 等的回程 item type 改写为
+                // custom_tool_call、tool_search 的改写为 tool_search_call（否则 Codex router
+                // 认不出：前者工具执行失败，后者检索发不起来→MCP 工具拿不到 schema）。
+                // 其他协议对不涉及此逻辑。
                 let custom_tools = crate::upstream::collect_custom_tools(req_json);
-                let translated =
-                    crate::upstream::convert_response_ext(&v, key.protocol, downstream, &custom_tools);
+                let search_tools = crate::upstream::collect_search_tools(req_json);
+                let translated = crate::upstream::convert_response_ext(
+                    &v,
+                    key.protocol,
+                    downstream,
+                    &custom_tools,
+                    &search_tools,
+                );
                 Bytes::from(serde_json::to_vec(&translated).unwrap_or_else(|_| bytes.to_vec()))
             }
             Err(_) => bytes, // 解析失败（非 JSON）：原样透传
@@ -1359,6 +1376,104 @@ mod tests {
             up.get("thinking").and_then(|t| t.get("budget_tokens")).is_some(),
             "上游 body 应含 thinking.budget_tokens（xhigh 注入 + 映射），实际收到:\n{}",
             serde_json::to_string_pretty(&up).unwrap()
+        );
+    }
+
+    /// 端到端（真实链路，非单元）：Codex direct 模式请求 → Anthropic 上游（opus），
+    /// 断言上游**实际收到的 body** 里同时带上了延迟工具检索器与 MCP 工具的真 schema。
+    ///
+    /// 这是「opus 作 Codex 主 Key 能否用 MCP」的决定性测试。覆盖的真实成因（2026-07-30 抓包）：
+    /// - `tool_search` 声明无 `name` 字段，请求侧曾一律 continue 跳过 → 模型不知道有检索器；
+    /// - MCP 工具（`mcp__*`）**从不出现在顶层 tools**，只在 `tool_search_output.tools[]` 回灌，
+    ///   未提升该处 → 模型永远看不到 `synaroute_ai`（表现为「MCP 握手正常但模型说没这工具」）。
+    ///
+    /// 走 `stream:false` 以复用捕获型 mock（流式路径的改写另有 upstream 侧单测覆盖）。
+    #[tokio::test]
+    async fn codex_tool_search_and_mcp_tools_reach_upstream() {
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let upstream = spawn_capture_mock(captured.clone()).await;
+
+        let dir = temp_dir("tool_search_e2e");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let mut k = key("k1", 0, &upstream);
+        k.category_id = CategoryType::Codex;
+        k.protocol = Protocol::Anthropic;
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::Codex).await.unwrap();
+
+        // Codex direct 模式真实骨架：顶层 tools 含无 name 的 tool_search；
+        // MCP 工具只在历史的 tool_search_output 里。
+        let _ = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .json(&json!({
+                "model": "gpt-5.5",
+                "stream": false,
+                "max_output_tokens": 1024,
+                "tools": [
+                    { "type": "function", "name": "shell_command",
+                      "parameters": {"type":"object","properties":{"cmd":{"type":"string"}}} },
+                    { "type": "tool_search", "execution": "client",
+                      "description": "Tool discovery via BM25.",
+                      "parameters": {"type":"object","properties":{"query":{"type":"string"}},"required":["query"]} }
+                ],
+                "input": [
+                    { "type": "message", "role": "user",
+                      "content": [{"type":"input_text","text":"用 synaroute_ai 审查"}] },
+                    { "type": "tool_search_call", "id": "tsc_1", "call_id": "cs1",
+                      "execution": "client", "arguments": {"query":"synaroute_ai"} },
+                    { "type": "tool_search_output", "id": "tso_1", "call_id": "cs1",
+                      "execution": "client", "tools": [{
+                          "type": "namespace", "name": "mcp__synaroute",
+                          "tools": [{ "type": "function", "name": "synaroute_ai",
+                                      "description": "多模型会诊",
+                                      "defer_loading": true,
+                                      "parameters": {"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"]} }]
+                      }] }
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        pm.stop(CategoryType::Codex);
+        let bodies = captured.lock().clone();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(bodies.len(), 1, "上游应收到 1 个请求");
+        let up: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        let tools = up["tools"].as_array().unwrap_or_else(|| {
+            panic!(
+                "上游 body 必须带 tools，实际收到:\n{}",
+                serde_json::to_string_pretty(&up).unwrap()
+            )
+        });
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(
+            names.contains(&"tool_search"),
+            "上游应收到延迟工具检索器（无 name 的声明需按 type 命名），实际: {names:?}"
+        );
+        assert!(
+            names.contains(&"mcp__synaroute__synaroute_ai"),
+            "上游应收到从 tool_search_output 提升的 MCP 工具全名，实际: {names:?}"
+        );
+        let syna = tools
+            .iter()
+            .find(|t| t["name"] == "mcp__synaroute__synaroute_ai")
+            .unwrap();
+        assert_eq!(
+            syna["input_schema"]["properties"]["prompt"]["type"], "string",
+            "MCP 工具的真 schema 要完整带到上游，实际: {syna}"
+        );
+        // 历史里的检索调用与结果不得退化成空消息（模型需看到自己检索过什么）。
+        let msgs = serde_json::to_string(&up["messages"]).unwrap();
+        assert!(
+            msgs.contains("mcp__synaroute__synaroute_ai"),
+            "检索结果回执应告知命中的工具，实际 messages:\n{msgs}"
         );
     }
 

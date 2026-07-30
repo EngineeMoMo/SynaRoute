@@ -1,0 +1,147 @@
+{
+ "model": "gpt-5.4",
+ "tools": [
+  {
+   "type": "function",
+   "name": "shell_command",
+   "description": "Runs a Powershell command (Windows) and returns its output.",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "command": {
+      "type": "string",
+      "description": "Shell script to run in the user's default shell."
+     },
+     "timeout_ms": {
+      "type": "number",
+      "description": "Maximum command runtime. Defaults to 10000 ms."
+     },
+     "workdir": {
+      "type": "string",
+      "description": "Working directory for the command. Defaults to the turn cwd."
+     }
+    },
+    "required": [
+     "command"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "type": "custom",
+   "name": "apply_patch",
+   "description": "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool.",
+   "format": {
+    "type": "grammar",
+    "syntax": "lark",
+    "definition": "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?\n\n%import common.LF\n"
+   }
+  },
+  {
+   "type": "tool_search",
+   "execution": "client",
+   "description": "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n- Dynamic tools\n- Multi-agent tools\n- sqlcl\n- synaroute\nFor MCP tool discovery, always use `tool_search`.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "limit": {
+      "type": "number",
+      "description": "Maximum number of tools to return. Defaults to 8."
+     },
+     "query": {
+      "type": "string",
+      "description": "Search query for deferred tools."
+     }
+    },
+    "required": [
+     "query"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "type": "web_search",
+   "external_web_access": false,
+   "search_content_types": [
+    "text",
+    "image"
+   ]
+  }
+ ],
+ "input": [
+  {
+   "type": "message",
+   "id": "msg_019fa1b1-f80b-75a0-b070-d4b7d3f99126",
+   "role": "user",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "<environment_context>\n  <cwd>C:\\Users\\mhm29\\Desktop\\temp\\gptTest</cwd>\n  <shell>powershell</shell>\n</environment_context>"
+    }
+   ]
+  },
+  {
+   "type": "tool_search_call",
+   "id": "tsc_0a2f06391d10d388016a66d59896d0819bbd10a344c102baa8",
+   "call_id": "call_o0aKSuAyGTe3ciAzbt2JysLO",
+   "status": "completed",
+   "execution": "client",
+   "arguments": {
+    "query": "synaroute_ai multi-model consultation route prompt category codex"
+   }
+  },
+  {
+   "type": "tool_search_output",
+   "id": "tso_019fa1b2-631d-7683-93fa-465d359986a1",
+   "call_id": "call_o0aKSuAyGTe3ciAzbt2JysLO",
+   "status": "completed",
+   "execution": "client",
+   "tools": [
+    {
+     "type": "namespace",
+     "name": "mcp__synaroute",
+     "description": "Tools in the mcp__synaroute namespace.",
+     "tools": [
+      {
+       "type": "function",
+       "name": "synaroute_ai",
+       "description": "调用 SynaRoute 多模型大脑聚合：多个模型并行回答同一个问题，再由决策者综合出一份高质量答案。",
+       "strict": false,
+       "defer_loading": true,
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "category": {
+          "type": "string",
+          "description": "使用哪个分类下配置的 Key 池与聚合设置，省略默认 claude-cli",
+          "enum": [
+           "claude-cli",
+           "claude-desktop",
+           "codex"
+          ]
+         },
+         "cwd": {
+          "type": "string",
+          "description": "可选：当前项目根目录的绝对路径。"
+         },
+         "languageHint": {
+          "type": "string",
+          "description": "回答语言提示，如 zh / en，省略则跟随 prompt 语言"
+         },
+         "prompt": {
+          "type": "string",
+          "description": "要交给多模型会诊的问题或任务。"
+         }
+        },
+        "required": [
+         "prompt"
+        ]
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}
