@@ -462,7 +462,61 @@ async fn handle_request(
         serde_json::to_string_pretty(&req_json).unwrap_or_else(|_| req_json.to_string())
     };
 
-    // 记录一条完整链路的调用模型日志（开关开启时）。
+    // 一次成功转发只记**一条**日志（kind = route，带链路快照）。
+    //
+    // 此前是两条：`route`「成功返回」+ `request`「调用」。两者的 Key 名、模型段完全一样，
+    // 只有延迟数字在后者里 —— 高频转发时界面上就是成对的重复行（实测 14 秒刷 12 条、
+    // 其中 6 对是同一件事）。合成一条后信息一个不少：延迟并进 detail，链路快照仍挂在这条上。
+    //
+    // 另带 collapse_key：连续的「同 Key、同请求模型、同流式与否」成功记录会被折叠成一条
+    // 带「×N」计数（见 `Store::append_event_collapsible`）。日志文件仍逐条完整写。
+    let log_success = |store: &Arc<Store>,
+                       key: &ProviderKey,
+                       elapsed: u64,
+                       url: String,
+                       real_model: String,
+                       request_body: String,
+                       response_body: String,
+                       status: u16,
+                       streaming: bool| {
+        let verb = if streaming { "流式返回" } else { "成功返回" };
+        let detail = format!(
+            "{} · {} · {} · {}ms",
+            key.name,
+            verb,
+            fmt_route_model_for_key(key, &requested_model),
+            elapsed
+        );
+        // 链路快照只在「调用模型日志」开关开启时产生（正文可达 2×20000 字符）。
+        let trace = req_log.then(|| RequestTrace {
+            key_name: key.name.clone(),
+            vendor: key.vendor.clone(),
+            protocol: key.protocol,
+            url,
+            requested_model: requested_model.clone(),
+            real_model,
+            request_body: cap(&request_body),
+            response_body: cap(&response_body),
+            status: Some(status),
+            latency_ms: elapsed,
+            ok: true,
+        });
+        let collapse = format!("ok:{}:{}:{}", key.id, requested_model, streaming);
+        store.append_event_collapsible(
+            category,
+            "route",
+            Some(&key.id),
+            &detail,
+            trace,
+            Some(collapse),
+        );
+    };
+
+    // 失败的单次尝试（开关开启时记，含链路快照供排障）。
+    //
+    // 与成功路径分开：失败信息（状态码、上游错误体）是排障核心，且它总伴随一条 failover
+    // 事件说明「转给了谁」，两条不重复。折叠判据带上状态码 —— 同 Key 连续同码失败才合并，
+    // 401 与 500 交替出现时不会被压成一条。
     let log_request = |store: &Arc<Store>,
                        key: &ProviderKey,
                        elapsed: u64,
@@ -508,7 +562,21 @@ async fn handle_request(
             latency_ms: elapsed,
             ok,
         };
-        store.append_event_trace(category, "request", Some(&key.id), &detail, Some(trace));
+        let collapse = format!(
+            "req:{}:{}:{}:{}",
+            key.id,
+            requested_model,
+            ok,
+            status.map(|s| s.to_string()).unwrap_or_else(|| "conn".into())
+        );
+        store.append_event_collapsible(
+            category,
+            "request",
+            Some(&key.id),
+            &detail,
+            Some(trace),
+            Some(collapse),
+        );
     };
 
     // 流式可走真流式的条件：同协议直通，或跨协议但有受支持的 SSE 翻译方向。
@@ -593,7 +661,7 @@ async fn handle_request(
                     } else {
                         request_body
                     };
-                    log_request(
+                    log_success(
                         &store,
                         key,
                         elapsed,
@@ -601,18 +669,8 @@ async fn handle_request(
                         real_model,
                         combined_req,
                         "（流式响应：边收边发，body 不留存。如需完整响应体，请在客户端侧抓取）".to_string(),
-                        Some(200),
+                        200,
                         true,
-                    );
-                    store.append_event(
-                        category,
-                        "route",
-                        Some(&key.id),
-                        &format!(
-                            "{} · 流式返回 · {}",
-                            key.name,
-                            fmt_route_model_for_key(key, &requested_model)
-                        ),
                     );
                     return Ok(resp);
                 }
@@ -675,7 +733,10 @@ async fn handle_request(
         match result {
             Ok(outcome) if outcome.ok => {
                 let resp_text = String::from_utf8_lossy(&outcome.bytes).to_string();
-                log_request(
+                health::record_live_success(&store, &key.id);
+                // 有 Key 能用了 → 立即解除「全部失败」短路，不等窗口自然到期。
+                clear_all_failed_gate(&gate_key);
+                log_success(
                     &store,
                     key,
                     elapsed,
@@ -683,21 +744,8 @@ async fn handle_request(
                     outcome.real_model.clone(),
                     outcome.request_body.clone(),
                     resp_text,
-                    Some(outcome.status),
-                    true,
-                );
-                health::record_live_success(&store, &key.id);
-                // 有 Key 能用了 → 立即解除「全部失败」短路，不等窗口自然到期。
-                clear_all_failed_gate(&gate_key);
-                store.append_event(
-                    category,
-                    "route",
-                    Some(&key.id),
-                    &format!(
-                        "{} · 成功返回 · {}",
-                        key.name,
-                        fmt_route_model_for_key(key, &requested_model)
-                    ),
+                    outcome.status,
+                    false,
                 );
                 return Ok(json_resp(StatusCode::OK, outcome.bytes));
             }

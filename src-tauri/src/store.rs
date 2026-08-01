@@ -205,6 +205,27 @@ impl Store {
         detail: &str,
         trace: Option<RequestTrace>,
     ) {
+        self.append_event_collapsible(category, kind, key_id, detail, trace, None);
+    }
+
+    /// 可折叠的事件写入。`collapse_key` 为 `Some` 时，若**紧邻的上一条**内存事件有相同的
+    /// collapse_key，就不新增条目、只把那条的 `repeat` 加一并把时间戳刷新到现在。
+    ///
+    /// 为什么只折叠「紧邻」的一条而不做全局归并：时间线的价值在于能看出穿插关系 ——
+    /// 中间只要插进一条失败或故障转移，就该重新起一条，否则「连续成功 20 次」和
+    /// 「成功 10 次→失败→再成功 10 次」在界面上会长得一样。
+    ///
+    /// **日志文件仍逐条完整写**（折叠前就调了 `write_log_to_file`）：排障取证要的是每一次
+    /// 真实调用的时刻与延迟，不能因为界面降噪而丢掉。
+    pub fn append_event_collapsible(
+        &self,
+        category: CategoryType,
+        kind: &str,
+        key_id: Option<&str>,
+        detail: &str,
+        trace: Option<RequestTrace>,
+        collapse_key: Option<String>,
+    ) {
         let entry = EventLogEntry {
             id: uuid::Uuid::new_v4().to_string(),
             ts: chrono::Utc::now().timestamp_millis(),
@@ -212,17 +233,35 @@ impl Store {
             kind: kind.to_string(),
             key_id: key_id.map(|s| s.to_string()),
             detail: detail.to_string(),
+            repeat: 1,
+            collapse_key: collapse_key.clone(),
             has_trace: trace.is_some(),
             trace,
         };
+        // 先写文件：文件是逐条完整的事实来源，不受下面的界面折叠影响。
+        self.write_log_to_file(&entry);
+
         let mut ev = self.events.write();
-        ev.push(entry.clone());
+        // 折叠：仅当本条带 collapse_key 且与**最后一条**相同。
+        if let Some(ck) = &collapse_key {
+            if let Some(last) = ev.last_mut() {
+                if last.collapse_key.as_deref() == Some(ck.as_str()) {
+                    last.repeat = last.repeat.saturating_add(1);
+                    last.ts = entry.ts; // 时间戳跟到最近一次，用户看到的是「最后一次发生在何时」
+                    // detail 也刷新：同类事件里延迟等数字会变，展示最近一次更有参考价值。
+                    last.detail = entry.detail;
+                    // trace 同理替换成最近一次（只保留一份，避免 N 条正文堆在内存里）。
+                    last.has_trace = entry.has_trace;
+                    last.trace = entry.trace;
+                    return;
+                }
+            }
+        }
+        ev.push(entry);
         if ev.len() > MAX_EVENTS {
             let overflow = ev.len() - MAX_EVENTS;
             ev.drain(0..overflow);
         }
-        drop(ev);
-        self.write_log_to_file(&entry);
     }
 
     fn write_log_to_file(&self, entry: &EventLogEntry) {
@@ -279,6 +318,7 @@ impl Store {
             // has_trace 必须留下：前端靠它决定「这行能不能展开」。剥的是正文，不是存在性。
             has_trace: e.trace.is_some(),
             trace: None,
+            collapse_key: None, // 内部折叠判据，不下发前端
             ..e.clone()
         }
     }
@@ -774,6 +814,8 @@ impl Store {
                 max_context_tokens: 50_000,
                 retrieval_enabled: false,
                 auto_follow_active: false,
+                tools_enabled: false,
+                max_tool_rounds: 6,
             })
     }
 
@@ -1363,7 +1405,115 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 编辑（upsert 已存 Key）：字段更新且落盘持久。
+    /// 连续同类事件在**内存态**折叠成一条并计数，但**日志文件仍逐条完整写**。
+    ///
+    /// 这两件事必须同时成立：界面降噪（高频转发下 14 秒能刷 12 条重复行）不能牺牲排障取证
+    /// ——每一次真实调用的时刻与延迟都得留在文件里。
+    #[test]
+    fn consecutive_same_events_collapse_in_memory_but_not_in_file() {
+        let dir = temp_dir("collapse");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        let log_dir = dir.join("logs");
+        let mut settings = store.get_settings();
+        settings.log_dir = Some(log_dir.display().to_string());
+        store.save_settings(settings).unwrap();
+
+        let ck = Some("ok:k1:claude-opus-4-8:false".to_string());
+        for i in 0..5 {
+            store.append_event_collapsible(
+                CategoryType::ClaudeCli,
+                "route",
+                Some("k1"),
+                &format!("厂商1 · 成功返回 · 模型 X · {}ms", 100 + i),
+                None,
+                ck.clone(),
+            );
+        }
+
+        let ev = store.list_all_events();
+        assert_eq!(ev.len(), 1, "连续 5 条同类必须折叠成 1 条: {ev:?}");
+        assert_eq!(ev[0].repeat, 5, "计数应为 5");
+        assert!(
+            ev[0].detail.contains("104ms"),
+            "detail 应刷新到最近一次（延迟数字会变，看最新的更有参考价值）: {}",
+            ev[0].detail
+        );
+
+        // 文件侧：5 条都在。
+        let date = chrono::Utc::now().format("%Y-%m-%d");
+        let raw = std::fs::read_to_string(log_dir.join(format!("{date}.jsonl"))).unwrap();
+        let route_lines = raw
+            .lines()
+            .filter(|l| l.contains("\"成功返回") || l.contains("成功返回"))
+            .count();
+        assert_eq!(route_lines, 5, "日志文件必须逐条完整写，不受界面折叠影响");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 中间插进别的事件就重新起一条 —— 只折叠**紧邻**的同类。
+    ///
+    /// 若做全局归并，「连续成功 20 次」与「成功 10 次 → 失败 → 再成功 10 次」在界面上会长得
+    /// 一样，而后者恰恰是需要被看见的异常。
+    #[test]
+    fn collapse_breaks_when_another_event_interleaves() {
+        let dir = temp_dir("collapse_break");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        let ck = Some("ok:k1:m:false".to_string());
+
+        store.append_event_collapsible(CategoryType::ClaudeCli, "route", Some("k1"), "成功 1", None, ck.clone());
+        store.append_event_collapsible(CategoryType::ClaudeCli, "route", Some("k1"), "成功 2", None, ck.clone());
+        // 插一条故障转移（无 collapse_key，永不折叠）
+        store.append_event(CategoryType::ClaudeCli, "failover", Some("k1"), "转移到厂商2");
+        store.append_event_collapsible(CategoryType::ClaudeCli, "route", Some("k1"), "成功 3", None, ck.clone());
+
+        let ev = store.list_all_events();
+        assert_eq!(ev.len(), 3, "应为「折叠×2」+「故障转移」+「新起的成功」: {ev:?}");
+        assert_eq!(ev[0].repeat, 2);
+        assert_eq!(ev[1].kind, "failover");
+        assert_eq!(ev[2].repeat, 1, "被打断后必须重新计数");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 不带 collapse_key 的事件永不折叠（配置变更、错误等每条都要独立可见）。
+    #[test]
+    fn events_without_collapse_key_never_merge() {
+        let dir = temp_dir("collapse_none");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        for _ in 0..3 {
+            store.append_event(CategoryType::ClaudeCli, "config", None, "完全相同的文案");
+        }
+        let ev = store.list_all_events();
+        assert_eq!(ev.len(), 3, "无折叠键时即便文案相同也不得合并: {ev:?}");
+        assert!(ev.iter().all(|e| e.repeat == 1));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `collapse_key` 是内部判据，**不得下发前端**（否则等于把 Key id 与模型名泄进 UI 载荷，
+    /// 且前端并不需要它）。
+    #[test]
+    fn collapse_key_is_not_exposed_to_frontend() {
+        let dir = temp_dir("collapse_hide");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        store.append_event_collapsible(
+            CategoryType::ClaudeCli,
+            "route",
+            Some("k1"),
+            "成功",
+            None,
+            Some("ok:k1:m:false".into()),
+        );
+        let ev = store.list_all_events();
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0].collapse_key.is_none(), "列表接口必须剥掉 collapse_key");
+        // 序列化后也不该出现该字段（#[serde(skip)]）
+        let json = serde_json::to_string(&ev[0]).unwrap();
+        assert!(!json.contains("collapseKey") && !json.contains("collapse_key"), "序列化不得含该字段: {json}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
     #[test]
     fn edit_key_updates_fields_in_place() {
         let dir = temp_dir("edit");

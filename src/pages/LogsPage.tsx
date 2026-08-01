@@ -258,6 +258,15 @@ function LogRow({ entry, lang }: { entry: EventLogEntry; lang: string }) {
         <span className={`flex-1 text-sm text-text-primary ${open ? "whitespace-pre-wrap break-words" : "truncate"}`}>
           {entry.detail}
         </span>
+        {/* 折叠计数：连续同类事件被合成一条时显示「×N」。1 不显示（避免每行都挂个 ×1 的噪音）。 */}
+        {(entry.repeat ?? 1) > 1 && (
+          <span
+            className="shrink-0 rounded-full bg-surface-hover px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-text-muted"
+            title={t("logs.repeatHint")}
+          >
+            ×{entry.repeat}
+          </span>
+        )}
       </div>
 
       {open && entry.hasTrace && (
