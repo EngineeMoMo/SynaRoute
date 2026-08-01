@@ -299,6 +299,164 @@ pub fn unwrap_gateway_model_id(name: &str) -> &str {
     name.strip_prefix(GATEWAY_ALIAS_PREFIX).unwrap_or(name)
 }
 
+// ---- Claude 桌面端（3p gateway）的模型名判据 ----
+//
+// **与 CLI 的规则完全不同，别混用**：
+// - CLI（`is_cli_discoverable_model_id`）只看前缀 `claude`/`anthropic`，无厂商黑名单。
+//   故非合规名可以靠 `to_gateway_model_id` 包 `claude-synaroute-` 前缀救回来。
+// - 桌面端（本函数）要求「含关键词」**且**「不含厂商名」，且厂商名黑名单优先。
+//   → `claude-synaroute-glm-4.6` 仍命中 `glm` 被拒，**前缀对桌面端毫无作用**。
+//
+// 判据来源：Claude 桌面端 `app.asar` v1.24012.9（包 `Claude_1.24012.9.0_x64__pzs8sxrjxfjjc`），
+// offset ≈ 6842900 处的 `sD()`。反查方法见 docs/14 第七节（分块 grep 字节串 + dump 上下文）。
+// 原文（minify 后）：
+//   const Dc=["sonnet","opus","haiku","fable","mythos"];
+//   const nhe=new RegExp(`^(${Dc.join("|")})(-[\d.]+)?$`);
+//   const Snt=["claude",...Dc,"anthropic"];
+//   const Ent=/ark-code|astron|…|dpsk/;
+//   function sD(e){const t=e.toLowerCase();return Ent.test(t)?!1:nhe.test(t)||Snt.some(n=>t.includes(n))}
+//
+// **不合规的后果是硬过滤，不是提示**（此前误记为「仅面板黄字」）：
+// `W0n(provider,{adminList,discovered})`（offset ≈ 7964450）末行 `return e?i.filter(o=>aD(e,o.id).ok):i`
+// 把不合规条目**从模型列表里删掉**；随后 `resolveDefaultSessionModel()` 见空即返回
+// `{ok:false, reason:"models_not_discovered"}`，打开会话直接抛 `ModelsNotDiscoveredError`。
+// 即「`inferenceModels` 非空但全被过滤」与「`inferenceModels` 为空」后果等价。
+// `validateSessionModel` 的 allowed 成员判断也是拿**过滤后**的列表比对，同样救不回来。
+
+/// Claude 桌面端的三档 + 两个新家族名（官方 `Dc`）。
+const DESKTOP_TIER_NAMES: [&str; 5] = ["sonnet", "opus", "haiku", "fable", "mythos"];
+
+/// 「1M 上下文」的判定阈值（token）。`supports1m` 只对达到此窗口的模型置 true。
+pub const ONE_MILLION_CONTEXT: u32 = 1_000_000;
+
+/// 从**对外模型名**推断它代表哪个 Claude 档位（`anthropicFamilyTier` 的取值）。
+///
+/// 官方 `anthropicFamilyTier` 的作用：桌面端遇到裸别名（`opus` / `sonnet` / `haiku` / `fable`）
+/// 时，会在 `inferenceModels` 里找 `anthropicFamilyTier` 等于该别名的条目并「钉」到它
+/// （`ldn()`，offset ≈ 7400700）；opus/fable 还兼作 refusal fallback 的来源。不填则裸别名无处可落。
+///
+/// 判定方式与桌面端自身对模型名的家族识别一致——按名字含哪个档位子串。同时含多个时按
+/// 官方 `Dc` 的顺序取第一个命中（`sonnet` → `opus` → `haiku` → `fable` → `mythos`），
+/// 保证结果稳定、不依赖遍历顺序。
+pub fn desktop_family_tier_of(outward_name: &str) -> Option<&'static str> {
+    let lower = outward_name.trim().to_ascii_lowercase();
+    DESKTOP_TIER_NAMES
+        .iter()
+        .find(|tier| lower.contains(*tier))
+        .copied()
+}
+
+/// 必须命中其一的关键词（官方 `Snt` = `["claude", ...Dc, "anthropic"]`）。
+const DESKTOP_ALLOW_KEYWORDS: [&str; 7] = [
+    "claude", "sonnet", "opus", "haiku", "fable", "mythos", "anthropic",
+];
+
+/// 厂商名黑名单里的**普通子串**项（官方 `Ent` 中不带 `\b` / `\d` 的那些）。
+/// `amazon.nova` 的点在原正则里是 `\.`（转义后为字面点），故此处也是字面量。
+/// 带词边界的 `\bling\b` / `\bunic\b` / `\bds-` / `\bk2\.` / `\bm2\.` 与 `phi\d`
+/// 不在此列，由 [`desktop_denied_vendor_name`] 单独处理。
+const DESKTOP_DENY_SUBSTRINGS: [&str; 50] = [
+    "ark-code", "astron", "command-r", "deepseek", "doubao", "gemini", "gemma", "glm", "gpt",
+    "grok", "hermes", "hy3", "kimi", "lfm", "llama", "longcat", "mimo", "minimax", "mistral",
+    "mixtral", "moonshot", "nemotron", "openai", "phi-", "qianfan", "qwen", "tc-code", "yi-",
+    "stepfun", "step-3", "seed-", "bytedance", "hunyuan", "granite", "amazon.nova", "nova-",
+    "devstral", "ministral", "ernie", "codex", "arcee", "trinity", "abab", "jamba", "arctic",
+    "solar", "mercury", "zamba", "kat-coder", "dpsk",
+];
+
+/// JS 正则 `\w` 的字符集（`[A-Za-z0-9_]`），用于复刻 `\b` 词边界语义。
+fn is_js_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// 复刻 JS 的 `\b<needle>` / `\b<needle>\b`：按需要求匹配位置左/右侧不是 `\w`（字符串边界算满足）。
+///
+/// 只处理 ASCII needle（黑名单全是 ASCII），故可安全按字节位置取相邻字符。
+fn contains_with_boundaries(hay: &str, needle: &str, need_left: bool, need_right: bool) -> bool {
+    let bytes = hay.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = hay[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let left_ok = !need_left
+            || start == 0
+            || !is_js_word_char(bytes[start - 1] as char);
+        let right_ok = !need_right
+            || end == bytes.len()
+            || !is_js_word_char(bytes[end] as char);
+        if left_ok && right_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// 命中官方厂商名黑名单（`Ent`）→ 桌面端一定拒绝，且**优先于**关键词允许判定。
+fn desktop_denied_vendor_name(lower: &str) -> bool {
+    if DESKTOP_DENY_SUBSTRINGS.iter().any(|s| lower.contains(s)) {
+        return true;
+    }
+    // `\bling\b` / `\bunic\b`：两侧都要词边界。
+    if contains_with_boundaries(lower, "ling", true, true)
+        || contains_with_boundaries(lower, "unic", true, true)
+    {
+        return true;
+    }
+    // `\bk2\.` / `\bm2\.` / `\bds-`：只要求左侧词边界（右侧的 `.` / `-` 已在字面量里）。
+    if contains_with_boundaries(lower, "k2.", true, false)
+        || contains_with_boundaries(lower, "m2.", true, false)
+        || contains_with_boundaries(lower, "ds-", true, false)
+    {
+        return true;
+    }
+    // `phi\d`：phi 紧跟一个数字。须遍历**全部**出现位置——只看第一处会漏
+    // 「phi 后面不是数字、但后续还有一个 phi3」这类串。
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find("phi") {
+        let end = from + rel + "phi".len();
+        if lower[end..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            return true;
+        }
+        from = from + rel + 1;
+    }
+    false
+}
+
+/// 整串恰为「档位名」或「档位名-数字/点」（官方 `nhe` = `^(sonnet|opus|…)(-[\d.]+)?$`）。
+fn is_desktop_bare_tier_alias(lower: &str) -> bool {
+    DESKTOP_TIER_NAMES.iter().any(|tier| {
+        if lower == *tier {
+            return true;
+        }
+        lower
+            .strip_prefix(tier)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|digits| {
+                !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
+            })
+    })
+}
+
+/// Claude 桌面端（3p gateway 供应商）是否接受该模型 id。
+///
+/// 复刻 `app.asar` 的 `sD()`（判据与后果见本节顶部注释）。不接受的名字会被桌面端从模型列表里
+/// **过滤掉**——全部不接受时选择器为空、打开会话抛 `ModelsNotDiscoveredError`。
+///
+/// 注意：`claude-synaroute-` 前缀救不了桌面端（黑名单优先），所以桌面端分类的**对外名**必须
+/// 本身合规；真实上游名不受此限（配一条映射 `claude-opus-4-8` → `glm-4.6` 即可）。
+pub fn is_desktop_acceptable_model_id(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    if desktop_denied_vendor_name(&lower) {
+        return false;
+    }
+    is_desktop_bare_tier_alias(&lower)
+        || DESKTOP_ALLOW_KEYWORDS.iter().any(|k| lower.contains(k))
+}
+
 /// `resolve_model` 的命中路径，供日志展示「为什么变成这个模型」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelResolveKind {
@@ -465,6 +623,34 @@ impl ProviderKey {
         out
     }
 
+    /// 某**对外名**对应的上游模型上下文窗口（token 数）；查不到返回 None。
+    ///
+    /// 用于桌面端 gateway 档的 `supports1m` 断言：官方文档明确它是「**你对自己部署做的能力
+    /// 断言**，只对确认支持 1M 窗口的模型设置」，故必须有依据、不能一律写 true——上游实际
+    /// 不支持时，桌面端会给出一个必然失败的选项。
+    ///
+    /// 解析路径：对外名 → `resolve_model_detail` 得到真实名 → 在 `models` 里按真实名查
+    /// `context_window`。之所以要先 resolve：对外名可能是映射的 `expected_name`
+    /// （如 `claude-opus-4-8`），而窗口大小记在真实名（如 `glm-4.6`）那条 `ModelInfo` 上。
+    ///
+    /// **只认命中路径**（Mapping / Tier / Native）。兜底路径（Default / First / Passthrough）
+    /// 一律返回 None：那时 `resolve_model` 返回的是「这个 Key 不认识该名字，随便给你一个」，
+    /// 拿兜底模型的窗口去断言请求名的能力毫无依据 —— 会写出「对外名 X 支持 1M」而真实落点
+    /// 只有 200k，桌面端于是给出一个必然被截断的选项，恰是本函数要避免的后果。
+    pub fn context_window_for_outward(&self, outward_name: &str) -> Option<u32> {
+        let (real, kind) = self.resolve_model_detail(outward_name);
+        if !matches!(
+            kind,
+            ModelResolveKind::Mapping | ModelResolveKind::Tier | ModelResolveKind::Native
+        ) {
+            return None;
+        }
+        self.models
+            .iter()
+            .find(|m| m.real_name == real)
+            .and_then(|m| m.context_window)
+    }
+
     /// 选一个「保证能被上游接受」的真实模型名，用于真实补全健康探测。
     ///
     /// 关键：真实探测必须发上游认识的真实名，而非对外映射名。此前只看 default_model / models，
@@ -600,6 +786,11 @@ pub struct EventLogEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
     pub detail: String,
+    /// 该条是否带链路快照。**列表接口会把 `trace` 正文剥掉**（见 `Store::strip_trace`），
+    /// 但前端仍需知道「这行能不能展开看详情」，故单独留一个布尔位——它只有 1 字节，
+    /// 而正文最坏 40000 字符。展开时前端按事件 id 走 `get_event_trace` 单取一条。
+    #[serde(default)]
+    pub has_trace: bool,
     /// 调用模型日志的完整链路快照（仅 request 类型有；开关开启时才产生）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace: Option<RequestTrace>,
@@ -950,6 +1141,106 @@ mod tests {
         // 档位为空白串视作未配 → 不命中，走兜底透传
         let k = key_with_tiers(None, Some("   "), None);
         assert_eq!(k.resolve_model("claude-sonnet-4-5"), "claude-sonnet-4-5");
+    }
+
+    /// 桌面端模型名判据必须与 `app.asar` 的 `sD()` 逐例一致。
+    ///
+    /// 用例是把官方 `sD()` 原样搬到 Node 里跑出来的期望值（判据来源与反查方法见
+    /// `is_desktop_acceptable_model_id` 上方注释），不是凭规则推的。
+    #[test]
+    fn desktop_model_check_matches_official_asar_semantics() {
+        use super::is_desktop_acceptable_model_id as ok;
+
+        // ---- 接受 ----
+        for name in [
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-4-8-thinking",
+            "claude-3-5-haiku",
+            "opus",              // nhe: 裸档位名
+            "opus-4-8",          // nhe: 档位名 + 数字段（连字符 + 数字/点）
+            "sonnet-4.5",
+            "mythos",
+            "fable-5",
+            "anthropic/claude-opus-5",
+            "my-opus-pro",       // Snt 只要求「包含」关键词，不要求前缀
+            "x-claude-y",
+            "claude",
+            "OPUS",              // 大小写不敏感
+        ] {
+            assert!(ok(name), "桌面端应接受 {name:?}");
+        }
+
+        // ---- 拒绝：厂商名黑名单（Ent）----
+        for name in [
+            "glm-4.6",
+            "grok-4.5",
+            "gpt-5",
+            "kimi-k2",
+            "deepseek-v4-pro",
+            "qwen3-max",
+            "solar-pro",
+            "kat-coder-1",
+        ] {
+            assert!(!ok(name), "桌面端应拒绝厂商名 {name:?}");
+        }
+
+        // ---- 拒绝：黑名单优先于关键词（本次最容易踩的一条）----
+        // `claude-synaroute-` 前缀是给 Claude Code CLI 用的（它只判前缀、无黑名单）。
+        // 桌面端这边 `glm`/`grok` 照样命中黑名单 → 前缀救不了，别指望它。
+        assert!(
+            !ok("claude-synaroute-glm-4.6"),
+            "claude-synaroute- 前缀对桌面端无效：glm 仍命中黑名单"
+        );
+        assert!(!ok("claude-synaroute-grok-4.5"));
+        assert!(!ok("claude-gpt-5"), "含 claude 也救不了 gpt");
+        assert!(!ok("claude-opus-glm"), "含 claude+opus 也救不了 glm");
+
+        // ---- 拒绝：黑名单里的词边界项（\bling\b / \bunic\b / \bds- / \bk2\. / \bm2\.）----
+        assert!(!ok("ling-1.5"));
+        assert!(!ok("unic-1"));
+        assert!(!ok("ds-v3"));
+        assert!(!ok("k2.5"));
+        assert!(!ok("m2.1"));
+        // 词边界的反面：这些名字里虽含 ling/unic 的字母序列，但左侧是 \w，官方 \b 不匹配，
+        // 故仅因黑名单不成立；它们最终仍因「不含任何允许关键词」被拒。
+        // 用带关键词的形式验证词边界确实生效（sibling 含 ling 但不构成 \bling\b）。
+        assert!(
+            ok("claude-sibling-opus"),
+            "sibling 里的 ling 前面是 \\w，不构成 \\bling\\b，不该被误拒"
+        );
+
+        // ---- 拒绝：phi\d（phi- 已在普通子串项里）----
+        assert!(!ok("phi4"));
+        assert!(!ok("phi-3"));
+        assert!(
+            ok("claude-opus-phix"),
+            "phi 后不是数字、也不是 phi-，不该命中 phi\\d"
+        );
+
+        // ---- 拒绝：不含任何允许关键词 ----
+        assert!(!ok("sibling-model"), "既无关键词又非裸档位名");
+        assert!(!ok(""), "空名不接受");
+        assert!(!ok("   "), "空白名不接受");
+    }
+
+    /// CLI 与桌面端的判据是两套规则，不能互相顶替。
+    #[test]
+    fn cli_and_desktop_model_checks_are_different_rules() {
+        // 非合规名：CLI 靠包前缀救回（客户端只看 claude/anthropic 前缀）；桌面端救不回。
+        let wrapped = to_gateway_model_id("glm-4.6");
+        assert_eq!(wrapped, "claude-synaroute-glm-4.6");
+        assert!(
+            is_cli_discoverable_model_id(&wrapped),
+            "CLI 认前缀，包完就能在 /model 里展示"
+        );
+        assert!(
+            !is_desktop_acceptable_model_id(&wrapped),
+            "桌面端有厂商名黑名单且优先，包前缀无效——这正是桌面端必须用合规对外名的原因"
+        );
+        // 反向：裸档位名桌面端接受，但 CLI 的前缀判据不认（会被包上前缀）。
+        assert!(is_desktop_acceptable_model_id("opus"));
+        assert!(!is_cli_discoverable_model_id("opus"));
     }
 
     #[test]

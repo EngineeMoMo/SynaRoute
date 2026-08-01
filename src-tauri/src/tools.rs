@@ -19,7 +19,7 @@
 //!   凭据预填齐 → 桌面端跳过 get-started 登录。不写 CLI settings、不写 ANTHROPIC_*。
 
 use crate::error::{AppError, AppResult};
-use crate::model::CategoryType;
+use crate::model::{CategoryType, ProviderKey};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -50,15 +50,22 @@ const DESKTOP_META_FILE: &str = "_meta.json";
 /// 将某分类的代理端点写入对应目标工具配置。返回人类可读的结果说明。
 ///
 /// `models`：当前分类「主 Key」的可服务对外名列表（与 `/v1/models` 口径一致，有序）。
+/// `keys`：该分类按优先级排序的启用 Key。仅桌面端用到——从中推导每条模型的能力断言
+/// （`supports1m` 按 `contextWindow` 判定等，见 `build_desktop_model_entries`）。
 /// - **Claude CLI only**：取首个写 env.ANTHROPIC_MODEL + 顶层 `model`；并清除三档 DEFAULT_* 残留。
 /// - **Codex only**：取首个写 config.toml 顶层 `model`（Responses 形态，与 Claude 字段无关）。
 /// - **桌面端**：整份列表写进 gateway 档的 `inferenceModels`（切 3p 部署模式，见 apply_claude_desktop）。
-pub fn apply(category: CategoryType, endpoint: &str, models: &[String]) -> AppResult<String> {
+pub fn apply(
+    category: CategoryType,
+    endpoint: &str,
+    models: &[String],
+    keys: &[ProviderKey],
+) -> AppResult<String> {
     let first = models.first().map(String::as_str);
     match category {
         CategoryType::ClaudeCli => apply_claude_cli(endpoint, first),
         CategoryType::Codex => apply_codex(endpoint, first),
-        CategoryType::ClaudeDesktop => apply_claude_desktop(endpoint, models),
+        CategoryType::ClaudeDesktop => apply_claude_desktop(endpoint, models, keys),
     }
 }
 
@@ -166,7 +173,9 @@ fn apply_codex(endpoint: &str, default_model: Option<&str>) -> AppResult<String>
     // 全部抹掉（判据 `if let Some(Value::String(existing))` 对 `OPENAI_API_KEY: null`
     // 不命中，直接落到整份替换分支）——虽有 .bak 兜底，但一次误触就要用户重登官方账号。
     // 现在接入完全不触及官方登录状态。
-    with_rollback(&[path.clone()], || apply_codex_at(&path, endpoint, default_model))
+    with_rollback(std::slice::from_ref(&path), || {
+        apply_codex_at(&path, endpoint, default_model)
+    })
 }
 
 /// 历史说明（2026-07-31 起已移除对 `auth.json` 的写入）：
@@ -343,7 +352,11 @@ fn desktop_meta_path(threep: &Path) -> PathBuf {
     threep.join(DESKTOP_CONFIG_LIBRARY).join(DESKTOP_META_FILE)
 }
 
-fn apply_claude_desktop(endpoint: &str, models: &[String]) -> AppResult<String> {
+fn apply_claude_desktop(
+    endpoint: &str,
+    models: &[String],
+    keys: &[ProviderKey],
+) -> AppResult<String> {
     let (normal, threep) = claude_desktop_dirs()?;
     let normal_config = normal.join(DESKTOP_CONFIG_FILE);
     let threep_config = threep.join(DESKTOP_CONFIG_FILE);
@@ -364,7 +377,15 @@ fn apply_claude_desktop(endpoint: &str, models: &[String]) -> AppResult<String> 
             meta.clone(),
         ],
         || {
-            apply_desktop_at(&normal_config, &threep_config, &profile, &meta, endpoint, models)
+            apply_desktop_at(
+                &normal_config,
+                &threep_config,
+                &profile,
+                &meta,
+                endpoint,
+                models,
+                keys,
+            )
         },
     )?;
 
@@ -381,6 +402,9 @@ fn apply_claude_desktop(endpoint: &str, models: &[String]) -> AppResult<String> 
 }
 
 /// 可测入口：把 3p 部署模式与 gateway 档写入指定的四个文件。
+///
+/// `keys` 供推导每条模型的能力断言（`supports1m` 等，见 [`build_desktop_model_entries`]）；
+/// 传空切片时退化为「无窗口数据」，即 `supports1m` 一律不写（保守，不做无依据的断言）。
 fn apply_desktop_at(
     normal_config: &Path,
     threep_config: &Path,
@@ -388,6 +412,7 @@ fn apply_desktop_at(
     meta: &Path,
     endpoint: &str,
     models: &[String],
+    keys: &[ProviderKey],
 ) -> AppResult<String> {
     // gateway 档读一次，用于合并写 + 缺省模型回退。
     let existing = read_json_or_empty(profile)?;
@@ -417,16 +442,72 @@ fn apply_desktop_at(
     write_deployment_mode(threep_config, "3p")?;
 
     // 2) gateway 档：预填端点 + 占位 key + bearer + 模型清单（合并写，保留档内其它既有键）。
-    let profile_json = build_gateway_profile(existing, endpoint, &effective);
+    //    每条模型的能力断言（supports1m / anthropicFamilyTier）由 Key 数据推导，见
+    //    build_desktop_model_entries——不做无依据的断言。
+    let entries = build_desktop_model_entries(&effective, keys);
+    let profile_json = build_gateway_profile(existing, endpoint, &entries);
     backup_and_write_json(profile, &profile_json)?;
 
     // 3) _meta.json：登记本档（与 cc-switch 档共存）并把 appliedId 指向本档。
     write_desktop_meta_apply(meta)?;
 
-    Ok(format!(
+    let mut msg = format!(
         "已接入 Claude 桌面端（3p 部署模式）：{}，gateway 端点={endpoint}，模型={}，原文件已备份。请重启桌面端生效。",
         threep_config.display(),
         effective.join("/")
+    );
+    if let Some(warning) = desktop_model_names_warning(&effective) {
+        msg.push_str("\n\n");
+        msg.push_str(&warning);
+    }
+    Ok(msg)
+}
+
+/// 写进 `inferenceModels` 的名字里若有桌面端不接受的，生成警告文案（全合规则返回 None）。
+///
+/// **不阻断接入**（与 cc-switch 同口径）：照原样写进档里，保留「先接入、再回头调映射」的用法。
+/// 保存 Key 时已有前置拦截（见 `lib.rs` 的 `reject_desktop_key_with_unusable_model_names`），
+/// 这里是兜底——档内历史清单（改端口时回退用的 `existing_inference_model_names`）与更早版本
+/// 存下的 Key 都可能绕过那道拦截。
+///
+/// 不合规名会被桌面端在加载时**过滤掉**（不是提示）；全部不合规时选择器为空、打开会话抛
+/// `ModelsNotDiscoveredError`，故那种情形单独升级措辞。判据与后果详见
+/// [`crate::model::is_desktop_acceptable_model_id`]。
+fn desktop_model_names_warning(models: &[String]) -> Option<String> {
+    let bad: Vec<&str> = models
+        .iter()
+        .filter(|m| !crate::model::is_desktop_acceptable_model_id(m))
+        .map(String::as_str)
+        .collect();
+    if bad.is_empty() {
+        return None;
+    }
+    let all_bad = bad.len() == models.len();
+    let head = if all_bad {
+        format!(
+            "⚠ 全部 {} 个模型名都不被桌面端接受：{}\n\
+             桌面端会把它们从模型列表里过滤掉 → 模型选择器为空 → 打开会话报 \
+             ModelsNotDiscoveredError。**当前这份配置写进去了但用不了。**",
+            bad.len(),
+            bad.join("、")
+        )
+    } else {
+        format!(
+            "⚠ 其中 {} 个模型名不被桌面端接受：{}\n\
+             它们会被桌面端从模型列表里过滤掉（其余 {} 个仍可用）。",
+            bad.len(),
+            bad.join("、"),
+            models.len() - bad.len()
+        )
+    };
+    Some(format!(
+        "{head}\n\
+         要求：名字须含 claude/opus/sonnet/haiku/fable/mythos/anthropic 之一，\
+         且不得含 glm/gpt/grok/deepseek/qwen/kimi/llama 等厂商名。\
+         注意 claude-synaroute- 前缀对桌面端无效。\n\
+         修法：在「模型映射」里把对外名改成合规形式（如 claude-opus-4-8 → {}），\
+         对外用合规名、上游仍打原名。",
+        bad.first().copied().unwrap_or("上游真实名")
     ))
 }
 
@@ -557,6 +638,56 @@ fn write_deployment_mode(path: &Path, mode: &str) -> AppResult<()> {
     backup_and_write_json(path, &root)
 }
 
+/// 桌面端 gateway 档里 `inferenceModels` 的一条：对外名 + 由 Key 数据推导出的能力断言。
+///
+/// 三个字段各有官方语义（判据：`app.asar` v1.24012.9 的 `inferenceModels` schema，
+/// offset ≈ 7013300 / 消费点 ≈ 7400700）：
+/// - `supports1m`：**你对自己部署做的能力断言**，只对确认支持 1M 窗口的模型设置。
+///   故此处按该对外名解析到的上游模型 `contextWindow` 判定，**无数据时保守 false**——
+///   一律写 true 会让桌面端给出一个上游实际不支持、必然失败的 1M 选项。
+/// - `anthropic_family_tier`：桌面端遇到裸别名（`opus`/`sonnet`/…）时钉到本条；不填则裸别名无处可落。
+/// - `is_family_default`：同档位多条时选谁。同档位内只给**第一条**置 true（官方对多个 true
+///   会告警并取首个，我们不制造这种告警）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DesktopModelEntry {
+    pub name: String,
+    pub supports1m: bool,
+    pub anthropic_family_tier: Option<&'static str>,
+    pub is_family_default: bool,
+}
+
+/// 把「对外名列表 + 各分类启用 Key」组装成 gateway 档需要的模型条目。
+///
+/// `keys` 为该分类按优先级排序的启用 Key（与 `discoverable_models` 同源）。
+///
+/// **窗口只认主 Key**（`keys.first()`，即路由实际优先落点），不逐 Key 找第一个有数据的。
+/// 逐 Key 找的问题：主 Key 把 `claude-opus-4-8` 映射到一个没记 `context_window` 的模型
+/// （`fetch_models` 拉来的模型一律 `context_window: None`，很常见），备用 Key 恰好记了 1M，
+/// 于是写出 `supports1m: true` —— 而请求实际落在主 Key 的 200k 上，桌面端给出一个必然被截断
+/// 的选项。查不到就保守写 false：少一个 1M 选项只是少个可选项，多一个假的会让请求直接失败。
+fn build_desktop_model_entries(
+    models: &[String],
+    keys: &[ProviderKey],
+) -> Vec<DesktopModelEntry> {
+    let mut tier_seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    let primary = keys.first();
+    models
+        .iter()
+        .map(|name| {
+            let ctx = primary.and_then(|k| k.context_window_for_outward(name));
+            let tier = crate::model::desktop_family_tier_of(name);
+            // 同档位只让第一条当默认（官方对多个 isFamilyDefault 会告警并取首个）。
+            let is_default = tier.is_some_and(|t| tier_seen.insert(t));
+            DesktopModelEntry {
+                name: name.clone(),
+                supports1m: ctx.is_some_and(|c| c >= crate::model::ONE_MILLION_CONTEXT),
+                anthropic_family_tier: tier,
+                is_family_default: is_default,
+            }
+        })
+        .collect()
+}
+
 /// 构造 gateway 配置档 JSON（对齐 cc-switch `build_gateway_profile`）。
 ///
 /// **合并写**：在 `existing`（档内既有内容）之上覆盖本函数负责的 7 个键，其余键原样保留——
@@ -565,9 +696,18 @@ fn write_deployment_mode(path: &Path, mode: &str) -> AppResult<()> {
 ///
 /// `inferenceGatewayApiKey` 用占位（代理剥入站鉴权头、按路由 Key 注入真实密钥）；
 /// `inferenceGatewayBaseUrl` 指向本地代理源（桌面端按 Anthropic 风格发 /v1/messages，代理已识别）。
-/// `models` 恒非空（调用方已挡空列表），统一按 supports1m=true 暴露（对齐本机 cc-switch 样本：
-/// opus/sonnet 系均标 supports1m）。
-fn build_gateway_profile(existing: Value, endpoint: &str, models: &[String]) -> Value {
+///
+/// `disableDeploymentModeChooser` 恒 `true`：**对齐 cc-switch 实测样本**（用户拍板保持一致）。
+/// 注意它并非 3p 生效的必需条件——判据 `pd(e) = hasInference(e) && (disableClaudeAiSignIn(e)
+/// || persistedMode() !== "1p")`（`app.asar` offset ≈ 7100100）是「或」关系，而我们本就会写
+/// `deploymentMode=3p`。代价是接入后桌面端里看不到官方登录入口，须从 SynaRoute 点还原才能回官方。
+///
+/// `entries` 恒非空（调用方已挡空列表）；每条的能力断言见 [`DesktopModelEntry`]。
+fn build_gateway_profile(
+    existing: Value,
+    endpoint: &str,
+    entries: &[DesktopModelEntry],
+) -> Value {
     let mut obj = match existing {
         Value::Object(map) => map,
         _ => serde_json::Map::new(),
@@ -591,13 +731,23 @@ fn build_gateway_profile(existing: Value, endpoint: &str, models: &[String]) -> 
     );
     obj.insert("inferenceProvider".into(), Value::String("gateway".into()));
     // 恒写 inferenceModels（调用方已挡空列表）：合并写下若沿用旧值会与当前可服务集脱节。
-    let arr: Vec<Value> = models
+    let arr: Vec<Value> = entries
         .iter()
-        .map(|m| {
-            let mut e = serde_json::Map::new();
-            e.insert("name".into(), Value::String(m.clone()));
-            e.insert("supports1m".into(), Value::Bool(true));
-            Value::Object(e)
+        .map(|e| {
+            let mut o = serde_json::Map::new();
+            o.insert("name".into(), Value::String(e.name.clone()));
+            // supports1m 只在确有依据时写：官方语义是能力断言，无依据即不断言。
+            if e.supports1m {
+                o.insert("supports1m".into(), Value::Bool(true));
+            }
+            if let Some(tier) = e.anthropic_family_tier {
+                o.insert("anthropicFamilyTier".into(), Value::String(tier.into()));
+                // isFamilyDefault 只在有 tier 时才有意义（官方对「无 tier 却设该标记」会告警并忽略）。
+                if e.is_family_default {
+                    o.insert("isFamilyDefault".into(), Value::Bool(true));
+                }
+            }
+            Value::Object(o)
         })
         .collect();
     obj.insert("inferenceModels".into(), Value::Array(arr));
@@ -867,7 +1017,7 @@ fn register_mcp_claude_desktop_at(path: &Path, exe_path: &str) -> AppResult<(Str
     // 触发重写，把非法项换成合法 stdio 项。
     if servers_obj.get(MCP_CLIENT_NAME) == Some(&desired) {
         return Ok((
-            format!("Claude 桌面端 MCP（stdio）已是最新，跳过"),
+            "Claude 桌面端 MCP（stdio）已是最新，跳过".to_string(),
             false,
         ));
     }
@@ -1049,10 +1199,7 @@ fn backup_and_write_bytes(path: &Path, data: &[u8]) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // 幂等 + 保护备份：新内容与磁盘现有内容完全一致时，不备份也不写盘。
-    // 关键：杜绝「重复接入」把已接入的内容再拷进 .synaroute.bak，冲掉用户接入前的原始备份
-    // （否则 restore 只能还原出「已接入」态，官方 config / OAuth 登录再也回不来）。
-    // 首次接入时新旧内容不同 → 正常备份原文件；此后再接入内容相同 → 直接跳过，.bak 保持原始态。
+    // 幂等：新内容与磁盘现有内容完全一致时，不备份也不写盘（连 .bak 的存在性判定都不必做）。
     if path.exists() {
         if let Ok(current) = std::fs::read(path) {
             if current == data {
@@ -1060,9 +1207,22 @@ fn backup_and_write_bytes(path: &Path, data: &[u8]) -> AppResult<()> {
             }
         }
     }
-    // 规则1：改写前备份原文件
+    // 规则1：改写前备份原文件，但**首写即锁**——`.bak` 已存在就绝不覆盖。
+    //
+    // 为什么不能只靠「内容相等」守卫（数据丢失级教训）：那条守卫只挡住「重复接入且内容逐字节
+    // 相同」这一种。真实场景里重复接入的内容几乎总会变——改代理端口、可服务模型列表变化、
+    // 升级换目录导致 MCP 的 command 路径变化——于是守卫不命中，第二次接入就把**已接入态**
+    // 拷进 `.bak`，冲掉用户接入前的原始快照。此后点「还原」拿回的是「已接入 v1」，
+    // 官方 config / ChatGPT OAuth 登录再也回不来（CLI 与 Codex 的 restore 直接读 `.bak`）。
+    //
+    // 首写即锁后，`.bak` 恒为「SynaRoute 第一次动这个文件之前」的内容，重复接入多少次都不变质。
+    // 配套：`restore_one` 还原成功后删掉 `.bak`（见该函数），让下一轮接入重新抓一份新鲜快照，
+    // 否则锁死的旧快照会在「接入→还原→改配置→再接入→再还原」时把用户改动覆盖回很久以前。
     if path.exists() {
-        std::fs::copy(path, backup_path_for(path))?;
+        let backup = backup_path_for(path);
+        if !backup.exists() {
+            std::fs::copy(path, &backup)?;
+        }
     }
     // 规则2：原子写
     crate::secret::atomic_write(path, data)
@@ -1119,6 +1279,12 @@ fn backup_path_for(path: &Path) -> PathBuf {
 }
 
 /// 从 `.synaroute.bak` 还原单个文件；备份不存在则返回 false（跳过，不报错）。
+///
+/// 还原成功后**删除 `.bak`**：与 `backup_and_write_bytes` 的「首写即锁」配套。
+/// 备份既已交还给目标文件，就该让下一轮接入重新抓一份新鲜的「接入前快照」——否则被锁死的旧
+/// 快照会在「接入 → 还原 → 用户改配置 → 再接入 → 再还原」时把用户改动覆盖回很久以前的状态。
+/// 副作用（可接受且语义准确）：连点两次还原，第二次会返回「无备份，无需还原」。
+/// 删除失败只告警不上抛：还原本身已成功，不该因清理失败把成功报成失败。
 fn restore_one(path: &Path) -> AppResult<bool> {
     let backup = backup_path_for(path);
     if !backup.exists() {
@@ -1126,6 +1292,9 @@ fn restore_one(path: &Path) -> AppResult<bool> {
     }
     let data = std::fs::read(&backup)?;
     crate::secret::atomic_write(path, &data)?;
+    if let Err(e) = std::fs::remove_file(&backup) {
+        tracing::warn!("还原后清理备份 {} 失败: {e}", backup.display());
+    }
     Ok(true)
 }
 
@@ -1228,8 +1397,32 @@ fn restore_claude_desktop() -> AppResult<String> {
 /// 可测入口：对指定的四个文件执行桌面端还原（不解析真实目录、不读写 SynaRoute 侧记录，
 /// 便于单测注入临时路径并断言真实逻辑，而非在测试里重抄一遍步骤）。
 ///
+/// **整体原子**：还原要动 4 个文件（两个 config 的 deploymentMode、本档 profile、`_meta`），
+/// 任一步失败就把 4 个文件全部恢复到还原前的状态。否则会留下「半还原」态——最典型的是
+/// profile 已删、`_meta` 却仍把 `appliedId` 指着它，桌面端启动时拿不到那份 gateway 档而卡死。
+/// 与接入侧（`apply_claude_desktop`）用同一套 `with_rollback` 保证。
+///
 /// `prefer`：appliedId 指向本档时优先交还给它（须仍在 entries 里），否则退化为剩余首个。
 fn restore_desktop_at(
+    normal_config: &Path,
+    threep_config: &Path,
+    profile: &Path,
+    meta: &Path,
+    prefer: Option<&str>,
+) -> AppResult<String> {
+    with_rollback(
+        &[
+            normal_config.to_path_buf(),
+            threep_config.to_path_buf(),
+            profile.to_path_buf(),
+            meta.to_path_buf(),
+        ],
+        || restore_desktop_steps(normal_config, threep_config, profile, meta, prefer),
+    )
+}
+
+/// 桌面端还原的实际步骤（由 [`restore_desktop_at`] 套上整体回滚后调用）。
+fn restore_desktop_steps(
     normal_config: &Path,
     threep_config: &Path,
     profile: &Path,
@@ -1416,6 +1609,10 @@ pub struct ToolConfigPreview {
     /// 本分类是否已接入 MCP 大脑聚合（目标配置文件里已含 synaroute MCP 段）。
     /// 供前端「接入/移除大脑聚合」按钮判定当前态，与全局 mcp_enabled 开关无关。
     pub mcp_registered: bool,
+    /// **仅桌面端**：接入被其他工具（如 cc-switch）接管时的说明；未被接管则为 None。
+    /// 见 [`detect_desktop_takeover`]。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub takeover_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1445,6 +1642,7 @@ fn preview_claude_cli() -> AppResult<ToolConfigPreview> {
         category_id: CategoryType::ClaudeCli,
         summary: "Claude CLI：~/.claude/settings.json。写入 BASE_URL / AUTH_TOKEN(占位) / 发现开关 / ANTHROPIC_MODEL / 顶层 model；不写三档 DEFAULT_*，不写 Codex/桌面端文件。".into(),
         mcp_registered: is_mcp_registered(CategoryType::ClaudeCli),
+        takeover_warning: None,
         files: vec![ToolConfigFilePreview {
             path: path.display().to_string(),
             exists,
@@ -1467,6 +1665,7 @@ fn preview_codex() -> AppResult<ToolConfigPreview> {
         category_id: CategoryType::Codex,
         summary: "Codex：~/.codex/config.toml + auth.json。写入 model_provider=synaroute、[model_providers.synaroute]、可选 model、OPENAI_API_KEY 占位。不写任何 ANTHROPIC_* / settings.json。".into(),
         mcp_registered: is_mcp_registered(CategoryType::Codex),
+        takeover_warning: None,
         files: vec![
             ToolConfigFilePreview {
                 path: cfg.display().to_string(),
@@ -1507,8 +1706,43 @@ fn preview_claude_desktop() -> AppResult<ToolConfigPreview> {
         category_id: CategoryType::ClaudeDesktop,
         summary: "Claude 桌面端（3p 部署模式）：两个 claude_desktop_config.json 写 deploymentMode=3p，Claude-3p/configLibrary 里写 gateway 档（inferenceGatewayBaseUrl 指向本机代理 + 占位 key + bearer + 可选模型）并登记进 _meta。凭据预填齐即跳过 get-started。与 cc-switch 用独立档共存。不写 CLI 的 settings.json。".into(),
         mcp_registered: is_mcp_registered(CategoryType::ClaudeDesktop),
+        takeover_warning: detect_desktop_takeover_at(&profile, &meta),
         files,
     })
+}
+
+/// 检测「桌面端接入已被其他工具接管」。返回 None = 没被接管（含「我们本就没接入」）。
+///
+/// 为什么需要：cc-switch 一被点开就会**整份重写** `configLibrary/_meta.json`，把 SynaRoute
+/// 登记的 entry 连 `appliedId` 一起换成它自己的。此时 SynaRoute 的 gateway 档文件还在磁盘上，
+/// UI 也仍显示「已接入」，但桌面端实际加载的是 cc-switch 那一档 —— 用户只看到「接入了但不生效」，
+/// 且没有任何线索指向真正的原因。
+///
+/// 判据：本档 profile 文件存在（说明我们确实接入过）**且** `_meta.appliedId` 不是本档。
+/// 两个条件都必要：
+/// - 只看 appliedId 会把「从未接入」误报成被接管；
+/// - 只看 profile 存在则漏掉「appliedId 仍是我们、只是档没了」这种情况（那属另一类残缺，
+///   接入流程会重写补齐，不是接管）。
+fn detect_desktop_takeover_at(profile: &Path, meta: &Path) -> Option<String> {
+    if !profile.exists() {
+        return None; // 没接入过，无从谈接管
+    }
+    let applied = read_desktop_applied_id(meta);
+    match applied.as_deref() {
+        Some(DESKTOP_PROFILE_ID) => None, // 仍指向本档，正常
+        Some(other) => Some(format!(
+            "SynaRoute 的 gateway 档仍在磁盘上，但桌面端当前生效的是另一档（appliedId={other}）\
+             ——通常是 cc-switch 等工具被打开后整份重写了 _meta.json。\
+             此时桌面端走的是那一档、不经 SynaRoute 代理。\
+             重新点「写入工具配置」即可把 appliedId 改回本档。"
+        )),
+        None => Some(
+            "SynaRoute 的 gateway 档仍在磁盘上，但 _meta.json 里已没有 appliedId\
+             ——通常是其他工具重写了该文件。桌面端此时不会加载任何 3p 档。\
+             重新点「写入工具配置」即可恢复。"
+                .into(),
+        ),
+    }
 }
 
 fn read_preview_text(path: &Path, redact_secrets: bool) -> AppResult<(bool, Option<String>)> {
@@ -2370,6 +2604,62 @@ mod tests {
     }
 
     #[test]
+    fn repeated_apply_with_changed_content_keeps_original_backup() {
+        // P0 回归（数据丢失级）：重复接入且**内容变化**时，.bak 仍必须是接入前的原始内容。
+        //
+        // 旧实现只有「内容逐字节相同」才短路，否则无条件覆盖 .bak。而真实重复接入的内容几乎
+        // 总会变——改代理端口、可服务模型列表变化、升级换目录导致 MCP 的 command 路径变化
+        // ——于是第二次接入把「已接入 v1」拷进 .bak，用户点还原拿回的是已接入态，官方配置
+        // 与 ChatGPT OAuth 登录永久丢失（CLI/Codex 的 restore 直接读 .bak）。
+        // 旧测试 repeated_apply_does_not_clobber_backup 只覆盖「内容相同」，故一直是绿的。
+        let path = temp_file("changed_clobber", "config.toml");
+        std::fs::write(&path, b"OFFICIAL_CONFIG").unwrap();
+        let backup = backup_path_for(&path);
+
+        // 接入 v1（如端口 8787）
+        backup_and_write_bytes(&path, b"SYNAROUTE_V1_PORT_8787").unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), b"OFFICIAL_CONFIG");
+
+        // 接入 v2（用户改了端口 → 内容不同，旧实现在此把 v1 写进 .bak）
+        backup_and_write_bytes(&path, b"SYNAROUTE_V2_PORT_9999").unwrap();
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"OFFICIAL_CONFIG",
+            ".bak 首写即锁：内容变化的重复接入也不得覆盖接入前的原始快照"
+        );
+
+        // 接入 v3，再确认一次（多次变化都不动 .bak）
+        backup_and_write_bytes(&path, b"SYNAROUTE_V3_MORE_MODELS").unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), b"OFFICIAL_CONFIG");
+
+        // 还原：必须拿回**原始**内容，而不是任何一版已接入态。
+        assert!(restore_one(&path).unwrap());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"OFFICIAL_CONFIG",
+            "还原必须回到接入前的原始配置"
+        );
+
+        // 还原后 .bak 应被删除，让下一轮接入重新抓新鲜快照
+        // （否则锁死的旧快照会在「还原→改配置→再接入→再还原」时把用户改动覆盖回很久以前）。
+        assert!(
+            !backup.exists(),
+            "还原成功后应删除 .bak，使下次接入重新抓取接入前快照"
+        );
+
+        // 还原后再接入：新的 .bak 应记录「本轮接入前」的内容（即刚还原出的原始内容）。
+        std::fs::write(&path, b"USER_EDITED_AFTER_RESTORE").unwrap();
+        backup_and_write_bytes(&path, b"SYNAROUTE_V4").unwrap();
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"USER_EDITED_AFTER_RESTORE",
+            "新一轮接入应抓取当轮接入前的内容作为备份"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
     fn restore_removes_placeholder_only_auth_without_backup() {
         // Q3 回归：接入前无 auth.json → 接入凭空建纯占位符文件 → 无 .bak。
         // 还原应删除该占位符文件，让用户回到接入前「无 auth.json」态。
@@ -2621,6 +2911,272 @@ tool_timeout_sec = 600
         vec!["claude-opus-4-8".to_string()]
     }
 
+    /// 造一个桌面端 Key：`models` 为 (真实名, contextWindow) 对，`mappings` 为 (对外名, 真实名)。
+    fn desktop_key(
+        models: &[(&str, Option<u32>)],
+        mappings: &[(&str, &str)],
+    ) -> ProviderKey {
+        use crate::model::{HealthState, KeyParams, ModelInfo, ModelMapping, Protocol};
+        ProviderKey {
+            id: "k1".into(),
+            category_id: CategoryType::ClaudeDesktop,
+            name: "k".into(),
+            vendor: "test".into(),
+            base_url: "https://example.com".into(),
+            protocol: Protocol::Anthropic,
+            has_secret: true,
+            enabled: true,
+            priority: 0,
+            headers_json: None,
+            params: KeyParams::default(),
+            models: models
+                .iter()
+                .map(|(n, ctx)| ModelInfo {
+                    real_name: (*n).into(),
+                    source: "manual".into(),
+                    fetched_at: None,
+                    context_window: *ctx,
+                })
+                .collect(),
+            mappings: mappings
+                .iter()
+                .enumerate()
+                .map(|(i, (out, real))| ModelMapping {
+                    id: format!("m{i}"),
+                    expected_name: (*out).into(),
+                    real_name: (*real).into(),
+                })
+                .collect(),
+            default_model: None,
+            tier_haiku: None,
+            tier_sonnet: None,
+            tier_opus: None,
+            health: HealthState::default(),
+        }
+    }
+
+    /// `supports1m` 是**能力断言**：只在该对外名解析到的上游模型 contextWindow ≥ 1M 时写。
+    ///
+    /// 官方文档原话是「a capability assertion you make about your deployment，只对确认支持
+    /// 1M 窗口的模型设置」。此前一律写 true——上游实际不支持时，桌面端会给出一个必然失败的
+    /// 1M 选项，用户选中后每次请求都报错、且看不出是配置问题。
+    #[test]
+    fn desktop_supports1m_follows_context_window() {
+        // 对外名 → 真实名经映射；窗口大小记在真实名那条 ModelInfo 上，故需先 resolve 再查。
+        let key = desktop_key(
+            &[("glm-4.6", Some(1_000_000)), ("glm-4.5", Some(128_000))],
+            &[("claude-opus-4-8", "glm-4.6"), ("claude-sonnet-4-5", "glm-4.5")],
+        );
+        let entries = build_desktop_model_entries(
+            &[
+                "claude-opus-4-8".to_string(),
+                "claude-sonnet-4-5".to_string(),
+            ],
+            std::slice::from_ref(&key),
+        );
+
+        assert!(entries[0].supports1m, "1M 窗口的模型应断言 supports1m");
+        assert!(
+            !entries[1].supports1m,
+            "128k 窗口不得断言 supports1m（否则桌面端给出必然失败的 1M 选项）"
+        );
+    }
+
+    #[test]
+    fn desktop_supports1m_stays_false_without_context_data() {
+        // 没有 contextWindow 数据（用户手填模型名、未拉取）→ 保守不断言。
+        let key = desktop_key(&[("glm-4.6", None)], &[("claude-opus-4-8", "glm-4.6")]);
+        let entries =
+            build_desktop_model_entries(&["claude-opus-4-8".to_string()], std::slice::from_ref(&key));
+        assert!(!entries[0].supports1m, "无依据时不做能力断言");
+
+        // 连 Key 都没有（如 preview / 改端口回退路径）→ 同样不断言，且不 panic。
+        let none = build_desktop_model_entries(&["claude-opus-4-8".to_string()], &[]);
+        assert!(!none[0].supports1m);
+    }
+
+    /// 窗口数据只认**主 Key**，不得从备用 Key 借。
+    ///
+    /// 失败场景：主 Key 把 `claude-opus-4-8` 映射到没记 `context_window` 的模型
+    /// （`fetch_models` 拉来的一律为 None，很常见），备用 Key 恰好记了 1M。逐 Key 找「第一个
+    /// 有数据的」会写出 `supports1m: true`，而请求实际落在主 Key 的模型上 —— 桌面端给出一个
+    /// 必然被截断的 1M 选项，恰是这个断言要防的后果。
+    #[test]
+    fn desktop_supports1m_uses_primary_key_only_not_fallback() {
+        // 主 Key：映射命中但无窗口数据
+        let primary = desktop_key(&[("glm-4.6", None)], &[("claude-opus-4-8", "glm-4.6")]);
+        // 备用 Key：同一个对外名，映射到一个记了 1M 的模型
+        let mut backup = desktop_key(
+            &[("other-1m", Some(1_000_000))],
+            &[("claude-opus-4-8", "other-1m")],
+        );
+        backup.id = "k2".into();
+        backup.priority = 1;
+
+        let entries = build_desktop_model_entries(
+            &["claude-opus-4-8".to_string()],
+            &[primary, backup],
+        );
+        assert!(
+            !entries[0].supports1m,
+            "主 Key 无窗口数据时必须保守 false，不能借用备用 Key 的 1M（路由落点是主 Key）"
+        );
+    }
+
+    /// 兜底解析路径不得产出窗口断言。
+    ///
+    /// `resolve_model` 在 Key 不认识请求名时会一路兜底到 `default_model` / `models` 首个 ——
+    /// 那时返回的是「随便给你一个」，拿它的窗口去断言请求名的能力毫无依据。
+    #[test]
+    fn desktop_supports1m_ignores_fallback_resolution() {
+        // Key 只认识 big-1m（记了 1M），没有任何映射；请求一个它不认识的对外名。
+        let mut key = desktop_key(&[("big-1m", Some(1_000_000))], &[]);
+        key.default_model = Some("big-1m".into());
+
+        // 对外名 unknown-name 走不到 Mapping/Tier/Native，只能兜底到 big-1m
+        let entries = build_desktop_model_entries(
+            &["unknown-name".to_string()],
+            std::slice::from_ref(&key),
+        );
+        assert!(
+            !entries[0].supports1m,
+            "兜底解析不是该对外名的真实能力，不得据此断言 supports1m"
+        );
+
+        // 对照：原生认识的名字（Native 命中）应当照常断言
+        let native = build_desktop_model_entries(
+            &["big-1m".to_string()],
+            std::slice::from_ref(&key),
+        );
+        assert!(native[0].supports1m, "Native 命中时应当正常断言");
+    }
+
+    /// `anthropicFamilyTier` 让桌面端的裸别名（`opus`/`sonnet`/…）钉到指定条目；
+    /// 同档位多条时只有第一条带 `isFamilyDefault`（官方对多个 true 会告警并取首个）。
+    #[test]
+    fn desktop_family_tier_is_derived_and_default_is_unique_per_tier() {
+        let entries = build_desktop_model_entries(
+            &[
+                "claude-opus-4-8".to_string(),
+                "claude-opus-5".to_string(),
+                "claude-sonnet-4-5".to_string(),
+                "claude-haiku-4-5".to_string(),
+                // 不含任何档位子串 → 无 tier，也就不该有 isFamilyDefault
+                "claude-custom".to_string(),
+            ],
+            &[],
+        );
+
+        assert_eq!(entries[0].anthropic_family_tier, Some("opus"));
+        assert!(entries[0].is_family_default, "opus 档第一条应为默认");
+        assert_eq!(entries[1].anthropic_family_tier, Some("opus"));
+        assert!(!entries[1].is_family_default, "同档位第二条不得再标默认");
+        assert_eq!(entries[2].anthropic_family_tier, Some("sonnet"));
+        assert!(entries[2].is_family_default, "sonnet 档首条独立计算");
+        assert_eq!(entries[3].anthropic_family_tier, Some("haiku"));
+        assert!(entries[3].is_family_default);
+        assert_eq!(entries[4].anthropic_family_tier, None, "无档位子串 → 不填 tier");
+        assert!(
+            !entries[4].is_family_default,
+            "无 tier 时不得设 isFamilyDefault（官方会告警并忽略）"
+        );
+    }
+
+    /// 无 tier 的条目在 JSON 里必须**既无** `anthropicFamilyTier` **也无** `isFamilyDefault`。
+    #[test]
+    fn desktop_profile_omits_tier_keys_when_not_derivable() {
+        let entries = build_desktop_model_entries(&["claude-custom".to_string()], &[]);
+        let p = build_gateway_profile(Value::Null, "http://127.0.0.1:1", &entries);
+        let m = &p["inferenceModels"][0];
+        assert_eq!(m["name"], "claude-custom");
+        assert!(m["anthropicFamilyTier"].is_null());
+        assert!(m["isFamilyDefault"].is_null());
+        assert!(m["supports1m"].is_null(), "无窗口数据不写 supports1m");
+    }
+
+    /// cc-switch 接管检测：档还在但 `appliedId` 已被换掉 → 必须能被识别并给出可操作说明。
+    ///
+    /// 这是「接入了但不生效」这类无头案的直接线索来源：cc-switch 一被点开就整份重写
+    /// `_meta.json`，SynaRoute 的档文件还在、UI 也仍显示已接入，但桌面端加载的是别人那一档。
+    #[test]
+    fn desktop_takeover_detected_when_applied_id_points_elsewhere() {
+        let (dir, normal, threep, profile, meta) = desktop_layout("takeover");
+        let ccswitch_id = "00000000-0000-4000-8000-000000157210";
+
+        // 未接入（无 profile）→ 不该误报被接管。
+        assert!(
+            detect_desktop_takeover_at(&profile, &meta).is_none(),
+            "从未接入时不得报「被接管」"
+        );
+
+        // 正常接入 → appliedId 是本档 → 无警告。
+        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
+        assert!(
+            detect_desktop_takeover_at(&profile, &meta).is_none(),
+            "appliedId 仍指向本档时不得报警"
+        );
+
+        // 模拟 cc-switch 被打开：整份重写 _meta.json，把 appliedId 与 entries 换成它自己的。
+        std::fs::write(
+            &meta,
+            format!(
+                r#"{{"appliedId":"{ccswitch_id}","entries":[{{"id":"{ccswitch_id}","name":"CC Switch"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let warn = detect_desktop_takeover_at(&profile, &meta).expect("被接管必须能检测到");
+        assert!(warn.contains(ccswitch_id), "要点出当前生效的是哪一档: {warn}");
+        assert!(
+            warn.contains("写入工具配置"),
+            "要给出可操作的恢复方式: {warn}"
+        );
+
+        // appliedId 整个被删掉（其他工具重写成不含该键）→ 同样算接管。
+        std::fs::write(&meta, r#"{"entries":[]}"#).unwrap();
+        let warn2 = detect_desktop_takeover_at(&profile, &meta).expect("缺 appliedId 也应报警");
+        assert!(warn2.contains("没有 appliedId"), "{warn2}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P2#6 复核护栏：三端预览对「单个文件读不出」都必须降级为占位，**不得整份返回 Err**。
+    ///
+    /// 结论：`read_preview_text` 是三端唯一的读取入口，且它对读失败已返回
+    /// `Ok((true, Some("/* 无法读取… */")))` 而非 Err —— 所以 codex / CLI 两条路径其实早已与
+    /// 桌面端同等容错（docs/14 里那条 P2 是过时的）。本测试把该行为**锁住**，防止日后有人
+    /// 图省事把 `?` 加回去：一旦整份 Err，前端会丢掉全部路径、聚合页永久卡「加载中」。
+    #[test]
+    fn preview_degrades_unreadable_file_instead_of_failing_whole_snapshot() {
+        // 用目录冒充文件：read_to_string 必然失败（Windows/Unix 均如此），且不依赖权限。
+        let fake = temp_file("preview_unreadable", "settings.json");
+        std::fs::create_dir_all(&fake).unwrap();
+        let dir = fake.parent().unwrap().to_path_buf();
+
+        let (exists, content) = read_preview_text(&fake, true).expect("读失败不得上抛");
+        assert!(exists, "文件（这里是目录）确实存在，应报 exists=true");
+        let text = content.expect("应给出占位文本而非 None");
+        assert!(
+            text.contains("无法读取"),
+            "占位要说明原因，否则用户以为文件是空的: {text}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 未接入 / 已正常接入时都不得报「被接管」——只看 appliedId 会把「从未接入」误报。
+    #[test]
+    fn takeover_not_reported_without_our_profile() {
+        let (dir, _normal, _threep, profile, meta) = desktop_layout("takeover_none");
+        std::fs::create_dir_all(meta.parent().unwrap()).unwrap();
+        // 场景：别人的档已生效，但我们从未接入（无 profile 文件）→ 不是接管，是「没接入」。
+        std::fs::write(&meta, r#"{"appliedId":"00000000-0000-4000-8000-000000157210"}"#).unwrap();
+        assert!(
+            detect_desktop_takeover_at(&profile, &meta).is_none(),
+            "从未接入时不得报「被接管」，否则每个新用户一打开预览就看到假警告"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn desktop_apply_writes_3p_mode_and_gateway_profile() {
         let (dir, normal, threep, profile, meta) = desktop_layout("desktop_apply");
@@ -2639,6 +3195,7 @@ tool_timeout_sec = 600
             &meta,
             "http://127.0.0.1:47102",
             &models,
+            &[],
         )
         .unwrap();
         assert!(msg.contains("3p 部署模式"));
@@ -2661,10 +3218,22 @@ tool_timeout_sec = 600
         assert_eq!(p["inferenceGatewayApiKey"], DESKTOP_GATEWAY_PLACEHOLDER);
         assert_eq!(p["disableDeploymentModeChooser"], true);
         assert_eq!(p["coworkEgressAllowedHosts"][0], "*");
-        // inferenceModels：数组、名字对、supports1m=true。
+        // inferenceModels：数组、名字对。
         assert_eq!(p["inferenceModels"][0]["name"], "claude-opus-4-8");
-        assert_eq!(p["inferenceModels"][0]["supports1m"], true);
         assert_eq!(p["inferenceModels"][1]["name"], "claude-opus-5");
+        // supports1m 是**能力断言**，无 contextWindow 依据时（本例传空 keys）不得凭空写。
+        assert!(
+            p["inferenceModels"][0]["supports1m"].is_null(),
+            "无窗口数据时不该断言 supports1m：上游不支持会让桌面端给出必然失败的选项"
+        );
+        // anthropicFamilyTier 按名字含哪个档位子串推导；同档位只有第一条当默认。
+        assert_eq!(p["inferenceModels"][0]["anthropicFamilyTier"], "opus");
+        assert_eq!(p["inferenceModels"][0]["isFamilyDefault"], true);
+        assert_eq!(p["inferenceModels"][1]["anthropicFamilyTier"], "opus");
+        assert!(
+            p["inferenceModels"][1]["isFamilyDefault"].is_null(),
+            "同档位第二条不得也标默认（官方对多个 isFamilyDefault 会告警并取首个）"
+        );
 
         // _meta：本档登记 + appliedId 指向本档。
         let m: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
@@ -2675,13 +3244,80 @@ tool_timeout_sec = 600
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 接入时对外名不合规 → **照写但强警告**（用户拍板：对齐 cc-switch，不阻断）。
+    ///
+    /// 保存 Key 那道拦截是主防线（见 lib.rs），这里是兜底：档内历史清单（改端口时
+    /// `existing_inference_model_names` 回退用）与更早版本存下的 Key 都可能绕过它。
+    #[test]
+    fn desktop_apply_warns_when_all_model_names_unusable() {
+        let (dir, normal, threep, profile, meta) = desktop_layout("desktop_warn_all");
+        let models = vec!["glm-4.6".to_string(), "grok-4.5".to_string()];
+        let msg =
+            apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &models, &[])
+                .unwrap();
+
+        assert!(msg.contains("3p 部署模式"), "接入本身仍应成功: {msg}");
+        assert!(msg.contains("glm-4.6") && msg.contains("grok-4.5"), "要列出具体名字: {msg}");
+        assert!(
+            msg.contains("ModelsNotDiscoveredError"),
+            "全不合规必须说清「写进去了但用不了」的后果: {msg}"
+        );
+        assert!(msg.contains("模型映射"), "要给可照做的修法: {msg}");
+
+        // 关键：不合规名必须**原样写进**档里，不能被过滤。
+        // 若过滤掉，effective 会变空并撞上「空列表 → 报错」分支，把用户选的「照写」变成阻断。
+        let p: Value = serde_json::from_slice(&std::fs::read(&profile).unwrap()).unwrap();
+        let names: Vec<&str> = p["inferenceModels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["glm-4.6", "grok-4.5"], "照写不过滤（警告 ≠ 阻断）");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 部分不合规：措辞降级为「其余仍可用」，且合规名照旧生效。
+    #[test]
+    fn desktop_apply_warns_partially_and_keeps_valid_ones() {
+        let (dir, normal, threep, profile, meta) = desktop_layout("desktop_warn_part");
+        let models = vec!["claude-opus-4-8".to_string(), "glm-4.6".to_string()];
+        let msg =
+            apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &models, &[])
+                .unwrap();
+
+        assert!(msg.contains("glm-4.6"), "要点出不合规的那个: {msg}");
+        assert!(msg.contains("其余 1 个仍可用"), "部分不合规应说明其余可用: {msg}");
+        assert!(
+            !msg.contains("ModelsNotDiscoveredError"),
+            "还有合规名时选择器不会空，不该拿死局吓用户: {msg}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 全合规 → 消息里不得出现任何警告噪音。
+    #[test]
+    fn desktop_apply_has_no_warning_when_all_names_compliant() {
+        let (dir, normal, threep, profile, meta) = desktop_layout("desktop_warn_none");
+        let models = vec!["claude-opus-4-8".to_string(), "opus".to_string()];
+        let msg =
+            apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &models, &[])
+                .unwrap();
+        assert!(!msg.contains('⚠'), "全合规不该有警告: {msg}");
+        assert!(!msg.contains("不被桌面端接受"), "全合规不该有警告: {msg}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn desktop_apply_rejects_empty_model_list() {
         // 空模型列表且档内也无既有模型 → 必须报错而非静默接入：省略 inferenceModels 会让桌面端
         // 进了 3p 却无模型可选，运行时发现一失败就 models_not_discovered、连会话都开不起来
         // （与「卡 get-started」同级的死局）。
         let (dir, normal, threep, profile, meta) = desktop_layout("desktop_nomodels");
-        let err = apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &[])
+        let err = apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &[], &[])
             .unwrap_err();
         assert!(
             err.to_string().contains("至少一个可服务模型"),
@@ -2707,11 +3343,12 @@ tool_timeout_sec = 600
             &meta,
             "http://127.0.0.1:1",
             &["claude-opus-4-8".to_string()],
+            &[],
         )
         .unwrap();
 
         // 再以空模型「改端口」重写：应成功、端点更新、模型清单保留。
-        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:2", &[]).unwrap();
+        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:2", &[], &[]).unwrap();
 
         let p: Value = serde_json::from_slice(&std::fs::read(&profile).unwrap()).unwrap();
         assert_eq!(
@@ -2747,6 +3384,7 @@ tool_timeout_sec = 600
             &meta,
             "http://127.0.0.1:2",
             &desktop_test_models(),
+            &[],
         )
         .unwrap();
 
@@ -2783,7 +3421,7 @@ tool_timeout_sec = 600
         )
         .unwrap();
 
-        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models()).unwrap();
+        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
 
         let m: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
         assert_eq!(m["appliedId"], DESKTOP_PROFILE_ID, "appliedId 应改指本档");
@@ -2803,7 +3441,7 @@ tool_timeout_sec = 600
         // 重复接入：entries 里本档不重复出现（去重）。
         let (dir, normal, threep, profile, meta) = desktop_layout("desktop_idem");
         for _ in 0..3 {
-            apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models()).unwrap();
+            apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
         }
         let m: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
         let ours: Vec<_> = m["entries"]
@@ -2821,7 +3459,7 @@ tool_timeout_sec = 600
         // 接入后还原（**调真实 restore_desktop_at**，不在测试里重抄步骤）：
         // 唯一档场景 → deploymentMode 复位 1p、本档 profile 删除、_meta 清本档且删 appliedId。
         let (dir, normal, threep, profile, meta) = desktop_layout("desktop_restore");
-        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models()).unwrap();
+        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
         assert!(profile.exists());
         assert_eq!(
             read_desktop_applied_id(&meta).as_deref(),
@@ -2850,6 +3488,56 @@ tool_timeout_sec = 600
     }
 
     #[test]
+    fn desktop_restore_is_atomic_on_midway_failure() {
+        // P1 回归：桌面端还原要动 4 个文件（两个 config 的 deploymentMode + 本档 profile + _meta），
+        // 中途失败若不整体回滚就留「半还原」态——最典型的是 profile 已删、_meta 却仍把 appliedId
+        // 指着它，桌面端启动时拿不到那份 gateway 档而卡死（用户视角：桌面端起不来，也无从修复）。
+        //
+        // 故障注入手法：让**最后一步**（写 deploymentMode）失败——把 normal config 写成非法 JSON，
+        // read_json_or_empty 会返回解析错误。此时前两步（删 profile、清 _meta）已经生效，
+        // 正是「半还原」的窗口。回滚后这两步都必须被撤销。
+        let (dir, normal, threep, profile, meta) = desktop_layout("desktop_restore_atomic");
+        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
+        assert!(profile.exists(), "前置条件：接入后 profile 存在");
+        assert_eq!(
+            read_desktop_applied_id(&meta).as_deref(),
+            Some(DESKTOP_PROFILE_ID),
+            "前置条件：appliedId 指向本档"
+        );
+        let profile_before = std::fs::read(&profile).unwrap();
+        let meta_before = std::fs::read(&meta).unwrap();
+
+        // 注入：normal config 变成非法 JSON → 还原的最后一步必然失败。
+        std::fs::write(&normal, b"{ this is not json").unwrap();
+
+        let err = restore_desktop_at(&normal, &threep, &profile, &meta, None);
+        assert!(err.is_err(), "最后一步失败时整体还原必须返回错误");
+
+        // 回滚断言：前两步的改动都必须被撤销，桌面端仍处于可用的「已接入」态。
+        assert!(
+            profile.exists(),
+            "还原中途失败必须回滚，profile 不得留在已删除状态（否则 appliedId 指向空档，桌面端起不来）"
+        );
+        assert_eq!(
+            std::fs::read(&profile).unwrap(),
+            profile_before,
+            "回滚后 profile 内容应与失败前一致"
+        );
+        assert_eq!(
+            std::fs::read(&meta).unwrap(),
+            meta_before,
+            "回滚后 _meta 应恢复（appliedId 仍指向本档、entry 未被摘掉）"
+        );
+        assert_eq!(
+            read_desktop_applied_id(&meta).as_deref(),
+            Some(DESKTOP_PROFILE_ID),
+            "回滚后 appliedId 仍应指向本档"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn desktop_restore_keeps_3p_when_ccswitch_profile_remains() {
         // 回归护栏（曾把用户踢回 get-started 的 bug）：cc-switch 档共存且 appliedId 是本档时，
         // 还原必须**保持 3p**（因为 appliedId 会交还给 cc-switch 那个 3p 网关档），
@@ -2868,7 +3556,7 @@ tool_timeout_sec = 600
         let ccswitch_profile = meta.parent().unwrap().join(format!("{ccswitch_id}.json"));
         std::fs::write(&ccswitch_profile, r#"{"inferenceProvider":"gateway"}"#).unwrap();
 
-        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models()).unwrap();
+        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
         let n: Value = serde_json::from_slice(&std::fs::read(&normal).unwrap()).unwrap();
         assert_eq!(n["deploymentMode"], "3p", "接入后应为 3p");
 
@@ -2908,7 +3596,7 @@ tool_timeout_sec = 600
         )
         .unwrap();
 
-        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models()).unwrap();
+        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
         restore_desktop_at(&normal, &threep, &profile, &meta, Some(prev_id)).unwrap();
 
         let m: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
@@ -3094,6 +3782,7 @@ tool_timeout_sec = 600
             &meta,
             "http://127.0.0.1:1",
             &desktop_test_models(),
+            &[],
         )
         .unwrap();
 

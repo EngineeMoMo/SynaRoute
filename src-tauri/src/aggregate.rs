@@ -763,11 +763,26 @@ async fn gather_members(
                     };
                 }
             }
-            let Some(secret) = store.secrets.read().get(&key_id).ok().flatten() else {
-                return MemberOutcome::Unavailable {
-                    label,
-                    reason: "未配置密钥".into(),
-                };
+            // 取密钥。`get` 在「主口令模式未解锁」时刻意返回 `Err` 而非 `Ok(None)`
+            // （见 secret.rs 该方法注释），正是为了让「需要解锁」这条可行动信息传得出来。
+            // 故这里不能 `.ok().flatten()` 一把吞成 None —— 那会把锁定态报成「未配置密钥」，
+            // 用户被引去逐个检查密钥配置，而真正要做的只是输一次主口令。
+            // （同一轮里决策者路径用 `?` 能正确抛出解锁提示，两条路径口径必须一致。）
+            let secret = match store.secrets.read().get(&key_id) {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return MemberOutcome::Unavailable {
+                        label,
+                        reason: "未配置密钥".into(),
+                    };
+                }
+                Err(e) => {
+                    return MemberOutcome::Unavailable {
+                        label,
+                        // 错误文案已含「请打开主窗口输入主口令解锁」这类行动指引，原样带出。
+                        reason: format!("密钥不可用：{e}"),
+                    };
+                }
             };
             let max_tokens = key.params.max_tokens.unwrap_or(4096);
             // 仅对实际模型调用套超时（这才是「成员自己的工作时间」）。
@@ -975,10 +990,71 @@ fn is_safe_relative_path(path: &str) -> bool {
     !path.trim().is_empty()
 }
 
+/// 规范化后判断 `candidate` 是否仍在 `work_root` 之下（解析符号链接后的真实落点）。
+///
+/// 任一侧 canonicalize 失败（权限/竞态）时**判为不安全**——宁可拒写一次让用户重试，
+/// 也不在无法确认落点时冒险写盘。
+fn is_within_work_root(work_root: &std::path::Path, candidate: &std::path::Path) -> bool {
+    match (work_root.canonicalize(), candidate.canonicalize()) {
+        (Ok(root), Ok(c)) => c.starts_with(root),
+        _ => false,
+    }
+}
+
+/// 落盘前的链接逃逸检查。返回 `Err(原因)` 即拒绝写入。
+///
+/// 两条独立的逃逸路径，必须都堵：
+///
+/// 1. **穿透链接目录建新子目录**。只校验「父目录存在时的父目录」是不够的：`vendor/` 是指向
+///    外部的目录链接时，`vendor/sub/x.txt` 的父目录 `vendor/sub` **不存在**，校验被跳过，
+///    紧随其后的 `create_dir_all` 会沿链接把目录建到外面去。故这里向上找到**最近一个已存在的
+///    祖先**再校验——链接必然在这个祖先或它之下的某一段里，canonicalize 它就能暴露真实落点。
+///    （Windows 上 junction 普通权限即可创建，pnpm 建 `node_modules/*` 就在用，不是刻意构造。）
+///
+/// 2. **目标文件自身是符号链接**。`fs::write` 跟随链接写入其目标：仓库里带一个
+///    `notes.md` → `~/.ssh/config` 的文件链接（git 能 checkout 链接），父目录校验完全通过，
+///    却把链接目标整份覆盖。故对已存在的目标用 `symlink_metadata`（不跟随链接）判类型，
+///    是链接就拒。
+///
+/// 判据都取自文件系统而非 LLM 给的字符串——`is_safe_relative_path` 那道只看字符串，
+/// 看不见链接。
+fn check_no_link_escape(
+    work_root: &std::path::Path,
+    full_path: &std::path::Path,
+) -> Result<(), String> {
+    // ① 最近的已存在祖先必须在 root 之内。
+    let mut probe = full_path.parent();
+    while let Some(dir) = probe {
+        if dir.exists() {
+            if !is_within_work_root(work_root, dir) {
+                return Err(
+                    "目标解析后落在工作目录之外（疑似链接目录逃逸），已拒绝写入".into()
+                );
+            }
+            break;
+        }
+        probe = dir.parent();
+    }
+    // 一路向上都不存在（work_dir 本身都没了）：无法确认落点，fail-closed。
+    if probe.is_none() {
+        return Err("工作目录不存在或无法解析，已拒绝写入".into());
+    }
+
+    // ② 目标本身不得是符号链接（用 symlink_metadata，它不跟随链接）。
+    if let Ok(md) = std::fs::symlink_metadata(full_path) {
+        if md.file_type().is_symlink() {
+            return Err("目标是符号链接，写入会覆盖链接指向的文件，已拒绝写入".into());
+        }
+    }
+    Ok(())
+}
+
 /// 解析决策者输出中的 ```file:path 代码块并写入磁盘。
 ///
-/// 安全与健壮性（本轮修复）：
-/// - 路径遏制：拒绝 `../`、绝对路径、盘符/UNC，防止 LLM 输出逃逸 work_dir 写任意文件（存在提示注入面）。
+/// 安全与健壮性：
+/// - 路径遏制（两道）：① 组件检查拒绝 `../`、绝对路径、盘符/UNC；② 落盘前把父目录
+///   canonicalize 后确认仍在 work_dir 之下，堵住符号链接逃逸（组件检查看字符串，看不见链接）。
+///   两道都为了防提示注入——prompt 里混着检索到的项目文件内容，LLM 输出的路径不可信。
 /// - 围栏解析：用「起始围栏的反引号数量」匹配对应长度的闭合围栏（≥3 个反引号且仅由反引号构成），
 ///   使文件内容里出现的 ``` 三反引号不会提前截断；找不到闭合围栏则丢弃该残块（不写截断文件）。
 fn parse_and_apply(work_dir: &str, output: &str) -> AppResult<Vec<AppliedChange>> {
@@ -1027,7 +1103,21 @@ fn parse_and_apply(work_dir: &str, output: &str) -> AppResult<Vec<AppliedChange>
                 continue;
             }
 
+            // 二次防线：从文件系统层面确认真实落点仍在 work_dir 之下。
+            //
+            // 为什么不能只靠 `is_safe_relative_path` 的组件检查：它看的是 LLM 给的**字符串**，
+            // 而符号链接是文件系统层面的事。若 work_dir 下存在一个指向外部的链接目录
+            // （`link/` → `C:\Windows`），`link/x.dll` 这个路径不含 `..`、不是绝对路径，
+            // 组件检查完全放行，但实际写到了工作目录之外。
+            //
+            // 两条逃逸路径（穿透链接目录建新子目录 / 目标本身是链接）都在
+            // `check_no_link_escape` 里堵，详见该函数注释。
             let full_path = work_root.join(&path);
+            if let Err(reason) = check_no_link_escape(work_root, &full_path) {
+                changes.push(AppliedChange { path, success: false, error: Some(reason) });
+                continue;
+            }
+
             if let Some(parent) = full_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -1116,6 +1206,405 @@ fn label_ref(store: &Arc<Store>, reference: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- 写文件路径的安全护栏（parse_and_apply / is_safe_relative_path）----
+    //
+    // 这两个函数会**真实写用户磁盘**：决策者（LLM）输出的路径直接决定写到哪里，而 prompt 里
+    // 混入了检索到的项目文件内容——存在提示注入面。故路径遏制与围栏解析都必须有护栏锁住。
+
+    /// 测试用临时目录（同 store/tools 的做法：pid + 自增序号，避免并发用例互踩）。
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "synaroute_agg_test_{}_{}_{}",
+            tag,
+            std::process::id(),
+            seq
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn safe_relative_path_rejects_escapes() {
+        // 允许：普通相对路径（含子目录）。
+        for p in ["a.rs", "src/main.rs", "src/deep/nested/mod.rs", "./a.rs"] {
+            assert!(is_safe_relative_path(p), "{p:?} 应被允许");
+        }
+        // 拒绝：父目录逃逸、绝对路径、盘符、UNC、根。
+        for p in [
+            "../secret.txt",
+            "src/../../etc/passwd",
+            "a/../../b",
+            "/etc/passwd",
+            "C:\\Windows\\System32\\drivers\\etc\\hosts",
+            "C:/Windows/x",
+            "\\\\server\\share\\x",
+            "",
+            "   ",
+        ] {
+            assert!(!is_safe_relative_path(p), "{p:?} 必须被拒绝（可写到工作目录之外）");
+        }
+    }
+
+    #[test]
+    fn parse_and_apply_writes_files_and_creates_parent_dirs() {
+        let dir = temp_dir("apply_ok");
+        let work = dir.to_string_lossy().to_string();
+        let output = "决策者说明文字（不应被当成文件）\n\
+             ```file:src/a.rs\n\
+             fn a() {}\n\
+             ```\n\
+             中间穿插的散文\n\
+             ```file:deep/nested/b.txt\n\
+             line1\n\
+             line2\n\
+             ```\n";
+
+        let changes = parse_and_apply(&work, output).unwrap();
+        assert_eq!(changes.len(), 2, "应解析出两个文件块: {changes:?}");
+        assert!(changes.iter().all(|c| c.success), "均应写入成功: {changes:?}");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/a.rs")).unwrap(),
+            "fn a() {}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("deep/nested/b.txt")).unwrap(),
+            "line1\nline2",
+            "多级父目录应被自动创建"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_and_apply_refuses_paths_escaping_work_dir() {
+        // 路径遏制的端到端验证：越界块必须**既不写盘、也不静默**（要报回 success:false）。
+        let dir = temp_dir("apply_escape");
+        let work = dir.join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+        let outside = dir.join("pwned.txt");
+
+        let output = format!(
+            "```file:../pwned.txt\nHACKED\n```\n\
+             ```file:{}\nHACKED\n```\n\
+             ```file:ok.rs\nfine\n```\n",
+            outside.display()
+        );
+        let changes = parse_and_apply(&work.to_string_lossy(), &output).unwrap();
+
+        let denied: Vec<&AppliedChange> = changes.iter().filter(|c| !c.success).collect();
+        assert_eq!(denied.len(), 2, "两个越界块都应被拒: {changes:?}");
+        assert!(
+            denied.iter().all(|c| c
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("路径越界")),
+            "拒绝原因要说清是路径越界: {denied:?}"
+        );
+        assert!(
+            !outside.exists(),
+            "工作目录之外的文件绝不能被创建（这是提示注入的直接后果）"
+        );
+        // 合规块不受影响，仍照常写入。
+        assert_eq!(std::fs::read_to_string(work.join("ok.rs")).unwrap(), "fine");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_and_apply_keeps_inner_triple_backticks_intact() {
+        // 围栏按「起始反引号数量」匹配：四反引号起始时，内容里的三反引号不得提前截断，
+        // 否则写出的文件被砍半（Markdown/文档类文件必然中招）。
+        let dir = temp_dir("apply_fence");
+        let work = dir.to_string_lossy().to_string();
+        let output = "````file:README.md\n\
+             # Doc\n\
+             ```rust\n\
+             fn inner() {}\n\
+             ```\n\
+             tail\n\
+             ````\n";
+
+        let changes = parse_and_apply(&work, output).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].success, "{changes:?}");
+        let written = std::fs::read_to_string(dir.join("README.md")).unwrap();
+        assert!(written.contains("```rust"), "内层三反引号应完整保留: {written:?}");
+        assert!(written.contains("fn inner() {}"));
+        assert!(written.ends_with("tail"), "内容不得被内层围栏提前截断: {written:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_and_apply_discards_unclosed_block_instead_of_writing_truncated_file() {
+        // 输出被截断（客户端断连 / max_tokens 用尽）时，绝不能把半个文件写上去覆盖用户源码。
+        let dir = temp_dir("apply_unclosed");
+        let work = dir.to_string_lossy().to_string();
+        let target = dir.join("src/a.rs");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "ORIGINAL").unwrap();
+
+        let output = "```file:src/a.rs\nfn half_written() {\n";
+        let changes = parse_and_apply(&work, output).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert!(!changes[0].success, "未闭合块必须判失败");
+        assert!(
+            changes[0].error.as_deref().unwrap_or("").contains("未正确闭合"),
+            "原因要点明未闭合: {changes:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "ORIGINAL",
+            "原文件不得被截断内容覆盖"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_and_apply_ignores_plain_code_blocks_without_file_prefix() {
+        // 决策者常在答案里贴普通代码块举例（无 file: 前缀）——不得被误当成待写文件。
+        let dir = temp_dir("apply_plain");
+        let work = dir.to_string_lossy().to_string();
+        let output = "示例：\n```rust\nfn demo() {}\n```\n以上仅为示例。\n";
+
+        let changes = parse_and_apply(&work, output).unwrap();
+        assert!(changes.is_empty(), "普通代码块不该产生写入动作: {changes:?}");
+        assert!(!dir.join("rust").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn within_work_root_resolves_links_and_fails_closed() {
+        let dir = temp_dir("within_root");
+        let work = dir.join("proj");
+        let inside = work.join("sub");
+        std::fs::create_dir_all(&inside).unwrap();
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        assert!(is_within_work_root(&work, &work), "work_dir 自身在其下");
+        assert!(is_within_work_root(&work, &inside), "真实子目录应通过");
+        assert!(!is_within_work_root(&work, &outside), "同级目录不在其下");
+        assert!(
+            !is_within_work_root(&work, dir.as_path()),
+            "父目录不在其下"
+        );
+        // fail-closed：路径不存在 → canonicalize 失败 → 判不安全（宁可拒写让用户重试）。
+        assert!(
+            !is_within_work_root(&work, &work.join("does-not-exist")),
+            "无法确认落点时必须判为不安全"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 符号链接逃逸：`link/` 指向工作目录之外时，`link/x` 这个相对路径不含 `..`、非绝对路径，
+    /// **组件检查完全放行**，但实际写到了外面。canonicalize 二次校验就是为堵这个洞。
+    ///
+    /// Windows 上目录符号链接需要特权，故优先用 **junction**（`mklink /J`）——普通权限即可创建，
+    /// 且 `canonicalize` 同样会解析它，能真实覆盖这条路径而不是跳过。两种都建不成才跳过。
+    #[test]
+    fn parse_and_apply_refuses_symlinked_dir_escaping_work_dir() {
+        let dir = temp_dir("apply_symlink");
+        let work = dir.join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let link = work.join("link");
+        let linked = link_dir_for_test(&outside, &link);
+        if !linked {
+            eprintln!("跳过：当前环境无法创建目录链接（symlink 需特权、junction 也失败）");
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        // 前置确认：这条路径确实能过组件检查——否则本测试没在验证 canonicalize 那道防线。
+        assert!(
+            is_safe_relative_path("link/pwned.txt"),
+            "该路径不含 ..、非绝对，组件检查必然放行；正是第二道防线的用途所在"
+        );
+
+        let output = "```file:link/pwned.txt\nHACKED\n```\n";
+        let changes = parse_and_apply(&work.to_string_lossy(), output).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert!(
+            !changes[0].success,
+            "经目录链接落到工作目录之外必须被拒: {changes:?}"
+        );
+        assert!(
+            changes[0].error.as_deref().unwrap_or("").contains("工作目录之外"),
+            "原因要点明真实落点越界: {changes:?}"
+        );
+        assert!(
+            !outside.join("pwned.txt").exists(),
+            "链接目标目录里绝不能被写入"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 建一个指向 `target` 的目录链接。Windows 先试 symlink（需特权），回退 junction；
+    /// 其他平台用 unix symlink。返回是否建成。
+    fn link_dir_for_test(target: &std::path::Path, link: &std::path::Path) -> bool {
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+                return true;
+            }
+            // junction：普通权限可创建，canonicalize 同样解析。
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    /// 建一个指向 `target` 文件的符号链接。Windows 需特权，建不成返回 false（测试跳过）。
+    fn link_file_for_test(target: &std::path::Path, link: &std::path::Path) -> bool {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    /// 逃逸路径 ①：**多一级**路径穿透链接目录。
+    ///
+    /// 原实现只在「父目录已存在」时校验，而 `link/sub/x.txt` 的父目录 `link/sub` 不存在，
+    /// 校验被短路跳过，紧随其后的 `create_dir_all` 沿链接把目录建到工作目录之外。
+    /// 与 `..._refuses_symlinked_dir_escaping_work_dir` 的区别就是这一级之差 —— 那条恰好
+    /// 命中「父目录存在」，所以旧实现能过；这条不能。
+    #[test]
+    fn parse_and_apply_refuses_new_subdir_through_linked_dir() {
+        let dir = temp_dir("apply_symlink_deep");
+        let work = dir.join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let link = work.join("vendor");
+        if !link_dir_for_test(&outside, &link) {
+            eprintln!("跳过：当前环境无法创建目录链接");
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        // 前置确认：组件检查放行，且父目录确实不存在（旧实现正是在此被短路）。
+        assert!(is_safe_relative_path("vendor/sub/pwned.txt"));
+        assert!(
+            !work.join("vendor/sub").exists(),
+            "父目录必须不存在，否则测不到「跳过校验」那条路径"
+        );
+
+        let output = "```file:vendor/sub/pwned.txt\nHACKED\n```\n";
+        let changes = parse_and_apply(&work.to_string_lossy(), output).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert!(!changes[0].success, "穿透链接目录建新子目录必须被拒: {changes:?}");
+        assert!(
+            !outside.join("sub").exists(),
+            "链接目标目录下绝不能被建出子目录"
+        );
+        assert!(
+            !outside.join("sub/pwned.txt").exists(),
+            "更不能写入内容"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 逃逸路径 ②：**目标文件自身**是符号链接。
+    ///
+    /// 父目录校验完全通过（就是 work_root），但 `fs::write` 跟随链接，把链接指向的
+    /// 工作目录外文件整份覆盖。仓库里带一个这样的链接即可（git 能 checkout 符号链接）。
+    #[test]
+    fn parse_and_apply_refuses_writing_through_symlinked_file() {
+        let dir = temp_dir("apply_symlink_file");
+        let work = dir.join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+        let secret = dir.join("secret.conf");
+        std::fs::write(&secret, "ORIGINAL").unwrap();
+
+        let link = work.join("notes.md");
+        if !link_file_for_test(&secret, &link) {
+            eprintln!("跳过：当前环境无法创建文件符号链接（Windows 需特权）");
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        let output = "```file:notes.md\nHACKED\n```\n";
+        let changes = parse_and_apply(&work.to_string_lossy(), output).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert!(!changes[0].success, "写入符号链接必须被拒: {changes:?}");
+        assert!(
+            changes[0].error.as_deref().unwrap_or("").contains("符号链接"),
+            "原因要点明是链接: {changes:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            "ORIGINAL",
+            "链接指向的工作目录外文件绝不能被改写"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// work_dir 本身不存在时 fail-closed（不能因为「一路向上都没有已存在祖先」而放行）。
+    #[test]
+    fn parse_and_apply_refuses_when_work_dir_missing() {
+        let dir = temp_dir("apply_no_workdir");
+        let work = dir.join("nonexistent-proj");
+        // 刻意不创建 work
+
+        let output = "```file:a.txt\nX\n```\n";
+        let changes = parse_and_apply(&work.to_string_lossy(), output).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(!changes[0].success, "工作目录不存在时不得写盘: {changes:?}");
+        assert!(!work.exists(), "更不该顺手把工作目录创建出来");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 正常路径不能被上面几道防线误伤：新建多级子目录应当照常成功。
+    #[test]
+    fn parse_and_apply_still_creates_nested_dirs_normally() {
+        let dir = temp_dir("apply_nested_ok");
+        let work = dir.join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+
+        let output = "```file:src/deep/nested/mod.rs\npub fn f() {}\n```\n";
+        let changes = parse_and_apply(&work.to_string_lossy(), output).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].success, "普通多级新建不得被误拒: {changes:?}");
+        assert_eq!(
+            std::fs::read_to_string(work.join("src/deep/nested/mod.rs")).unwrap(),
+            "pub fn f() {}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn solo_decider_prompt_includes_file_context_when_present() {

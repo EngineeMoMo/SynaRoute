@@ -60,28 +60,70 @@ const PROXY_PORT_FALLBACK_RANGE: u16 = 20;
 /// 故不会延误恢复。
 const ALL_FAILED_SHORT_CIRCUIT_MS: i64 = 5_000;
 
-/// 各分类的「全部 Key 失败」短路截止时刻（epoch ms）。进程内状态，重启即清。
-fn all_failed_gate() -> &'static Mutex<HashMap<String, i64>> {
-    static GATE: std::sync::OnceLock<Mutex<HashMap<String, i64>>> = std::sync::OnceLock::new();
+/// 「全部 Key 均失败」时回给下游的状态码：**529 overloaded_error**，不是 502。
+///
+/// 判据来自 claude.exe v2.1.219 内嵌的官方 gateway 协议规范：529 是「上游过载、稍后重试」的
+/// 专用码，客户端 SDK 见到它会走**退避重试**；而 502 映射成 `api_error`，SDK 的处理是不确定的
+/// （可能立刻重发，可能直接报错终止）。「全部候选都打不通」本质就是「暂时无产能」，语义正是 529。
+///
+/// 用 u16 常量而非 `StatusCode` 关联常量：529 不在 http crate 的预定义列表里（非 IANA 注册码，
+/// 属 Cloudflare/Anthropic 惯例），只能 `from_u16` 构造。
+const STATUS_OVERLOADED: u16 = 529;
+
+/// 各分类的「全部 Key 失败」短路状态。进程内状态，重启即清。
+///
+/// 键是 `{ProxyManager 实例 id}:{分类名}`（见 [`ProxyManager::gate_key`]）。
+/// 生产环境全程只有一个 `ProxyManager`，故等价于「按分类」；而单元测试里每个用例各建一个
+/// `ProxyManager`，于是天然互不干扰——此前只用分类名做键，两条都用 `ClaudeCli` 的 e2e 测试会
+/// 共享同一格：一条武装的 5s 窗口把另一条的请求直接短路，表现为 `proxy_fails_over_bad_to_good`
+/// 偶发变红（同一份代码三次跑出 276/1、276/1、277/0）。
+///
+/// `until_ms`：短路截止时刻（epoch ms）。
+/// `retry_at_ms`：上游 429/503 的 `Retry-After` 换算出的「可再试时刻」（epoch ms），无则 None。
+///   窗口内被短路的响应用它给下游一个**不早于上游要求**的 `Retry-After`，避免下游按 5s 退避
+///   却在上游仍限流时又撞上去。
+#[derive(Clone, Copy)]
+struct GateEntry {
+    until_ms: i64,
+    retry_at_ms: Option<i64>,
+}
+
+fn all_failed_gate() -> &'static Mutex<HashMap<String, GateEntry>> {
+    static GATE: std::sync::OnceLock<Mutex<HashMap<String, GateEntry>>> =
+        std::sync::OnceLock::new();
     GATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 记一次「全部 Key 失败」，武装短路窗口。
-fn arm_all_failed_gate(category: CategoryType) {
-    let until = chrono::Utc::now().timestamp_millis() + ALL_FAILED_SHORT_CIRCUIT_MS;
-    all_failed_gate()
-        .lock()
-        .insert(category.as_str().to_string(), until);
+/// 记一次「全部失败」，武装短路窗口。`retry_after_secs` 为上游给出的退避秒数（若有）。
+fn arm_all_failed_gate(gate_key: &str, retry_after_secs: Option<i64>) {
+    let now = chrono::Utc::now().timestamp_millis();
+    all_failed_gate().lock().insert(
+        gate_key.to_string(),
+        GateEntry {
+            until_ms: now + ALL_FAILED_SHORT_CIRCUIT_MS,
+            retry_at_ms: retry_after_secs.map(|s| now + s.saturating_mul(1000)),
+        },
+    );
 }
 
-/// 短路窗口是否仍有效。有效则返回剩余毫秒（>0），否则 None（并顺手清理过期项）。
-fn all_failed_gate_remaining(category: CategoryType) -> Option<i64> {
+/// 短路窗口是否仍有效。有效则返回 `(剩余毫秒>0, 应告知下游的 Retry-After 秒数)`，
+/// 否则 None（并顺手清理过期项）。
+fn all_failed_gate_remaining(gate_key: &str) -> Option<(i64, i64)> {
     let now = chrono::Utc::now().timestamp_millis();
     let mut gate = all_failed_gate().lock();
-    match gate.get(category.as_str()).copied() {
-        Some(until) if until > now => Some(until - now),
+    match gate.get(gate_key).copied() {
+        Some(e) if e.until_ms > now => {
+            // Retry-After 取「短路剩余」与「上游要求」的较晚者。
+            //
+            // 这里取较晚是对的（与 `retry_after_hint` 取最小值不矛盾）：那边比较的是**不同候选**
+            // 的限流窗口，取最早者才不误伤整池；这里比较的是**同一个结论**的两个下限 ——
+            // 短路窗口内重试注定被本地挡回，而上游若要求更久，提前去也是白撞。
+            // 两者都是「不早于」，所以取 max。
+            let target = e.retry_at_ms.unwrap_or(0).max(e.until_ms);
+            Some((e.until_ms - now, retry_after_secs_until(target, now)))
+        }
         Some(_) => {
-            gate.remove(category.as_str());
+            gate.remove(gate_key);
             None
         }
         None => None,
@@ -89,19 +131,49 @@ fn all_failed_gate_remaining(category: CategoryType) -> Option<i64> {
 }
 
 /// 转发成功 → 立即解除短路（Key 恢复后无需等窗口自然到期）。
-fn clear_all_failed_gate(category: CategoryType) {
-    all_failed_gate().lock().remove(category.as_str());
+fn clear_all_failed_gate(gate_key: &str) {
+    all_failed_gate().lock().remove(gate_key);
+}
+
+/// 把「目标时刻」换算成 `Retry-After` 秒数（向上取整）。
+///
+/// 结果天然 ≥ 1：唯一调用方只在 `until_ms > now`（整数毫秒，故 `delta ≥ 1`）时调用，
+/// `ceil(0.001) = 1`。这条下限很重要——`Retry-After: 0` 等于不退避，客户端会立刻重发，
+/// 与短路的目的相反；对**上游给出**的秒数（可能真是 0）由调用方另行夹取，
+/// 最终写响应头前还有一道边界守卫（见 `error_resp_with_retry_after`）。
+fn retry_after_secs_until(target_ms: i64, now_ms: i64) -> i64 {
+    let delta = (target_ms - now_ms).max(0);
+    ((delta as f64) / 1000.0).ceil() as i64
+}
+
+/// 拼短路窗口键：`{实例命名空间}:{分类名}`。
+fn gate_key_of(ns: u64, category: CategoryType) -> String {
+    format!("{ns}:{}", category.as_str())
 }
 
 /// 代理管理器：管理各分类的代理生命周期
 pub struct ProxyManager {
     store: Arc<Store>,
     running: Mutex<HashMap<String, RunningProxy>>,
+    /// 本实例的短路窗口命名空间（见 [`all_failed_gate`]）。生产环境只有一个实例，
+    /// 故与「按分类」等价；测试里每个用例各建一个实例，天然互不干扰。
+    gate_ns: u64,
 }
 
 impl ProxyManager {
     pub fn new(store: Arc<Store>) -> Self {
-        Self { store, running: Mutex::new(HashMap::new()) }
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_NS: AtomicU64 = AtomicU64::new(0);
+        Self {
+            store,
+            running: Mutex::new(HashMap::new()),
+            gate_ns: NEXT_NS.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// 该分类在本实例下的短路窗口键。
+    fn gate_key(&self, category: CategoryType) -> String {
+        gate_key_of(self.gate_ns, category)
     }
 
     pub fn port_of(&self, category: CategoryType) -> Option<u16> {
@@ -160,6 +232,7 @@ impl ProxyManager {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let store = self.store.clone();
         let accept_shutdown = shutdown_rx.clone();
+        let gate_key = self.gate_key(category);
         let handle = tokio::spawn(async move {
             let mut loop_shutdown = accept_shutdown;
             loop {
@@ -168,9 +241,12 @@ impl ProxyManager {
                         let Ok((stream, _)) = accepted else { break };
                         let io = TokioIo::new(stream);
                         let store = store.clone();
+                        let gate_key = gate_key.clone();
                         let mut conn_shutdown = shutdown_rx.clone();
                         tokio::spawn(async move {
-                            let svc = service_fn(move |req| handle_request(store.clone(), category, req));
+                            let svc = service_fn(move |req| {
+                                handle_request(store.clone(), category, gate_key.clone(), req)
+                            });
                             let conn = hyper::server::conn::http1::Builder::new()
                                 .serve_connection(io, svc);
                             tokio::pin!(conn);
@@ -195,6 +271,12 @@ impl ProxyManager {
             handle.abort();
             return Ok(existing.port);
         }
+        // 启动即解除该分类的「全部 Key 失败」短路窗口。
+        //
+        // 窗口原本只有两条解除路径——一次成功转发或自然到期（5s）。而「停止代理 → 换/修好 Key
+        // → 重新启动」是用户已经介入的明确信号，此前被忽略，导致刚点启动后最长 5s 内的请求
+        // 仍被挡成失败，用户视角是「刚点了启动却说全部 Key 不可用」。
+        clear_all_failed_gate(&self.gate_key(category));
         running.insert(
             category.as_str().to_string(),
             RunningProxy { port, handle, shutdown: shutdown_tx },
@@ -208,13 +290,19 @@ impl ProxyManager {
             let _ = p.shutdown.send(true);
             p.handle.abort();
         }
+        // 停止时也清一次：代理已不在服务，残留的短路窗口对下一次启动毫无意义（语义更干净，
+        // 也让「stop → 立刻 start」这条路径不依赖 start 侧的清理）。
+        clear_all_failed_gate(&self.gate_key(category));
     }
 }
 
 /// 处理一次下游工具请求：故障转移路由。
+///
+/// `gate_key`：本次请求所属「代理实例 + 分类」的短路窗口键（见 [`all_failed_gate`]）。
 async fn handle_request(
     store: Arc<Store>,
     category: CategoryType,
+    gate_key: String,
     req: Request<Incoming>,
 ) -> Result<Response<ResBody>, hyper::Error> {
     // 保留完整路径 + query（如 /v1/messages/count_tokens?beta=true）：同协议转发时原样透传，
@@ -280,11 +368,7 @@ async fn handle_request(
     // 每请求实时读 get_settings，改选即时生效、免重启客户端。空/未选时透传客户端原值。
     // 覆盖后的名字仍走下游各 Key 的 resolve_model（映射→三档→原生→兜底），故多 Key 故障转移不受影响。
     let requested_model = store
-        .get_settings()
-        .active_models
-        .get(category.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .active_model_of(category.as_str())
         .unwrap_or(client_model);
 
     // 下游是否要求流式（Claude Code / Codex 默认 stream:true）。
@@ -311,6 +395,22 @@ async fn handle_request(
         ));
     }
 
+    // 密钥库锁着（主口令模式、本次进程未解锁）→ 任何 Key 都取不到密钥。
+    //
+    // 必须在**进入故障转移循环之前**挡住：否则会逐个候选去试、每个都因「未解锁」失败，
+    // 于是 record_live_failure 把整池好 Key 刷成熔断、还武装 529 短路窗口——用户解锁后
+    // 反倒要等熔断窗口过去才恢复。而真实原因只是没解锁，与 Key 好坏无关。
+    //
+    // 状态码用 503（service_unavailable）而非 529：529 的语义是「上游过载、稍后重试」，
+    // 客户端会自动退避重试；而这里需要的是**人来操作**（打开主窗口输口令），
+    // 自动重试永远等不到结果。503 + 明确文案让客户端与用户都知道要做什么。
+    if store.secrets.read().is_locked() {
+        return Ok(error_resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "密钥库已用主口令加密但尚未解锁：请打开 SynaRoute 主窗口输入主口令解锁后重试。",
+        ));
+    }
+
     // 候选：启用 + 未熔断，按优先级。全被熔断时（如单 Key 刚熔断）忽略熔断兜底，
     // 避免无处可切却直接 503——熔断本为多 Key 快速切换，无候选可切时不应自杀。
     let (candidates, used_breaker_fallback) =
@@ -333,21 +433,30 @@ async fn handle_request(
 
     // 「全部 Key 失败」短路：上一次已确认全部候选都打不通，且仍在短路窗口内 →
     // 直接返回失败，不再逐个重打上游。见 ALL_FAILED_SHORT_CIRCUIT_MS 的完整理由。
-    if let Some(remaining_ms) = all_failed_gate_remaining(category) {
-        return Ok(error_resp(
-            StatusCode::BAD_GATEWAY,
+    // 状态码用 529 overloaded_error（规范要求，客户端据此退避）并带 Retry-After。
+    if let Some((remaining_ms, retry_after)) = all_failed_gate_remaining(&gate_key) {
+        return Ok(error_resp_with_retry_after(
+            overloaded_status(),
             &format!(
                 "全部 Key 不可用：上次尝试已确认全部候选均失败，{}s 内不再重试（任一次成功即恢复）",
                 (remaining_ms as f64 / 1000.0).ceil() as i64
             ),
+            Some(retry_after),
         ));
     }
 
     // 调用模型日志开关（默认关）：开启后每次转发尝试记一条 request 事件（含完整链路快照）
-    let req_log = store.get_settings().request_log_enabled;
+    let req_log = store.request_log_enabled();
 
-    // 下游发来的原始请求体快照（映射/转换前），供日志展示「我发出去的请求」
-    let downstream_body = if req_json.is_null() {
+    // 下游发来的原始请求体快照（映射/转换前），供日志展示「我发出去的请求」。
+    //
+    // **开关关闭时不构造**：这一步会把整个请求体 pretty-print 成 String（Codex 的 body 可达
+    // 十几万字符），而它唯一的用途是喂给 `log_request` —— 开关关着时那个闭包直接 return，
+    // 这份字符串白构造、还要在每个候选失败分支被 `.clone()` 一次。默认关，故绝大多数请求
+    // 都在白做这件事。
+    let downstream_body = if !req_log {
+        String::new()
+    } else if req_json.is_null() {
         String::from_utf8_lossy(&body_bytes).chars().take(REQ_LOG_CAP).collect()
     } else {
         serde_json::to_string_pretty(&req_json).unwrap_or_else(|_| req_json.to_string())
@@ -410,6 +519,18 @@ async fn handle_request(
     };
 
     let mut last_err = String::new();
+    // 候选给出的 `Retry-After`（秒）。上游 429/503 常带此头；全部候选失败后要把它透传给下游，
+    // 否则客户端按自己的固定节奏重发，仍会撞在上游限流窗口里（官方 gateway 规范明确要求透传）。
+    //
+    // 取**最小值**，不是最大值。下游重试面对的是**整池**，只要有一个候选恢复就该放行：
+    // 候选 A 撞上按天配额回 `Retry-After: 3600`（夹到 300），候选 B 只是一次瞬时连接抖动 ——
+    // 取最大值会让整个分类停摆 300 秒，而 1 秒后 B 就能服务了。这正是本项目最痛的「误伤」形态：
+    // 一个 Key 的限流窗口被强加到所有 Key 头上。取最小值即「各候选中最早可再试的时刻」，
+    // 早到的那次重试若仍失败，短路窗口会再武装一次，代价只是一次探路请求。
+    let mut retry_after_hint: Option<i64> = None;
+    // 最后一次失败的上游状态码（连接层失败为 None）。用于区分「等一等可能好」与
+    // 「不可自愈的配置错误」——两者该给下游的状态码完全不同，见函数尾部。
+    let mut last_status: Option<u16> = None;
     for (i, key) in candidates.iter().enumerate() {
         let started = std::time::Instant::now();
         let next = candidates.get(i + 1);
@@ -453,14 +574,17 @@ async fn handle_request(
                 Ok(StreamAttempt::Streaming { resp, url, real_model, request_body }) => {
                     health::record_live_success(&store, &key.id);
                     // 有 Key 能用了 → 立即解除「全部失败」短路，不等窗口自然到期。
-                    clear_all_failed_gate(category);
+                    clear_all_failed_gate(&gate_key);
                     let elapsed = started.elapsed().as_millis() as u64;
                     // 流式成功也记一条 request 事件（开关开启时）。请求体以「转换后发往上游」为主
                     // （含 reasoning→thinking 映射结果，排障核心），单独完整保留、放最前；
                     // 「下游原始 body」（Codex 发来、转换前）体量极大（可达十几万字符），仅在
                     // log_downstream_raw_enabled 开关开启时追加、且单独截到小额度，避免把转换后段挤没
                     // ——此前双段直接拼接后被整体 cap(20000) 截断，转换后段常被下游原始段整段吞掉。
-                    let combined_req = if store.get_settings().log_downstream_raw_enabled {
+                    //
+                    // `req_log &&` 前置：开关关着时 log_request 会直接 return，没必要先做这段
+                    // 字符串拼接 + 两次截断（也就不必再读一次 settings）。
+                    let combined_req = if req_log && store.log_downstream_raw_enabled() {
                         format!(
                             "==== 转换后发往上游 ====\n{}\n\n==== 下游原始请求（转换前，Codex 发来）====\n{}",
                             cap_to(&request_body, 8000),
@@ -493,7 +617,7 @@ async fn handle_request(
                     return Ok(resp);
                 }
                 // 上游非 2xx：记录并切下一个
-                Ok(StreamAttempt::HttpError { status, body, url, real_model }) => {
+                Ok(StreamAttempt::HttpError { status, body, url, real_model, retry_after }) => {
                     let elapsed = started.elapsed().as_millis() as u64;
                     let snippet: String = body.trim().chars().take(400).collect();
                     last_err = if snippet.is_empty() {
@@ -501,6 +625,10 @@ async fn handle_request(
                     } else {
                         format!("HTTP {status}: {snippet}")
                     };
+                    if let Some(s) = retry_after {
+                        retry_after_hint = Some(retry_after_hint.map_or(s, |cur: i64| cur.min(s)));
+                    }
+                    last_status = Some(status);
                     log_request(&store, key, elapsed, url, real_model, downstream_body.clone(), body, Some(status), false);
                     // 429/5xx 临时错误只切、不罚（不熔断好 Key）；4xx 硬错误才计入熔断。
                     if status_counts_against_breaker(status) {
@@ -519,6 +647,7 @@ async fn handle_request(
                 Err(e) => {
                     let elapsed = started.elapsed().as_millis() as u64;
                     last_err = e.to_string();
+                    last_status = None; // 连接层失败：无状态码，按临时错误对待
                     log_request(&store, key, elapsed, String::new(), key.resolve_model(&requested_model), downstream_body.clone(), last_err.clone(), None, false);
                     health::record_live_failure(&store, &key.id);
                     log_failover(&store, key, "失败", &last_err, next);
@@ -529,9 +658,12 @@ async fn handle_request(
 
         // 流式 + 无法翻译的跨协议组合（如两端各为 Anthropic/Responses，无中枢路径）：
         // 绝不能走缓冲路径返回 application/json——下游按 text/event-stream 解析必失败。
-        // 跳过该候选，让故障转移去找可流式的 Key；若最终都不可流式，循环结束统一回 502。
+        // 跳过该候选，让故障转移去找可流式的 Key。
         if wants_stream && !can_stream(key) {
             last_err = "流式请求不支持跨协议转换（该 Key 协议与下游不一致）".to_string();
+            // 501：这是**配置不匹配**，等多久都不会好转，不能包装成「过载请重试」
+            // （见函数尾部的状态码分流）。用一个明确的「不支持」码让用户去改配置。
+            last_status = Some(StatusCode::NOT_IMPLEMENTED.as_u16());
             log_failover(&store, key, "跳过", &last_err, next);
             continue;
         }
@@ -556,7 +688,7 @@ async fn handle_request(
                 );
                 health::record_live_success(&store, &key.id);
                 // 有 Key 能用了 → 立即解除「全部失败」短路，不等窗口自然到期。
-                clear_all_failed_gate(category);
+                clear_all_failed_gate(&gate_key);
                 store.append_event(
                     category,
                     "route",
@@ -578,6 +710,10 @@ async fn handle_request(
                 } else {
                     format!("HTTP {}: {}", outcome.status, snippet)
                 };
+                if let Some(s) = outcome.retry_after {
+                    retry_after_hint = Some(retry_after_hint.map_or(s, |cur: i64| cur.min(s)));
+                }
+                last_status = Some(outcome.status);
                 log_request(
                     &store,
                     key,
@@ -604,6 +740,7 @@ async fn handle_request(
             // 连接层失败（无响应）：也记一条日志，response_body 为错误信息
             Err(e) => {
                 last_err = e.to_string();
+                last_status = None; // 连接层失败：无状态码，按临时错误对待
                 log_request(
                     &store,
                     key,
@@ -622,12 +759,56 @@ async fn handle_request(
     }
 
     store.append_event(category, "error", None, &format!("全部 Key 失败: {last_err}"));
+
+    // 按「最后一次失败的性质」分流。全部候选失败有两类完全不同的成因，给下游同一个状态码
+    // 是错的：
+    //
+    // - **临时性**（429 限流 / 408 超时 / 409 冲突 / 5xx / 连接层失败）：等一等可能真的会好。
+    //   回 529 `overloaded_error` + `Retry-After`，客户端据此退避重试。（此前用 502 →
+    //   `api_error`，客户端重试行为不确定，实测表现为立刻重发、把失败放大成轮询。）
+    //   并武装短路窗口，挡住窗口内的重发。
+    //
+    // - **硬错误**（401/403/404 等其余 4xx、协议不匹配的 501）：密钥填错、模型名不存在、
+    //   下游要流式而该 Key 协议无法翻译 —— 这些等到宇宙尽头也不会好转。若也回 529，客户端会当
+    //   「上游过载」持续退避重试，界面上呈现「过载」而真实根因是配置错误，方向完全相反；
+    //   而且短路窗口一到期就放行一个真实请求再撞一次 401，如此循环。故**原样回该状态码**、
+    //   **不带 Retry-After**、**不武装短路窗口**：让客户端第一次就拿到确定的失败，
+    //   用户去改配置。
+    //
+    // 429/408/409 之所以划进临时性：它们本就是「稍后重试」语义，且与 Anthropic SDK 的
+    // 重试判据（408/409/429 或 >= 500）一致。
+    const TRANSIENT_4XX: [u16; 3] = [408, 409, 429];
+    let is_hard_error = matches!(
+        last_status,
+        Some(s) if (s == 501 || ((400..500).contains(&s) && !TRANSIENT_4XX.contains(&s)))
+    );
+
+    if is_hard_error {
+        let status = last_status
+            .and_then(|s| StatusCode::from_u16(s).ok())
+            .unwrap_or(StatusCode::BAD_GATEWAY);
+        return Ok(error_resp(status, &format!("全部 Key 不可用：{last_err}")));
+    }
+
     // 武装短路窗口：窗口内后续请求（含客户端自动重发）直接失败，不再重打全部上游。
-    arm_all_failed_gate(category);
-    Ok(error_resp(
-        StatusCode::BAD_GATEWAY,
+    // 带上候选给出的最早 Retry-After（见 retry_after_hint 的取最小值理由）。
+    arm_all_failed_gate(&gate_key, retry_after_hint);
+    // 退避秒数：有上游值就用它（夹到 [1, MAX]——上游可能给 0，那等于不退避，与短路矛盾）；
+    // 没有则用短路窗口本身的长度（窗口内重试注定被挡，早回来毫无意义）。
+    let retry_after = retry_after_hint
+        .map(|s| s.clamp(1, MAX_RETRY_AFTER_SECS))
+        .unwrap_or((ALL_FAILED_SHORT_CIRCUIT_MS / 1000).max(1));
+    Ok(error_resp_with_retry_after(
+        overloaded_status(),
         &format!("全部 Key 不可用：{last_err}"),
+        Some(retry_after),
     ))
+}
+
+/// 529 的 `StatusCode`。529 非 IANA 注册码（Cloudflare/Anthropic 惯例的「过载」码），
+/// http crate 无关联常量，只能 `from_u16` 构造；它对 100~999 恒成功，故 expect 不会触发。
+fn overloaded_status() -> StatusCode {
+    StatusCode::from_u16(STATUS_OVERLOADED).expect("529 是合法 HTTP 状态码")
 }
 
 /// 单模型检索 `GET /v1/models/{id}`：返回**单个**模型对象（Anthropic SDK 的 models.retrieve
@@ -797,11 +978,13 @@ enum StreamAttempt {
         request_body: String,
     },
     /// 上游有响应但非 2xx：缓冲错误体，调用方据此切换下一个 Key。
+    /// `retry_after`：上游 `Retry-After` 头解析出的秒数（429/503 常带），无则 None。
     HttpError {
         status: u16,
         body: String,
         url: String,
         real_model: String,
+        retry_after: Option<i64>,
     },
 }
 
@@ -875,7 +1058,8 @@ async fn try_stream_to_key(
     let status = resp.status();
 
     if !status.is_success() {
-        // 非 2xx：缓冲错误体供切换决策与日志。
+        // 非 2xx：缓冲错误体供切换决策与日志。Retry-After 须在读 body（消费 resp）之前取。
+        let retry_after = parse_retry_after(resp.headers());
         let body = resp
             .bytes()
             .await
@@ -886,6 +1070,7 @@ async fn try_stream_to_key(
             body,
             url,
             real_model,
+            retry_after,
         });
     }
 
@@ -1008,6 +1193,8 @@ struct ForwardOutcome {
     status: u16,
     /// 是否 2xx
     ok: bool,
+    /// 上游 `Retry-After` 头解析出的秒数（429/503 常带），无则 None。
+    retry_after: Option<i64>,
 }
 
 /// 按下游请求 path 判定下游客户端使用的协议：
@@ -1059,13 +1246,7 @@ fn inject_default_effort(
     }
     // 用**本请求所属分类**取 effort，而非硬编码 Codex：分类各有独立端口与独立设置，
     // 硬编码会让「把某个 Responses 客户端接到别的分类端口」时读到 Codex 的强度（口径串台）。
-    let effort = match store
-        .get_settings()
-        .active_efforts
-        .get(category.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
+    let effort = match store.active_effort_of(category.as_str()) {
         Some(e) => e,
         None => return, // 未配默认强度：保持现状，不注入
     };
@@ -1165,6 +1346,8 @@ async fn forward_to_key(
         .await
         .map_err(|e| AppError::Upstream(format!("连接 {url} 失败: {e}")))?;
     let status = resp.status();
+    // Retry-After 须在 resp.bytes() 消费响应体之前取（bytes() 拿走所有权）。
+    let retry_after = parse_retry_after(resp.headers());
     let bytes = resp.bytes().await.map_err(|e| AppError::Upstream(e.to_string()))?;
 
     // 跨协议响应翻译：上游 2xx 时，把响应体从上游协议翻译回下游客户端期望的协议格式。
@@ -1201,6 +1384,7 @@ async fn forward_to_key(
         status: status.as_u16(),
         ok: status.is_success(),
         bytes,
+        retry_after,
     })
 }
 
@@ -1234,6 +1418,8 @@ fn is_stripped_header(name: &str) -> bool {
 /// 429（限流）与 5xx（网关/后端临时故障）都是**临时性**、Key 本身没坏：
 /// - 429 requests-per-minute：这一分钟请求满了，下一分钟自动恢复，不该把好 Key 熔断 60s。
 /// - 502/503/504：中转商网关抖动，同样短暂。
+/// - 529：上游明说「我过载了，稍后再来」。我们自己对下游正是用它表达这个意思
+///   （见 `STATUS_OVERLOADED`），收到时却判成「Key 坏了」显然口径矛盾。
 ///
 /// **400 也不计入**（2026-07-31 实机复盘的结论）：400 的语义是「这个请求不合法」，
 /// 而请求是下游客户端发的、或经我们的协议转换构造的——它与用哪个 Key 无关，
@@ -1250,7 +1436,7 @@ fn is_stripped_header(name: &str) -> bool {
 /// 401/403 鉴权失败（密钥错/被封）、404 端点或模型不存在——换 Key 才有意义，
 /// 重试同一个只是白试，连续几次后熔断掉它，避免每个请求都从它开始。
 fn status_counts_against_breaker(status: u16) -> bool {
-    !matches!(status, 400 | 429 | 500 | 502 | 503 | 504)
+    !matches!(status, 400 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
 /// 是否为「无内容探测请求」：消息载荷为空**且**未解析出任何模型名。
@@ -1376,6 +1562,19 @@ fn anthropic_error_type(status: u16) -> &'static str {
 /// 只能当未知错误处理（表现为界面上一句无意义的报错、且重试策略失效）。
 /// 额外保留 `source` 便于用户一眼看出这条错误是代理产生的、不是上游返回的。
 fn error_resp(status: StatusCode, msg: &str) -> Response<ResBody> {
+    error_resp_with_retry_after(status, msg, None)
+}
+
+/// 带 `Retry-After` 的错误响应。
+///
+/// 官方 gateway 规范（claude.exe v2.1.219 内嵌的 llm-gateway-protocol 原文）要求：限流/过载类
+/// 响应（429/529）必须带 `Retry-After`，否则下游客户端无法正确退避——表现为收到 5xx 立刻重发，
+/// 把上游限流窗口反复撞满（这正是「一直轮询」现象的一环）。
+fn error_resp_with_retry_after(
+    status: StatusCode,
+    msg: &str,
+    retry_after_secs: Option<i64>,
+) -> Response<ResBody> {
     let body = serde_json::json!({
         "type": "error",
         "error": {
@@ -1384,8 +1583,35 @@ fn error_resp(status: StatusCode, msg: &str) -> Response<ResBody> {
             "source": "synaroute",
         }
     });
-    json_resp(status, Bytes::from(serde_json::to_vec(&body).unwrap()))
+    let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
+    let mut builder = Response::builder()
+        .status(status)
+        .header("content-type", "application/json");
+    if let Some(secs) = retry_after_secs {
+        builder = builder.header("retry-after", secs.max(1).to_string());
+    }
+    builder.body(full_body(bytes)).unwrap()
 }
+
+/// 从上游响应头解析 `Retry-After`（RFC 7231）：既支持「秒数」也支持 HTTP-date。
+/// 解析不出（缺头/格式怪/已过期）返回 None，由调用方回退到自己的退避口径。
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<i64> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let raw = raw.trim();
+    // 形态一：delta-seconds。
+    if let Ok(secs) = raw.parse::<i64>() {
+        return Some(secs.clamp(0, MAX_RETRY_AFTER_SECS));
+    }
+    // 形态二：HTTP-date（如 `Wed, 21 Oct 2026 07:28:00 GMT`）→ 换算成相对秒数。
+    let when = chrono::DateTime::parse_from_rfc2822(raw).ok()?;
+    let delta = when.timestamp() - chrono::Utc::now().timestamp();
+    Some(delta.clamp(0, MAX_RETRY_AFTER_SECS))
+}
+
+/// `Retry-After` 采纳上限（秒）。上游偶有返回极大值（甚至几小时）的情况；照抄会让客户端
+/// 长时间彻底不再重试，而我们的 Key 可能几秒后就恢复（换 Key、改配置都会立即解除短路）。
+/// 取 300s：足够表达「别急着重试」，又不至于把客户端锁死。
+const MAX_RETRY_AFTER_SECS: i64 = 300;
 
 #[cfg(test)]
 mod tests {
@@ -1407,7 +1633,8 @@ mod tests {
     #[test]
     fn breaker_spares_transient_status_penalizes_hard_errors() {
         // 429 限流 + 5xx 网关抖动：Key 没坏，只切不罚（不熔断）。
-        for s in [429u16, 500, 502, 503, 504] {
+        // 529 也在内：上游明说「过载，稍后再来」，与我们对下游的口径一致，不该反过来判 Key 坏了。
+        for s in [429u16, 500, 502, 503, 504, 529] {
             assert!(!status_counts_against_breaker(s), "HTTP {s} 不应计入熔断");
         }
         // 400「请求不合法」与 Key 无关（换任何 Key 都同样 400）：不得因客户端空探测
@@ -1549,19 +1776,38 @@ mod tests {
         // 间隔低至 0.2s —— 因为 select_candidates 在「全熔断」时忽略熔断窗口把所有 Key 原样返回，
         // 熔断在最需要它的场景形同虚设，客户端 5xx 自动重发于是无限放大。
         //
-        // 用独立分类避免与其它并发测试共享 gate 状态。
-        let cat = CategoryType::Codex;
+        // 用**本用例专属的键**：gate 是进程级状态，键里带实例命名空间，测试直接用一个不与任何
+        // ProxyManager 冲突的合成串即可与并发跑的 e2e 用例完全隔离。
+        let cat = "test:gate_arms_clears";
         clear_all_failed_gate(cat);
         assert!(
             all_failed_gate_remaining(cat).is_none(),
             "初始不应处于短路"
         );
 
-        arm_all_failed_gate(cat);
-        let remaining = all_failed_gate_remaining(cat).expect("武装后应处于短路窗口");
+        arm_all_failed_gate(cat, None);
+        let (remaining, retry_after) =
+            all_failed_gate_remaining(cat).expect("武装后应处于短路窗口");
         assert!(
             remaining > 0 && remaining <= ALL_FAILED_SHORT_CIRCUIT_MS,
             "剩余窗口应在 (0, {ALL_FAILED_SHORT_CIRCUIT_MS}] 内，实际 {remaining}"
+        );
+        // 无上游 Retry-After 时，退避时间取短路剩余（向上取整、至少 1s）——绝不能是 0，
+        // `Retry-After: 0` 等于不退避，客户端会立刻重发，与短路目的相反。
+        assert!(
+            (1..=ALL_FAILED_SHORT_CIRCUIT_MS / 1000).contains(&retry_after),
+            "Retry-After 应落在 [1, {}]，实际 {retry_after}",
+            ALL_FAILED_SHORT_CIRCUIT_MS / 1000
+        );
+
+        // 上游给了更长的退避（如 429 带 Retry-After: 30）→ 必须采纳更晚者，不能只用 5s 窗口，
+        // 否则客户端 5s 后重来仍撞在上游限流窗口里。
+        clear_all_failed_gate(cat);
+        arm_all_failed_gate(cat, Some(30));
+        let (_, upstream_retry) = all_failed_gate_remaining(cat).expect("应处于短路窗口");
+        assert!(
+            upstream_retry >= 29,
+            "上游要求 30s 退避时不得只回 5s，实际 {upstream_retry}"
         );
 
         // 任一次转发成功 → 立即解除，不等窗口自然到期（Key 恢复不被延误）。
@@ -1574,20 +1820,91 @@ mod tests {
 
     #[test]
     fn all_failed_gate_is_per_category() {
-        // 分类隔离：Claude 桌面端全挂不能连带把 Codex 的请求也短路掉。
-        let a = CategoryType::ClaudeDesktop;
-        let b = CategoryType::ClaudeCli;
-        clear_all_failed_gate(a);
-        clear_all_failed_gate(b);
+        // 分类隔离：一个分类全挂不能连带把另一个分类的请求也短路掉。
+        // 用真实的键构造函数（gate_key_of），确保测的就是生产用的那套键，而不是随手拼的串。
+        let ns = 999_999u64;
+        let a = gate_key_of(ns, CategoryType::ClaudeDesktop);
+        let b = gate_key_of(ns, CategoryType::ClaudeCli);
+        clear_all_failed_gate(&a);
+        clear_all_failed_gate(&b);
 
-        arm_all_failed_gate(a);
-        assert!(all_failed_gate_remaining(a).is_some(), "A 分类应短路");
+        arm_all_failed_gate(&a, None);
+        assert!(all_failed_gate_remaining(&a).is_some(), "A 分类应短路");
         assert!(
-            all_failed_gate_remaining(b).is_none(),
+            all_failed_gate_remaining(&b).is_none(),
             "B 分类不应被 A 的失败牵连"
         );
 
-        clear_all_failed_gate(a);
+        clear_all_failed_gate(&a);
+    }
+
+    /// 短路窗口必须按**代理实例**隔离，而不只是按分类名。
+    ///
+    /// 测试污染回归：gate 是进程级 `HashMap`，早先只用分类名做键，不认是哪个 `ProxyManager` /
+    /// `Store` / 临时目录。两条都用 `ClaudeCli` 的 e2e 用例于是共享同一格——`proxy_all_fail_*`
+    /// 武装的 5s 窗口把 `proxy_fails_over_bad_to_good` 的请求直接短路掉，表现为同一份代码三次
+    /// 跑出 276/1、276/1、277/0 的偶发红。键里带实例命名空间后，两个实例天然互不干扰。
+    #[test]
+    fn gate_is_isolated_per_proxy_manager_instance() {
+        let dir = temp_dir("gate_ns");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let pm_a = ProxyManager::new(store.clone());
+        let pm_b = ProxyManager::new(store.clone());
+        let cat = CategoryType::ClaudeCli;
+
+        let key_a = pm_a.gate_key(cat);
+        let key_b = pm_b.gate_key(cat);
+        assert_ne!(key_a, key_b, "不同实例的同一分类必须是不同的键");
+
+        arm_all_failed_gate(&key_a, None);
+        assert!(all_failed_gate_remaining(&key_a).is_some());
+        assert!(
+            all_failed_gate_remaining(&key_b).is_none(),
+            "一个代理实例的「全部 Key 失败」不得短路另一个实例的同名分类"
+        );
+
+        clear_all_failed_gate(&key_a);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 启动代理必须解除该分类残留的短路窗口。
+    ///
+    /// 产品缺陷回归：窗口原本只有「一次成功转发」或「自然到期 5s」两条解除路径，
+    /// 「停止代理 → 换/修好 Key → 重新启动」这个用户已介入的明确信号被忽略，
+    /// 于是刚点启动后最长 5s 内的请求仍被挡成失败（用户视角：「刚启动却说全部 Key 不可用」）。
+    #[tokio::test]
+    async fn start_clears_leftover_short_circuit_gate() {
+        let dir = temp_dir("gate_start");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let cat = CategoryType::ClaudeDesktop;
+        let pm = ProxyManager::new(store.clone());
+        let gate_key = pm.gate_key(cat);
+
+        arm_all_failed_gate(&gate_key, None);
+        assert!(
+            all_failed_gate_remaining(&gate_key).is_some(),
+            "前置条件：窗口已武装"
+        );
+
+        let _port = pm.start(cat).await.unwrap();
+        assert!(
+            all_failed_gate_remaining(&gate_key).is_none(),
+            "启动代理应解除残留短路窗口，否则刚启动就把请求挡成失败"
+        );
+
+        // stop 也清一次（语义更干净，且 stop→start 路径不依赖 start 侧清理）。
+        arm_all_failed_gate(&gate_key, None);
+        pm.stop(cat);
+        assert!(
+            all_failed_gate_remaining(&gate_key).is_none(),
+            "停止代理也应清掉短路窗口"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1662,22 +1979,38 @@ mod tests {
 
     /// 起一个返回固定 status + body 的 mock 上游，返回其 base_url。
     async fn spawn_mock(status: u16, body: &'static str) -> String {
+        spawn_mock_with_headers(status, body, &[]).await
+    }
+
+    /// 同 [`spawn_mock`]，但额外附带响应头（用于验证 Retry-After 透传）。
+    async fn spawn_mock_with_headers(
+        status: u16,
+        body: &'static str,
+        headers: &[(&'static str, &'static str)],
+    ) -> String {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
+        let headers: Vec<(&'static str, &'static str)> = headers.to_vec();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else { break };
                 let io = TokioIo::new(stream);
+                let headers = headers.clone();
                 tokio::spawn(async move {
-                    let svc = service_fn(move |_req: Request<Incoming>| async move {
-                        let resp = Response::builder()
-                            .status(status)
-                            .header("content-type", "application/json")
-                            .body(full_body(Bytes::from(body)))
-                            .unwrap();
-                        Ok::<_, hyper::Error>(resp)
+                    let svc = service_fn(move |_req: Request<Incoming>| {
+                        let headers = headers.clone();
+                        async move {
+                            let mut builder = Response::builder()
+                                .status(status)
+                                .header("content-type", "application/json");
+                            for (h, v) in &headers {
+                                builder = builder.header(*h, *v);
+                            }
+                            let resp = builder.body(full_body(Bytes::from(body))).unwrap();
+                            Ok::<_, hyper::Error>(resp)
+                        }
                     });
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, svc)
@@ -1724,9 +2057,65 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 端到端：全部候选失败 → 502。
+    /// 主口令锁定态：必须在**进入故障转移之前**短路，且不得污染健康状态。
+    ///
+    /// 若不短路，会逐个候选去试、每个都因取不到密钥失败 → `record_live_failure` 把整池好 Key
+    /// 刷成熔断 + 武装 529 短路窗口。用户解锁后反倒要等熔断过去才恢复，而真实原因只是没解锁。
     #[tokio::test]
-    async fn proxy_all_fail_returns_502() {
+    async fn locked_vault_short_circuits_before_touching_upstream_or_breaker() {
+        // mock 上游返回 200：若真被打到，测试会拿到 200 而非 503，从而暴露「没短路」。
+        let upstream = spawn_mock(
+            200,
+            r#"{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}"#,
+        )
+        .await;
+        let dir = temp_dir("locked");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        store.upsert_key(key("k1", 0, &upstream)).unwrap();
+        store.secrets.write().set("k1", "sk-x").unwrap();
+        // 启用主口令 → 已解锁态；随后显式上锁，模拟「新进程启动但用户还没输口令」。
+        store.secrets.write().enable_master_password("master-pw").unwrap();
+        store.secrets.write().lock();
+        assert!(store.secrets.read().is_locked(), "前置条件：处于锁定态");
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+
+        // 503 而非 529：529 会让客户端自动退避重试，但这里需要**人来输口令**，自动重试等不到结果。
+        assert_eq!(
+            resp.status().as_u16(),
+            503,
+            "锁定态应回 503（需人工介入），而非 529（那会让客户端无意义地自动重试）"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let msg = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("主口令"), "要点明是主口令未解锁: {msg}");
+        assert!(msg.contains("解锁"), "要给出可操作指引: {msg}");
+
+        // 关键：健康状态没被污染——解锁后应立即可用，不必等熔断窗口过去。
+        let k = store.get_key("k1").unwrap();
+        assert_eq!(k.health.fail_count, 0, "锁定态不得把好 Key 刷成失败");
+        assert!(k.health.breaker_until.is_none(), "锁定态不得触发熔断");
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 端到端：全部候选失败 → 529 overloaded_error + Retry-After。
+    ///
+    /// 状态码判据来自官方 gateway 规范（claude.exe v2.1.219 内嵌原文）：529 是「上游暂时无产能」
+    /// 的专用码，客户端 SDK 见到它走退避重试。此前回 502（→ `api_error`），SDK 的处理不确定，
+    /// 实测表现为立刻重发、把单次故障放大成持续轮询。
+    #[tokio::test]
+    async fn proxy_all_fail_returns_529_overloaded_with_retry_after() {
         let bad1 = spawn_mock(401, "no").await;
         let bad2 = spawn_mock(500, "err").await;
         let dir = temp_dir("allfail");
@@ -1745,9 +2134,187 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status().as_u16(), 502, "全部失败应回 502");
+        assert_eq!(
+            resp.status().as_u16(),
+            529,
+            "全部失败应回 529 overloaded_error（规范要求，客户端据此退避）"
+        );
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .expect("529 必须带可解析的 Retry-After");
+        assert!(retry_after >= 1, "Retry-After 不得为 0（等于不退避）");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "overloaded_error");
+
+        // 窗口内的短路响应同样必须是 529 + Retry-After（此前是 502）。
+        let again = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status().as_u16(), 529, "短路窗口内也应回 529");
+        assert!(
+            again.headers().contains_key("retry-after"),
+            "短路响应也必须带 Retry-After"
+        );
+
         pm.stop(CategoryType::ClaudeCli);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 全部候选都是**硬错误**（401 鉴权失败）时不得回 529，也不得武装短路窗口。
+    ///
+    /// 529 `overloaded_error` 的语义是「上游暂时无产能，退避后重试」，客户端 SDK 据此
+    /// 持续退避重试。可 401 是密钥填错——等到宇宙尽头也不会好转：
+    /// - 界面上呈现「过载」，与真实根因（配置错误）方向相反，用户会去查上游而不是查密钥；
+    /// - 短路窗口一到期就放行一个真实请求再撞一次 401，无谓消耗；
+    /// - 带 `Retry-After` 等于明示「稍后会好」，是错误承诺。
+    ///
+    /// 故硬错误原样回该状态码、不带 `Retry-After`、不武装短路窗口，让客户端第一次就拿到
+    /// 确定的失败。与上面那条 529 用例对照着看：区别只在最后一个候选给的是 401 还是 5xx。
+    #[tokio::test]
+    async fn all_hard_errors_return_status_verbatim_without_retry_after_or_gate() {
+        let bad1 = spawn_mock(401, "invalid api key").await;
+        let bad2 = spawn_mock(401, "invalid api key").await;
+        let dir = temp_dir("hardfail");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // 用 ClaudeDesktop 分类：与其它用例的 gate key 天然隔开
+        let mut k1 = key("k1", 0, &bad1);
+        k1.category_id = CategoryType::ClaudeDesktop;
+        let mut k2 = key("k2", 1, &bad2);
+        k2.category_id = CategoryType::ClaudeDesktop;
+        store.upsert_key(k1).unwrap();
+        store.upsert_key(k2).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        store.secrets.write().set("k2", "y").unwrap();
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeDesktop).await.unwrap();
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            401,
+            "硬错误必须原样回传，不能包装成 529「过载」"
+        );
+        assert!(
+            !resp.headers().contains_key("retry-after"),
+            "硬错误不该给 Retry-After —— 那是「稍后会好」的错误承诺"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_ne!(body["error"]["type"], "overloaded_error", "错误分类不能是过载");
+
+        // 短路窗口不该被武装：第二次请求应当再次真打上游、仍得 401（而非窗口短路的 529）。
+        let again = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            again.status().as_u16(),
+            401,
+            "硬错误不武装短路窗口，第二次仍应是 401 而不是短路的 529"
+        );
+
+        pm.stop(CategoryType::ClaudeDesktop);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 上游 429 的 `Retry-After` 必须透传给下游，且取各候选中的**最短**者。
+    ///
+    /// 官方 gateway 规范明确要求限流响应带 `Retry-After`。丢掉它，下游客户端只能按自己的固定
+    /// 节奏重发，仍会撞在上游的限流窗口里（这是「一直轮询」现象的一环）。
+    ///
+    /// **为什么取最短而非最长**：下游重试面对的是整池，只要有一个候选恢复就该放行。若取最长，
+    /// 一个撞上按天配额的候选（`Retry-After: 3600`）会把整个分类停摆到上限 300s，而另一个
+    /// 只是瞬时抖动的候选 1s 后就能服务 —— 那正是本项目最痛的「一个 Key 限流拖垮所有 Key」。
+    #[tokio::test]
+    async fn upstream_retry_after_is_propagated_downstream() {
+        // 两个候选都限流：一个说 7s，一个说 42s。取较短者，让下游在 7s 后就能来探路。
+        let limited_short = spawn_mock_with_headers(429, "slow down", &[("retry-after", "7")]).await;
+        let limited_long = spawn_mock_with_headers(429, "slow down", &[("retry-after", "42")]).await;
+        let dir = temp_dir("retry_after");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // 分类用 Codex：本用例走 Responses 之外的 Anthropic 端点也无妨，这里只关心 Retry-After
+        // 是否被采集并透传（gate 已按代理实例隔离，用哪个分类都不会污染别的用例）。
+        let mut k1 = key("k1", 0, &limited_short);
+        k1.category_id = CategoryType::Codex;
+        let mut k2 = key("k2", 1, &limited_long);
+        k2.category_id = CategoryType::Codex;
+        store.upsert_key(k1).unwrap();
+        store.upsert_key(k2).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        store.secrets.write().set("k2", "y").unwrap();
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::Codex).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 529);
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .expect("上游给了 Retry-After，下游必须收到");
+        assert_eq!(
+            retry_after, 7,
+            "应透传候选中最短的 Retry-After：只要有一个候选先恢复就该放下游来探路，\
+             取最长会让一个撞配额的 Key 把整池停摆"
+        );
+
+        pm.stop(CategoryType::Codex);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_retry_after_accepts_seconds_and_http_date() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let mut h = HeaderMap::new();
+
+        // 形态一：delta-seconds
+        h.insert(RETRY_AFTER, HeaderValue::from_static("30"));
+        assert_eq!(parse_retry_after(&h), Some(30));
+
+        // 形态二：HTTP-date（RFC 7231 允许）。取相对秒数，允许 ±2s 抖动。
+        let future = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let date = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        h.insert(RETRY_AFTER, HeaderValue::from_str(&date).unwrap());
+        let got = parse_retry_after(&h).expect("HTTP-date 形态应能解析");
+        assert!((58..=62).contains(&got), "HTTP-date 应换算成约 60s，实际 {got}");
+
+        // 已过期的 HTTP-date → 夹到 0（不产生负数退避）。
+        let past = chrono::Utc::now() - chrono::Duration::seconds(120);
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&past.format("%a, %d %b %Y %H:%M:%S GMT").to_string()).unwrap(),
+        );
+        assert_eq!(parse_retry_after(&h), Some(0));
+
+        // 上限夹取：上游给几小时不能照抄（我们的 Key 可能几秒后就恢复）。
+        h.insert(RETRY_AFTER, HeaderValue::from_static("99999"));
+        assert_eq!(parse_retry_after(&h), Some(MAX_RETRY_AFTER_SECS));
+
+        // 无头 / 垃圾值 → None，由调用方回退自己的退避口径。
+        assert_eq!(parse_retry_after(&HeaderMap::new()), None);
+        h.insert(RETRY_AFTER, HeaderValue::from_static("soon-ish"));
+        assert_eq!(parse_retry_after(&h), None);
     }
 
     /// 起一个**捕获请求体**的 mock 上游：把收到的 body 存进共享 Vec，返回固定 200。
