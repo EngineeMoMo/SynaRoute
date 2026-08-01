@@ -14,6 +14,38 @@ import type {
 import type { Lang } from "@/lib/i18n";
 import { api, isTauri } from "@/lib/bridge";
 
+/**
+ * 只改 settings 里的一两个字段并落盘，**基线取磁盘最新值而非内存快照**。
+ *
+ * 为什么不能直接 `{...get().settings, theme}`：`store.settings` 只在 App 挂载时 `loadSettings()`
+ * 写过一次，设置页此后改的字段（自启动、日志目录、健康探测间隔、局域网暴露…）只进它自己的
+ * 局部 state，store 这份是**挂载那一刻的旧快照**。拿旧快照整份提交，会把用户刚改的字段全部
+ * 顶回旧值。
+ *
+ * 后端 `Store::save_settings` 对 `mcp_*` / `active_*` / `proxy_ports` /
+ * `master_password_enabled` 做了「一律保留后端值」的防线，但 `auto_start` / `log_dir` /
+ * `request_log_enabled` / `lan_exposure` / `health_*` 这批没有，且 `auto_start` 现在会真的
+ * 去写系统自启动项 —— 用旧快照提交就等于「用户刚关掉自启动，切个主题又给装回去了」，
+ * 而设置页显示的仍是「关」。这正是本轮刚修掉的那类静默背离。
+ *
+ * 故先 `getSettings()` 拉磁盘权威值，再合并本次要改的字段。
+ */
+async function persistOneSetting(
+  patch: Partial<AppSettings>,
+  get: () => AppState,
+): Promise<void> {
+  try {
+    const latest = await api.getSettings();
+    const next = { ...latest, ...patch };
+    await api.saveSettings(next);
+    // 落盘成功后同步 store 副本，避免它继续陈旧下去（下一次调用仍会重拉，这里只是保持一致）
+    useStore.setState({ settings: next });
+  } catch (e) {
+    console.error("persistOneSetting failed", patch, e);
+    get().showToast("error", String((e as Error)?.message ?? e));
+  }
+}
+
 interface AppState {
   // 当前选中分类
   activeCategory: CategoryType;
@@ -127,25 +159,13 @@ export const useStore = create<AppState>((set, get) => ({
   setTheme: (t) => {
     set({ theme: t });
     applyTheme(t);
-    const s = get().settings;
-    if (s) {
-      api.saveSettings({ ...s, theme: t }).catch((e) => {
-        console.error("saveSettings(theme) failed", e);
-        get().showToast("error", String((e as Error)?.message ?? e));
-      });
-    }
+    void persistOneSetting({ theme: t }, get);
   },
 
   lang: "zh",
   setLang: (l) => {
     set({ lang: l });
-    const s = get().settings;
-    if (s) {
-      api.saveSettings({ ...s, language: l }).catch((e) => {
-        console.error("saveSettings(language) failed", e);
-        get().showToast("error", String((e as Error)?.message ?? e));
-      });
-    }
+    void persistOneSetting({ language: l }, get);
   },
 
   toast: null,
@@ -265,8 +285,14 @@ export const useStore = create<AppState>((set, get) => ({
     await get().loadCategory(cat);
   },
 
-  // 一键设为主：把目标 Key 提到 priority 0（其余保持原相对顺序顺延），
-  // 免去连点上移箭头。与 moveKey 同样规整为连续优先级、只对变动的 Key 落盘。
+  // 一键设为主：把目标 Key 提到 priority 0（其余保持原相对顺序顺延），免去连点上移箭头。
+  //
+  // 重排规则在**后端** Store::set_primary_key 里，这里只负责乐观更新 + 调命令。
+  // 原先前端自己算重排再逐个 upsertKey：托盘也要这个功能（FR-022 要求「从托盘可完成
+  // 主 Key 快切」），两处各写一份规则迟早漂移 —— 表现为「从托盘设的主」与「从界面设的主」
+  // 结果不一致。故规则收归后端做单一事实来源。
+  //
+  // 乐观更新仍留在前端：让点击即时反映，失败时由 loadCategory 拉回后端权威值纠正。
   async setPrimaryKey(keyId) {
     const cat = get().activeCategory;
     const ordered = [...get().keys]
@@ -277,14 +303,10 @@ export const useStore = create<AppState>((set, get) => ({
     const [target] = ordered.splice(idx, 1);
     ordered.unshift(target);
     const renumbered = ordered.map((k, i) => ({ ...k, priority: i }));
-    const toPersist = renumbered.filter((k) => {
-      const orig = get().keys.find((o) => o.id === k.id);
-      return orig && orig.priority !== k.priority;
-    });
     const byId = new Map(renumbered.map((k) => [k.id, k]));
     set({ keys: get().keys.map((k) => byId.get(k.id) ?? k) });
     try {
-      await Promise.all(toPersist.map((k) => api.upsertKey(k)));
+      await api.setPrimaryKey(cat, keyId);
     } catch (e) {
       console.error("setPrimaryKey failed", e);
       get().showToast("error", String((e as Error)?.message ?? e));

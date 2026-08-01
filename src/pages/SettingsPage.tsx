@@ -6,15 +6,26 @@ import { Switch } from "@/components/ui/Switch";
 import { Button } from "@/components/ui/Button";
 import { useT } from "@/lib/useT";
 import { LANGS } from "@/lib/i18n";
-import type { AppSettings, McpStatus, ThemePref, CategoryType } from "@/types";
+import type {
+  AppSettings,
+  McpStatus,
+  ThemePref,
+  CategoryType,
+  ExportOutcome,
+  ImportMode,
+  ImportPreview,
+  ImportReport,
+  MasterPasswordState,
+} from "@/types";
 import {
   Sun, Moon, Monitor, ShieldCheck, KeyRound, Languages, ScrollText,
-  Activity, RefreshCw, FolderOpen, Info, Plug, BookOpen, Copy, Check, X, Brain, MousePointerClick, MessageSquareDot, type LucideIcon,
+  Activity, RefreshCw, FolderOpen, Info, Plug, BookOpen, Copy, Check, X, Brain, MousePointerClick, MessageSquareDot,
+  Download, Upload, AlertTriangle, type LucideIcon,
 } from "lucide-react";
 
 /** 设置页（主题 / 语言 / 自启 / 加密方式 / 局域网暴露 / 版本更新 / 日志路径） */
 export function SettingsPage() {
-  const { theme, setTheme, lang, setLang, showToast, activeCategory } = useStore();
+  const { theme, setTheme, lang, setLang, showToast, activeCategory, refreshCategory, loadCategory, loadSettings } = useStore();
   const t = useT();
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [version, setVersion] = useState<string>("");
@@ -26,11 +37,70 @@ export function SettingsPage() {
   const [defaultLogDir, setDefaultLogDir] = useState<string>("");
   const [mcp, setMcp] = useState<McpStatus | null>(null);
   const [showWizard, setShowWizard] = useState(false);
+  // 配置导入导出（FR-021）
+  const [exportOpen, setExportOpen] = useState(false);
+  const [importState, setImportState] = useState<{ path: string; preview: ImportPreview } | null>(null);
+  // 主口令增强模式（FR-018 可选增强）。master 是后端真实状态（判据是密钥库里有无 master
+  // 头部），不是 settings.masterPasswordEnabled 那个镜像字段。
+  const [master, setMaster] = useState<MasterPasswordState | null>(null);
+  const [masterDialog, setMasterDialog] = useState<"enable" | "disable" | "unlock" | "change" | null>(null);
+
+  /** 重新拉主口令状态。任何切换/解锁后都要调，UI 才不会显示陈旧态。 */
+  const reloadMaster = async () => {
+    try {
+      setMaster(await api.getMasterPasswordState());
+    } catch (e) {
+      console.error("getMasterPasswordState failed", e);
+    }
+  };
+
+  /** 立即锁定：不需要口令，故不走对话框。 */
+  const lockNow = async () => {
+    try {
+      await api.lockMasterPassword();
+      showToast("success", t("master.locked"));
+      await reloadMaster();
+    } catch (e) {
+      showToast("error", String((e as Error)?.message ?? e));
+    }
+  };
+
+  /** 选文件 + 校验 + 预检（不改任何配置）。校验不过时直接弹错，不进确认弹窗。 */
+  const startImport = async () => {
+    try {
+      const picked = await api.pickAndPreviewImport();
+      if (!picked) return; // 用户取消
+      const [path, preview] = picked;
+      setImportState({ path, preview });
+    } catch (e) {
+      // 版本不符 / 校验和不匹配 / 不是导出文件，都在这里——后端消息已含行动指引。
+      showToast("error", String((e as Error)?.message ?? e));
+    }
+  };
+
+  /** 导入成功后刷新全局状态：Key 列表、设置、当前分类都变了。 */
+  const reloadAfterImport = async () => {
+    try {
+      // 走 store 的 loadSettings 而不是只 setSettings 局部：它会一并同步 store.settings /
+      // theme / lang 并 applyTheme。只刷局部的话，导入进来的主题不生效，且 store 里那份
+      // 陈旧快照会在下次切主题时把刚导入的设置顶回去（见 store.ts persistOneSetting 注释）。
+      await loadSettings();
+      setSettings(useStore.getState().settings);
+      await loadCategory(activeCategory);
+      await refreshCategory();
+      await reloadMaster(); // 导入含密钥段时锁定态可能变
+    } catch (e) {
+      console.error("reload after import failed", e);
+      showToast("error", String((e as Error)?.message ?? e));
+    }
+  };
 
   useEffect(() => {
     void api.getSettings().then(setSettings);
     void api.getAppVersion().then(setVersion);
     void api.getDefaultLogDir().then(setDefaultLogDir);
+    void reloadMaster();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // MCP 运行状态轮询：开启时每 3s 刷新一次，展示运行中/端口/故障原因。
@@ -48,13 +118,24 @@ export function SettingsPage() {
 
   const update = (patch: Partial<AppSettings>) => {
     if (!settings) return;
+    const prev = settings;
     const next = { ...settings, ...patch };
     setSettings(next);
-    // 落盘失败必须可见（项目硬规则：禁止静默吞错）。乐观更新 UI，写盘失败时弹提示。
-    void api.saveSettings(next).catch((e) => {
-      console.error("saveSettings failed", e);
-      showToast("error", String((e as Error)?.message ?? e));
-    });
+    // 落盘失败必须可见（项目硬规则：禁止静默吞错）。乐观更新 UI，写盘失败时弹提示
+    // **并回滚开关状态**——否则 UI 显示已开、系统实际没开（自启动这类「后端要动系统」的
+    // 设置尤其致命：用户以为开成了，重启后什么也没发生）。
+    void api
+      .saveSettings(next)
+      .then(() => {
+        // 成功后同步 store 副本：store.settings 是切主题/语言时的落盘基线之一，
+        // 留着旧值会让那条路径把刚改的字段顶回去（见 store.ts persistOneSetting）。
+        useStore.setState({ settings: next });
+      })
+      .catch((e) => {
+        console.error("saveSettings failed", e);
+        setSettings(prev);
+        showToast("error", String((e as Error)?.message ?? e));
+      });
   };
 
   // MCP 开关/端口走专用命令：携带当前活跃分类，后端据此自动注册 synaroute 到对应工具客户端
@@ -302,14 +383,37 @@ export function SettingsPage() {
             <CardTitle>{t("settings.security")}</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
+            {/* 主口令增强（FR-018 可选增强）。开关不直接落盘——启用/关闭都要整库迁移密钥，
+                必须走对话框收口令。checked 取自后端真实状态（密钥库里有无 master 头部），
+                不看 settings 那个镜像字段。 */}
             <ToggleRow
               icon={ShieldCheck}
               title={t("settings.masterPwTitle")}
               desc={t("settings.masterPwDesc")}
-              checked={false}
-              onChange={() => {}}
-              disabled
+              checked={master?.enabled ?? false}
+              onChange={(v) => setMasterDialog(v ? "enable" : "disable")}
             />
+            {master?.enabled && (
+              <div className="ml-[26px] flex flex-wrap items-center gap-2">
+                {master.locked ? (
+                  <>
+                    <span className="rounded-control bg-warning/12 px-2 py-0.5 text-[11px] text-warning">
+                      ● {t("master.lockedBadge")}
+                    </span>
+                    <Button size="sm" variant="secondary" onClick={() => setMasterDialog("unlock")}>
+                      {t("master.unlockAction")}
+                    </Button>
+                  </>
+                ) : (
+                  <Button size="sm" variant="outline" onClick={() => void lockNow()}>
+                    {t("master.lockNow")}
+                  </Button>
+                )}
+                <Button size="sm" variant="outline" onClick={() => setMasterDialog("change")}>
+                  {t("master.changeAction")}
+                </Button>
+              </div>
+            )}
             <ToggleRow
               icon={KeyRound}
               title={t("settings.lanTitle")}
@@ -573,23 +677,62 @@ export function SettingsPage() {
           </CardContent>
         </Card>
 
-        {/* 配置导入导出 */}
+        {/* 配置导入导出（FR-021）。密钥段走用户口令加密而非 DPAPI 密文——后者绑当前
+            Windows 账户、换机解不出，照搬等于导出一份用不了的文件。 */}
         <Card>
           <CardHeader>
             <CardTitle>{t("settings.backup")}</CardTitle>
           </CardHeader>
           <CardContent className="space-y-2">
             <div className="flex gap-2">
-              <Button variant="secondary" size="sm" disabled>{t("settings.export")}</Button>
-              <Button variant="secondary" size="sm" disabled>{t("settings.import")}</Button>
+              <Button variant="secondary" size="sm" onClick={() => setExportOpen(true)}>
+                {t("settings.export")}
+              </Button>
+              <Button variant="secondary" size="sm" onClick={() => void startImport()}>
+                {t("settings.import")}
+              </Button>
             </div>
-            <div className="text-xs text-text-muted">{t("settings.backupDeveloping")}</div>
+            <div className="text-xs text-text-muted">{t("settings.backupHint")}</div>
           </CardContent>
         </Card>
       </div>
 
+      {exportOpen && <ExportDialog onClose={() => setExportOpen(false)} t={t} />}
+      {importState && (
+        <ImportDialog
+          path={importState.path}
+          preview={importState.preview}
+          onClose={() => setImportState(null)}
+          onDone={() => {
+            setImportState(null);
+            // 导入会整体改动 Key/厂商/大脑配置，必须让整个应用重新拉一遍，
+            // 否则用户看到的还是导入前的列表（且下次保存会用旧快照顶回）。
+            void reloadAfterImport();
+          }}
+          t={t}
+        />
+      )}
+
       {showWizard && (
         <McpWizard mcpAddress={mcpAddress} onClose={() => setShowWizard(false)} t={t} />
+      )}
+
+      {masterDialog && (
+        <MasterPasswordDialog
+          kind={masterDialog}
+          onClose={() => setMasterDialog(null)}
+          onDone={async () => {
+            setMasterDialog(null);
+            await reloadMaster();
+            // 迁移会改 settings 里的镜像字段（后端在库切换成功后写），重拉一遍免得显示陈旧。
+            try {
+              setSettings(await api.getSettings());
+            } catch (e) {
+              console.error("reload settings after master switch failed", e);
+            }
+          }}
+          t={t}
+        />
       )}
     </div>
   );
@@ -737,5 +880,575 @@ function ToggleRow({
       </div>
       <Switch checked={checked} onCheckedChange={onChange} disabled={disabled} />
     </div>
+  );
+}
+
+/** 导出配置弹窗：先选「是否含密钥」，含则要求设口令并二次确认。 */
+function ExportDialog({
+  onClose,
+  t,
+}: {
+  onClose: () => void;
+  t: (k: string, vars?: Record<string, string | number>) => string;
+}) {
+  const showToast = useStore((s) => s.showToast);
+  const [includeSecrets, setIncludeSecrets] = useState(false);
+  const [pw, setPw] = useState("");
+  const [pw2, setPw2] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  // 只在「有 Key 的密钥解不出被跳过」时置位。这种情况**不能只弹 toast**——toast 会自己消失，
+  // 用户很可能带着一份缺条目的文件离开源机器，到新机器才发现。故留在弹窗里等用户确认。
+  const [skipped, setSkipped] = useState<ExportOutcome | null>(null);
+
+  // 口令校验只在勾了「含密钥」时生效。8 位下限是个务实底线：这层的真实保护来自
+  // Argon2id 的派生成本，但太短的口令依然挡不住字典攻击。
+  const pwProblem = !includeSecrets
+    ? null
+    : pw.length < 8
+      ? t("backup.passwordTooShort")
+      : pw !== pw2
+        ? t("backup.passwordMismatch")
+        : null;
+
+  const run = async () => {
+    if (pwProblem) return setErr(pwProblem);
+    setBusy(true);
+    setErr(null);
+    try {
+      const out = await api.exportConfig(includeSecrets ? pw : undefined);
+      if (!out) return onClose(); // 用户取消选文件，不算失败
+      if (out.undecryptable > 0) {
+        // 文件已经写成功了，只是少了几条密钥。停在弹窗上把这事说清楚。
+        setSkipped(out);
+        setBusy(false);
+        return;
+      }
+      showToast("success", t("backup.exportDone", { path: out.path }));
+      onClose();
+    } catch (e) {
+      setErr(String((e as Error)?.message ?? e));
+      setBusy(false);
+    }
+  };
+
+  // 导出成功但有条目被跳过：单独一屏，必须用户点掉才走。
+  if (skipped) {
+    return (
+      <ModalShell title={t("backup.exportTitle")} icon={Download} onClose={onClose}>
+        <div className="break-all rounded-control bg-surface-elevated px-3 py-2 font-mono text-[11px] text-text-secondary">
+          {skipped.path}
+        </div>
+        <div className="flex items-start gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2">
+          <AlertTriangle size={13} className="mt-0.5 shrink-0 text-warning" />
+          <span className="text-[11px] leading-relaxed text-warning">
+            {t("backup.exportSkipped", { n: skipped.undecryptable })}
+          </span>
+        </div>
+        <div className="flex justify-end pt-1">
+          <Button size="sm" onClick={onClose}>
+            {t("common.close")}
+          </Button>
+        </div>
+      </ModalShell>
+    );
+  }
+
+  return (
+    <ModalShell title={t("backup.exportTitle")} icon={Download} onClose={onClose} busy={busy}>
+      <label className="flex cursor-pointer items-start gap-2.5">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={includeSecrets}
+          onChange={(e) => setIncludeSecrets(e.target.checked)}
+        />
+        <div>
+          <div className="text-sm text-text-primary">{t("backup.includeSecrets")}</div>
+          <div className="mt-0.5 text-[11px] leading-relaxed text-text-muted">
+            {t("backup.includeSecretsDesc")}
+          </div>
+        </div>
+      </label>
+
+      {includeSecrets ? (
+        <div className="space-y-2">
+          <input
+            type="password"
+            className={pwInputCls}
+            placeholder={t("backup.exportPassword")}
+            value={pw}
+            onChange={(e) => setPw(e.target.value)}
+            autoFocus
+          />
+          <input
+            type="password"
+            className={pwInputCls}
+            placeholder={t("backup.exportPasswordAgain")}
+            value={pw2}
+            onChange={(e) => setPw2(e.target.value)}
+          />
+          <div className="flex items-start gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2">
+            <AlertTriangle size={13} className="mt-0.5 shrink-0 text-warning" />
+            <span className="text-[11px] leading-relaxed text-warning">
+              {t("backup.passwordLostWarning")}
+            </span>
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-control bg-info/10 px-3 py-2 text-[11px] leading-relaxed text-text-secondary">
+          {t("backup.noSecretsHint")}
+        </div>
+      )}
+
+      {/* 口令校验提示常驻渲染：只把它塞进 disabled 判据的话，用户只看到一个灰掉的按钮，
+          界面上一个字都不说为什么（「至少 8 位」这个约束也无从得知）。开始输入后才显示，
+          避免刚打开弹窗就报红。 */}
+      {includeSecrets && pwProblem && (pw.length > 0 || pw2.length > 0) && (
+        <div className="text-[11px] leading-relaxed text-warning">{pwProblem}</div>
+      )}
+
+      {err && (
+        <div className="whitespace-pre-line rounded-control bg-danger/10 px-3 py-2 text-xs leading-relaxed text-danger">
+          {err}
+        </div>
+      )}
+
+      <div className="flex justify-end gap-2 pt-1">
+        <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>
+          {t("common.cancel")}
+        </Button>
+        <Button size="sm" onClick={() => void run()} disabled={busy || !!pwProblem}>
+          {busy ? t("backup.exporting") : t("backup.exportAction")}
+        </Button>
+      </div>
+    </ModalShell>
+  );
+}
+
+/** 导入配置弹窗：展示预检结果 → 选模式 →（若含密钥）输口令 → 执行。 */
+function ImportDialog({
+  path,
+  preview,
+  onClose,
+  onDone,
+  t,
+}: {
+  path: string;
+  preview: ImportPreview;
+  onClose: () => void;
+  onDone: () => void;
+  t: (k: string, vars?: Record<string, string | number>) => string;
+}) {
+  const showToast = useStore((s) => s.showToast);
+  const [mode, setMode] = useState<ImportMode>("merge");
+  const [pw, setPw] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [report, setReport] = useState<ImportReport | null>(null);
+
+  const run = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const r = await api.applyImportConfig(path, mode, preview.hasSecrets ? pw : undefined);
+      setReport(r);
+      showToast(
+        "success",
+        t("backup.importDone", {
+          added: r.keysAdded,
+          overwritten: r.keysOverwritten,
+          removed: r.keysRemoved,
+          secrets: r.secretsImported,
+        }),
+      );
+    } catch (e) {
+      // 口令错 / 文件损坏都在这里。后端已保证「失败时本机配置一点没动」。
+      setErr(String((e as Error)?.message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 导入已完成：只展示结果与警告，按「完成」才刷新全局状态并关闭。
+  if (report) {
+    return (
+      <ModalShell title={t("backup.importTitle")} icon={Upload} onClose={onDone}>
+        <div className="rounded-control bg-success/10 px-3 py-2 text-xs leading-relaxed text-success">
+          {t("backup.importDone", {
+            added: report.keysAdded,
+            overwritten: report.keysOverwritten,
+            removed: report.keysRemoved,
+            secrets: report.secretsImported,
+          })}
+        </div>
+        {report.backupPath && (
+          <div className="break-all rounded-control bg-surface-elevated px-3 py-2 font-mono text-[11px] text-text-secondary">
+            {t("backup.backupSaved", { path: report.backupPath })}
+          </div>
+        )}
+        {report.warnings.length > 0 && (
+          <div className="space-y-1 rounded-control border border-warning/30 bg-warning/8 px-3 py-2">
+            {report.warnings.map((w, i) => (
+              <div key={i} className="flex items-start gap-2">
+                <AlertTriangle size={13} className="mt-0.5 shrink-0 text-warning" />
+                <span className="text-[11px] leading-relaxed text-warning">{w}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="flex justify-end pt-1">
+          <Button size="sm" onClick={onDone}>
+            {t("common.close")}
+          </Button>
+        </div>
+      </ModalShell>
+    );
+  }
+
+  return (
+    <ModalShell title={t("backup.importTitle")} icon={Upload} onClose={onClose} busy={busy}>
+      <div className="space-y-1 rounded-control bg-surface-elevated px-3 py-2">
+        <div className="break-all font-mono text-[11px] text-text-secondary">{path}</div>
+        <div className="text-[11px] text-text-muted">
+          {t("backup.fileInfo", { version: preview.appVersion, time: preview.exportedAt })}
+        </div>
+        <div className="text-xs text-text-primary">
+          {t("backup.summary", {
+            keys: preview.keyCount,
+            vendors: preview.vendorCount,
+            brain: preview.brainCount,
+          })}
+        </div>
+        <div className="text-[11px] text-text-muted">
+          {preview.hasSecrets ? t("backup.hasSecrets") : t("backup.noSecrets")}
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <div className="text-xs font-medium text-text-primary">{t("backup.modeTitle")}</div>
+        <ModeOption
+          checked={mode === "merge"}
+          onSelect={() => setMode("merge")}
+          title={t("backup.modeMerge")}
+          desc={t("backup.modeMergeDesc")}
+          note={
+            preview.conflictingKeys > 0
+              ? t("backup.conflictNote", { n: preview.conflictingKeys })
+              : undefined
+          }
+        />
+        <ModeOption
+          checked={mode === "replace"}
+          onSelect={() => setMode("replace")}
+          title={t("backup.modeReplace")}
+          desc={t("backup.modeReplaceDesc")}
+          note={
+            preview.localOnlyKeys > 0
+              ? t("backup.removeNote", { n: preview.localOnlyKeys })
+              : undefined
+          }
+          danger
+        />
+      </div>
+
+      {preview.hasSecrets && (
+        <input
+          type="password"
+          className={pwInputCls}
+          placeholder={t("backup.importPassword")}
+          value={pw}
+          onChange={(e) => setPw(e.target.value)}
+          autoFocus
+        />
+      )}
+
+      {err && (
+        <div className="whitespace-pre-line rounded-control bg-danger/10 px-3 py-2 text-xs leading-relaxed text-danger">
+          {err}
+        </div>
+      )}
+
+      <div className="flex justify-end gap-2 pt-1">
+        <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>
+          {t("common.cancel")}
+        </Button>
+        <Button
+          size="sm"
+          onClick={() => void run()}
+          disabled={busy || (preview.hasSecrets && pw.length === 0)}
+        >
+          {busy ? t("backup.importing") : t("backup.importAction")}
+        </Button>
+      </div>
+    </ModalShell>
+  );
+}
+
+/** 导入模式单选项。`danger` 用于「替换」这种破坏性选项，选中后描边变警示色。 */
+function ModeOption({
+  checked,
+  onSelect,
+  title,
+  desc,
+  note,
+  danger,
+}: {
+  checked: boolean;
+  onSelect: () => void;
+  title: string;
+  desc: string;
+  note?: string;
+  danger?: boolean;
+}) {
+  const border = checked
+    ? danger
+      ? "border-warning/50 bg-warning/8"
+      : "border-primary/50 bg-primary/8"
+    : "border-border";
+  return (
+    <label className={`flex cursor-pointer items-start gap-2.5 rounded-control border ${border} px-3 py-2`}>
+      <input type="radio" className="mt-0.5" checked={checked} onChange={onSelect} />
+      <div className="min-w-0">
+        <div className="text-sm text-text-primary">{title}</div>
+        <div className="mt-0.5 text-[11px] leading-relaxed text-text-muted">{desc}</div>
+        {note && (
+          <div className={`mt-1 text-[11px] ${danger ? "text-warning" : "text-text-secondary"}`}>
+            {note}
+          </div>
+        )}
+      </div>
+    </label>
+  );
+}
+
+/** 弹窗外壳：与项目既有弹窗一致——遮罩用 onMouseDown + target===currentTarget 判定，
+ *  避免框内拖选文字松手落到遮罩上误关（见 memory: modal-overlay-close-pattern）。
+ *
+ *  `busy` 期间遮罩与 X 都不响应：这两条路径的结果（导出跳过条数、迁移失败原因）只存在于
+ *  弹窗组件的局部 state，组件一卸载 setState 就是 no-op，React 不报错也不提示 ——
+ *  用户会带着一份缺条目的导出文件走，或以为主口令启用成功了。取消按钮本来就 disabled，
+ *  遮罩与 X 必须同口径，否则「禁用」形同虚设。 */
+function ModalShell({
+  title,
+  icon: Icon,
+  onClose,
+  busy = false,
+  children,
+}: {
+  title: string;
+  icon: LucideIcon;
+  onClose: () => void;
+  /** 进行中：禁止通过遮罩/X 关闭，防止结果信息随组件卸载丢失 */
+  busy?: boolean;
+  children: React.ReactNode;
+}) {
+  const close = () => {
+    if (!busy) onClose();
+  };
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) close();
+      }}
+    >
+      <div className="flex max-h-[85vh] w-full max-w-lg flex-col overflow-hidden rounded-card border border-border bg-surface shadow-lg">
+        <div className="flex items-center gap-2 border-b border-border px-4 py-3">
+          <Icon size={16} className="text-primary" />
+          <h2 className="flex-1 text-sm font-semibold text-text-primary">{title}</h2>
+          <button
+            type="button"
+            onClick={close}
+            disabled={busy}
+            className="rounded p-1 hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <X size={16} />
+          </button>
+        </div>
+        <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+const pwInputCls =
+  "h-9 w-full rounded-control border border-border bg-surface px-3 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ring";
+
+/**
+ * 主口令增强模式的四合一对话框（FR-018 可选增强）。
+ *
+ * 四种用途共用一个组件，因为它们的结构完全一致（收 1~2 个口令 → 调一个命令 → 报结果），
+ * 分成四个组件只会把同样的错误处理、忙碌态、回车提交抄四遍。
+ *
+ * | kind | 收什么 | 调什么 |
+ * |---|---|---|
+ * | `enable` | 新口令 ×2 | `enableMasterPassword` |
+ * | `disable` | 当前口令 | `disableMasterPassword` |
+ * | `unlock` | 当前口令 | `unlockMasterPassword` |
+ * | `change` | 旧口令 + 新口令 ×2 | `changeMasterPassword` |
+ *
+ * 失败**不关闭弹窗**：口令错是最常见的失败，关掉会让用户从头点起。
+ */
+function MasterPasswordDialog({
+  kind,
+  onClose,
+  onDone,
+  t,
+}: {
+  kind: "enable" | "disable" | "unlock" | "change";
+  onClose: () => void;
+  onDone: () => void;
+  t: (k: string, vars?: Record<string, string | number>) => string;
+}) {
+  const showToast = useStore((s) => s.showToast);
+  const [oldPw, setOldPw] = useState("");
+  const [pw, setPw] = useState("");
+  const [pw2, setPw2] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // 需要「设新口令」的两种：要二次确认 + 长度下限。
+  // 8 位下限是务实底线——真正的保护来自 Argon2id 的派生成本，但太短仍挡不住字典攻击。
+  const settingNew = kind === "enable" || kind === "change";
+  const pwProblem = !settingNew
+    ? null
+    : pw.length < 8
+      ? t("master.passwordTooShort")
+      : pw !== pw2
+        ? t("master.passwordMismatch")
+        : null;
+  // 提交按钮的可用判据：各 kind 需要的字段都填了、且新口令校验通过。
+  const canSubmit =
+    !busy &&
+    !pwProblem &&
+    (kind === "change" ? oldPw.length > 0 && pw.length > 0 : pw.length > 0);
+
+  const titleKey = {
+    enable: "master.enableTitle",
+    disable: "master.disableTitle",
+    unlock: "master.unlockTitle",
+    change: "master.changeTitle",
+  }[kind];
+  const descKey = {
+    enable: "master.enableDesc",
+    disable: "master.disableDesc",
+    unlock: "master.unlockDesc",
+    change: "master.changeDesc",
+  }[kind];
+  const actionKey = {
+    enable: "master.enableAction",
+    disable: "master.disableAction",
+    unlock: "master.unlockAction",
+    change: "master.changeAction",
+  }[kind];
+  const busyKey = {
+    enable: "master.enabling",
+    disable: "master.disabling",
+    unlock: "master.unlocking",
+    change: "master.changing",
+  }[kind];
+
+  const run = async () => {
+    if (pwProblem) return setErr(pwProblem);
+    setBusy(true);
+    setErr(null);
+    try {
+      if (kind === "unlock") {
+        await api.unlockMasterPassword(pw);
+        showToast("success", t("master.unlockAction"));
+      } else if (kind === "enable") {
+        const n = await api.enableMasterPassword(pw);
+        showToast("success", t("master.enabled", { count: n }));
+      } else if (kind === "disable") {
+        const n = await api.disableMasterPassword(pw);
+        showToast("success", t("master.disabled", { count: n }));
+      } else {
+        const n = await api.changeMasterPassword(oldPw, pw);
+        showToast("success", t("master.changed", { count: n }));
+      }
+      onDone();
+    } catch (e) {
+      // 不关弹窗：口令错是最常见的失败，关掉等于让用户从头点一遍。
+      setErr(String((e as Error)?.message ?? e));
+      setBusy(false);
+    }
+  };
+
+  // 回车提交：这几个弹窗都是纯口令输入，用户手不会离开键盘。
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && canSubmit) void run();
+  };
+
+  return (
+    <ModalShell title={t(titleKey)} icon={ShieldCheck} onClose={onClose} busy={busy}>
+      <div className="rounded-control bg-info/10 px-3 py-2 text-[11px] leading-relaxed text-text-secondary">
+        {t(descKey)}
+      </div>
+
+      {kind === "change" && (
+        <input
+          type="password"
+          className={pwInputCls}
+          placeholder={t("master.oldPassword")}
+          value={oldPw}
+          onChange={(e) => setOldPw(e.target.value)}
+          onKeyDown={onKeyDown}
+          autoFocus
+        />
+      )}
+
+      <input
+        type="password"
+        className={pwInputCls}
+        placeholder={t(settingNew ? "master.newPassword" : "master.password")}
+        value={pw}
+        onChange={(e) => setPw(e.target.value)}
+        onKeyDown={onKeyDown}
+        autoFocus={kind !== "change"}
+      />
+
+      {settingNew && (
+        <input
+          type="password"
+          className={pwInputCls}
+          placeholder={t("master.newPasswordAgain")}
+          value={pw2}
+          onChange={(e) => setPw2(e.target.value)}
+          onKeyDown={onKeyDown}
+        />
+      )}
+
+      {/* 启用是不可逆风险最高的一步：忘记口令等于永久失去全部密钥，必须显式警告。 */}
+      {kind === "enable" && (
+        <div className="flex items-start gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2">
+          <AlertTriangle size={13} className="mt-0.5 shrink-0 text-warning" />
+          <span className="text-[11px] leading-relaxed text-warning">
+            {t("master.enableWarning")}
+          </span>
+        </div>
+      )}
+
+      {/* 口令校验提示常驻渲染，理由同导出弹窗：只塞进 disabled 判据的话，
+          用户只看到一个灰掉的按钮而界面不说原因。开始输入后才显示。 */}
+      {pwProblem && (pw.length > 0 || pw2.length > 0) && (
+        <div className="text-[11px] leading-relaxed text-warning">{pwProblem}</div>
+      )}
+
+      {err && (
+        <div className="whitespace-pre-line rounded-control bg-danger/10 px-3 py-2 text-xs leading-relaxed text-danger">
+          {err}
+        </div>
+      )}
+
+      <div className="flex justify-end gap-2 pt-1">
+        <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>
+          {t("common.cancel")}
+        </Button>
+        <Button size="sm" onClick={() => void run()} disabled={!canSubmit}>
+          {busy ? t(busyKey) : t(actionKey)}
+        </Button>
+      </div>
+    </ModalShell>
   );
 }
