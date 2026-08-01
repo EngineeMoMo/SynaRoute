@@ -119,6 +119,13 @@ export interface BrainConfig {
   maxContextTokens?: number; // 注入文件 token 上限（默认 50000）
   retrievalEnabled: boolean; // 是否启用文件检索
   autoFollowActive?: boolean; // 自动跟随最近活动项目（每次运行时取最新工作目录，忽略 workDir）
+  /**
+   * 是否给参与者一组只读检索工具（read_file / grep / list_dir / codegraph_query）。
+   * 默认关：每轮工具调用都要重发完整历史，额度消耗显著高于单轮。
+   */
+  toolsEnabled?: boolean;
+  /** 工具调用轮数上限，后端 clamp 到 2~12（默认 6） */
+  maxToolRounds?: number;
 }
 
 /** 聚合运行结果 */
@@ -228,6 +235,14 @@ export interface EventLogEntry {
   type: "route" | "failover" | "health" | "aggregate" | "error" | "request" | "mcp" | "config";
   keyId?: string;
   detail: string;
+  /**
+   * 连续同类事件被折叠的条数（1 = 未折叠，UI 不显示计数）。
+   *
+   * 高频转发下「同 Key、同模型、都成功」的记录只是延迟不同，逐条列出会瞬间刷屏。
+   * 后端把**连续**的同类记录合成一条并计数；中间插进任何别的事件就重新起一条，
+   * 时间线不会被压扁到看不出穿插关系。日志文件仍逐条完整写。
+   */
+  repeat?: number;
   /**
    * 该条是否带链路快照（可展开看详情）。
    *

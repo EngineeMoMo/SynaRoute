@@ -114,6 +114,8 @@ const brainConfigs: Record<CategoryType, BrainConfig> = {
       { id: "bm3", keyId: "k3", modelName: "GLM5.2" },
     ],
     retrievalEnabled: false,
+    toolsEnabled: false,
+    maxToolRounds: 6,
   },
   "claude-desktop": {
     categoryId: "claude-desktop",
@@ -123,6 +125,8 @@ const brainConfigs: Record<CategoryType, BrainConfig> = {
     totalTimeoutMs: 60000,
     members: [],
     retrievalEnabled: false,
+    toolsEnabled: false,
+    maxToolRounds: 6,
   },
   codex: {
     categoryId: "codex",
@@ -132,6 +136,8 @@ const brainConfigs: Record<CategoryType, BrainConfig> = {
     totalTimeoutMs: 60000,
     members: [],
     retrievalEnabled: false,
+    toolsEnabled: false,
+    maxToolRounds: 6,
   },
 };
 
@@ -157,6 +163,8 @@ const events: EventLogEntry[] = [
     type: "route",
     keyId: "k2",
     detail: "厂商2 成功返回 opus-4-7",
+    // 折叠计数：验证「×N」徽标的渲染（真实后端对连续同类成功记录会这样合并）
+    repeat: 7,
   },
   {
     id: "e3",

@@ -438,6 +438,487 @@ async fn openai_chat(
     Ok(text)
 }
 
+// ===========================================================================
+// 多模态（图片）+ 工具调用：大脑聚合成员的 agent 循环用
+//
+// 为什么与上面的 text_completion 并列、而不是给它加参数：text_completion 有三个调用点
+// （聚合成员、决策者、汇总者）。后两者的职责是「综合已有分析」，给它们工具会让整轮耗时
+// 不可控；硬塞参数则让那两条不需要工具的路径也背上多轮循环的复杂度。
+// ===========================================================================
+
+/// 一张随 prompt 发给模型的图片。`base64` 是裸编码，**不含** `data:` 前缀
+/// —— OpenAI 侧需要的 data URL 在 [`openai_user_content`] 里现拼，Anthropic 侧则要裸串。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagePart {
+    /// MIME 类型。只允许两家协议**共同**支持的四种（png/jpeg/gif/webp）。
+    /// 校验在入口（MCP 的 `images` 参数）做，协议层只负责按各自形状拼装。
+    pub media_type: String,
+    pub base64: String,
+}
+
+/// 聚合调用的输入：文本 + 可选图片。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MultimodalPrompt {
+    pub text: String,
+    pub images: Vec<ImagePart>,
+}
+
+impl MultimodalPrompt {
+    /// 纯文本输入（与旧的 `&str` prompt 等价）。
+    pub fn from_text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn has_images(&self) -> bool {
+        !self.images.is_empty()
+    }
+}
+
+/// 一个可供模型调用的工具声明（协议无关，由 `agent_tools` 提供）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    /// 参数的 JSON Schema（`{"type":"object","properties":{..}}` 形态）。
+    pub input_schema: Value,
+}
+
+/// 模型请求的一次工具调用。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolInvocation {
+    /// 协议侧的调用 id（Anthropic `tool_use.id` / OpenAI `tool_calls[].id`）。
+    /// 回填结果时必须**原样带回**，否则上游认不出这条结果属于哪次调用。
+    pub id: String,
+    pub name: String,
+    /// 已解析的参数。OpenAI 的 `arguments` 是 JSON **字符串**，此处已解析成对象；
+    /// 若模型吐出的不是合法 JSON，则为 [`Value::Null`]（执行层据此回一条可读错误给模型）。
+    pub args: Value,
+}
+
+/// 一次工具执行的结果，待回填进消息历史。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolResultMsg {
+    /// 对应的 [`ToolInvocation::id`]。
+    pub id: String,
+    pub content: String,
+    pub is_error: bool,
+}
+
+/// 一轮模型调用的产出。
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnOutcome {
+    /// 模型给了最终文本、没有工具调用 → 循环结束。
+    Text(String),
+    /// 模型要调工具（`calls` 必非空）。
+    ToolCalls {
+        /// 本轮模型在调工具**之前**说的话（Anthropic 常先出一个 text block 再出 tool_use）。
+        /// 保留它是为了轮数/时间预算到顶时能把「已说的部分」当作阶段结论交出去，而不是返回空串。
+        text: String,
+        /// 原样回填历史的 assistant 消息（协议原生形态）。
+        ///
+        /// **照抄上游返回、不重建**：重建会丢掉 thinking block 及其 `signature`，而 Anthropic
+        /// 在带扩展思考的多轮里校验签名，缺失直接 400；OpenAI 侧同理会丢 `refusal` 等字段。
+        assistant: Value,
+        calls: Vec<ToolInvocation>,
+    },
+}
+
+/// 构造 Anthropic 的 user content。
+///
+/// 无图片时返回**字符串**而非单元素 block 数组：与旧的纯文本请求逐字节一致，避免给不吃
+/// content 数组的老网关平添兼容风险。有图片时图片在前、文本在后 —— 两家官方文档都建议
+/// 图片先于引用它的文字，反过来放部分模型会答「没看到图片」。
+fn anthropic_user_content(p: &MultimodalPrompt) -> Value {
+    if p.images.is_empty() {
+        return json!(p.text);
+    }
+    let mut blocks: Vec<Value> = p
+        .images
+        .iter()
+        .map(|img| {
+            json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img.media_type,
+                    "data": img.base64,
+                }
+            })
+        })
+        .collect();
+    blocks.push(json!({ "type": "text", "text": p.text }));
+    Value::Array(blocks)
+}
+
+/// 构造 OpenAI Chat 的 user content。图片走 `image_url` + inline data URL
+/// （不用外链 URL：本地文件根本没有可访问的 URL，且外链会把用户截图发给第三方图床）。
+fn openai_user_content(p: &MultimodalPrompt) -> Value {
+    if p.images.is_empty() {
+        return json!(p.text);
+    }
+    let mut blocks: Vec<Value> = p
+        .images
+        .iter()
+        .map(|img| {
+            json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:{};base64,{}", img.media_type, img.base64) }
+            })
+        })
+        .collect();
+    blocks.push(json!({ "type": "text", "text": p.text }));
+    Value::Array(blocks)
+}
+
+/// Anthropic 工具声明：`{name, description, input_schema}`。
+fn anthropic_tools(tools: &[ToolDef]) -> Value {
+    Value::Array(
+        tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// OpenAI 工具声明：外层包一层 `{type:"function", function:{..}}`，且 schema 字段叫
+/// `parameters` 而非 `input_schema` —— 这两处是两家协议最容易写错的差异点。
+fn openai_tools(tools: &[ToolDef]) -> Value {
+    Value::Array(
+        tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    }
+                })
+            })
+            .collect(),
+    )
+}
+
+/// 解析 Anthropic 一轮响应，同时取出文本与工具调用。
+///
+/// 与 [`parse_anthropic_text`] 的区别：那个只取 text block。这里还要认 `tool_use`，
+/// 并把整份 content 数组原样留下作为 assistant 历史。
+///
+/// **SSE 兜底**：工具循环发的是非流式请求，正常必是普通 JSON；但个别网关无论请求怎么发都回
+/// SSE。那种情况下退化成「只取文本、当作没有工具调用」——比整轮报错好：成员至少还能给出
+/// 一个基于已注入上下文的答案（降级而非失灵）。
+fn parse_anthropic_turn(raw: &str) -> Option<TurnOutcome> {
+    let Ok(body) = serde_json::from_str::<Value>(raw) else {
+        return parse_anthropic_text(raw).map(TurnOutcome::Text);
+    };
+    let Some(content) = body.get("content").and_then(|c| c.as_array()) else {
+        return parse_anthropic_text(raw).map(TurnOutcome::Text);
+    };
+    let calls: Vec<ToolInvocation> = content
+        .iter()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+        .filter_map(|b| {
+            Some(ToolInvocation {
+                id: b.get("id")?.as_str()?.to_string(),
+                name: b.get("name")?.as_str()?.to_string(),
+                // input 缺失按「无参数」处理：无参工具（如 list_dir 默认根目录）合法。
+                args: b.get("input").cloned().unwrap_or_else(|| json!({})),
+            })
+        })
+        .collect();
+    let text = content
+        .iter()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+        .collect::<Vec<_>>()
+        .join("");
+    if calls.is_empty() {
+        return Some(TurnOutcome::Text(text));
+    }
+    Some(TurnOutcome::ToolCalls {
+        text,
+        assistant: json!({ "role": "assistant", "content": content }),
+        calls,
+    })
+}
+
+/// 解析 OpenAI Chat 一轮响应（文本 + tool_calls）。SSE 兜底同 [`parse_anthropic_turn`]。
+fn parse_openai_turn(raw: &str) -> Option<TurnOutcome> {
+    let msg = serde_json::from_str::<Value>(raw).ok().and_then(|body| {
+        body.get("choices")?
+            .as_array()?
+            .first()?
+            .get("message")
+            .cloned()
+    });
+    let Some(msg) = msg else {
+        return parse_openai_text(raw).map(TurnOutcome::Text);
+    };
+    let text = msg
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let calls: Vec<ToolInvocation> = msg
+        .get("tool_calls")
+        .and_then(|t| t.as_array())
+        .map(|arr| arr.iter().filter_map(parse_openai_tool_call).collect())
+        .unwrap_or_default();
+    if calls.is_empty() {
+        return Some(TurnOutcome::Text(text));
+    }
+    // 部分网关回的 message 不带 role；缺了它下一轮上游会把这条消息当成非法角色而 400。
+    let mut assistant = msg;
+    if assistant.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+        assistant["role"] = json!("assistant");
+    }
+    Some(TurnOutcome::ToolCalls {
+        text,
+        assistant,
+        calls,
+    })
+}
+
+/// 解析单条 OpenAI `tool_calls[]`。`function.arguments` 是 JSON **字符串**（不是对象）。
+fn parse_openai_tool_call(item: &Value) -> Option<ToolInvocation> {
+    let f = item.get("function")?;
+    let raw_args = f.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
+    let args = if raw_args.trim().is_empty() {
+        // 无参工具的 arguments 常是 "" 或 "{}"，都按空对象处理。
+        json!({})
+    } else {
+        // 模型偶尔吐出被截断/带多余文字的 arguments。此时留 Null，由执行层回一条
+        // 「参数不是合法 JSON 对象」的 tool_result 让模型自己重试 —— 比静默当空参数
+        // 去执行（可能读错文件）安全，也比整轮失败友好。
+        serde_json::from_str::<Value>(raw_args).unwrap_or(Value::Null)
+    };
+    Some(ToolInvocation {
+        id: item.get("id")?.as_str()?.to_string(),
+        name: f.get("name")?.as_str()?.to_string(),
+        args,
+    })
+}
+
+/// 一次 [`ToolSession::turn`] 需要的上游参数。
+///
+/// 收成结构体而非逐个传：逐个会到 8 个参数，而调用方（聚合的成员循环）在整个循环里持有的
+/// 本来就是同一份，每轮重复展开只会让调用点变噪音。
+///
+/// `Copy`：成员循环每轮要按**剩余时间预算**复制一份、只改 `request_timeout`
+/// （见 `aggregate::run_member_turns`）。字段全是引用/标量，复制成本与 `&self` 等同。
+#[derive(Clone, Copy)]
+pub struct TurnParams<'a> {
+    pub key: &'a ProviderKey,
+    pub secret: &'a str,
+    pub model: &'a str,
+    pub max_tokens: u32,
+    /// 对临时性上游错误（502/503/504/429/连接失败）自动重试。
+    pub retry: bool,
+    /// **单次** HTTP 请求的超时（含上游完整生成时间）。
+    pub request_timeout: Duration,
+}
+
+/// 带工具的多轮会话。协议差异（消息形态、工具声明、结果回填）全收在这里，
+/// 调用方（`aggregate` 的成员循环）只处理 [`TurnOutcome`]，不碰 JSON 形状。
+///
+/// 两家 API 都是无状态的：每轮把**整份历史**重发。这也是工具循环显著更耗 token 的原因，
+/// 故上层开关默认关闭。
+pub struct ToolSession {
+    protocol: Protocol,
+    /// 协议原生形态的消息历史。
+    messages: Vec<Value>,
+}
+
+impl ToolSession {
+    /// 以一条 user 消息开局（可含图片）。
+    pub fn new(protocol: Protocol, prompt: &MultimodalPrompt) -> Self {
+        let content = if protocol.is_openai() {
+            openai_user_content(prompt)
+        } else {
+            anthropic_user_content(prompt)
+        };
+        Self {
+            protocol,
+            messages: vec![json!({ "role": "user", "content": content })],
+        }
+    }
+
+    /// 当前消息历史（只读）。仅测试断言形状用 —— 生产路径不该直接摸 JSON。
+    #[cfg(test)]
+    pub fn messages(&self) -> &[Value] {
+        &self.messages
+    }
+
+    /// 回填工具执行结果，供下一轮使用。
+    ///
+    /// 调用方必须为**上一轮的每一个** [`ToolInvocation`] 都给出结果（失败也要给，带
+    /// `is_error`）：两家协议都要求调用与结果一一对应，缺一条上游直接 400 而不是忽略。
+    pub fn push_tool_results(&mut self, results: &[ToolResultMsg]) {
+        if results.is_empty() {
+            return;
+        }
+        if self.protocol.is_openai() {
+            // OpenAI：一条结果一条 `role:"tool"` 消息。协议里**没有** is_error 字段，
+            // 故把错误标记写进正文 —— 否则模型看不出这次调用是失败的，会拿错误文本当数据用。
+            for r in results {
+                let content = if r.is_error {
+                    format!("[工具执行失败] {}", r.content)
+                } else {
+                    r.content.clone()
+                };
+                self.messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": r.id,
+                    "content": content,
+                }));
+            }
+        } else {
+            // Anthropic：所有结果打包进**一条** user 消息的 content 数组。
+            // 拆成多条 user 消息会被判为连续 user 轮次而报错。
+            let blocks: Vec<Value> = results
+                .iter()
+                .map(|r| {
+                    json!({
+                        "type": "tool_result",
+                        "tool_use_id": r.id,
+                        "content": r.content,
+                        "is_error": r.is_error,
+                    })
+                })
+                .collect();
+            self.messages.push(json!({ "role": "user", "content": blocks }));
+        }
+    }
+
+    /// 追加一条来自 user 的补充指示（如「已到轮数上限，请直接出结论」）。
+    ///
+    /// Anthropic 侧**合并进上一条 user 消息**而不是新开一条：紧邻的两条 user 消息在部分
+    /// 网关/版本上会被判为角色未交替而 400。OpenAI 侧 `tool` 之后接 `user` 是合法的，直接新增。
+    pub fn push_user_note(&mut self, note: &str) {
+        if !self.protocol.is_openai() {
+            if let Some(last) = self.messages.last_mut() {
+                if last.get("role").and_then(|r| r.as_str()) == Some("user") {
+                    if let Some(arr) = last.get_mut("content").and_then(|c| c.as_array_mut()) {
+                        arr.push(json!({ "type": "text", "text": note }));
+                        return;
+                    }
+                }
+            }
+        }
+        self.messages
+            .push(json!({ "role": "user", "content": note }));
+    }
+
+    /// 发一轮请求。
+    ///
+    /// `tools` 传空时等价于「带完整历史的普通补全」—— 轮数/预算到顶后的**强制出结论**那一次
+    /// 就这么调：不给工具，模型只能拿已有材料作答，不会再要求调用。
+    ///
+    /// 返回 [`TurnOutcome::ToolCalls`] 时 assistant 消息**已**追加进历史，调用方接着执行工具
+    /// 并调 [`Self::push_tool_results`]；返回 [`TurnOutcome::Text`] 时历史不变（该轮即终点）。
+    ///
+    /// `p.retry` 对临时性上游错误重试。重发是安全的：失败时消息历史未被改动，重发的是同一份。
+    pub async fn turn(
+        &mut self,
+        p: &TurnParams<'_>,
+        tools: &[ToolDef],
+    ) -> AppResult<TurnOutcome> {
+        let max_attempts = if p.retry { RETRY_MAX_ATTEMPTS } else { 1 };
+        let mut last_err = None;
+        for attempt in 1..=max_attempts {
+            let result = self.turn_once(p, tools).await;
+            match result {
+                Ok(outcome) => {
+                    if let TurnOutcome::ToolCalls { assistant, .. } = &outcome {
+                        self.messages.push(assistant.clone());
+                    }
+                    return Ok(outcome);
+                }
+                Err(e) => {
+                    if attempt >= max_attempts || !is_retriable_upstream_error(&e) {
+                        return Err(e);
+                    }
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(
+                        RETRY_BASE_BACKOFF_MS * attempt as u64,
+                    ))
+                    .await;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| AppError::Upstream("未知上游错误".into())))
+    }
+
+    /// 单次请求（不重试）。协议分支只在这里，上面的重试逻辑与协议无关。
+    async fn turn_once(
+        &self,
+        p: &TurnParams<'_>,
+        tools: &[ToolDef],
+    ) -> AppResult<TurnOutcome> {
+        let (key, model) = (p.key, p.model);
+        let client = build_client(key)?;
+        let openai = self.protocol.is_openai();
+        let url = if openai {
+            join_endpoint(&key.base_url, "/v1/chat/completions")
+        } else {
+            join_endpoint(&key.base_url, "/v1/messages")
+        };
+        let mut payload = json!({
+            "model": model,
+            "max_tokens": p.max_tokens,
+            "messages": self.messages,
+        });
+        // tools 为空时**不发** tools 字段：部分网关对 `tools: []` 直接 400，
+        // 而「强制出结论」那一轮正是空 tools。
+        if !tools.is_empty() {
+            if openai {
+                payload["tools"] = openai_tools(tools);
+                payload["tool_choice"] = json!("auto");
+            } else {
+                payload["tools"] = anthropic_tools(tools);
+            }
+        }
+
+        let mut req = client.post(&url).json(&payload).timeout(p.request_timeout);
+        if !openai {
+            req = req.header("anthropic-version", "2023-06-01");
+        }
+        req = apply_auth(req, key, p.secret);
+        req = apply_client_identity(req, self.protocol);
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        // 同 text_completion：先读文本再解析，否则上游回 HTML 错误页时只能看到笼统的
+        // 「error decoding response body」，看不出上游到底说了什么。
+        let raw = resp.text().await?;
+        let label = if openai { "OpenAI" } else { "Anthropic" };
+        if !status.is_success() {
+            return Err(AppError::Upstream(format!(
+                "{label} HTTP {status}: {}",
+                truncate_body(&raw)
+            )));
+        }
+        let parsed = if openai {
+            parse_openai_turn(&raw)
+        } else {
+            parse_anthropic_turn(&raw)
+        };
+        parsed.ok_or_else(|| {
+            AppError::Upstream(format!("{label} 响应无法解析: {}", truncate_body(&raw)))
+        })
+    }
+}
+
 /// 某次探测拿到的 HTTP 状态码是否代表「该 Key 可作路由候选」。
 ///
 /// 借鉴 cc-switch 的健康判定：**可达性 ≠ 特定 API 路径返回 2xx**。只要拿到 HTTP 响应，
@@ -741,7 +1222,7 @@ pub fn collect_tool_namespaces(body: &Value) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .collect();
     // 长的在前：`a__b` 与 `a` 同时存在时，`a__b__x` 应归到 `a__b` 而非 `a`。
-    names.sort_by(|a, b| b.len().cmp(&a.len()));
+    names.sort_by_key(|b| std::cmp::Reverse(b.len()));
     names.dedup();
     names
 }
@@ -2944,19 +3425,17 @@ impl SseTranslator {
                     }
                     // thinking_delta：Claude 扩展思考的增量 → Codex reasoning_summary 增量事件，
                     // 让 Codex 显示思考过程。仅当该 index 是 thinking 块时才转（与普通文本区分）。
-                    "thinking_delta" => {
-                        if self.thinking_blocks.contains(&idx) {
-                            if let Some(t) = delta.and_then(|d| d.get("thinking")).and_then(|t| t.as_str()) {
-                                if !t.is_empty() {
-                                    self.reasoning_accum.push_str(t);
-                                    out.push_str(&sse(
-                                        "response.reasoning_summary_text.delta",
-                                        &json!({
-                                            "type": "response.reasoning_summary_text.delta",
-                                            "item_id": self.msg_id, "summary_index": 0, "delta": t
-                                        }),
-                                    ));
-                                }
+                    "thinking_delta" if self.thinking_blocks.contains(&idx) => {
+                        if let Some(t) = delta.and_then(|d| d.get("thinking")).and_then(|t| t.as_str()) {
+                            if !t.is_empty() {
+                                self.reasoning_accum.push_str(t);
+                                out.push_str(&sse(
+                                    "response.reasoning_summary_text.delta",
+                                    &json!({
+                                        "type": "response.reasoning_summary_text.delta",
+                                        "item_id": self.msg_id, "summary_index": 0, "delta": t
+                                    }),
+                                ));
                             }
                         }
                     }
@@ -3244,6 +3723,7 @@ pub fn key_timeout(key: &ProviderKey) -> Duration {
 /// - 健康检查是**串行**循环（health::check_category 逐 Key await），一个挂掉的慢 Key
 ///   若跟随大超时，会把整个分类的探测阻塞几分钟；
 /// - 拉模型按候选端点顺序试（最多 4 个），跟随大超时时「拉取模型」按钮最坏挂 4×超时。
+///
 /// 这些都是秒级应答的元数据 GET / 1-token 探测，30s 是宽裕上限，不该继承长生成超时。
 pub fn fast_timeout(key: &ProviderKey) -> Duration {
     key_timeout(key).min(Duration::from_secs(30))
@@ -5703,5 +6183,273 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
         let tool_msg = msgs.iter().find(|m| m["role"] == "tool").expect("缺 tool 结果消息");
         assert_eq!(tool_msg["tool_call_id"], "c1");
         assert_eq!(tool_msg["content"], "done");
+    }
+
+    // ---- 多模态 + 工具调用（聚合成员 agent 循环的协议层）----
+
+    fn img(mt: &str) -> ImagePart {
+        ImagePart {
+            media_type: mt.to_string(),
+            base64: "AAAA".to_string(),
+        }
+    }
+
+    #[test]
+    fn user_content_stays_plain_string_without_images() {
+        // 无图片时必须退化成字符串，与旧的纯文本请求逐字节一致（老网关可能不吃 content 数组）。
+        let p = MultimodalPrompt::from_text("你好");
+        assert_eq!(anthropic_user_content(&p), json!("你好"));
+        assert_eq!(openai_user_content(&p), json!("你好"));
+        assert!(!p.has_images());
+    }
+
+    #[test]
+    fn anthropic_image_block_puts_image_before_text() {
+        let p = MultimodalPrompt {
+            text: "这个报错怎么回事".into(),
+            images: vec![img("image/png")],
+        };
+        let c = anthropic_user_content(&p);
+        let arr = c.as_array().expect("有图片时应为 block 数组");
+        assert_eq!(arr.len(), 2);
+        // 图片在前：反过来放部分模型会答「没看到图片」。
+        assert_eq!(arr[0]["type"], "image");
+        assert_eq!(arr[0]["source"]["type"], "base64");
+        assert_eq!(arr[0]["source"]["media_type"], "image/png");
+        assert_eq!(arr[0]["source"]["data"], "AAAA");
+        assert_eq!(arr[1]["type"], "text");
+        assert_eq!(arr[1]["text"], "这个报错怎么回事");
+    }
+
+    #[test]
+    fn openai_image_block_uses_inline_data_url() {
+        let p = MultimodalPrompt {
+            text: "看图".into(),
+            images: vec![img("image/jpeg")],
+        };
+        let arr = openai_user_content(&p);
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr[0]["type"], "image_url");
+        // 必须是 data URL 内联，而不是外链（本地文件没有可访问 URL，外链等于发给第三方图床）
+        assert_eq!(arr[0]["image_url"]["url"], "data:image/jpeg;base64,AAAA");
+        assert_eq!(arr[1]["text"], "看图");
+    }
+
+    fn tool_def() -> ToolDef {
+        ToolDef {
+            name: "read_file".into(),
+            description: "读文件".into(),
+            input_schema: json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+        }
+    }
+
+    #[test]
+    fn tool_declaration_shapes_differ_per_protocol() {
+        let tools = vec![tool_def()];
+        // Anthropic：平铺 + input_schema
+        let a = anthropic_tools(&tools);
+        assert_eq!(a[0]["name"], "read_file");
+        assert_eq!(a[0]["input_schema"]["type"], "object");
+        assert!(a[0].get("function").is_none(), "Anthropic 不该有 function 包层");
+        // OpenAI：包一层 function + 字段名叫 parameters（这两处最易写错）
+        let o = openai_tools(&tools);
+        assert_eq!(o[0]["type"], "function");
+        assert_eq!(o[0]["function"]["name"], "read_file");
+        assert_eq!(o[0]["function"]["parameters"]["type"], "object");
+        assert!(
+            o[0]["function"].get("input_schema").is_none(),
+            "OpenAI 的 schema 字段是 parameters，不是 input_schema"
+        );
+    }
+
+    #[test]
+    fn parse_anthropic_turn_picks_up_tool_use_and_preamble_text() {
+        let raw = json!({
+            "content": [
+                { "type": "text", "text": "我先看看那个文件" },
+                { "type": "tool_use", "id": "toolu_1", "name": "read_file",
+                  "input": { "path": "src/main.rs" } }
+            ],
+            "stop_reason": "tool_use"
+        })
+        .to_string();
+        let TurnOutcome::ToolCalls { text, assistant, calls } =
+            parse_anthropic_turn(&raw).expect("应解析成功")
+        else {
+            panic!("有 tool_use 时不该判为纯文本");
+        };
+        assert_eq!(text, "我先看看那个文件");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "toolu_1");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].args["path"], "src/main.rs");
+        // assistant 历史照抄原 content 数组（重建会丢 thinking 的 signature → 下一轮 400）
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn parse_anthropic_turn_thinking_signature_survives_roundtrip() {
+        // 带扩展思考的多轮：signature 必须原样留在 assistant 历史里，否则 Anthropic 校验失败 400。
+        let raw = json!({
+            "content": [
+                { "type": "thinking", "thinking": "先读文件", "signature": "sig_abc" },
+                { "type": "tool_use", "id": "toolu_9", "name": "grep", "input": { "pattern": "fn main" } }
+            ]
+        })
+        .to_string();
+        let TurnOutcome::ToolCalls { assistant, .. } = parse_anthropic_turn(&raw).unwrap() else {
+            panic!("应是工具调用");
+        };
+        assert_eq!(assistant["content"][0]["signature"], "sig_abc");
+    }
+
+    #[test]
+    fn parse_anthropic_turn_without_tool_use_is_final_text() {
+        let raw = json!({ "content": [{ "type": "text", "text": "结论是 A" }] }).to_string();
+        assert_eq!(
+            parse_anthropic_turn(&raw).unwrap(),
+            TurnOutcome::Text("结论是 A".into())
+        );
+    }
+
+    #[test]
+    fn parse_anthropic_turn_degrades_to_text_on_sse_body() {
+        // 个别网关无论怎么发都回 SSE。此时退化成「纯文本、无工具调用」比整轮报错好：
+        // 成员至少还能基于已注入的上下文作答。
+        let raw = "data: {\"delta\":{\"text\":\"部\"}}\n\ndata: {\"delta\":{\"text\":\"分\"}}\n\ndata: [DONE]\n";
+        assert_eq!(
+            parse_anthropic_turn(raw).unwrap(),
+            TurnOutcome::Text("部分".into())
+        );
+    }
+
+    #[test]
+    fn parse_openai_turn_parses_arguments_json_string() {
+        let raw = json!({
+            "choices": [{ "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{ "id": "call_1", "type": "function", "function": {
+                    "name": "grep", "arguments": "{\"pattern\":\"fn main\"}"
+                }}]
+            }}]
+        })
+        .to_string();
+        let TurnOutcome::ToolCalls { text, calls, .. } = parse_openai_turn(&raw).unwrap() else {
+            panic!("应是工具调用");
+        };
+        assert_eq!(text, "", "content 为 null 时文本应是空串而非 panic");
+        assert_eq!(calls[0].id, "call_1");
+        // arguments 是 JSON 字符串，必须解析成对象后再交给执行层
+        assert_eq!(calls[0].args["pattern"], "fn main");
+    }
+
+    #[test]
+    fn parse_openai_turn_malformed_arguments_becomes_null() {
+        // 被截断的 arguments 留 Null，由执行层回「参数不是合法 JSON 对象」让模型重试；
+        // 若当成空对象去执行，read_file 可能读错目标。
+        let raw = json!({
+            "choices": [{ "message": { "role": "assistant", "tool_calls": [
+                { "id": "c1", "function": { "name": "read_file", "arguments": "{\"path\":\"sr" } }
+            ]}}]
+        })
+        .to_string();
+        let TurnOutcome::ToolCalls { calls, .. } = parse_openai_turn(&raw).unwrap() else {
+            panic!("应是工具调用");
+        };
+        assert!(calls[0].args.is_null());
+        // 空 arguments（无参工具）反过来要按空对象处理，不能也判成 Null
+        let raw2 = json!({
+            "choices": [{ "message": { "role": "assistant", "tool_calls": [
+                { "id": "c2", "function": { "name": "list_dir", "arguments": "" } }
+            ]}}]
+        })
+        .to_string();
+        let TurnOutcome::ToolCalls { calls, .. } = parse_openai_turn(&raw2).unwrap() else {
+            panic!("应是工具调用");
+        };
+        assert_eq!(calls[0].args, json!({}));
+    }
+
+    #[test]
+    fn parse_openai_turn_backfills_missing_role() {
+        // 部分网关回的 message 不带 role；缺了它下一轮会被上游判为非法角色而 400。
+        let raw = json!({
+            "choices": [{ "message": { "tool_calls": [
+                { "id": "c1", "function": { "name": "list_dir", "arguments": "{}" } }
+            ]}}]
+        })
+        .to_string();
+        let TurnOutcome::ToolCalls { assistant, .. } = parse_openai_turn(&raw).unwrap() else {
+            panic!("应是工具调用");
+        };
+        assert_eq!(assistant["role"], "assistant");
+    }
+
+    #[test]
+    fn parse_openai_turn_without_tool_calls_is_final_text() {
+        let raw = json!({ "choices": [{ "message": { "role": "assistant", "content": "结论 B" } }] })
+            .to_string();
+        assert_eq!(
+            parse_openai_turn(&raw).unwrap(),
+            TurnOutcome::Text("结论 B".into())
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_results_pack_into_single_user_message() {
+        let mut s = ToolSession::new(Protocol::Anthropic, &MultimodalPrompt::from_text("问题"));
+        s.push_tool_results(&[
+            ToolResultMsg { id: "t1".into(), content: "内容1".into(), is_error: false },
+            ToolResultMsg { id: "t2".into(), content: "文件不存在".into(), is_error: true },
+        ]);
+        // 两条结果必须打包进**一条** user 消息：拆成两条会被判连续 user 轮次而报错。
+        assert_eq!(s.messages().len(), 2, "开局 user + 一条结果消息");
+        let m = &s.messages()[1];
+        assert_eq!(m["role"], "user");
+        let blocks = m["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "t1");
+        assert_eq!(blocks[0]["is_error"], false);
+        assert_eq!(blocks[1]["is_error"], true);
+        assert_eq!(blocks[1]["content"], "文件不存在");
+    }
+
+    #[test]
+    fn openai_tool_results_are_one_message_each_with_error_marker() {
+        let mut s = ToolSession::new(Protocol::OpenaiChat, &MultimodalPrompt::from_text("问题"));
+        s.push_tool_results(&[
+            ToolResultMsg { id: "c1".into(), content: "内容1".into(), is_error: false },
+            ToolResultMsg { id: "c2".into(), content: "被拒".into(), is_error: true },
+        ]);
+        assert_eq!(s.messages().len(), 3, "OpenAI 一条结果一条消息");
+        assert_eq!(s.messages()[1]["role"], "tool");
+        assert_eq!(s.messages()[1]["tool_call_id"], "c1");
+        assert_eq!(s.messages()[1]["content"], "内容1");
+        // OpenAI 协议无 is_error 字段，错误标记只能写进正文，否则模型会把错误文本当数据用。
+        assert_eq!(
+            s.messages()[2]["content"].as_str().unwrap(),
+            "[工具执行失败] 被拒"
+        );
+    }
+
+    #[test]
+    fn empty_tool_results_do_not_append_message() {
+        // 空结果集不该塞一条空 content 消息（Anthropic 对空 content 数组会 400）。
+        let mut s = ToolSession::new(Protocol::Anthropic, &MultimodalPrompt::from_text("问题"));
+        s.push_tool_results(&[]);
+        assert_eq!(s.messages().len(), 1);
+    }
+
+    #[test]
+    fn tool_session_seeds_images_per_protocol() {
+        let p = MultimodalPrompt { text: "看图".into(), images: vec![img("image/webp")] };
+        let a = ToolSession::new(Protocol::Anthropic, &p);
+        assert_eq!(a.messages()[0]["content"][0]["type"], "image");
+        // Responses 协议在聚合路径按 Chat 形态发（与 text_completion 一致）
+        let o = ToolSession::new(Protocol::OpenaiResponses, &p);
+        assert_eq!(o.messages()[0]["content"][0]["type"], "image_url");
     }
 }

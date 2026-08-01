@@ -586,6 +586,11 @@ fn tool_schema() -> Value {
                 "languageHint": {
                     "type": "string",
                     "description": "回答语言提示，如 zh / en，省略则跟随 prompt 语言"
+                },
+                "images": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "可选：要让模型一起看的图片，填**相对于 cwd 的路径**（如 docs/error.png）。用于「这个报错截图是什么问题」这类需要看图的任务。最多 4 张、单张不超过 5MB，仅支持 png / jpg / jpeg / gif / webp。传了 images 就必须同时传 cwd。注意：参与者模型需具备多模态能力，纯文本模型会返回 4xx。"
                 }
             },
             "required": ["prompt"]
@@ -593,11 +598,50 @@ fn tool_schema() -> Value {
     })
 }
 
+/// 校验并取出 `images` 参数（相对 cwd 的路径数组）。
+///
+/// **响亮报错、不静默丢**（FR-027）：调用方把任何一种「传了但形状不对」都变成用户可见的错误，
+/// 而不是当作「没传图」继续。三种要拦的错法：
+/// - `images` 存在但不是数组（`"images":"a.png"` 裸字符串是模型最容易犯的）
+/// - 数组里混进非字符串项（`["a.png", 123]`）
+/// - 数组里有空字符串
+///
+/// 内容级校验（张数 / 大小 / 格式 / 路径逃逸）在 `agent_tools::load_images` 里做，不在这里。
+fn parse_image_paths(images: Option<&Value>) -> Result<Vec<String>, String> {
+    let Some(v) = images else {
+        return Ok(Vec::new());
+    };
+    // 显式 null 视同未传（JSON 客户端常把可选参数填 null）。
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    let Some(arr) = v.as_array() else {
+        return Err(
+            "images 必须是字符串数组（相对 cwd 的图片路径），例如 [\"docs/error.png\"]。\
+             若只有一张也要用数组包起来。"
+                .into(),
+        );
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let Some(s) = item.as_str() else {
+            return Err(format!(
+                "images[{i}] 不是字符串。每一项都应是相对 cwd 的图片路径。"
+            ));
+        };
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(format!("images[{i}] 是空字符串，请填写有效的图片路径或去掉它。"));
+        }
+        out.push(s.to_string());
+    }
+    Ok(out)
+}
+
 async fn handle_tool_call(
     store: &Arc<Store>,
     params: Value,
-) -> Result<Value, (i64, String)> {
-    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+) -> Result<Value, (i64, String)> {    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     if name != "synaroute_ai" {
         return Err((-32602, format!("未知工具: {name}")));
     }
@@ -626,6 +670,16 @@ async fn handle_tool_call(
         .get("languageHint")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // 图片路径按原样传下去，由 aggregate 用**同一个** effective_work_dir 解析并校验
+    // （两处各算一次工作目录必然漂移）。
+    //
+    // 校验形状要**响亮报错、不静默丢**（FR-027 原则）：模型很可能把单图传成裸字符串
+    // `"images":"a.png"` 而非数组，或数组里混进非字符串。旧写法 `as_array()?.filter_map(as_str)`
+    // 会把这些整个吞掉 → 聚合照跑 → 用户拿到「看起来看了图、实际没看」的答案。
+    let image_paths = match parse_image_paths(args.get("images")) {
+        Ok(v) => v,
+        Err(msg) => return Ok(tool_error_content(&msg)),
+    };
 
     // 语言提示拼进 prompt（决策者/参与者都会看到）
     let effective_prompt = match &language_hint {
@@ -636,7 +690,8 @@ async fn handle_tool_call(
     };
 
     let started = std::time::Instant::now();
-    let outcome = aggregate::run_mcp(store, category, &effective_prompt, cwd.clone()).await;
+    let outcome =
+        aggregate::run_mcp(store, category, &effective_prompt, cwd.clone(), image_paths).await;
     let elapsed = started.elapsed().as_millis() as u64;
 
     match outcome {
@@ -914,5 +969,38 @@ mod tests {
         let b = new_session_id();
         assert_ne!(a, b);
         assert!(a.starts_with("synaroute-"));
+    }
+
+    // images 参数形状校验：不静默丢，错法都要响亮报错（FR-027）。
+    #[test]
+    fn parse_image_paths_accepts_valid_array() {
+        let v = json!(["docs/a.png", "  b.jpg  "]);
+        assert_eq!(
+            parse_image_paths(Some(&v)).unwrap(),
+            vec!["docs/a.png".to_string(), "b.jpg".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_image_paths_absent_or_null_is_empty() {
+        assert!(parse_image_paths(None).unwrap().is_empty());
+        assert!(parse_image_paths(Some(&Value::Null)).unwrap().is_empty());
+        assert!(parse_image_paths(Some(&json!([]))).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_image_paths_rejects_bare_string_instead_of_dropping() {
+        // 模型最容易犯的错：单图传成裸字符串。旧写法会静默当「没传图」，
+        // 用户拿到看起来看了图实际没看的答案。必须报错。
+        let e = parse_image_paths(Some(&json!("only-one.png"))).unwrap_err();
+        assert!(e.contains("数组"), "{e}");
+    }
+
+    #[test]
+    fn parse_image_paths_rejects_non_string_and_empty_items() {
+        let e = parse_image_paths(Some(&json!(["a.png", 123]))).unwrap_err();
+        assert!(e.contains("images[1]") && e.contains("不是字符串"), "{e}");
+        let e = parse_image_paths(Some(&json!(["a.png", "   "]))).unwrap_err();
+        assert!(e.contains("images[1]") && e.contains("空字符串"), "{e}");
     }
 }

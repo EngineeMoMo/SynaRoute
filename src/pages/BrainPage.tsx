@@ -11,7 +11,7 @@ import { useT } from "@/lib/useT";
 import type { TFunc } from "@/lib/i18n";
 import type { AggregateMode, BrainConfig, CategoryType, CodegraphState, ProviderKey } from "@/types";
 import type { RecentWorkdir } from "@/types";
-import { Brain, Info, Save, Plus, X, FolderOpen, Play, CheckCircle, History, Activity, ChevronDown, Wand2, Plug } from "lucide-react";
+import { Brain, Info, Save, Plus, X, FolderOpen, Play, CheckCircle, History, Activity, ChevronDown, Wand2, Plug, AlertTriangle } from "lucide-react";
 
 const CATEGORIES: { value: CategoryType; tKey: string }[] = [
   { value: "claude-cli", tKey: "nav.claude-cli" },
@@ -383,46 +383,7 @@ export function BrainPage() {
             </div>
             {config.retrievalEnabled && (
               <>
-                <div className="flex items-center justify-between border-t border-border pt-3">
-                  <div>
-                    <div className="text-sm font-medium text-text-primary">{t("brain.autoFollowTitle")}</div>
-                    <div className="text-xs text-text-muted">{t("brain.autoFollowDesc")}</div>
-                  </div>
-                  <Switch
-                    checked={config.autoFollowActive ?? false}
-                    onCheckedChange={(v) => update({ autoFollowActive: v })}
-                  />
-                </div>
-
-                {config.autoFollowActive ? (
-                  <ActiveProjectDisplay t={t} />
-                ) : (
-                  <div>
-                    <div className="mb-1 flex items-center justify-between">
-                      <span className="text-xs font-medium text-text-secondary">{t("brain.workDir")}</span>
-                      <RecentWorkdirsMenu t={t} onPick={(dir) => update({ workDir: dir })} />
-                    </div>
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        className="flex-1 rounded-control border border-border bg-bg px-2.5 py-1.5 font-mono text-xs text-text-primary placeholder:text-text-muted"
-                        value={config.workDir ?? ""}
-                        placeholder={t("brain.workDirPlaceholder")}
-                        onChange={(e) => update({ workDir: e.target.value || undefined })}
-                      />
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        onClick={async () => {
-                          const dir = await api.pickDirectory();
-                          if (dir) update({ workDir: dir });
-                        }}
-                      >
-                        <FolderOpen size={13} /> {t("settings.logBrowse")}
-                      </Button>
-                    </div>
-                  </div>
-                )}
+                <WorkDirBlock t={t} config={config} update={update} />
 
                 <NumberField
                   label={t("brain.maxContextTokens")}
@@ -434,6 +395,67 @@ export function BrainPage() {
                 />
 
                 <CodegraphPanel t={t} workDir={config.workDir} autoFollow={config.autoFollowActive ?? false} />
+              </>
+            )}
+          </CardContent>
+        </Card>
+
+        {/*
+          工具调用：独立成卡，不塞进「文件检索」里 —— 两者互不依赖（工具可以在检索关闭时用，
+          工作目录由 MCP 的 cwd / 自动跟随 / 手工目录任一提供）。默认关，且开启后必须把
+          「会增加额度消耗」摊在用户眼前：每一轮都要重发完整历史，成本不是线性的。
+        */}
+        <Card>
+          <CardHeader>
+            <CardTitle>{t("brain.toolsSection")}</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="min-w-0 pr-3">
+                <div className="text-sm font-medium text-text-primary">{t("brain.toolsTitle")}</div>
+                <div className="text-xs leading-relaxed text-text-muted">{t("brain.toolsDesc")}</div>
+              </div>
+              <Switch
+                checked={config.toolsEnabled ?? false}
+                onCheckedChange={(v) => update({ toolsEnabled: v })}
+              />
+            </div>
+            {config.toolsEnabled && (
+              <>
+                <div className="flex items-start gap-1.5 rounded-control border border-warning/30 bg-warning/10 px-2.5 py-2">
+                  <AlertTriangle size={13} className="mt-0.5 shrink-0 text-warning" />
+                  <span className="text-[11px] leading-relaxed text-text-secondary">
+                    {t("brain.toolsCost")}
+                  </span>
+                </div>
+                <NumberField
+                  label={t("brain.maxToolRounds")}
+                  value={config.maxToolRounds ?? 6}
+                  min={2}
+                  max={12}
+                  step={1}
+                  onChange={(v) => update({ maxToolRounds: v })}
+                />
+                <div className="text-[11px] leading-relaxed text-text-muted">
+                  {t("brain.toolsRoundsHint")}
+                </div>
+                {/*
+                  工作目录入口：仅当「文件检索」关着时才在这里出现 —— 检索开着时它已在检索卡里显示，
+                  两处都渲染会出现两个改同一个 workDir 的控件。工具需要工作目录（MCP 调用可由 cwd 提供，
+                  但桌面端走工具时只能靠这里配），若只把入口放在检索卡内，就会出现「开了工具、关着检索 →
+                  界面上根本没有填目录的地方」。
+                */}
+                {!config.retrievalEnabled && (
+                  <div className="border-t border-border pt-3">
+                    <WorkDirBlock t={t} config={config} update={update} />
+                  </div>
+                )}
+                <div className="border-t border-border pt-2 text-[11px] leading-relaxed text-text-muted">
+                  {t("brain.toolsWorkDirHint")}
+                </div>
+                <div className="text-[11px] leading-relaxed text-text-muted">
+                  {t("brain.toolsSafetyHint")}
+                </div>
               </>
             )}
           </CardContent>
@@ -612,6 +634,14 @@ function BrainHeader({
         <Badge variant={enabled ? "success" : "neutral"}>{enabled ? t("brain.enabled") : t("brain.disabled")}</Badge>
       </div>
       <p className="mt-1 text-xs text-text-muted">{t("brain.subtitle")}</p>
+      {/* 首版能力边界：必须写在页面顶部而不是折在某个说明里 —— 用户拿图片或让它调工具时
+          会得到「看起来在做但没做」的结果，事先说清比事后解释便宜得多。 */}
+      <div className="mt-2 flex items-start gap-1.5 rounded-control border border-info/30 bg-info/8 px-2.5 py-1.5">
+        <Info size={12} className="mt-0.5 shrink-0 text-info" />
+        <span className="text-[11px] leading-relaxed text-text-secondary">
+          {t("brain.textOnlyNotice")}
+        </span>
+      </div>
       {/* 端分类切换：三端聚合配置互相隔离 */}
       <div className="mt-3 flex gap-1.5">
         {CATEGORIES.map((c) => (
@@ -861,9 +891,70 @@ function ModeOption({
   );
 }
 
+/**
+ * 工作目录选择块：自动跟随开关 + （手工目录输入 / 活跃项目显示）。
+ *
+ * 抽成组件是因为**文件检索**与**工具调用**都需要它：两者各自的开关都会用到工作目录，
+ * 而它只能有一份（改的是同一个 config.workDir / autoFollowActive）。渲染在哪张卡里由调用方
+ * 决定，同一时刻只渲染一处，避免两个控件改同一字段。
+ */
+function WorkDirBlock({
+  t,
+  config,
+  update,
+}: {
+  t: TFunc;
+  config: BrainConfig;
+  update: (patch: Partial<BrainConfig>) => void;
+}) {
+  return (
+    <>
+      <div className="flex items-center justify-between border-t border-border pt-3">
+        <div>
+          <div className="text-sm font-medium text-text-primary">{t("brain.autoFollowTitle")}</div>
+          <div className="text-xs text-text-muted">{t("brain.autoFollowDesc")}</div>
+        </div>
+        <Switch
+          checked={config.autoFollowActive ?? false}
+          onCheckedChange={(v) => update({ autoFollowActive: v })}
+        />
+      </div>
+
+      {config.autoFollowActive ? (
+        <ActiveProjectDisplay t={t} />
+      ) : (
+        <div>
+          <div className="mb-1 flex items-center justify-between">
+            <span className="text-xs font-medium text-text-secondary">{t("brain.workDir")}</span>
+            <RecentWorkdirsMenu t={t} onPick={(dir) => update({ workDir: dir })} />
+          </div>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              className="flex-1 rounded-control border border-border bg-bg px-2.5 py-1.5 font-mono text-xs text-text-primary placeholder:text-text-muted"
+              value={config.workDir ?? ""}
+              placeholder={t("brain.workDirPlaceholder")}
+              onChange={(e) => update({ workDir: e.target.value || undefined })}
+            />
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={async () => {
+                const dir = await api.pickDirectory();
+                if (dir) update({ workDir: dir });
+              }}
+            >
+              <FolderOpen size={13} /> {t("settings.logBrowse")}
+            </Button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
 /** 显示当前检测到的活跃项目（每 5s 刷新）。auto_follow 模式下取代 workDir 字段。 */
-function ActiveProjectDisplay({ t }: { t: TFunc }) {
-  const [active, setActive] = useState<RecentWorkdir | null>(null);
+function ActiveProjectDisplay({ t }: { t: TFunc }) {  const [active, setActive] = useState<RecentWorkdir | null>(null);
 
   useEffect(() => {
     const fetch = async () => {

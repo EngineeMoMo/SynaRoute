@@ -1,6 +1,7 @@
 //! SynaRoute Tauri 后端入口。
 //! IPC 命令名与前端 src/lib/bridge.ts 严格对齐。
 
+mod agent_tools;
 mod aggregate;
 mod ccswitch;
 mod codegraph;

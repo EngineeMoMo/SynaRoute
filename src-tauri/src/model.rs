@@ -717,6 +717,21 @@ pub struct BrainConfig {
     /// 开启后运行时忽略 `work_dir`，实时用检测到的最新活动项目路径。
     #[serde(default)]
     pub auto_follow_active: bool,
+    /// 是否给参与者一组**只读**检索工具（read_file / grep / list_dir / codegraph_query），
+    /// 让它按需一步步挖，而不是靠 `retrieval` 一次性猜哪些文件相关。
+    ///
+    /// **默认关**：每轮工具调用都要重发完整消息历史，额度消耗显著高于单轮，用户该明确知道
+    /// 自己在开什么（UI 上附了「会增加额度消耗」说明）。
+    #[serde(default)]
+    pub tools_enabled: bool,
+    /// 工具调用的轮数上限。模型可能陷入「读文件 → 再读 → 再读」的循环烧掉整轮预算，
+    /// 到顶后强制它基于已有材料出结论。运行时会 clamp 到 2~12。
+    #[serde(default = "default_max_tool_rounds")]
+    pub max_tool_rounds: u32,
+}
+
+fn default_max_tool_rounds() -> u32 {
+    6
 }
 
 fn default_max_context_tokens() -> u32 {
@@ -786,6 +801,19 @@ pub struct EventLogEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
     pub detail: String,
+    /// 连续同类事件被折叠的条数（1 = 未折叠）。
+    ///
+    /// 高频转发下「同一个 Key、同一个模型、都成功」的记录只是延迟不同，逐条列出会瞬间刷屏
+    /// （实测 14 秒 12 条）。故内存态把**连续**的同类记录合成一条并在这里计数，UI 显示
+    /// 「×N」。判据是 [`Self::collapse_key`]，只折叠紧邻的一条 —— 中间插进任何别的事件
+    /// （失败、故障转移、配置变更）就重新起一条，时间线不会被压扁到看不出穿插关系。
+    ///
+    /// **日志文件仍逐条完整写**（`write_log_to_file` 在折叠前调用），排障取证不受影响。
+    #[serde(default = "default_repeat")]
+    pub repeat: u32,
+    /// 折叠判据：同 key 的连续事件才合并。仅后端内存态使用，不下发前端。
+    #[serde(skip)]
+    pub collapse_key: Option<String>,
     /// 该条是否带链路快照。**列表接口会把 `trace` 正文剥掉**（见 `Store::strip_trace`），
     /// 但前端仍需知道「这行能不能展开看详情」，故单独留一个布尔位——它只有 1 字节，
     /// 而正文最坏 40000 字符。展开时前端按事件 id 走 `get_event_trace` 单取一条。
@@ -925,6 +953,11 @@ pub fn default_proxy_port(category: &str) -> u16 {
 
 fn default_true() -> bool {
     true
+}
+
+/// 事件折叠计数的默认值。旧日志文件里没有 `repeat` 字段，反序列化时按「未折叠」算。
+fn default_repeat() -> u32 {
+    1
 }
 
 fn default_mcp_port() -> u16 {

@@ -16,6 +16,7 @@ use crate::model::{
 use crate::retrieval;
 use crate::store::Store;
 use crate::upstream;
+use crate::upstream::{ImagePart, MultimodalPrompt, ToolSession, TurnOutcome};
 use futures_util::future::join_all;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
@@ -174,7 +175,10 @@ pub async fn run_plan(
 
     // 2. 并行成员解答（预算 = 剩余整轮时间 − 决策者保底）
     let members_budget = upstream_phase_budget_ms(remaining_ms(deadline), decider_floor, PHASE_MIN_BUDGET_MS);
-    let gathered = gather_members(store, category, &brain, &member_prompt, members_budget).await;
+    let tool_env = prepare_tool_env(store, category, &brain, effective_work_dir.as_deref()).await;
+    // 桌面端 UI 这条路径不接受图片（只有 MCP 的 images 参数会传图，见 run_mcp）。
+    let gathered =
+        gather_members(store, category, &brain, &member_prompt, &[], tool_env, members_budget).await;
     let answers = &gathered.answers;
 
     if answers.is_empty() {
@@ -345,6 +349,7 @@ pub async fn run_mcp(
     category: CategoryType,
     prompt: &str,
     cwd: Option<String>,
+    image_paths: Vec<String>,
 ) -> AppResult<McpAggregateResult> {
     let brain = store.get_brain(category);
     if !brain.enabled {
@@ -370,6 +375,30 @@ pub async fn run_mcp(
         Some(c) if !c.trim().is_empty() => Some(c),
         _ => resolve_work_dir(&brain),
     };
+
+    // 图片：在这里加载而不是在 mcp.rs —— 图片路径相对于**同一个** effective_work_dir，
+    // 两处各算一次工作目录必然漂移。任何校验不过都直接抛错，绝不静默丢图。
+    let images = crate::agent_tools::load_images(
+        effective_work_dir.as_deref(),
+        &image_paths,
+    )
+    .map_err(AppError::Invalid)?;
+    if !images.is_empty() {
+        store.append_event(
+            category,
+            "aggregate",
+            None,
+            &format!(
+                "图片输入 · {} 张 · {}",
+                images.len(),
+                images
+                    .iter()
+                    .map(|i| i.media_type.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        );
+    }
 
     // 文件检索
     let files = if brain.retrieval_enabled {
@@ -442,7 +471,17 @@ pub async fn run_mcp(
     //    预算 = 剩余整轮时间 − 决策者保底。
     let member_prompt = build_member_prompt(prompt, &file_context);
     let members_budget = upstream_phase_budget_ms(remaining_ms(deadline), decider_floor, PHASE_MIN_BUDGET_MS);
-    let gathered = gather_members(store, category, &brain, &member_prompt, members_budget).await;
+    let tool_env = prepare_tool_env(store, category, &brain, effective_work_dir.as_deref()).await;
+    let gathered = gather_members(
+        store,
+        category,
+        &brain,
+        &member_prompt,
+        &images,
+        tool_env,
+        members_budget,
+    )
+    .await;
     let answers = &gathered.answers;
     let member_labels: Vec<String> = answers.iter().map(|a| a.label.clone()).collect();
     let members_attempted = gathered.attempted;
@@ -704,11 +743,331 @@ enum MemberOutcome {
     Unavailable { label: String, reason: String },
 }
 
+/// 一个成员做上游调用需要的入参。上游那部分直接复用 [`upstream::TurnParams`]，
+/// 这里只额外带一个 `label`（日志用，不进请求）。
+struct MemberCallCtx<'a> {
+    up: upstream::TurnParams<'a>,
+    label: &'a str,
+}
+
+/// 工具循环里探索阶段可用的预算占比；剩下的留给「强制出结论」那一轮。
+///
+/// 不留这一份，最后一次调用会在刚发出时被外层 timeout 掐掉 —— 前面几轮挖到的信息全白费，
+/// 用户看到的只是「超时」。
+const TOOL_LOOP_EXPLORE_PCT: u64 = 70;
+
+/// 工具轮数的运行时上下限。上限防配置写了个 999 把预算烧光；下限保证「开了工具至少能真调一次」
+/// （只给 1 轮时收尾逻辑会立刻生效，等于开了开关却没有工具）。
+const TOOL_ROUNDS_RANGE: (u32, u32) = (2, 12);
+
+/// **单轮**内实际执行的工具调用数上限。超出的回一条 is_error 结果但不执行（不起子进程、不读盘）。
+///
+/// 为什么需要：模型一轮可以返回任意多个 tool_use（协议无上界）。一份被提示注入的文件能诱导它
+/// 一轮返回上百个 → 上百次串行子进程 + 上百条 8000 字符结果塞进历史 → 下一轮重发完整历史 →
+/// token 爆炸。轮数上限只管轮数、不管单轮宽度，这条补上宽度。16 对正常"并行读几个文件"够用。
+const MAX_TOOL_CALLS_PER_TURN: usize = 16;
+
+/// 本次成员调用实际跑几轮。
+///
+/// 无工具时恒为 1（形状与旧的单轮补全完全一致）；有工具时把配置值夹进
+/// [`TOOL_ROUNDS_RANGE`] —— 夹下限是关键：配 1 轮会让第一轮就走收尾分支，
+/// 工具声明了却永远调不动，正是「开关开着但功能没生效」那类静默失效。
+fn effective_rounds(has_tools: bool, configured: u32) -> u32 {
+    if has_tools {
+        configured.clamp(TOOL_ROUNDS_RANGE.0, TOOL_ROUNDS_RANGE.1)
+    } else {
+        1
+    }
+}
+
+/// 成员的一次调用：工具关闭时是单轮普通补全，开启时是受限的 agent 循环。
+///
+/// 四条护栏，缺任何一条都有真实故障：
+/// 1. **轮数上限**：模型会陷入「读文件 → 再读 → 再读」，不设上限能烧掉整轮预算。
+/// 2. **时间预算**：探索只用前 [`TOOL_LOOP_EXPLORE_PCT`]%，余量留给收尾轮。
+/// 3. **工具失败不中断**：错误文本作为 `tool_result` 回给模型让它换方向 —— 一个不存在的
+///    文件名不该毁掉整次聚合。
+/// 4. **收尾轮仍声明 tools**：Anthropic 规定「消息里出现过 tool_use/tool_result 就必须带 tools」，
+///    收尾时抽掉 tools 会直接 400。故改用一条 user 指示让它别再调；它若仍要调，就采用
+///    已积累的正文交差，而不是白跑一轮。
+async fn run_member_turns(
+    store: &Arc<Store>,
+    category: CategoryType,
+    session: &mut ToolSession,
+    ctx: &MemberCallCtx<'_>,
+    tool_env: Option<&crate::agent_tools::ToolEnv>,
+    max_rounds: u32,
+    budget_ms: u64,
+) -> Result<String, String> {
+    let tools = match tool_env {
+        Some(env) => crate::agent_tools::tool_defs(env),
+        None => Vec::new(),
+    };
+    // 无工具 → 一轮即终；请求形状与旧的 text_completion 完全一致（content 是字符串、无 tools 字段）。
+    let rounds = effective_rounds(!tools.is_empty(), max_rounds);
+    let started = std::time::Instant::now();
+    let explore_deadline = started + Duration::from_millis(budget_ms * TOOL_LOOP_EXPLORE_PCT / 100);
+    // 整个成员循环的硬截止。外层 `gather_members` 也套了 `timeout(budget_ms)`，但**外层先到
+    // 等于全盘皆输**：future 在 HTTP await 上被丢弃，前几轮挖到的 `preamble` 连同已花掉的
+    // token 一起作废，用户只看到「超时」。故这里自己先到点，把已有正文交出去。
+    let hard_deadline = started + Duration::from_millis(budget_ms);
+    // 留给「内层先于外层返回」的余量：单轮超时按此往回缩，收到 reqwest 超时错误后还有时间
+    // 走完下面的日志与返回，不至于在 return 的路上被外层掐掉。
+    const TURN_MARGIN: Duration = Duration::from_millis(750);
+
+    // 模型在调工具前说的话。轮数/时间到顶时用它交差，比返回空串有用。
+    let mut preamble = String::new();
+    for round in 1..=rounds {
+        let now = std::time::Instant::now();
+        let out_of_time = round > 1 && now >= explore_deadline;
+        let wrapping_up = round == rounds || out_of_time;
+        if wrapping_up && round > 1 {
+            session.push_user_note(
+                "已达到工具调用上限，请不要再调用工具，直接基于目前已获得的信息给出完整分析与结论。",
+            );
+        }
+        // 单轮超时 = min(Key 级超时, 距硬截止的剩余量 - 余量)。
+        // 不夹这一刀，`request_timeout`（budget+5s）永远比外层 timeout 长，上面那段注释里的
+        // 「外层先到」就是必然结果而非边缘情况。
+        let left = hard_deadline.saturating_duration_since(now);
+        let turn_budget = left.saturating_sub(TURN_MARGIN);
+        if turn_budget.is_zero() {
+            // 连发一次请求的时间都没有了：有正文就交差，没有就如实报超时。
+            return if preamble.trim().is_empty() {
+                Err(format!("超时（>{budget_ms}ms）且未给出结论"))
+            } else {
+                store.append_event(
+                    category,
+                    "aggregate",
+                    None,
+                    &format!(
+                        "工具循环收尾 · {} · 第 {round}/{rounds} 轮前时间预算已用尽，采用已有正文",
+                        ctx.label
+                    ),
+                );
+                Ok(preamble)
+            };
+        }
+        let mut up = ctx.up;
+        up.request_timeout = up.request_timeout.min(turn_budget);
+        let outcome = match session.turn(&up, &tools).await {
+            Ok(o) => o,
+            // 轮内失败：已有正文就交差而不是整次作废（多轮探索的价值就在这里 —— 第 3 轮
+            // 超时/报错，前 2 轮读到的东西仍然值钱）。失败原因写进日志，不静默。
+            Err(e) if !preamble.trim().is_empty() => {
+                store.append_event(
+                    category,
+                    "aggregate",
+                    None,
+                    &format!(
+                        "工具循环中断 · {} · 第 {round}/{rounds} 轮调用失败（{e}），采用已有正文",
+                        ctx.label
+                    ),
+                );
+                return Ok(preamble);
+            }
+            Err(e) => return Err(format!("调用失败：{e}")),
+        };
+        match outcome {
+            TurnOutcome::Text(t) if !t.trim().is_empty() => return Ok(t),
+            TurnOutcome::Text(_) => {
+                // 空文本：有铺垫就用铺垫，否则如实返回空（上层判为「返回空答案」）。
+                return Ok(preamble);
+            }
+            TurnOutcome::ToolCalls { text, calls, .. } => {
+                if !text.trim().is_empty() {
+                    if !preamble.is_empty() {
+                        preamble.push_str("\n\n");
+                    }
+                    preamble.push_str(&text);
+                }
+                if wrapping_up {
+                    store.append_event(
+                        category,
+                        "aggregate",
+                        None,
+                        &format!(
+                            "工具循环收尾 · {} · 第 {round}/{rounds} 轮仍请求调用工具{}，采用已有正文",
+                            ctx.label,
+                            if out_of_time { "（时间预算已用尽）" } else { "" }
+                        ),
+                    );
+                    return if preamble.trim().is_empty() {
+                        Err(format!("工具调用已达 {rounds} 轮上限且未给出结论"))
+                    } else {
+                        Ok(preamble)
+                    };
+                }
+                let Some(env) = tool_env else {
+                    // 本次没声明任何工具却回了 tool_use：上游协议异常，如实报出不静默。
+                    return Err("上游返回了工具调用，但本次未声明任何工具".into());
+                };
+                // 单轮工具调用数上限。**每个 call 仍必须回一条结果**（两家协议都要求一一对应，
+                // 缺一条上游直接 400），故超限的不是丢弃、而是回一条 is_error 结果且**不执行**
+                // （不起子进程、不读盘、不占 8000 字符预算）。这样既堵住「一份被注入的文件诱导
+                // 模型一轮返回上百个 tool_use → 上百次串行子进程 + 历史爆炸 → 下轮重发天价 token」，
+                // 又保持协议正确。
+                if calls.len() > MAX_TOOL_CALLS_PER_TURN {
+                    store.append_event(
+                        category,
+                        "aggregate",
+                        None,
+                        &format!(
+                            "工具调用过多 · {} · 单轮 {} 个，仅执行前 {}，其余回退让模型减少调用",
+                            ctx.label,
+                            calls.len(),
+                            MAX_TOOL_CALLS_PER_TURN
+                        ),
+                    );
+                }
+                let mut results = Vec::with_capacity(calls.len());
+                for (idx, c) in calls.iter().enumerate() {
+                    if idx >= MAX_TOOL_CALLS_PER_TURN {
+                        // 超限：回一条错误结果，不执行。模型据此在下一轮减少调用数。
+                        results.push(crate::agent_tools::over_limit_result(
+                            c,
+                            MAX_TOOL_CALLS_PER_TURN,
+                        ));
+                        continue;
+                    }
+                    let r = crate::agent_tools::execute(env, c).await;
+                    // 折叠只对**成功**的同名连续调用生效（降噪）。**失败/被拒不折叠**：
+                    // collapse_key=None 让每条被拒都在 UI 留独立一行 —— 折叠会用最后一条
+                    // 覆盖 detail，把「模型连读了两个 .env 被拒、第三个 main.rs 成功」抹成
+                    // 一条「read_file main.rs ×3」，正好埋掉安全审计最需要看到的信号
+                    // （提示注入诱导模型连试凭据文件时就是这个相邻同工具的形态）。
+                    let collapse_key = if r.is_error {
+                        None
+                    } else {
+                        Some(format!("tool:{}:{}", ctx.label, c.name))
+                    };
+                    store.append_event_collapsible(
+                        category,
+                        "aggregate",
+                        None,
+                        &format!(
+                            "工具 · {} · {} {}{}",
+                            ctx.label,
+                            c.name,
+                            tool_call_brief(c),
+                            if r.is_error { " · 被拒/失败" } else { "" }
+                        ),
+                        None,
+                        collapse_key,
+                    );
+                    results.push(r);
+                }
+                // 每个 call 都必须有结果：两家协议都要求一一对应，缺一条上游直接 400。
+                session.push_tool_results(&results);
+            }
+        }
+    }
+    // rounds >= 1 且每个分支都 return，正常到不了这里。
+    Ok(preamble)
+}
+
+/// 工具调用的一行摘要（进日志）。参数值可能是整段正则/长路径，统一截到 80 字符。
+fn tool_call_brief(c: &upstream::ToolInvocation) -> String {
+    let Some(obj) = c.args.as_object() else {
+        return "[参数非法]".into();
+    };
+    let mut parts: Vec<String> = obj
+        .iter()
+        .map(|(k, v)| {
+            let s = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
+            format!("{k}={s}")
+        })
+        .collect();
+    parts.sort(); // 顺序稳定，折叠 key 才不会因参数顺序抖动而失效
+    let s = parts.join(" ");
+    if s.chars().count() > 80 {
+        format!("{}…", s.chars().take(80).collect::<String>())
+    } else {
+        s
+    }
+}
+
+/// 带图片却收到 4xx 时，在失败原因里点出「该模型可能不支持图片输入」。
+///
+/// 为什么必须显式提示：成员配的可能是纯文本模型，上游只回一个 400，用户在日志里看到的是
+/// 「调用失败：OpenAI HTTP 400: ...」，根因埋在响应体里，几乎没人能一眼看出是图片导致的。
+fn image_unsupported_hint(reason: &str, had_images: bool) -> String {
+    if !had_images || !mentions_4xx(reason) {
+        return reason.to_string();
+    }
+    format!(
+        "{reason}\n提示：本次请求带了图片，而 4xx 常见于模型不支持图片输入 —— \
+         请确认该成员模型具备多模态能力，或去掉 images 参数重试。"
+    )
+}
+
+/// 错误文本里是否出现 `HTTP 4xx`。
+fn mentions_4xx(reason: &str) -> bool {
+    reason.split("HTTP ").skip(1).any(|s| {
+        let d: Vec<char> = s.chars().take(3).collect();
+        d.len() == 3 && d[0] == '4' && d[1].is_ascii_digit() && d[2].is_ascii_digit()
+    })
+}
+
+/// 工具开关开启且工作目录可用时，探测一次工具环境（codegraph 在此只解析一次，
+/// 否则每次工具调用都要起子进程探版本）。
+///
+/// 返回 None 即本轮不给成员工具，请求形状与「未加这个开关之前」完全一致。
+/// 每种 None 的原因都落日志 —— 「开了开关却没生效」必须看得见，这正是本项目反复防的
+/// 静默失效那类缺陷。
+async fn prepare_tool_env(
+    store: &Arc<Store>,
+    category: CategoryType,
+    brain: &BrainConfig,
+    work_dir: Option<&str>,
+) -> Option<Arc<crate::agent_tools::ToolEnv>> {
+    if !brain.tools_enabled {
+        return None;
+    }
+    let Some(dir) = work_dir.filter(|d| !d.trim().is_empty()) else {
+        store.append_event(
+            category,
+            "aggregate",
+            None,
+            "工具调用已开启，但没有工作目录（未传 cwd、未开自动跟随、也未填手工目录），本轮不提供工具",
+        );
+        return None;
+    };
+    let path = std::path::Path::new(dir);
+    if !path.is_dir() {
+        store.append_event(
+            category,
+            "aggregate",
+            None,
+            &format!("工具调用已开启，但工作目录不存在：{dir}，本轮不提供工具"),
+        );
+        return None;
+    }
+    let env = crate::agent_tools::ToolEnv::detect(path).await;
+    if let Some(note) = &env.codegraph_note {
+        store.append_event(category, "aggregate", None, &format!("工具环境 · {note}"));
+    }
+    store.append_event(
+        category,
+        "aggregate",
+        None,
+        &format!(
+            "工具调用已开启 · 目录={dir} · 轮数上限 {}",
+            brain
+                .max_tool_rounds
+                .clamp(TOOL_ROUNDS_RANGE.0, TOOL_ROUNDS_RANGE.1)
+        ),
+    );
+    Some(Arc::new(env))
+}
+
 async fn gather_members(
     store: &Arc<Store>,
     category: CategoryType,
     brain: &BrainConfig,
     prompt: &str,
+    images: &[ImagePart],
+    tool_env: Option<Arc<crate::agent_tools::ToolEnv>>,
     budget_ms: u64,
 ) -> GatherOutcome {
     let total_timeout = Duration::from_millis(budget_ms);
@@ -723,6 +1082,28 @@ async fn gather_members(
     // prompt 内嵌了检索到的全部文件内容（可达数十万字符）。用 Arc<str> 让所有成员任务
     // 共享同一份，克隆只 bump 引用计数，避免 N 个成员各持一份大副本同时驻留内存。
     let prompt: Arc<str> = Arc::from(prompt);
+    // 图片同理走 Arc：一张截图 base64 后可达数 MB，N 个成员各持一份会翻 N 倍。
+    let mm: Arc<MultimodalPrompt> = Arc::new(if images.is_empty() {
+        MultimodalPrompt::from_text(prompt.as_ref())
+    } else {
+        MultimodalPrompt {
+            text: prompt.to_string(),
+            images: images.to_vec(),
+        }
+    });
+    let had_images = mm.has_images();
+    let max_tool_rounds = brain.max_tool_rounds;
+    // trace 里的入参：prompt 正文 + 图片计数。base64 正文刻意不记日志 —— 一张几 MB、且没有
+    // 阅读价值，写进去只会让日志文件与 IPC 载荷暴涨（上一轮刚为此把日志载荷降了 99.5%）。
+    let trace_prompt: Arc<str> = Arc::from(if had_images {
+        format!(
+            "{}\n\n[附带 {} 张图片（base64 内容未记入日志）]",
+            cap_text(&prompt),
+            mm.images.len()
+        )
+    } else {
+        cap_text(&prompt)
+    });
 
     // 超时按「单个成员的实际模型调用」计。信号量排队时间**不**计入超时——否则
     // concurrency_limit 小于成员数时，后排成员在队列里就耗尽预算、从未发出请求即被判超时。
@@ -731,9 +1112,10 @@ async fn gather_members(
     let tasks = brain.members.iter().map(|m| {
         let store = store.clone();
         let sem = sem.clone();
+        let mm = mm.clone();
+        let tool_env = tool_env.clone();
         let key_id = m.key_id.clone();
         let model = m.model_name.clone();
-        let prompt = prompt.clone();
         async move {
             let Ok(_permit) = sem.acquire().await else {
                 return MemberOutcome::Unavailable {
@@ -799,7 +1181,27 @@ async fn gather_members(
                 model: model.clone(),
                 latency_ms,
             };
-            let call = upstream::text_completion(&key, &secret, &model, &prompt, max_tokens, retry, req_timeout);
+            let mut session = ToolSession::new(key.protocol, &mm);
+            let ctx = MemberCallCtx {
+                up: upstream::TurnParams {
+                    key: &key,
+                    secret: &secret,
+                    model: &model,
+                    max_tokens,
+                    retry,
+                    request_timeout: req_timeout,
+                },
+                label: &label,
+            };
+            let call = run_member_turns(
+                &store,
+                category,
+                &mut session,
+                &ctx,
+                tool_env.as_deref(),
+                max_tool_rounds,
+                budget_ms,
+            );
             match timeout(total_timeout, call).await {
                 Ok(Ok(ans)) if !ans.trim().is_empty() => {
                     let meta = mk_meta(started.elapsed().as_millis() as u64);
@@ -812,8 +1214,8 @@ async fn gather_members(
                 },
                 Ok(Err(e)) => MemberOutcome::Failed {
                     label,
-                    // upstream 错误已含 HTTP 状态码 / 连接失败详情。
-                    reason: format!("调用失败：{e}"),
+                    // e 已含 HTTP 状态码 / 连接失败详情；带图时再点出多模态支持这条可能根因。
+                    reason: image_unsupported_hint(&e, had_images),
                     meta: Some(mk_meta(started.elapsed().as_millis() as u64)),
                 },
                 Err(_) => MemberOutcome::Failed {
@@ -843,7 +1245,7 @@ async fn gather_members(
                     url: meta.base_url,
                     requested_model: meta.model.clone(),
                     real_model: meta.model,
-                    request_body: cap_text(&prompt),
+                    request_body: trace_prompt.to_string(),
                     response_body: cap_text(&ans.answer),
                     status: None,
                     latency_ms: meta.latency_ms,
@@ -869,7 +1271,7 @@ async fn gather_members(
                     url: m.base_url,
                     requested_model: m.model.clone(),
                     real_model: m.model,
-                    request_body: cap_text(&prompt),
+                    request_body: trace_prompt.to_string(),
                     response_body: cap_text(&reason),
                     status: None,
                     latency_ms: m.latency_ms,
@@ -974,7 +1376,10 @@ fn format_file_context(files: &[retrieval::RetrievedFile]) -> String {
 
 /// 判断 LLM 给出的相对路径是否安全（禁止逃逸 work_dir）。
 /// 拒绝：绝对路径、盘符/UNC 前缀、根、任何 `..` 组件。
-fn is_safe_relative_path(path: &str) -> bool {
+///
+/// `pub(crate)`：`agent_tools` 的只读工具收到的路径同样来自模型输出，同样不可信，
+/// 走同一道字符串级校验（两处各写一份必然漂移）。
+pub(crate) fn is_safe_relative_path(path: &str) -> bool {
     use std::path::Component;
     let p = std::path::Path::new(path);
     if p.is_absolute() {
@@ -994,7 +1399,14 @@ fn is_safe_relative_path(path: &str) -> bool {
 ///
 /// 任一侧 canonicalize 失败（权限/竞态）时**判为不安全**——宁可拒写一次让用户重试，
 /// 也不在无法确认落点时冒险写盘。
-fn is_within_work_root(work_root: &std::path::Path, candidate: &std::path::Path) -> bool {
+///
+/// `pub(crate)`：`agent_tools` 的只读工具用它做「解析链接后仍在工作目录内」这道判定。
+/// 读路径不需要 [`check_no_link_escape`]（那道为「目标尚不存在的写入」设计），因为读的目标
+/// 必然已存在，直接 canonicalize 目标本身即可同时暴露「链接目录」与「目标自身是链接」两种逃逸。
+pub(crate) fn is_within_work_root(
+    work_root: &std::path::Path,
+    candidate: &std::path::Path,
+) -> bool {
     match (work_root.canonicalize(), candidate.canonicalize()) {
         (Ok(root), Ok(c)) => c.starts_with(root),
         _ => false,
@@ -1672,5 +2084,484 @@ mod tests {
         // 剩余被前面阶段耗尽：最小下限保护，仍给决策者一次机会。
         assert_eq!(decider_phase_budget_ms(0, 5_000), 5_000);
         assert_eq!(decider_phase_budget_ms(2_000, 5_000), 5_000);
+    }
+
+    // ---- 工具循环（成员 agent 循环）----
+
+    #[test]
+    fn effective_rounds_clamps_and_degrades() {
+        // 无工具 → 恒 1 轮（形状回到开关加入之前）
+        assert_eq!(effective_rounds(false, 6), 1);
+        assert_eq!(effective_rounds(false, 99), 1);
+        // 有工具 → 夹进 [2, 12]。下限是关键：配 1 轮会让第一轮就走收尾分支，
+        // 工具声明了却永远调不动 —— 那正是「开关开着但功能没生效」。
+        assert_eq!(effective_rounds(true, 0), TOOL_ROUNDS_RANGE.0);
+        assert_eq!(effective_rounds(true, 1), TOOL_ROUNDS_RANGE.0);
+        assert_eq!(effective_rounds(true, 6), 6);
+        assert_eq!(effective_rounds(true, 999), TOOL_ROUNDS_RANGE.1);
+    }
+
+    #[test]
+    fn image_hint_only_fires_for_4xx_with_images() {
+        let e400 = "调用失败：OpenAI HTTP 400: {\"error\":\"invalid image\"}";
+        // 带图 + 4xx → 点出「模型可能不支持图片」，否则根因埋在响应体里没人看得出来
+        assert!(image_unsupported_hint(e400, true).contains("不支持图片输入"));
+        // 没带图 → 不该乱加提示，误导排查方向
+        assert_eq!(image_unsupported_hint(e400, false), e400);
+        // 5xx / 超时 / 连接失败与图片无关
+        for e in [
+            "调用失败：Anthropic HTTP 529: overloaded",
+            "调用失败：Anthropic HTTP 500: boom",
+            "超时（>60000ms）",
+            "调用失败：连接 x 失败",
+        ] {
+            assert_eq!(image_unsupported_hint(e, true), e, "{e} 不该加图片提示");
+        }
+        assert!(mentions_4xx("HTTP 404 not found"));
+        assert!(!mentions_4xx("HTTP 4x not a status"));
+        assert!(!mentions_4xx("没有状态码"));
+    }
+
+    #[test]
+    fn tool_call_brief_is_stable_and_capped() {
+        use serde_json::json;
+        let c = upstream::ToolInvocation {
+            id: "t".into(),
+            name: "read_file".into(),
+            args: json!({ "start_line": 3, "path": "src/main.rs" }),
+        };
+        // 排序固定：折叠 key 与日志文本不能因参数顺序抖动
+        assert_eq!(tool_call_brief(&c), "path=src/main.rs start_line=3");
+        // 非对象参数（模型吐了截断 JSON）要有可读标记，不能 panic
+        let bad = upstream::ToolInvocation {
+            id: "t".into(),
+            name: "read_file".into(),
+            args: serde_json::Value::Null,
+        };
+        assert_eq!(tool_call_brief(&bad), "[参数非法]");
+        // 长参数截断（整段正则/长路径会撑爆日志行）
+        let long = upstream::ToolInvocation {
+            id: "t".into(),
+            name: "grep".into(),
+            args: json!({ "pattern": "x".repeat(200) }),
+        };
+        let s = tool_call_brief(&long);
+        assert!(s.chars().count() <= 81 && s.ends_with('…'), "{s}");
+    }
+
+    /// 起一个**按脚本逐次应答**的 mock 上游：第 N 次请求返回 `bodies[N-1]`（用尽后重复最后一条）。
+    /// 同时把每次收到的请求体存下来，供断言「tools 声明 / tool_result 回填」的真实形状。
+    ///
+    /// 为什么要真起 HTTP：工具循环最容易错的地方是**第二轮请求体长什么样**（assistant 消息
+    /// 是否照抄、tool_result 是否一一对应、tools 是否还带着）。只测纯函数覆盖不到这一层。
+    async fn spawn_scripted(
+        bodies: Vec<&'static str>,
+    ) -> (String, Arc<parking_lot::Mutex<Vec<serde_json::Value>>>) {
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::{Bytes, Incoming};
+        use hyper::service::service_fn;
+        use hyper::{Request, Response};
+        use hyper_util::rt::TokioIo;
+        use std::net::SocketAddr;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<parking_lot::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_srv = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let io = TokioIo::new(stream);
+                let bodies = bodies.clone();
+                let seen_conn = seen_srv.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let bodies = bodies.clone();
+                        let seen_req = seen_conn.clone();
+                        async move {
+                            let raw = req.into_body().collect().await.unwrap().to_bytes();
+                            let parsed: serde_json::Value =
+                                serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+                            let idx = {
+                                let mut g = seen_req.lock();
+                                g.push(parsed);
+                                g.len() - 1
+                            };
+                            let body = bodies[idx.min(bodies.len() - 1)];
+                            let resp = Response::builder()
+                                .status(200)
+                                .header("content-type", "application/json")
+                                .body(
+                                    Full::new(Bytes::from(body))
+                                        .map_err(|n: std::convert::Infallible| -> std::io::Error {
+                                            match n {}
+                                        })
+                                        .boxed(),
+                                )
+                                .unwrap();
+                            Ok::<_, hyper::Error>(resp)
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn test_key(base_url: &str) -> crate::model::ProviderKey {
+        crate::model::ProviderKey {
+            id: "k1".into(),
+            category_id: CategoryType::ClaudeCli,
+            name: "mock".into(),
+            vendor: "test".into(),
+            base_url: base_url.into(),
+            protocol: Protocol::Anthropic,
+            has_secret: true,
+            enabled: true,
+            priority: 0,
+            headers_json: None,
+            params: crate::model::KeyParams::default(),
+            models: vec![],
+            mappings: vec![],
+            default_model: None,
+            tier_haiku: None,
+            tier_sonnet: None,
+            tier_opus: None,
+            health: crate::model::HealthState::default(),
+        }
+    }
+
+    /// 建一个带一个源文件的临时工作目录 + 对应的 ToolEnv。
+    async fn tool_env_with_file(tag: &str) -> (std::path::PathBuf, crate::agent_tools::ToolEnv) {
+        let dir = temp_dir(tag);
+        std::fs::write(dir.join("main.rs"), "fn main() {\n    answer_42();\n}\n").unwrap();
+        let env = crate::agent_tools::ToolEnv::detect(&dir).await;
+        (dir, env)
+    }
+
+    fn test_store(tag: &str) -> (std::path::PathBuf, Arc<Store>) {
+        let dir = temp_dir(tag);
+        let store = Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        (dir, store)
+    }
+
+    fn ctx_for<'a>(
+        key: &'a crate::model::ProviderKey,
+        secret: &'a str,
+        label: &'a str,
+    ) -> MemberCallCtx<'a> {
+        MemberCallCtx {
+            up: upstream::TurnParams {
+                key,
+                secret,
+                model: "m",
+                max_tokens: 256,
+                retry: false,
+                request_timeout: Duration::from_secs(10),
+            },
+            label,
+        }
+    }
+
+    /// 端到端：模型先要求 read_file → 本地执行 → 结果回填 → 第二轮给出最终答案。
+    #[tokio::test]
+    async fn tool_loop_executes_tool_then_returns_final_text() {
+        let (upstream, seen) = spawn_scripted(vec![
+            // 第 1 轮：先说一句，再要求读文件
+            r#"{"content":[{"type":"text","text":"我先看看那个文件"},{"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"main.rs"}}],"stop_reason":"tool_use"}"#,
+            // 第 2 轮：拿到内容后给结论
+            r#"{"content":[{"type":"text","text":"main 调用了 answer_42"}]}"#,
+        ])
+        .await;
+        let (work, env) = tool_env_with_file("loop_ok").await;
+        let (sdir, store) = test_store("loop_ok_store");
+        let key = test_key(&upstream);
+        let mut session = ToolSession::new(
+            Protocol::Anthropic,
+            &MultimodalPrompt::from_text("main.rs 里调了什么"),
+        );
+
+        let out = run_member_turns(
+            &store,
+            CategoryType::ClaudeCli,
+            &mut session,
+            &ctx_for(&key, "sk", "mock/m"),
+            Some(&env),
+            6,
+            60_000,
+        )
+        .await
+        .expect("循环应正常结束");
+        assert_eq!(out, "main 调用了 answer_42");
+
+        let reqs = seen.lock().clone();
+        assert_eq!(reqs.len(), 2, "应恰好两轮请求");
+        // 第 1 轮：必须声明 tools（否则模型无从调用）
+        let names: Vec<&str> = reqs[0]["tools"]
+            .as_array()
+            .expect("第一轮应带 tools")
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"read_file") && names.contains(&"grep"), "{names:?}");
+        // 第 2 轮：历史里必须有照抄的 assistant 消息 + 一一对应的 tool_result
+        let msgs = reqs[1]["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3, "user + assistant(tool_use) + user(tool_result)");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"][1]["type"], "tool_use");
+        assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
+        assert_eq!(msgs[2]["content"][0]["tool_use_id"], "toolu_1");
+        assert_eq!(msgs[2]["content"][0]["is_error"], false);
+        // 工具真读到了文件内容（不是空壳成功）
+        let result_text = msgs[2]["content"][0]["content"].as_str().unwrap();
+        assert!(result_text.contains("answer_42"), "{result_text}");
+        // 第 2 轮仍须带 tools：Anthropic 规定历史里出现 tool_use/tool_result 就必须声明 tools
+        assert!(reqs[1]["tools"].is_array(), "第二轮丢了 tools 会被上游 400");
+
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// 模型死磕工具不出结论：到轮数上限必须停下并交出已说的内容，而不是无限烧预算。
+    #[tokio::test]
+    async fn tool_loop_stops_at_round_limit_and_salvages_preamble() {
+        let (upstream, seen) = spawn_scripted(vec![
+            r#"{"content":[{"type":"text","text":"我再看一个文件"},{"type":"tool_use","id":"t1","name":"read_file","input":{"path":"main.rs"}}],"stop_reason":"tool_use"}"#,
+        ])
+        .await;
+        let (work, env) = tool_env_with_file("loop_cap").await;
+        let (sdir, store) = test_store("loop_cap_store");
+        let key = test_key(&upstream);
+        let mut session =
+            ToolSession::new(Protocol::Anthropic, &MultimodalPrompt::from_text("问题"));
+
+        // 配 2 轮（下限）：第 1 轮真调工具，第 2 轮收尾。
+        let out = run_member_turns(
+            &store,
+            CategoryType::ClaudeCli,
+            &mut session,
+            &ctx_for(&key, "sk", "mock/m"),
+            Some(&env),
+            2,
+            60_000,
+        )
+        .await
+        .expect("到上限应交出已有正文，而不是报错");
+        // 两轮的铺垫都保留下来了（丢掉等于白烧两轮额度）
+        assert_eq!(out, "我再看一个文件\n\n我再看一个文件");
+
+        let reqs = seen.lock().clone();
+        assert_eq!(reqs.len(), 2, "必须在 2 轮后停下，不能无限循环");
+        // 收尾轮要带一条「别再调工具」的 user 指示，且是**并进** tool_result 那条 user 消息
+        // （Anthropic 侧连续两条 user 会被判角色未交替）
+        let msgs = reqs[1]["messages"].as_array().unwrap();
+        let last = msgs.last().unwrap();
+        assert_eq!(last["role"], "user");
+        let blocks = last["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert!(
+            blocks.last().unwrap()["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("不要再调用工具"),
+            "收尾指示应并进同一条 user 消息：{blocks:?}"
+        );
+        // 收尾轮仍带 tools（抽掉会被 Anthropic 400）
+        assert!(reqs[1]["tools"].is_array());
+
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// 工具被安全策略拒绝时，成员**不该失败**：错误文本回给模型，让它换个方向继续。
+    #[tokio::test]
+    async fn rejected_tool_call_does_not_fail_the_member() {
+        let (upstream, seen) = spawn_scripted(vec![
+            // 模型（被注入内容诱导）去读工作目录外的文件
+            r#"{"content":[{"type":"tool_use","id":"t1","name":"read_file","input":{"path":"../../secret.txt"}}],"stop_reason":"tool_use"}"#,
+            r#"{"content":[{"type":"text","text":"读不到那个文件，我基于已有信息回答"}]}"#,
+        ])
+        .await;
+        let (work, env) = tool_env_with_file("loop_deny").await;
+        let (sdir, store) = test_store("loop_deny_store");
+        let key = test_key(&upstream);
+        let mut session =
+            ToolSession::new(Protocol::Anthropic, &MultimodalPrompt::from_text("问题"));
+
+        let out = run_member_turns(
+            &store,
+            CategoryType::ClaudeCli,
+            &mut session,
+            &ctx_for(&key, "sk", "mock/m"),
+            Some(&env),
+            6,
+            60_000,
+        )
+        .await
+        .expect("工具被拒不该让整个成员失败");
+        assert_eq!(out, "读不到那个文件，我基于已有信息回答");
+
+        let reqs = seen.lock().clone();
+        let tr = &reqs[1]["messages"][2]["content"][0];
+        assert_eq!(tr["is_error"], true, "被拒必须标成错误，否则模型把拒绝文本当数据用");
+        assert!(
+            tr["content"].as_str().unwrap().contains("相对路径"),
+            "拒绝原因要可行动：{tr:?}"
+        );
+
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// OpenAI 侧的形状与 Anthropic 完全不同（tool_calls / role:"tool"），单独端到端跑一遍。
+    #[tokio::test]
+    async fn tool_loop_openai_shape_roundtrips() {        let (upstream, seen) = spawn_scripted(vec![
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"main.rs\"}"}}]}}]}"#,
+            r#"{"choices":[{"message":{"role":"assistant","content":"main 调了 answer_42"}}]}"#,
+        ])
+        .await;
+        let (work, env) = tool_env_with_file("loop_oai").await;
+        let (sdir, store) = test_store("loop_oai_store");
+        let mut key = test_key(&upstream);
+        key.protocol = Protocol::OpenaiChat;
+        let mut session =
+            ToolSession::new(Protocol::OpenaiChat, &MultimodalPrompt::from_text("问题"));
+
+        let out = run_member_turns(
+            &store,
+            CategoryType::ClaudeCli,
+            &mut session,
+            &ctx_for(&key, "sk", "mock/m"),
+            Some(&env),
+            6,
+            60_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "main 调了 answer_42");
+
+        let reqs = seen.lock().clone();
+        // tools 要包一层 function、schema 字段叫 parameters
+        assert_eq!(reqs[0]["tools"][0]["type"], "function");
+        assert!(reqs[0]["tools"][0]["function"]["parameters"].is_object());
+        assert_eq!(reqs[0]["tool_choice"], "auto");
+        // 结果是一条独立的 role:"tool" 消息，带 tool_call_id
+        let msgs = reqs[1]["messages"].as_array().unwrap();
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "call_1");
+        assert!(msgs[2]["content"].as_str().unwrap().contains("answer_42"));
+
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// 单轮工具调用数超上限：超出的回 is_error 结果但**不执行**（不起子进程/不读盘），
+    /// 且每个 call 仍有一一对应的结果（否则下一轮上游 400）。
+    #[tokio::test]
+    async fn tool_loop_caps_calls_per_turn() {
+        // 第 1 轮返回 MAX+3 个 tool_use（模拟被注入诱导的爆量调用），第 2 轮给结论。
+        let n = MAX_TOOL_CALLS_PER_TURN + 3;
+        let calls: String = (0..n)
+            .map(|i| format!(
+                r#"{{"type":"tool_use","id":"t{i}","name":"read_file","input":{{"path":"main.rs"}}}}"#
+            ))
+            .collect::<Vec<_>>()
+            .join(",");
+        let first = format!(r#"{{"content":[{calls}],"stop_reason":"tool_use"}}"#);
+        let first_static: &'static str = Box::leak(first.into_boxed_str());
+        let (upstream, seen) = spawn_scripted(vec![
+            first_static,
+            r#"{"content":[{"type":"text","text":"够了，结论是 X"}]}"#,
+        ])
+        .await;
+        let (work, env) = tool_env_with_file("loop_cap_calls").await;
+        let (sdir, store) = test_store("loop_cap_calls_store");
+        let key = test_key(&upstream);
+        let mut session =
+            ToolSession::new(Protocol::Anthropic, &MultimodalPrompt::from_text("问题"));
+
+        let out = run_member_turns(
+            &store,
+            CategoryType::ClaudeCli,
+            &mut session,
+            &ctx_for(&key, "sk", "mock/m"),
+            Some(&env),
+            6,
+            60_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "够了，结论是 X");
+
+        let reqs = seen.lock().clone();
+        let results = reqs[1]["messages"][2]["content"].as_array().unwrap();
+        // 协议一一对应：n 个 tool_use → n 个 tool_result，一个都不能少
+        assert_eq!(results.len(), n, "每个 call 都必须有结果，否则上游 400");
+        // 前 MAX 个真执行（读到了文件内容），超出的是「未执行」错误
+        assert!(
+            results[0]["content"].as_str().unwrap().contains("answer_42"),
+            "前若干个应真执行：{:?}",
+            results[0]
+        );
+        let over = &results[MAX_TOOL_CALLS_PER_TURN];
+        assert_eq!(over["is_error"], true);
+        assert!(
+            over["content"].as_str().unwrap().contains("超过上限"),
+            "超出的应回未执行错误：{over:?}"
+        );
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// 回归护栏：工具**关闭**（tool_env=None）时，请求体必须与旧的 text_completion 逐字段一致
+    /// —— content 是纯字符串、无 tools/tool_choice 字段、单轮即终。这是「关掉开关等于回到改动前」
+    /// 的判据，本轮把成员路径从 text_completion 换成了 ToolSession，最容易在这里回归。
+    #[tokio::test]
+    async fn tools_off_request_shape_matches_plain_completion() {
+        let (upstream, seen) = spawn_scripted(vec![
+            r#"{"content":[{"type":"text","text":"纯文本答案"}]}"#,
+        ])
+        .await;
+        let (sdir, store) = test_store("tools_off_store");
+        let key = test_key(&upstream);
+        let mut session =
+            ToolSession::new(Protocol::Anthropic, &MultimodalPrompt::from_text("问题X"));
+
+        let out = run_member_turns(
+            &store,
+            CategoryType::ClaudeCli,
+            &mut session,
+            &ctx_for(&key, "sk", "mock/m"),
+            None, // 工具关闭
+            6,
+            60_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "纯文本答案");
+
+        let reqs = seen.lock().clone();
+        assert_eq!(reqs.len(), 1, "工具关闭必须单轮即终");
+        // 无 tools / tool_choice 字段
+        assert!(reqs[0].get("tools").is_none(), "关闭态不该发 tools 字段");
+        assert!(reqs[0].get("tool_choice").is_none());
+        // content 是纯字符串（与 text_completion 的 [{role:user, content:prompt}] 一致）
+        let msgs = reqs[0]["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "问题X", "content 必须是纯字符串，不是 block 数组");
+
+        std::fs::remove_dir_all(&sdir).ok();
     }
 }
