@@ -11,11 +11,17 @@ import type {
   CcSwitchScanResult,
   CodegraphState,
   EventLogEntry,
+  ExportOutcome,
+  ImportMode,
+  ImportPreview,
+  ImportReport,
+  MasterPasswordState,
   McpStatus,
   ModelInfo,
   ProviderKey,
   ProxyState,
   RecentWorkdir,
+  RequestTrace,
   RetrievedFile,
   ToolConfigPreview,
   UpdateCheckResult,
@@ -70,6 +76,14 @@ export const api = {
   // 切换启用状态
   toggleKey: (keyId: string, enabled: boolean) =>
     call<void>("toggle_key", { keyId, enabled }, () => mockBridge.toggleKey(keyId, enabled)),
+
+  // 设为该分类的主 Key（优先级 0，其余顺延）。重排规则在后端 Store::set_primary_key，
+  // 因为托盘快切（FR-022）与界面共用同一套规则，前端不再自己算。
+  // 返回是否真的改了（已是主则 false）。
+  setPrimaryKey: (categoryId: CategoryType, keyId: string) =>
+    call<boolean>("set_primary_key", { categoryId, keyId }, () =>
+      mockBridge.setPrimaryKey(categoryId, keyId),
+    ),
 
   // ---- 从 cc-switch 导入历史 Key（只读对方库；导入后不接入）----
   scanCcswitch: () =>
@@ -137,6 +151,17 @@ export const api = {
   listAllEvents: () =>
     call<EventLogEntry[]>("list_all_events", undefined, () => mockBridge.listAllEvents()),
 
+  /**
+   * 按事件 id 取链路快照（用户展开某行日志时才调）。
+   *
+   * 列表接口不返回 trace 正文——每 2s 全量轮询 × 单条最坏 40000 字符会把界面拖卡。
+   * 返回 null = 该条已被内存日志上限挤出。
+   */
+  getEventTrace: (eventId: string) =>
+    call<RequestTrace | null>("get_event_trace", { eventId }, () =>
+      mockBridge.getEventTrace(eventId),
+    ),
+
   // ---- 设置 ----
   getSettings: () => call<AppSettings>("get_settings", undefined, () => mockBridge.getSettings()),
 
@@ -177,6 +202,73 @@ export const api = {
   pickDirectory: () => call<string | null>("pick_directory", undefined, async () => null),
 
   getDefaultLogDir: () => call<string>("get_default_log_dir", undefined, async () => "C:\\AppData\\SynaRoute\\logs"),
+
+  // ---- 配置导入 / 导出（FR-021）----
+  // 密钥段用**用户口令**加密（Argon2id + AES-GCM），而非照搬 DPAPI 密文——后者绑当前
+  // Windows 账户、换机解不出，照搬等于导出一份用不了的文件。password 为空即不含密钥。
+
+  /** 导出配置到用户选定文件。返回路径 + 跳过条数；用户取消时 null。 */
+  exportConfig: (password?: string) =>
+    call<ExportOutcome | null>("export_config", { password }, async () => ({
+      path: "C:\\mock\\synaroute-config.json",
+      undecryptable: 0,
+    })),
+
+  /** 选文件并只做校验+预检（不改任何配置）。返回 [路径, 预检]；用户取消时 null。 */
+  pickAndPreviewImport: () =>
+    call<[string, ImportPreview] | null>("pick_and_preview_import", undefined, async () => null),
+
+  /** 执行导入。path 来自 pickAndPreviewImport。 */
+  applyImportConfig: (path: string, mode: ImportMode, password?: string) =>
+    call<ImportReport>("apply_import_config", { path, mode, password }, async () => ({
+      mode,
+      keysAdded: 0,
+      keysOverwritten: 0,
+      keysRemoved: 0,
+      vendorsImported: 0,
+      brainImported: 0,
+      secretsImported: 0,
+      warnings: ["浏览器预览模式：未实际导入"],
+    })),
+
+  // ---- 主口令增强模式（FR-018 可选增强）----
+  // 默认 DPAPI（免口令、绑当前 Windows 账户）。启用后由 Argon2id 从用户口令派生密钥
+  // 加密整个密钥库，每次启动需解锁一次。**真实模式的事实来源是密钥库文件本身**，
+  // settings.masterPasswordEnabled 只是镜像。
+
+  /** 读当前状态（是否启用 / 是否锁着）。 */
+  getMasterPasswordState: () =>
+    call<MasterPasswordState>("get_master_password_state", undefined, () =>
+      mockBridge.getMasterPasswordState(),
+    ),
+
+  /** 用主口令解锁本次进程。解锁前取不到任何密钥（转发会报「需解锁」）。 */
+  unlockMasterPassword: (password: string) =>
+    call<void>("unlock_master_password", { password }, () =>
+      mockBridge.unlockMasterPassword(password),
+    ),
+
+  /** 立即上锁（清掉进程内常驻的库密钥）。 */
+  lockMasterPassword: () =>
+    call<void>("lock_master_password", undefined, () => mockBridge.lockMasterPassword()),
+
+  /** 启用主口令：把库里全部 DPAPI 密文改用口令加密。返回迁移条数。 */
+  enableMasterPassword: (password: string) =>
+    call<number>("enable_master_password", { password }, () =>
+      mockBridge.enableMasterPassword(password),
+    ),
+
+  /** 关闭主口令：改回 DPAPI。需输入当前主口令确认。返回迁移条数。 */
+  disableMasterPassword: (password: string) =>
+    call<number>("disable_master_password", { password }, () =>
+      mockBridge.disableMasterPassword(password),
+    ),
+
+  /** 修改主口令（验证旧口令 + 全库用新口令重新封装）。返回重新封装条数。 */
+  changeMasterPassword: (oldPassword: string, newPassword: string) =>
+    call<number>("change_master_password", { oldPassword, newPassword }, () =>
+      mockBridge.changeMasterPassword(oldPassword, newPassword),
+    ),
 
   // ---- 厂商预设 ----
   listVendors: () => call<Vendor[]>("list_vendors", undefined, () => mockBridge.listVendors()),

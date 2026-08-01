@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { useStore } from "@/store";
 import { Badge } from "@/components/ui/Badge";
+import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
-import type { CategoryType, EventLogEntry } from "@/types";
+import type { CategoryType, EventLogEntry, RequestTrace } from "@/types";
 import {
   ArrowLeftRight,
   Activity,
@@ -79,44 +80,28 @@ export function LogsPage() {
     return () => clearInterval(id);
   }, [refreshEvents]);
 
-  // 每组事件计数（在「当前分类筛选」范围内统计，交叉联动）。
-  const counts = useMemo(() => {
-    const c: Record<LogGroup, number> = { system: 0, brain: 0, route: 0, failover: 0, error: 0 };
+  // 计数与可见列表**一趟算完**（原先是 5 个各自遍历 events 的 useMemo：两个 Record 累加 +
+  // 两个 filter().length + 一次 reverse+filter，合计 5 次全量遍历 + 2 次数组拷贝。日志每 2s
+  // 刷一次、最多 500 条，没必要为几个计数把数组走 5 遍）。
+  const { counts, catCounts, allByGroup, allByCat, visible } = useMemo(() => {
+    const counts: Record<LogGroup, number> = { system: 0, brain: 0, route: 0, failover: 0, error: 0 };
+    const catCounts: Record<CategoryType, number> = { "claude-cli": 0, "claude-desktop": 0, codex: 0 };
+    let allByGroup = 0;
+    let allByCat = 0;
+    const visible: EventLogEntry[] = [];
     for (const e of events) {
-      if (catFilter && e.categoryId !== catFilter) continue;
-      c[GROUP_OF[e.type] ?? "system"] += 1;
+      const g = GROUP_OF[e.type] ?? "system";
+      const catOk = !catFilter || e.categoryId === catFilter;
+      const groupOk = !filter || g === filter;
+      // 交叉联动：每个维度的计数落在**另一个**维度的筛选范围内
+      if (catOk) counts[g] += 1;
+      if (groupOk) catCounts[e.categoryId] += 1;
+      if (catOk) allByGroup += 1;
+      if (groupOk) allByCat += 1;
+      if (catOk && groupOk) visible.push(e);
     }
-    return c;
-  }, [events, catFilter]);
-
-  // 每分类事件计数（在「当前分组筛选」范围内统计，交叉联动）。
-  const catCounts = useMemo(() => {
-    const c: Record<CategoryType, number> = { "claude-cli": 0, "claude-desktop": 0, codex: 0 };
-    for (const e of events) {
-      if (filter && (GROUP_OF[e.type] ?? "system") !== filter) continue;
-      c[e.categoryId] += 1;
-    }
-    return c;
-  }, [events, filter]);
-
-  // 「全部」标签计数：分别落在各自维度的另一维筛选范围内。
-  const allByGroup = useMemo(
-    () => events.filter((e) => !catFilter || e.categoryId === catFilter).length,
-    [events, catFilter],
-  );
-  const allByCat = useMemo(
-    () => events.filter((e) => !filter || (GROUP_OF[e.type] ?? "system") === filter).length,
-    [events, filter],
-  );
-
-  // 最新在前；同时按两个维度裁剪。
-  const visible = useMemo(() => {
-    const ordered = [...events].reverse();
-    return ordered.filter(
-      (e) =>
-        (!filter || (GROUP_OF[e.type] ?? "system") === filter) &&
-        (!catFilter || e.categoryId === catFilter),
-    );
+    visible.reverse(); // 最新在前（就地反转，省一次数组拷贝）
+    return { counts, catCounts, allByGroup, allByCat, visible };
   }, [events, filter, catFilter]);
 
   return (
@@ -222,18 +207,39 @@ function FilterTab({
 function LogRow({ entry, lang }: { entry: EventLogEntry; lang: string }) {
   const t = useT();
   const [open, setOpen] = useState(false);
+  // 链路快照按需拉取：列表接口不带 trace 正文（每 2s 轮询 × 单条最坏 40000 字符会拖卡界面），
+  // 展开时才按事件 id 单取一条。undefined = 还没取过；null = 已滚出保留窗口。
+  const [trace, setTrace] = useState<RequestTrace | null | undefined>(undefined);
+  const [loadingTrace, setLoadingTrace] = useState(false);
   const meta = TYPE_META[entry.type] ?? TYPE_META.route;
   const Icon = meta.icon;
   // 所有类型都可展开：有 trace 的展开完整链路快照；无 trace 的展开 detail 全文
   //（长 detail 在收起态被 truncate 截断，展开后不截断，解决「日志太长看不了」）。
-  const expandable = !!entry.trace || entry.detail.length > 0;
+  const expandable = !!entry.hasTrace || entry.detail.length > 0;
   const time = new Date(entry.ts).toLocaleTimeString(lang === "en" ? "en-US" : "zh-CN");
+
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    // 首次展开且这条有快照 → 拉一次并缓存在本行 state 里（收起再展开不重复请求）。
+    if (next && entry.hasTrace && trace === undefined && !loadingTrace) {
+      setLoadingTrace(true);
+      void api
+        .getEventTrace(entry.id)
+        .then((tr) => setTrace(tr))
+        .catch((e) => {
+          console.error("getEventTrace failed", e);
+          setTrace(null); // 取不到就按「无快照」渲染，不让展开态空着
+        })
+        .finally(() => setLoadingTrace(false));
+    }
+  };
 
   return (
     <div className="rounded-control border border-border bg-surface">
       <div
         className={`flex items-center gap-3 px-3 py-2 ${expandable ? "cursor-pointer hover:bg-surface-hover" : ""}`}
-        onClick={expandable ? () => setOpen((v) => !v) : undefined}
+        onClick={expandable ? toggle : undefined}
       >
         {expandable ? (
           <ChevronRight
@@ -254,12 +260,20 @@ function LogRow({ entry, lang }: { entry: EventLogEntry; lang: string }) {
         </span>
       </div>
 
-      {open && entry.trace && <TraceDetail trace={entry.trace} />}
+      {open && entry.hasTrace && (
+        loadingTrace ? (
+          <div className="px-3 pb-2.5 text-[11px] text-text-muted">{t("logs.trace.loading")}</div>
+        ) : trace ? (
+          <TraceDetail trace={trace} />
+        ) : trace === null ? (
+          <div className="px-3 pb-2.5 text-[11px] text-text-muted">{t("logs.trace.evicted")}</div>
+        ) : null
+      )}
     </div>
   );
 }
 
-function TraceDetail({ trace }: { trace: NonNullable<EventLogEntry["trace"]> }) {
+function TraceDetail({ trace }: { trace: RequestTrace }) {
   const t = useT();
   return (
     <div className="border-t border-border px-3 py-3 text-xs">

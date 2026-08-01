@@ -10,6 +10,7 @@ import type {
   CategoryType,
   EventLogEntry,
   HealthStatus,
+  MasterPasswordState,
   ModelInfo,
   ProviderKey,
   ProxyState,
@@ -17,6 +18,10 @@ import type {
 } from "@/types";
 
 const now = Date.now();
+
+/** 主口令模式的浏览器预览态：默认关（与真实默认一致），启用后记住口令用于校验。 */
+let masterMock: MasterPasswordState = { enabled: false, locked: false };
+let masterPw = "";
 
 /** 便捷构造模型列表 */
 const models = (names: string[], ctxWindow?: number): ModelInfo[] =>
@@ -350,6 +355,27 @@ export const mockBridge = {
     }
   },
 
+  // 与后端 Store::set_primary_key 同规则：目标提到队首，整列重编号为连续 0,1,2…
+  // 浏览器预览态也要能看到「设为主」的效果，否则 npm run dev 下点了没反应像坏了。
+  async setPrimaryKey(categoryId: CategoryType, keyId: string) {
+    await delay();
+    const list = store[categoryId] ?? [];
+    if (!list.some((k) => k.id === keyId)) return false;
+    const ordered = [...list].sort((a, b) => a.priority - b.priority);
+    const idx = ordered.findIndex((k) => k.id === keyId);
+    const [target] = ordered.splice(idx, 1);
+    ordered.unshift(target);
+    let changed = false;
+    ordered.forEach((k, i) => {
+      const live = list.find((x) => x.id === k.id);
+      if (live && live.priority !== i) {
+        live.priority = i;
+        changed = true;
+      }
+    });
+    return changed;
+  },
+
   // 浏览器预览态：给出一份覆盖各种分支的假候选（可导入 / 重复 / 官方档 / 不支持端），
   // 让 UI 的每种状态都能在 npm run dev 下被看到。
   async scanCcswitch() {
@@ -558,7 +584,12 @@ export const mockBridge = {
   },
   async listAllEvents() {
     await delay();
-    return clone(events);
+    // 与真实后端同口径：列表剥掉 trace 正文，只留 hasTrace 布尔位。
+    return clone(events).map((e) => ({ ...e, hasTrace: !!e.trace, trace: undefined }));
+  },
+  async getEventTrace(eventId: string) {
+    await delay();
+    return clone(events.find((e) => e.id === eventId)?.trace ?? null);
   },
   async getSettings() {
     await delay();
@@ -589,5 +620,49 @@ export const mockBridge = {
     const v = vendors.find((x) => x.id === vendorId);
     if (v?.builtin) throw new Error("内置厂商不可删除");
     vendors = vendors.filter((x) => x.id !== vendorId);
+  },
+
+  // ---- 主口令增强模式（浏览器预览态）----
+  // 只模拟状态机与口令校验，不做真加密。目的是让设置页的三个对话框
+  // （启用 / 解锁 / 关闭）在 npm run dev 下都能走完整流程被看到。
+  async getMasterPasswordState(): Promise<MasterPasswordState> {
+    await delay();
+    return { ...masterMock };
+  },
+  async unlockMasterPassword(password: string) {
+    await delay();
+    if (!masterMock.enabled) throw new Error("当前不是主口令模式，无需解锁");
+    if (password !== masterPw) throw new Error("主口令错误。请确认后重试（口令区分大小写）。");
+    masterMock.locked = false;
+  },
+  async lockMasterPassword() {
+    await delay();
+    if (masterMock.enabled) masterMock.locked = true;
+  },
+  async enableMasterPassword(password: string) {
+    await delay();
+    if (masterMock.enabled) throw new Error("已处于主口令模式，无需重复启用");
+    if (!password) throw new Error("主口令不能为空");
+    masterPw = password;
+    masterMock = { enabled: true, locked: false };
+    // 迁移条数 = 当前三个分类的 Key 总数（贴近真实反馈）
+    return (Object.keys(store) as CategoryType[]).reduce((n, c) => n + store[c].length, 0);
+  },
+  async disableMasterPassword(password: string) {
+    await delay();
+    if (!masterMock.enabled) throw new Error("当前不是主口令模式，无需关闭");
+    if (password !== masterPw) throw new Error("主口令错误。请确认后重试（口令区分大小写）。");
+    masterMock = { enabled: false, locked: false };
+    masterPw = "";
+    return (Object.keys(store) as CategoryType[]).reduce((n, c) => n + store[c].length, 0);
+  },
+  async changeMasterPassword(oldPassword: string, newPassword: string) {
+    await delay();
+    if (!masterMock.enabled) throw new Error("当前不是主口令模式，无法修改主口令");
+    if (oldPassword !== masterPw) throw new Error("主口令错误。请确认后重试（口令区分大小写）。");
+    if (!newPassword) throw new Error("新主口令不能为空");
+    masterPw = newPassword;
+    masterMock.locked = false;
+    return (Object.keys(store) as CategoryType[]).reduce((n, c) => n + store[c].length, 0);
   },
 };

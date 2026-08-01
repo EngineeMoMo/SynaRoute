@@ -212,6 +212,7 @@ impl Store {
             kind: kind.to_string(),
             key_id: key_id.map(|s| s.to_string()),
             detail: detail.to_string(),
+            has_trace: trace.is_some(),
             trace,
         };
         let mut ev = self.events.write();
@@ -225,8 +226,9 @@ impl Store {
     }
 
     fn write_log_to_file(&self, entry: &EventLogEntry) {
-        let settings = self.get_settings();
-        let log_dir = match &settings.log_dir {
+        // 只取 log_dir 这一个字段，不克隆整份 settings（每条日志都会走这里，而 AppSettings
+        // 里有 3 个 HashMap + 2 个 Vec，克隆开销远大于取一个 Option<String>）。
+        let log_dir = match self.config.read().settings.log_dir.as_deref() {
             Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
             _ => default_log_dir(),
         };
@@ -265,19 +267,46 @@ impl Store {
         }
     }
 
+    /// 事件日志列表（**不含 trace**），供 UI 列表展示。
+    ///
+    /// 为什么必须剥掉 trace：日志页每 2s 轮询一次全量列表，而 trace 里的
+    /// `request_body`/`response_body` 各上限 20000 字符 —— 500 条满载约 19 MB。
+    /// 每 2s 克隆 + 序列化 + 过 IPC + 前端反序列化这么多字节，会把界面拖到卡顿，
+    /// 而前端只在**用户展开某一行**时才用 trace（其余时刻整份都是传过去就扔）。
+    /// 展开时另走 [`Self::event_trace`] 按 id 单取一条。
+    fn strip_trace(e: &EventLogEntry) -> EventLogEntry {
+        EventLogEntry {
+            // has_trace 必须留下：前端靠它决定「这行能不能展开」。剥的是正文，不是存在性。
+            has_trace: e.trace.is_some(),
+            trace: None,
+            ..e.clone()
+        }
+    }
+
     pub fn list_events(&self, category: CategoryType) -> Vec<EventLogEntry> {
         self.events
             .read()
             .iter()
             .filter(|e| e.category_id == category)
-            .cloned()
+            .map(Self::strip_trace)
             .collect()
     }
 
     /// 合并全部分类的事件日志（不按分类过滤），供「运行日志」页连续展示。
     /// 切换活动分类时日志不再被裁剪，每条自带 category_id 标签，前端可再做客户端过滤。
+    /// **不含 trace**，理由见 [`Self::strip_trace`]。
     pub fn list_all_events(&self) -> Vec<EventLogEntry> {
-        self.events.read().iter().cloned().collect()
+        self.events.read().iter().map(Self::strip_trace).collect()
+    }
+
+    /// 按事件 id 取该条的链路快照（列表里剥掉了，用户展开某行时才按需取一条）。
+    /// 找不到（已被 MAX_EVENTS 挤出）返回 None，前端据此显示「已滚出保留窗口」。
+    pub fn event_trace(&self, event_id: &str) -> Option<RequestTrace> {
+        self.events
+            .read()
+            .iter()
+            .find(|e| e.id == event_id)
+            .and_then(|e| e.trace.clone())
     }
 
     /// 读取 config 文件当前磁盘状态快照 (mtime, 字节数)；文件不存在/不可读时返回 (None, 0)。
@@ -426,6 +455,131 @@ impl Store {
         )
     }
 
+    // ---- 配置导入 / 导出支撑（FR-021，见 crate::portable）----
+
+    /// 整份配置的只读快照（导出与导入预检用）。
+    /// 读前自愈：磁盘被外部改过就重载，避免导出的是进程里的旧快照。
+    pub fn snapshot_config(&self) -> AppConfig {
+        self.reload_if_disk_newer();
+        self.config.read().clone()
+    }
+
+    /// 导入前把现有 config 备份到同目录的 `config.pre-import-<时间戳>.json`，返回备份路径。
+    ///
+    /// 只在 Replace 模式调用——那个模式会删掉「导出之后新建的条目」，必须留一条退路。
+    /// 备份失败**上抛**：宁可不导入，也不在无退路的情况下做破坏性替换。
+    pub fn backup_config_before_import(&self) -> AppResult<String> {
+        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        let backup = self
+            .config_path
+            .with_file_name(format!("config.pre-import-{stamp}.json"));
+        // 用当前**磁盘**内容做备份（而非内存序列化）：备份的意义是「回到导入前磁盘上那一份」。
+        // 磁盘文件不存在（极早期/首次运行）时退化为序列化内存态，仍给出可回滚的东西。
+        let data = match std::fs::read(&self.config_path) {
+            Ok(d) => d,
+            Err(_) => serde_json::to_vec_pretty(&*self.config.read())?,
+        };
+        atomic_write(&backup, &data)?;
+        Ok(backup.display().to_string())
+    }
+
+    /// 把导入载荷写进配置（走 `mutate_and_persist`，落盘失败磁盘对账回滚）。
+    ///
+    /// 两种模式的差异只在「是否先清空」；其余都是「同 id 覆盖、新 id 追加」。
+    /// **settings 一律整份替换**（导入方已剔掉本机绑定字段，见 `portable::strip_machine_local`），
+    /// 但随后仍由 `save_settings` 那套「后端自管字段保留」逻辑管着——这里直接写 cfg.settings
+    /// 会绕过它，故显式把本机自管的几项从当前值继承回来。
+    pub fn apply_imported_config(
+        &self,
+        payload: &crate::portable::ExportPayload,
+        mode: crate::portable::ImportMode,
+    ) -> AppResult<()> {
+        use crate::portable::ImportMode;
+        self.mutate_and_persist(|cfg| {
+            if mode == ImportMode::Replace {
+                cfg.keys.clear();
+                cfg.brain.clear();
+                // vendors 不清空：内置厂商种子（builtin=true）是程序自带的，清掉会让
+                // 「一键导入预设模型」失效；导入的自定义厂商按 id 覆盖即可。
+                cfg.vendors.retain(|v| v.builtin);
+            }
+            for k in &payload.keys {
+                match cfg.keys.iter_mut().find(|x| x.id == k.id) {
+                    Some(slot) => *slot = k.clone(),
+                    None => cfg.keys.push(k.clone()),
+                }
+            }
+            for b in &payload.brain {
+                match cfg.brain.iter_mut().find(|x| x.category_id == b.category_id) {
+                    Some(slot) => *slot = b.clone(),
+                    None => cfg.brain.push(b.clone()),
+                }
+            }
+            for v in &payload.vendors {
+                match cfg.vendors.iter_mut().find(|x| x.id == v.id) {
+                    Some(slot) => *slot = v.clone(),
+                    None => cfg.vendors.push(v.clone()),
+                }
+            }
+            // settings：接受导入值，但**本机运行态字段一律保留当前值**。
+            // 导出侧已把它们清空/置默认，这里再保一道——万一有人手改导出文件塞了别的机器的端口，
+            // 也不该覆盖本机粘滞端口与 MCP 注册记录（那会造成「声称已注册实则没写过」）。
+            let mut incoming = payload.settings.clone();
+            incoming.proxy_ports = cfg.settings.proxy_ports.clone();
+            incoming.mcp_port = cfg.settings.mcp_port;
+            incoming.mcp_enabled = cfg.settings.mcp_enabled;
+            incoming.mcp_registered_categories = cfg.settings.mcp_registered_categories.clone();
+            incoming.log_dir = cfg.settings.log_dir.clone();
+            incoming.auto_start = cfg.settings.auto_start;
+            cfg.settings = incoming;
+            Ok(())
+        })
+    }
+
+    /// 让每个 Key 的 `has_secret` 标记与密钥库实际内容对账，返回「标记有但实际没有」的条数。
+    ///
+    /// 导入后必做：文件不含密钥（或某条密钥写入失败）时，Key 的 `has_secret` 仍是导出机器上的
+    /// `true`。若不对账，UI 显示「已配置密钥」而转发时报「密钥缺失」——正是
+    /// [`crate::store`] 里反复防的那类「配置与实际不一致且用户无从察觉」。
+    ///
+    /// **主口令未解锁时直接跳过对账**（返回 0）。锁定态下 `get` 一律返回 Err，
+    /// 若照常对账会把**每一条** `has_secret` 都判成 false 写盘 —— 解锁后 UI 说全都没密钥、
+    /// 提示用户重录，而库里其实一条不少。这属于把「暂时读不到」误记成「确实没有」。
+    pub fn reconcile_has_secret_flags(&self) -> AppResult<usize> {
+        if self.secrets.read().is_locked() {
+            tracing::info!("密钥库未解锁，跳过 has_secret 对账（避免把读不到误判成没有）");
+            return Ok(0);
+        }
+        // 先在读锁下算出需要改的 id，避免在持配置写锁时再去拿密钥库读锁（降低锁序风险）。
+        let ids: Vec<(String, bool)> = {
+            let cfg = self.config.read();
+            let guard = self.secrets.read();
+            cfg.keys
+                .iter()
+                .map(|k| {
+                    let actual = guard.get(&k.id).ok().flatten().is_some();
+                    (k.id.clone(), actual)
+                })
+                .collect()
+        };
+        let mut fixed = 0usize;
+        self.mutate_and_persist(|cfg| {
+            for (id, actual) in &ids {
+                if let Some(k) = cfg.keys.iter_mut().find(|k| &k.id == id) {
+                    if k.has_secret && !actual {
+                        k.has_secret = false;
+                        fixed += 1;
+                    } else if !k.has_secret && *actual {
+                        // 反向也修：库里有密钥却标记没有，会让 UI 提示用户重录（其实不必）。
+                        k.has_secret = true;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(fixed)
+    }
+
     // ---- Key CRUD ----
 
     pub fn list_keys(&self, category: CategoryType) -> Vec<ProviderKey> {
@@ -489,6 +643,65 @@ impl Store {
                 Err(AppError::NotFound(key_id.into()))
             }
         })
+    }
+
+    /// 把某 Key 提为该分类的「主 Key」（优先级 0），其余保持原相对顺序顺延。
+    ///
+    /// **为什么放后端**：前端 `store.ts` 的 `setPrimaryKey` 原先自己算重排、再逐个 `upsertKey`。
+    /// 托盘也要这个功能（FR-022 要求「从托盘可完成主 Key 快切」），若托盘另写一份，
+    /// 两处的重排规则迟早漂移（例如一边规整为连续 0,1,2… 一边只交换两个值），
+    /// 表现为「从托盘设的主」与「从界面设的主」结果不一致。故抽到这里做单一事实来源。
+    ///
+    /// 重排规则：目标提到队首，其余按原 priority 升序顺延，然后**整列重编号为连续 0,1,2…**。
+    /// 重编号是必须的——历史配置里存在「全部 priority 都是 999」的同级状态，那时故障转移
+    /// 没有确定的主备顺序（永远先打 `Vec` 里的第一个），只有优先级互不相同才有确定语义。
+    ///
+    /// 幂等：目标已是主（且该分类优先级已连续）时不写盘，返回 `false`。
+    /// 托盘每次点击都会调它，避免无意义的落盘与事件噪音。
+    pub fn set_primary_key(&self, category: CategoryType, key_id: &str) -> AppResult<bool> {
+        // 只重排「同分类」的 Key，别的分类一个字节都不动。
+        let ordered_ids: Vec<String> = {
+            let cfg = self.config.read();
+            if !cfg.keys.iter().any(|k| k.id == key_id && k.category_id == category) {
+                return Err(AppError::NotFound(format!(
+                    "分类 {} 下没有 id={key_id} 的 Key",
+                    category.as_str()
+                )));
+            }
+            let mut same: Vec<&ProviderKey> =
+                cfg.keys.iter().filter(|k| k.category_id == category).collect();
+            same.sort_by_key(|k| k.priority);
+            let mut ids: Vec<String> = same.iter().map(|k| k.id.clone()).collect();
+            if let Some(pos) = ids.iter().position(|id| id == key_id) {
+                let target = ids.remove(pos);
+                ids.insert(0, target);
+            }
+            ids
+        };
+
+        // 目标优先级映射，并先判断是否真的需要改（幂等）。
+        let changed = {
+            let cfg = self.config.read();
+            ordered_ids.iter().enumerate().any(|(i, id)| {
+                cfg.keys
+                    .iter()
+                    .find(|k| &k.id == id)
+                    .is_some_and(|k| k.priority != i as i32)
+            })
+        };
+        if !changed {
+            return Ok(false);
+        }
+
+        self.mutate_and_persist(|cfg| {
+            for (i, id) in ordered_ids.iter().enumerate() {
+                if let Some(k) = cfg.keys.iter_mut().find(|k| &k.id == id) {
+                    k.priority = i as i32;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(true)
     }
 
     /// 更新某 Key 的健康状态（健康检查模块调用）。
@@ -564,16 +777,20 @@ impl Store {
             })
     }
 
+    /// 保存某分类的大脑聚合配置。
+    ///
+    /// 走 `mutate_and_persist`：落盘失败时从磁盘对账回滚，不让内存态领先磁盘。
+    /// 与 Key 的 CRUD 同一套保证——「内存比磁盘新」这个方向的背离**永不自愈**
+    /// （mtime 自愈只认「磁盘比内存新」），会一直显示成功保存直到重启才露馅。
     pub fn save_brain(&self, brain: BrainConfig) -> AppResult<()> {
-        {
-            let mut cfg = self.config.write();
+        self.mutate_and_persist(|cfg| {
             if let Some(b) = cfg.brain.iter_mut().find(|b| b.category_id == brain.category_id) {
                 *b = brain;
             } else {
                 cfg.brain.push(brain);
             }
-        }
-        self.persist()
+            Ok(())
+        })
     }
 
     // ---- 设置 ----
@@ -582,9 +799,55 @@ impl Store {
         self.config.read().settings.clone()
     }
 
-    pub fn save_settings(&self, mut settings: AppSettings) -> AppResult<()> {
-        {
-            let mut cfg = self.config.write();
+    // ---- 转发热路径专用的窄读取器 ----
+    //
+    // 为什么不直接用 `get_settings()`：它克隆**整份** `AppSettings`，里面有 3 个 HashMap
+    // （active_models / active_efforts / proxy_ports）+ 2 个 Vec + 若干 String。而转发路径
+    // 每个请求要读 3~4 次设置（对外模型覆盖、日志开关、推理强度注入），等于每请求做十几次
+    // 堆分配，只为取一个 bool 或一个短字符串。下面这几个只克隆真正要用的那一个值。
+
+    /// 调用模型日志开关（转发热路径每请求读一次）。
+    pub fn request_log_enabled(&self) -> bool {
+        self.config.read().settings.request_log_enabled
+    }
+
+    /// 「日志里附下游原始 body」开关（仅开了调用模型日志时才会被问到）。
+    pub fn log_downstream_raw_enabled(&self) -> bool {
+        self.config.read().settings.log_downstream_raw_enabled
+    }
+
+    /// 某分类当前选定的「对外模型名」（空/未配时 None）。
+    pub fn active_model_of(&self, category: &str) -> Option<String> {
+        self.config
+            .read()
+            .settings
+            .active_models
+            .get(category)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// 某分类的「默认推理强度」（空/未配时 None）。
+    pub fn active_effort_of(&self, category: &str) -> Option<String> {
+        self.config
+            .read()
+            .settings
+            .active_efforts
+            .get(category)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// 保存全局设置。
+    ///
+    /// 走 `mutate_and_persist`（与 Key CRUD / save_brain 同一套）：落盘失败时磁盘对账回滚，
+    /// 不留「UI 显示已保存、磁盘其实没写」的内存领先态。
+    ///
+    /// **闭包内先做「后端自管字段保留」再整份覆盖**——顺序不能反：那几个字段的值必须取自
+    /// 当前内存态（即最后已提交态），故必须在 `cfg.settings = settings` 之前从 `cfg` 里取走。
+    pub fn save_settings(&self, settings: AppSettings) -> AppResult<()> {
+        self.mutate_and_persist(move |cfg| {
+            let mut settings = settings;
             // mcp_registered_categories 是后端自管字段：前端 saveSettings 不携带它（序列化为空 vec），
             // 若直接覆盖会在每次切主题/语言时清空注册记录。故这里始终保留已有值——
             // 该字段只能由后端专用方法（add/clear_registered_category）更新，
@@ -611,9 +874,15 @@ impl Store {
             // proxy_ports 同为后端自管字段（粘滞端口）：由 set_proxy_port（用户改端口 / 占用回退写回）
             // 直写，前端 saveSettings 的旧快照不得覆盖，否则粘滞端口被顶回、下次重启又漂移。
             settings.proxy_ports = std::mem::take(&mut cfg.settings.proxy_ports);
+            // master_password_enabled 同为后端自管字段，且性质更严重：它只是**密钥库真实模式的
+            // UI 镜像**（真实模式记在 secrets.enc 的 master 头部里）。若允许前端入参覆盖，
+            // 用户切个主题就可能把它写成 true —— 下次启动便按「已启用」要求解锁，而密钥库里
+            // 根本没有 master 头部，解锁无从进行、密钥也读不出来（自造死局）。
+            // 只能由 enable/disable_master_password 在**库迁移成功之后**改，以及启动时的对账修正。
+            settings.master_password_enabled = cfg.settings.master_password_enabled;
             cfg.settings = settings;
-        }
-        self.persist()
+            Ok(())
+        })
     }
 
     /// 设置某分类当前选定的对外模型名（后端自管字段专用写入，绕过 save_settings 的旧快照覆盖）。
@@ -747,6 +1016,21 @@ impl Store {
                 return Ok(());
             }
             cfg.settings.mcp_enabled = enabled;
+        }
+        self.persist()
+    }
+
+    /// 设置主口令开关的 **UI 镜像**（真实模式记在 `secrets.enc` 的 master 头部里）。
+    ///
+    /// 专用写入方法，因为 `save_settings` 刻意不让前端入参覆盖这个字段（见那里的注释）。
+    /// 只应由「库迁移成功后」与「启动对账」两处调用。幂等：值相同不写盘。
+    pub fn set_master_password_flag(&self, enabled: bool) -> AppResult<()> {
+        {
+            let mut cfg = self.config.write();
+            if cfg.settings.master_password_enabled == enabled {
+                return Ok(());
+            }
+            cfg.settings.master_password_enabled = enabled;
         }
         self.persist()
     }
@@ -1126,6 +1410,109 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 设为主 Key：目标提到 priority 0，其余按原序顺延，整列重编号为连续值。
+    #[test]
+    fn set_primary_key_promotes_and_renumbers_contiguously() {
+        let dir = temp_dir("primary");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        // 刻意造「全部同级 999」——历史配置的真实形态，此时故障转移没有确定主备顺序。
+        store.upsert_key(sample_key("a", 999)).unwrap();
+        store.upsert_key(sample_key("b", 999)).unwrap();
+        store.upsert_key(sample_key("c", 999)).unwrap();
+
+        assert!(store.set_primary_key(CategoryType::ClaudeCli, "c").unwrap(), "应有改动");
+
+        let ordered = store.enabled_keys_sorted(CategoryType::ClaudeCli);
+        let ids: Vec<&str> = ordered.iter().map(|k| k.id.as_str()).collect();
+        assert_eq!(ids[0], "c", "目标必须成为主");
+        let prios: Vec<i32> = ordered.iter().map(|k| k.priority).collect();
+        assert_eq!(prios, vec![0, 1, 2], "必须重编号为连续值，否则同级下无确定主备顺序");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 幂等：目标已是主且优先级已连续时不再写盘（托盘每次点击都会调，避免噪音与无谓落盘）。
+    #[test]
+    fn set_primary_key_is_idempotent_when_already_primary() {
+        let dir = temp_dir("primary_idem");
+        let cfg = dir.join("config.json");
+        let store = Store::new_at(cfg.clone(), dir.join("secrets.enc")).unwrap();
+        store.upsert_key(sample_key("a", 0)).unwrap();
+        store.upsert_key(sample_key("b", 1)).unwrap();
+
+        let before = std::fs::read(&cfg).unwrap();
+        assert!(
+            !store.set_primary_key(CategoryType::ClaudeCli, "a").unwrap(),
+            "已是主应返回 false"
+        );
+        assert_eq!(std::fs::read(&cfg).unwrap(), before, "幂等时磁盘不应被改写");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 只动同分类：给 Codex 设主不得改动 ClaudeCli 那些 Key 的优先级。
+    #[test]
+    fn set_primary_key_touches_only_its_own_category() {
+        let dir = temp_dir("primary_scope");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        store.upsert_key(sample_key("cli_a", 5)).unwrap();
+        store.upsert_key(sample_key("cli_b", 7)).unwrap();
+        let mut cx1 = sample_key("cx_1", 3);
+        cx1.category_id = CategoryType::Codex;
+        let mut cx2 = sample_key("cx_2", 4);
+        cx2.category_id = CategoryType::Codex;
+        store.upsert_key(cx1).unwrap();
+        store.upsert_key(cx2).unwrap();
+
+        store.set_primary_key(CategoryType::Codex, "cx_2").unwrap();
+
+        let cx = store.enabled_keys_sorted(CategoryType::Codex);
+        assert_eq!(
+            cx.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(),
+            vec!["cx_2", "cx_1"]
+        );
+        assert_eq!(cx.iter().map(|k| k.priority).collect::<Vec<_>>(), vec![0, 1]);
+        // ClaudeCli 的原始优先级一个都没动（5 / 7 保持原值，而非被重编号成 0/1）
+        assert_eq!(store.get_key("cli_a").unwrap().priority, 5, "跨分类不得被牵连重编号");
+        assert_eq!(store.get_key("cli_b").unwrap().priority, 7, "跨分类不得被牵连重编号");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 不存在 / 跨分类误传的 id 必须报 NotFound，而不是静默把别的 Key 提成主。
+    #[test]
+    fn set_primary_key_rejects_unknown_or_cross_category_id() {
+        let dir = temp_dir("primary_notfound");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        store.upsert_key(sample_key("a", 0)).unwrap(); // ClaudeCli
+
+        assert!(store.set_primary_key(CategoryType::ClaudeCli, "nope").is_err());
+        assert!(
+            store.set_primary_key(CategoryType::Codex, "a").is_err(),
+            "id 存在但分类不符也必须拒绝（否则托盘传错分类会静默改错分类的主）"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 禁用的 Key 也参与重编号（它仍占一个位次），锁住「优先级不出现空洞」。
+    #[test]
+    fn set_primary_key_includes_disabled_keys_in_renumbering() {
+        let dir = temp_dir("primary_disabled");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        store.upsert_key(sample_key("a", 0)).unwrap();
+        let mut off = sample_key("off", 1);
+        off.enabled = false;
+        store.upsert_key(off).unwrap();
+        store.upsert_key(sample_key("c", 2)).unwrap();
+
+        store.set_primary_key(CategoryType::ClaudeCli, "c").unwrap();
+
+        let mut all: Vec<ProviderKey> = store.list_keys(CategoryType::ClaudeCli);
+        all.sort_by_key(|k| k.priority);
+        assert_eq!(
+            all.iter().map(|k| (k.id.as_str(), k.priority)).collect::<Vec<_>>(),
+            vec![("c", 0), ("a", 1), ("off", 2)]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 禁用 Key 时应清空遗留的 Down/熔断状态，避免界面一直显示「不可用」。
     #[test]
     fn disabling_key_clears_stale_health() {
@@ -1150,6 +1537,88 @@ mod tests {
         assert_eq!(h.status, HealthStatus::Unknown, "禁用后不应残留 Down");
         assert_eq!(h.fail_count, 0);
         assert!(h.breaker_until.is_none(), "禁用后不应残留熔断窗口");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 主口令开关是 **UI 镜像**，前端 saveSettings 的旧快照绝不能覆盖它。
+    ///
+    /// 为什么这条特别毒：真实模式记在 `secrets.enc` 的 master 头部里。若前端能把镜像写成
+    /// `true`（用户切个主题就会带上旧快照），下次启动便按「已启用」引导解锁，而密钥库里
+    /// 根本没有 master 头部 —— 解锁无从进行、密钥也读不出来，自造死局。
+    #[test]
+    fn save_settings_never_lets_frontend_flip_master_password_flag() {
+        let dir = temp_dir("master_flag_guard");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        assert!(!store.get_settings().master_password_enabled, "默认关");
+
+        // 前端提交一份「声称已启用」的 settings（模拟旧快照/手改）。
+        let mut s = store.get_settings();
+        s.master_password_enabled = true;
+        s.theme = "dark".into();
+        store.save_settings(s).unwrap();
+
+        assert!(
+            !store.get_settings().master_password_enabled,
+            "前端入参不得翻转主口令开关（否则会造出「配置说开着、库里没有 master 头部」的死局）"
+        );
+        assert_eq!(store.get_settings().theme, "dark", "其他字段照常保存");
+
+        // 反向：后端把镜像置真后，前端提交「关闭」也不得覆盖。
+        store.set_master_password_flag(true).unwrap();
+        let mut s2 = store.get_settings();
+        s2.master_password_enabled = false;
+        store.save_settings(s2).unwrap();
+        assert!(
+            store.get_settings().master_password_enabled,
+            "反向同样不得被前端覆盖——真实模式只由密钥库迁移与启动对账决定"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 专用写入方法：能改镜像，且幂等（值相同不写盘）。
+    #[test]
+    fn set_master_password_flag_writes_and_is_idempotent() {
+        let dir = temp_dir("master_flag_set");
+        let cfg = dir.join("config.json");
+        let store = Store::new_at(cfg.clone(), dir.join("secrets.enc")).unwrap();
+
+        store.set_master_password_flag(true).unwrap();
+        assert!(store.get_settings().master_password_enabled);
+
+        let before = std::fs::read(&cfg).unwrap();
+        store.set_master_password_flag(true).unwrap();
+        assert_eq!(std::fs::read(&cfg).unwrap(), before, "幂等时不应重写文件");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 密钥库锁定时 `has_secret` 对账必须**跳过**，不能把「暂时读不到」记成「确实没有」。
+    ///
+    /// 若不跳过：锁定态下 `get` 一律 Err → 每条都被判成 false 落盘 → 解锁后 UI 说全都没密钥、
+    /// 提示用户重录，而库里其实一条不少。
+    #[test]
+    fn reconcile_has_secret_skips_while_vault_locked() {
+        let dir = temp_dir("reconcile_locked");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        store.upsert_key(sample_key("k1", 0)).unwrap();
+        store.secrets.write().set("k1", "sk-x").unwrap();
+        store.reconcile_has_secret_flags().unwrap();
+        assert!(store.get_key("k1").unwrap().has_secret, "前置条件：标记应为真");
+
+        // 切到主口令模式后手动上锁（模拟「重启后还没解锁」）。
+        store.secrets.write().enable_master_password("pw").unwrap();
+        store.secrets.write().lock();
+
+        let fixed = store.reconcile_has_secret_flags().unwrap();
+        assert_eq!(fixed, 0, "锁定态应直接跳过对账");
+        assert!(
+            store.get_key("k1").unwrap().has_secret,
+            "标记必须保持为真——密钥还在库里，只是没解锁读不到"
+        );
+
+        // 解锁后对账照常工作，且结论正确（仍有密钥）。
+        store.secrets.write().unlock("pw").unwrap();
+        assert_eq!(store.reconcile_has_secret_flags().unwrap(), 0);
+        assert!(store.get_key("k1").unwrap().has_secret);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1460,11 +1929,83 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `save_brain` 落盘失败必须回滚内存（与 Key CRUD 同一套保证）。
+    ///
+    /// 补这条的理由：`save_brain` / `save_settings` 曾是全仓仅剩两个直接 `persist()` 的写路径，
+    /// 落盘失败时内存态领先磁盘。而「内存比磁盘新」这个方向**永不自愈**（mtime 自愈只认
+    /// 「磁盘比内存新」），表现为 UI 一直显示保存成功、重启后配置却回退。
+    #[test]
+    fn save_brain_rolls_back_memory_when_persist_fails() {
+        let dir = temp_dir("rollback_brain");
+        let cfg_path = dir.join("config.json");
+        let store = Store::new_at(cfg_path.clone(), dir.join("secrets.enc")).unwrap();
+
+        // 先落一条正常的 brain 配置（内存 + 磁盘一致）。
+        let mut brain = store.get_brain(CategoryType::ClaudeCli);
+        brain.total_timeout_ms = 111_000;
+        store.save_brain(brain).unwrap();
+        assert_eq!(store.get_brain(CategoryType::ClaudeCli).total_timeout_ms, 111_000);
+
+        // 制造确定性落盘失败：把 config.json 变成目录（同 delete_key 那条测试的手法）。
+        std::fs::remove_file(&cfg_path).unwrap();
+        std::fs::create_dir(&cfg_path).unwrap();
+
+        let mut dirty = store.get_brain(CategoryType::ClaudeCli);
+        dirty.total_timeout_ms = 999_000;
+        assert!(store.save_brain(dirty).is_err(), "落盘失败必须上抛错误");
+        assert_eq!(
+            store.get_brain(CategoryType::ClaudeCli).total_timeout_ms,
+            111_000,
+            "persist 失败必须回滚内存，否则 UI 显示已保存、磁盘其实是旧值且永不自愈"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `save_settings` 落盘失败同样必须回滚内存，且**不得**在回滚过程中丢掉后端自管字段。
+    ///
+    /// 后者是这次改造最容易写坏的点：把「保留后端自管字段」搬进 `mutate_and_persist` 的闭包后，
+    /// 顺序若反（先整份覆盖再取值）就会把 mcp_port 等清零；而回滚走磁盘对账，
+    /// 磁盘上那份仍是正确值，故断言要同时覆盖「回滚后字段仍在」。
+    #[test]
+    fn save_settings_rolls_back_memory_and_keeps_backend_owned_fields() {
+        let dir = temp_dir("rollback_settings");
+        let cfg_path = dir.join("config.json");
+        let store = Store::new_at(cfg_path.clone(), dir.join("secrets.enc")).unwrap();
+
+        // 后端自管字段先落盘（专用方法直写）。
+        store.set_mcp_port(9531).unwrap();
+        store.set_active_model("codex", "claude-opus-4-8").unwrap();
+        let mut s = store.get_settings();
+        s.theme = "light".into();
+        store.save_settings(s).unwrap();
+        assert_eq!(store.get_settings().theme, "light");
+        assert_eq!(store.get_settings().mcp_port, 9531);
+
+        // 落盘失败。
+        std::fs::remove_file(&cfg_path).unwrap();
+        std::fs::create_dir(&cfg_path).unwrap();
+
+        let mut dirty = store.get_settings();
+        dirty.theme = "dark".into();
+        assert!(store.save_settings(dirty).is_err(), "落盘失败必须上抛错误");
+
+        let now = store.get_settings();
+        assert_eq!(now.theme, "light", "persist 失败必须回滚，不留内存领先态");
+        assert_eq!(now.mcp_port, 9531, "回滚不得丢掉后端自管的粘滞端口");
+        assert_eq!(
+            now.active_models.get("codex").map(|s| s.as_str()),
+            Some("claude-opus-4-8"),
+            "回滚不得丢掉后端自管的已选模型"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 回归 review：磁盘读/解析失败(正是 persist 失败之因,如目标被建成目录)时，
     /// rollback_from_disk 回退到改动前内存快照兜底，保证内存不领先磁盘。
     #[test]
-    fn rollback_from_disk_falls_back_to_snapshot_when_disk_unreadable() {
-        let dir = temp_dir("rollback_fallback");
+    fn rollback_from_disk_falls_back_to_snapshot_when_disk_unreadable() {        let dir = temp_dir("rollback_fallback");
         let cfg_path = dir.join("config.json");
         let store = Store::new_at(cfg_path.clone(), dir.join("secrets.enc")).unwrap();
         store.upsert_key(sample_key("k1", 0)).unwrap();

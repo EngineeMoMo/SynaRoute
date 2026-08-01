@@ -190,6 +190,8 @@ export interface ToolConfigPreview {
   files: ToolConfigFilePreview[];
   /** 本分类是否已接入 MCP 大脑聚合（目标配置里已含 synaroute MCP 段），与全局开关无关 */
   mcpRegistered: boolean;
+  /** 仅桌面端：接入已被其他工具（如 cc-switch 重写 _meta.json）接管时的说明；未被接管则不下发 */
+  takeoverWarning?: string;
 }
 
 /** 检查更新结构化结果（与后端 UpdateCheckResult 对齐） */
@@ -226,7 +228,16 @@ export interface EventLogEntry {
   type: "route" | "failover" | "health" | "aggregate" | "error" | "request" | "mcp" | "config";
   keyId?: string;
   detail: string;
-  trace?: RequestTrace; // request / mcp 类型带完整链路快照
+  /**
+   * 该条是否带链路快照（可展开看详情）。
+   *
+   * 列表接口**不返回 trace 正文**：日志页每 2s 全量轮询，而单条 trace 的请求/响应体各上限
+   * 20000 字符，500 条满载约 19 MB —— 每 2s 搬一次会把界面拖卡，而正文只在用户展开某行时才看。
+   * 故列表只带这个布尔位，展开时调 `api.getEventTrace(id)` 单取一条。
+   */
+  hasTrace?: boolean;
+  /** 链路快照。仅 `getEventTrace` 单取时有；列表返回的条目此字段恒为 undefined */
+  trace?: RequestTrace;
 }
 
 /** 主题偏好 */
@@ -246,7 +257,7 @@ export interface AppSettings {
   theme: ThemePref;
   language: Lang; // 界面语言（默认 zh）
   autoStart: boolean;
-  masterPasswordEnabled: boolean; // 加密增强：主口令（默认关，DPAPI 免口令）
+  masterPasswordEnabled: boolean; // 加密增强：主口令（默认关，DPAPI 免口令）。**只是 UI 镜像**——真实模式记在 secrets.enc 的 master 头部里，后端自管，走 enable/disableMasterPassword 专用命令，saveSettings 不得覆盖
   lanExposure: boolean; // 局域网暴露（默认关，NFR-007）
   requestLogEnabled: boolean; // 调用模型日志（默认关，开启后记录每次转发）
   logDownstreamRawEnabled?: boolean; // 诊断：request 日志额外记「下游原始请求体」（转换前，体量大，默认关，仅排障用）
@@ -313,4 +324,72 @@ export interface CcSwitchImportReport {
   skipped: number;
   failed: number;
   outcomes: CcSwitchImportOutcome[];
+}
+
+// ---- 配置导入 / 导出（FR-021，后端 src-tauri/src/portable.rs）----
+
+/**
+ * 导入模式（用户当场选）。
+ * - merge：同 id 覆盖、新 id 新增、本机多出的保留（不删任何东西）
+ * - replace：清空后导入，还原到导出那一刻（会删掉导出后新建的条目，故后端会先备份 config）
+ */
+export type ImportMode = "merge" | "replace";
+
+/**
+ * 导出结果。
+ *
+ * `undecryptable` 必须展示给用户：解不出的 Key 是被**跳过**而非让整次导出失败
+ * （某个 Key 的密文可能因换过 Windows 账户而失效，不该因此丢掉整份配置的导出价值）。
+ * 若不提示，用户会拿着「声称含密钥、实际少几条」的文件走，到新机器才发现。
+ */
+export interface ExportOutcome {
+  path: string;
+  /** 密钥解不出、已跳过的 Key 数（0 表示全部带上了） */
+  undecryptable: number;
+}
+
+/** 导入前的只读预检：让用户在真正写盘之前看到会发生什么 */
+export interface ImportPreview {
+  formatVersion: number;
+  /** 产出该文件的 SynaRoute 版本（仅供人看） */
+  appVersion: string;
+  exportedAt: string;
+  /** 文件里有多少条 Key */
+  keyCount: number;
+  /** 其中与本机 id 重复的（merge 会覆盖它们） */
+  conflictingKeys: number;
+  /** 本机独有、replace 模式会被删掉的 Key 数 */
+  localOnlyKeys: number;
+  vendorCount: number;
+  brainCount: number;
+  /** 文件是否含密钥段（含则导入时需要口令） */
+  hasSecrets: boolean;
+}
+
+/** 导入结果报告 */
+export interface ImportReport {
+  mode: ImportMode;
+  keysAdded: number;
+  keysOverwritten: number;
+  keysRemoved: number;
+  vendorsImported: number;
+  brainImported: number;
+  secretsImported: number;
+  /** replace 模式下导入前备份的 config 路径 */
+  backupPath?: string;
+  /** 非致命提示（如「需重新录入密钥」） */
+  warnings: string[];
+}
+
+/**
+ * 主口令增强模式的运行时状态（FR-018 可选增强）。
+ *
+ * `enabled` 的判据是**密钥库文件里有没有 master 头部**，不是 settings 里那个字段——
+ * 后者只是 UI 镜像，启动时会按库对账。
+ */
+export interface MasterPasswordState {
+  /** 是否处于主口令模式 */
+  enabled: boolean;
+  /** 是否锁着（主口令模式但本次进程还没解锁）。DPAPI 模式恒 false */
+  locked: boolean;
 }
