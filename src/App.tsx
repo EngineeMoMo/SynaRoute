@@ -7,6 +7,7 @@ import { SettingsPage } from "@/pages/SettingsPage";
 import { VendorPage } from "@/pages/VendorPage";
 import { KeyEditor } from "@/components/KeyEditor";
 import { Toast } from "@/components/Toast";
+import { UpdateBanner } from "@/components/UpdateBanner";
 import { ConfigAppliedDialog } from "@/components/ConfigAppliedDialog";
 import { useStore, applyTheme } from "@/store";
 import { isTauri } from "@/lib/bridge";
@@ -27,10 +28,10 @@ export default function App() {
     void loadSettings();
     void loadVendors();
     void loadCategory(activeCategory);
-    // 启动后静默检查更新（失败不弹窗，仅供侧栏徽章 / 设置页展示）
-    if (isTauri()) {
-      void useStore.getState().checkForUpdates({ silent: true });
-    }
+    // 启动后静默检查更新（失败不弹窗，仅供顶部横幅 / 设置页展示）。
+    // 不加 isTauri 守卫：浏览器预览下 bridge 会走 mock，正好能验证横幅布局；
+    // 真实环境走 Tauri 命令。两边都不弹窗，失败仅落进 updateCheck.error。
+    void useStore.getState().checkForUpdates({ silent: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -91,10 +92,15 @@ export default function App() {
   };
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-background text-text-primary">
-      <Sidebar active={nav} onSelect={handleNav} />
+    <div className="flex h-screen w-screen flex-col overflow-hidden bg-background text-text-primary">
+      {/* 更新横幅：整宽置顶、跨所有页面。原先只有侧栏 Logo 右上角一个小角标，不显眼。 */}
+      <UpdateBanner onOpenSettings={() => handleNav("settings")} />
 
-      <main className="flex-1 overflow-hidden">{renderMain()}</main>
+      <div className="flex min-h-0 flex-1">
+        <Sidebar active={nav} onSelect={handleNav} />
+
+        <main className="flex-1 overflow-hidden">{renderMain()}</main>
+      </div>
 
       {editorOpen && (
         <KeyEditor initial={editingKey} onClose={() => setEditorOpen(false)} />

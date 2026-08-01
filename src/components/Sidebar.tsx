@@ -12,7 +12,6 @@ import {
   Settings,
   Building2,
   Waypoints,
-  ArrowUpCircle,
   type LucideIcon,
 } from "lucide-react";
 
@@ -93,16 +92,13 @@ export function Sidebar({ active, onSelect }: SidebarProps) {
     <aside className="flex h-full w-56 shrink-0 flex-col border-r border-border bg-surface">
       {/* Logo 区 */}
       <div className="flex items-center gap-2 px-4 py-4">
-        <div className="relative flex h-8 w-8 items-center justify-center rounded-control bg-primary text-primary-foreground">
+        {/*
+          这里原先挂着一个「有新版本」角标（ArrowUpCircle）。已移除：它与 Logo 图形挤在同一个
+          32px 方块里，实测用户看不见。更新提示改由顶部整宽横幅承担（见 UpdateBanner），
+          常驻入口仍保留在下方「设置」导航项的圆点 + 版本徽章上。
+        */}
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-control bg-primary text-primary-foreground">
           <Waypoints size={18} />
-          {hasUpdate && (
-            <span
-              className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-warning text-[10px] text-white shadow"
-              title={t("settings.updateAvailable", { version: updateVer ?? "?" })}
-            >
-              <ArrowUpCircle size={12} />
-            </span>
-          )}
         </div>
         <div className="min-w-0 leading-tight">
           <div className="text-sm font-semibold text-text-primary">SynaRoute</div>
