@@ -4,6 +4,7 @@ import { CategoryPage } from "@/pages/CategoryPage";
 import { BrainPage } from "@/pages/BrainPage";
 import { LogsPage } from "@/pages/LogsPage";
 import { SettingsPage } from "@/pages/SettingsPage";
+import { AboutPage } from "@/pages/AboutPage";
 import { VendorPage } from "@/pages/VendorPage";
 import { KeyEditor } from "@/components/KeyEditor";
 import { Toast } from "@/components/Toast";
@@ -88,6 +89,7 @@ export default function App() {
     if (nav === "logs") return <LogsPage />;
     if (nav === "vendors") return <VendorPage />;
     if (nav === "settings") return <SettingsPage />;
+    if (nav === "about") return <AboutPage />;
     return <CategoryPage onAddKey={openAdd} onEditKey={openEdit} />;
   };
 

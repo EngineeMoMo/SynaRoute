@@ -39,6 +39,29 @@ const zh: Dict = {
   "nav.logs": "运行日志",
   "nav.vendors": "厂商管理",
   "nav.settings": "设置",
+  "nav.about": "关于作者",
+
+  // 关于作者页
+  "about.title": "关于作者",
+  "about.subtitle": "SynaRoute 由个人开发者维护，欢迎反馈问题与建议",
+  "about.avatarAlt": "{user} 的头像",
+  "about.authorBlurb":
+    "SynaRoute 是一个本地运行的 AI API 路由代理：多 Key 故障转移、模型映射、跨协议转换，配置与密钥都留在你自己的机器上。",
+  "about.viewProfile": "GitHub 主页",
+  "about.starRepo": "给项目点个 Star",
+  "about.contactTitle": "联系方式与地址",
+  "about.github": "GitHub",
+  "about.repo": "项目仓库",
+  "about.site": "官网",
+  "about.email": "邮箱",
+  "about.tbd": "待补充",
+  "about.copy": "复制",
+  "about.openInBrowser": "在浏览器中打开",
+  "about.issueHint":
+    "遇到问题优先提 Issue：附上「运行日志」里的相关条目与 SynaRoute 版本号，能省掉大半来回确认。",
+  "about.thanksTitle": "致谢",
+  "about.thanksBody":
+    "本项目在配置管理与托盘交互上参考了 cc-switch 的设计；协议转换与工具调用的判据来自对官方客户端的实测反查。感谢这些先行工作。",
 
   // 顶部更新横幅（原先只有侧栏 Logo 角标，太不显眼）
   "update.bannerTitle": "有新版本 v{version} 可以更新",
@@ -169,6 +192,8 @@ const zh: Dict = {
   "brain.enabled": "已启用",
   "brain.disabled": "未启用",
   "brain.subtitle": "多个模型并行解答 → 聚合 → 最终决策者产出答案，提升准确性",
+  "brain.textOnlyNotice":
+    "已支持图片与工具调用。图片：客户端调 synaroute_ai 时传 images（相对 cwd 的路径），最多 4 张、单张 5MB，仅 png/jpg/gif/webp，且参与者模型需支持图片。工具调用默认关闭，需在下方「工具调用」里开启。",
   "brain.enableTitle": "启用大脑聚合",
   "brain.enableDesc": "开启后该分类请求走聚合流程，而非普通故障转移",
   "brain.mcpConnectTitle": "接入到客户端",
@@ -199,7 +224,7 @@ const zh: Dict = {
   "brain.totalTimeout": "整轮总预算 (ms)",
   "brain.totalTimeoutHint":
     "整个聚合一轮的墙钟上限（成员 + 压缩 + 决策者共享，决策者留保底配额）。MCP 客户端超时会自动跟随此值（+余量），无需手动配。问题复杂、模型思考久，把此值调大即可。",
-  "brain.textOnlyNote": "聚合首版仅支持纯文本响应；多模态与工具调用将在后续迭代支持。",
+  "brain.textOnlyNote": "参与者只做分析、不写文件；决策者的改动需你在结果面板里确认后才落盘。",
   "brain.saveConfig": "保存聚合配置",
   "brain.noMembers": "未选择任何参与成员",
   "brain.noDecider": "未配置决策者，无法开启聚合",
@@ -231,6 +256,18 @@ const zh: Dict = {
   "brain.retrievalTitle": "启用文件知识检索",
   "brain.retrievalDesc": "从工作目录中自动检索与需求相关的文件，注入参与者和决策者的上下文",
   "brain.maxContextTokens": "检索内容 Token 上限",
+  "brain.toolsSection": "工具调用",
+  "brain.toolsTitle": "允许参与者按需检索",
+  "brain.toolsDesc":
+    "给参与者一组只读工具（读文件 / 正则搜索 / 列目录 / 查符号索引），让它自己决定看哪些文件，而不是靠前置检索猜。",
+  "brain.toolsCost":
+    "会明显增加额度消耗：每一轮工具调用都要把完整对话历史重发一次。建议先在单个分类上试。",
+  "brain.maxToolRounds": "工具调用轮数上限",
+  "brain.toolsRoundsHint": "到上限后会要求模型基于已获得的信息直接出结论，不再调用工具。",
+  "brain.toolsWorkDirHint":
+    "需要工作目录：由客户端调用时传 cwd，或在上面开启「自动跟随」/ 填写工作目录。三者都没有时本轮不提供工具（运行日志会写明原因）。",
+  "brain.toolsSafetyHint":
+    "工具只读，永不写文件、不执行命令；限制在工作目录内，且凭据类文件（.env / 密钥 / 证书）一律拒读。",
   "brain.cgTitle": "代码索引（codegraph）",
   "brain.cgDescReady": "已就绪：检索按「符号 + 调用链」精确切片，只发相关方法体而非整份文件，省 token 且更适合代码审查。",
   "brain.cgDescNotInstalled": "未安装。装上后检索可按「符号 + 调用链」精确切片（只发相关方法体而非整份文件）；不装则退化为按文件检索。",
@@ -282,6 +319,7 @@ const zh: Dict = {
   "logs.trace.requestBody": "发往上游的请求",
   "logs.trace.responseBody": "模型返回",
   "logs.trace.copy": "复制",
+  "logs.repeatHint": "连续多次同类记录已合并（日志文件里仍是逐条完整记录）",
   "logs.trace.loading": "正在加载链路详情…",
   "logs.trace.evicted": "该条的链路详情已超出内存保留窗口（仅保留最近 500 条），日志文件里仍有完整记录。",
 
@@ -492,6 +530,29 @@ const en: Dict = {
   "nav.logs": "Logs",
   "nav.vendors": "Vendors",
   "nav.settings": "Settings",
+  "nav.about": "About",
+
+  // About page
+  "about.title": "About the author",
+  "about.subtitle": "SynaRoute is maintained by an individual developer. Feedback and suggestions are welcome.",
+  "about.avatarAlt": "{user}'s avatar",
+  "about.authorBlurb":
+    "SynaRoute is a locally-run AI API routing proxy: multi-key failover, model mapping, cross-protocol translation. Your config and secrets never leave your machine.",
+  "about.viewProfile": "GitHub profile",
+  "about.starRepo": "Star the project",
+  "about.contactTitle": "Contact & links",
+  "about.github": "GitHub",
+  "about.repo": "Repository",
+  "about.site": "Website",
+  "about.email": "Email",
+  "about.tbd": "not set yet",
+  "about.copy": "Copy",
+  "about.openInBrowser": "Open in browser",
+  "about.issueHint":
+    "Prefer opening an issue: include the relevant entries from Logs plus your SynaRoute version — that saves most of the back-and-forth.",
+  "about.thanksTitle": "Acknowledgements",
+  "about.thanksBody":
+    "Config management and tray interactions draw on cc-switch's design; the protocol-translation and tool-call criteria come from reverse-engineering the official clients. Thanks to that prior work.",
 
   // Top update banner (the sidebar logo badge alone was too easy to miss)
   "update.bannerTitle": "Version {version} is available",
@@ -616,6 +677,8 @@ const en: Dict = {
   "brain.enabled": "Enabled",
   "brain.disabled": "Disabled",
   "brain.subtitle": "Multiple models answer in parallel → aggregate → decider produces the final answer for higher accuracy",
+  "brain.textOnlyNotice":
+    "Images and tool calls are supported now. Images: pass `images` (paths relative to cwd) when the client calls synaroute_ai — up to 4 files, 5MB each, png/jpg/gif/webp only, and the participant models must accept image input. Tool calls are off by default; turn them on under “Tool calls” below.",
   "brain.enableTitle": "Enable brain aggregation",
   "brain.enableDesc": "When on, requests in this category go through aggregation instead of plain failover",
   "brain.mcpConnectTitle": "Connect to client",
@@ -646,7 +709,7 @@ const en: Dict = {
   "brain.totalTimeout": "Whole-round budget (ms)",
   "brain.totalTimeoutHint":
     "Wall-clock cap for one full aggregation round (members + compression + decider share it; the decider keeps a reserved floor). The MCP client timeout auto-tracks this value (+ margin), no manual config needed. For complex problems that need longer thinking, just raise this value.",
-  "brain.textOnlyNote": "The first aggregation release supports text-only responses; multimodal and tool calls come later.",
+  "brain.textOnlyNote": "Participants only analyse — they never write files; the decider's edits land on disk only after you confirm them in the result panel.",
   "brain.saveConfig": "Save aggregation config",
   "brain.noMembers": "No members selected",
   "brain.noDecider": "No decider configured — cannot enable aggregation",
@@ -668,6 +731,18 @@ const en: Dict = {
   "brain.retrievalTitle": "Enable file retrieval",
   "brain.retrievalDesc": "Auto-search for relevant files in the working directory and inject them as context for members",
   "brain.maxContextTokens": "Max context tokens",
+  "brain.toolsSection": "Tool calls",
+  "brain.toolsTitle": "Let participants retrieve on demand",
+  "brain.toolsDesc":
+    "Give participants a read-only toolset (read file / regex search / list directory / query symbol index) so they decide which files to look at instead of relying on up-front guessing.",
+  "brain.toolsCost":
+    "Noticeably increases token spend: every tool round resends the full conversation history. Try it on one category first.",
+  "brain.maxToolRounds": "Max tool rounds",
+  "brain.toolsRoundsHint": "Once the cap is hit, the model is told to conclude from what it already has and stop calling tools.",
+  "brain.toolsWorkDirHint":
+    "Requires a working directory: either the client passes cwd, or you enable “Auto-follow” / fill in a directory above. With none of those, no tools are offered for that round (the run log says why).",
+  "brain.toolsSafetyHint":
+    "Tools are read-only — never write files, never run commands. They are confined to the working directory, and credential-like files (.env / keys / certificates) are always refused.",
   "brain.cgTitle": "Code index (codegraph)",
   "brain.cgDescReady": "Ready — retrieval slices by symbol and call chain, sending only the relevant method bodies instead of whole files. Cheaper and better suited to code review.",
   "brain.cgDescNotInstalled": "Not installed. With it, retrieval can slice by symbol and call chain (only relevant method bodies instead of whole files); without it, retrieval falls back to whole-file matching.",
@@ -729,6 +804,7 @@ const en: Dict = {
   "logs.trace.requestBody": "Request sent upstream",
   "logs.trace.responseBody": "Model response",
   "logs.trace.copy": "Copy",
+  "logs.repeatHint": "Consecutive identical entries were merged (the log file still records each one separately)",
   "logs.trace.loading": "Loading trace…",
   "logs.trace.evicted": "This entry's trace is no longer in the in-memory window (last 500 events only); the log file still has the full record.",
 

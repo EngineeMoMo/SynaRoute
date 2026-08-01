@@ -11,11 +11,12 @@ import {
   ScrollText,
   Settings,
   Building2,
+  UserRound,
   Waypoints,
   type LucideIcon,
 } from "lucide-react";
 
-export type NavKey = CategoryType | "brain" | "logs" | "vendors" | "settings";
+export type NavKey = CategoryType | "brain" | "logs" | "vendors" | "settings" | "about";
 
 interface NavItem {
   key: NavKey;
@@ -32,6 +33,7 @@ const NAV: NavItem[] = [
   { key: "logs", tKey: "nav.logs", icon: ScrollText, group: "feature" },
   { key: "vendors", tKey: "nav.vendors", icon: Building2, group: "system" },
   { key: "settings", tKey: "nav.settings", icon: Settings, group: "system" },
+  { key: "about", tKey: "nav.about", icon: UserRound, group: "system" },
 ];
 
 interface SidebarProps {
