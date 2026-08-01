@@ -1,8 +1,18 @@
 //! 密钥加密存储（FR-018 / NFR-006）
 //!
-//! 当前仅实现 Windows DPAPI 免口令加密（绑定当前用户账户）。
-//! 主口令增强模式 UI 标注「开发中」且从未接线，相关解锁/派生代码已移除，避免死代码。
-//! vault 仍保留 master_mode/salt 字段以兼容旧 secrets 文件反序列化。
+//! 两种保护模式，同一时刻只有一种生效：
+//!
+//! | 模式 | 密钥来源 | 换机可用 | 需要输口令 |
+//! |---|---|---|---|
+//! | **DPAPI**（默认） | Windows `CryptProtectData`，绑当前用户账户 | ❌ 解不出 | 否 |
+//! | **主口令**（FR-018 可选增强） | Argon2id 从用户口令派生（[`crate::crypto`]） | ✅ | 每次启动解锁一次 |
+//!
+//! 模式记录在密钥库文件自身（`master` 字段在即为主口令模式），**它是唯一事实来源**；
+//! `settings.master_password_enabled` 只是给 UI 看的镜像，启动时按库对账。
+//! 反过来（以 settings 为准）会出现「配置说开着、库里其实是 DPAPI 密文」这种解不开的死局。
+//!
+//! 两模式的密文分开存（`entries` / `boxes`），不共用一个 map：格式不同，混在一起一旦
+//! 迁移中断就无法判断某条到底是哪种密文，只能靠猜。分开存则「哪个 map 里有」即答案。
 //!
 //! 密钥单独存于 secrets 加密文件，绝不随 ProviderKey 经 IPC 下发前端。
 
@@ -11,10 +21,19 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// 主口令模式的库头部：KDF 参数 + 盐 + 校验串。存在即表示当前是主口令模式。
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct MasterHeader {
+    /// KDF 参数与盐（解锁时据此派生库密钥）
+    kdf: crate::crypto::KdfHeader,
+    /// 口令校验串：库里没有任何密钥时也能判断口令对不对（见 `crypto::make_verifier`）
+    verifier: crate::crypto::SealedBox,
+}
+
 /// 加密后的密钥库文件结构（落盘为 JSON）
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct SecretVault {
-    /// keyId -> base64(密文)
+    /// **DPAPI 模式**的密文：keyId -> base64(DPAPI 密文)
     entries: HashMap<String, String>,
     /// 历史主口令模式标记（当前运行时忽略，仅兼容旧文件）
     #[serde(default)]
@@ -22,6 +41,22 @@ struct SecretVault {
     /// 历史主口令盐（当前运行时忽略，仅兼容旧文件）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     salt: Option<String>,
+    /// 主口令模式的库头部。**存在即为主口令模式。**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    master: Option<MasterHeader>,
+    /// **主口令模式**的密文：keyId -> 口令派生密钥加密的盒子
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    boxes: HashMap<String, crate::crypto::SealedBox>,
+}
+
+/// 主口令模式的运行时状态，供 UI 展示与解锁引导。
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterPasswordState {
+    /// 是否处于主口令模式（判据是密钥库里有 `master` 头部，不看 settings）
+    pub enabled: bool,
+    /// 是否已锁定（主口令模式但本次进程还没解锁）。DPAPI 模式恒 `false`
+    pub locked: bool,
 }
 
 pub struct SecretStore {
@@ -31,6 +66,9 @@ pub struct SecretStore {
     /// 否则「空库 + 用户新存的一条」整份覆盖会销毁其余全部密文（与 config 的 init
     /// fallback 覆盖同类风险）。备份失败则拒绝写入。
     load_failed: bool,
+    /// 解锁后常驻的库密钥（仅主口令模式）。`None` = DPAPI 模式，或主口令模式但未解锁。
+    /// 进程退出即消失，故每次启动都要重新解锁。
+    vault_key: Option<crate::crypto::VaultKey>,
 }
 
 impl SecretStore {
@@ -56,18 +94,103 @@ impl SecretStore {
         } else {
             (SecretVault::default(), false)
         };
-        Ok(Self { path, vault, load_failed })
+        Ok(Self { path, vault, load_failed, vault_key: None })
     }
 
-    /// 保存一条密钥（加密）
+    // ---- 主口令模式：状态与解锁 ----
+
+    /// 当前是否为主口令模式。**判据是密钥库文件本身**（有 `master` 头部），不看 settings。
+    pub fn is_master_mode(&self) -> bool {
+        self.vault.master.is_some()
+    }
+
+    /// 主口令模式但本次进程尚未解锁 → 取不到任何密钥。
+    pub fn is_locked(&self) -> bool {
+        self.is_master_mode() && self.vault_key.is_none()
+    }
+
+    pub fn master_state(&self) -> MasterPasswordState {
+        MasterPasswordState { enabled: self.is_master_mode(), locked: self.is_locked() }
+    }
+
+    /// 用口令解锁。口令错则**不改变**已解锁状态（避免「输错一次把已解锁的库锁回去」）。
+    pub fn unlock(&mut self, password: &str) -> AppResult<()> {
+        let Some(hdr) = self.vault.master.clone() else {
+            return Err(AppError::Invalid(
+                "当前不是主口令模式，无需解锁（密钥由 Windows 账户保护）".into(),
+            ));
+        };
+        let key = crate::crypto::derive_vault_key(password, &hdr.kdf)?;
+        if !crate::crypto::check_verifier(&key, &hdr.verifier) {
+            return Err(AppError::Invalid(
+                "主口令错误。请确认后重试（口令区分大小写）。".into(),
+            ));
+        }
+        self.vault_key = Some(key);
+        Ok(())
+    }
+
+    /// 主动上锁（清掉常驻密钥）。用于「立即锁定」这类显式操作。
+    pub fn lock(&mut self) {
+        self.vault_key = None;
+    }
+
+    /// 取当前可用的库密钥，未解锁时给出可行动的错误（而非静默返回「无密钥」）。
+    ///
+    /// 这条错误信息会一路冒泡到代理转发的失败原因里 —— 必须让用户看懂是「要解锁」，
+    /// 而不是以为 Key 配错了去反复检查密钥。
+    fn require_vault_key(&self) -> AppResult<&crate::crypto::VaultKey> {
+        self.vault_key.as_ref().ok_or_else(|| {
+            AppError::Invalid(
+                "密钥库已用主口令加密但尚未解锁：请打开 SynaRoute 主窗口输入主口令解锁后重试。"
+                    .into(),
+            )
+        })
+    }
+
+    /// 保存一条密钥（按当前模式加密）。
+    ///
+    /// 主口令模式下未解锁则**拒绝写入**——不能退回 DPAPI 加密，否则库里会同时存在两种密文，
+    /// 而用户以为已经全部由口令保护。
+    ///
+    /// 两个分支都清掉**另一个 map 里的同 id 残留**：`get` 按当前模式单边读，若另一边留着
+    /// 旧密文，切模式后会读出**过期的密钥**（用户改过密钥、切回原模式却拿到改之前那条），
+    /// 表现为「明明更新过密钥却仍报鉴权失败」。
     pub fn set(&mut self, key_id: &str, secret: &str) -> AppResult<()> {
-        let cipher = dpapi_encrypt(secret.as_bytes())?;
-        self.vault.entries.insert(key_id.to_string(), STANDARD.encode(cipher));
+        if self.is_master_mode() {
+            let boxed = {
+                let key = self.require_vault_key()?;
+                crate::crypto::seal_with_key(key, secret.as_bytes())?
+            };
+            self.vault.boxes.insert(key_id.to_string(), boxed);
+            self.vault.entries.remove(key_id);
+        } else {
+            let cipher = dpapi_encrypt(secret.as_bytes())?;
+            self.vault.entries.insert(key_id.to_string(), STANDARD.encode(cipher));
+            // 对称清理：DPAPI 模式下也要清掉 boxes 里的同 id（关闭主口令后新存的密钥，
+            // 若 boxes 残留旧条目，将来再启用主口令时 all_key_ids 会读到那条过期密文）。
+            self.vault.boxes.remove(key_id);
+        }
         self.persist()
     }
 
-    /// 读取一条明文密钥（仅在代理转发时后端内部使用，绝不返回前端）
+    /// 读取一条明文密钥（仅在代理转发时后端内部使用，绝不返回前端）。
+    ///
+    /// 主口令模式下未解锁 → 返回 `Err`（而非 `Ok(None)`）。这个区分很重要：
+    /// `Ok(None)` 的调用方会当成「这个 Key 没配密钥」，让用户去查配置；
+    /// `Err` 才能把「需要解锁」这条可行动的信息带到 UI 与转发失败原因里。
     pub fn get(&self, key_id: &str) -> AppResult<Option<String>> {
+        if self.is_master_mode() {
+            let Some(boxed) = self.vault.boxes.get(key_id) else {
+                // 库里没这条：先判是否锁着——锁着时「没这条」的结论本身不可信
+                // （可能只是还没解锁看不到，虽然本实现下 boxes 键名不加密，但保持语义一致）。
+                self.require_vault_key()?;
+                return Ok(None);
+            };
+            let key = self.require_vault_key()?;
+            let plain = crate::crypto::open_with_key(key, boxed)?;
+            return Ok(Some(String::from_utf8_lossy(&plain).to_string()));
+        }
         let Some(b64) = self.vault.entries.get(key_id) else {
             return Ok(None);
         };
@@ -77,8 +200,235 @@ impl SecretStore {
     }
 
     pub fn remove(&mut self, key_id: &str) -> AppResult<()> {
+        // 两个 map 都删：模式切换过程中断时同 id 可能两处都有，只删一个会留下能被
+        // 反向模式读出的残留密文。
         self.vault.entries.remove(key_id);
+        self.vault.boxes.remove(key_id);
         self.persist()
+    }
+
+    /// 库里现有的全部 keyId（不解密，仅用于迁移与对账）。
+    ///
+    /// **两个 map 取并集**，而不是按当前模式单边读。理由是迁移的安全性不能依赖「另一边一定是空的」
+    /// 这个假设：`enable_master_password` 用它决定「要迁移哪些密钥」，若此刻 `boxes` 里还残留
+    /// 上一次迁移中断留下的条目，单边读会把它们**静默漏掉**——迁移完成后那些 Key 的密钥就再也
+    /// 读不出来了（`get` 只认当前模式那一边，而残留条目用的是另一套密钥）。
+    ///
+    /// 取并集则最坏情况是「多试解一条、失败即整体放弃」，不会丢数据。`set`/`remove` 已做双边
+    /// 清理，正常路径下另一边本就是空的；这里是兜住异常路径。
+    fn all_key_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.vault.boxes.keys().cloned().collect();
+        for id in self.vault.entries.keys() {
+            if !ids.iter().any(|x| x == id) {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+
+    // ---- 主口令模式：启用 / 关闭（整库迁移）----
+
+    /// 启用主口令模式：把库里**全部** DPAPI 密文解出来，改用口令派生密钥重新封装。
+    ///
+    /// 三条硬要求，任一不满足都会造成密钥永久丢失：
+    ///
+    /// 1. **先全部解密成功再写盘**。若边解边写，中途某条 DPAPI 解密失败（密文损坏 /
+    ///    账户变更）就会留下「一半口令密文、一半 DPAPI 密文」的半迁移库，而
+    ///    `is_master_mode()` 已经为真 → 剩下那半永远读不出来。
+    /// 2. **落盘前备份原库**。这是唯一一次「整份重写全部密文」的操作，写坏就全没了。
+    /// 3. **落盘失败要回滚内存**，否则内存已是口令模式、磁盘还是 DPAPI，
+    ///    此后每次 set 都按口令模式写，与磁盘上的 DPAPI 密文混成一团。
+    pub fn enable_master_password(&mut self, password: &str) -> AppResult<usize> {
+        if self.is_master_mode() {
+            return Err(AppError::Invalid("已处于主口令模式，无需重复启用".into()));
+        }
+        if password.is_empty() {
+            return Err(AppError::Invalid("主口令不能为空".into()));
+        }
+        if self.load_failed {
+            // 降级态下 entries 是空的（读盘失败），此时迁移等于「把用户的密钥全丢掉再
+            // 声称已加密」。必须拒绝，让用户先解决读盘问题。
+            return Err(AppError::Invalid(
+                "密钥库当前处于降级态（本次启动读取失败），为避免丢失既有密钥，已拒绝切换加密模式。\
+                 请重启 SynaRoute 确认密钥可正常读取后再试。"
+                    .into(),
+            ));
+        }
+
+        // 第 1 步：全部解密到内存（任一失败即整体放弃，不动磁盘）。
+        let ids = self.all_key_ids();
+        let mut plain: Vec<(String, String)> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            match self.get(id) {
+                Ok(Some(s)) => plain.push((id.clone(), s)),
+                // `Ok(None)` 在这里**不是**「这条没有密钥」，而是「它只存在于另一个 map 里」——
+                // `all_key_ids` 取的是两个 map 的并集，而 `get` 按当前模式单边读。
+                //
+                // 必须当错误中止：继续走下去会在第 3 步 `std::mem::take` 时把那条密文
+                // **静默丢弃**（新 vault 只装 `boxes`），用户永久失去该密钥且毫无提示。
+                // 这属于「上一次迁移中断」的残留态，该让用户先处理，而不是替他做减法。
+                Ok(None) => {
+                    return Err(AppError::Crypto(format!(
+                        "启用主口令失败：密钥「{id}」以另一种加密形态残留在库里（通常是上一次切换\
+                         加密模式时中断所致），当前模式读不出它。为避免静默丢弃该密钥，已放弃切换、\
+                         密钥库未被修改。\n\n\
+                         处理方式：在界面上为该 Key 重新录入一次密钥（会覆盖残留密文），再试。"
+                    )))
+                }
+                Err(e) => {
+                    return Err(AppError::Crypto(format!(
+                        "启用主口令失败：现有密钥「{id}」解密不出来（{e}），已放弃切换，密钥库未被修改。"
+                    )))
+                }
+            }
+        }
+
+        // 第 2 步：备份原库（唯一一次整份重写，必须可回退）。
+        self.backup_before_rewrite("master-on")?;
+
+        // 第 3 步：构造新头部与新密文，全部成功后才替换内存态。
+        let hdr = crate::crypto::KdfHeader::new_random();
+        let vault_key = crate::crypto::derive_vault_key(password, &hdr)?;
+        let verifier = crate::crypto::make_verifier(&vault_key)?;
+        let mut boxes = HashMap::with_capacity(plain.len());
+        for (id, s) in &plain {
+            boxes.insert(id.clone(), crate::crypto::seal_with_key(&vault_key, s.as_bytes())?);
+        }
+
+        let prev = std::mem::take(&mut self.vault);
+        self.vault.master = Some(MasterHeader { kdf: hdr, verifier });
+        self.vault.boxes = boxes;
+        self.vault.entries.clear();
+        self.vault_key = Some(vault_key);
+        if let Err(e) = self.persist() {
+            // 回滚内存，保持「内存态不领先磁盘」（与 store.rs 的 mutate_and_persist 同原则）。
+            self.vault = prev;
+            self.vault_key = None;
+            return Err(e);
+        }
+        Ok(plain.len())
+    }
+
+    /// 关闭主口令模式：用口令解出全部密钥，改回 DPAPI 加密。
+    ///
+    /// 要求已解锁（或当场用给定口令解锁）——否则解不出任何密钥，关闭等于清空密钥库。
+    pub fn disable_master_password(&mut self, password: &str) -> AppResult<usize> {
+        if !self.is_master_mode() {
+            return Err(AppError::Invalid("当前不是主口令模式，无需关闭".into()));
+        }
+        // 无论此前是否已解锁，都用本次输入的口令校验一遍：关闭是不可逆操作，
+        // 必须确认操作者知道口令（防止有人趁已解锁的机器直接关掉保护）。
+        self.unlock(password)?;
+
+        let ids = self.all_key_ids();
+        let mut plain: Vec<(String, String)> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            match self.get(id) {
+                Ok(Some(s)) => plain.push((id.clone(), s)),
+                // 同 enable_master_password：`Ok(None)` 意味着该条只存在于另一个 map（中断残留），
+                // 放行会让它在整份重写时被静默丢弃。
+                Ok(None) => {
+                    return Err(AppError::Crypto(format!(
+                        "关闭主口令失败：密钥「{id}」以另一种加密形态残留在库里（通常是上一次切换\
+                         加密模式时中断所致），当前模式读不出它。为避免静默丢弃该密钥，已放弃切换、\
+                         密钥库未被修改。\n\n\
+                         处理方式：在界面上为该 Key 重新录入一次密钥（会覆盖残留密文），再试。"
+                    )))
+                }
+                Err(e) => {
+                    return Err(AppError::Crypto(format!(
+                        "关闭主口令失败：密钥「{id}」解密不出来（{e}），已放弃切换，密钥库未被修改。"
+                    )))
+                }
+            }
+        }
+
+        self.backup_before_rewrite("master-off")?;
+
+        let mut entries = HashMap::with_capacity(plain.len());
+        for (id, s) in &plain {
+            entries.insert(id.clone(), STANDARD.encode(dpapi_encrypt(s.as_bytes())?));
+        }
+
+        let prev = std::mem::take(&mut self.vault);
+        let prev_key = self.vault_key.take();
+        self.vault.entries = entries;
+        self.vault.master = None;
+        self.vault.boxes.clear();
+        if let Err(e) = self.persist() {
+            self.vault = prev;
+            self.vault_key = prev_key;
+            return Err(e);
+        }
+        Ok(plain.len())
+    }
+
+    /// 修改主口令：用旧口令解出全部密钥，用新口令重新封装（含新盐、新校验串）。
+    pub fn change_master_password(&mut self, old: &str, new: &str) -> AppResult<usize> {
+        if !self.is_master_mode() {
+            return Err(AppError::Invalid("当前不是主口令模式，无法修改主口令".into()));
+        }
+        if new.is_empty() {
+            return Err(AppError::Invalid("新主口令不能为空".into()));
+        }
+        self.unlock(old)?;
+
+        let ids = self.all_key_ids();
+        let mut plain: Vec<(String, String)> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            match self.get(id)? {
+                Some(s) => plain.push((id.clone(), s)),
+                // 与另两个迁移函数同口径：`None` 意味着该条只存在于另一个 map（中断残留），
+                // 放行会让它在整份重写时被静默丢弃。改口令同样是整份重写。
+                None => {
+                    return Err(AppError::Crypto(format!(
+                        "修改主口令失败：密钥「{id}」以另一种加密形态残留在库里（通常是上一次切换\
+                         加密模式时中断所致），当前模式读不出它。为避免静默丢弃该密钥，已放弃修改、\
+                         密钥库未被修改。\n\n\
+                         处理方式：在界面上为该 Key 重新录入一次密钥（会覆盖残留密文），再试。"
+                    )))
+                }
+            }
+        }
+
+        self.backup_before_rewrite("master-change")?;
+
+        let hdr = crate::crypto::KdfHeader::new_random();
+        let vault_key = crate::crypto::derive_vault_key(new, &hdr)?;
+        let verifier = crate::crypto::make_verifier(&vault_key)?;
+        let mut boxes = HashMap::with_capacity(plain.len());
+        for (id, s) in &plain {
+            boxes.insert(id.clone(), crate::crypto::seal_with_key(&vault_key, s.as_bytes())?);
+        }
+
+        let prev = std::mem::take(&mut self.vault);
+        let prev_key = self.vault_key.take();
+        self.vault.master = Some(MasterHeader { kdf: hdr, verifier });
+        self.vault.boxes = boxes;
+        if let Err(e) = self.persist() {
+            self.vault = prev;
+            self.vault_key = prev_key;
+            return Err(e);
+        }
+        self.vault_key = Some(vault_key);
+        Ok(plain.len())
+    }
+
+    /// 整份重写前的备份（带用途标签与时间戳，可回滚 —— dev-hard-rules）。
+    /// 文件不存在时不算失败（首次启用、库还没落过盘）。
+    fn backup_before_rewrite(&self, tag: &str) -> AppResult<()> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        let bak = self.path.with_extension(format!("enc.{tag}-{ts}"));
+        std::fs::copy(&self.path, &bak).map_err(|e| {
+            AppError::Other(format!(
+                "切换密钥加密模式前备份密钥库失败，已放弃操作（避免整份重写写坏后无从恢复）: {e}"
+            ))
+        })?;
+        tracing::info!("切换密钥加密模式前已备份密钥库到 {bak:?}");
+        Ok(())
     }
 
     fn persist(&mut self) -> AppResult<()> {
@@ -357,6 +707,356 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().contains("corrupt"));
         assert!(!has_bak, "正常路径不应产生 corrupt 备份");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- 主口令增强模式（FR-018 可选增强）----
+
+    /// 启用主口令：既有 DPAPI 密钥必须全部迁移过去、仍能读出原值，且落盘后重开也能解锁读到。
+    #[test]
+    fn enabling_master_password_migrates_existing_secrets_and_survives_reload() {
+        let dir = temp_dir("master_on");
+        let path = dir.join("secrets.enc");
+        let mut store = SecretStore::load(path.clone()).unwrap();
+        store.set("k1", "sk-one").unwrap();
+        store.set("k2", "sk-two").unwrap();
+        assert!(!store.is_master_mode(), "默认必须是 DPAPI 模式");
+
+        let migrated = store.enable_master_password("correct horse battery").unwrap();
+        assert_eq!(migrated, 2, "两条既有密钥都要迁移，漏一条就是永久丢失");
+        assert!(store.is_master_mode());
+        assert!(!store.is_locked(), "启用后应处于已解锁态（刚输过口令）");
+        assert_eq!(store.get("k1").unwrap().as_deref(), Some("sk-one"));
+        assert_eq!(store.get("k2").unwrap().as_deref(), Some("sk-two"));
+
+        // 落盘内容检查：不得残留 DPAPI 密文，否则关闭模式时会两处都有、读到哪条看分支顺序。
+        let v: SecretVault = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(v.entries.is_empty(), "迁移后不得残留 DPAPI 密文");
+        assert_eq!(v.boxes.len(), 2);
+        assert!(v.master.is_some(), "master 头部是模式的事实来源，必须落盘");
+
+        // 重开进程：应识别为主口令模式且处于锁定态，解锁后才读得到。
+        let mut reopened = SecretStore::load(path.clone()).unwrap();
+        assert!(reopened.is_master_mode());
+        assert!(reopened.is_locked(), "新进程必须重新解锁");
+        assert!(reopened.get("k1").is_err(), "锁定态取密钥必须报错而非返回 None");
+        reopened.unlock("correct horse battery").unwrap();
+        assert_eq!(reopened.get("k1").unwrap().as_deref(), Some("sk-one"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 锁定态读密钥必须返回 **Err** 而不是 `Ok(None)`。
+    ///
+    /// 这个区分是整个模式最容易写错、后果最隐蔽的一处：`Ok(None)` 会让调用方（转发、
+    /// has_secret 对账、导出）都当成「这个 Key 没配密钥」，于是提示用户去重录密钥，
+    /// 而实际只是没解锁。has_secret 对账更糟——会把全部标记刷成 false 写盘。
+    #[test]
+    fn locked_vault_returns_error_not_absent() {
+        let dir = temp_dir("master_locked");
+        let path = dir.join("secrets.enc");
+        let mut store = SecretStore::load(path.clone()).unwrap();
+        store.set("k1", "sk-x").unwrap();
+        store.enable_master_password("pw").unwrap();
+        drop(store);
+
+        let store = SecretStore::load(path).unwrap();
+        let err = store.get("k1").unwrap_err().to_string();
+        assert!(err.contains("解锁"), "错误必须告诉用户去解锁，而不是含糊的失败: {err}");
+        // 连「库里根本没有的 id」也报错：锁定态下「没有」这个结论本身不可信。
+        assert!(store.get("nonexistent").is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 锁定态写密钥必须被拒绝，不得偷偷回退成 DPAPI 加密。
+    /// 否则库里同时存在两种密文，而用户以为已全部由口令保护。
+    #[test]
+    fn locked_vault_refuses_writes_instead_of_falling_back_to_dpapi() {
+        let dir = temp_dir("master_locked_write");
+        let path = dir.join("secrets.enc");
+        let mut store = SecretStore::load(path.clone()).unwrap();
+        store.enable_master_password("pw").unwrap();
+        drop(store);
+
+        let mut store = SecretStore::load(path.clone()).unwrap();
+        assert!(store.set("k_new", "sk-new").is_err(), "锁定态不得写入");
+        // 磁盘上不应出现 DPAPI 密文
+        let v: SecretVault = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(v.entries.is_empty(), "绝不能回退成 DPAPI 加密（会造出两种密文并存）");
+        assert!(v.boxes.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 错误口令解锁：必须失败，且**不得**把已解锁状态锁回去。
+    #[test]
+    fn wrong_password_fails_unlock_without_clobbering_unlocked_state() {
+        let dir = temp_dir("master_wrong_pw");
+        let path = dir.join("secrets.enc");
+        let mut store = SecretStore::load(path).unwrap();
+        store.set("k1", "sk-x").unwrap();
+        store.enable_master_password("right-pw").unwrap();
+        assert!(!store.is_locked());
+
+        let err = store.unlock("wrong-pw").unwrap_err().to_string();
+        assert!(err.contains("主口令错误"), "{err}");
+        assert!(!store.is_locked(), "输错口令不该把已解锁的库锁回去");
+        assert_eq!(store.get("k1").unwrap().as_deref(), Some("sk-x"), "仍应可读");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 空库也能正确判定口令对错 —— 这是校验串（verifier）存在的唯一理由。
+    /// 没有它就只能「试解某条密钥」，而空库无从试，会把错口令当成解锁成功。
+    #[test]
+    fn empty_vault_still_validates_password_via_verifier() {
+        let dir = temp_dir("master_empty");
+        let path = dir.join("secrets.enc");
+        let mut store = SecretStore::load(path.clone()).unwrap();
+        assert_eq!(store.enable_master_password("pw-empty").unwrap(), 0, "空库迁移 0 条");
+        drop(store);
+
+        let mut store = SecretStore::load(path).unwrap();
+        assert!(store.unlock("not-it").is_err(), "空库也必须能识别错口令");
+        assert!(store.unlock("pw-empty").is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 关闭主口令：全部密钥改回 DPAPI，且必须输对当前口令才能关。
+    #[test]
+    fn disabling_master_password_requires_password_and_migrates_back() {
+        let dir = temp_dir("master_off");
+        let path = dir.join("secrets.enc");
+        let mut store = SecretStore::load(path.clone()).unwrap();
+        store.set("k1", "sk-one").unwrap();
+        store.enable_master_password("pw").unwrap();
+
+        // 错口令不得关闭（防止有人趁已解锁的机器直接撤掉保护）。
+        assert!(store.disable_master_password("wrong").is_err());
+        assert!(store.is_master_mode(), "关闭失败后模式不变");
+
+        assert_eq!(store.disable_master_password("pw").unwrap(), 1);
+        assert!(!store.is_master_mode());
+        assert!(!store.is_locked(), "DPAPI 模式恒非锁定");
+        assert_eq!(store.get("k1").unwrap().as_deref(), Some("sk-one"), "密钥必须完好");
+
+        let v: SecretVault = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(v.master.is_none() && v.boxes.is_empty(), "口令模式的痕迹要清干净");
+        assert_eq!(v.entries.len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 修改主口令：旧口令验证 + 换新盐重新封装；旧口令随即失效、新口令可用。
+    #[test]
+    fn changing_master_password_rotates_salt_and_invalidates_old() {
+        let dir = temp_dir("master_change");
+        let path = dir.join("secrets.enc");
+        let mut store = SecretStore::load(path.clone()).unwrap();
+        store.set("k1", "sk-one").unwrap();
+        store.enable_master_password("old-pw").unwrap();
+        let old_salt = {
+            let v: SecretVault = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            v.master.unwrap().kdf.salt
+        };
+
+        assert!(store.change_master_password("wrong", "new-pw").is_err(), "旧口令要验");
+        assert_eq!(store.change_master_password("old-pw", "new-pw").unwrap(), 1);
+
+        let new_salt = {
+            let v: SecretVault = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            v.master.unwrap().kdf.salt
+        };
+        assert_ne!(old_salt, new_salt, "换口令必须换盐，否则新旧密钥可比对");
+
+        let mut reopened = SecretStore::load(path).unwrap();
+        assert!(reopened.unlock("old-pw").is_err(), "旧口令必须立即失效");
+        reopened.unlock("new-pw").unwrap();
+        assert_eq!(reopened.get("k1").unwrap().as_deref(), Some("sk-one"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 整份重写前必须留备份（唯一一次全量重写密文的操作，写坏就全没了）。
+    #[test]
+    fn mode_switch_backs_up_vault_before_rewriting() {
+        let dir = temp_dir("master_backup");
+        let path = dir.join("secrets.enc");
+        let mut store = SecretStore::load(path.clone()).unwrap();
+        store.set("k1", "sk-one").unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        store.enable_master_password("pw").unwrap();
+
+        let bak = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().contains("master-on-"))
+            .expect("启用主口令前必须备份密钥库");
+        assert_eq!(std::fs::read(bak.path()).unwrap(), before, "备份必须是切换前的原字节");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 降级态（本次启动读盘失败）下禁止切换模式：
+    /// 那时 entries 是空的，迁移等于「把用户全部密钥丢掉，还声称已加密」。
+    #[test]
+    fn degraded_vault_refuses_mode_switch() {
+        let dir = temp_dir("master_degraded");
+        let path = dir.join("secrets.enc");
+        std::fs::write(&path, b"{ corrupted but holds user ciphertexts }").unwrap();
+
+        let mut store = SecretStore::load(path).unwrap();
+        assert!(store.load_failed, "前置条件：应处于降级态");
+        let err = store.enable_master_password("pw").unwrap_err().to_string();
+        assert!(err.contains("降级"), "要说清原因并给出行动指引: {err}");
+        assert!(!store.is_master_mode(), "拒绝后模式不变");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 重复启用要报错而不是重新生成盐 —— 后者会让旧密文全部解不开。
+    #[test]
+    fn enabling_twice_is_rejected() {
+        let dir = temp_dir("master_twice");
+        let mut store = SecretStore::load(dir.join("secrets.enc")).unwrap();
+        store.enable_master_password("pw").unwrap();
+        assert!(store.enable_master_password("pw2").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 非主口令模式下调解锁/关闭/改口令都应给出明确错误，而不是静默成功。
+    #[test]
+    fn master_operations_rejected_in_dpapi_mode() {
+        let dir = temp_dir("master_dpapi_ops");
+        let mut store = SecretStore::load(dir.join("secrets.enc")).unwrap();
+        assert!(store.unlock("pw").is_err());
+        assert!(store.disable_master_password("pw").is_err());
+        assert!(store.change_master_password("a", "b").is_err());
+        assert!(store.enable_master_password("").is_err(), "空口令等于没加密");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 手动上锁后立刻不可读，再解锁恢复。用于「离开电脑前锁定」。
+    #[test]
+    fn manual_lock_takes_effect_immediately() {
+        let dir = temp_dir("master_manual_lock");
+        let mut store = SecretStore::load(dir.join("secrets.enc")).unwrap();
+        store.set("k1", "sk-x").unwrap();
+        store.enable_master_password("pw").unwrap();
+        assert!(store.get("k1").is_ok());
+
+        store.lock();
+        assert!(store.is_locked());
+        assert!(store.get("k1").is_err());
+
+        store.unlock("pw").unwrap();
+        assert_eq!(store.get("k1").unwrap().as_deref(), Some("sk-x"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 删除 Key 时两种密文都要清 —— 模式切换中断时同 id 可能两处都有，
+    /// 只删一个会留下能被反向模式读出的残留。
+    #[test]
+    fn remove_clears_both_cipher_maps() {
+        let dir = temp_dir("master_remove");
+        let path = dir.join("secrets.enc");
+        let mut store = SecretStore::load(path.clone()).unwrap();
+        store.set("k1", "sk-x").unwrap();
+        store.enable_master_password("pw").unwrap();
+        // 人为造出「两处都有」的中断态
+        store.vault.entries.insert("k1".into(), "stale-dpapi".into());
+        store.remove("k1").unwrap();
+
+        let v: SecretVault = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(v.entries.is_empty() && v.boxes.is_empty(), "两个 map 都要清");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `set` 必须清掉**另一个 map** 里的同 id 残留（双向）。
+    ///
+    /// 不清的后果不是「多占空间」，而是**读出过期密钥**：`get` 按当前模式单边读，切模式后会
+    /// 拿到残留的那条旧密文 —— 用户明明更新过密钥，转发却仍用改之前那条、继续报鉴权失败，
+    /// 且从 UI 上完全看不出原因。
+    #[test]
+    fn set_clears_stale_cipher_in_the_other_map_both_directions() {
+        let dir = temp_dir("set_cross_clear");
+        let path = dir.join("secrets.enc");
+        let mut store = SecretStore::load(path.clone()).unwrap();
+
+        // 方向一：主口令模式下写入，应清掉 entries 里的 DPAPI 残留。
+        store.enable_master_password("pw").unwrap();
+        store.vault.entries.insert("k1".into(), "stale-dpapi".into());
+        store.set("k1", "sk-new").unwrap();
+        assert!(
+            !store.vault.entries.contains_key("k1"),
+            "主口令模式写入后不得留 DPAPI 残留"
+        );
+        assert_eq!(store.get("k1").unwrap().as_deref(), Some("sk-new"));
+
+        // 方向二：关回 DPAPI 模式后写入，应清掉 boxes 里的口令密文残留。
+        store.disable_master_password("pw").unwrap();
+        // 造残留：直接塞一条 boxes（模拟上一次迁移中断留下的条目）
+        store.vault.boxes.insert(
+            "k1".into(),
+            crate::crypto::SealedBox { nonce: "AAAA".into(), ct: "BBBB".into() },
+        );
+        store.set("k1", "sk-dpapi").unwrap();
+        assert!(
+            !store.vault.boxes.contains_key("k1"),
+            "DPAPI 模式写入后不得留口令密文残留（否则再启用主口令会迁移到过期密钥）"
+        );
+        assert_eq!(store.get("k1").unwrap().as_deref(), Some("sk-dpapi"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 迁移必须覆盖**两个 map 的并集**，不能按当前模式单边读。
+    ///
+    /// 场景：上一次迁移中断，库里同时有 DPAPI 密文与口令密文（不同 id）。此时启用主口令，
+    /// 若 `all_key_ids` 只读 `entries`，`boxes` 里那条会被静默漏掉 —— 迁移完成后它用的还是
+    /// 上一把口令派生的密钥，新口令解不开、DPAPI 也解不开，**永久丢失且无任何提示**。
+    ///
+    /// 取并集后最坏情况是「多试解一条、失败即整体放弃」，不会丢数据。
+    #[test]
+    fn migration_covers_union_of_both_maps_not_just_current_mode() {
+        let dir = temp_dir("union_ids");
+        let path = dir.join("secrets.enc");
+        let mut store = SecretStore::load(path.clone()).unwrap();
+
+        // 先在 DPAPI 模式存一条，再人为塞一条**上一把口令**加密的 boxes 条目（中断态）。
+        store.set("dpapi-one", "sk-dpapi").unwrap();
+        let old_hdr = crate::crypto::KdfHeader::new_random();
+        let old_key = crate::crypto::derive_vault_key("old-pw", &old_hdr).unwrap();
+        store.vault.boxes.insert(
+            "orphan-boxed".into(),
+            crate::crypto::seal_with_key(&old_key, b"sk-orphan").unwrap(),
+        );
+
+        // all_key_ids 必须同时看到两条（这是并集的直接断言）。
+        let ids = store.all_key_ids();
+        assert!(ids.iter().any(|x| x == "dpapi-one"), "{ids:?}");
+        assert!(
+            ids.iter().any(|x| x == "orphan-boxed"),
+            "另一个 map 里的条目不得被漏掉: {ids:?}"
+        );
+
+        // 启用主口令：那条孤儿用旧口令加密、当前模式（DPAPI）解不出 → 必须**整体放弃**并保持
+        // 密钥库原样，而不是「跳过它、迁移剩下的」（后者等于静默丢弃）。
+        let err = store.enable_master_password("new-pw").unwrap_err().to_string();
+        assert!(
+            err.contains("orphan-boxed") || err.contains("解密不出来"),
+            "应明确指出是哪条解不出并放弃切换: {err}"
+        );
+        assert!(!store.is_master_mode(), "失败后不得留在主口令模式");
+        assert_eq!(
+            store.get("dpapi-one").unwrap().as_deref(),
+            Some("sk-dpapi"),
+            "放弃切换后原有密钥必须仍可读"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

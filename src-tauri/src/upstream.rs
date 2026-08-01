@@ -189,7 +189,7 @@ const OPENAI_CLIENT_UA: &str =
 /// Codex 的客户端来源标识头值（default_client.rs `DEFAULT_ORIGINATOR`）。
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 
-/// 判断上游错误是否「临时性、值得重试」：502/503/504 网关错误、429 限流、连接层失败。
+/// 判断上游错误是否「临时性、值得重试」：502/503/504/529 网关或过载错误、429 限流、连接层失败。
 /// 4xx（除 429）多为鉴权/参数问题，重试无意义，不重试。
 pub fn is_retriable_upstream_error(e: &AppError) -> bool {
     let AppError::Upstream(msg) = e else { return false };
@@ -197,6 +197,8 @@ pub fn is_retriable_upstream_error(e: &AppError) -> bool {
         || msg.contains("HTTP 503")
         || msg.contains("HTTP 504")
         || msg.contains("HTTP 429")
+        // 529 overloaded：上游明说「过载、稍后再来」，与 503 同级的临时性错误。
+        || msg.contains("HTTP 529")
         // 连接层失败（build_client / send 失败）："连接 xxx 失败"
         || msg.contains("连接")
         || msg.contains("error sending request")
@@ -1051,7 +1053,25 @@ pub fn openai_to_anthropic(body: &Value) -> Value {
             flush(&mut pending_tool_results, &mut messages);
 
             match role {
-                "system" => system.push_str(&extract_text_content(m.get("content"))),
+                // `developer` 与 `system` 同等对待：OpenAI 侧 developer 就是「开发者指令」，
+                // 语义等价于旧的 system（o1 系起改名，Responses 协议沿用）。
+                //
+                // 此前 developer 落进下面的 `_ =>` 分支被降级成普通 user 消息。这不只是形式问题：
+                // Codex 桌面端把**技能（skills）说明**放在 developer 消息里（`# Using skills` +
+                // `### Available skills` 清单，实测 offset 见 docs/13 第十一节），其中含
+                // 「Trigger rules: 用户点名或任务匹配时**必须**使用该 skill」这类强指令。
+                // Anthropic 的 `system` 是独立字段、权重高于对话消息；降级成 user 后这些指令
+                // 与用户自己的话混在一起，模型遵守程度下降。多条 developer 消息按出现顺序拼接。
+                "system" | "developer" => {
+                    let text = extract_text_content(m.get("content"));
+                    if !text.is_empty() {
+                        // 多段之间补换行，避免「上一段末尾」与「下一段开头」黏成一行改变语义。
+                        if !system.is_empty() {
+                            system.push_str("\n\n");
+                        }
+                        system.push_str(&text);
+                    }
+                }
                 "assistant" => {
                     let text = extract_text_content(m.get("content"));
                     let mut blocks: Vec<Value> = vec![];
@@ -3617,6 +3637,73 @@ mod tests {
     }
 
     // ---- Responses ↔ Chat 转换 ----
+
+    /// `developer` 角色必须与 `system` 同等对待，落进 Anthropic 的 `system` 字段。
+    ///
+    /// 这条护栏的实际保护对象是 **Codex 的技能（skills）机制**：桌面端把技能说明放在
+    /// developer 消息里（`# Using skills` + `### Available skills` 清单，含「用户点名或任务匹配时
+    /// **必须**使用该 skill」这类强指令），而不是放在任何工具字段里（顶层 `tools` 与
+    /// `additional_tools` 里都搜不到 skill）。
+    ///
+    /// 此前 developer 落进 `_ =>` 分支被降级成普通 user 消息 —— 那些强指令与用户自己的话
+    /// 混在同一层，而 Anthropic 的 `system` 是独立字段、权重更高。功能不缺（模型读 SKILL.md
+    /// 走的是已通的 shell_command），但遵守程度会下降。
+    #[test]
+    fn developer_role_maps_to_anthropic_system_not_user() {
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "developer", "content": "# Using skills\nTrigger rules: 必须使用该 skill" },
+                { "role": "user", "content": "帮我建个 skill" }
+            ]
+        });
+        let ant = openai_to_anthropic(&chat);
+        let sys = ant["system"].as_str().unwrap_or_default();
+        assert!(sys.contains("Using skills"), "developer 内容必须进 system: {ant}");
+        assert!(sys.contains("必须使用该 skill"), "强指令不得丢: {sys}");
+
+        // 用户消息仍是唯一的 user 消息 —— developer 不该再被降级混进对话层。
+        let msgs = ant["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "developer 不应再产出一条 user 消息: {ant}");
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "帮我建个 skill");
+    }
+
+    /// 多条 system/developer 混排时按顺序拼接，且**补空行分隔**。
+    ///
+    /// Codex 实际会连发多条 developer 消息（一条是技能使用说明、一条是可用技能清单）。
+    /// 直接首尾相接会让「上一段末尾」与「下一段标题」黏成一行，改变 Markdown 结构。
+    #[test]
+    fn multiple_system_and_developer_messages_are_joined_with_blank_line() {
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "system", "content": "段一" },
+                { "role": "developer", "content": "## Skills" },
+                { "role": "developer", "content": "### Available skills\n- imagegen: ..." },
+                { "role": "user", "content": "hi" }
+            ]
+        });
+        let ant = openai_to_anthropic(&chat);
+        let sys = ant["system"].as_str().unwrap();
+        assert_eq!(sys, "段一\n\n## Skills\n\n### Available skills\n- imagegen: ...");
+    }
+
+    /// 空 developer 消息不得往 system 里塞出多余空行（Codex 的 additional_tools 项被跳过后，
+    /// 历史上曾产生过空 developer 消息）。
+    #[test]
+    fn empty_developer_message_does_not_pollute_system() {
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "system", "content": "真实系统提示" },
+                { "role": "developer", "content": "" },
+                { "role": "user", "content": "hi" }
+            ]
+        });
+        let ant = openai_to_anthropic(&chat);
+        assert_eq!(ant["system"], "真实系统提示");
+    }
 
     #[test]
     fn responses_to_chat_maps_instructions_and_input() {

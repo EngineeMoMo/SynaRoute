@@ -28,6 +28,11 @@ fn pick_probe_message(messages: &[String]) -> String {
 /// 对单个 Key 执行一次健康检查并更新其状态。
 pub async fn check_one(store: &Arc<Store>, key_id: &str) {
     let Some(key) = store.get_key(key_id) else { return };
+    // 锁定态（主口令未解锁）不改任何健康状态：取不到密钥不代表 Key 坏了。
+    // 前端「手动检测」也走这里，故必须在这一层挡住，而不只是在 check_category。
+    if store.secrets.read().is_locked() {
+        return;
+    }
     let secret = store.secrets.read().get(key_id).ok().flatten();
     let Some(secret) = secret else {
         // 无密钥无法探测，标记未知
@@ -178,6 +183,12 @@ pub fn select_candidates(keys: Vec<crate::model::ProviderKey>) -> (Vec<crate::mo
 /// 只探测启用的 Key：禁用的 Key 不参与路由，对它探测既白耗额度，又会因失败被判 Down/熔断，
 /// 在界面上留下无意义的「熔断中/不可用」状态污染。
 pub async fn check_category(store: &Arc<Store>, category: crate::model::CategoryType) {
+    // 密钥库锁着（主口令模式未解锁）时取不到任何密钥：整轮探测会把每个 Key 都探成
+    // Unknown/Down，UI 一片红，而真实原因只是没解锁。直接跳过，保留各 Key 现有健康态
+    // ——与「间隔设为 0 关闭探测」同一处理原则。
+    if store.secrets.read().is_locked() {
+        return;
+    }
     let keys = store.enabled_keys_sorted(category);
     for k in keys {
         check_one(store, &k.id).await;
@@ -190,6 +201,71 @@ mod tests {
 
     fn hs(status: HealthStatus, fail_count: u32, breaker_until: Option<i64>) -> HealthState {
         HealthState { status, fail_count, breaker_until, ..Default::default() }
+    }
+
+    /// 密钥库锁着时健康探测必须**一个字节都不改**。
+    ///
+    /// 若不挡住：锁定态取不到密钥 → 每个 Key 都被写成 Unknown（甚至 Down），UI 一片红，
+    /// 而真实原因只是没解锁。用户会去逐个检查 Key 配置，方向完全错。
+    #[tokio::test]
+    async fn locked_vault_skips_probe_without_touching_health() {
+        use crate::model::{CategoryType, HealthStatus, KeyParams, Protocol, ProviderKey};
+        let dir = std::env::temp_dir().join(format!(
+            "synaroute_health_locked_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let key = ProviderKey {
+            id: "k1".into(),
+            category_id: CategoryType::ClaudeCli,
+            name: "k".into(),
+            vendor: "test".into(),
+            // 不可路由地址：万一没被挡住而真去探测，会判 Down —— 让断言能区分两种结果。
+            base_url: "http://127.0.0.1:1".into(),
+            protocol: Protocol::Anthropic,
+            has_secret: true,
+            enabled: true,
+            priority: 0,
+            headers_json: None,
+            params: KeyParams::default(),
+            models: vec![],
+            mappings: vec![],
+            default_model: None,
+            tier_haiku: None,
+            tier_sonnet: None,
+            tier_opus: None,
+            health: HealthState::default(),
+        };
+        store.upsert_key(key).unwrap();
+        store.secrets.write().set("k1", "sk-x").unwrap();
+        // 先摆一个「已探测为 Up」的既有状态，用来检验它不被覆盖。
+        store
+            .update_health(
+                "k1",
+                HealthState { status: HealthStatus::Up, latency_ms: Some(42), ..Default::default() },
+            )
+            .unwrap();
+
+        store.secrets.write().enable_master_password("pw").unwrap();
+        store.secrets.write().lock();
+
+        check_one(&store, "k1").await;
+        let h = store.get_key("k1").unwrap().health;
+        assert_eq!(h.status, HealthStatus::Up, "锁定态不得把既有健康态改掉");
+        assert_eq!(h.latency_ms, Some(42), "延迟等展示字段也应原样保留");
+
+        check_category(&store, CategoryType::ClaudeCli).await;
+        assert_eq!(
+            store.get_key("k1").unwrap().health.status,
+            HealthStatus::Up,
+            "整轮探测同样必须跳过"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -4,7 +4,7 @@ import { useStore } from "@/store";
 import { useT } from "@/lib/useT";
 import type { ToolConfigPreview as Preview } from "@/types";
 import { Button } from "@/components/ui/Button";
-import { FileCode2, RefreshCw, X, Copy, FolderOpen } from "lucide-react";
+import { FileCode2, RefreshCw, X, Copy, FolderOpen, AlertTriangle } from "lucide-react";
 
 /**
  * 目标工具配置只读预览。
@@ -63,6 +63,15 @@ export function ToolConfigPreviewPanel({ open, onClose }: { open: boolean; onClo
           {data && (
             <>
               <p className="text-xs leading-relaxed text-text-secondary">{data.summary}</p>
+              {/* 接入被其他工具接管（cc-switch 重写 _meta.json）：档还在、UI 也显示已接入，
+                  但桌面端实际走的是别人那一档。这是「接入了但不生效」这类无头案的唯一线索，
+                  必须醒目且给出可操作的恢复方式。 */}
+              {data.takeoverWarning && (
+                <div className="flex items-start gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2">
+                  <AlertTriangle size={14} className="mt-0.5 shrink-0 text-warning" />
+                  <p className="text-[11px] leading-relaxed text-warning">{data.takeoverWarning}</p>
+                </div>
+              )}
               {data.files.map((f) => (
                 <div key={f.path} className="rounded-control border border-border bg-surface-elevated">
                   <div className="flex items-center gap-2 border-b border-border px-3 py-2">

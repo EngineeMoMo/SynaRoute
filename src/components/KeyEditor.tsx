@@ -193,8 +193,11 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
         }
       })();
     } catch (e) {
-      // 失败时保留抽屉并显示错误，避免"报错后窗口卡住、列表不刷新"
-      setError(t("editor.errSave", { err: String(e) }));
+      // 失败时保留抽屉并显示错误，避免"报错后窗口卡住、列表不刷新"。
+      // 后端校验消息（如桌面端对外模型名不合规）本身已含后果与修法，是多行文本，
+      // 故不再套 "保存失败：{err}" 前缀——那会把首行挤在前缀后面、破坏排版。
+      const raw = e instanceof Error ? e.message : String(e);
+      setError(raw.includes("\n") ? raw : t("editor.errSave", { err: raw }));
       await loadCategory(activeCategory); // 刷新以反映可能的部分写入
       setSaving(false);
     }
@@ -475,7 +478,13 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
             <p className="mt-1 text-[11px] leading-relaxed text-text-muted">{t("editor.defaultModelHint")}</p>
           </Field>
 
-          {error && <div className="rounded-control bg-danger/10 px-3 py-2 text-xs text-danger">{error}</div>}
+          {/* 保存错误：后端的校验消息是多行的（如桌面端模型名不合规会附后果与修法），
+              必须 whitespace-pre-line 保留换行，否则挤成一坨没人读得下去。 */}
+          {error && (
+            <div className="whitespace-pre-line rounded-control bg-danger/10 px-3 py-2 text-xs leading-relaxed text-danger">
+              {error}
+            </div>
+          )}
         </div>
 
         {/* 底部操作 */}

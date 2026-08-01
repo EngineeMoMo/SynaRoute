@@ -6,9 +6,66 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
 
 **[docs/14-交接与待办清单.md](docs/14-交接与待办清单.md)** —— 2026-07-31 换机交接。里面有：
 
-- **P0 未修缺陷**：重复接入会冲掉「接入前备份」，导致 CLI/Codex 的「还原」还原成已接入态（数据丢失级，触发条件日常）
-- 其余待办分级清单、以及**故意不修的项**（别当成遗漏重复劳动）
-- **审查覆盖边界**：哪些查过、哪些没查（六路并行审查两次因额度失败，改人工聚焦自查）
+- **已修完（换机后）**：重复接入冲掉「接入前备份」（P0 数据丢失级）、短路窗口测试串台 + 重启代理不解除窗口、
+  桌面端还原非原子、429 `Retry-After` 不透传、全失败返 502 应为 529、
+  **桌面端模型名硬过滤**（对外名不合规会导致模型选择器为空 + `ModelsNotDiscoveredError`，
+  已在保存 Key 时拦截；注意 `claude-synaroute-` 前缀对桌面端**无效**，详见文档第九节）。
+  当前基线 `cargo test --lib` **311 passed / 0 failed，连跑 5 次全绿**
+- **审查已补完**：docs/14 第五节原「未系统覆盖」的 5 个区域全部查完，无缺陷级问题；
+  顺手加固 2 处（`parse_and_apply` 加 canonicalize 防线堵符号链接逃逸、
+  `save_brain`/`save_settings` 改走带回滚的 `mutate_and_persist`）
+- **P2 九条已处理完**（见 docs/14 第四节结论表）：`supports1m` 改按 contextWindow 判定、
+  cc-switch 接管检测 + UI 常驻警告、加 `anthropicFamilyTier`/`isFamilyDefault`；
+  `disableDeploymentModeChooser` 保持对齐 cc-switch，`headers_json` 死字段暂留
+- **FR-025 开机自启动已接线**（见 docs/14 第十节）：原是个**静默失效的开关**——字段存在、
+  UI 能点、值落盘，后端却从无代码注册自启动项。已接 `tauri-plugin-autostart`，含启动时状态对账
+  （老用户开关开着但系统里没项）与「仅 `--autostart` 参数才最小化到托盘」。
+  当前基线 **312 passed / 0 failed，连跑 5 次全绿**
+- **FR-021 配置导入/导出已实现**（原是设置页两个 `disabled` 按钮）：新增 `crypto.rs`
+  （Argon2id + AES-GCM 口令信封）+ `portable.rs`（导出/sha256 校验/Merge 与 Replace 两种导入）。
+  关键判据：密钥不能照搬 DPAPI 密文（绑账户、换机解不出），故含密钥导出走**用户口令**重新加密；
+  端口/日志目录/MCP 注册态属本机运行态不随导出走
+- **FR-022 托盘补齐**：图标按代理运行状态灰度化派生（从运行时图标现场派生，换图标自动跟随）、
+  「代理」子菜单三分类启停（**语义与界面按钮一致**：起=顺带写工具配置、停=顺带还原，
+  否则会出现「托盘说已启动、客户端没走代理」）、「主 Key」子菜单快切。
+  重排规则收归后端 `Store::set_primary_key` 做单一事实来源，前端改调它（原先前端自己算，
+  托盘再写一份必然漂移）
+- **主口令增强模式已实现**（FR-018 可选增强，原是 `disabled` 开关 + 零使用点字段）：
+  **模式的事实来源是 `secrets.enc` 里有无 `master` 头部**，`settings.master_password_enabled`
+  只是 UI 镜像（启动时以库为准对账，且 `save_settings` 不许前端覆盖它——否则自造
+  「配置说开着、库里没头部」的死局）。`crypto.rs` 另加长驻密钥 API（解锁派生一次、
+  各条只做 AES-GCM，因为转发每次取密钥都要解）+ 校验串（空库也能判口令对错）。
+  三个迁移操作都是「先整库解密成功 → 备份 → 写盘 → 失败回滚内存」。
+  **锁定态四处刻意行为**：`get` 返 Err 不返 `Ok(None)`、`set` 拒写不回退 DPAPI、
+  跳过 `has_secret` 对账、跳过健康探测
+  当前基线 **368 passed / 0 failed，连跑 5 次全绿**；`--test-threads=1` 全量也全绿。
+- **第二轮审查已完成（2026-08-01）**：五路并行审查 + 自审 lib.rs/tools/store，修出
+  **P0 一条：切主题/语言会把刚关掉的开机自启动重新装回系统**（`store.settings` 是挂载时的旧快照，
+  而后端只对 `mcp_*`/`active_*`/`proxy_ports` 有「保留后端值」防线，`auto_start` 没有 →
+  已改为落盘前先拉磁盘权威值，见 `store.ts persistOneSetting`）；
+  P1 一条：`aggregate.rs` 路径遏制有两条绕过（多一级路径穿透链接目录 / 目标本身是符号链接）；
+  P2 两条：`Retry-After` 取最大值让一个撞配额的 Key 拖垮整池（改取最小值）、硬错误（401 等）
+  被包装成 529「过载请重试」（改按状态码分流，4xx 原样回、不武装短路窗口）；
+  P3 两条 + 前端一致性 5 条。**注意 `all_failed_gate_remaining` 里的 `.max()` 是对的**，
+  与上面那条不矛盾（它比较同一结论的两个下限，都是「不早于」）
+- **效率整治（2026-08-01）**：`list_all_events` 原先每 2s 返回 500 条**含 trace 正文**
+  （满载 19 MB → 572 MB/min），已改为列表只带 `hasTrace`、展开时按 id 单取，**降 99.5%**；
+  转发热路径去掉「开关关着也 pretty-print 整个请求体」与「每请求克隆整份 AppSettings 3~4 次」；
+  LogsPage 5 趟遍历合成 1 趟
+- **v0.1.6 已 bump 并出包**：三处版本号一致，`SynaRoute_0.1.6_x64-setup.exe`（5.99 MB）+
+  exe（23.9 MB）已产出，chunk 嵌入判据各 = 1、与源产物 sha256 一致，已复制到 `F:\SynaRoute\`
+  （旧 exe 已备份）。**仍未验证：NSIS 安装器能否装成**（历史上静默安装卡死过两次，
+  此前部署都是绕过安装器直接覆盖 exe；F 盘现在放的也是直接覆盖的）
+  当前基线 **383 passed / 0 failed，连跑 3 次全绿**
+- **仍未做**：真机验证清单（docs/14 第八节，13 条）、提交与发 Release
+- **尚未开发的功能：已全部做完**（FR-001~025 逐条核过，无遗留项、无第二个静默失效开关）。
+  docs/13「非 GPT 主 Key 支持 Codex 工具」也**已闭环**：从 Codex 自己的日志库
+  （`~/.codex/logs_2.sqlite`）取证到 opus 主 Key 下 **9/9 次调用全走 `exec`**、
+  MCP 与 `tool_search` 链路都通，故原计划的「沙箱工具拍平」**不做**（前提被证伪，详见 docs/13 第十一节）。
+  顺带修掉一处协议映射偏差：`developer` 角色原被降级成 user，现与 `system` 并列
+  —— Codex 的 **skills 就装在 developer 消息里**（不是工具），降级会削弱「必须使用该 skill」这类强指令
+- **故意不修的项**（别当成遗漏重复劳动）：SmartScreen 签名告警、`retrieval.rs` 的 `cwd` 白名单、
+  请求日志存明文对话（默认关闭）
 - **换机注意**：`secrets.enc` 由 DPAPI 绑账户、**不可跨机器搬运**；本文档里的绝对路径都是旧机器实测值
 - **判据取证方法**：如何反查 `claude.exe` / `codex.exe` 的字段与内嵌官方 gateway 规范
   （本轮所有「客户端认什么字段」的结论都出自此，不是文档推测）

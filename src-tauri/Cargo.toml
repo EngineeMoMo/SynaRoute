@@ -1,6 +1,6 @@
 [package]
 name = "synaroute"
-version = "0.1.5"
+version = "0.1.6"
 description = "SynaRoute - 智能 API Key 路由代理与配置管理"
 authors = ["SynaRoute"]
 edition = "2021"
@@ -19,6 +19,8 @@ tauri-plugin-shell = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
+# 开机自启动（FR-025）：注册系统级自启动项。Windows 走注册表 Run 键，跨平台由插件适配。
+tauri-plugin-autostart = "2"
 
 # 异步运行时 + HTTP
 tokio = { version = "1", features = ["full"] }
@@ -42,6 +44,13 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 aes-gcm = "0.10"
 rand = "0.8"
 base64 = "0.22"
+# 口令派生（Argon2id）：配置导出的「含密钥」信封与主口令增强模式共用同一套 KDF。
+# DPAPI 绑当前 Windows 账户，密文跨机解不出，故迁移场景必须走口令派生密钥。
+argon2 = "0.5"
+# 口令等敏感缓冲用后清零，减少内存残留窗口。
+zeroize = { version = "1", features = ["zeroize_derive"] }
+# 导出文件完整性校验（FR-021 验收要求「导入时校验版本与完整性」）。
+sha2 = "0.10"
 
 # 路径 / 时间 / 日志 / 错误
 dirs = "5"

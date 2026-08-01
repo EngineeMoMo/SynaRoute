@@ -5,6 +5,7 @@ import { ProxyStatusBar } from "@/components/ProxyStatusBar";
 import { CcSwitchImportDialog } from "@/components/CcSwitchImportDialog";
 import { Button } from "@/components/ui/Button";
 import { Combobox } from "@/components/ui/Combobox";
+import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
 import type { ProviderKey } from "@/types";
 import { Plus, AlertTriangle, Inbox, X, Database } from "lucide-react";
@@ -41,6 +42,57 @@ export function CategoryPage({ onAddKey, onEditKey }: {
   );
   const activeModel = settings?.activeModels?.[activeCategory] ?? "";
   const activeEffort = settings?.activeEfforts?.[activeCategory] ?? "";
+
+  // 桌面端接入是否已被其他工具接管（cc-switch 重写 _meta.json）。
+  // 只对桌面端查，且跟随 5s 轮询刷新——用户可能在 SynaRoute 开着的时候去点 cc-switch。
+  const [takeover, setTakeover] = useState<string | null>(null);
+  useEffect(() => {
+    if (activeCategory !== "claude-desktop") {
+      setTakeover(null);
+      return;
+    }
+    let alive = true;
+    const check = () => {
+      void api
+        .getToolConfigPreview("claude-desktop")
+        .then((p) => {
+          if (alive) setTakeover(p.takeoverWarning ?? null);
+        })
+        .catch(() => {
+          // 预览读不出来（路径不存在等）不影响主界面，静默即可
+        });
+    };
+    check();
+    const id = setInterval(check, 5000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [activeCategory]);
+
+  // 密钥库是否锁着（主口令模式尚未解锁）。锁着时**每一次转发都会失败**，
+  // 而失败原因藏在运行日志里 —— 必须在最显眼的位置常驻提示，否则用户会以为 Key 配错了。
+  // 跟随 5s 轮询：用户可能在设置页解锁后切回来，也可能点了「立即锁定」。
+  const [vaultLocked, setVaultLocked] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    const check = () => {
+      void api
+        .getMasterPasswordState()
+        .then((s) => {
+          if (alive) setVaultLocked(s.enabled && s.locked);
+        })
+        .catch(() => {
+          // 读不到就不提示（宁可漏提示，也不要因一次 IPC 抖动弹个假警告）
+        });
+    };
+    check();
+    const id = setInterval(check, 5000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
 
   return (
     <div className="flex h-full flex-col">
@@ -111,6 +163,25 @@ export function CategoryPage({ onAddKey, onEditKey }: {
             </select>
             <p className="mt-1.5 text-[11px] leading-relaxed text-text-muted">{t("category.effortHint")}</p>
           </div>
+        </div>
+      )}
+
+      {/* 桌面端接入被其他工具接管（cc-switch 一被点开就整份重写 _meta.json）：
+          档还在磁盘上、代理也在跑，但桌面端实际走的是别人那一档 → 表现为「接入了但不生效」。
+          这是该无头案的唯一线索，故常驻在列表顶部而非只藏在预览弹窗里。 */}
+      {/* 密钥库锁定：比其他警告更靠前，因为它让**全部**转发失败，不是某一项配置不完美。
+          用 danger 而非 warning，且给出可执行动作。 */}
+      {vaultLocked && (
+        <div className="mx-6 mb-2 flex items-start gap-2 rounded-control border border-danger/30 bg-danger/8 px-3 py-2 text-xs text-danger">
+          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+          <span className="flex-1 leading-relaxed">{t("master.lockedBanner")}</span>
+        </div>
+      )}
+
+      {takeover && (
+        <div className="mx-6 mb-2 flex items-start gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-xs text-warning">
+          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+          <span className="flex-1 leading-relaxed">{takeover}</span>
         </div>
       )}
 
