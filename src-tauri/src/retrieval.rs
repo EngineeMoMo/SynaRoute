@@ -8,10 +8,10 @@
 //! 5. 按 max_tokens 限制裁剪内容
 
 use crate::error::AppResult;
+use crate::proc::hidden;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tokio::process::Command;
 
 /// 检索到的单个文件
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,7 +79,9 @@ async fn grep_search(
     let mut rg_ran = false;
 
     for kw in keywords {
-        let output = Command::new("rg")
+        // 走 proc::hidden 而非 Command::new：Windows 上 rg 是控制台程序，
+        // 直接起会闪一个黑窗口（见 crate::proc 模块注释）。
+        let output = hidden("rg")
             .args([
                 "--files-with-matches",
                 "--no-messages",

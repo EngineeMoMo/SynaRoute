@@ -19,6 +19,7 @@
 //!      returnType/visibility/docstring`——**`startLine`/`endLine` 是符号级切片的关键**，
 //!      有它就不必自己做花括号配对来找方法体边界。
 
+use crate::proc::hidden;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -179,7 +180,7 @@ async fn candidate_dirs() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
 
     // npm config get prefix（最权威，但 npm 自身可能不在 PATH，故失败不致命）
-    if let Ok(o) = timeout_output(Command::new(npm_program()).args(["config", "get", "prefix"])).await
+    if let Ok(o) = timeout_output(hidden(npm_program()).args(["config", "get", "prefix"])).await
     {
         let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
         if !p.is_empty() && p != "undefined" {
@@ -244,7 +245,7 @@ fn npm_program() -> &'static str {
 /// 判据是**stdout 里能否找到形如 `1.5.0` 的版本串**，而非退出码——codegraph 的退出码恒为 0
 /// （实测），且当程序压根不存在时 `Command` 会在启动阶段就 Err，两种失败都能区分开。
 async fn probe_version(program: &str) -> Option<String> {
-    let out = timeout_output(Command::new(program).arg("version")).await.ok()?;
+    let out = timeout_output(hidden(program).arg("version")).await.ok()?;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -284,7 +285,7 @@ pub async fn init_project(work_dir: &Path) -> Result<String, String> {
     let dir = work_dir.to_string_lossy().to_string();
     let out = match tokio::time::timeout(
         INIT_TIMEOUT,
-        Command::new(&r.program).args(["init", &dir]).output(),
+        hidden(&r.program).args(["init", &dir]).output(),
     )
     .await
     {
@@ -330,7 +331,7 @@ async fn run_json<T: serde::de::DeserializeOwned>(
     program: &str,
     args: &[&str],
 ) -> Result<T, String> {
-    let out = timeout_output(Command::new(program).args(args))
+    let out = timeout_output(hidden(program).args(args))
         .await
         .map_err(|e| format!("启动失败: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);

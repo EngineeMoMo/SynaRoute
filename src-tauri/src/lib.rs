@@ -10,6 +10,7 @@ mod health;
 mod mcp;
 mod model;
 mod portable;
+mod proc;
 mod proxy;
 mod retrieval;
 mod secret;
