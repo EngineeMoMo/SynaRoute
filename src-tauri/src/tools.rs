@@ -166,15 +166,74 @@ fn codex_auth_path() -> AppResult<PathBuf> {
 
 fn apply_codex(endpoint: &str, default_model: Option<&str>) -> AppResult<String> {
     let path = codex_config_path()?;
-    // 只写 config.toml —— **不再碰 auth.json**（2026-07-31 改）。
-    // 密钥占位改为写进 provider 表的 `experimental_bearer_token`（codex.exe 符号表证实该字段
-    // 属 ModelProviderInfo，本机 cc-switch 的生效配置也正是这么写的）。
-    // 旧做法整份重写 auth.json，在 ChatGPT OAuth 态下会把 tokens/auth_mode/last_refresh
-    // 全部抹掉（判据 `if let Some(Value::String(existing))` 对 `OPENAI_API_KEY: null`
-    // 不命中，直接落到整份替换分支）——虽有 .bak 兜底，但一次误触就要用户重登官方账号。
-    // 现在接入完全不触及官方登录状态。
-    with_rollback(std::slice::from_ref(&path), || {
-        apply_codex_at(&path, endpoint, default_model)
+    let auth = codex_auth_path()?;
+    // **双文件写**（2026-08-02 改回，见 `apply_codex_auth_at` 的完整判据）。
+    //
+    // 为什么又要写 auth.json：2026-07-31 那版只写 config.toml、把占位塞进
+    // `[model_providers.synaroute].experimental_bearer_token`，理由是「codex.exe 符号表里有
+    // 这个字段」。真机实测（2026-08-02）证明**字段存在 ≠ 该路径能过门禁**：接入后打开 Codex
+    // 仍提示需要登录，运行日志里 codex 分类**一条 route 事件都没有**（请求压根没到代理）。
+    //
+    // 反查 codex.exe 拿到决定性证据 —— 它找凭据只认三条路：
+    //   `auth.json` / 环境变量（OPENAI_API_KEY、CODEX_API_KEY、CODEX_ACCESS_TOKEN）/ auth.credentials
+    // 都没有就报 `no Codex credentials were found` + `Run codex login or provide an API key…`。
+    // `experimental_bearer_token` 只是 `ModelProviderInfo` 的一个字段（用于请求头），
+    // **不参与「有没有凭据」这道门禁**。而我们又写了 `requires_openai_auth = true`
+    // （强制走 OpenAI 鉴权），于是必然卡在登录页。
+    //
+    // cc-switch 的 codex 档正是「`requires_openai_auth = true` + auth.json 里放
+    // `OPENAI_API_KEY`」这套配套写法（本机库实测），我们照搬。
+    //
+    // 两个文件必须同进同退（with_rollback 收两条路径）：只写成一个会留下
+    // 「config 指向代理、auth 仍是官方」或反之的半接入态，两种都表现为诡异的鉴权失败。
+    with_rollback(&[path.clone(), auth.clone()], || {
+        let msg = apply_codex_at(&path, endpoint, default_model)?;
+        let auth_msg = apply_codex_auth_at(&auth)?;
+        Ok(format!("{msg}；{auth_msg}"))
+    })
+}
+
+/// 接入时把 `~/.codex/auth.json` 整份替换为纯占位，**并确保替换前已存下本轮接入前的快照**。
+///
+/// ## 为什么是「整份替换」而不是「保留 tokens 再加一个占位 key」
+///
+/// 后者已被证伪（2026-07-30 事故，勿重犯）：`tokens` 与 `OPENAI_API_KEY` 并存时，
+/// Codex 桌面端会判定为 **api-key 模式**却又拿着 ChatGPT 账号信息去调，撞上
+/// 「no access 账号门」——用户看到的是账号无权限，比「要求登录」更难排查。
+/// cc-switch 同样是整份替换（它把完整 auth.json 存进自己的库里做还原）。
+///
+/// ## 还原能力是这条路的前提
+///
+/// 整份替换会抹掉 ChatGPT OAuth 的 `tokens`/`auth_mode`/`last_refresh`。因此
+/// **`.bak` 必须是「本轮接入前」的真实快照**，否则用户切回官方就登不回去。
+/// 这由 `backup_and_write_bytes` 的「首写即锁 + 还原后删 .bak」语义保证：
+/// - 首次接入：抓当前（真实 OAuth）→ 锁住
+/// - 重复接入：`.bak` 已存在不覆盖，故不会被「已接入态」冲掉
+/// - 还原：拿回 OAuth 并删 `.bak`，下次接入重新抓新鲜快照
+///
+/// 幂等：内容已是纯占位时 `backup_and_write_bytes` 短路（不备份不写）。
+fn apply_codex_auth_at(path: &Path) -> AppResult<String> {
+    // 已经是纯占位 → 无需再写（也避免把「已接入态」当成接入前快照存进 .bak）
+    if is_placeholder_only_auth(path) {
+        return Ok(format!("{} 已是接入态（未改动）", path.display()));
+    }
+    let had_oauth = path.exists()
+        && std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .is_some_and(|v| v.get("tokens").is_some_and(|t| !t.is_null()));
+
+    let body = serde_json::json!({ "OPENAI_API_KEY": CODEX_AUTH_PLACEHOLDER });
+    let bytes = serde_json::to_vec_pretty(&body)
+        .map_err(|e| AppError::ToolConfig(format!("序列化 auth.json 失败: {e}")))?;
+    backup_and_write_bytes(path, &bytes)?;
+    Ok(if had_oauth {
+        format!(
+            "已写入 {}（鉴权占位）；原 ChatGPT 登录态已备份，点「还原」或停止代理即可恢复",
+            path.display()
+        )
+    } else {
+        format!("已写入 {}（鉴权占位）", path.display())
     })
 }
 
@@ -200,10 +259,14 @@ fn apply_codex(endpoint: &str, default_model: Option<&str>) -> AppResult<String>
 /// - `[model_providers.synaroute]`：base_url = `{endpoint}/v1`（Codex 按 wire_api=responses
 ///   调 `{base_url}/responses`，本地代理已识别 `/v1/responses`）；wire_api="responses"（Codex 默认且唯一支持）。
 /// - `model_provider = "synaroute"` 选中它。
-/// - `experimental_bearer_token` = 占位（codex.exe 符号表证实属 ModelProviderInfo 正式字段；
-///   本机 cc-switch 生效配置同写法）+ `requires_openai_auth = true`。这套组合让 Codex 走
-///   bearer 鉴权流程而**完全不碰 `auth.json`**，用户的 ChatGPT OAuth 登录态原样保留。
-///   故**不写 env_key**——那会让 Codex 改从环境变量读 key，重新引入「用户手设环境变量」负担。
+/// - `requires_openai_auth = true`：与 cc-switch 的生效样本一致。**它要求 Codex 能找到
+///   OpenAI 凭据**，故必须配套写 `auth.json`（见 [`apply_codex_auth_at`]）。
+/// - `experimental_bearer_token` = 占位：保留，它是 `ModelProviderInfo` 的正式字段（用于
+///   请求头）。但**别指望它替代凭据门禁** —— 2026-08-02 真机实测：只写它、不写 auth.json，
+///   Codex 直接停在登录页，日志里连一条 route 事件都没有。反查 codex.exe 确认凭据只认
+///   `auth.json` / 环境变量（OPENAI_API_KEY、CODEX_API_KEY、CODEX_ACCESS_TOKEN）/
+///   `auth.credentials` 三条路，否则报 `no Codex credentials were found`。
+/// - 故**不写 env_key**——那会让 Codex 改从环境变量读 key，重新引入「用户手设环境变量」负担。
 ///   代理侧不校验该占位值，真实密钥由代理按路由 Key 注入。
 ///
 /// 幂等：序列化结果与磁盘现有内容一致时，backup_and_write_bytes 会短路（不备份不写），
@@ -2757,9 +2820,16 @@ tool_timeout_sec = 600
     /// 于是直接落到整份替换分支，把 `tokens` / `auth_mode` / `last_refresh` 全抹掉。
     /// 现在鉴权占位写进 provider 表的 `experimental_bearer_token`，auth.json 字节不动。
     #[test]
-    fn codex_apply_never_touches_auth_json_and_writes_bearer_in_provider() {
+    fn codex_apply_writes_auth_placeholder_and_keeps_oauth_restorable() {
+        // 2026-08-02 真机回归：上一版只写 config.toml、把占位塞进 experimental_bearer_token，
+        // 结果 Codex 仍停在登录页、日志里 codex 分类一条 route 都没有。
+        // 反查 codex.exe：凭据只认 auth.json / 环境变量 / auth.credentials，
+        // 否则 `no Codex credentials were found`。而我们又写了 requires_openai_auth = true。
+        // 故必须照 cc-switch 那样配套写 auth.json。
+        //
+        // 这条测试同时锁住**代价可控**：OAuth 被换掉，但必须能原样还原。
         let dir = std::env::temp_dir().join(format!(
-            "synaroute_codex_noauth_{}_{}",
+            "synaroute_codex_auth_{}_{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
@@ -2771,28 +2841,98 @@ tool_timeout_sec = 600
         std::fs::write(&auth, oauth).unwrap();
 
         apply_codex_at(&cfg, "http://127.0.0.1:47101", Some("gpt-5.6")).unwrap();
+        apply_codex_auth_at(&auth).unwrap();
 
-        // auth.json 字节级不变，且不产生 .synaroute.bak（说明压根没写过它）。
-        assert_eq!(std::fs::read(&auth).unwrap(), oauth.to_vec(), "接入不得改动 auth.json");
+        // ① auth.json 变成**纯占位**（不能是 tokens + key 混合态 —— 那会撞账号门，
+        //    见 apply_codex_auth_at 的判据）
         assert!(
-            !backup_path_for(&auth).exists(),
-            "不该为 auth.json 产生备份——根本不应触碰它"
+            is_placeholder_only_auth(&auth),
+            "auth.json 必须是纯占位，实际：{}",
+            std::fs::read_to_string(&auth).unwrap()
         );
 
-        // 鉴权占位落在 provider 表里。
+        // ② 原 OAuth 必须完整躺在备份里 —— 这是允许整份替换的前提
+        let bak = backup_path_for(&auth);
+        assert!(bak.exists(), "必须为 auth.json 留下接入前快照，否则用户登不回官方");
+        assert_eq!(
+            std::fs::read(&bak).unwrap(),
+            oauth.to_vec(),
+            "备份必须是接入前的真实 OAuth，字节级一致"
+        );
+
+        // ③ 重复接入不得把「已接入态」冲进备份（首写即锁）
+        apply_codex_auth_at(&auth).unwrap();
+        assert_eq!(
+            std::fs::read(&bak).unwrap(),
+            oauth.to_vec(),
+            "重复接入后备份仍须是最初的 OAuth"
+        );
+
+        // ④ 还原后拿回真实 OAuth，且 .bak 被清掉（下次接入重新抓新鲜快照）
+        restore_one(&auth).unwrap();
+        assert_eq!(
+            std::fs::read(&auth).unwrap(),
+            oauth.to_vec(),
+            "还原必须拿回原 ChatGPT 登录态"
+        );
+        assert!(!bak.exists(), "还原后应删除 .bak");
+
+        // ⑤ config.toml 侧仍是标准自定义 provider
         let doc: toml::Value = std::fs::read_to_string(&cfg).unwrap().parse().unwrap();
         let p = doc["model_providers"]["synaroute"].as_table().unwrap();
-        assert_eq!(
-            p["experimental_bearer_token"].as_str(),
-            Some(CODEX_AUTH_PLACEHOLDER),
-            "占位密钥须写进 experimental_bearer_token（codex.exe 的 ModelProviderInfo 正式字段）"
-        );
         assert_eq!(p["requires_openai_auth"].as_bool(), Some(true), "与 cc-switch 生效样本一致");
         assert_eq!(p["wire_api"].as_str(), Some("responses"));
         assert_eq!(p["base_url"].as_str(), Some("http://127.0.0.1:47101/v1"));
         assert_eq!(doc["model_provider"].as_str(), Some("synaroute"));
         assert_eq!(doc["model"].as_str(), Some("gpt-5.6"), "默认模型应写顶层 model");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn codex_auth_apply_is_idempotent_and_never_backs_up_applied_state() {
+        // 已是接入态时再接入：不得写、更不得把占位当成「接入前快照」存进 .bak
+        // （那会让用户永久失去官方登录态 —— 还原只能拿回一个占位）。
+        let dir = std::env::temp_dir().join(format!(
+            "synaroute_codex_auth_idem_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let auth = dir.join("auth.json");
+        std::fs::write(
+            &auth,
+            format!(r#"{{"OPENAI_API_KEY":"{CODEX_AUTH_PLACEHOLDER}"}}"#),
+        )
+        .unwrap();
+
+        let msg = apply_codex_auth_at(&auth).unwrap();
+        assert!(msg.contains("已是接入态"), "应短路，实际：{msg}");
+        assert!(
+            !backup_path_for(&auth).exists(),
+            "绝不能把已接入态存成接入前快照"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn codex_auth_apply_handles_first_time_without_auth_file() {
+        // 用户从未登录过官方（无 auth.json）：接入应直接建纯占位，且不产生无意义的 .bak
+        let dir = std::env::temp_dir().join(format!(
+            "synaroute_codex_auth_new_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let auth = dir.join("auth.json");
+
+        let msg = apply_codex_auth_at(&auth).unwrap();
+        assert!(is_placeholder_only_auth(&auth), "应建出纯占位");
+        assert!(
+            !msg.contains("已备份"),
+            "本就没有登录态，不该提示已备份，实际：{msg}"
+        );
+        assert!(!backup_path_for(&auth).exists(), "无原文件则不该有备份");
         std::fs::remove_dir_all(&dir).ok();
     }
 

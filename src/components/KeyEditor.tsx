@@ -352,6 +352,16 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
                     <span className={`flex-1 truncate font-mono text-xs ${m.source === "manual" ? "text-text-secondary" : "text-text-primary"}`}>
                       {m.realName}
                     </span>
+                    {/* 填了 ≥1M 窗口即会自动启用 1M 上下文（代理按落点模型补 anthropic-beta 头）。
+                        给个可见徽标，避免又出现「配了但不知道生没生效」。 */}
+                    {(m.contextWindow ?? 0) >= 1_000_000 && (
+                      <span
+                        className="shrink-0 rounded bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent"
+                        title={t("editor.oneMHint")}
+                      >
+                        1M
+                      </span>
+                    )}
                     <input
                       type="number"
                       className="h-7 w-24 rounded-control border border-border bg-bg px-2 text-xs text-text-primary placeholder:text-text-muted"

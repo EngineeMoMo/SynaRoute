@@ -1091,8 +1091,16 @@ async fn try_stream_to_key(
     let client = crate::upstream::shared_client();
 
     let mut rb = client.post(&url).json(&payload);
+    // `anthropic-beta` 单独算（1M 上下文需按落点模型追加特性），故先跳过原值再统一设置。
+    let beta = effective_beta_header(fwd_headers, key, &real_model);
     for (h, v) in fwd_headers {
+        if h == "anthropic-beta" {
+            continue;
+        }
         rb = rb.header(h, v);
+    }
+    if let Some(b) = &beta {
+        rb = rb.header("anthropic-beta", b.as_str());
     }
     rb = rb.header(auth_header, auth_val);
     if let Some((h, v)) = extra {
@@ -1380,8 +1388,16 @@ async fn forward_to_key(
         .post(&url)
         .json(&payload)
         .timeout(std::time::Duration::from_millis(key.params.timeout_ms.unwrap_or(30_000)));
+    // `anthropic-beta` 单独算（1M 上下文需按落点模型追加特性），故先跳过原值再统一设置。
+    let beta = effective_beta_header(fwd_headers, key, &real_model);
     for (h, v) in fwd_headers {
+        if h == "anthropic-beta" {
+            continue;
+        }
         rb = rb.header(h, v);
+    }
+    if let Some(b) = &beta {
+        rb = rb.header("anthropic-beta", b.as_str());
     }
     rb = rb.header(auth_header, auth_val);
     if let Some((h, v)) = extra {
@@ -1440,6 +1456,55 @@ async fn forward_to_key(
 /// 剔除项：鉴权（用 Key 自己的）、路由/长度类（reqwest 按目标重算）、
 /// hop-by-hop（RFC 7230）、content-type（reqwest .json() 自带）、
 /// accept-encoding（避免上游返回压缩体导致响应快照乱码）。
+/// 1M 上下文对应的 Anthropic beta 特性名。
+///
+/// **判据来源**（反查而非文档推测）：`claude.exe` v2.1.219 内嵌的 beta 特性注册表
+/// （offset ≈ 186988648）里成对出现 `long_context` → `context-1m-2025-08-07`，
+/// 与 `interleaved_thinking` → `interleaved-thinking-2025-05-14` 等同一张表。
+const BETA_CONTEXT_1M: &str = "context-1m-2025-08-07";
+
+/// 计算发往上游的 `anthropic-beta` 头：在下游原值基础上**按需追加** 1M 上下文特性。
+///
+/// ## 为什么代理要代劳
+///
+/// Claude Code 只对**它认识的**模型名发 `context-1m-2025-08-07`。经 SynaRoute 路由时，
+/// 客户端看到的是我们的对外名（`claude-opus-4-8`、或非合规名被包成 `claude-synaroute-*`），
+/// 客户端不认识 → 不会发这个头 → 即使上游模型真支持 1M，实际仍按默认窗口截断，
+/// 用户配了大 `contextWindow` 却完全不生效（又一个「看起来配了、实际没用上」）。
+///
+/// 故判据取「**本次实际要打的真实模型**的 `contextWindow` ≥ 1M」——不是看客户端要什么，
+/// 而是看请求最终落在哪个模型上。桌面端侧的 `supports1m` 是同一份数据的另一面
+/// （见 `tools::build_desktop_model_entries`），两端口径因此天然一致。
+///
+/// ## 必须追加而非替换
+///
+/// 下游原值里带着 `claude-code-20250219` 等特性，那是中转商识别「真实 Claude Code 客户端」
+/// 的依据（部分分组只放行 CC）。整体覆盖会让这些请求被拒。已存在同名特性时不重复追加。
+fn effective_beta_header(
+    fwd_headers: &[(String, String)],
+    key: &ProviderKey,
+    real_model: &str,
+) -> Option<String> {
+    let existing = fwd_headers
+        .iter()
+        .find(|(h, _)| h == "anthropic-beta")
+        .map(|(_, v)| v.as_str());
+    // beta 头是 Anthropic 协议特有的；打到 OpenAI 系上游时不加（原值仍按既有行为透传）
+    let want_1m = matches!(key.protocol, Protocol::Anthropic)
+        && key
+            .context_window_of_real(real_model)
+            .is_some_and(|w| w >= crate::model::ONE_MILLION_CONTEXT);
+    if !want_1m {
+        return existing.map(|s| s.to_string());
+    }
+    match existing.map(str::trim).filter(|s| !s.is_empty()) {
+        // 客户端已经带上了 → 原样用，不重复追加
+        Some(v) if v.split(',').any(|p| p.trim() == BETA_CONTEXT_1M) => Some(v.to_string()),
+        Some(v) => Some(format!("{},{BETA_CONTEXT_1M}", v.trim_end_matches(','))),
+        None => Some(BETA_CONTEXT_1M.to_string()),
+    }
+}
+
 fn is_stripped_header(name: &str) -> bool {
     matches!(
         name,
@@ -1522,13 +1587,35 @@ fn is_contentless_probe(req_json: &Value, requested_model: &str) -> bool {
         .any(|k| obj.contains_key(*k))
 }
 
-/// 故障转移日志里的动词：临时错误（429/5xx）用「限流/繁忙，暂避」，
-/// 确定性错误用「失败」。让用户一眼区分「Key 坏了」和「Key 只是这一下满了」。
+/// 故障转移日志里的动词：**按真实状态码分类**，让用户一眼看出该去修什么。
+///
+/// 2026-08-02 真机实证的反例（勿退回旧写法）：旧版只分两类 ——
+/// `status_counts_against_breaker` 为真说「失败」、否则一律说「限流/繁忙，暂避」。
+/// 于是一次会话里 400×16 + 502×5 + 503×5 + 504×1 **全被写成「限流/繁忙」，
+/// 而真实 429 一次都没有**。用户据此判断「触发了很多限流」，方向完全错了：
+/// 那 16 个 400 是我们自己没填模型名（见 `resolve_model` 第 6 步），
+/// 11 个 5xx 是上游中转商真的挂了/无可用账号，两者都与限流无关。
+///
+/// 措辞要能直接指向排查方向，不能用一个模糊词盖住三种不同的根因。
 fn failover_verb(status: u16) -> &'static str {
-    if status_counts_against_breaker(status) {
-        "失败"
-    } else {
-        "限流/繁忙，暂避"
+    match status {
+        // 真限流：唯一该说「限流」的码
+        429 => "限流，暂避",
+        // 请求本身不合法：换任何 Key 都同样失败，别让用户以为是 Key 的问题
+        400 | 422 => "请求被拒（非 Key 问题）",
+        // 鉴权/权限：Key 本身坏了或没权限
+        401 | 403 => "鉴权失败",
+        // 端点或模型不存在
+        404 => "端点/模型不存在",
+        // 上游协议不支持（我们的跨协议转换打到了不支持的端点）
+        501 => "上游不支持该协议",
+        // 网关层故障：上游中转商挂了，与限流无关
+        502..=504 => "上游故障/无可用渠道",
+        // 其余 5xx
+        s if s >= 500 => "上游错误",
+        // 其余 4xx
+        s if s >= 400 => "请求失败",
+        _ => "失败",
     }
 }
 
@@ -1695,9 +1782,29 @@ mod tests {
         for s in [401u16, 403, 404, 422] {
             assert!(status_counts_against_breaker(s), "HTTP {s} 应计入熔断");
         }
-        // 日志动词：临时错误说「暂避」，硬错误说「失败」。
-        assert_eq!(failover_verb(429), "限流/繁忙，暂避");
-        assert_eq!(failover_verb(401), "失败");
+        // 日志动词按**真实状态码**分类：一个模糊的「限流」会把三种不同根因盖住。
+        // 真机反例：一次会话 400×16 + 5xx×11、429 零次，旧写法全标成「限流/繁忙」，
+        // 用户据此以为触发了限流，而真因是我们没填模型名 + 上游中转商挂了。
+        assert_eq!(failover_verb(429), "限流，暂避", "只有 429 该说限流");
+        assert_eq!(failover_verb(400), "请求被拒（非 Key 问题）");
+        assert_eq!(failover_verb(401), "鉴权失败");
+        assert_eq!(failover_verb(403), "鉴权失败");
+        assert_eq!(failover_verb(404), "端点/模型不存在");
+        for s in [502u16, 503, 504] {
+            assert_eq!(
+                failover_verb(s),
+                "上游故障/无可用渠道",
+                "HTTP {s} 是上游挂了，不是限流"
+            );
+        }
+        // 反例护栏：除 429 外，任何码都不得出现「限流」二字
+        for s in [400u16, 401, 403, 404, 422, 500, 501, 502, 503, 504] {
+            assert!(
+                !failover_verb(s).contains("限流"),
+                "HTTP {s} 不该被说成限流，实际：{}",
+                failover_verb(s)
+            );
+        }
     }
 
     #[tokio::test]
@@ -2023,6 +2130,99 @@ mod tests {
             tier_opus: None,
             health: HealthState::default(),
         }
+    }
+
+    /// 造一个带 contextWindow 的模型条目。
+    fn model_ctx(name: &str, ctx: Option<u32>) -> crate::model::ModelInfo {
+        crate::model::ModelInfo {
+            real_name: name.into(),
+            source: "manual".into(),
+            fetched_at: None,
+            context_window: ctx,
+        }
+    }
+
+    #[test]
+    fn beta_header_adds_1m_context_for_million_window_models() {
+        // 需求（用户提出）：Claude Code / CLI 也要能用 1M 上下文。
+        // 判据来源：claude.exe v2.1.219 的 beta 注册表 long_context → context-1m-2025-08-07。
+        //
+        // 为什么必须由代理代劳：客户端只对**它认识的**模型名发这个头，而经 SynaRoute 路由时
+        // 它看到的是我们的对外名，认不出来 → 不发 → 用户配了 1M 窗口也完全不生效。
+        let mut k = key("a", 0, "https://x");
+        k.models = vec![model_ctx("claude-opus-4-8-1m", Some(1_000_000))];
+
+        // ① 下游没带 beta 头 → 我们补上
+        assert_eq!(
+            effective_beta_header(&[], &k, "claude-opus-4-8-1m").as_deref(),
+            Some(BETA_CONTEXT_1M)
+        );
+
+        // ② 下游带了其它特性 → **追加**，绝不覆盖
+        //    （claude-code-20250219 是中转商识别真实 CC 客户端的依据，覆盖会被拒）
+        let fwd = vec![(
+            "anthropic-beta".to_string(),
+            "claude-code-20250219,interleaved-thinking-2025-05-14".to_string(),
+        )];
+        let got = effective_beta_header(&fwd, &k, "claude-opus-4-8-1m").unwrap();
+        assert!(got.contains("claude-code-20250219"), "原特性必须保留：{got}");
+        assert!(got.contains("interleaved-thinking-2025-05-14"), "{got}");
+        assert!(got.contains(BETA_CONTEXT_1M), "{got}");
+
+        // ③ 客户端已经带了 1M → 不重复追加
+        let fwd = vec![("anthropic-beta".to_string(), BETA_CONTEXT_1M.to_string())];
+        let got = effective_beta_header(&fwd, &k, "claude-opus-4-8-1m").unwrap();
+        assert_eq!(
+            got.matches(BETA_CONTEXT_1M).count(),
+            1,
+            "同一特性不得出现两次：{got}"
+        );
+    }
+
+    #[test]
+    fn beta_header_is_not_added_without_evidence() {
+        // 反例三条：无窗口数据 / 窗口不足 1M / 非 Anthropic 上游 —— 都不得断言 1M。
+        // 「无依据不断言」与桌面端 supports1m 的口径一致：凭空声称 1M 会让上游直接 400。
+        let mut k = key("a", 0, "https://x");
+
+        // 无 contextWindow 数据
+        k.models = vec![model_ctx("m-unknown", None)];
+        assert_eq!(effective_beta_header(&[], &k, "m-unknown"), None);
+
+        // 窗口不足 1M
+        k.models = vec![model_ctx("m-200k", Some(200_000))];
+        assert_eq!(effective_beta_header(&[], &k, "m-200k"), None);
+
+        // 模型不在列表里（查不到窗口）
+        assert_eq!(effective_beta_header(&[], &k, "not-listed"), None);
+
+        // 非 Anthropic 上游：beta 头是 Anthropic 特有的，不该加
+        k.protocol = Protocol::OpenaiChat;
+        k.models = vec![model_ctx("gpt-1m", Some(1_000_000))];
+        assert_eq!(effective_beta_header(&[], &k, "gpt-1m"), None);
+
+        // 但下游原有的 beta 头在任何情况下都要**原样透传**（中转商靠它识别客户端）
+        let fwd = vec![("anthropic-beta".to_string(), "claude-code-20250219".to_string())];
+        assert_eq!(
+            effective_beta_header(&fwd, &k, "gpt-1m").as_deref(),
+            Some("claude-code-20250219"),
+            "不加 1M 时也不能把原头吞掉"
+        );
+    }
+
+    #[test]
+    fn beta_header_threshold_is_exactly_one_million() {
+        let mut k = key("a", 0, "https://x");
+        // 边界：恰好 1M 要算支持（阈值是「≥」）
+        k.models = vec![model_ctx("exact", Some(crate::model::ONE_MILLION_CONTEXT))];
+        assert_eq!(
+            effective_beta_header(&[], &k, "exact").as_deref(),
+            Some(BETA_CONTEXT_1M),
+            "恰好 1M 应视为支持"
+        );
+        // 差 1 token 就不算
+        k.models = vec![model_ctx("almost", Some(crate::model::ONE_MILLION_CONTEXT - 1))];
+        assert_eq!(effective_beta_header(&[], &k, "almost"), None);
     }
 
     /// 起一个返回固定 status + body 的 mock 上游，返回其 base_url。

@@ -124,7 +124,7 @@ pub fn tool_defs(env: &ToolEnv) -> Vec<ToolDef> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "工作目录下的相对路径，如 src/main.rs" },
+                    "path": { "type": "string", "description": "工作目录下的相对路径，如 src/main.rs（也接受 file_path / filePath 等等价写法）" },
                     "start_line": { "type": "integer", "description": "起始行（1 起，含）。省略为文件开头" },
                     "end_line": { "type": "integer", "description": "结束行（1 起，含）。省略为文件末尾" }
                 },
@@ -458,18 +458,80 @@ fn cap_result(s: String) -> String {    if s.chars().count() <= RESULT_CHAR_CAP 
     )
 }
 
-/// 取可选的正整数参数。
-fn opt_u32(args: &Value, key: &str) -> Option<u32> {
-    args.get(key).and_then(|v| v.as_u64()).map(|n| n as u32)
+/// 各参数的**别名**：模型常按自己熟悉的工具口径发参数名，我们照收。
+///
+/// 为什么必须有（实测证据，勿当过度设计）：2026-08-02 的真机日志里，
+/// `claude-opus-4-8` 连续 **8 轮**都把路径发成 `file_path`（那是 Claude Code 原生 Read 工具的
+/// 参数名，Claude 系模型被训成这么发），每次都被 `req_str` 判「缺少必填参数 `path`」拒掉 ——
+/// **报错并没有让它改口**，整个成员的检索能力等于归零，而同一次聚合里发 `path` 的另一个成员
+/// 7 次全部成功。
+///
+/// 判据取舍：与其指望模型读懂错误提示后自纠（实测不会），不如入口直接兼容。
+/// 这不是放宽安全边界 —— 取到值之后仍然过完整的三道路径防线。
+const ARG_ALIASES: &[(&str, &[&str])] = &[
+    // Claude Code 原生 Read/Edit 用 file_path；部分模型习惯 filename / filePath。
+    ("path", &["file_path", "filePath", "filename", "file", "target_file"]),
+    // rg 口径叫 regex/query；Claude Code 的 Grep 工具本身也用 pattern。
+    ("pattern", &["regex", "query", "search", "q"]),
+    // Claude Code 的 Grep 用 glob；部分模型发 include/file_pattern。
+    ("glob", &["include", "file_pattern", "filter"]),
+    ("start_line", &["startLine", "offset", "from_line"]),
+    ("end_line", &["endLine", "limit", "to_line"]),
+    ("depth", &["max_depth", "maxDepth", "recursive_depth"]),
+    ("keyword", &["symbol", "name", "term"]),
+    ("mode", &["kind", "type"]),
+];
+
+/// 按「正名 + 别名」顺序找出第一个存在的键。返回该键名，供取值与日志用。
+fn resolve_key<'a>(args: &Value, key: &'a str) -> Option<&'a str> {
+    if args.get(key).is_some_and(|v| !v.is_null()) {
+        return Some(key);
+    }
+    ARG_ALIASES
+        .iter()
+        .find(|(canon, _)| *canon == key)?
+        .1
+        .iter()
+        .copied()
+        .find(|a| args.get(*a).is_some_and(|v| !v.is_null()))
 }
 
-/// 取必填字符串参数。
+/// 取可选的正整数参数（含别名）。
+///
+/// 数字也接受字符串形态（`"120"`）：模型偶发把整数发成字符串，为此报错纯属自找麻烦。
+fn opt_u32(args: &Value, key: &str) -> Option<u32> {
+    let k = resolve_key(args, key)?;
+    let v = args.get(k)?;
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        .map(|n| n.min(u32::MAX as u64) as u32)
+}
+
+/// 取必填字符串参数（含别名）。
+///
+/// 失败提示里**列出接受的别名**：万一模型发的是别名之外的第三种名字，它能从提示里挑一个用，
+/// 而不是像日志里那样重复 8 轮同一个错。
 fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
-    args.get(key)
+    resolve_key(args, key)
+        .and_then(|k| args.get(k))
         .and_then(|v| v.as_str())
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("缺少必填参数 `{key}`（应为非空字符串）。"))
+        .ok_or_else(|| {
+            let aliases = ARG_ALIASES
+                .iter()
+                .find(|(canon, _)| *canon == key)
+                .map(|(_, a)| a.join("` / `"))
+                .unwrap_or_default();
+            if aliases.is_empty() {
+                format!("缺少必填参数 `{key}`（应为非空字符串）。")
+            } else {
+                format!(
+                    "缺少必填参数 `{key}`（应为非空字符串）。也接受这些等价写法：`{aliases}`。\
+                     请用其中任意一个重新调用。"
+                )
+            }
+        })
 }
 
 /// `read_file` 单次最多读取的字节数。与 walk_grep 的 per-file 2MB、rg 的 --max-filesize 一致。
@@ -610,8 +672,8 @@ const LIST_ENTRY_CAP: usize = 400;
 /// 敏感文件仍**列出**但标注不可读：文件名本身不是凭据，而让模型知道「这个存在但读不到」
 /// 比让它对一个看不见的文件反复试探更省轮次。
 fn list_dir_tool(env: &ToolEnv, args: &Value) -> Result<String, String> {
-    let rel = args
-        .get("path")
+    let rel = resolve_key(args, "path")
+        .and_then(|k| args.get(k))
         .and_then(|v| v.as_str())
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
@@ -694,8 +756,8 @@ const MAX_MATCH_LINES: usize = 120;
 /// [`is_sensitive_path`] 再交给模型 —— 这一层不是减噪，是防凭据外发。
 async fn grep_tool(env: &ToolEnv, args: &Value) -> Result<String, String> {
     let pattern = req_str(args, "pattern")?;
-    let glob = args
-        .get("glob")
+    let glob = resolve_key(args, "glob")
+        .and_then(|k| args.get(k))
         .and_then(|v| v.as_str())
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
@@ -899,8 +961,8 @@ async fn codegraph_tool(env: &ToolEnv, args: &Value) -> Result<String, String> {
         return Err("codegraph 不可用（未安装或该项目未建索引）。请改用 grep + read_file。".into());
     };
     let keyword = req_str(args, "keyword")?;
-    let mode = args
-        .get("mode")
+    let mode = resolve_key(args, "mode")
+        .and_then(|k| args.get(k))
         .and_then(|v| v.as_str())
         .map(|s| s.trim())
         .unwrap_or("symbols");
@@ -1590,6 +1652,100 @@ mod tests {
             assert_eq!(t.input_schema["type"], "object", "{} 的 schema 形状不对", t.name);
             assert!(!t.description.trim().is_empty(), "{} 缺描述", t.name);
         }
+        std::fs::remove_dir_all(&w).ok();
+    }
+
+    #[test]
+    fn read_file_accepts_claude_code_style_file_path_alias() {
+        // 真机回归（2026-08-02 日志实证）：claude-opus-4-8 连续 8 轮把路径发成 `file_path`
+        // （Claude Code 原生 Read 工具的参数名），每次都被判「缺少必填参数 path」拒掉，
+        // 报错没能让它改口 —— 该成员整轮检索能力归零，而同次聚合里发 `path` 的成员 7 次全成。
+        // 故入口必须兼容。去掉 ARG_ALIASES 里的 file_path，这条立刻变红。
+        let w = work("rf_alias");
+        let body: String = (1..=20).map(|i| format!("line{i}\n")).collect();
+        std::fs::create_dir_all(w.join("src/main/java")).unwrap();
+        std::fs::write(w.join("src/main/java/CustomThreadPool.java"), &body).unwrap();
+        let env = ToolEnv::bare(&w);
+
+        // 日志里那条被拒调用的原样形状
+        let out = read_file_tool(
+            &env,
+            &json!({ "file_path": "src/main/java/CustomThreadPool.java" }),
+        )
+        .expect("file_path 别名必须被接受（真机上模型就是这么发的）");
+        assert!(out.contains("1\tline1"), "{out}");
+
+        // 其余别名同样接受
+        for k in ["filePath", "filename", "file", "target_file"] {
+            assert!(
+                read_file_tool(&env, &json!({ k: "src/main/java/CustomThreadPool.java" })).is_ok(),
+                "别名 {k} 应被接受"
+            );
+        }
+        // 正名仍然优先且可用
+        assert!(read_file_tool(&env, &json!({ "path": "src/main/java/CustomThreadPool.java" })).is_ok());
+        std::fs::remove_dir_all(&w).ok();
+    }
+
+    #[test]
+    fn alias_resolution_does_not_weaken_path_defenses() {
+        // 关键：别名只影响「从哪个键取值」，取到之后三道防线一视同仁。
+        // 否则这次兼容就成了绕过凭据防线的后门。
+        let w = work("alias_def");
+        std::fs::write(w.join(".env"), "TOKEN=abc").unwrap();
+        let env = ToolEnv::bare(&w);
+        for k in ["path", "file_path", "filePath", "filename"] {
+            let e = read_file_tool(&env, &json!({ k: ".env" }))
+                .expect_err("凭据文件无论用哪个参数名都必须被拒");
+            assert!(e.contains("凭据"), "用 {k} 时的拒绝原因不对：{e}");
+            let e = read_file_tool(&env, &json!({ k: "../outside.txt" }))
+                .expect_err("逃逸路径无论用哪个参数名都必须被拒");
+            assert!(e.contains("相对路径"), "用 {k} 时的拒绝原因不对：{e}");
+        }
+        std::fs::remove_dir_all(&w).ok();
+    }
+
+    #[test]
+    fn missing_param_error_lists_accepted_aliases() {
+        // 万一模型发的是别名之外的第四种名字，提示里要给出可照抄的选项，
+        // 而不是像真机日志那样让它重复 8 轮同一个错。
+        let w = work("alias_msg");
+        let env = ToolEnv::bare(&w);
+        let e = read_file_tool(&env, &json!({ "nonsense_key": "a.rs" })).unwrap_err();
+        assert!(e.contains("path"), "{e}");
+        assert!(e.contains("file_path"), "提示应列出等价写法供模型照抄：{e}");
+        std::fs::remove_dir_all(&w).ok();
+    }
+
+    #[test]
+    fn numeric_params_accept_string_form_and_aliases() {
+        // 模型偶发把整数发成字符串（"120"），为此报错纯属自找麻烦。
+        let w = work("num_alias");
+        let body: String = (1..=200).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(w.join("a.rs"), body).unwrap();
+        let env = ToolEnv::bare(&w);
+        let out = read_file_tool(
+            &env,
+            &json!({ "file_path": "a.rs", "startLine": "5", "endLine": 7 }),
+        )
+        .unwrap();
+        assert!(out.contains("5\tline5") && out.contains("7\tline7"), "{out}");
+        assert!(!out.contains("line4") && !out.contains("line8"), "区间应精确：{out}");
+        std::fs::remove_dir_all(&w).ok();
+    }
+
+    #[tokio::test]
+    async fn grep_and_list_dir_accept_aliases_too() {
+        let w = work("gl_alias");
+        std::fs::create_dir_all(w.join("src")).unwrap();
+        std::fs::write(w.join("src/app.rs"), "let x = NEEDLE_Z;\n").unwrap();
+        let env = ToolEnv::bare(&w);
+        // grep：regex/query 是常见别名
+        let out = grep_tool(&env, &json!({ "regex": "NEEDLE_Z" })).await.unwrap();
+        assert!(out.contains("app.rs"), "grep 的 regex 别名应生效：{out}");
+        // list_dir：file_path 当目录名、max_depth 当深度
+        let out = list_dir_tool(&env, &json!({ "file_path": "src", "max_depth": 1 })).unwrap();
+        assert!(out.contains("app.rs"), "list_dir 别名应生效：{out}");
         std::fs::remove_dir_all(&w).ok();
     }
 

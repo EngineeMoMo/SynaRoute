@@ -505,6 +505,44 @@ impl ProviderKey {
         self.resolve_model_detail(requested_model).0
     }
 
+    /// 下游**完全没给模型名**时，为本 Key 选一个它一定能认的模型。
+    ///
+    /// 只在 `requested_model` 为空时用（见 `resolve_model_detail` 第 6 步的注释）。
+    /// 顺序：默认兜底 → 首个已知模型 → 任一映射的真实名 → 任一三档。
+    /// 全都没有则返回 `None`（该 Key 确实没有任何模型信息，只能让上游报错，
+    /// 此时硬编造一个名字反而会把「配置不全」伪装成「上游拒绝」）。
+    ///
+    /// **刻意不硬编码任何厂商模型名**：各 Key 指向不同中转商，写死
+    /// `claude-3-5-sonnet` 之类对只支持 GPT 的 Key 必然 404 —— 那是把一种错换成另一种错。
+    fn fallback_model_for_empty_request(&self) -> Option<String> {
+        if let Some(dm) = self
+            .default_model
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(dm.to_string());
+        }
+        if let Some(first) = self.models.first() {
+            return Some(first.real_name.clone());
+        }
+        // 映射的真实名同样是「本 Key 认得的模型」，可用
+        if let Some(m) = self
+            .mappings
+            .iter()
+            .find(|m| !m.real_name.trim().is_empty())
+        {
+            return Some(m.real_name.trim().to_string());
+        }
+        // 三档任一（顺序取 opus → sonnet → haiku，与家族默认口径一致）
+        [&self.tier_opus, &self.tier_sonnet, &self.tier_haiku]
+            .into_iter()
+            .flatten()
+            .map(|s| s.trim())
+            .find(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+
     /// 同 [`Self::resolve_model`]，额外返回命中路径，供日志写清「请求/实际/原因」。
     pub fn resolve_model_detail(&self, requested_model: &str) -> (String, ModelResolveKind) {
         // 0. 网关别名反解：CLI 只能展示 claude/anthropic 前缀 id，/v1/models 对非合规名
@@ -541,6 +579,25 @@ impl ProviderKey {
             return (first.real_name.clone(), ModelResolveKind::First);
         }
         // 6. 透传（透传剥后的名字，避免把别名原样打给上游）
+        //
+        // **空请求名的兜底**（2026-08-02 真机实证，勿删）：下游可能压根不传 `model`
+        // （Claude 桌面端的部分请求、部分客户端的非补全调用），此时 requested 是空串，
+        // 前 5 级全不命中而落到这里。若原样透传空串，上游一律回
+        // `400 model is required` / `Model name not specified` —— 实测一次会话里 16 次 400
+        // 全是这个形状，且**每个候选 Key 都会重打一遍**，最后报「全部 Key 失败」，
+        // 用户看到的是「所有中转商都挂了」，真实原因只是我们没填模型名。
+        //
+        // 更隐蔽的是日志：`log_request` 展示的是 `resolve_model` ���结果，
+        // 空串时写成「客户端要 ? → 实际用 <兜底名>」，看起来我们已经兜底了 —— 但那只是
+        // 展示层各算各的，请求体里塞的仍是空串。这正是本项目反复防的「看起来做了、实际没做」。
+        //
+        // 兜底顺序与上面一致（default_model → 首个模型），只是这里要在**空请求名**时也生效；
+        // 两者都没有则交给 `first_serviceable_or_family` 给一个该 Key 一定能认的名字。
+        if requested_model.is_empty() {
+            if let Some(fallback) = self.fallback_model_for_empty_request() {
+                return (fallback, ModelResolveKind::Default);
+            }
+        }
         (requested_model.to_string(), ModelResolveKind::Passthrough)
     }
 
@@ -648,6 +705,18 @@ impl ProviderKey {
         self.models
             .iter()
             .find(|m| m.real_name == real)
+            .and_then(|m| m.context_window)
+    }
+
+    /// 本 Key 里某个**真实模型名**的上下文窗口（token）。
+    ///
+    /// 与 [`Self::context_window_for_outward`] 的分工：那个用于桌面端 `supports1m`
+    /// **能力断言**（故要求命中 Mapping/Tier/Native 才敢断言）；这个用于转发时判断
+    /// 「本次实际要打的模型是否 1M」，输入已是解析后的真实名，直接查表即可。
+    pub fn context_window_of_real(&self, real_name: &str) -> Option<u32> {
+        self.models
+            .iter()
+            .find(|m| m.real_name == real_name)
             .and_then(|m| m.context_window)
     }
 
@@ -1063,6 +1132,65 @@ mod tests {
 
     fn mapping(expected: &str, real: &str) -> ModelMapping {
         ModelMapping { id: "m".into(), expected_name: expected.into(), real_name: real.into() }
+    }
+
+    #[test]
+    fn empty_request_model_never_passes_through_as_empty() {
+        // 真机回归（2026-08-02 日志实证）：下游未传 model 时，前 5 级解析全不命中，
+        // 原样透传空串 → 上游一律 400「model is required / Model name not specified」，
+        // 且**每个候选 Key 都重打一遍**，最终报「全部 Key 失败」，用户以为所有中转商都挂了。
+        // 一次会话里 16 次 400 全是这个形状。
+        //
+        // 更隐蔽的是日志会写成「客户端要 ? → 实际用 gpt-5.5」——展示层自己算了兜底，
+        // 而请求体里塞的仍是空串，属「看起来做了、实际没做」。
+
+        // ① 有 default_model → 用它
+        let k = key_with(vec![model("gpt-5.5")], vec![], Some("gpt-5.5"));
+        let (m, kind) = k.resolve_model_detail("");
+        assert_eq!(m, "gpt-5.5", "空请求名必须落到默认兜底，不能是空串");
+        assert_eq!(kind, ModelResolveKind::Default);
+
+        // ② 无 default_model 但有模型列表 → 用首个
+        let k = key_with(vec![model("claude-opus-4-8"), model("x")], vec![], None);
+        assert_eq!(k.resolve_model(""), "claude-opus-4-8");
+
+        // ③ 只配了映射（没填模型列表）→ 用映射的真实名
+        let k = key_with(vec![], vec![mapping("claude-opus-4-8", "glm-4.6")], None);
+        assert_eq!(k.resolve_model(""), "glm-4.6");
+
+        // ④ 什么都没配 → 只能返回空串（此时硬编造模型名会把「配置不全」
+        //    伪装成「上游拒绝」，反而更难排查）
+        let k = key_with(vec![], vec![], None);
+        assert_eq!(k.resolve_model(""), "");
+
+        // ⑤ 关键反例：非空请求名的行为**不得**被这条兜底改变
+        let k = key_with(vec![model("gpt-5.5")], vec![], Some("gpt-5.5"));
+        assert_eq!(
+            k.resolve_model("claude-opus-4-7"),
+            "gpt-5.5",
+            "非空请求名仍走原有的默认兜底路径"
+        );
+        let k = key_with(vec![model("kimi-k2")], vec![], None);
+        assert_eq!(
+            k.resolve_model("kimi-k2"),
+            "kimi-k2",
+            "原生支持的模型名必须原样保留"
+        );
+    }
+
+    #[test]
+    fn empty_request_model_prefers_tier_when_only_tiers_configured() {
+        // 只配了三档（无模型列表、无映射、无默认）的 Key 也要能兜底 ——
+        // 否则这类 Key 遇到「下游不传 model」时仍会 400。
+        let mut k = key_with(vec![], vec![], None);
+        k.tier_sonnet = Some("glm-4.6".into());
+        k.tier_opus = Some("deepseek-v3".into());
+        // 顺序 opus → sonnet → haiku，与家族默认口径一致
+        assert_eq!(k.resolve_model(""), "deepseek-v3");
+
+        let mut k2 = key_with(vec![], vec![], None);
+        k2.tier_haiku = Some("qwen-turbo".into());
+        assert_eq!(k2.resolve_model(""), "qwen-turbo");
     }
 
     #[test]
