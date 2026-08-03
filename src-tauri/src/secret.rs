@@ -584,7 +584,18 @@ pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> AppResult<()> {
         None => std::path::PathBuf::from(format!("{file_name}.{}.{seq}.tmp", std::process::id())),
     };
 
-    std::fs::write(&tmp, data).map_err(|e| ctx("写临时文件", &e))?;
+    // 写临时文件失败时**必须清掉它自己**：`?` 直接返回会把一个可能半写入的 .tmp 留在
+    // 数据目录里（本机实测存在 `config.json.4752.4.tmp` 这类 0 字节残留）。后续两条
+    // 清理路径（rename 成功 / 回退原地写）都在这一行之后，覆盖不到这里。
+    //
+    // 残留的实际危害不在磁盘空间，而在**排障干扰**：本项目的诊断高度依赖「看数据目录的
+    // 文件清单」（见 CLAUDE.md 的 MSIX 复发速查），散着几个 .tmp 会让人误判成
+    // 「落盘正在进行」或「上次写坏了」。且若失败发生在部分写入之后，残留文件会含上一次
+    // 配置的完整内容（base_url、映射等；密钥不在 config 里）。
+    if let Err(e) = std::fs::write(&tmp, data) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ctx("写临时文件", &e));
+    }
 
     // ERROR_NOT_SAME_DEVICE：跨设备移动，重试无意义，直接回退原地写。
     const ERROR_NOT_SAME_DEVICE: i32 = 17;

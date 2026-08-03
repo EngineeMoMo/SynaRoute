@@ -645,7 +645,7 @@ async fn handle_request(
         // 先探上游状态码：非 2xx 则照常切换下一个 Key（首字节尚未发出，切换安全）；
         // 2xx 则把上游 SSE 流原样转给下游，正确设置 content-type，直接返回（不再切换）。
         if wants_stream && can_stream(key) {
-            match try_stream_to_key(&store, category, key, &path, &req_json, &requested_model, &fwd_headers)
+            match try_stream_to_key(&store, category, key, &path, &req_json, &requested_model, &fwd_headers, req_log)
                 .await
             {
                 Ok(StreamAttempt::Streaming { resp, url, real_model, request_body }) => {
@@ -741,12 +741,19 @@ async fn handle_request(
         }
 
         let result =
-            forward_to_key(&store, category, key, &path, &req_json, &requested_model, &fwd_headers)
+            forward_to_key(&store, category, key, &path, &req_json, &requested_model, &fwd_headers, req_log)
                 .await;
         let elapsed = started.elapsed().as_millis() as u64;
         match result {
             Ok(outcome) if outcome.ok => {
-                let resp_text = String::from_utf8_lossy(&outcome.bytes).to_string();
+                // 响应体快照只在开关开启时构造：唯一去向是下面的 log_success，
+                // 而它在 `req_log` 关闭时直接 return。成功响应体常态几十 KB~几百 KB
+                // （流式以外的完整回答），默认关日志时这份 to_string() 是纯浪费。
+                let resp_text = if req_log {
+                    String::from_utf8_lossy(&outcome.bytes).to_string()
+                } else {
+                    String::new()
+                };
                 health::record_live_success(&store, &key.id);
                 // 有 Key 能用了 → 立即解除「全部失败」短路，不等窗口自然到期。
                 clear_all_failed_gate(&gate_key);
@@ -755,24 +762,34 @@ async fn handle_request(
                 let usage = serde_json::from_slice::<Value>(&outcome.bytes)
                     .ok()
                     .and_then(|v| crate::upstream::extract_usage(&v));
+                // 解构取走三个 String（url / real_model / request_body），消掉三次 clone。
+                // `bytes` 是 `Bytes`（引用计数，clone 廉价）留到最后回给下游；`status` 是 Copy。
+                // 这是本分支对 outcome 的最后一次使用，故可以整体移动而非借用。
+                let ForwardOutcome { bytes, url, real_model, request_body, status, .. } = outcome;
                 log_success(
                     &store,
                     key,
                     elapsed,
-                    outcome.url.clone(),
-                    outcome.real_model.clone(),
-                    outcome.request_body.clone(),
+                    url,
+                    real_model,
+                    request_body,
                     resp_text,
-                    outcome.status,
+                    status,
                     false,
                     usage,
                 );
-                return Ok(json_resp(StatusCode::OK, outcome.bytes));
+                return Ok(json_resp(StatusCode::OK, bytes));
             }
             // 上游有响应但非 2xx：记完整快照（含上游返回的真实错误体），再切下一个
             Ok(outcome) => {
-                let resp_text = String::from_utf8_lossy(&outcome.bytes).to_string();
-                let snippet: String = resp_text.trim().chars().take(400).collect();
+                // snippet 必须**无条件**产生：它进 `last_err`，最终作为错误信息返回给客户端，
+                // 与日志开关无关。但不必为此先把整个响应体 to_string()——直接在借用的
+                // Cow 上 trim + 取前 400 **字符**（`chars()` 而非字节切片：上游错误体常含中文，
+                // 按字节截会切裂多字节序列）。
+                let resp_cow = String::from_utf8_lossy(&outcome.bytes);
+                let snippet: String = resp_cow.trim().chars().take(400).collect();
+                // 完整响应体只在开关开启时落成 String（唯一去向是下面的 log_request）。
+                let resp_text = if req_log { resp_cow.into_owned() } else { String::new() };
                 last_err = if snippet.is_empty() {
                     format!("HTTP {}", outcome.status)
                 } else {
@@ -782,15 +799,18 @@ async fn handle_request(
                     retry_after_hint = Some(retry_after_hint.map_or(s, |cur: i64| cur.min(s)));
                 }
                 last_status = Some(outcome.status);
+                // 解构取走三个 String，消掉三次 clone（本分支对 outcome 的最后一次使用）。
+                // 必须放在 `resp_cow` 用完之后：它借用了 `outcome.bytes`。
+                let ForwardOutcome { url, real_model, request_body, status, .. } = outcome;
                 log_request(
                     &store,
                     key,
                     elapsed,
-                    outcome.url.clone(),
-                    outcome.real_model.clone(),
-                    outcome.request_body.clone(),
+                    url,
+                    real_model,
+                    request_body,
                     resp_text,
-                    Some(outcome.status),
+                    Some(status),
                     false,
                 );
                 // 429/5xx 临时错误只切、不罚（不熔断好 Key）；4xx 硬错误才计入熔断。
@@ -1071,6 +1091,8 @@ async fn try_stream_to_key(
     req_json: &Value,
     requested_model: &str,
     fwd_headers: &[(String, String)],
+    // 见 `forward_to_key` 同名形参：仅用于决定是否构造只喂给日志的请求体快照。
+    req_log: bool,
 ) -> AppResult<StreamAttempt> {
     let secret = store
         .secrets
@@ -1246,7 +1268,12 @@ async fn try_stream_to_key(
         .map_err(|e| AppError::Upstream(e.to_string()))?;
 
     // 转换后发往上游的请求体快照（供调用模型日志核对 reasoning→thinking 等映射）。
-    let request_body = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+    // 开关关闭时不构造——理由同 `forward_to_key` 内同名变量（三处同进同退）。
+    let request_body = if req_log {
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
+    } else {
+        String::new()
+    };
     Ok(StreamAttempt::Streaming {
         resp: response,
         url,
@@ -1359,6 +1386,10 @@ async fn forward_to_key(
     req_json: &Value,
     requested_model: &str,
     fwd_headers: &[(String, String)],
+    // 调用模型日志开关（默认关）。由调用方传入而非在此重读 settings：
+    // 一次转发里同一开关要被判多次，且调用方 `handle_request` 已在 `:449` 取过一次。
+    // 传进来的唯一用途是决定「要不要构造那些只喂给日志的大字符串」——见下方 request_body。
+    req_log: bool,
 ) -> AppResult<ForwardOutcome> {
     let secret = store
         .secrets
@@ -1380,8 +1411,23 @@ async fn forward_to_key(
     // 跨协议转换（下游协议 → 上游 Key 协议；同协议时 convert_request 内部直接返回克隆）
     let payload = crate::upstream::convert_request(&payload, downstream, key.protocol);
 
-    // 发往上游的请求体快照（pretty，方便页面阅读；密钥不在 body 里，安全）
-    let request_body = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+    // 发往上游的请求体快照（pretty，方便页面阅读；密钥不在 body 里，安全）。
+    //
+    // **开关关闭时不构造**：与 `handle_request` 里 `downstream_body`（`:457`）同一理由——
+    // 这份字符串唯一去向是 `ForwardOutcome.request_body`，而它的两个消费点
+    // （`:766` 成功分支、`:790` 失败分支）都被 `req_log` 门控的 `log_success` / `log_request`
+    // 吃掉。开关关着时那两个闭包直接 return，这里 pretty-print 一个可达十几万字符的
+    // body（Codex 常态 100~200 KB，pretty 后约 1.3~1.6 倍）纯属白做，还要在失败分支
+    // 被 clone 一次。`request_log_enabled` 默认 false，即绝大多数用户的绝大多数请求
+    // 都在白做这件事。
+    //
+    // 历史：`downstream_body` 那处早先已加守卫，但**同类的这处与流式那处当时漏了**
+    // （docs/14 效率整治表已就此勘误）。三处必须同进同退。
+    let request_body = if req_log {
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
+    } else {
+        String::new()
+    };
 
     // 目标 URL + 鉴权。
     // 同协议：原样保留下游路径 + query（count_tokens 等子路径正确透传）。

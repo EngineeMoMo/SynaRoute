@@ -342,12 +342,25 @@ impl Store {
     /// 而前端只在**用户展开某一行**时才用 trace（其余时刻整份都是传过去就扔）。
     /// 展开时另走 [`Self::event_trace`] 按 id 单取一条。
     fn strip_trace(e: &EventLogEntry) -> EventLogEntry {
+        // 逐字段构造，**不 clone trace**。绝不能用 `..e.clone()`：Rust 函数式更新语法会
+        // 先**完整求值** `e.clone()`（含 request_body/response_body 各上限 20000 字符），
+        // 再从完整克隆里移出剩余字段，被覆盖的那份 trace 克隆随即析构——500 条满载时
+        // 每次列表轮询白分配并释放约 500×2×20000 ≈ 2000 万字符（≈19 MB），每 2s 一轮。
+        // 这在排障（开日志）这个最需要界面顺滑的时刻，反而让分配器最忙。
         EventLogEntry {
+            id: e.id.clone(),
+            ts: e.ts,
+            category_id: e.category_id,
+            kind: e.kind.clone(),
+            key_id: e.key_id.clone(),
+            detail: e.detail.clone(),
+            repeat: e.repeat,
             // has_trace 必须留下：前端靠它决定「这行能不能展开」。剥的是正文，不是存在性。
             has_trace: e.trace.is_some(),
+            // collapse_key 是内部折叠判据，不下发前端。
+            collapse_key: None,
+            usage: e.usage.clone(),
             trace: None,
-            collapse_key: None, // 内部折叠判据，不下发前端
-            ..e.clone()
         }
     }
 
@@ -820,6 +833,39 @@ impl Store {
             Ok(())
         })?;
         Ok(ids.len())
+    }
+
+    /// 在**单个写锁临界区内**原地读改某 Key 的健康态，闭包返回「本次是否需要落盘」。
+    ///
+    /// 为什么需要它（对比 `update_health` 的「先 get_key 再 update_health」用法）：
+    /// 1. **消除丢失更新**。旧用法 `let prev = store.get_key(..)` → 计算 → `update_health(..)`
+    ///    跨了两个独立临界区。两个并发失败可能都读到 `fail_count == 1`，各自算出 2 写回，
+    ///    实际应为 3 —— 表现为**熔断比预期迟钝**（要多几次失败才触发），且并发越高越迟钝。
+    ///    这类 bug 不会报错，只会让熔断阈值悄悄失准。
+    /// 2. **省两次整 Key 深克隆**。`get_key` 返回的是整个 `ProviderKey` 的 clone
+    ///    （含 `models` / `mappings` 两个 Vec），而调用方只要 6 个 Copy 标量。
+    ///    这落在**每个请求的必经收尾路径**上（`record_live_success` / `record_live_failure`）。
+    ///
+    /// **闭包内绝不可再调用任何会取 `self.config` 锁的 Store 方法**（parking_lot 非重入，
+    /// 会直接自死锁）。闭包只该做纯计算。
+    ///
+    /// 落盘判定交给闭包而非在此比较：调用方比我们更清楚「哪些字段变化才值得写盘」
+    /// （见 `update_health` 的注释——latency/last_checked 每轮都变但不必持久化）。
+    pub fn mutate_health<F>(&self, key_id: &str, f: F) -> AppResult<()>
+    where
+        F: FnOnce(&mut HealthState) -> bool,
+    {
+        let need_persist = {
+            let mut cfg = self.config.write();
+            match cfg.keys.iter_mut().find(|k| k.id == key_id) {
+                Some(k) => f(&mut k.health),
+                None => false,
+            }
+        };
+        if need_persist {
+            self.persist()?;
+        }
+        Ok(())
     }
 
     /// 更新某 Key 的健康状态（健康检查模块调用）。
@@ -1593,6 +1639,69 @@ mod tests {
         let last = ev.last().unwrap();
         assert_eq!(last.repeat, 2);
         assert_eq!(last.usage.map(|x| (x.input, x.output)), Some((70, 8)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `strip_trace` 逐字段构造：正文必须剥掉、存在性必须留下、**其余字段一个都不能漏**。
+    ///
+    /// 为什么专门补这条：`strip_trace` 从 `..e.clone()` 改成逐字段构造（避免先深拷贝
+    /// 20000×2 字符的 trace 再丢弃），代价是**将来给 `EventLogEntry` 加字段时编译器不会报错**，
+    /// 会静默漏传（表现为 UI 上某列永远是默认值，且没有任何报错）。故这里逐字段断言，
+    /// 让漏传变成测试失败而不是线上静默缺字段。
+    #[test]
+    fn strip_trace_drops_body_keeps_every_other_field() {
+        let dir = temp_dir("strip_trace_fields");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        let big = "X".repeat(20_000);
+        let trace = RequestTrace {
+            key_name: "K名".into(),
+            vendor: "厂商".into(),
+            protocol: Protocol::Anthropic,
+            url: "https://u.example/v1/messages".into(),
+            requested_model: "对外名".into(),
+            real_model: "真实名".into(),
+            request_body: big.clone(),
+            response_body: big.clone(),
+            status: Some(200),
+            latency_ms: 1234,
+            ok: true,
+        };
+        store.append_event_full(
+            CategoryType::Codex,
+            "request",
+            Some("k9"),
+            "详情文本",
+            Some(trace),
+            None,
+            Some(crate::upstream::TokenUsage { input: 11, output: 22, cache_read: 33 }),
+        );
+
+        let ev = store.list_all_events();
+        assert_eq!(ev.len(), 1);
+        let got = &ev[0];
+
+        // 剥掉正文、保留存在性——这是本函数存在的唯一理由。
+        assert!(got.trace.is_none(), "列表接口必须剥掉 trace 正文");
+        assert!(got.has_trace, "但必须留下 has_trace，否则前端无从判断该行能否展开");
+        assert!(got.collapse_key.is_none(), "内部折叠判据不下发前端");
+
+        // 其余字段逐个核对：漏传任何一个都在这里失败。
+        assert!(!got.id.is_empty(), "id 不能丢（前端按 id 单取 trace）");
+        assert!(got.ts > 0, "ts 不能丢");
+        assert_eq!(got.category_id, CategoryType::Codex, "category_id 不能丢");
+        assert_eq!(got.kind, "request", "kind 不能丢");
+        assert_eq!(got.key_id.as_deref(), Some("k9"), "key_id 不能丢");
+        assert_eq!(got.detail, "详情文本", "detail 不能丢");
+        assert_eq!(got.repeat, 1, "repeat 不能丢");
+        let u = got.usage.as_ref().expect("usage 不能丢");
+        assert_eq!((u.input, u.output, u.cache_read), (11, 22, 33), "usage 三个分量都不能丢");
+
+        // 按 id 单取仍能拿到完整正文（剥的只是列表，不是存储）。
+        let full = store.event_trace(&got.id).expect("按 id 应能取回完整 trace");
+        assert_eq!(full.request_body.len(), 20_000, "存储侧正文不应被截断或剥掉");
+        assert_eq!(full.response_body.len(), 20_000);
 
         std::fs::remove_dir_all(&dir).ok();
     }

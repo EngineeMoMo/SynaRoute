@@ -100,53 +100,49 @@ pub async fn check_one(store: &Arc<Store>, key_id: &str) {
 /// 注意：只动 fail_count / breaker_until，不改 status（status 交给后台探测维护，
 /// 避免设 Down 后 is_candidate 永久拒绝、而实时流量又进不来无法恢复的死锁）。
 pub fn record_live_failure(store: &Arc<Store>, key_id: &str) {
-    let prev = store.get_key(key_id).map(|k| k.health).unwrap_or_default();
     let now = Utc::now().timestamp_millis();
-    let fail_count = prev.fail_count.saturating_add(1);
-    let breaker_until = if fail_count >= BREAKER_THRESHOLD {
-        Some(now + BREAKER_COOLDOWN_MS)
-    } else {
-        prev.breaker_until
-    };
-    let _ = store.update_health(
-        key_id,
-        HealthState {
-            status: prev.status,
-            last_checked: prev.last_checked,
-            latency_ms: prev.latency_ms,
-            fail_count,
-            breaker_until,
-            last_live_success: prev.last_live_success,
-        },
-    );
+    // 走 `mutate_health` 而非「get_key → 算 → update_health」：后者跨两个临界区，
+    // 两个并发失败会都读到同一个 prev.fail_count 各自 +1 写回，导致熔断迟钝
+    // （详见 Store::mutate_health 的文档）。这里 read-modify-write 在同一个写锁内完成。
+    let _ = store.mutate_health(key_id, |h| {
+        h.fail_count = h.fail_count.saturating_add(1);
+        if h.fail_count >= BREAKER_THRESHOLD {
+            h.breaker_until = Some(now + BREAKER_COOLDOWN_MS);
+        }
+        // status / last_checked / latency_ms / last_live_success 一概不动：
+        // status 交给后台探测维护（改这里会造成「设 Down 后 is_candidate 永久拒绝、
+        // 实时流量又进不来无法恢复」的死锁，见函数头注释）。
+        //
+        // 落盘判据与 update_health 保持一致：只有熔断相关字段变了才写。fail_count 每次
+        // 必变，故这里恒为 true —— 与旧行为等价（旧代码 fail_count 变化即触发 persist）。
+        true
+    });
 }
 
 /// 把一次「实时转发成功」计入熔断器：清零 fail_count、解除熔断，标记 Up。
 /// 让恢复的 Key 立即回到候选池（无需等下一次后台探测）。
 pub fn record_live_success(store: &Arc<Store>, key_id: &str) {
-    let prev = store.get_key(key_id).map(|k| k.health).unwrap_or_default();
     let now = Utc::now().timestamp_millis();
-    // 已健康、无熔断残留、且 last_live_success 仍新鲜：无需写盘（避免高频请求每次都写）。
-    // 但若时间戳偏旧（超过宽限窗口一半），仍刷新一次，让「近期成功」宽限窗口在持续流量下不失效。
-    let fresh = prev
-        .last_live_success
-        .map(|t| now - t < LIVE_SUCCESS_GRACE_MS / 2)
-        .unwrap_or(false);
-    if prev.fail_count == 0 && prev.breaker_until.is_none() && prev.status == HealthStatus::Up && fresh
-    {
-        return;
-    }
-    let _ = store.update_health(
-        key_id,
-        HealthState {
-            status: HealthStatus::Up,
-            last_checked: prev.last_checked,
-            latency_ms: prev.latency_ms,
-            fail_count: 0,
-            breaker_until: None,
-            last_live_success: Some(now),
-        },
-    );
+    let _ = store.mutate_health(key_id, |h| {
+        // 已健康、无熔断残留、且 last_live_success 仍新鲜：内存与磁盘都无需动
+        // （避免高频请求每次都写盘——这是热路径上最值钱的一处抑制，见 Store::update_health）。
+        // 但若时间戳偏旧（超过宽限窗口一半），仍刷新一次，让「近期成功」宽限窗口
+        // 在持续流量下不失效。
+        let fresh = h
+            .last_live_success
+            .map(|t| now - t < LIVE_SUCCESS_GRACE_MS / 2)
+            .unwrap_or(false);
+        if h.fail_count == 0 && h.breaker_until.is_none() && h.status == HealthStatus::Up && fresh {
+            return false; // 稳态成功路径：**完全不落盘**
+        }
+        // 需要写：清零熔断计数、解除熔断、标 Up，让恢复的 Key 立即回到候选池。
+        h.status = HealthStatus::Up;
+        h.fail_count = 0;
+        h.breaker_until = None;
+        h.last_live_success = Some(now);
+        // last_checked / latency_ms 保持不动（那是探测的观测量，不是转发的）。
+        true
+    });
 }
 
 /// 判断某 Key 当前是否可作为路由候选。
@@ -264,6 +260,74 @@ mod tests {
             HealthStatus::Up,
             "整轮探测同样必须跳过"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 并发失败**不得丢计数**：N 个并发 `record_live_failure` 必须精确累加成 N。
+    ///
+    /// 补这条的理由：旧实现是「`get_key` 读锁取 prev → 算 → `update_health` 写锁」，
+    /// 跨两个独立临界区。两个并发失败会都读到 `fail_count == 1`、各自算出 2 写回，
+    /// 真实值应为 3 —— 表现为**熔断比预期迟钝**（要多失败几次才触发），并发越高越迟钝。
+    /// 这类 bug 不报错、不 panic，只让阈值悄悄失准，靠读代码很难发现。
+    /// 改走 `Store::mutate_health` 后 read-modify-write 在同一写锁内完成。
+    #[test]
+    fn concurrent_failures_never_lose_count() {
+        use crate::model::{CategoryType, KeyParams, Protocol, ProviderKey};
+        let dir = std::env::temp_dir().join(format!(
+            "synaroute_health_race_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        store
+            .upsert_key(ProviderKey {
+                id: "k1".into(),
+                category_id: CategoryType::ClaudeCli,
+                name: "k".into(),
+                vendor: "test".into(),
+                base_url: "http://127.0.0.1:1".into(),
+                protocol: Protocol::Anthropic,
+                has_secret: false,
+                enabled: true,
+                priority: 0,
+                headers_json: None,
+                params: KeyParams::default(),
+                models: vec![],
+                mappings: vec![],
+                default_model: None,
+                tier_haiku: None,
+                tier_sonnet: None,
+                tier_opus: None,
+                health: HealthState::default(),
+            })
+            .unwrap();
+
+        // 8 线程 × 各记 1 次失败。旧实现下这里会稳定小于 8。
+        const N: u32 = 8;
+        std::thread::scope(|s| {
+            for _ in 0..N {
+                let st = Arc::clone(&store);
+                s.spawn(move || record_live_failure(&st, "k1"));
+            }
+        });
+
+        let h = store.get_key("k1").unwrap().health;
+        assert_eq!(h.fail_count, N, "并发失败必须精确累加，丢一次都会让熔断阈值失准");
+        assert!(
+            h.breaker_until.is_some(),
+            "累计已远超阈值 {BREAKER_THRESHOLD}，必须已武装熔断"
+        );
+
+        // 一次成功即清零并解除熔断（让恢复的 Key 立刻回到候选池）。
+        record_live_success(&store, "k1");
+        let h = store.get_key("k1").unwrap().health;
+        assert_eq!(h.fail_count, 0, "成功必须清零计数");
+        assert!(h.breaker_until.is_none(), "成功必须解除熔断");
+        assert_eq!(h.status, HealthStatus::Up);
 
         std::fs::remove_dir_all(&dir).ok();
     }

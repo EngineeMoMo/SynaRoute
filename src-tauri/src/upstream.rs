@@ -4170,6 +4170,33 @@ pub fn shared_client() -> reqwest::Client {
         .get_or_init(|| {
             reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(30))
+                // ---- 连接池与保活：针对「突发 + 长空闲」的桌面代理流量特征 ----
+                //
+                // 为什么要显式设：reqwest 的 `pool_idle_timeout` 默认 **90 秒**，而桌面代理的
+                // 真实流量是「用户问一句 → 想几分钟 → 再问一句」。默认值下每次「想一会儿再问」
+                // 都超过 90s，连接已被回收，下一发要重做 TCP 三次握手 + 完整 TLS 握手；
+                // 跨境到中转商 RTT 常 100~300ms、完整握手 2~3 个 RTT，即**每次白付
+                // 300~900ms 首字节延迟**。这是用户能直接感知的卡顿，且极易被误读成「上游慢」
+                // 或「这个 Key 不行」，从而引导错误的排查方向。
+                //
+                // 取值理由：
+                // - `pool_idle_timeout(300s)`：覆盖典型思考间隔（几分钟），比 90s 默认宽裕。
+                //   不设更长是因为中转商侧通常也有空闲上限，本地留着已被对端关掉的连接
+                //   反而要多付一次失败重连。
+                // - `pool_max_idle_per_host(8)`：单请求只用一条连接，8 条足够覆盖故障转移与
+                //   健康探测并发；上界存在是为了避免多 Key 场景下空闲连接无限累积。
+                // - `tcp_keepalive(60s)`：家用路由器 / NAT 会静默丢弃空闲映射，
+                //   没有 keepalive 时表现为「连接看着还在、一写就 reset」。
+                //
+                // 注：**当前是 HTTP/1.1 连接池**——`Cargo.toml` 里 reqwest 是
+                // `default-features = false` 且未开 `http2` feature，故不存在 h2 多路复用，
+                // 也就没有 `http2_keep_alive_*` 可设（编译期即报错）。h1 下「一连接一请求」，
+                // 靠上面的池上限与保活即可。是否开启 h2 需单独评估：它会改变与**所有**上游的
+                // ALPN 协商结果，部分中转商网关对 h2 的行为与 h1 不同，属于需要真机验证的改动，
+                // 不应与本轮的纯增益调参混在一起。
+                .pool_idle_timeout(Duration::from_secs(300))
+                .pool_max_idle_per_host(8)
+                .tcp_keepalive(Duration::from_secs(60))
                 .build()
                 .expect("构建共享 HTTP 客户端失败")
         })
