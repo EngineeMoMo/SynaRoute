@@ -414,6 +414,50 @@ impl Store {
     ///   已落盘变更），而非内存 snapshot 整份覆盖。snapshot 仅作「连磁盘都读不回来」的兜底。
     ///
     /// CRUD 为低频用户操作，整份 clone 成本可忽略。
+    /// 同 [`Self::mutate_and_persist`]，但闭包返回 `bool` 表示**是否真的产生了变化**：
+    /// `false` 时跳过落盘（幂等写入的快路径），`true` 时落盘且失败走同一套磁盘对账回滚。
+    ///
+    /// 为什么需要这个变体：`set_active_model` / `set_proxy_port` 这类「后端自管字段专用写入」
+    /// 大量是幂等调用（前端每次切页都可能重发同一个值）。无条件 persist 会把 20KB 的整份
+    /// config 反复重写；而若为省这次写盘就退回「裸 persist + 提前 return」的老写法，就又丢掉了
+    /// 落盘失败回滚——两者不该二选一。
+    ///
+    /// 注意：闭包返回 `false` 时**内存改动仍然保留**（本函数不回滚它）。这是刻意的：
+    /// 调用方的契约是「返回 false ⟺ 没改任何东西」。若闭包既改了内存又返回 false，
+    /// 会造成内存领先磁盘——正是本函数要防的那件事。所有调用点都遵守该契约。
+    fn mutate_and_persist_when<F, R>(&self, f: F) -> AppResult<R>
+    where
+        F: FnOnce(&mut AppConfig) -> (R, bool),
+    {
+        // 快照必须在改内存之前取（回滚基线），但只有真要落盘时才用得上。
+        let snapshot = self.config.read().clone();
+        let (value, changed) = {
+            let mut cfg = self.config.write();
+            f(&mut cfg)
+        };
+        if !changed {
+            // 契约：`false` ⟺ 没改任何东西 → 无需落盘，也无需回滚。
+            return Ok(value);
+        }
+        match self.persist() {
+            Ok(()) => Ok(value),
+            Err(e) => {
+                // 与 mutate_and_persist 同一套：从磁盘对账回滚，既撤销本次未落盘的脏改，
+                // 又保留并发写者已提交的变更（详见那个函数的文档）。
+                self.rollback_from_disk(snapshot);
+                Err(e)
+            }
+        }
+    }
+
+    /// [`Self::mutate_and_persist_when`] 的无返回值简写。
+    fn mutate_and_persist_if<F>(&self, f: F) -> AppResult<()>
+    where
+        F: FnOnce(&mut AppConfig) -> bool,
+    {
+        self.mutate_and_persist_when(|cfg| ((), f(cfg)))
+    }
+
     fn mutate_and_persist<F, R>(&self, f: F) -> AppResult<R>
     where
         F: FnOnce(&mut AppConfig) -> AppResult<R>,
@@ -872,6 +916,15 @@ impl Store {
     /// 仅当「熔断相关」字段（status / fail_count / breaker_until）变化时才落盘——
     /// last_checked / latency 每轮都变但无需持久化（内存态已更新，UI 走内存态实时展示），
     /// 避免后台健康检查每轮对每个 Key 都整份重写 config.json，减少磁盘写与锁竞争。
+    ///
+    /// ⚠️ **本方法与 [`Self::mutate_health`] 是全仓刻意保留的两处裸 `persist()`，勿「顺手统一」
+    /// 到 `mutate_and_persist`**（其余 12 处已于 2026-08-03 全部改走带回滚的版本）。理由：
+    /// - 调用频率是**每请求 + 每探测轮 × 每 Key**，而 `mutate_and_persist` 每次都要 clone
+    ///   整份 `AppConfig` 做回滚快照——代价与收益严重不对称；
+    /// - 健康态是**可重建的瞬态**：真实流量与下一轮探测会立刻重新得出结论，
+    ///   丢一次落盘不会留下需要人工修的错账（这与「厂商保存成功但重启消失」性质完全不同）。
+    ///
+    /// 换言之：这里容忍「内存领先磁盘」，因为该背离会被下一次流量自动抹平。
     pub fn update_health(&self, key_id: &str, health: HealthState) -> AppResult<()> {
         let changed = {
             let mut cfg = self.config.write();
@@ -1093,61 +1146,57 @@ impl Store {
     /// 设置某分类当前选定的对外模型名（后端自管字段专用写入，绕过 save_settings 的旧快照覆盖）。
     /// 空串视为清除该分类的选择（回到「透传客户端发来的模型名」）。已是目标值则幂等跳过写盘。
     pub fn set_active_model(&self, category: &str, model: &str) -> AppResult<()> {
-        {
-            let mut cfg = self.config.write();
+        // 走 `mutate_and_persist_if`：落盘失败时磁盘对账回滚。旧写法是「改内存 → persist()」，
+        // 落盘失败即内存领先磁盘，而该方向**永不自愈**（mtime 自愈只认「磁盘比内存新」）——
+        // 表现为用户在应用内改选的模型「看着生效了」，重启后悄悄回退。
+        self.mutate_and_persist_if(|cfg| {
             let trimmed = model.trim();
             if trimmed.is_empty() {
-                if cfg.settings.active_models.remove(category).is_none() {
-                    return Ok(());
-                }
+                // 本来就没有该项 → 无变化，不必落盘（幂等）。
+                cfg.settings.active_models.remove(category).is_some()
+            } else if cfg.settings.active_models.get(category).map(|s| s.as_str()) == Some(trimmed) {
+                false
             } else {
-                if cfg.settings.active_models.get(category).map(|s| s.as_str()) == Some(trimmed) {
-                    return Ok(());
-                }
                 cfg.settings
                     .active_models
                     .insert(category.to_string(), trimmed.to_string());
+                true
             }
-        }
-        self.persist()
+        })
     }
 
     /// 设置某分类的「默认推理强度」（Codex 用；后端自管字段专用写入，绕过 save_settings 旧快照覆盖）。
     /// 空串视为清除（回到不注入、保持上游默认）。已是目标值则幂等跳过写盘。
     /// 取值：low/medium/high/xhigh（minimal 亦可，映射侧按不开思考处理）。
     pub fn set_active_effort(&self, category: &str, effort: &str) -> AppResult<()> {
-        {
-            let mut cfg = self.config.write();
+        self.mutate_and_persist_if(|cfg| {
             let trimmed = effort.trim();
             if trimmed.is_empty() {
-                if cfg.settings.active_efforts.remove(category).is_none() {
-                    return Ok(());
-                }
+                cfg.settings.active_efforts.remove(category).is_some()
+            } else if cfg.settings.active_efforts.get(category).map(|s| s.as_str()) == Some(trimmed)
+            {
+                false
             } else {
-                if cfg.settings.active_efforts.get(category).map(|s| s.as_str()) == Some(trimmed) {
-                    return Ok(());
-                }
                 cfg.settings
                     .active_efforts
                     .insert(category.to_string(), trimmed.to_string());
+                true
             }
-        }
-        self.persist()
+        })
     }
 
     /// 设置某分类代理的首选端口（粘滞：绑定回退后写回实际端口作下次首选，或前端手改端口）。
     /// 后端自管字段专用写入，绕过 save_settings 旧快照覆盖。已是目标值则幂等跳过写盘。
     pub fn set_proxy_port(&self, category: &str, port: u16) -> AppResult<()> {
-        {
-            let mut cfg = self.config.write();
+        // 这条的落盘失败后果最具体：粘滞端口丢了 → 重启后端口重新漂移 → 客户端配置里
+        // 写的旧端口连不上，而这正是引入粘滞端口本要解决的问题。必须带回滚。
+        self.mutate_and_persist_if(|cfg| {
             if cfg.settings.proxy_ports.get(category).copied() == Some(port) {
-                return Ok(());
+                return false;
             }
-            cfg.settings
-                .proxy_ports
-                .insert(category.to_string(), port);
-        }
-        self.persist()
+            cfg.settings.proxy_ports.insert(category.to_string(), port);
+            true
+        })
     }
 
     /// 记录某分类已注册 synaroute MCP（去重后落盘）。后端注册逻辑专用。
@@ -1157,43 +1206,41 @@ impl Store {
     /// 端口漂移后其它已注册分类的客户端配置永不更新、关闭 MCP 时注销循环也读到空。
     /// 返回 true 表示本次新增（原本不含），false 表示已存在（幂等跳过写盘）。
     pub fn add_registered_category(&self, category: &str) -> AppResult<bool> {
-        {
-            let mut cfg = self.config.write();
+        // 落盘失败若不回滚：内存记着「已注册」而磁盘没有 → 端口漂移时的批量重写会漏掉
+        // 该分类，客户端 MCP 指向死端口；且该方向永不自愈。
+        //
+        // `mutate_and_persist_when`：闭包同时给出「返回值」与「是否需要落盘」，
+        // 于是幂等命中时既能返回 false 又不白写一次盘。
+        self.mutate_and_persist_when(|cfg| {
             if cfg.settings.mcp_registered_categories.iter().any(|c| c == category) {
-                return Ok(false);
+                return (false, false);
             }
             cfg.settings.mcp_registered_categories.push(category.to_string());
-        }
-        self.persist()?;
-        Ok(true)
+            (true, true)
+        })
     }
 
     /// 移除单个已注册分类记录并落盘（per-category 注销 MCP 时用）。后端专用，
     /// 与 add_registered_category 对称。返回 true 表示确实移除，false 表示原本不含（幂等跳过写盘）。
     pub fn remove_registered_category(&self, category: &str) -> AppResult<bool> {
-        {
-            let mut cfg = self.config.write();
+        self.mutate_and_persist_when(|cfg| {
             let before = cfg.settings.mcp_registered_categories.len();
             cfg.settings.mcp_registered_categories.retain(|c| c != category);
-            if cfg.settings.mcp_registered_categories.len() == before {
-                return Ok(false);
-            }
-        }
-        self.persist()?;
-        Ok(true)
+            let removed = cfg.settings.mcp_registered_categories.len() != before;
+            (removed, removed)
+        })
     }
 
     /// 清空已注册分类记录并落盘（关闭 MCP 开关时用）。后端专用。
     /// 已为空则跳过写盘（幂等）。
     pub fn clear_registered_categories(&self) -> AppResult<()> {
-        {
-            let mut cfg = self.config.write();
+        self.mutate_and_persist_if(|cfg| {
             if cfg.settings.mcp_registered_categories.is_empty() {
-                return Ok(());
+                return false;
             }
             cfg.settings.mcp_registered_categories.clear();
-        }
-        self.persist()
+            true
+        })
     }
 
     /// 只更新 MCP 首选端口并落盘（后端自管字段，不走前端全量 save_settings）。
@@ -1201,28 +1248,26 @@ impl Store {
     /// 使下次启动直接以它为首选，不再每次都从被占的旧端口重新回退、重写客户端配置。
     /// 已是目标值则跳过写盘（幂等，避免无谓 IO）。
     pub fn set_mcp_port(&self, port: u16) -> AppResult<()> {
-        {
-            let mut cfg = self.config.write();
+        self.mutate_and_persist_if(|cfg| {
             if cfg.settings.mcp_port == port {
-                return Ok(());
+                return false;
             }
             cfg.settings.mcp_port = port;
-        }
-        self.persist()
+            true
+        })
     }
 
     /// 只更新 MCP 启用开关并落盘（后端自管字段，不走前端全量 save_settings）。
     /// 通用 save_settings 会保留旧的 mcp_enabled，避免切主题/语言时被入参顶掉；
     /// 真正翻转开关的路径（set_mcp_enabled）必须走这个专用方法直写。已是目标值则幂等跳过。
     pub fn set_mcp_enabled_flag(&self, enabled: bool) -> AppResult<()> {
-        {
-            let mut cfg = self.config.write();
+        self.mutate_and_persist_if(|cfg| {
             if cfg.settings.mcp_enabled == enabled {
-                return Ok(());
+                return false;
             }
             cfg.settings.mcp_enabled = enabled;
-        }
-        self.persist()
+            true
+        })
     }
 
     /// 设置主口令开关的 **UI 镜像**（真实模式记在 `secrets.enc` 的 master 头部里）。
@@ -1230,14 +1275,15 @@ impl Store {
     /// 专用写入方法，因为 `save_settings` 刻意不让前端入参覆盖这个字段（见那里的注释）。
     /// 只应由「库迁移成功后」与「启动对账」两处调用。幂等：值相同不写盘。
     pub fn set_master_password_flag(&self, enabled: bool) -> AppResult<()> {
-        {
-            let mut cfg = self.config.write();
+        // 落盘失败若不回滚：内存镜像与磁盘背离 → 启动对账（以库为准修正这个镜像）本身
+        // 就建立在读磁盘之上，背离会让对账逻辑失效，可能自造「配置说开着、库里没头部」的死局。
+        self.mutate_and_persist_if(|cfg| {
             if cfg.settings.master_password_enabled == enabled {
-                return Ok(());
+                return false;
             }
             cfg.settings.master_password_enabled = enabled;
-        }
-        self.persist()
+            true
+        })
     }
 
     // ---- 厂商预设 CRUD ----
@@ -1248,8 +1294,9 @@ impl Store {
 
     /// 新增/更新厂商。内置项（builtin）不可修改。
     pub fn upsert_vendor(&self, vendor: Vendor) -> AppResult<Vendor> {
-        {
-            let mut cfg = self.config.write();
+        // 用户可见 CRUD：落盘失败若不回滚，界面会显示「保存成功」而重启后厂商消失，
+        // 且该方向永不自愈。闭包内的 Err（内置项不可改）也由 mutate_and_persist 走磁盘对账。
+        self.mutate_and_persist(|cfg| {
             if let Some(existing) = cfg.vendors.iter_mut().find(|v| v.id == vendor.id) {
                 if existing.builtin {
                     return Err(AppError::Invalid("内置厂商不可修改".into()));
@@ -1263,15 +1310,15 @@ impl Store {
                 incoming.builtin = false;
                 cfg.vendors.push(incoming);
             }
-        }
-        self.persist()?;
+            Ok(())
+        })?;
         Ok(vendor)
     }
 
     /// 删除厂商。内置项不可删除。
     pub fn delete_vendor(&self, vendor_id: &str) -> AppResult<()> {
-        {
-            let mut cfg = self.config.write();
+        // 同 upsert_vendor：用户可见 CRUD，必须带落盘失败回滚。
+        self.mutate_and_persist(|cfg| {
             match cfg.vendors.iter().find(|v| v.id == vendor_id) {
                 Some(v) if v.builtin => {
                     return Err(AppError::Invalid("内置厂商不可删除".into()))
@@ -1279,8 +1326,8 @@ impl Store {
                 Some(_) => cfg.vendors.retain(|v| v.id != vendor_id),
                 None => return Err(AppError::NotFound(vendor_id.into())),
             }
-        }
-        self.persist()
+            Ok(())
+        })
     }
 
     /// 测试专用：在指定路径构造 Store，避免污染真实 %APPDATA% 配置。
@@ -2373,6 +2420,120 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().starts_with("config.corrupt-"));
         assert!(has_backup, "应另存 config.corrupt-* 备份供抢救");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P1-2 回归：原先 12 处「后端自管字段」写入是裸 `persist()`，落盘失败即内存领先磁盘，
+    /// 而该方向**永不自愈**（mtime 自愈只认「磁盘比内存新」）。这里逐个验证改走
+    /// `mutate_and_persist*` 后都会回滚。
+    ///
+    /// 挑这四个是因为它们有**用户可见后果**：
+    /// - `upsert_vendor` / `delete_vendor`：界面显示「保存成功」但重启后厂商消失；
+    /// - `set_proxy_port`：粘滞端口丢失 → 重启后端口漂移，客户端里写的旧端口连不上
+    ///   （而粘滞端口本就是为解决这个问题引入的）；
+    /// - `add_registered_category`：内存记着已注册而磁盘没有 → 端口漂移时的批量重写漏掉
+    ///   该分类，客户端 MCP 指向死端口。
+    ///
+    /// 故障注入判据：把任一方法改回「改内存 → self.persist()」，对应断言立刻变红。
+    #[test]
+    fn backend_owned_writes_roll_back_when_persist_fails() {
+        let dir = temp_dir("rollback_backend_owned");
+        let cfg_path = dir.join("config.json");
+        let store = Store::new_at(cfg_path.clone(), dir.join("secrets.enc")).unwrap();
+
+        // 先在可写状态下建立基线
+        let mk_vendor = |id: &str, name: &str| Vendor {
+            id: id.into(),
+            name: name.into(),
+            default_base_url: "https://x.example".into(),
+            default_protocol: Protocol::Anthropic,
+            builtin: false,
+            icon: None,
+            preset_models: vec![],
+        };
+        store.upsert_vendor(mk_vendor("v1", "厂商1")).unwrap();
+        store.set_proxy_port("claude-cli", 47100).unwrap();
+        assert!(store.add_registered_category("claude-cli").unwrap());
+
+        // 制造确定性落盘失败（同 delete_key 那条的手法）：把 config.json 变成目录。
+        std::fs::remove_file(&cfg_path).unwrap();
+        std::fs::create_dir(&cfg_path).unwrap();
+
+        // upsert_vendor：新增一个应失败并回滚（厂商数不变）
+        let before_vendors = store.config.read().vendors.len();
+        let r = store.upsert_vendor(mk_vendor("v2", "厂商2"));
+        assert!(r.is_err(), "落盘失败必须上抛错误");
+        assert_eq!(
+            store.config.read().vendors.len(),
+            before_vendors,
+            "upsert_vendor 落盘失败必须回滚，否则界面显示已保存而重启后消失"
+        );
+
+        // delete_vendor：删除应失败并回滚（v1 仍在）
+        let r = store.delete_vendor("v1");
+        assert!(r.is_err(), "落盘失败必须上抛错误");
+        assert!(
+            store.config.read().vendors.iter().any(|v| v.id == "v1"),
+            "delete_vendor 落盘失败必须回滚"
+        );
+
+        // set_proxy_port：改成新端口应失败并回滚到 47100
+        let r = store.set_proxy_port("claude-cli", 47999);
+        assert!(r.is_err(), "落盘失败必须上抛错误");
+        assert_eq!(
+            store.config.read().settings.proxy_ports.get("claude-cli").copied(),
+            Some(47100),
+            "set_proxy_port 落盘失败必须回滚，否则粘滞端口丢失、重启后端口漂移"
+        );
+
+        // add_registered_category：新增另一分类应失败并回滚
+        let r = store.add_registered_category("codex");
+        assert!(r.is_err(), "落盘失败必须上抛错误");
+        assert!(
+            !store.config.read().settings.mcp_registered_categories.iter().any(|c| c == "codex"),
+            "add_registered_category 落盘失败必须回滚，否则批量重写会漏掉该分类"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 幂等写入必须**跳过落盘**（`mutate_and_persist_if` 的存在理由）。
+    ///
+    /// 前端切页会重发同一个值，若无条件 persist 就是反复重写 20KB 整份 config。
+    /// 但也不能为省这次写盘退回「裸 persist + 提前 return」——那样又丢了回滚。
+    #[test]
+    fn idempotent_backend_writes_skip_persist() {
+        let dir = temp_dir("idempotent_skip");
+        let cfg_path = dir.join("config.json");
+        let store = Store::new_at(cfg_path.clone(), dir.join("secrets.enc")).unwrap();
+
+        store.set_active_model("codex", "gpt-5").unwrap();
+        let mtime1 = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
+
+        // ⚠️ 必须**先把值取出来再调用**，不能写成
+        // `store.set_mcp_enabled_flag(store.config.read().settings.mcp_enabled)`：
+        // 参数表达式里的读守卫活到整条语句结束，而被调方法内部要取 `config.write()`，
+        // parking_lot 的写锁会等所有读守卫释放 → 自锁挂死（本测试初版就这么挂了 60s+）。
+        // 这与 `mutate_health` 文档里「闭包内禁调取锁方法」是同一根因的变体。
+        let cur_port = store.config.read().settings.proxy_ports.get("codex").copied();
+        let cur_mcp = store.config.read().settings.mcp_enabled;
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // 重复写同一个值 → 不该落盘
+        store.set_active_model("codex", "gpt-5").unwrap();
+        if let Some(p) = cur_port {
+            store.set_proxy_port("codex", p).unwrap();
+        }
+        store.set_mcp_enabled_flag(cur_mcp).unwrap();
+        let mtime2 = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
+        assert_eq!(mtime1, mtime2, "幂等写入不应触发落盘");
+
+        // 真改值 → 必须落盘
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        store.set_active_model("codex", "gpt-5-codex").unwrap();
+        let mtime3 = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
+        assert_ne!(mtime2, mtime3, "值真变了必须落盘");
 
         std::fs::remove_dir_all(&dir).ok();
     }
