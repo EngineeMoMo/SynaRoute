@@ -1170,7 +1170,7 @@ async fn try_stream_to_key(
         obj.insert("model".into(), Value::String(real_model.clone()));
     }
     inject_default_effort(store, category, &mut payload, downstream, key.protocol);
-    let payload = crate::upstream::convert_request(&payload, downstream, key.protocol);
+    let payload = crate::upstream::convert_request_owned(payload, downstream, key.protocol);
 
     // SSE 翻译方向：同协议为 None（原样透传）；跨协议按方向重组事件流。
     let sse_dir = crate::upstream::sse_direction(downstream, key.protocol);
@@ -1491,7 +1491,7 @@ async fn forward_to_key(
     inject_default_effort(store, category, &mut payload, downstream, key.protocol);
 
     // 跨协议转换（下游协议 → 上游 Key 协议；同协议时 convert_request 内部直接返回克隆）
-    let payload = crate::upstream::convert_request(&payload, downstream, key.protocol);
+    let payload = crate::upstream::convert_request_owned(payload, downstream, key.protocol);
 
     // 发往上游的请求体快照（pretty，方便页面阅读；密钥不在 body 里，安全）。
     //

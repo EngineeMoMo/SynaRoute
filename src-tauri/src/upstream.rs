@@ -2289,6 +2289,24 @@ pub fn anthropic_resp_to_openai(body: &Value) -> Value {
 /// 跨协议**请求体**转换：下游协议 `from` → 上游协议 `to`，以 Chat Completions 为中枢。
 /// 同协议直通（不经中枢，避免 Responses→Chat→Responses 往返丢信息）。
 /// `model` 已由调用方写入 body，此处只做协议形态转换。
+/// 同 [`convert_request`]，但**按值接收**：同协议时零拷贝直接把 body 移动出去（P2-5）。
+///
+/// 为什么需要它：同协议是**最常见**的场景（Claude Code → Anthropic Key、
+/// Codex → Responses Key），而 `convert_request(&payload, ..)` 在这条路上要做一次
+/// **整棵树的深拷贝**（`body.clone()`）。`serde_json::Value` 是指针密集树，200 KB 的 JSON
+/// 展开后堆占用常达 1~2 MB、节点数以万计——白做一次全树拷贝就是数万次小分配 + 指针追逐，
+/// 而调用方拿到结果后原 body 立刻不再需要。故障转移时每个候选还要重来一遍。
+///
+/// 跨协议路径与 [`convert_request`] 完全一致（转换本身必须重建结构，无法零拷贝）。
+pub fn convert_request_owned(body: Value, from: Protocol, to: Protocol) -> Value {
+    if from == to {
+        // 零拷贝：直接移动。这也保住了「同协议原样透传」的语义
+        // （见下方 convert_request 里同一分支的注释）。
+        return body;
+    }
+    convert_request(&body, from, to)
+}
+
 pub fn convert_request(body: &Value, from: Protocol, to: Protocol) -> Value {
     if from == to {
         return body.clone();
@@ -4330,6 +4348,46 @@ fn apply_models_auth(req: reqwest::RequestBuilder, secret: &str) -> reqwest::Req
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2-5：`convert_request_owned` 同协议时必须**零拷贝原样返回**，跨协议时与
+    /// `convert_request` 结果完全一致。
+    ///
+    /// 「原样」是关键语义：同协议路径是最常见场景（Claude Code→Anthropic Key、
+    /// Codex→Responses Key），此时请求体应逐字节透传，任何隐式改写都会让
+    /// count_tokens 等子路径行为偏离。
+    #[test]
+    fn convert_request_owned_passes_through_and_matches_borrowed() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "messages": [ { "role": "user", "content": "hi" } ],
+            // 放一个转换器不认识的字段：同协议必须原样保留
+            "some_vendor_ext": { "a": [1, 2, 3] }
+        });
+
+        // 同协议：逐字节等价（零拷贝移动的结果就是原对象本身）
+        for p in [Protocol::Anthropic, Protocol::OpenaiChat, Protocol::OpenaiResponses] {
+            let out = convert_request_owned(body.clone(), p, p);
+            assert_eq!(out, body, "同协议必须原样透传（{p:?}）");
+        }
+
+        // 跨协议：与按引用版本结果一致（不能因为换了入口就走出不同结果）
+        let pairs = [
+            (Protocol::Anthropic, Protocol::OpenaiChat),
+            (Protocol::Anthropic, Protocol::OpenaiResponses),
+            (Protocol::OpenaiChat, Protocol::Anthropic),
+            (Protocol::OpenaiChat, Protocol::OpenaiResponses),
+            (Protocol::OpenaiResponses, Protocol::Anthropic),
+            (Protocol::OpenaiResponses, Protocol::OpenaiChat),
+        ];
+        for (from, to) in pairs {
+            assert_eq!(
+                convert_request_owned(body.clone(), from, to),
+                convert_request(&body, from, to),
+                "{from:?}→{to:?} 两个入口结果必须一致"
+            );
+        }
+    }
 
     /// P3-1：两个 `→Chat` 方向必须发 usage 收尾 chunk。
     ///
