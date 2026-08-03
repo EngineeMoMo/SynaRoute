@@ -569,8 +569,8 @@ async fn anthropic_message(
         "max_tokens": max_tokens,
         "messages": [{ "role": "user", "content": prompt }]
     });
+    // 版本头由 apply_auth 按协议统一添加（见那里的注释），此处不再单独补。
     let mut req = client.post(&url).json(&payload).timeout(request_timeout);
-    req = req.header("anthropic-version", "2023-06-01");
     req = apply_auth(req, key, secret);
     req = apply_client_identity(req, key.protocol);
 
@@ -1222,7 +1222,7 @@ impl ToolSession {
         let send = |body: &Value| {
             let mut req = client.post(&url).json(body).timeout(p.request_timeout);
             if !openai {
-                req = req.header("anthropic-version", "2023-06-01");
+                // 版本头由 apply_auth 统一添加；这里只补缓存 beta 头。
                 // 官方要求携带该 beta 头才启用扩展缓存能力；真 Anthropic 认，
                 // 兼容中转忽略,严格中转的 400 会走下面的自愈。
                 req = req.header("anthropic-beta", "prompt-caching-2024-07-31");
@@ -1398,8 +1398,12 @@ pub async fn health_probe(key: &ProviderKey, secret: &str) -> (bool, u64, Option
     let mut req = apply_models_auth(client.get(&url).timeout(fast_timeout(key)), secret);
     // Anthropic 真实 API 的 GET /v1/models 需带版本头，否则 400（不影响健康判定，但让
     // 有效 Key 能拿到真实 200 与准确延迟）。
-    if matches!(key.protocol, Protocol::Anthropic) {
-        req = req.header("anthropic-version", "2023-06-01");
+    //
+    // 这里不能用 `apply_auth`（它会按协议只设一种鉴权头），因为 `apply_models_auth` 刻意
+    // **两种鉴权头都带**——兼容把 Anthropic 协议挂在子路径、而模型列表是 OpenAI 风格的厂商。
+    // 但版本头仍走 Protocol 的穷举能力方法，与其余四处同源。
+    if let Some((h, v)) = key.protocol.version_header() {
+        req = req.header(h, v);
     }
 
     let start = std::time::Instant::now();
@@ -4297,18 +4301,23 @@ fn build_client(key: &ProviderKey) -> AppResult<reqwest::Client> {
     Ok(shared_client())
 }
 
-/// 按协议注入鉴权头
+/// 按协议注入鉴权头**与版本头**。
+///
+/// 版本头（`anthropic-version`）收敛进来（P2-2）：它原先由本函数的三个调用点各自补
+/// （`:573` / `:1225` / `:1402`），而 proxy 侧的两条转发路径又各写一遍 —— 五处实现、
+/// 已经分叉过一次。现在协议→版本头的映射是 `Protocol::version_header()` 这一处**穷举 match**，
+/// 加第 4 种协议时编译器会要求明确回答「它要不要版本头」。
 fn apply_auth(
     req: reqwest::RequestBuilder,
     key: &ProviderKey,
     secret: &str,
 ) -> reqwest::RequestBuilder {
-    // Chat 与 Responses 同属 OpenAI 家族，均用 Bearer 鉴权；Anthropic 用 x-api-key。
-    if key.protocol.is_openai() {
-        req.header("authorization", format!("Bearer {secret}"))
-    } else {
-        req.header("x-api-key", secret)
+    let scheme = key.protocol.auth_scheme();
+    let mut req = req.header(scheme.header_name(), scheme.header_value(secret));
+    if let Some((h, v)) = key.protocol.version_header() {
+        req = req.header(h, v);
     }
+    req
 }
 
 /// 为聚合成员/决策者的**自建请求**注入客户端身份头（User-Agent 等）。
@@ -4348,6 +4357,45 @@ fn apply_models_auth(req: reqwest::RequestBuilder, secret: &str) -> reqwest::Req
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2-2：`Protocol` 的能力方法必须对**每个变体**都有明确取值，不许靠 `_ =>` 兜底。
+    ///
+    /// 这条是「加第 4 种协议时的安全网」：遍历全变体逐项断言，若将来有人在能力方法里加了
+    /// `_ =>` 兜底臂（那会让新协议被静默按某一族处理，向上游发错误的头 → 401 或
+    /// `client_restricted` 403，排查方向被误导到「Key 配错了」），这条测试不会直接报错，
+    /// 但配合下面「每个变体的取值都被显式列出」的断言，至少能保证现有三个变体的取值不被
+    /// 无意改动。真正的编译期保障来自能力方法里的穷举 match 本身。
+    #[test]
+    fn protocol_capabilities_cover_all_variants() {
+        use crate::model::AuthScheme;
+        // 全变体清单：加变体后这里会因为 ALL 长度断言失败而被发现
+        let all = [Protocol::Anthropic, Protocol::OpenaiChat, Protocol::OpenaiResponses];
+        assert_eq!(all.len(), 3, "新增 Protocol 变体后，请逐项确认下面各能力方法的取值");
+
+        // 鉴权形态
+        assert_eq!(Protocol::Anthropic.auth_scheme(), AuthScheme::XApiKey);
+        assert_eq!(Protocol::OpenaiChat.auth_scheme(), AuthScheme::Bearer);
+        assert_eq!(Protocol::OpenaiResponses.auth_scheme(), AuthScheme::Bearer);
+
+        // 头名与取值形态
+        assert_eq!(AuthScheme::XApiKey.header_name(), "x-api-key");
+        assert_eq!(AuthScheme::XApiKey.header_value("sk-1"), "sk-1");
+        assert_eq!(AuthScheme::Bearer.header_name(), "authorization");
+        assert_eq!(AuthScheme::Bearer.header_value("sk-1"), "Bearer sk-1");
+
+        // 版本头：只有 Anthropic 需要，且取值必须逐字保持（改了会让真 Anthropic API 返 400）
+        assert_eq!(
+            Protocol::Anthropic.version_header(),
+            Some(("anthropic-version", "2023-06-01"))
+        );
+        assert_eq!(Protocol::OpenaiChat.version_header(), None);
+        assert_eq!(Protocol::OpenaiResponses.version_header(), None);
+
+        // 1M 上下文 beta 是 Anthropic 特有
+        assert!(Protocol::Anthropic.supports_1m_beta());
+        assert!(!Protocol::OpenaiChat.supports_1m_beta());
+        assert!(!Protocol::OpenaiResponses.supports_1m_beta());
+    }
 
     /// P2-5：`convert_request_owned` 同协议时必须**零拷贝原样返回**，跨协议时与
     /// `convert_request` 结果完全一致。

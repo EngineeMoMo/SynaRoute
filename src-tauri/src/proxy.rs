@@ -48,6 +48,49 @@ const PROXY_PORT_FALLBACK_RANGE: u16 = 20;
 /// 「全部 Key 均失败」后的短路窗口（毫秒）：窗口内该分类的新请求**直接返回失败**，
 /// 不再逐个重打上游。
 ///
+/// 给上游请求装齐所有请求头：透传下游头 → `anthropic-beta` → 鉴权头 → 版本头（P2-2）。
+///
+/// **为什么必须抽出来**：这段逻辑原先在 `try_stream_to_key` 与 `forward_to_key` 里**逐字重复**
+/// （去空行去注释后 38 行完全一致），且鉴权头另有第三份实现在 `upstream::apply_auth`。
+/// 三份已经分叉：proxy 的两处带 `anthropic-version`，而 `apply_auth` 不带、改由它的三个调用点
+/// 各自补。任何转发前置语义变更（新增鉴权形态、改 beta 头推导、启用 `ProviderKey.headers_json`
+/// 这个自定义请求头预留位）都要同时改 2~5 处，漏一处即「非流式生效、流式不生效」这类
+/// 最难复现的半残缺陷——`anthropic-version` 的现状就是该风险已发生过一次的证据。
+///
+/// 顺序不能变：
+/// 1. 先透传下游客户端头（UA / x-app / x-stainless-*），让中转商识别为真实客户端；
+/// 2. `anthropic-beta` 单独算（1M 上下文要按**落点模型**追加特性），故上一步跳过原值、这里统一设；
+/// 3. **鉴权头最后设**，确保覆盖掉下游可能带来的同名头（鉴权必须用本 Key 的密钥）。
+///
+/// ⚠️ **超时不在这里设**：流式与非流式的超时语义刻意不同（流式只约束探头阶段、不掐已建立的
+/// SSE 流），必须留在各自调用点。见 `try_stream_to_key` 与 `forward_to_key` 的相应注释。
+fn apply_upstream_headers(
+    mut rb: reqwest::RequestBuilder,
+    key: &ProviderKey,
+    secret: &str,
+    fwd_headers: &[(String, String)],
+    real_model: &str,
+) -> reqwest::RequestBuilder {
+    let beta = effective_beta_header(fwd_headers, key, real_model);
+    for (h, v) in fwd_headers {
+        if h == "anthropic-beta" {
+            continue;
+        }
+        rb = rb.header(h, v);
+    }
+    if let Some(b) = &beta {
+        rb = rb.header("anthropic-beta", b.as_str());
+    }
+    // 鉴权与版本头都走 Protocol 的**穷举**能力方法：加第 4 种协议时编译器会点出这里要改，
+    // 而不是静默按「非 Anthropic 即 OpenAI」发错误的头。
+    let scheme = key.protocol.auth_scheme();
+    rb = rb.header(scheme.header_name(), scheme.header_value(secret));
+    if let Some((h, v)) = key.protocol.version_header() {
+        rb = rb.header(h, v);
+    }
+    rb
+}
+
 /// 故障转移预算的最小切片：剩余预算低于此值时不再开始新的候选尝试。
 ///
 /// 为什么要有下限而不是「有多少用多少」：剩下 200ms 时去打一次上游几乎必然超时，
@@ -1183,31 +1226,13 @@ async fn try_stream_to_key(
         std::borrow::Cow::Borrowed(key.protocol.completion_path())
     };
     let url = crate::upstream::join_endpoint(&key.base_url, &resource_path);
-    let (auth_header, auth_val, extra) = if matches!(key.protocol, Protocol::Anthropic) {
-        ("x-api-key", secret.clone(), Some(("anthropic-version", "2023-06-01")))
-    } else {
-        ("authorization", format!("Bearer {secret}"), None)
-    };
 
     // 流式：用共享客户端（连接池复用，含 connect_timeout），不设总超时，避免长回答被掐断。
     let client = crate::upstream::shared_client();
 
-    let mut rb = client.post(&url).json(&payload);
-    // `anthropic-beta` 单独算（1M 上下文需按落点模型追加特性），故先跳过原值再统一设置。
-    let beta = effective_beta_header(fwd_headers, key, &real_model);
-    for (h, v) in fwd_headers {
-        if h == "anthropic-beta" {
-            continue;
-        }
-        rb = rb.header(h, v);
-    }
-    if let Some(b) = &beta {
-        rb = rb.header("anthropic-beta", b.as_str());
-    }
-    rb = rb.header(auth_header, auth_val);
-    if let Some((h, v)) = extra {
-        rb = rb.header(h, v);
-    }
+    // 请求头统一由 apply_upstream_headers 装齐（与非流式路径共用同一实现，防两条路径分叉）。
+    // 流式**不设总超时**，避免长回答被掐断——故这里不调 .timeout()。
+    let rb = apply_upstream_headers(client.post(&url).json(&payload), key, &secret, fwd_headers, &real_model);
 
     // 故障转移预算**只约束这个探头阶段**（等上游返回响应头/状态码）。
     //
@@ -1521,17 +1546,10 @@ async fn forward_to_key(
         std::borrow::Cow::Borrowed(key.protocol.completion_path())
     };
     let url = crate::upstream::join_endpoint(&key.base_url, &resource_path);
-    let (auth_header, auth_val, extra) = if matches!(key.protocol, Protocol::Anthropic) {
-        ("x-api-key", secret.clone(), Some(("anthropic-version", "2023-06-01")))
-    } else {
-        ("authorization", format!("Bearer {secret}"), None)
-    };
 
     // 用共享客户端（连接池复用），总超时按 Key 配置逐请求指定。
     let client = crate::upstream::shared_client();
 
-    // 先透传下游客户端头（User-Agent / anthropic-beta / x-app / x-stainless-* 等），
-    // 让中转商识别为真实 Claude Code 客户端；再用本 Key 的鉴权头覆盖，确保鉴权用对密钥。
     // 本次请求的超时 = min(Key 自身超时, 故障转移剩余预算)。
     // 取小值：既不让一个慢 Key 吃光整池预算（那会让后续候选无机会尝试），
     // 也不放宽用户为该 Key 设的上限。预算关闭时退化为纯 Key 超时（旧行为）。
@@ -1540,22 +1558,15 @@ async fn forward_to_key(
         Some(b) => key_to.min(b),
         None => key_to,
     };
-    let mut rb = client.post(&url).json(&payload).timeout(effective_to);
-    // `anthropic-beta` 单独算（1M 上下文需按落点模型追加特性），故先跳过原值再统一设置。
-    let beta = effective_beta_header(fwd_headers, key, &real_model);
-    for (h, v) in fwd_headers {
-        if h == "anthropic-beta" {
-            continue;
-        }
-        rb = rb.header(h, v);
-    }
-    if let Some(b) = &beta {
-        rb = rb.header("anthropic-beta", b.as_str());
-    }
-    rb = rb.header(auth_header, auth_val);
-    if let Some((h, v)) = extra {
-        rb = rb.header(h, v);
-    }
+    // 请求头统一由 apply_upstream_headers 装齐（与流式路径共用同一实现，防两条路径分叉）。
+    // **超时留在这里设**：非流式要等上游完整生成，语义与流式刻意不同，故不进公共函数。
+    let rb = apply_upstream_headers(
+        client.post(&url).json(&payload).timeout(effective_to),
+        key,
+        &secret,
+        fwd_headers,
+        &real_model,
+    );
 
     // 连接层失败（DNS/超时/拒连）仍返回 Err，附带目标 URL 便于定位。
     let resp = rb
@@ -1642,8 +1653,10 @@ fn effective_beta_header(
         .iter()
         .find(|(h, _)| h == "anthropic-beta")
         .map(|(_, v)| v.as_str());
-    // beta 头是 Anthropic 协议特有的；打到 OpenAI 系上游时不加（原值仍按既有行为透传）
-    let want_1m = matches!(key.protocol, Protocol::Anthropic)
+    // beta 头是 Anthropic 协议特有的；打到 OpenAI 系上游时不加（原值仍按既有行为透传）。
+    // 走 Protocol 的**穷举**能力方法而非 `matches!(.., Anthropic)`：加第 4 种协议时
+    // 编译器会要求在 supports_1m_beta 里明确回答「它支持不支持」，而不是被静默当成不支持。
+    let want_1m = key.protocol.supports_1m_beta()
         && key
             .context_window_of_real(real_model)
             .is_some_and(|w| w >= crate::model::ONE_MILLION_CONTEXT);
@@ -2916,6 +2929,139 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// 抓请求头的 mock（返回 SSE 或 JSON 由 `sse` 决定，以便同一个 mock 服务两条转发路径）。
+    async fn spawn_header_capture_mock(
+        captured: std::sync::Arc<parking_lot::Mutex<Vec<Vec<(String, String)>>>>,
+        sse: bool,
+    ) -> String {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let cap = captured.clone();
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let cap = cap.clone();
+                        async move {
+                            let hs: Vec<(String, String)> = req
+                                .headers()
+                                .iter()
+                                .map(|(k, v)| {
+                                    (
+                                        k.as_str().to_ascii_lowercase(),
+                                        v.to_str().unwrap_or("").to_string(),
+                                    )
+                                })
+                                .collect();
+                            cap.lock().push(hs);
+                            let (ct, body): (&str, &[u8]) = if sse {
+                                ("text/event-stream", b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+                            } else {
+                                ("application/json", br#"{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}"#)
+                            };
+                            let resp = Response::builder()
+                                .status(200)
+                                .header("content-type", ct)
+                                .body(full_body(Bytes::from(body)))
+                                .unwrap();
+                            Ok::<_, hyper::Error>(resp)
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// P2-2：**流式与非流式两条路径发出的请求头必须一致**。
+    ///
+    /// 这两条路径的前置段落原先逐字重复 38 行（含鉴权头三元组），任何一处改动漏掉另一处，
+    /// 就得到「非流式生效、流式不生效」这类最难复现的半残缺陷——`anthropic-version` 的
+    /// 分叉现状就是该风险已发生过一次的证据。现在两者共用 `apply_upstream_headers`，
+    /// 这条测试是那个共用的护栏。
+    ///
+    /// 故障注入判据：让任一路径绕过 `apply_upstream_headers` 自己拼头，本测试立刻变红。
+    #[tokio::test]
+    async fn stream_and_nonstream_send_identical_headers() {
+        let cap_stream = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let cap_plain = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let up_stream = spawn_header_capture_mock(cap_stream.clone(), true).await;
+        let up_plain = spawn_header_capture_mock(cap_plain.clone(), false).await;
+
+        // 两个 store 各配一条同样的 Anthropic Key，只是上游地址不同
+        let mk = |dir: &std::path::Path, url: &str| {
+            let store = std::sync::Arc::new(
+                Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            );
+            store.upsert_key(key("k1", 0, url)).unwrap();
+            store.secrets.write().set("k1", "sk-test").unwrap();
+            store
+        };
+        let d1 = temp_dir("hdr_stream");
+        let d2 = temp_dir("hdr_plain");
+        let s1 = mk(&d1, &up_stream);
+        let s2 = mk(&d2, &up_plain);
+
+        let pm1 = ProxyManager::new(s1.clone());
+        let pm2 = ProxyManager::new(s2.clone());
+        let p1 = pm1.start(CategoryType::ClaudeCli).await.unwrap();
+        let p2 = pm2.start(CategoryType::ClaudeCli).await.unwrap();
+
+        let cli = reqwest::Client::new();
+        // 同一份请求，只有 stream 标志不同 → 分别走两条路径
+        for (port, stream) in [(p1, true), (p2, false)] {
+            cli.post(format!("http://127.0.0.1:{port}/v1/messages"))
+                .header("user-agent", "claude-cli/1.2.3")
+                .header("x-app", "cli")
+                .json(&json!({
+                    "model": "m", "max_tokens": 10, "stream": stream,
+                    "messages": [ { "role": "user", "content": "hi" } ]
+                }))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let pick = |v: &std::sync::Arc<parking_lot::Mutex<Vec<Vec<(String, String)>>>>| {
+            let g = v.lock();
+            let mut hs = g.first().cloned().unwrap_or_default();
+            // 剔除逐请求必然不同 / 由 reqwest 自行计算的头
+            hs.retain(|(k, _)| {
+                !matches!(k.as_str(), "host" | "content-length" | "accept" | "accept-encoding")
+            });
+            hs.sort();
+            hs
+        };
+        let a = pick(&cap_stream);
+        let b = pick(&cap_plain);
+        assert!(!a.is_empty(), "流式路径应已收到请求");
+        assert_eq!(a, b, "两条路径的请求头集合必须完全一致\n流式={a:?}\n非流式={b:?}");
+
+        // 顺带钉住关键头的实际取值（这些是实测判据，改了会导致鉴权失败或被判 client_restricted）
+        let m: std::collections::HashMap<_, _> = a.into_iter().collect();
+        assert_eq!(m.get("x-api-key").map(String::as_str), Some("sk-test"), "Anthropic 用 x-api-key");
+        assert!(!m.contains_key("authorization"), "Anthropic 不该带 Bearer");
+        assert_eq!(
+            m.get("anthropic-version").map(String::as_str),
+            Some("2023-06-01"),
+            "版本头必须带（真 Anthropic API 缺它会 400）"
+        );
+        assert_eq!(m.get("user-agent").map(String::as_str), Some("claude-cli/1.2.3"), "下游 UA 应透传");
+        assert_eq!(m.get("x-app").map(String::as_str), Some("cli"), "下游 x-app 应透传");
+
+        pm1.stop(CategoryType::ClaudeCli);
+        pm2.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&d1).ok();
+        std::fs::remove_dir_all(&d2).ok();
     }
 
     /// 端到端复现：Codex（下游 /v1/responses，body 无 effort）→ Anthropic 上游，配了 codex:xhigh，

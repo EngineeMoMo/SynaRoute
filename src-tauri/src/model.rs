@@ -68,6 +68,74 @@ impl Protocol {
             Protocol::OpenaiResponses => "/v1/responses",
         }
     }
+
+    // ---- 能力方法（P2-2）：一律用**穷举 match**，不用 `is_openai()` 之类的二分 ----
+    //
+    // 为什么必须穷举：这些是「新增协议时逐项必须重新决定」的东西。原先散落 11 处
+    // `matches!(p, Anthropic)` / `is_openai()` 形式的二分判断，加第 4 种协议（如 Gemini）时
+    // **不会编译失败**，而是静默按「非 Anthropic 即 OpenAI」处理 —— 于是鉴权头被套上
+    // `Bearer`、客户端身份头被套 Codex UA，不 panic、不报错，直接向上游发错误的头，
+    // 表现为 401 或 `client_restricted` 403，排查方向极易被误导到「Key 配错了」。
+    //
+    // 穷举 match 让编译器成为清单：加变体即报错，逐个方法回答「这个新协议该怎么办」。
+    // 故这些方法里**不许出现 `_ =>` 兜底臂**。
+
+    /// 鉴权头名与取值形态。
+    pub fn auth_scheme(self) -> AuthScheme {
+        match self {
+            Protocol::Anthropic => AuthScheme::XApiKey,
+            Protocol::OpenaiChat => AuthScheme::Bearer,
+            Protocol::OpenaiResponses => AuthScheme::Bearer,
+        }
+    }
+
+    /// 该协议要求的 API 版本头（名, 值）；`None` = 不需要。
+    ///
+    /// 收敛这一处的动机：`anthropic-version` 曾经在 proxy 的两条路径里各写一遍、
+    /// 而 `upstream::apply_auth` 里没有、改由三个调用点各自补 —— 三份实现已经分叉。
+    pub fn version_header(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Protocol::Anthropic => Some(("anthropic-version", "2023-06-01")),
+            Protocol::OpenaiChat => None,
+            Protocol::OpenaiResponses => None,
+        }
+    }
+
+    /// 是否支持 Anthropic 的 1M 上下文 beta 特性（`anthropic-beta: context-1m-*`）。
+    pub fn supports_1m_beta(self) -> bool {
+        match self {
+            Protocol::Anthropic => true,
+            Protocol::OpenaiChat => false,
+            Protocol::OpenaiResponses => false,
+        }
+    }
+}
+
+/// 鉴权头的形态。用枚举而非直接返回 (名, 值) 是因为取值需要拼 secret，
+/// 而 secret 不该进 `model` 这一层（它只描述协议能力，不接触密钥）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthScheme {
+    /// `x-api-key: <secret>`（Anthropic）
+    XApiKey,
+    /// `authorization: Bearer <secret>`（OpenAI 家族）
+    Bearer,
+}
+
+impl AuthScheme {
+    /// 头名。
+    pub fn header_name(self) -> &'static str {
+        match self {
+            AuthScheme::XApiKey => "x-api-key",
+            AuthScheme::Bearer => "authorization",
+        }
+    }
+    /// 按形态拼出头值。
+    pub fn header_value(self, secret: &str) -> String {
+        match self {
+            AuthScheme::XApiKey => secret.to_string(),
+            AuthScheme::Bearer => format!("Bearer {secret}"),
+        }
+    }
 }
 
 /// 厂商预设的一个模型条目（参考 cc-switch 的 modelCatalog，取长补短）。
