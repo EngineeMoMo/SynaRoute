@@ -1133,6 +1133,10 @@ enum StreamAttempt {
 /// - 先 send() 探状态码：非 2xx 缓冲错误体返回 HttpError（首字节未发，切换安全）；
 ///   2xx 则用 bytes_stream() 逐块转发，content-type 沿用上游真实值（保 text/event-stream）。
 /// - 仅在下游协议与 Key 协议一致时调用（无需跨协议转换），跨协议 SSE 翻译属已知限制。
+// 参数多但每个都是这条转发链必需的运行时上下文（store/分类写日志、key/path/body/model 定位请求、
+// headers 透传客户端身份）。抽成 struct 只是换个地方传同样的东西，还要动全部调用点 ——
+// 与 `Store::append_event_full`、`aggregate::run_member_turns` 同样的取舍。
+#[allow(clippy::too_many_arguments)]
 async fn try_stream_to_key(
     store: &Arc<Store>,
     category: CategoryType,
@@ -1451,6 +1455,8 @@ fn inject_default_effort(
 /// 返回完整 outcome（含发往上游的请求体、响应体、状态），供路由与调用模型日志共用。
 /// 注意：非 2xx 不再直接返回 Err，而是照常返回 outcome（ok=false），
 /// 由调用方决定是否切换——这样失败也能被完整记进调用模型日志。
+// 同 `try_stream_to_key`：参数均为必需的运行时上下文，不为消警告做无收益的重构。
+#[allow(clippy::too_many_arguments)]
 async fn forward_to_key(
     store: &Arc<Store>,
     category: CategoryType,
@@ -2463,7 +2469,7 @@ mod tests {
         );
         // 5 个候选都指向同一个慢上游；每个 Key 自身超时 900ms
         for i in 0..5 {
-            let mut k = key(&format!("k{i}"), i as i32, &slow);
+            let mut k = key(&format!("k{i}"), i, &slow);
             k.params.timeout_ms = Some(900);
             store.upsert_key(k).unwrap();
             store.secrets.write().set(&format!("k{i}"), "x").unwrap();

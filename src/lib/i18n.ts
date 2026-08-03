@@ -109,6 +109,12 @@ const zh: Dict = {
   "health.breakerFromLive": "熔断来自实时请求连续失败（非健康探测）——请检查密钥、额度或模型名是否正确。熔断至 {time}",
   "health.breakerFromProbe": "熔断来自健康探测失败。熔断至 {time}",
   "health.latencyTitle": "延迟 {ms}ms",
+  "health.stale": "● 状态已过期",
+  "health.staleTitle":
+    "上次探测在 {ago}前失败，之后没再检测过（停用的 Key 不参与定时探测）。这不代表它现在不可用——点右侧刷新按钮重新检测一次。",
+  "health.agoMinutes": "{n} 分钟",
+  "health.agoHours": "{n} 小时",
+  "health.agoDays": "{n} 天",
 
   // 分类页
   "category.keyCount": "共 {total} 个 Key · {enabled} 个已启用",
@@ -622,6 +628,12 @@ const en: Dict = {
   "health.breakerFromLive": "Tripped by consecutive live-request failures (not health probes) — check the API key, quota, or model name. Tripped until {time}",
   "health.breakerFromProbe": "Tripped by health-probe failures. Tripped until {time}",
   "health.latencyTitle": "Latency {ms}ms",
+  "health.stale": "● Status outdated",
+  "health.staleTitle":
+    "The last probe failed {ago} ago and it hasn't been checked since (disabled keys are skipped by the periodic probe). This does not mean it's unavailable now — hit the refresh button on the right to re-check.",
+  "health.agoMinutes": "{n} min",
+  "health.agoHours": "{n} h",
+  "health.agoDays": "{n} d",
 
   "category.keyCount": "{total} keys · {enabled} enabled",
   "category.addKey": "Add provider key",

@@ -78,6 +78,45 @@ const store: Record<CategoryType, ProviderKey[]> = {
       ],
       health: { status: "unknown", failCount: 0 },
     },
+    // 以下两条专供验证「陈旧失败结论」与「新鲜失败结论」的徽标差异（2026-08-02 加）：
+    // 真机上见过一条**禁用** Key 卡片显示「探测不可达 · 10 天前」，而那家上游早已恢复、
+    // 真实转发也成功 —— 定时探测只扫启用的 Key，禁用期间状态永久冻结在很久以前那次失败上。
+    // 两条并排放，才能在预览里一眼看出「已过期」与「不可达」是两种不同措辞。
+    {
+      id: "k4",
+      categoryId: "claude-cli",
+      name: "厂商4（禁用·状态是 10 天前的）",
+      vendor: "custom",
+      baseUrl: "https://stale.example.com",
+      protocol: "anthropic",
+      hasSecret: true,
+      enabled: false, // 禁用 → 不参与定时探测 → 状态永久冻结
+      priority: 3,
+      params: { temperature: 1.0, maxTokens: 8192 },
+      models: models(["claude-opus-4-8"]),
+      mappings: [],
+      health: {
+        status: "down",
+        lastChecked: now - 10 * 24 * 60 * 60 * 1000, // 10 天前
+        latencyMs: 342,
+        failCount: 0,
+      },
+    },
+    {
+      id: "k5",
+      categoryId: "claude-cli",
+      name: "厂商5（刚探测过·确实不可达）",
+      vendor: "custom",
+      baseUrl: "https://fresh-down.example.com",
+      protocol: "anthropic",
+      hasSecret: true,
+      enabled: true,
+      priority: 4,
+      params: { temperature: 1.0, maxTokens: 8192 },
+      models: models(["claude-opus-4-8"]),
+      mappings: [],
+      health: { status: "down", lastChecked: now - 30_000, latencyMs: 1251, failCount: 1 },
+    },
   ],
   "claude-desktop": [],
   codex: [

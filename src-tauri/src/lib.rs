@@ -118,9 +118,34 @@ fn save_secret(state: tauri::State<AppState>, key_id: String, secret: String) ->
     Ok(())
 }
 
+/// 启用/停用某条 Key。
+///
+/// **启用时顺带探测一次**（2026-08-02 加）：定时健康检查只扫**启用**的 Key，
+/// 故一条 Key 在停用期间的 `status` 会一直冻结在它上次被探测时的结论上。
+/// 真机实测过这个坑：一条禁用 Key 的卡片显示「探测不可达 · 10 天前」，
+/// 而那家上游早就恢复了、真实转发也能成功 —— 用户以为「现在就是坏的」，
+/// 实际只是没人去刷新过那个陈旧快照。
+///
+/// 「刚把它启用」正是最需要知道它当下可用性的时刻，故在这里补一次探测。
+/// 探测**异步跑、不阻塞返回**：它最长可达 30s（`fast_timeout`），
+/// 若同步等待，用户点一下开关会看到界面卡住半分钟。
+/// 探测本身只写 status/latency、绝不碰熔断字段（见 `health::check_one`）。
 #[tauri::command]
-fn toggle_key(state: tauri::State<AppState>, key_id: String, enabled: bool) -> AppResult<()> {
-    state.store.toggle_key(&key_id, enabled)
+fn toggle_key(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+    key_id: String,
+    enabled: bool,
+) -> AppResult<()> {
+    state.store.toggle_key(&key_id, enabled)?;
+    if enabled {
+        // 用 AppHandle 取 store 的 Arc（不能把 tauri::State 跨 await 送进 spawn）。
+        let store = app.state::<AppState>().store.clone();
+        tauri::async_runtime::spawn(async move {
+            health::check_one(&store, &key_id).await;
+        });
+    }
+    Ok(())
 }
 
 // ============ 主口令增强模式（FR-018 可选增强）============

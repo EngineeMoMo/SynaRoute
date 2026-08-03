@@ -504,7 +504,7 @@ impl Store {
             has_trace: e.trace.is_some(),
             // collapse_key 是内部折叠判据，不下发前端。
             collapse_key: None,
-            usage: e.usage.clone(),
+            usage: e.usage,
             trace: None,
         }
     }
