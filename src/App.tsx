@@ -18,7 +18,15 @@ import type { CategoryType, ProviderKey } from "@/types";
 const CATEGORY_KEYS: NavKey[] = ["claude-cli", "claude-desktop", "codex"];
 
 export default function App() {
-  const { activeCategory, setActiveCategory, loadCategory, loadSettings, loadVendors, refreshCategory, theme } = useStore();
+  // 细粒度订阅（勿改回整店解构）：App 是根组件，整店订阅会让**整棵树**在任何 store
+  // 字段变化时重渲染——包括 LogsPage 每 2s 的 events 刷新。
+  const activeCategory = useStore((s) => s.activeCategory);
+  const setActiveCategory = useStore((s) => s.setActiveCategory);
+  const loadCategory = useStore((s) => s.loadCategory);
+  const loadSettings = useStore((s) => s.loadSettings);
+  const loadVendors = useStore((s) => s.loadVendors);
+  const refreshCategory = useStore((s) => s.refreshCategory);
+  const theme = useStore((s) => s.theme);
   const t = useT();
   const [nav, setNav] = useState<NavKey>("claude-cli");
   const [editorOpen, setEditorOpen] = useState(false);

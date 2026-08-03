@@ -15,7 +15,9 @@ interface KeyEditorProps {
 
 /** 新增/编辑 Key 抽屉面板（FR-002/004/005/006） */
 export function KeyEditor({ initial, onClose }: KeyEditorProps) {
-  const { activeCategory, loadCategory, vendors } = useStore();
+  const activeCategory = useStore((s) => s.activeCategory);
+  const loadCategory = useStore((s) => s.loadCategory);
+  const vendors = useStore((s) => s.vendors);
   const t = useT();
   const isNew = !initial;
 

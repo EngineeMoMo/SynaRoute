@@ -25,7 +25,16 @@ import {
 
 /** 设置页（主题 / 语言 / 自启 / 加密方式 / 局域网暴露 / 版本更新 / 日志路径） */
 export function SettingsPage() {
-  const { theme, setTheme, lang, setLang, showToast, activeCategory, refreshCategory, loadCategory, loadSettings } = useStore();
+  // 细粒度订阅（勿改回整店解构）：见 ProxyStatusBar 同处注释。
+  const theme = useStore((s) => s.theme);
+  const setTheme = useStore((s) => s.setTheme);
+  const lang = useStore((s) => s.lang);
+  const setLang = useStore((s) => s.setLang);
+  const showToast = useStore((s) => s.showToast);
+  const activeCategory = useStore((s) => s.activeCategory);
+  const refreshCategory = useStore((s) => s.refreshCategory);
+  const loadCategory = useStore((s) => s.loadCategory);
+  const loadSettings = useStore((s) => s.loadSettings);
   const t = useT();
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [version, setVersion] = useState<string>("");

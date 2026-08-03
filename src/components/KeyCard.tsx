@@ -18,7 +18,14 @@ export function KeyCard({ k, onEdit, isFirst, isLast }: {
   isFirst: boolean;
   isLast: boolean;
 }) {
-  const { toggleKey, deleteKey, checkHealth, moveKey, setPrimaryKey, vendors } = useStore();
+  // 细粒度订阅：KeyCard 会被渲染 N 份（每个 Key 一份），整店解构时任何无关字段变化
+  // （如日志页每 2s 的 events）都会把整列卡片全部重渲染一遍。
+  const toggleKey = useStore((s) => s.toggleKey);
+  const deleteKey = useStore((s) => s.deleteKey);
+  const checkHealth = useStore((s) => s.checkHealth);
+  const moveKey = useStore((s) => s.moveKey);
+  const setPrimaryKey = useStore((s) => s.setPrimaryKey);
+  const vendors = useStore((s) => s.vendors);
   const t = useT();
   const vendorIcon = vendors.find((v) => v.id === k.vendor)?.icon;
   // 就地二次确认：不用原生 confirm()（在 Tauri WebView2 里行为不可靠，会导致删除不触发）

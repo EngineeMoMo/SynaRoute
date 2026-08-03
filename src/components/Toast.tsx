@@ -8,7 +8,8 @@ import { AlertTriangle, CheckCircle2, X } from "lucide-react";
  * 成功提示 3s 后自动消失。
  */
 export function Toast() {
-  const { toast, clearToast } = useStore();
+  const toast = useStore((s) => s.toast);
+  const clearToast = useStore((s) => s.clearToast);
 
   useEffect(() => {
     if (toast?.kind === "success") {

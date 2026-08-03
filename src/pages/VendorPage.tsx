@@ -19,7 +19,8 @@ type Draft = { id: string; name: string; defaultBaseUrl: string; defaultProtocol
 
 /** 厂商管理页（FR-002 扩展）：维护可在 Key 编辑器中选择的厂商预设 */
 export function VendorPage() {
-  const { vendors, loadVendors } = useStore();
+  const vendors = useStore((s) => s.vendors);
+  const loadVendors = useStore((s) => s.loadVendors);
   const t = useT();
   // editing.id === "" 表示新增；null 表示未在编辑
   const [editing, setEditing] = useState<Draft | null>(null);

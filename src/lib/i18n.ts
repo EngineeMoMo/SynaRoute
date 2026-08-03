@@ -76,6 +76,10 @@ const zh: Dict = {
   "proxy.directMode": "单 Key 直连",
   "proxy.failoverMode": "无感切换（{n} Key）",
   "proxy.copyEndpoint": "复制端点",
+  // 健康度聚合：状态条此前只显示「运行中 + 启用 Key 数」，全部 Key 探测为不可用时
+  // 仍是绿点，用户要点进列表才知道。这与「托盘说已启动、客户端没走代理」是同类的可见性缺口。
+  "proxy.allKeysDown": "全部 {n} 个 Key 当前不可用",
+  "proxy.someKeysDown": "{down}/{total} 个 Key 当前不可用",
   "proxy.applyConfig": "写入工具配置",
   "proxy.configAppliedTitle": "配置已写入",
   "proxy.configAppliedDesc": "已自动将代理端点写入 {tool} 的配置文件。请退出并重启 {tool} 客户端，以使新配置生效。",
@@ -581,6 +585,8 @@ const en: Dict = {
   "proxy.directMode": "Single-key direct",
   "proxy.failoverMode": "Seamless failover ({n} keys)",
   "proxy.copyEndpoint": "Copy endpoint",
+  "proxy.allKeysDown": "All {n} keys currently unavailable",
+  "proxy.someKeysDown": "{down}/{total} keys currently unavailable",
   "proxy.applyConfig": "Apply tool config",
   "proxy.configAppliedTitle": "Config Applied",
   "proxy.configAppliedDesc": "The proxy endpoint has been written to {tool}'s configuration. Please quit and restart {tool} to apply the new settings.",

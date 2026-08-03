@@ -12,7 +12,7 @@ import { FileCode2, RefreshCw, X, Copy, FolderOpen, AlertTriangle } from "lucide
  * 不做自由编辑（阶段 4 未做）；token 已在后端脱敏。
  */
 export function ToolConfigPreviewPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { activeCategory } = useStore();
+  const activeCategory = useStore((s) => s.activeCategory);
   const t = useT();
   const [data, setData] = useState<Preview | null>(null);
   const [err, setErr] = useState<string | null>(null);

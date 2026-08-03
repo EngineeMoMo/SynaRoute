@@ -413,8 +413,9 @@ async fn handle_request(
 
     // 候选：启用 + 未熔断，按优先级。全被熔断时（如单 Key 刚熔断）忽略熔断兜底，
     // 避免无处可切却直接 503——熔断本为多 Key 快速切换，无候选可切时不应自杀。
-    let (candidates, used_breaker_fallback) =
-        health::select_candidates(store.enabled_keys_sorted(category));
+    // 走 `candidates_for`：一次读锁内筛选排序、只克隆入选者（旧路径
+    // `enabled_keys_sorted` + `select_candidates` 要克隆两轮全量启用 Key）。
+    let (candidates, used_breaker_fallback) = store.candidates_for(category);
 
     if candidates.is_empty() {
         return Ok(error_resp(

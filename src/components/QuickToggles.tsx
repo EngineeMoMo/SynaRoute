@@ -18,7 +18,10 @@ const THEME_ICON: Record<ThemePref, typeof Sun> = {
  * - 主题：浅色 → 深色 → 跟随系统 循环
  */
 export function QuickToggles() {
-  const { theme, setTheme, lang, setLang } = useStore();
+  const theme = useStore((s) => s.theme);
+  const setTheme = useStore((s) => s.setTheme);
+  const lang = useStore((s) => s.lang);
+  const setLang = useStore((s) => s.setLang);
   const t = useT();
 
   const cycleTheme = () => {

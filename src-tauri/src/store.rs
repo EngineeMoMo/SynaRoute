@@ -902,6 +902,43 @@ impl Store {
         })
     }
 
+    /// 路由候选：一次读锁内完成「筛分类+启用 → 按优先级排序 → 剔除熔断中」，
+    /// **只对最终入选者克隆**。返回 (候选列表, 是否触发了全熔断兜底)。
+    ///
+    /// 为什么不直接用 `enabled_keys_sorted` + `health::select_candidates`：那条路径要克隆
+    /// **两轮全量启用 Key**——`enabled_keys_sorted` 先 `.cloned()` 一遍（在筛选与排序**之前**
+    /// 就已克隆），`select_candidates` 拿到 Vec 后又 `.cloned()` 一遍。每个 `ProviderKey` 带
+    /// `models` / `mappings` 两个 Vec，6 条 Key × 各 30 个 ModelInfo 时单请求要克隆约 180 个
+    /// ModelInfo 两轮。功能无误但纯浪费，且**随 Key 数与模型数线性放大**——形成「配得越全
+    /// 越慢」这种反直觉的性能曲线。
+    ///
+    /// 兜底语义与 `health::select_candidates` **必须保持一致**：全部熔断时忽略熔断窗口、
+    /// 原样返回全部启用 Key（熔断本为「多 Key 快速切换」而设，无处可切时不应自杀成 503）。
+    /// 该语义有 4 条测试锁住，改这里前先读 `health::select_candidates` 的文档。
+    pub fn candidates_for(&self, category: CategoryType) -> (Vec<ProviderKey>, bool) {
+        let cfg = self.config.read();
+        // 先按引用收集（零克隆），排序也只动指针。
+        let mut enabled: Vec<&ProviderKey> = cfg
+            .keys
+            .iter()
+            .filter(|k| k.category_id == category && k.enabled)
+            .collect();
+        enabled.sort_by_key(|k| k.priority);
+
+        // 未熔断者优先。`is_candidate` 是纯函数（只读 HealthState + 当前时间），锁内调用安全。
+        let primary: Vec<ProviderKey> = enabled
+            .iter()
+            .filter(|k| crate::health::is_candidate(&k.health))
+            .map(|k| (*k).clone())
+            .collect();
+        if !primary.is_empty() {
+            return (primary, false);
+        }
+        // 全熔断兜底：忽略熔断窗口全部纳入。此时才克隆全部（罕见路径）。
+        let used_fallback = !enabled.is_empty();
+        (enabled.into_iter().cloned().collect(), used_fallback)
+    }
+
     /// 取某分类下按优先级升序排列的启用 Key（路由用）
     pub fn enabled_keys_sorted(&self, category: CategoryType) -> Vec<ProviderKey> {
         let mut v: Vec<ProviderKey> = self

@@ -15,7 +15,16 @@ export function CategoryPage({ onAddKey, onEditKey }: {
   onAddKey: () => void;
   onEditKey: (k: ProviderKey) => void;
 }) {
-  const { activeCategory, keys, proxy, loading, refreshCategory, settings, setActiveModel, setActiveEffort } = useStore();
+  // 细粒度订阅（勿改回整店解构 `useStore()`）：整店订阅会让本页在 LogsPage 每 2s
+  // 刷新 events 时也全量重渲染——连同它下面的全部 KeyCard。
+  const activeCategory = useStore((s) => s.activeCategory);
+  const keys = useStore((s) => s.keys);
+  const proxy = useStore((s) => s.proxy);
+  const loading = useStore((s) => s.loading);
+  const refreshCategory = useStore((s) => s.refreshCategory);
+  const settings = useStore((s) => s.settings);
+  const setActiveModel = useStore((s) => s.setActiveModel);
+  const setActiveEffort = useStore((s) => s.setActiveEffort);
   const t = useT();
   const [gapDialogOpen, setGapDialogOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);

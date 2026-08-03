@@ -264,6 +264,90 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `Store::candidates_for` 必须与旧路径
+    /// （`enabled_keys_sorted` + `select_candidates`）**逐项等价**。
+    ///
+    /// 补这条的理由：`candidates_for` 是为省掉「两轮全量克隆」而新开的生产路径，而原有的
+    /// 4 条熔断测试打的是 `select_candidates` **纯函数**——新路径没有任何覆盖。两者一旦
+    /// 语义漂移，表现是路由候选集悄悄变了（少一个候选＝少一次故障转移机会，多一个＝把
+    /// 熔断中的 Key 又拉回来），不报错、不 panic。故这里对同一份 store 状态跑两条路径逐项比对。
+    #[test]
+    fn candidates_for_matches_legacy_path() {
+        use crate::model::{CategoryType, KeyParams, Protocol, ProviderKey};
+        let dir = std::env::temp_dir().join(format!(
+            "synaroute_cand_eq_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+
+        let mk = |id: &str, cat: CategoryType, prio: i32, enabled: bool, health: HealthState| {
+            ProviderKey {
+                id: id.into(),
+                category_id: cat,
+                name: id.into(),
+                vendor: "test".into(),
+                base_url: "http://127.0.0.1:1".into(),
+                protocol: Protocol::Anthropic,
+                has_secret: false,
+                enabled,
+                priority: prio,
+                headers_json: None,
+                params: KeyParams::default(),
+                models: vec![],
+                mappings: vec![],
+                default_model: None,
+                tier_haiku: None,
+                tier_sonnet: None,
+                tier_opus: None,
+                health,
+            }
+        };
+        let future = chrono::Utc::now().timestamp_millis() + 60_000;
+        let cat = CategoryType::ClaudeCli;
+
+        // 故意乱序插入 + 混入他分类与禁用项，同时放一个熔断中的。
+        store.upsert_key(mk("c", cat, 2, true, HealthState::default())).unwrap();
+        store.upsert_key(mk("a", cat, 0, true, hs(HealthStatus::Up, 0, None))).unwrap();
+        store.upsert_key(mk("burnt", cat, 1, true, hs(HealthStatus::Up, 3, Some(future)))).unwrap();
+        store.upsert_key(mk("off", cat, 0, false, HealthState::default())).unwrap();
+        store.upsert_key(mk("other", CategoryType::Codex, 0, true, HealthState::default())).unwrap();
+
+        let legacy = select_candidates(store.enabled_keys_sorted(cat));
+        let now = store.candidates_for(cat);
+        assert_eq!(
+            now.0.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(),
+            legacy.0.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(),
+            "候选集与顺序必须与旧路径一致"
+        );
+        assert_eq!(now.1, legacy.1, "兜底标记必须一致");
+        // 具体断言，防止两条路径「一起错」也判等价。
+        assert_eq!(
+            now.0.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "c"],
+            "应按 priority 升序、剔除熔断中的 burnt、排除禁用与他分类"
+        );
+        assert!(!now.1);
+
+        // 全部熔断 → 兜底返回全部启用 Key（含熔断中的），两条路径同样必须一致。
+        store.mutate_health("a", |h| { h.breaker_until = Some(future); true }).unwrap();
+        store.mutate_health("c", |h| { h.breaker_until = Some(future); true }).unwrap();
+        let legacy = select_candidates(store.enabled_keys_sorted(cat));
+        let now = store.candidates_for(cat);
+        assert_eq!(
+            now.0.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(),
+            legacy.0.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(),
+        );
+        assert_eq!(now.1, legacy.1);
+        assert!(now.1, "全熔断必须标记为已触发兜底");
+        assert_eq!(now.0.len(), 3, "兜底应纳入全部 3 个启用 Key（不含禁用/他分类）");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 并发失败**不得丢计数**：N 个并发 `record_live_failure` 必须精确累加成 N。
     ///
     /// 补这条的理由：旧实现是「`get_key` 读锁取 prev → 算 → `update_health` 写锁」，

@@ -66,7 +66,11 @@ const CATEGORY_ORDER: CategoryType[] = ["claude-cli", "claude-desktop", "codex"]
 
 /** 运行日志 / 可观测性视图（FR-020）。合并全部分类连续展示，按「类型分组」与「来源分类」两维筛选。 */
 export function LogsPage() {
-  const { events, lang, refreshEvents } = useStore();
+  // 细粒度订阅（勿改回 `useStore()` 整店解构）：本页每 2s 刷新 events，
+  // 而整店解构会让**所有**这样写的组件跟着每 2s 全量重渲染。
+  const events = useStore((s) => s.events);
+  const lang = useStore((s) => s.lang);
+  const refreshEvents = useStore((s) => s.refreshEvents);
   const t = useT();
   // 类型分组筛选：null = 全部；否则只看某一组。
   const [filter, setFilter] = useState<LogGroup | null>(null);

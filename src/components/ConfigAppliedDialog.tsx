@@ -4,7 +4,8 @@ import { Button } from "@/components/ui/Button";
 import { CheckCircle } from "lucide-react";
 
 export function ConfigAppliedDialog() {
-  const { configAppliedCategory, clearConfigApplied } = useStore();
+  const configAppliedCategory = useStore((s) => s.configAppliedCategory);
+  const clearConfigApplied = useStore((s) => s.clearConfigApplied);
   const t = useT();
 
   if (!configAppliedCategory) return null;
