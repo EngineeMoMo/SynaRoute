@@ -2936,6 +2936,96 @@ tool_timeout_sec = 600
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **核心防线（历史事故回归）**：真实 ChatGPT OAuth 态下接入 Codex，必须
+    /// ① 把完整 OAuth 令牌备份进 .bak，② 磁盘上的 auth.json 变为纯占位，
+    /// ③ restore_one 能把 OAuth **一字不差**拿回来。
+    ///
+    /// 这正是「一次接入就抹掉官方登录态」那个事故的核心：旧实现整份替换 auth.json，
+    /// 若备份/还原任一环断裂，用户官方账号就永久登不回来。此前只测了幂等与首次场景，
+    /// 缺这条完整往返 —— 现补上并做故障注入验证。
+    #[test]
+    fn codex_auth_apply_backs_up_oauth_and_restore_brings_it_back_verbatim() {
+        let auth = temp_file("codex_auth_oauth_roundtrip", "auth.json");
+        // 真实 ChatGPT OAuth 形态：OPENAI_API_KEY 为 null + 完整 tokens 段 + auth_mode。
+        // 字节要“难看”一点（含缩进、特定顺序），才能验证还原是**逐字节**而非“语义等价”。
+        let oauth_original = concat!(
+            "{\n",
+            "  \"OPENAI_API_KEY\": null,\n",
+            "  \"auth_mode\": \"chatgpt\",\n",
+            "  \"tokens\": {\n",
+            "    \"access_token\": \"eyJreal.access.TOKEN\",\n",
+            "    \"refresh_token\": \"rt_real_value\",\n",
+            "    \"account_id\": \"acct-123\"\n",
+            "  },\n",
+            "  \"last_refresh\": \"2026-08-02T09:00:00Z\"\n",
+            "}\n"
+        );
+        std::fs::write(&auth, oauth_original).unwrap();
+
+        // —— 接入 ——
+        let msg = apply_codex_auth_at(&auth).unwrap();
+        assert!(msg.contains("已备份"), "有 OAuth 态时必须提示已备份，实际：{msg}");
+
+        // ① 备份存在且**内容与原 OAuth 逐字节一致**（不是被序列化重排过的等价物）
+        let bak = backup_path_for(&auth);
+        assert!(bak.exists(), "接入必须备份原 OAuth 令牌");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            oauth_original,
+            "备份必须是原 OAuth 的逐字节副本，否则还原后 token 形态可能失真"
+        );
+
+        // ② 磁盘上的 auth.json 已变为纯占位（Codex 才能走 bearer 鉴权而非撞账号门）
+        assert!(
+            is_placeholder_only_auth(&auth),
+            "接入后 auth.json 应为纯占位"
+        );
+
+        // —— 还原 ——
+        assert!(restore_one(&auth).unwrap(), "应从 .bak 还原");
+        // ③ OAuth 一字不差回来，且 .bak 已被清掉（下次接入重抓新鲜快照）
+        assert_eq!(
+            std::fs::read_to_string(&auth).unwrap(),
+            oauth_original,
+            "还原后必须拿回一字不差的官方登录态"
+        );
+        assert!(!bak.exists(), "还原成功后应清掉 .bak");
+
+        std::fs::remove_dir_all(auth.parent().unwrap()).ok();
+    }
+
+    /// 「首写即锁」在 Codex auth 上的体现：重复接入不得让第二次的“已接入态”
+    /// 冲掉第一次备份的真实 OAuth。否则改端口/换模型后再接入，还原只能拿回占位。
+    #[test]
+    fn codex_auth_repeated_apply_keeps_original_oauth_backup() {
+        let auth = temp_file("codex_auth_relock", "auth.json");
+        let oauth = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","tokens":{"access_token":"ORIGINAL"}}"#;
+        std::fs::write(&auth, oauth).unwrap();
+
+        // 首次接入：备份原 OAuth，磁盘变占位
+        apply_codex_auth_at(&auth).unwrap();
+        let bak = backup_path_for(&auth);
+        let bak_after_first = std::fs::read_to_string(&bak).unwrap();
+        assert!(bak_after_first.contains("ORIGINAL"), "首次应备份真实 OAuth");
+
+        // 再次接入（此时磁盘已是占位）：must be no-op，且 .bak 绝不能被占位覆盖
+        let msg = apply_codex_auth_at(&auth).unwrap();
+        assert!(msg.contains("已是接入态"), "占位态再接入应短路：{msg}");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            bak_after_first,
+            ".bak 必须仍是最初的 OAuth，不能被已接入态冲掉"
+        );
+
+        // 还原仍能拿回真实 OAuth
+        restore_one(&auth).unwrap();
+        assert!(
+            std::fs::read_to_string(&auth).unwrap().contains("ORIGINAL"),
+            "还原应拿回最初的 OAuth"
+        );
+        std::fs::remove_dir_all(auth.parent().unwrap()).ok();
+    }
+
     /// 旧版遗留清理：**旧版**接入把 auth.json 换成了纯占位，`restore` 仍要能识别并清掉它。
     /// 这条锁的是 `is_placeholder_only_auth` 的判据（严格要求「只有一个 OPENAI_API_KEY 且值为占位」），
     /// 保证绝不误删含 OAuth tokens 的真实凭证。
