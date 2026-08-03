@@ -1117,9 +1117,21 @@ function ImportDialog({
             secrets: report.secretsImported,
           })}
         </div>
+        {/* 清理掉的旧密钥要明确报告（P2-3）：密钥是敏感材料，删了几条不该无声发生。 */}
+        {report.secretsPruned > 0 && (
+          <div className="rounded-control bg-surface-elevated px-3 py-2 text-xs leading-relaxed text-text-secondary">
+            {t("backup.secretsPruned", { n: report.secretsPruned })}
+          </div>
+        )}
         {report.backupPath && (
-          <div className="break-all rounded-control bg-surface-elevated px-3 py-2 font-mono text-[11px] text-text-secondary">
-            {t("backup.backupSaved", { path: report.backupPath })}
+          <div className="space-y-1.5 rounded-control bg-surface-elevated px-3 py-2">
+            <div className="break-all font-mono text-[11px] text-text-secondary">
+              {t("backup.backupSaved", { path: report.backupPath })}
+            </div>
+            {/* 备份路径原先只是显示出来，用户不知道拿它能干什么（docs/15 UX #20）。 */}
+            <div className="text-[11px] leading-relaxed text-text-muted">
+              {t("backup.backupRestoreHint")}
+            </div>
           </div>
         )}
         {report.warnings.length > 0 && (

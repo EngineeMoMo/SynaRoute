@@ -132,6 +132,11 @@ pub struct ImportReport {
     pub vendors_imported: usize,
     pub brain_imported: usize,
     pub secrets_imported: usize,
+    /// 随被移除 Key 一并清理掉的旧密钥条数（P2-3，仅 Replace 模式非零）。
+    ///
+    /// 要报告给用户：密钥是敏感材料，「删掉了几条」应当明说，而不是无声发生。
+    #[serde(default)]
+    pub secrets_pruned: usize,
     /// Replace 模式下导入前备份的 config 路径（Merge 模式为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<String>,
@@ -382,8 +387,31 @@ pub fn apply_import(
         0
     };
 
-    // 配置整体落盘（走 store 的带回滚写路径）。
-    store.apply_imported_config(&file.payload, mode)?;
+    // 配置整体落盘（走 store 的带回滚写路径）。返回 Replace 模式下被移除的 Key id。
+    let removed_ids = store.apply_imported_config(&file.payload, mode)?;
+
+    // 清理被移除 Key 的密钥（P2-3）。**必须在配置落盘成功之后**——反之若配置落盘失败，
+    // Key 会在下次启动时复活而密钥已没了（`has_secret=true` 却取不到的孤儿）。
+    // 这与 `Store::delete_key` 的时序理由完全相同。
+    //
+    // 且必须在下面写入新密钥的循环**之前**完成：removed_ids 已排除「载荷里也有的 id」，
+    // 故不会误删本次马上要写入的同 id 密钥。
+    //
+    // 不清理的后果（历史行为）：Replace 导入后那些 Key 的可解密钥材料仍完整留在
+    // secrets.enc 里，UI 无入口可见更无法删除；日后导入「含同 id Key 但不含密钥段」的文件时，
+    // 对账会读到孤儿密文把 has_secret 刷成 true，得到「新配置 + 旧密钥」的嵌合体 → 莫名 401。
+    let mut secrets_pruned = 0usize;
+    if !removed_ids.is_empty() {
+        let mut guard = store.secrets.write();
+        for id in &removed_ids {
+            match guard.remove(id) {
+                Ok(()) => secrets_pruned += 1,
+                // 残留一条孤儿是无害的（可被 prune_orphan_secrets 兜住），不中止导入。
+                Err(e) => warnings.push(format!("清理 Key {id} 的旧密钥失败: {e}")),
+            }
+        }
+        drop(guard);
+    }
 
     // 密钥逐条写入（在配置落盘成功之后——否则可能出现「有密钥、没 Key」的孤儿）。
     //
@@ -433,6 +461,7 @@ pub fn apply_import(
         vendors_imported: file.payload.vendors.len(),
         brain_imported: file.payload.brain.len(),
         secrets_imported,
+        secrets_pruned,
         backup_path,
         warnings,
     })
@@ -877,6 +906,97 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("过旧"), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P2-3：Replace 导入必须清理「被移除 Key」的密钥，否则留下不可见、不可删的孤儿。
+    ///
+    /// 两层后果（不修的话）：
+    /// 1. 用户以为那些 Key 已经没了，但可解密钥材料仍完整留在 secrets.enc 里，UI 无入口可见；
+    /// 2. 更隐蔽：日后导入「含同 id Key 但不含密钥段」的文件时，has_secret 对账会读到孤儿密文
+    ///    把标记刷成 true → 得到「新配置 + 旧密钥」的嵌合体，转发莫名 401 而界面一切正常。
+    #[test]
+    fn replace_import_prunes_secrets_of_removed_keys() {
+        let src_dir = temp_dir("prune_src");
+        let dst_dir = temp_dir("prune_dst");
+
+        // 文件里只有 keep 这一条
+        let src = store_at(&src_dir);
+        src.upsert_key(key("keep", "留下的")).unwrap();
+        let file = build_export(&src, "1.0.0", None).unwrap().0;
+
+        // 本机有 keep + gone 两条，且两条都有密钥
+        let dst = store_at(&dst_dir);
+        dst.upsert_key(key("keep", "本机的")).unwrap();
+        dst.upsert_key(key("gone", "将被移除")).unwrap();
+        dst.secrets.write().set("keep", "sk-keep").unwrap();
+        dst.secrets.write().set("gone", "sk-gone").unwrap();
+        assert_eq!(dst.count_orphan_secrets(), 0, "前置条件：此时无孤儿");
+
+        let report = apply_import(&dst, &file, ImportMode::Replace, None).unwrap();
+
+        // gone 的密钥必须已被清理
+        assert_eq!(report.secrets_pruned, 1, "应清理 1 条随 Key 移除的密钥");
+        assert_eq!(
+            dst.count_orphan_secrets(),
+            0,
+            "Replace 后不应残留孤儿密钥，实得 {} 条",
+            dst.count_orphan_secrets()
+        );
+        assert!(
+            dst.secrets.read().get("gone").unwrap().is_none(),
+            "被移除 Key 的密钥必须已删除"
+        );
+        // keep 仍在载荷里 → 它的密钥**不能**被误删
+        assert_eq!(
+            dst.secrets.read().get("keep").unwrap().as_deref(),
+            Some("sk-keep"),
+            "载荷里仍有的 Key，其密钥不得被清理"
+        );
+
+        std::fs::remove_dir_all(&src_dir).ok();
+        std::fs::remove_dir_all(&dst_dir).ok();
+    }
+
+    /// P2-3：`prune_orphan_secrets` 兜住历史遗留孤儿，且**锁定态必须跳过**（不误删）。
+    #[test]
+    fn prune_orphan_secrets_cleans_history_and_skips_when_locked() {
+        let dir = temp_dir("prune_history");
+        let store = store_at(&dir);
+        store.upsert_key(key("live", "在用")).unwrap();
+        store.secrets.write().set("live", "sk-live").unwrap();
+        // 手工制造历史遗留孤儿：直接往密钥库写一条配置里没有的
+        store.secrets.write().set("ghost", "sk-ghost").unwrap();
+
+        assert_eq!(store.count_orphan_secrets(), 1, "应检出 1 条孤儿");
+        assert_eq!(store.prune_orphan_secrets(), 1, "应清理 1 条");
+        assert_eq!(store.count_orphan_secrets(), 0);
+        assert_eq!(
+            store.secrets.read().get("live").unwrap().as_deref(),
+            Some("sk-live"),
+            "在用 Key 的密钥不得被误删"
+        );
+
+        // 锁定态：读不到内容，必须**跳过**而非把所有密钥都当成孤儿删掉。
+        //
+        // 注意 `is_locked()` = 「主口令模式 **且** 未解锁」——DPAPI 模式下没有可锁的东西，
+        // 直接调 lock() 不会进入锁定态。故必须先启用主口令，再锁。
+        store.secrets.write().set("ghost2", "sk-ghost2").unwrap();
+        assert_eq!(store.count_orphan_secrets(), 1);
+        store.secrets.write().enable_master_password("pw-123456").unwrap();
+        store.secrets.write().lock();
+        assert!(store.secrets.read().is_locked(), "前置条件：必须真的进入锁定态");
+        assert_eq!(
+            store.count_orphan_secrets(),
+            0,
+            "锁定态应返回 0（不是「没有孤儿」，而是「此时无法判断」）"
+        );
+        assert_eq!(
+            store.prune_orphan_secrets(),
+            0,
+            "锁定态必须跳过清理：把「暂时读不到」当成「确实没有」会误删真实密钥"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

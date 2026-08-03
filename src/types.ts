@@ -429,6 +429,8 @@ export interface ImportReport {
   vendorsImported: number;
   brainImported: number;
   secretsImported: number;
+  /** 随被移除 Key 一并清理的旧密钥条数（仅 Replace 模式非零）。密钥是敏感材料，删了几条要明说。 */
+  secretsPruned: number;
   /** replace 模式下导入前备份的 config 路径 */
   backupPath?: string;
   /** 非致命提示（如「需重新录入密钥」） */

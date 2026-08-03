@@ -216,7 +216,10 @@ impl SecretStore {
     ///
     /// 取并集则最坏情况是「多试解一条、失败即整体放弃」，不会丢数据。`set`/`remove` 已做双边
     /// 清理，正常路径下另一边本就是空的；这里是兜住异常路径。
-    fn all_key_ids(&self) -> Vec<String> {
+    /// 改为 `pub(crate)`：`Store::prune_orphan_secrets`（P2-3）要据此找出
+    /// 「密钥库里有、但配置里已无对应 Key」的孤儿。取并集这件事对孤儿清理同样重要——
+    /// 只看单边会漏掉另一边的残留，那些密文将永远无法被清理。
+    pub(crate) fn all_key_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.vault.boxes.keys().cloned().collect();
         for id in self.vault.entries.keys() {
             if !ids.iter().any(|x| x == id) {
@@ -416,7 +419,9 @@ impl SecretStore {
 
     /// 整份重写前的备份（带用途标签与时间戳，可回滚 —— dev-hard-rules）。
     /// 文件不存在时不算失败（首次启用、库还没落过盘）。
-    fn backup_before_rewrite(&self, tag: &str) -> AppResult<()> {
+    ///
+    /// `pub(crate)`：孤儿密钥清理（P2-3）也是不可逆的删除操作，必须先备份。
+    pub(crate) fn backup_before_rewrite(&self, tag: &str) -> AppResult<()> {
         if !self.path.exists() {
             return Ok(());
         }

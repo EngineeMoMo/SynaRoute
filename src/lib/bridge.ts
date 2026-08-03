@@ -235,6 +235,7 @@ export const api = {
       vendorsImported: 0,
       brainImported: 0,
       secretsImported: 0,
+      secretsPruned: 0,
       warnings: ["浏览器预览模式：未实际导入"],
     })),
 

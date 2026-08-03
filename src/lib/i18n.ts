@@ -477,6 +477,8 @@ const zh: Dict = {
   "backup.importing": "导入中…",
   "backup.importDone": "导入完成：新增 {added} / 覆盖 {overwritten} / 删除 {removed} 个 Key，密钥 {secrets} 条",
   "backup.backupSaved": "导入前配置已备份到 {path}",
+  "backup.backupRestoreHint": "如需回退到导入前的状态：用「替换导入」模式导入上面这个备份文件即可。",
+  "backup.secretsPruned": "已清理 {n} 条随 Key 一并移除的旧密钥（它们对应的 Key 已不在配置里）。",
 
   // MCP 服务器
   "settings.mcpTitle": "MCP 服务器",
@@ -994,6 +996,8 @@ const en: Dict = {
   "backup.importing": "Importing…",
   "backup.importDone": "Import done: {added} added / {overwritten} overwritten / {removed} removed keys, {secrets} secrets",
   "backup.backupSaved": "Previous config backed up to {path}",
+  "backup.backupRestoreHint": "To roll back to the state before this import: import the backup file above using \"Replace\" mode.",
+  "backup.secretsPruned": "Cleaned up {n} stale API key(s) belonging to keys that are no longer in the config.",
 
   // MCP server
   "settings.mcpTitle": "MCP Server",

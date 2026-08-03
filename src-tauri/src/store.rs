@@ -801,13 +801,31 @@ impl Store {
     /// **settings 一律整份替换**（导入方已剔掉本机绑定字段，见 `portable::strip_machine_local`），
     /// 但随后仍由 `save_settings` 那套「后端自管字段保留」逻辑管着——这里直接写 cfg.settings
     /// 会绕过它，故显式把本机自管的几项从当前值继承回来。
+    ///
+    /// **返回 Replace 模式下被移除的 Key id**（P2-3）：调用方据此清理它们的密钥。
+    /// 这里刻意**不**在本函数内删密钥——必须等配置落盘成功之后再删，理由同 `delete_key`：
+    /// 反之若配置落盘失败，Key 会在下次启动时复活，而密钥已经没了（`has_secret=true`
+    /// 却取不到密钥的孤儿）。Merge 模式返回空 vec（不删任何东西）。
     pub fn apply_imported_config(
         &self,
         payload: &crate::portable::ExportPayload,
         mode: crate::portable::ImportMode,
-    ) -> AppResult<()> {
+    ) -> AppResult<Vec<String>> {
         use crate::portable::ImportMode;
         self.mutate_and_persist(|cfg| {
+            // Replace 会清空 keys：记下「本机原有、但导入载荷里没有」的 id，它们的密钥要清理。
+            // 载荷里也有的 id 不算移除（马上会被写回来，且随后可能要写入新密钥）。
+            let removed: Vec<String> = if mode == ImportMode::Replace {
+                let incoming: std::collections::HashSet<&str> =
+                    payload.keys.iter().map(|k| k.id.as_str()).collect();
+                cfg.keys
+                    .iter()
+                    .filter(|k| !incoming.contains(k.id.as_str()))
+                    .map(|k| k.id.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
             if mode == ImportMode::Replace {
                 cfg.keys.clear();
                 cfg.brain.clear();
@@ -844,8 +862,60 @@ impl Store {
             incoming.log_dir = cfg.settings.log_dir.clone();
             incoming.auto_start = cfg.settings.auto_start;
             cfg.settings = incoming;
-            Ok(())
+            Ok(removed)
         })
+    }
+
+    /// 清理「配置里已不存在的 Key 仍留在密钥库里」的孤儿密钥（P2-3）。
+    ///
+    /// 为什么需要：`delete_key` 会同步删密钥，但 **Replace 模式导入**清空 keys 时从不碰密钥库
+    /// （历史遗留）。后果两层：
+    /// 1. 用户执行 Replace 导入（UI 明示会删掉本机多出的 Key）后，那些 Key 的**可解密钥材料
+    ///    仍完整留在 `secrets.enc` 里**，UI 无入口可见、更无法删除，只能手工删文件；
+    /// 2. 更隐蔽：日后再导入一份「含同 id Key 但不含密钥段」的文件时，
+    ///    `reconcile_has_secret_flags` 的反向修复分支会读到孤儿密文把 `has_secret` 刷成 true，
+    ///    UI 显示「已配置密钥」，而转发用的是上一批配置里那条早已废弃的 Key ——
+    ///    表现为莫名 401 或「用错账号扣错额度」，根因埋在几次导入之前。
+    ///
+    /// **锁定态直接跳过**（返回 0）：主口令未解锁时 `all_key_ids` 读不到内容，
+    /// 照常执行等于把「暂时读不到」当成「确实没有」，会误删真实密钥。
+    /// 与 `reconcile_has_secret_flags` 的锁定态处理同一原则。
+    ///
+    /// 返回被清理的条数。**这是破坏性操作**，调用方应先备份并让用户确认（见 lib.rs 的调用点）。
+    pub fn prune_orphan_secrets(&self) -> usize {
+        if self.secrets.read().is_locked() {
+            return 0;
+        }
+        let live: std::collections::HashSet<String> =
+            self.config.read().keys.iter().map(|k| k.id.clone()).collect();
+        let orphans: Vec<String> = {
+            let sec = self.secrets.read();
+            sec.all_key_ids().into_iter().filter(|id| !live.contains(id)).collect()
+        };
+        let mut n = 0;
+        for id in &orphans {
+            match self.secrets.write().remove(id) {
+                Ok(()) => n += 1,
+                // 单条失败只记日志：残留一条孤儿是无害的（下次再清或手工处理），
+                // 不该让整次清理中断。
+                Err(e) => tracing::warn!("清理孤儿密钥 {id} 失败: {e}"),
+            }
+        }
+        if n > 0 {
+            tracing::info!("已清理 {n} 条孤儿密钥（配置中已无对应 Key）");
+        }
+        n
+    }
+
+    /// 统计孤儿密钥条数（只读，不删）。供 UI 在清理前告知用户「将清理 N 条」。
+    pub fn count_orphan_secrets(&self) -> usize {
+        if self.secrets.read().is_locked() {
+            return 0;
+        }
+        let live: std::collections::HashSet<String> =
+            self.config.read().keys.iter().map(|k| k.id.clone()).collect();
+        let sec = self.secrets.read();
+        sec.all_key_ids().into_iter().filter(|id| !live.contains(id)).count()
     }
 
     /// 让每个 Key 的 `has_secret` 标记与密钥库实际内容对账，返回「标记有但实际没有」的条数。

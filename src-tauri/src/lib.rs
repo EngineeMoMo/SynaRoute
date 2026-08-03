@@ -1253,15 +1253,52 @@ async fn apply_import_config(
         "config",
         None,
         &format!(
-            "已导入配置（{:?}）：新增 {} / 覆盖 {} / 删除 {} 个 Key，密钥 {} 条",
+            "已导入配置（{:?}）：新增 {} / 覆盖 {} / 删除 {} 个 Key，密钥 {} 条{}",
             report.mode,
             report.keys_added,
             report.keys_overwritten,
             report.keys_removed,
-            report.secrets_imported
+            report.secrets_imported,
+            // 清理掉的旧密钥要写进事件日志：密钥是敏感材料，删了几条应当留痕。
+            if report.secrets_pruned > 0 {
+                format!("，清理随 Key 一并移除的旧密钥 {} 条", report.secrets_pruned)
+            } else {
+                String::new()
+            }
         ),
     );
     Ok(report)
+}
+
+/// 统计孤儿密钥条数（P2-3）：密钥库里有、但配置里已无对应 Key 的残留。
+///
+/// 只读命令。用于在设置页告知用户「检测到 N 条可清理的旧密钥」，由用户点确认再执行
+/// [`prune_orphan_secrets`] —— 刻意不做启动时静默清理：删密钥不可逆，
+/// 而残留孤儿本身是无害的（只占空间），不值得用「自动删」去换那点整洁。
+#[tauri::command]
+fn count_orphan_secrets(state: tauri::State<AppState>) -> usize {
+    state.store.count_orphan_secrets()
+}
+
+/// 清理孤儿密钥（P2-3）。**破坏性操作**：先备份密钥库，再删。
+///
+/// 返回被清理的条数。锁定态下 `Store::prune_orphan_secrets` 会直接返回 0（不误删），
+/// 故这里无需另做判断。
+#[tauri::command]
+fn prune_orphan_secrets(state: tauri::State<AppState>) -> AppResult<usize> {
+    // 删密钥前先备份整库：这是唯一能挽回误删的手段（硬规则「改配置前必备份」）。
+    // 备份失败即放弃清理——孤儿残留是无害的，为整洁去冒「删了没法恢复」的风险不值。
+    state.store.secrets.read().backup_before_rewrite("prune-orphans")?;
+    let n = state.store.prune_orphan_secrets();
+    if n > 0 {
+        state.store.append_event(
+            CategoryType::ClaudeCli,
+            "config",
+            None,
+            &format!("已清理 {n} 条孤儿密钥（配置中已无对应 Key），清理前已备份密钥库"),
+        );
+    }
+    Ok(n)
 }
 
 // ============ 厂商预设命令 ============
@@ -1604,6 +1641,8 @@ pub fn run() {
             export_config,
             pick_and_preview_import,
             apply_import_config,
+            count_orphan_secrets,
+            prune_orphan_secrets,
             list_vendors,
             upsert_vendor,
             delete_vendor,
