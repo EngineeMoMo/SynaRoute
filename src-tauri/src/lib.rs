@@ -1379,6 +1379,15 @@ pub fn run() {
                 // 只按此固定节奏轮询配置，用户在设置里改回非 0 档后最多这么久即恢复自动探测。
                 const DISABLED_POLL_SECS: u64 = 30;
                 loop {
+                    // 健康态合并落盘（P1-3 后半）：转发热路径的 record_live_* 只标脏，
+                    // 真正的 20KB 序列化 + atomic_write 挪到这个后台线程上做。
+                    //
+                    // 放在这里（而非另起一个线程）是因为本循环已经是「周期性、可容忍延迟、
+                    // 不在请求路径上」的现成载体；另起线程只是多一个要管生命周期的东西。
+                    // 注意它在 `interval == 0`（用户关闭定时探测）时也必须继续执行——
+                    // 熔断态由**真实流量**驱动，与探测开关无关，否则关掉探测就永不落盘了。
+                    store_bg.flush_health_if_dirty();
+
                     let interval = store_bg.get_settings().health_check_interval_secs;
                     if interval == 0 {
                         // 关闭：跳过本轮探测（保留各 Key 现有健康态，不改动），仅轮询配置等待重新开启。
@@ -1597,6 +1606,9 @@ pub fn run() {
             // 恰恰是退出/崩溃前那几条。`flush_logs` 内部带 3s 上限，磁盘僵死时也不会把退出挂住。
             if let tauri::RunEvent::Exit = event {
                 let state = app.state::<AppState>();
+                // 健康态若还是脏的（后台合并轮次未到就退出了），在这里补一次落盘。
+                // 不做的话，本次运行攒下的熔断计数会丢，下次启动会立刻重打已知坏掉的 Key。
+                state.store.flush_health_if_dirty();
                 state.store.flush_logs();
                 let dropped = state.store.log_dropped_count();
                 if dropped > 0 {

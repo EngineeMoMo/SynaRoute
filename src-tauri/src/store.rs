@@ -35,6 +35,13 @@ pub struct Store {
     log_tx: std::sync::mpsc::SyncSender<LogCmd>,
     /// 队列满被丢弃的日志条数。**必须可观测**——静默丢日志是本项目最忌讳的失效形态。
     log_dropped: std::sync::atomic::AtomicU64,
+    /// 健康态（熔断计数 / 窗口）有未落盘变更（P1-3 后半）。
+    ///
+    /// 转发热路径的 `record_live_failure/success` 只翻这个标记，由后台任务合并落盘：
+    /// 一次 `persist()` 要序列化整份 AppConfig（~20KB）再走 `atomic_write`，而后者持进程级
+    /// 锁且内部含最坏 ~1.2s 的 `thread::sleep` 退避——在 tokio worker 上同步执行会让同线程
+    /// 的其它并发转发（含 SSE 流）一并停顿。健康态是可重建的瞬态，合并落盘是正确的取舍。
+    health_dirty: std::sync::atomic::AtomicBool,
 }
 
 /// 发给日志写线程的命令。
@@ -191,6 +198,7 @@ impl Store {
             config_stamp: RwLock::new(initial_stamp),
             log_tx: Self::spawn_log_writer(),
             log_dropped: std::sync::atomic::AtomicU64::new(0),
+            health_dirty: std::sync::atomic::AtomicBool::new(false),
         };
         // P1 防数据销毁：仅在「全新安装(文件不存在)首次 seed」或「成功加载后的迁移」时落盘。
         // load_failed(文件存在但解析失败)时绝不 persist——否则空配置会覆盖磁盘上的原有数据。
@@ -694,7 +702,31 @@ impl Store {
             let mut cfg = self.config.write();
             before_len = cfg.keys.len();
             // 只合并数据类字段,保留 settings 中的后端自管字段
+            //
+            // **健康态例外：按 id 保留本进程的内存值，不采用磁盘那份。**
+            //
+            // 理由有两层：
+            // 1. 语义上，`health`（status/latency/fail_count/breaker_until）是**本进程的运行时
+            //    状态**——它由本进程的真实转发结果与探测得出。磁盘上那份只是「暖启动缓存」，
+            //    外部编辑（用户手改 config.json、另一个实例写盘）里的健康块对我们并不权威。
+            // 2. 实践上，`update_health` / `mutate_health` 刻意不是每次变化都落盘
+            //    （latency 每轮都变；熔断计数改为标脏后由后台合并落盘，见 P1-3）。若这里整份
+            //    采用磁盘值，一次外部改动就会把内存里**尚未落盘的熔断计数清零**，
+            //    表现为「刚攒到 2 次失败的 Key 又变回 0，熔断永远攒不满」。
+            //    本次把合并窗口放宽到「后台一轮」后，这个窗口更值得堵。
+            let prev_health: std::collections::HashMap<String, HealthState> = cfg
+                .keys
+                .iter()
+                .map(|k| (k.id.clone(), k.health.clone()))
+                .collect();
             cfg.keys = fresh.keys;
+            for k in cfg.keys.iter_mut() {
+                if let Some(h) = prev_health.get(&k.id) {
+                    // 本进程已认识这个 Key → 用内存里的健康态（更新、更权威）。
+                    k.health = h.clone();
+                }
+                // 磁盘上新出现的 Key（本进程没见过）→ 保留其磁盘健康态作为暖启动值。
+            }
             cfg.brain = fresh.brain;
             cfg.vendors = fresh.vendors;
             after_len = cfg.keys.len();
@@ -1044,9 +1076,43 @@ impl Store {
             }
         };
         if need_persist {
-            self.persist()?;
+            // **标脏，不在此落盘**（P1-3 后半）。转发热路径上的 record_live_failure/success
+            // 会走到这里，而 persist() 要序列化整份 AppConfig（实测 ~20KB）再走 atomic_write
+            // ——后者持进程级 WRITE_LOCK 且内部含两轮各 6 次 thread::sleep（最坏累计 ~1.2s）。
+            // 在 tokio worker 上同步执行会让同线程的其它并发转发（含 SSE）一并停顿。
+            //
+            // 健康态是**可重建的瞬态**：丢最后几秒的落盘不会留下需人工修的错账（真实流量与
+            // 下一轮探测会立刻重新得出结论）。故改为标脏 + 由后台任务合并落盘，
+            // 顺带消掉「每次熔断字段变化就整份重写 20KB」的写放大。
+            self.mark_health_dirty();
         }
         Ok(())
+    }
+
+    /// 标记「健康态有未落盘的变更」。由 `flush_health_if_dirty` 合并落盘。
+    fn mark_health_dirty(&self) {
+        self.health_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 若健康态被标脏则落盘一次并清标记（由后台任务定期调用，以及退出前调用）。
+    ///
+    /// 返回是否真的写了盘。**先清标记再写**：若写盘期间又有新变更，宁可多写一次（下一轮），
+    /// 也不要漏掉那次变更（先写后清会形成丢失窗口）。
+    pub fn flush_health_if_dirty(&self) -> bool {
+        if !self
+            .health_dirty
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        if let Err(e) = self.persist() {
+            // 落盘失败：重新标脏，下一轮再试。健康态可重建，不必上抛打断调用方。
+            self.mark_health_dirty();
+            tracing::warn!("健康态合并落盘失败（下一轮重试）: {e}");
+            return false;
+        }
+        true
     }
 
     /// 更新某 Key 的健康状态（健康检查模块调用）。
@@ -1076,7 +1142,8 @@ impl Store {
             }
         };
         if changed {
-            self.persist()?;
+            // 同 `mutate_health`：标脏由后台合并落盘，不在调用线程上做 20KB 序列化 + atomic_write。
+            self.mark_health_dirty();
         }
         Ok(())
     }
@@ -1498,6 +1565,7 @@ impl Store {
             config_stamp: RwLock::new(initial_stamp),
             log_tx: Self::spawn_log_writer(),
             log_dropped: std::sync::atomic::AtomicU64::new(0),
+            health_dirty: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -1876,6 +1944,84 @@ mod tests {
         let last = ev.last().unwrap();
         assert_eq!(last.repeat, 2);
         assert_eq!(last.usage.map(|x| (x.input, x.output)), Some((70, 8)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P1-3 后半：熔断计数改为**标脏 + 合并落盘**，转发路径不再做 20KB 序列化 + atomic_write。
+    #[test]
+    fn health_changes_are_coalesced_not_persisted_inline() {
+        let dir = temp_dir("health_coalesce");
+        let cfg_path = dir.join("config.json");
+        // record_live_* 收 &Arc<Store>（真实调用方是 proxy 里的 Arc）
+        let store =
+            std::sync::Arc::new(Store::new_at(cfg_path.clone(), dir.join("secrets.enc")).unwrap());
+        store.upsert_key(sample_key("k1", 0)).unwrap();
+        let mtime0 = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // 连续失败：会改熔断字段，但**不应该**立刻落盘（旧实现每次都整份重写 20KB）
+        for _ in 0..5 {
+            crate::health::record_live_failure(&store, "k1");
+        }
+        let mtime1 = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime0, mtime1,
+            "熔断计数变化应只标脏、不在调用线程上落盘（那会带来 20KB 序列化 + 持锁 sleep）"
+        );
+        // 内存态必须已生效（标脏不等于不改内存——路由决策靠内存态）
+        assert_eq!(store.get_key("k1").unwrap().health.fail_count, 5);
+
+        // 合并落盘：一次写，把这 5 次变化一起持久化
+        assert!(store.flush_health_if_dirty(), "脏标记存在时应真的落盘");
+        let mtime2 = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
+        assert_ne!(mtime1, mtime2, "flush 后必须已落盘");
+
+        // 幂等：不脏时不写
+        assert!(!store.flush_health_if_dirty(), "无变更时不应落盘");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P1-3 后半的配套防线：mtime 自愈重载**不得**用磁盘上的旧健康态覆盖内存。
+    ///
+    /// 这是把落盘改成「合并」后必须堵的窗口，也是一个本来就存在的隐性 bug：
+    /// `reload_if_disk_newer` 原先整份 `cfg.keys = fresh.keys`，连 health 一起换掉。于是
+    /// 「内存里刚攒到 N 次失败、尚未落盘」时，一次外部改动就把计数清零 →
+    /// 熔断永远攒不满阈值。
+    ///
+    /// 故障注入判据：去掉 reload 里按 id 保留 health 的那段，本测试立刻变红。
+    #[test]
+    fn reload_preserves_in_memory_health() {
+        let dir = temp_dir("reload_keep_health");
+        let cfg_path = dir.join("config.json");
+        let store =
+            std::sync::Arc::new(Store::new_at(cfg_path.clone(), dir.join("secrets.enc")).unwrap());
+        store.upsert_key(sample_key("k1", 0)).unwrap();
+
+        // 让磁盘上留下 fail_count = 0 的那一版
+        store.flush_health_if_dirty();
+
+        // 内存里攒失败（标脏，未落盘）
+        for _ in 0..2 {
+            crate::health::record_live_failure(&store, "k1");
+        }
+        assert_eq!(store.get_key("k1").unwrap().health.fail_count, 2);
+
+        // 模拟「外部改过 config.json」：直接改磁盘文件（改个无关字段并保证 mtime/len 变化）
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let raw = std::fs::read_to_string(&cfg_path).unwrap();
+        let mut disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        disk["keys"][0]["name"] = serde_json::json!("被外部改过的名字");
+        std::fs::write(&cfg_path, serde_json::to_vec_pretty(&disk).unwrap()).unwrap();
+
+        // 触发自愈重载（list_keys 会走 reload_if_disk_newer）
+        let keys = store.list_keys(CategoryType::ClaudeCli);
+        assert_eq!(keys[0].name, "被外部改过的名字", "外部的数据类改动应被采纳");
+        assert_eq!(
+            keys[0].health.fail_count, 2,
+            "但**健康态必须保留内存值**：磁盘那份是暖启动缓存，用它覆盖会把尚未落盘的熔断计数清零"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2525,7 +2671,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 健康态无实质变化（仅 last_checked/latency 变）时 update_health 不重复落盘。
+    /// 健康态无实质变化（仅 last_checked/latency 变）时不产生任何磁盘写。
+    ///
+    /// P1-3 后半改动后语义微调：实质变化不再**立即**落盘，而是标脏 + 由后台合并落盘。
+    /// 故本测试的判据从「status 变化应立刻重写文件」改为「status 变化应把脏标记置起来，
+    /// flush 后才落盘」。**未放宽的部分**：仅 latency/last_checked 变化时既不落盘、
+    /// 也不该标脏（否则每轮探测都会触发一次 20KB 重写，那正是这条优化要防的）。
     #[test]
     fn update_health_skips_persist_when_unchanged() {
         let dir = temp_dir("health_skip");
@@ -2537,6 +2688,9 @@ mod tests {
         store
             .update_health("k1", HealthState { status: HealthStatus::Up, last_checked: Some(1), ..Default::default() })
             .unwrap();
+        // 首次写 Up 是**实质变化**（Unknown→Up），会标脏。先 flush 掉，让后面能干净地验证
+        // 「仅 latency 变化不标脏」——否则读到的是这一次遗留的脏标记。
+        store.flush_health_if_dirty();
         let mtime1 = std::fs::metadata(&cfg).unwrap().modified().unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -2550,13 +2704,27 @@ mod tests {
         // 内存态仍更新（UI 走内存）：last_checked 应是最新值
         assert_eq!(store.get_key("k1").unwrap().health.last_checked, Some(999));
 
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        // status 变化 → 应落盘
+        // 且**不该标脏**：否则后台一轮就会为「只有延迟数字变了」写一次 20KB，
+        // 等于绕过这条优化。
+        assert!(
+            !store.flush_health_if_dirty(),
+            "仅 latency/last_checked 变化不应标脏（否则每轮探测都触发整份重写）"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let mtime_before_status = std::fs::metadata(&cfg).unwrap().modified().unwrap();
+        // status 变化 → 标脏（不立即落盘），flush 后才写
         store
             .update_health("k1", HealthState { status: HealthStatus::Down, fail_count: 1, ..Default::default() })
             .unwrap();
+        assert_eq!(
+            std::fs::metadata(&cfg).unwrap().modified().unwrap(),
+            mtime_before_status,
+            "P1-3：实质变化只标脏，不在调用线程上落盘"
+        );
+        assert!(store.flush_health_if_dirty(), "status 变化必须已标脏");
         let mtime3 = std::fs::metadata(&cfg).unwrap().modified().unwrap();
-        assert!(mtime3 > mtime2, "status 变化应重写 config.json");
+        assert!(mtime3 > mtime_before_status, "flush 后 status 变化必须已持久化");
         std::fs::remove_dir_all(&dir).ok();
     }
 
