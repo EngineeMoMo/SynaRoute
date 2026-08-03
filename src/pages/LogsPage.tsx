@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useStore } from "@/store";
 import { Badge } from "@/components/ui/Badge";
 import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
+import { usePolling } from "@/lib/usePolling";
 import type { CategoryType, EventLogEntry, RequestTrace } from "@/types";
 import {
   ArrowLeftRight,
@@ -16,6 +17,7 @@ import {
   Copy,
   Check,
   Settings2,
+  Search,
   type LucideIcon,
 } from "lucide-react";
 
@@ -76,13 +78,14 @@ export function LogsPage() {
   const [filter, setFilter] = useState<LogGroup | null>(null);
   // 分类筛选：null = 全部分类；否则只看某一来源分类。与分组筛选正交。
   const [catFilter, setCatFilter] = useState<CategoryType | null>(null);
+  // 搜索词（UX#10）：此前 500 条日志只能靠「类型分组 + 来源分类」两维筛选肉眼扫，
+  // 排障时找一条具体记录（某个 Key、某个模型、某条错误）非常费劲。
+  const [query, setQuery] = useState("");
 
   // 实时刷新：每 2s 拉一次事件（仅事件，不重载 keys/proxy，开销小）。
-  useEffect(() => {
-    void refreshEvents();
-    const id = setInterval(() => void refreshEvents(), 2000);
-    return () => clearInterval(id);
-  }, [refreshEvents]);
+  // 走 usePolling：**窗口不可见时自动停表**，切回来立即补一次（见该 hook 的文档）。
+  // 本页是全应用最密的轮询（2s），最值得省。
+  usePolling(() => void refreshEvents(), 2000);
 
   // 计数与可见列表**一趟算完**（原先是 5 个各自遍历 events 的 useMemo：两个 Record 累加 +
   // 两个 filter().length + 一次 reverse+filter，合计 5 次全量遍历 + 2 次数组拷贝。日志每 2s
@@ -93,7 +96,19 @@ export function LogsPage() {
     let allByGroup = 0;
     let allByCat = 0;
     const visible: EventLogEntry[] = [];
+    // 搜索词（UX#10）：与两个筛选维度**正交叠加**——先按搜索缩小全集，再在其中做分组/分类计数，
+    // 这样徽标数字始终与用户眼前看到的列表一致（否则会出现「徽标说有 20 条、列表只显示 3 条」）。
+    // 500 条上限下纯前端过滤足够，不必回后端。
+    const needle = query.trim().toLowerCase();
     for (const e of events) {
+      // 匹配面覆盖用户实际会搜的东西：详情正文（含 Key 名、模型名、错误原因）、事件类型、分类。
+      // detail 里已经拼了「Key 名 · 模型段 · 动词」，故搜 Key 名或模型名都能命中。
+      const hit =
+        !needle ||
+        e.detail.toLowerCase().includes(needle) ||
+        e.type.toLowerCase().includes(needle) ||
+        e.categoryId.toLowerCase().includes(needle);
+      if (!hit) continue;
       const g = GROUP_OF[e.type] ?? "system";
       const catOk = !catFilter || e.categoryId === catFilter;
       const groupOk = !filter || g === filter;
@@ -106,13 +121,32 @@ export function LogsPage() {
     }
     visible.reverse(); // 最新在前（就地反转，省一次数组拷贝）
     return { counts, catCounts, allByGroup, allByCat, visible };
-  }, [events, filter, catFilter]);
+  }, [events, filter, catFilter, query]);
 
   return (
     <div className="flex h-full flex-col">
       <div className="border-b border-border px-6 py-4">
-        <h1 className="text-lg font-semibold text-text-primary">{t("logs.title")}</h1>
-        <p className="mt-1 text-xs text-text-muted">{t("logs.subtitle")}</p>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-lg font-semibold text-text-primary">{t("logs.title")}</h1>
+            <p className="mt-1 text-xs text-text-muted">{t("logs.subtitle")}</p>
+          </div>
+          {/* 搜索（UX#10）：与下方两维筛选正交叠加，徽标计数会跟着搜索结果走 */}
+          <div className="relative shrink-0">
+            <Search
+              size={13}
+              className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-text-muted"
+            />
+            <input
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={t("logs.searchPlaceholder")}
+              aria-label={t("logs.searchPlaceholder")}
+              className="w-56 rounded-control border border-border bg-surface py-1.5 pl-7 pr-2 text-xs text-text-primary placeholder:text-text-muted focus:border-primary focus:outline-none"
+            />
+          </div>
+        </div>
 
         {/* 分类筛选：全部 + 三个来源分类（带计数）。日志已合并连续展示，切换活动分类不再裁剪。 */}
         <div className="mt-3 flex flex-wrap gap-1.5">
@@ -161,7 +195,21 @@ export function LogsPage() {
         {visible.length === 0 ? (
           <div className="flex flex-col items-center gap-3 py-16 text-text-muted">
             <ScrollText size={40} />
-            <p className="text-sm">{t("logs.empty")}</p>
+            {/* 区分「真的没有事件」与「搜索没命中」：后者若也显示「暂无事件」，
+                用户会以为日志功能坏了，而实际只是搜索词太窄。 */}
+            {query.trim() ? (
+              <>
+                <p className="text-sm">{t("logs.noMatch", { q: query.trim() })}</p>
+                <button
+                  onClick={() => setQuery("")}
+                  className="rounded-control border border-border px-2 py-1 text-xs text-text-secondary hover:bg-surface-hover"
+                >
+                  {t("logs.clearSearch")}
+                </button>
+              </>
+            ) : (
+              <p className="text-sm">{t("logs.empty")}</p>
+            )}
           </div>
         ) : (
           <div className="space-y-1.5">

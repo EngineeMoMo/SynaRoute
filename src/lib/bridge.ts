@@ -210,6 +210,24 @@ export const api = {
 
   getDefaultLogDir: () => call<string>("get_default_log_dir", undefined, async () => "C:\\AppData\\SynaRoute\\logs"),
 
+  /**
+   * 当前**实际生效**的日志目录（用户配了就是用户的）。
+   * 与 getDefaultLogDir 的区别很重要：显示给用户看的必须是真正在写的那个。
+   */
+  getEffectiveLogDir: () =>
+    call<string>("get_effective_log_dir", undefined, async () => "C:\\AppData\\SynaRoute\\logs"),
+
+  /** 确保日志目录存在并返回绝对路径；打开动作由调用方走 shell 插件（UX#13）。 */
+  prepareLogDir: () =>
+    call<string>("prepare_log_dir", undefined, async () => "C:\\AppData\\SynaRoute\\logs"),
+
+  /**
+   * 导出诊断报告（UX#12）。返回保存路径，用户取消时返回 null。
+   * 内容已脱敏且不含对话正文——后端在报告头部显式列出了包含/不包含什么。
+   */
+  exportDiagnostics: () =>
+    call<string | null>("export_diagnostics", undefined, async () => null),
+
   // ---- 配置导入 / 导出（FR-021）----
   // 密钥段用**用户口令**加密（Argon2id + AES-GCM），而非照搬 DPAPI 密文——后者绑当前
   // Windows 账户、换机解不出，照搬等于导出一份用不了的文件。password 为空即不含密钥。

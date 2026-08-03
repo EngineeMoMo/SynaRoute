@@ -355,12 +355,10 @@ impl Store {
 
     /// 把一条日志**投递**给写线程（非阻塞）。转发热路径只做序列化 + 一次 channel push。
     fn write_log_to_file(&self, entry: &EventLogEntry) {
-        // 只取 log_dir 这一个字段，不克隆整份 settings（每条日志都会走这里，而 AppSettings
-        // 里有 3 个 HashMap + 2 个 Vec，克隆开销远大于取一个 Option<String>）。
-        let log_dir = match self.config.read().settings.log_dir.as_deref() {
-            Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
-            _ => default_log_dir(),
-        };
+        // 用 effective_log_dir 统一判定（UI 显示与「打开日志目录」按钮走同一处）：
+        // 三个调用方各写一遍必然漂移，那会导致「按钮打开的目录里没有日志」这类困惑。
+        // 它内部只读 log_dir 一个字段，不克隆整份 settings（每条日志都会走这里）。
+        let log_dir = self.effective_log_dir();
         let line = match serde_json::to_string(entry) {
             Ok(l) => l,
             Err(e) => {
@@ -1392,6 +1390,34 @@ impl Store {
     /// 「日志里附下游原始 body」开关（仅开了调用模型日志时才会被问到）。
     pub fn log_downstream_raw_enabled(&self) -> bool {
         self.config.read().settings.log_downstream_raw_enabled
+    }
+
+    /// 配置文件的绝对路径（用于诊断报告）。
+    ///
+    /// 这条在排障里很关键：MSIX 虚拟化下，用户双击启动与被包内进程启动看到的是**不同的**
+    /// config.json（包内私有副本 vs 真实文件）。把实际路径打进报告，才能一眼分辨是哪一份。
+    pub fn config_path_display(&self) -> String {
+        self.config_path.display().to_string()
+    }
+
+    /// 脱敏后的完整配置 JSON（用于诊断报告）。
+    ///
+    /// 走 `crate::tools::redact_config_secrets`：与「工具配置只读预览」用同一套脱敏实现——
+    /// 单独写一份必然漂移，而漏脱一个字段就是把用户密钥泄进他要发出去的文件里。
+    pub fn redacted_config_json(&self) -> AppResult<String> {
+        let raw = serde_json::to_string_pretty(&*self.config.read())?;
+        Ok(crate::tools::redact_config_secrets(&raw))
+    }
+
+    /// 当前**实际生效**的日志目录：用户在设置里配了就用它，否则用默认目录。
+    ///
+    /// 抽出来是因为有三个调用方需要同一份判定（写日志、UI 显示、「打开目录」按钮），
+    /// 各写一遍必然漂移——那会导致「按钮打开的目录里没有日志」这类困惑。
+    pub fn effective_log_dir(&self) -> PathBuf {
+        match self.config.read().settings.log_dir.as_deref() {
+            Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+            _ => default_log_dir(),
+        }
     }
 
     /// 取某 Key 的明文密钥（转发热路径专用），带 DPAPI 解密缓存（P2-6）。

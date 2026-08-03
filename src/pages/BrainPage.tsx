@@ -1,3 +1,4 @@
+import { usePolling } from "@/lib/usePolling";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/bridge";
 import { useStore } from "@/store";
@@ -978,19 +979,17 @@ function WorkDirBlock({
 /** 显示当前检测到的活跃项目（每 5s 刷新）。auto_follow 模式下取代 workDir 字段。 */
 function ActiveProjectDisplay({ t }: { t: TFunc }) {  const [active, setActive] = useState<RecentWorkdir | null>(null);
 
-  useEffect(() => {
-    const fetch = async () => {
+  // 窗口不可见时停表（见 usePolling）。这条尤其值得——它每 5s 起一次子进程级的工作目录探测。
+  usePolling(() => {
+    void (async () => {
       try {
         const list = await api.detectRecentWorkdirs();
         setActive(list[0] ?? null);
       } catch {
         setActive(null);
       }
-    };
-    void fetch();
-    const id = setInterval(() => void fetch(), 5000);
-    return () => clearInterval(id);
-  }, []);
+    })();
+  }, 5000);
 
   const formatAge = (ts?: number) => {
     if (!ts) return "";

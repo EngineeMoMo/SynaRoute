@@ -1854,7 +1854,7 @@ fn read_preview_text(path: &Path, redact_secrets: bool) -> AppResult<(bool, Opti
 /// 3. **裸 token 兜底**：`sk-` 前缀长串。
 ///
 /// JSON（`"key": "value"`）与 TOML（`key = "value"`）两种形态都处理。
-fn redact_config_secrets(s: &str) -> String {
+pub(crate) fn redact_config_secrets(s: &str) -> String {
     let mut out = s.to_string();
     for key in [
         "ANTHROPIC_AUTH_TOKEN",

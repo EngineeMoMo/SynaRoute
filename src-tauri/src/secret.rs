@@ -256,7 +256,7 @@ impl SecretStore {
         Ok(got)
     }
 
-    /// 该条是否已在解密缓存里。供 `Store::secret_for` 的「两段式」判断是否需要升级到写锁。
+    /// 该条是否已在解密缓存里（P2-6）。供 `Store::secret_for` 的「两段式」判断是否需要升级到写锁。
     pub fn is_cached(&self, key_id: &str) -> bool {
         self.dpapi_cache.contains_key(key_id)
     }

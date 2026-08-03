@@ -1129,6 +1129,189 @@ fn get_default_log_dir() -> String {
     store::default_log_dir().to_string_lossy().into_owned()
 }
 
+/// 当前**实际生效**的日志目录（用户配了就用用户的，否则默认目录）。
+///
+/// 与 `get_default_log_dir` 的区别很重要：后者只给默认值，而用户可能改过。
+/// 「打开日志目录」按钮必须打开真正在写的那个，否则用户对着空目录找不到日志。
+#[tauri::command]
+fn get_effective_log_dir(state: tauri::State<AppState>) -> String {
+    state.store.effective_log_dir().to_string_lossy().into_owned()
+}
+
+/// 导出诊断报告（UX#12）：把排障要用的东西汇成**一个纯文本文件**，供用户报障时附上。
+///
+/// **为什么是纯文本而不是 zip**（docs/15 原建议 zip）：
+/// 1. 用户能在发出前**亲眼看清里面没有密钥**——这直接决定他敢不敢发。zip 里的东西看不见，
+///    要额外解释「我保证脱敏了」，信任成本高得多；
+/// 2. 不引入 `zip` 直接依赖；
+/// 3. 报障场景下贴一段文本比传附件更顺手。
+///
+/// **绝不包含**：任何密钥明文（config 走 `redact_config_secrets` 脱敏）、
+/// trace 正文（调用模型日志的请求/响应体，可达数万字符且含完整对话）。
+/// 头部显式列出「包含什么、不含什么」，让用户不必逐行审也能判断。
+#[tauri::command]
+async fn export_diagnostics(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> AppResult<Option<String>> {
+    use tauri_plugin_dialog::DialogExt;
+    use std::fmt::Write as _;
+
+    let store = &state.store;
+    let mut r = String::with_capacity(16 * 1024);
+
+    let _ = writeln!(r, "# SynaRoute 诊断报告");
+    let _ = writeln!(r, "生成时间：{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z"));
+    let _ = writeln!(r);
+    let _ = writeln!(r, "## 本文件包含什么");
+    let _ = writeln!(r, "- 版本、运行环境、各路径（供核对 MSIX 虚拟化导致的「平行宇宙」问题）");
+    let _ = writeln!(r, "- 配置（**已脱敏**：所有密钥字段替换为 ***）");
+    let _ = writeln!(r, "- 各 Key 的健康状态与代理运行状态");
+    let _ = writeln!(r, "- 最近的事件日志摘要");
+    let _ = writeln!(r);
+    let _ = writeln!(r, "## 本文件**不**包含");
+    let _ = writeln!(r, "- 任何 API 密钥明文");
+    let _ = writeln!(r, "- 对话正文（「调用模型日志」的请求体/响应体一律不含）");
+    let _ = writeln!(r);
+
+    // ---- 环境与路径 ----
+    let _ = writeln!(r, "## 环境");
+    let _ = writeln!(r, "- 应用版本：{}", app.package_info().version);
+    let _ = writeln!(r, "- 操作系统：{} {}", std::env::consts::OS, std::env::consts::ARCH);
+    let _ = writeln!(
+        r,
+        "- 当前 exe：{}",
+        std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into())
+    );
+    // 路径是 MSIX 虚拟化问题的关键证据：用户双击启动与被包内进程启动看到的是不同副本。
+    let _ = writeln!(r, "- 配置文件：{}", store.config_path_display());
+    let _ = writeln!(r, "- 日志目录：{}", store.effective_log_dir().display());
+    let _ = writeln!(r, "- 丢弃日志条数（队列满/磁盘慢）：{}", store.log_dropped_count());
+    let _ = writeln!(r);
+
+    // ---- 代理与 Key 状态 ----
+    let _ = writeln!(r, "## 代理状态");
+    for cat in CategoryType::ALL {
+        let _ = writeln!(
+            r,
+            "- {}: {} 端口={:?}",
+            cat.as_str(),
+            if state.proxy.is_running(cat) { "running" } else { "stopped" },
+            state.proxy.port_of(cat)
+        );
+    }
+    let _ = writeln!(r);
+
+    let _ = writeln!(r, "## Key 健康状态（不含密钥）");
+    for cat in CategoryType::ALL {
+        let keys = store.list_keys(cat);
+        if keys.is_empty() {
+            continue;
+        }
+        let _ = writeln!(r, "### {}", cat.as_str());
+        for k in keys {
+            let _ = writeln!(
+                r,
+                "- [{}] {} | 协议={:?} | 优先级={} | 启用={} | 有密钥={} | 状态={:?} 失败计数={} 熔断至={:?} 延迟={:?}ms | 模型数={} 映射数={}",
+                k.id,
+                k.name,
+                k.protocol,
+                k.priority,
+                k.enabled,
+                k.has_secret,
+                k.health.status,
+                k.health.fail_count,
+                k.health.breaker_until,
+                k.health.latency_ms,
+                k.models.len(),
+                k.mappings.len()
+            );
+            // base_url 单列一行：它常是问题根源（协议选错、路径写错），但不含密钥，可以给。
+            let _ = writeln!(r, "  base_url: {}", k.base_url);
+        }
+    }
+    let _ = writeln!(r);
+
+    // ---- 脱敏后的配置 ----
+    let _ = writeln!(r, "## 配置（已脱敏）");
+    let _ = writeln!(r, "```json");
+    match store.redacted_config_json() {
+        Ok(s) => {
+            let _ = writeln!(r, "{s}");
+        }
+        Err(e) => {
+            let _ = writeln!(r, "（读取配置失败：{e}）");
+        }
+    }
+    let _ = writeln!(r, "```");
+    let _ = writeln!(r);
+
+    // ---- 最近事件（不含 trace 正文）----
+    const MAX_EVENTS_IN_REPORT: usize = 200;
+    let events = store.list_all_events();
+    let total = events.len();
+    let _ = writeln!(
+        r,
+        "## 最近事件（共 {total} 条，取最后 {}；**不含**调用模型日志的请求/响应正文）",
+        MAX_EVENTS_IN_REPORT.min(total)
+    );
+    for e in events.iter().rev().take(MAX_EVENTS_IN_REPORT).rev() {
+        let ts = chrono::DateTime::from_timestamp_millis(e.ts)
+            .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| e.ts.to_string());
+        let _ = writeln!(
+            r,
+            "[{ts}] {} {} {}{}",
+            e.category_id.as_str(),
+            e.kind,
+            e.detail,
+            if e.repeat > 1 { format!(" (×{})", e.repeat) } else { String::new() }
+        );
+    }
+
+    let default_name = format!(
+        "synaroute-diagnostics-{}.txt",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("保存 SynaRoute 诊断报告")
+        .set_file_name(&default_name)
+        .add_filter("文本文件", &["txt"])
+        .save_file(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(path) = rx.await.ok().flatten() else {
+        return Ok(None); // 用户取消，不算错误
+    };
+    let path = path.to_string();
+    std::fs::write(&path, r.as_bytes())
+        .map_err(|e| error::AppError::Other(format!("写入诊断报告失败（{path}）: {e}")))?;
+    Ok(Some(path))
+}
+
+/// 准备「打开日志目录」（UX#13）：确保目录存在并返回其绝对路径，由**前端**调 shell 插件打开。
+///
+/// 为什么后端不直接开：项目既有做法是前端 `@tauri-apps/plugin-shell` 的 `open`
+/// （见 AboutPage 打开外链那处的注释），且后端的 `shell().open` 已被标记废弃。
+/// 保持单一做法，避免两套外部打开路径。
+///
+/// 目录先创建：一条日志都没写过时它还不存在，直接交给资源管理器会报「找不到路径」。
+///
+/// ⚠️ **MSIX 虚拟化注意**：返回的是**当前进程视角**的路径。若 SynaRoute 由有包身份的进程
+/// （如 Claude Code）启动，`%APPDATA%` 会被重定向到包内私有副本，用户看到的将是那份虚拟副本
+/// 而非双击启动时的真实目录。故 UI 必须**同时显示这个绝对路径全文**（见设置页），
+/// 让用户能核对自己看的是哪一份——这是 CLAUDE.md 里「平行宇宙」惨案的复发防线。
+#[tauri::command]
+fn prepare_log_dir(state: tauri::State<AppState>) -> AppResult<String> {
+    let dir = state.store.effective_log_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        error::AppError::Other(format!("创建日志目录失败（{}）: {e}", dir.display()))
+    })?;
+    Ok(dir.to_string_lossy().into_owned())
+}
+
 // ============ 配置导入 / 导出（FR-021）============
 //
 // 导出体不含 DPAPI 密文——那玩意儿绑当前 Windows 账户、换机解不出。含密钥导出时改用
@@ -1653,6 +1836,9 @@ pub fn run() {
             install_update,
             pick_directory,
             get_default_log_dir,
+            get_effective_log_dir,
+            prepare_log_dir,
+            export_diagnostics,
             export_config,
             pick_and_preview_import,
             apply_import_config,

@@ -1,3 +1,4 @@
+import { usePolling } from "@/lib/usePolling";
 import { useEffect, useState } from "react";
 import { useStore } from "@/store";
 import { api } from "@/lib/bridge";
@@ -113,17 +114,20 @@ export function SettingsPage() {
   }, []);
 
   // MCP 运行状态轮询：开启时每 3s 刷新一次，展示运行中/端口/故障原因。
+  const mcpEnabled = !!settings?.mcpEnabled;
   useEffect(() => {
-    if (!settings?.mcpEnabled) {
-      setMcp(null);
-      return;
-    }
-    let alive = true;
-    const tick = () => void api.mcpStatus().then((s) => { if (alive) setMcp(s); });
-    tick();
-    const id = setInterval(tick, 3000);
-    return () => { alive = false; clearInterval(id); };
-  }, [settings?.mcpEnabled]);
+    if (!mcpEnabled) setMcp(null);
+  }, [mcpEnabled]);
+  // `enabled` 跟随 MCP 开关；窗口不可见时停表（见 usePolling）。
+  usePolling(
+    () => {
+      void api.mcpStatus().then((s) => setMcp(s)).catch(() => {
+        // 状态读不到不清空已有显示：一次 IPC 抖动不该让界面闪成「未运行」
+      });
+    },
+    3000,
+    mcpEnabled,
+  );
 
   const update = (patch: Partial<AppSettings>) => {
     if (!settings) return;
@@ -194,6 +198,37 @@ export function SettingsPage() {
   const handlePickLogDir = async () => {
     const dir = await api.pickDirectory();
     if (dir) update({ logDir: dir });
+  };
+
+  // **实际生效**的日志目录：用户配了就是用户的，否则是默认目录。
+  // 直接推导而非另开一个 IPC + state：这样改完目录立刻同步，不会出现「显示的还是旧路径」。
+  // 显示它是必需的——MSIX 虚拟化下「按钮打开的目录」可能是包内私有副本，
+  // 用户得能核对自己看的是哪一份（CLAUDE.md 平行宇宙惨案的复发防线）。
+  const effectiveLogDir = settings?.logDir?.trim() || defaultLogDir;
+
+  /**
+   * 打开日志目录（UX#13）。后端先确保目录存在（一条日志都没写过时它不存在，
+   * 直接交给资源管理器会报「找不到路径」），再由前端走 shell 插件打开——
+   * 与关于页打开外链同一做法（WebView 里 window.open 不可靠）。
+   */
+  const handleOpenLogDir = async () => {
+    try {
+      const dir = await api.prepareLogDir();
+      const { open } = await import("@tauri-apps/plugin-shell");
+      await open(dir);
+    } catch (e) {
+      showToast("error", String((e as Error)?.message ?? e));
+    }
+  };
+
+  /** 导出诊断报告（UX#12）。用户取消保存对话框时后端返回 null，不提示错误。 */
+  const handleExportDiagnostics = async () => {
+    try {
+      const path = await api.exportDiagnostics();
+      if (path) showToast("success", t("settings.diagSaved", { path }));
+    } catch (e) {
+      showToast("error", String((e as Error)?.message ?? e));
+    }
   };
 
   // MCP 接入地址：优先用实际绑定端口（占用时会 fallback），否则用配置端口。
@@ -706,6 +741,24 @@ export function SettingsPage() {
                       {t("settings.logReset")}
                     </Button>
                   )}
+                </div>
+
+                {/* 打开日志目录 + 诊断报告（UX#12/#13）。
+                    实际路径全文常驻显示：MSIX 虚拟化下「按钮打开的目录」可能是包内私有副本，
+                    用户必须能核对自己看的是哪一份（CLAUDE.md 平行宇宙惨案的复发防线）。 */}
+                <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                  <Button size="sm" variant="outline" onClick={() => void handleOpenLogDir()}>
+                    <FolderOpen size={13} /> {t("settings.logOpenDir")}
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => void handleExportDiagnostics()}>
+                    <ScrollText size={13} /> {t("settings.diagExport")}
+                  </Button>
+                </div>
+                <div className="mt-1.5 break-all font-mono text-[11px] text-text-muted">
+                  {effectiveLogDir || "—"}
+                </div>
+                <div className="mt-1 text-[11px] leading-relaxed text-text-muted">
+                  {t("settings.diagDesc")}
                 </div>
               </div>
             </div>

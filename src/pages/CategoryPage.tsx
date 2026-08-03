@@ -1,3 +1,4 @@
+import { usePolling } from "@/lib/usePolling";
 import { useEffect, useMemo, useState } from "react";
 import { useStore } from "@/store";
 import { KeyCard } from "@/components/KeyCard";
@@ -29,10 +30,9 @@ export function CategoryPage({ onAddKey, onEditKey }: {
   const [gapDialogOpen, setGapDialogOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
 
-  useEffect(() => {
-    const id = setInterval(() => void refreshCategory(), 5000);
-    return () => clearInterval(id);
-  }, [refreshCategory]);
+  // 窗口不可见时自动停表（见 usePolling）。注意这里**不再**在挂载时单独 refresh 一次——
+  // usePolling 自己会立即执行一次。
+  usePolling(() => void refreshCategory(), 5000);
 
   // 排序：按优先级
   const sorted = useMemo(
@@ -55,53 +55,37 @@ export function CategoryPage({ onAddKey, onEditKey }: {
   // 桌面端接入是否已被其他工具接管（cc-switch 重写 _meta.json）。
   // 只对桌面端查，且跟随 5s 轮询刷新——用户可能在 SynaRoute 开着的时候去点 cc-switch。
   const [takeover, setTakeover] = useState<string | null>(null);
+  const isDesktop = activeCategory === "claude-desktop";
   useEffect(() => {
-    if (activeCategory !== "claude-desktop") {
-      setTakeover(null);
-      return;
-    }
-    let alive = true;
-    const check = () => {
+    if (!isDesktop) setTakeover(null);
+  }, [isDesktop]);
+  // `enabled` 只对桌面端开：其余分类没有「被 cc-switch 接管」这回事，不必白问。
+  // 窗口不可见时停表（见 usePolling）。
+  usePolling(
+    () => {
       void api
         .getToolConfigPreview("claude-desktop")
-        .then((p) => {
-          if (alive) setTakeover(p.takeoverWarning ?? null);
-        })
+        .then((p) => setTakeover(p.takeoverWarning ?? null))
         .catch(() => {
           // 预览读不出来（路径不存在等）不影响主界面，静默即可
         });
-    };
-    check();
-    const id = setInterval(check, 5000);
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
-  }, [activeCategory]);
+    },
+    5000,
+    isDesktop,
+  );
 
   // 密钥库是否锁着（主口令模式尚未解锁）。锁着时**每一次转发都会失败**，
   // 而失败原因藏在运行日志里 —— 必须在最显眼的位置常驻提示，否则用户会以为 Key 配错了。
   // 跟随 5s 轮询：用户可能在设置页解锁后切回来，也可能点了「立即锁定」。
   const [vaultLocked, setVaultLocked] = useState(false);
-  useEffect(() => {
-    let alive = true;
-    const check = () => {
-      void api
-        .getMasterPasswordState()
-        .then((s) => {
-          if (alive) setVaultLocked(s.enabled && s.locked);
-        })
-        .catch(() => {
-          // 读不到就不提示（宁可漏提示，也不要因一次 IPC 抖动弹个假警告）
-        });
-    };
-    check();
-    const id = setInterval(check, 5000);
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
-  }, []);
+  usePolling(() => {
+    void api
+      .getMasterPasswordState()
+      .then((s) => setVaultLocked(s.enabled && s.locked))
+      .catch(() => {
+        // 读不到就不提示（宁可漏提示，也不要因一次 IPC 抖动弹个假警告）
+      });
+  }, 5000);
 
   return (
     <div className="flex h-full flex-col">
