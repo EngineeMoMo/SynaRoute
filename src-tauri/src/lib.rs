@@ -101,7 +101,10 @@ fn delete_key(state: tauri::State<AppState>, key_id: String) -> AppResult<()> {
 /// 注意：这会把明文返回给前端 WebView，仅用于本地单机自管密钥场景。
 #[tauri::command]
 fn reveal_secret(state: tauri::State<AppState>, key_id: String) -> AppResult<Option<String>> {
-    state.store.secrets.read().get(&key_id)
+    // 这里必须解出 Zeroizing：返回值要过 IPC 序列化给前端。
+    // 到这一步「明文进 WebView」已是该命令的既定语义（供编辑器眼睛查看），
+    // Zeroizing 保护的是**后端内部**那份副本的驻留时长。
+    Ok(state.store.secrets.read().get(&key_id)?.map(|s| s.to_string()))
 }
 
 #[tauri::command]
@@ -347,8 +350,10 @@ async fn fetch_models_draft(
     key: ProviderKey,
     secret: Option<String>,
 ) -> AppResult<Vec<ModelInfo>> {
-    let secret = match secret {
-        Some(s) if !s.is_empty() => s,
+    // 统一成 Zeroizing：两个来源（前端传入的草稿密钥 / 库里已存的）都是明文，
+    // 都该在用完后清零，没理由只保护其中一个。
+    let secret: zeroize::Zeroizing<String> = match secret {
+        Some(s) if !s.is_empty() => zeroize::Zeroizing::new(s),
         _ => state
             .store
             .secrets

@@ -214,7 +214,9 @@ pub fn build_export(
             for k in &cfg.keys {
                 match guard.get(&k.id) {
                     Ok(Some(plain)) => {
-                        entries.insert(k.id.clone(), plain);
+                        // 解出 Zeroizing 存进待序列化的 map：这份内容马上要被 crypto::seal
+                        // 加密进导出文件，必须是普通 String 才能过 serde。
+                        entries.insert(k.id.clone(), plain.to_string());
                     }
                     // `Ok(None)` = 这个 Key 本来就没配密钥，不算「解不出」。
                     Ok(None) => {}
@@ -574,11 +576,11 @@ mod tests {
 
         // **明文密钥**回来了（这是「能真正迁移」的判据）
         assert_eq!(
-            dst.secrets.read().get("k1").unwrap().as_deref(),
+            dst.secrets.read().get("k1").unwrap().as_deref().map(String::as_str),
             Some("sk-secret-one")
         );
         assert_eq!(
-            dst.secrets.read().get("k2").unwrap().as_deref(),
+            dst.secrets.read().get("k2").unwrap().as_deref().map(String::as_str),
             Some("sk-secret-two")
         );
         // has_secret 与库一致，不会出现「UI 说有、转发说没有」
@@ -950,7 +952,7 @@ mod tests {
         );
         // keep 仍在载荷里 → 它的密钥**不能**被误删
         assert_eq!(
-            dst.secrets.read().get("keep").unwrap().as_deref(),
+            dst.secrets.read().get("keep").unwrap().as_deref().map(String::as_str),
             Some("sk-keep"),
             "载荷里仍有的 Key，其密钥不得被清理"
         );
@@ -973,7 +975,7 @@ mod tests {
         assert_eq!(store.prune_orphan_secrets(), 1, "应清理 1 条");
         assert_eq!(store.count_orphan_secrets(), 0);
         assert_eq!(
-            store.secrets.read().get("live").unwrap().as_deref(),
+            store.secrets.read().get("live").unwrap().as_deref().map(String::as_str),
             Some("sk-live"),
             "在用 Key 的密钥不得被误删"
         );

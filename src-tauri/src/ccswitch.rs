@@ -301,7 +301,7 @@ fn find_duplicate(
             continue;
         }
         let existing = store.secrets.read().get(&k.id).ok().flatten();
-        if existing.as_deref() == Some(secret) {
+        if existing.as_deref().map(String::as_str) == Some(secret) {
             return Some(k.name);
         }
     }
@@ -696,7 +696,7 @@ mod tests {
         assert!(cli[0].enabled, "导入即启用");
         assert_eq!(cli[0].vendor, "cc-switch", "vendor 标来源，便于事后辨认");
         assert_eq!(
-            store.secrets.read().get(&cli[0].id).unwrap().as_deref(),
+            store.secrets.read().get(&cli[0].id).unwrap().as_deref().map(String::as_str),
             Some("sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaa1111"),
             "密钥必须能原样解出来（DPAPI 往返）"
         );

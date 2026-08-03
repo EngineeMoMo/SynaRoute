@@ -20,6 +20,7 @@ use crate::error::{AppError, AppResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 /// 主口令模式的库头部：KDF 参数 + 盐 + 校验串。存在即表示当前是主口令模式。
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -69,6 +70,20 @@ pub struct SecretStore {
     /// 解锁后常驻的库密钥（仅主口令模式）。`None` = DPAPI 模式，或主口令模式但未解锁。
     /// 进程退出即消失，故每次启动都要重新解锁。
     vault_key: Option<crate::crypto::VaultKey>,
+    /// DPAPI 模式下的**进程内解密缓存**（P2-6）。
+    ///
+    /// 为什么只给 DPAPI 模式：DPAPI 每次 `get` 都要走一次 `CryptUnprotectData` 内核态系统调用
+    /// （10~50µs，杀软钩子下更高），而转发热路径每请求每候选都取一次密钥。主口令模式本就有
+    /// 长驻 `vault_key`、每条只做 AES-GCM，没有这个问题，故不为它引入缓存状态。
+    ///
+    /// 安全权衡：明文密钥本来就要拼进 Authorization 头发出去，缓存**不新增暴露面**；
+    /// 且值用 `Zeroizing` 包着，逐出/析构即清零。
+    ///
+    /// ⚠️ **失效点必须穷举覆盖**（漏一处就是「明明更新过密钥却仍报鉴权失败」这个历史症状）：
+    /// `set` / `remove` / 三个整库迁移 / `lock` / `unlock`，共 7 处。
+    /// **锁定态必须清空**——否则会破坏「锁定态 `get` 返 Err」这条刻意行为，
+    /// 也让「立即锁定」名不副实（已解出的明文仍能从缓存里拿到）。
+    dpapi_cache: HashMap<String, Zeroizing<String>>,
 }
 
 impl SecretStore {
@@ -94,7 +109,7 @@ impl SecretStore {
         } else {
             (SecretVault::default(), false)
         };
-        Ok(Self { path, vault, load_failed, vault_key: None })
+        Ok(Self { path, vault, load_failed, vault_key: None, dpapi_cache: HashMap::new() })
     }
 
     // ---- 主口令模式：状态与解锁 ----
@@ -127,12 +142,18 @@ impl SecretStore {
             ));
         }
         self.vault_key = Some(key);
+        // 失效点 7/7：解锁前若残留过 DPAPI 模式的缓存（例如刚做完 disable→enable 往返），
+        // 那些明文对应的已是旧模式的密文，留着只会给出过期结论。
+        self.invalidate_cache();
         Ok(())
     }
 
     /// 主动上锁（清掉常驻密钥）。用于「立即锁定」这类显式操作。
     pub fn lock(&mut self) {
         self.vault_key = None;
+        // **必须清缓存**（P2-6 失效点 6/7）：否则「立即锁定」名不副实——已解出的明文仍能从
+        // 缓存里被 `get` 拿到，破坏「锁定态 get 返 Err」这条刻意行为。
+        self.invalidate_cache();
     }
 
     /// 取当前可用的库密钥，未解锁时给出可行动的错误（而非静默返回「无密钥」）。
@@ -171,6 +192,11 @@ impl SecretStore {
             // 若 boxes 残留旧条目，将来再启用主口令时 all_key_ids 会读到那条过期密文）。
             self.vault.boxes.remove(key_id);
         }
+        // 失效点 1/7：这一条的明文变了，缓存里那份已过期。
+        // 漏掉它就是「明明更新过密钥却仍报鉴权失败」这个历史症状。
+        // 只清这一条不够保险？——`invalidate_cache` 整体清空更稳：`set` 是低频用户操作，
+        // 全清的代价只是后续几次请求各多一次解密，而漏清的代价是持续用错密钥。
+        self.invalidate_cache();
         self.persist()
     }
 
@@ -179,7 +205,16 @@ impl SecretStore {
     /// 主口令模式下未解锁 → 返回 `Err`（而非 `Ok(None)`）。这个区分很重要：
     /// `Ok(None)` 的调用方会当成「这个 Key 没配密钥」，让用户去查配置；
     /// `Err` 才能把「需要解锁」这条可行动的信息带到 UI 与转发失败原因里。
-    pub fn get(&self, key_id: &str) -> AppResult<Option<String>> {
+    /// 取某条密钥的**明文**。
+    ///
+    /// 返回 `Zeroizing<String>`（P2-6）：析构时自动把缓冲区清零，缩短明文 API Key 在堆上的
+    /// 驻留窗口。此前返回裸 `String`，明文副本会一直留在被释放的堆内存里直到被复用——
+    /// 崩溃 dump / 页文件换出 / 休眠镜像都可能留存。这与项目已为 `DerivedKey` 做清零的意图
+    /// 不一致：**最值钱的东西（上游 Key 明文）反而没有任何缩短窗口的措施**。
+    ///
+    /// 注意这不是完备防护（明文终究要拼进 Authorization 头发出去），只是把「无谓的长期驻留」
+    /// 压成「用完即清」。
+    pub fn get(&self, key_id: &str) -> AppResult<Option<Zeroizing<String>>> {
         if self.is_master_mode() {
             let Some(boxed) = self.vault.boxes.get(key_id) else {
                 // 库里没这条：先判是否锁着——锁着时「没这条」的结论本身不可信
@@ -189,14 +224,47 @@ impl SecretStore {
             };
             let key = self.require_vault_key()?;
             let plain = crate::crypto::open_with_key(key, boxed)?;
-            return Ok(Some(String::from_utf8_lossy(&plain).to_string()));
+            return Ok(Some(Zeroizing::new(String::from_utf8_lossy(&plain).to_string())));
         }
         let Some(b64) = self.vault.entries.get(key_id) else {
             return Ok(None);
         };
+        // DPAPI 模式：先查进程内缓存，命中即免掉一次 CryptUnprotectData 系统调用（P2-6）。
+        // 缓存的失效由 set / remove / 三个迁移 / lock / unlock 共 7 处负责（见字段文档）。
+        if let Some(hit) = self.dpapi_cache.get(key_id) {
+            return Ok(Some(hit.clone()));
+        }
         let cipher = STANDARD.decode(b64).map_err(|e| AppError::Crypto(e.to_string()))?;
         let plain = dpapi_decrypt(&cipher)?;
-        Ok(Some(String::from_utf8_lossy(&plain).to_string()))
+        Ok(Some(Zeroizing::new(String::from_utf8_lossy(&plain).to_string())))
+    }
+
+    /// 解密并**写入缓存**的 `get`（仅 DPAPI 模式有缓存效果）。
+    ///
+    /// 拆成独立方法而不是让 `get` 直接写缓存：`get` 只需 `&self`（转发热路径持读锁调用它），
+    /// 写缓存需要 `&mut self`。转发路径按「先读锁查缓存、未命中再拿写锁填充」两段式使用，
+    /// 由 `Store` 侧封装（见 `Store::secret_for`）。
+    pub fn get_caching(&mut self, key_id: &str) -> AppResult<Option<Zeroizing<String>>> {
+        let got = self.get(key_id)?;
+        if let Some(v) = &got {
+            // 只在 DPAPI 模式缓存：主口令模式有长驻 vault_key，本就不慢，
+            // 不为它引入额外的明文驻留。
+            if !self.is_master_mode() {
+                self.dpapi_cache.insert(key_id.to_string(), v.clone());
+            }
+        }
+        Ok(got)
+    }
+
+    /// 该条是否已在解密缓存里。供 `Store::secret_for` 的「两段式」判断是否需要升级到写锁。
+    pub fn is_cached(&self, key_id: &str) -> bool {
+        self.dpapi_cache.contains_key(key_id)
+    }
+
+    /// 清空解密缓存。**所有会让缓存过期的操作都必须调它**（见 `dpapi_cache` 字段文档）。
+    fn invalidate_cache(&mut self) {
+        // Zeroizing 的值在这里被析构 → 自动清零，不留明文残迹。
+        self.dpapi_cache.clear();
     }
 
     pub fn remove(&mut self, key_id: &str) -> AppResult<()> {
@@ -204,6 +272,8 @@ impl SecretStore {
         // 反向模式读出的残留密文。
         self.vault.entries.remove(key_id);
         self.vault.boxes.remove(key_id);
+        // 失效点 2/7：删了还留在缓存里，会让 `get` 对一条已不存在的 Key 返回明文。
+        self.invalidate_cache();
         self.persist()
     }
 
@@ -263,7 +333,7 @@ impl SecretStore {
         let mut plain: Vec<(String, String)> = Vec::with_capacity(ids.len());
         for id in &ids {
             match self.get(id) {
-                Ok(Some(s)) => plain.push((id.clone(), s)),
+                Ok(Some(s)) => plain.push((id.clone(), s.to_string())),
                 // `Ok(None)` 在这里**不是**「这条没有密钥」，而是「它只存在于另一个 map 里」——
                 // `all_key_ids` 取的是两个 map 的并集，而 `get` 按当前模式单边读。
                 //
@@ -299,6 +369,10 @@ impl SecretStore {
         }
 
         let prev = std::mem::take(&mut self.vault);
+        // 失效点 3~5/7（三个整库迁移各一处）：整份重写后，缓存里的明文对应的都是**旧密文**，
+        // 留着必然给出过期结论。放在 take 之后、写盘之前——即便随后回滚，多解密几次也无害，
+        // 而漏清会让用错密钥持续下去。
+        self.invalidate_cache();
         self.vault.master = Some(MasterHeader { kdf: hdr, verifier });
         self.vault.boxes = boxes;
         self.vault.entries.clear();
@@ -327,7 +401,7 @@ impl SecretStore {
         let mut plain: Vec<(String, String)> = Vec::with_capacity(ids.len());
         for id in &ids {
             match self.get(id) {
-                Ok(Some(s)) => plain.push((id.clone(), s)),
+                Ok(Some(s)) => plain.push((id.clone(), s.to_string())),
                 // 同 enable_master_password：`Ok(None)` 意味着该条只存在于另一个 map（中断残留），
                 // 放行会让它在整份重写时被静默丢弃。
                 Ok(None) => {
@@ -354,6 +428,10 @@ impl SecretStore {
         }
 
         let prev = std::mem::take(&mut self.vault);
+        // 失效点 3~5/7（三个整库迁移各一处）：整份重写后，缓存里的明文对应的都是**旧密文**，
+        // 留着必然给出过期结论。放在 take 之后、写盘之前——即便随后回滚，多解密几次也无害，
+        // 而漏清会让用错密钥持续下去。
+        self.invalidate_cache();
         let prev_key = self.vault_key.take();
         self.vault.entries = entries;
         self.vault.master = None;
@@ -380,7 +458,7 @@ impl SecretStore {
         let mut plain: Vec<(String, String)> = Vec::with_capacity(ids.len());
         for id in &ids {
             match self.get(id)? {
-                Some(s) => plain.push((id.clone(), s)),
+                Some(s) => plain.push((id.clone(), s.to_string())),
                 // 与另两个迁移函数同口径：`None` 意味着该条只存在于另一个 map（中断残留），
                 // 放行会让它在整份重写时被静默丢弃。改口令同样是整份重写。
                 None => {
@@ -405,6 +483,10 @@ impl SecretStore {
         }
 
         let prev = std::mem::take(&mut self.vault);
+        // 失效点 3~5/7（三个整库迁移各一处）：整份重写后，缓存里的明文对应的都是**旧密文**，
+        // 留着必然给出过期结论。放在 take 之后、写盘之前——即便随后回滚，多解密几次也无害，
+        // 而漏清会让用错密钥持续下去。
+        self.invalidate_cache();
         let prev_key = self.vault_key.take();
         self.vault.master = Some(MasterHeader { kdf: hdr, verifier });
         self.vault.boxes = boxes;
@@ -662,6 +744,103 @@ mod tests {
         dir
     }
 
+    /// P2-6：DPAPI 解密缓存的**全部失效点**。
+    ///
+    /// 这条测试是这项优化的全部风险所在：漏掉任一失效点，症状就是历史上出现过的
+    /// 「明明更新过密钥却仍报鉴权失败」——不报错、不 panic，只是持续用错密钥。
+    ///
+    /// 逐个覆盖：`set`（更新同一条）/ `remove` / `lock`（**必须清**，否则「立即锁定」名不副实）
+    /// / 三个整库迁移 / `unlock`。
+    #[test]
+    fn dpapi_cache_invalidates_on_every_mutation() {
+        let dir = temp_dir("cache_invalidate");
+        let mut s = SecretStore::load(dir.join("secrets.enc")).unwrap();
+
+        // 填充缓存
+        s.set("k1", "sk-v1").unwrap();
+        assert_eq!(s.get_caching("k1").unwrap().as_deref().map(String::as_str), Some("sk-v1"));
+        assert!(s.is_cached("k1"), "get_caching 应已填充缓存（DPAPI 模式）");
+
+        // ---- 失效点 1：set 更新同一条 ----
+        s.set("k1", "sk-v2").unwrap();
+        assert!(!s.is_cached("k1"), "set 后缓存必须失效");
+        assert_eq!(
+            s.get("k1").unwrap().as_deref().map(String::as_str),
+            Some("sk-v2"),
+            "更新后必须读到新值——漏清缓存就是「改了密钥仍鉴权失败」那个历史症状"
+        );
+
+        // ---- 失效点 2：remove ----
+        s.get_caching("k1").unwrap();
+        assert!(s.is_cached("k1"));
+        s.remove("k1").unwrap();
+        assert!(!s.is_cached("k1"), "remove 后缓存必须失效");
+        assert!(
+            s.get("k1").unwrap().is_none(),
+            "已删除的 Key 不得还能从缓存里读出明文"
+        );
+
+        // ---- 失效点 3：lock ----
+        s.set("k2", "sk-x").unwrap();
+        s.get_caching("k2").unwrap();
+        assert!(s.is_cached("k2"));
+        s.lock();
+        assert!(
+            !s.is_cached("k2"),
+            "lock 必须清缓存，否则「立即锁定」名不副实（已解出的明文仍能被读到）"
+        );
+
+        // ---- 失效点 4~6：三个整库迁移 ----
+        s.set("k3", "sk-y").unwrap();
+        s.get_caching("k3").unwrap();
+        assert!(s.is_cached("k3"));
+        s.enable_master_password("pw-123456").unwrap();
+        assert!(!s.is_cached("k3"), "启用主口令（整库重写）必须清缓存");
+
+        s.change_master_password("pw-123456", "pw-abcdef").unwrap();
+        assert!(!s.is_cached("k3"), "改主口令（整库重写）必须清缓存");
+
+        s.disable_master_password("pw-abcdef").unwrap();
+        assert!(!s.is_cached("k3"), "关闭主口令（整库重写）必须清缓存");
+        // 迁移往返后值必须完好
+        assert_eq!(
+            s.get("k3").unwrap().as_deref().map(String::as_str),
+            Some("sk-y"),
+            "三次整库迁移往返后明文必须完好"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P2-6：主口令模式**不使用**缓存（它有长驻 vault_key，本就不慢），
+    /// 且锁定态 `get` 仍返回 `Err` 而非从缓存兜底。
+    #[test]
+    fn master_mode_does_not_cache_and_locked_still_errs() {
+        let dir = temp_dir("cache_master_mode");
+        let mut s = SecretStore::load(dir.join("secrets.enc")).unwrap();
+        s.set("k1", "sk-secret").unwrap();
+        s.enable_master_password("pw-123456").unwrap();
+
+        // 主口令模式：get_caching 不应写缓存
+        assert_eq!(
+            s.get_caching("k1").unwrap().as_deref().map(String::as_str),
+            Some("sk-secret")
+        );
+        assert!(
+            !s.is_cached("k1"),
+            "主口令模式不该缓存明文（已有长驻密钥，缓存只是多一份无谓驻留）"
+        );
+
+        // 锁定后 get 必须返 Err（这条刻意行为不能被缓存绕过）
+        s.lock();
+        assert!(
+            s.get("k1").is_err(),
+            "锁定态必须返 Err 而非 Ok(None) 或从缓存兜底——调用方靠这个区分「要解锁」与「没配密钥」"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 损坏的密钥库文件:load 不得报错(降级空库,app 能起),磁盘原文件保持原样。
     #[test]
     fn corrupt_vault_degrades_without_error_and_keeps_disk() {
@@ -716,7 +895,7 @@ mod tests {
         assert!(!store.load_failed);
 
         store.set("k1", "sk-abc").unwrap();
-        assert_eq!(store.get("k1").unwrap().as_deref(), Some("sk-abc"), "DPAPI 加解密应可逆");
+        assert_eq!(store.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-abc"), "DPAPI 加解密应可逆");
         // 无 corrupt 备份产生
         let has_bak = std::fs::read_dir(&dir)
             .unwrap()
@@ -743,8 +922,8 @@ mod tests {
         assert_eq!(migrated, 2, "两条既有密钥都要迁移，漏一条就是永久丢失");
         assert!(store.is_master_mode());
         assert!(!store.is_locked(), "启用后应处于已解锁态（刚输过口令）");
-        assert_eq!(store.get("k1").unwrap().as_deref(), Some("sk-one"));
-        assert_eq!(store.get("k2").unwrap().as_deref(), Some("sk-two"));
+        assert_eq!(store.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-one"));
+        assert_eq!(store.get("k2").unwrap().as_deref().map(String::as_str), Some("sk-two"));
 
         // 落盘内容检查：不得残留 DPAPI 密文，否则关闭模式时会两处都有、读到哪条看分支顺序。
         let v: SecretVault = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -758,7 +937,7 @@ mod tests {
         assert!(reopened.is_locked(), "新进程必须重新解锁");
         assert!(reopened.get("k1").is_err(), "锁定态取密钥必须报错而非返回 None");
         reopened.unlock("correct horse battery").unwrap();
-        assert_eq!(reopened.get("k1").unwrap().as_deref(), Some("sk-one"));
+        assert_eq!(reopened.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-one"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -819,7 +998,7 @@ mod tests {
         let err = store.unlock("wrong-pw").unwrap_err().to_string();
         assert!(err.contains("主口令错误"), "{err}");
         assert!(!store.is_locked(), "输错口令不该把已解锁的库锁回去");
-        assert_eq!(store.get("k1").unwrap().as_deref(), Some("sk-x"), "仍应可读");
+        assert_eq!(store.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-x"), "仍应可读");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -857,7 +1036,7 @@ mod tests {
         assert_eq!(store.disable_master_password("pw").unwrap(), 1);
         assert!(!store.is_master_mode());
         assert!(!store.is_locked(), "DPAPI 模式恒非锁定");
-        assert_eq!(store.get("k1").unwrap().as_deref(), Some("sk-one"), "密钥必须完好");
+        assert_eq!(store.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-one"), "密钥必须完好");
 
         let v: SecretVault = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(v.master.is_none() && v.boxes.is_empty(), "口令模式的痕迹要清干净");
@@ -891,7 +1070,7 @@ mod tests {
         let mut reopened = SecretStore::load(path).unwrap();
         assert!(reopened.unlock("old-pw").is_err(), "旧口令必须立即失效");
         reopened.unlock("new-pw").unwrap();
-        assert_eq!(reopened.get("k1").unwrap().as_deref(), Some("sk-one"));
+        assert_eq!(reopened.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-one"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -970,7 +1149,7 @@ mod tests {
         assert!(store.get("k1").is_err());
 
         store.unlock("pw").unwrap();
-        assert_eq!(store.get("k1").unwrap().as_deref(), Some("sk-x"));
+        assert_eq!(store.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-x"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1011,7 +1190,7 @@ mod tests {
             !store.vault.entries.contains_key("k1"),
             "主口令模式写入后不得留 DPAPI 残留"
         );
-        assert_eq!(store.get("k1").unwrap().as_deref(), Some("sk-new"));
+        assert_eq!(store.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-new"));
 
         // 方向二：关回 DPAPI 模式后写入，应清掉 boxes 里的口令密文残留。
         store.disable_master_password("pw").unwrap();
@@ -1025,7 +1204,7 @@ mod tests {
             !store.vault.boxes.contains_key("k1"),
             "DPAPI 模式写入后不得留口令密文残留（否则再启用主口令会迁移到过期密钥）"
         );
-        assert_eq!(store.get("k1").unwrap().as_deref(), Some("sk-dpapi"));
+        assert_eq!(store.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-dpapi"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1069,7 +1248,7 @@ mod tests {
         );
         assert!(!store.is_master_mode(), "失败后不得留在主口令模式");
         assert_eq!(
-            store.get("dpapi-one").unwrap().as_deref(),
+            store.get("dpapi-one").unwrap().as_deref().map(String::as_str),
             Some("sk-dpapi"),
             "放弃切换后原有密钥必须仍可读"
         );

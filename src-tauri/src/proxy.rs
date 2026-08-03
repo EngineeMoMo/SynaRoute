@@ -1229,10 +1229,10 @@ async fn try_stream_to_key(
     // 那是本项目明确的设计判断（见下方 send() 处的注释）。
     budget_left: Option<std::time::Duration>,
 ) -> AppResult<StreamAttempt> {
+    // 走 secret_for：DPAPI 模式带进程内解密缓存，免掉每请求每候选一次 CryptUnprotectData
+    // 内核态系统调用（P2-6）。锁定态返 Err 的刻意语义原样保留。
     let secret = store
-        .secrets
-        .read()
-        .get(&key.id)?
+        .secret_for(&key.id)?
         .ok_or_else(|| AppError::upstream_msg("密钥缺失"))?;
 
     // 模型解析：映射 → 原生支持 → 默认兜底 → 第一个模型 → 透传（见 ProviderKey::resolve_model）
@@ -1550,10 +1550,9 @@ async fn forward_to_key(
     // 谁先到谁生效，既不让单个慢 Key 吃光整池预算，也不放宽用户为该 Key 设的上限。
     budget_left: Option<std::time::Duration>,
 ) -> AppResult<ForwardOutcome> {
+    // 同 try_stream_to_key：走带解密缓存的 secret_for（P2-6）。
     let secret = store
-        .secrets
-        .read()
-        .get(&key.id)?
+        .secret_for(&key.id)?
         .ok_or_else(|| AppError::upstream_msg("密钥缺失"))?;
 
     // 模型解析：映射 → 原生支持 → 默认兜底 → 第一个模型 → 透传（FR-006，见 resolve_model）

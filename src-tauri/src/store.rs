@@ -1394,6 +1394,29 @@ impl Store {
         self.config.read().settings.log_downstream_raw_enabled
     }
 
+    /// 取某 Key 的明文密钥（转发热路径专用），带 DPAPI 解密缓存（P2-6）。
+    ///
+    /// **两段式**：先持**读锁**查（命中即返回，读锁可并发，多个转发互不阻塞）；
+    /// 未命中才升级到写锁解密并填充。为什么不直接一路写锁：转发是高并发路径，
+    /// 写锁会把所有并发转发串行化——那比省下的一次 syscall 贵得多。
+    ///
+    /// 缓存只在 DPAPI 模式生效（主口令模式有长驻 vault_key，本就不慢）。
+    /// 锁定态下 `get` 返回 `Err`，该语义原样向上传递（不被缓存干扰——`lock()` 会清缓存）。
+    pub fn secret_for(&self, key_id: &str) -> AppResult<Option<zeroize::Zeroizing<String>>> {
+        // 第一段：读锁。命中缓存或「本就不需要缓存（主口令模式）」时到此为止。
+        {
+            let sec = self.secrets.read();
+            let got = sec.get(key_id)?;
+            // 主口令模式不缓存，直接返回；DPAPI 模式若已命中缓存，`get` 内部已经走了缓存分支，
+            // 这里同样直接返回。两种情况都无需写锁。
+            if got.is_none() || sec.is_master_mode() || sec.is_cached(key_id) {
+                return Ok(got);
+            }
+        }
+        // 第二段：写锁填充缓存。期间可能有别的线程已经填过——`get_caching` 幂等，无妨。
+        self.secrets.write().get_caching(key_id)
+    }
+
     /// 健康探测方式：`Some(测试消息)` = 用真实补全探测（消息已从列表随机取好，空列表回退
     /// 内置 `"hi"`）；`None` = 用轻量连通探测（默认）。
     ///
@@ -1801,7 +1824,7 @@ mod tests {
         // 存密钥（DPAPI/AES 加密），并回读校验
         store.secrets.write().set("k1", "sk-secret-123").unwrap();
         let got = store.secrets.read().get("k1").unwrap();
-        assert_eq!(got.as_deref(), Some("sk-secret-123"));
+        assert_eq!(got.as_deref().map(String::as_str), Some("sk-secret-123"));
 
         // 切换启用状态
         store.toggle_key("k1", false).unwrap();
