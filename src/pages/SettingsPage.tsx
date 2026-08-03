@@ -1187,6 +1187,31 @@ function ImportDialog({
         />
       </div>
 
+      {/* 可疑冲突（P3-5）：id 相同但名字与地址都不同 → 极可能是历史时间戳 id 跨机碰撞，
+          导入会把一条完全无关的本机 Key 换成对方的配置。必须逐条显示，
+          而不是混进 conflictingKeys 那个计数里——后者与「同一条 Key 的正常更新」无法区分。 */}
+      {preview.suspiciousConflicts.length > 0 && (
+        <div className="space-y-1.5 rounded-control border border-danger/40 bg-danger/5 p-2.5">
+          <div className="flex items-center gap-1.5 text-xs font-medium text-danger">
+            <AlertTriangle size={13} className="shrink-0" />
+            {t("backup.suspiciousTitle", { n: preview.suspiciousConflicts.length })}
+          </div>
+          <div className="text-[11px] leading-relaxed text-text-secondary">
+            {t("backup.suspiciousDesc")}
+          </div>
+          <ul className="space-y-1">
+            {preview.suspiciousConflicts.map((c) => (
+              <li key={c.id} className="font-mono text-[11px] text-text-secondary">
+                <span className="text-danger">{c.localName}</span>
+                <span className="text-text-muted"> ({c.localBaseUrl}) → </span>
+                <span className="text-text-primary">{c.incomingName}</span>
+                <span className="text-text-muted"> ({c.incomingBaseUrl})</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {preview.hasSecrets && (
         <input
           type="password"

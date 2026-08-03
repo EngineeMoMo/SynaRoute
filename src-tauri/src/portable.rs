@@ -90,12 +90,35 @@ pub struct ImportPreview {
     pub key_count: usize,
     /// 其中与本机 id 重复的（Merge 会覆盖它们）
     pub conflicting_keys: usize,
+    /// **可疑冲突**：id 相同但 name 与 base_url 都不一样的条目（P3-5）。
+    ///
+    /// 为什么要单列出来：历史上 Key id 是 `k_<毫秒时间戳>`，跨机会碰撞
+    /// （「两台机器照同一份教程配置」是真实场景）。撞号时导入会把一条**完全无关**的本机
+    /// Key 静默覆盖成对方的 base_url / 协议 / 映射，而它在 `conflicting_keys` 里只是一个
+    /// 计数，与「同一条 Key 的正常更新」看不出区别。新建 Key 已改用 uuid v4，但**历史 id
+    /// 不迁移**（它们是 secrets.enc 的键名），故这条防线要长期留着。
+    ///
+    /// 逐条给出「本机那条 → 文件那条」的名字，让用户在确认前就能看见要被换成什么。
+    pub suspicious_conflicts: Vec<SuspiciousConflict>,
     /// 本机独有、Replace 模式会被删掉的 Key 数
     pub local_only_keys: usize,
     pub vendor_count: usize,
     pub brain_count: usize,
     /// 文件是否含密钥段（含则导入时需要口令）
     pub has_secrets: bool,
+}
+
+/// 一处「id 相同但看起来根本不是同一条 Key」的冲突。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuspiciousConflict {
+    pub id: String,
+    /// 本机这条的名字与 base_url（将被覆盖掉的一方）
+    pub local_name: String,
+    pub local_base_url: String,
+    /// 文件里这条的名字与 base_url（覆盖方）
+    pub incoming_name: String,
+    pub incoming_base_url: String,
 }
 
 /// 导入结果报告。
@@ -255,12 +278,34 @@ pub fn preview_import(store: &Store, file: &ExportFile) -> ImportPreview {
     let file_ids: std::collections::HashSet<&str> =
         file.payload.keys.iter().map(|k| k.id.as_str()).collect();
 
+    // 可疑冲突（P3-5）：id 撞了，但 name 与 base_url **都**不同 → 极可能是时间戳 id 碰撞，
+    // 而不是同一条 Key 的正常更新。判据要求两者都不同：只改名字（同一上游换个称呼）或
+    // 只改 base_url（中转商换域名）都是常见的正常更新，单独一项不同不该报警。
+    let suspicious_conflicts: Vec<SuspiciousConflict> = file
+        .payload
+        .keys
+        .iter()
+        .filter_map(|inc| {
+            let loc = local.keys.iter().find(|k| k.id == inc.id)?;
+            let name_differs = loc.name.trim() != inc.name.trim();
+            let url_differs = loc.base_url.trim_end_matches('/') != inc.base_url.trim_end_matches('/');
+            (name_differs && url_differs).then(|| SuspiciousConflict {
+                id: inc.id.clone(),
+                local_name: loc.name.clone(),
+                local_base_url: loc.base_url.clone(),
+                incoming_name: inc.name.clone(),
+                incoming_base_url: inc.base_url.clone(),
+            })
+        })
+        .collect();
+
     ImportPreview {
         format_version: file.format_version,
         app_version: file.app_version.clone(),
         exported_at: file.exported_at.clone(),
         key_count: file.payload.keys.len(),
         conflicting_keys: file_ids.iter().filter(|id| local_ids.contains(**id)).count(),
+        suspicious_conflicts,
         local_only_keys: local_ids.iter().filter(|id| !file_ids.contains(**id)).count(),
         vendor_count: file.payload.vendors.len(),
         brain_count: file.payload.brain.len(),
@@ -832,6 +877,91 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("过旧"), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P3-5：id 撞号但「名字与地址都不同」必须被列为**可疑冲突**逐条警告，
+    /// 而不是混进 `conflicting_keys` 那个计数里（后者与正常更新无法区分）。
+    ///
+    /// 真实场景：早期 Key id 是 `k_<毫秒>`，两台机器照同一份教程配置、落在同一毫秒即撞号。
+    /// 跨机导入会把一条**完全无关**的本机 Key 静默换成对方的 base_url / 协议 / 映射。
+    #[test]
+    fn suspicious_conflicts_are_listed_not_just_counted() {
+        let src_dir = temp_dir("susp_src");
+        let dst_dir = temp_dir("susp_dst");
+        let src = store_at(&src_dir);
+        // 三条都与本机同 id，但性质不同
+        let mut collide = key("k_1700000000000", "对方的 GLM");
+        collide.base_url = "https://glm.example.com".into();
+        src.upsert_key(collide).unwrap();
+        src.upsert_key(key("same-both", "同名同地址")).unwrap(); // 正常更新
+        let mut renamed = key("only-name-differs", "改了个名字");
+        renamed.base_url = "https://api.example.com".into(); // 地址不变
+        src.upsert_key(renamed).unwrap();
+        let file = build_export(&src, "1.0.0", None).unwrap().0;
+
+        let dst = store_at(&dst_dir);
+        let mut local_collide = key("k_1700000000000", "我的 Kimi");
+        local_collide.base_url = "https://kimi.example.com".into();
+        dst.upsert_key(local_collide).unwrap();
+        dst.upsert_key(key("same-both", "同名同地址")).unwrap();
+        dst.upsert_key(key("only-name-differs", "原来的名字")).unwrap();
+
+        let pv = preview_import(&dst, &file);
+        assert_eq!(pv.conflicting_keys, 3, "三条都是 id 重复");
+        assert_eq!(
+            pv.suspicious_conflicts.len(),
+            1,
+            "只有「名字与地址都不同」那条算可疑，实得 {:?}",
+            pv.suspicious_conflicts
+        );
+        let s = &pv.suspicious_conflicts[0];
+        assert_eq!(s.id, "k_1700000000000");
+        assert_eq!(s.local_name, "我的 Kimi", "要指出本机哪条会被换掉");
+        assert_eq!(s.incoming_name, "对方的 GLM", "要指出会被换成什么");
+        assert!(s.local_base_url.contains("kimi"));
+        assert!(s.incoming_base_url.contains("glm"));
+
+        std::fs::remove_dir_all(&src_dir).ok();
+        std::fs::remove_dir_all(&dst_dir).ok();
+    }
+
+    /// P3-5：新建 Key 的 id 由后端生成 uuid v4，且**必须随返回值回传**。
+    ///
+    /// 回传是硬要求：前端拿返回值去 saveSecret / checkHealth，若拿到空 id
+    /// 会把密钥写成孤儿、探测打到不存在的 Key 上，而界面一切正常——静默失效。
+    #[test]
+    fn upsert_key_assigns_uuid_when_id_empty() {
+        let dir = temp_dir("uuid_id");
+        let store = store_at(&dir);
+
+        let mut fresh = key("", "新建的");
+        fresh.id = String::new();
+        let saved = store.upsert_key(fresh).unwrap();
+        assert!(!saved.id.is_empty(), "后端必须补 id 并回传");
+        // uuid v4 形状：8-4-4-4-12
+        let parts: Vec<&str> = saved.id.split('-').collect();
+        assert_eq!(parts.len(), 5, "应为 uuid v4 形状，实得 {}", saved.id);
+        assert_eq!(parts[0].len(), 8);
+        assert_eq!(parts[4].len(), 12);
+        // 真的进库了（用回传的 id 能取到）
+        assert!(store.get_key(&saved.id).is_some(), "回传的 id 必须能取到该 Key");
+
+        // 两次新建不撞号（时间戳 id 在同毫秒会撞，uuid 不会）
+        let mut a = key("", "A");
+        a.id = String::new();
+        let mut b = key("", "B");
+        b.id = String::new();
+        let ida = store.upsert_key(a).unwrap().id;
+        let idb = store.upsert_key(b).unwrap().id;
+        assert_ne!(ida, idb, "连续新建必须得到不同 id");
+
+        // 已有 id 时不得被改写（编辑保存不能变成新增一条）
+        let existing = key("keep-me", "原有");
+        store.upsert_key(existing.clone()).unwrap();
+        let again = store.upsert_key(existing).unwrap();
+        assert_eq!(again.id, "keep-me", "已有 id 必须原样保留");
 
         std::fs::remove_dir_all(&dir).ok();
     }

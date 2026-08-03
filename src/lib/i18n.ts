@@ -468,6 +468,9 @@ const zh: Dict = {
   "backup.modeReplace": "替换",
   "backup.modeReplaceDesc": "清空后按文件重建，还原到导出那一刻。会删除本机独有的条目（导入前自动备份现有配置）。",
   "backup.conflictNote": "其中 {n} 个与本机重复，将被文件版本覆盖",
+  "backup.suspiciousTitle": "{n} 个条目看起来不是同一个 Key，但会被覆盖",
+  "backup.suspiciousDesc":
+    "它们的内部编号相同，但名称与接口地址都不一样。早期版本的编号按时间生成，两台机器同时创建就可能撞号——继续导入会把左边这条换成右边这条。若不是你预期的，请先取消，在另一台机器上改名或重建该 Key 后重新导出。",
   "backup.removeNote": "替换模式将删除本机独有的 {n} 个 Key",
   "backup.importPassword": "导出时设置的口令",
   "backup.importAction": "开始导入",
@@ -982,6 +985,9 @@ const en: Dict = {
   "backup.modeReplace": "Replace",
   "backup.modeReplaceDesc": "Clear and rebuild from the file, restoring the exported state. Local-only entries are deleted (current config is backed up first).",
   "backup.conflictNote": "{n} of them already exist locally and will be overwritten",
+  "backup.suspiciousTitle": "{n} entries don't look like the same key, yet will be overwritten",
+  "backup.suspiciousDesc":
+    "They share the same internal id but differ in both name and endpoint. Early versions generated ids from the clock, so two machines creating a key at the same moment could collide — importing will replace the left entry with the right one. If that isn't what you expect, cancel, then rename or recreate that key on the other machine and export again.",
   "backup.removeNote": "Replace mode will delete {n} local-only keys",
   "backup.importPassword": "Password set at export time",
   "backup.importAction": "Start import",

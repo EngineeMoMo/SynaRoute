@@ -387,6 +387,17 @@ export interface ExportOutcome {
 }
 
 /** 导入前的只读预检：让用户在真正写盘之前看到会发生什么 */
+/** 一处「id 相同但看起来根本不是同一条 Key」的导入冲突（见 ImportPreview.suspiciousConflicts）。 */
+export interface SuspiciousConflict {
+  id: string;
+  /** 本机这条（将被覆盖的一方） */
+  localName: string;
+  localBaseUrl: string;
+  /** 文件里这条（覆盖方） */
+  incomingName: string;
+  incomingBaseUrl: string;
+}
+
 export interface ImportPreview {
   formatVersion: number;
   /** 产出该文件的 SynaRoute 版本（仅供人看） */
@@ -396,6 +407,11 @@ export interface ImportPreview {
   keyCount: number;
   /** 其中与本机 id 重复的（merge 会覆盖它们） */
   conflictingKeys: number;
+  /**
+   * id 相同但名字与地址都不同的条目：极可能是历史时间戳 id 跨机碰撞，
+   * 导入会把一条完全无关的本机 Key 覆盖成对方的配置。逐条显式警告，不混进计数。
+   */
+  suspiciousConflicts: SuspiciousConflict[];
   /** 本机独有、replace 模式会被删掉的 Key 数 */
   localOnlyKeys: number;
   vendorCount: number;

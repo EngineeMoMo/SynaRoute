@@ -75,6 +75,24 @@ const MAX_EVENTS: usize = 500;
 /// 任务），多线程共用同一探针文件名会互删对方的探针，导致偶发探测失败 → 个别日志行漏回退到
 /// `%APPDATA%`，日志被劈成两处（实测 368 行落安装目录、1 行漏到 AppData）。缓存后每进程只探测
 /// 一次，路径从此稳定；探针名另加进程 id + 随机后缀，杜绝同机多实例互删。
+/// 生成新 Key 的 id（uuid v4）。
+///
+/// **必须由后端生成**（P3-5）：id 是 `portable.rs` 导入逻辑的**全局唯一标识**，
+/// 「同 id ⟹ 同一条 Key ⟹ 覆盖」。前端原先用 `k_${Date.now()}`、cc-switch 导入用
+/// `k_<毫秒>_<序号>`，两者在跨机场景都会碰撞——「两台机器照同一份教程配置」是真实场景，
+/// 落在同一毫秒即撞号，跨机导入会把一条**完全无关**的本机 Key 静默覆盖成对方的
+/// base_url / 协议 / 映射，而 preview 里只显示为一个 `conflictingKeys` 计数，
+/// 与真正的「同 Key 更新」无法区分。
+///
+/// 与事件 id 口径一致（`append_event_full` 早已在用 uuid v4）。
+///
+/// **历史 id 不迁移**：它们是 `secrets.enc` 的键名，改 id 等于要同步搬密钥，
+/// 风险远大于收益。新建的 Key 用 uuid，老 Key 保持原样，两者共存无碍
+/// （唯一性只对「新产生的 id」有要求）。
+pub fn new_key_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 pub fn default_log_dir() -> PathBuf {
     static CACHED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     CACHED.get_or_init(resolve_default_log_dir).clone()
@@ -892,7 +910,18 @@ impl Store {
         self.config.read().keys.iter().find(|k| k.id == key_id).cloned()
     }
 
+    /// 新增或更新一条 Key。
+    ///
+    /// **id 为空时由后端补一个 uuid v4**（P3-5）并随返回值回传给前端。前端不再自造 id
+    /// （原先是 `k_${Date.now()}`，跨机会碰撞，详见 [`new_key_id`]）。
+    ///
+    /// ⚠️ 前端**必须用返回值更新自己的 state**：否则「新建后紧接着再编辑保存」会因为本地
+    /// 仍是空 id 而再插入一条，表现为「保存两次出现两条重复 Key」。
     pub fn upsert_key(&self, key: ProviderKey) -> AppResult<ProviderKey> {
+        let mut key = key;
+        if key.id.trim().is_empty() {
+            key.id = new_key_id();
+        }
         // 失败回滚：落盘失败不让内存领先磁盘（见 mutate_and_persist）。
         self.mutate_and_persist(|cfg| {
             if let Some(existing) = cfg.keys.iter_mut().find(|k| k.id == key.id) {

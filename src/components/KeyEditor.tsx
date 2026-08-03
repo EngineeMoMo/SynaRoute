@@ -187,7 +187,11 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
     if (!baseUrl.trim()) return setError(t("editor.errNeedBaseUrl2"));
 
     const key: ProviderKey = {
-      id: initial?.id ?? `k_${Date.now()}`,
+      // 新建时留空，**由后端生成 uuid v4**（P3-5）。原先是 `k_${Date.now()}`：
+      // id 被导入逻辑当作全局唯一标识做「同 id 即同一条 Key」的覆盖判据，而
+      // 「两台机器照同一份教程配置」是真实场景，落在同一毫秒即撞号 → 跨机导入会把一条
+      // 完全无关的本机 Key 静默覆盖成对方的配置。后端 upsert_key 会回填 id 并随返回值给回。
+      id: initial?.id ?? "",
       categoryId: activeCategory,
       name: name.trim(),
       vendor,
@@ -211,8 +215,11 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
     setSaving(true);
     setError(null);
     try {
-      await api.upsertKey(key);
-      if (secret) await api.saveSecret(key.id, secret);
+      // **必须用后端返回的 key**：新建时本地 id 是空串，真正的 uuid 由后端生成并回填。
+      // 用本地那个空 id 去 saveSecret/checkHealth 会写到一条不存在的 Key 上（密钥成孤儿、
+      // 探测无对象），而界面看起来一切正常——正是本项目最防的静默失效形态。
+      const saved = await api.upsertKey(key);
+      if (secret) await api.saveSecret(saved.id, secret);
       await loadCategory(activeCategory);
       onClose(); // 落盘即关闭：健康探测移出关键路径，避免等上游往返「像卡住」
       // Codex 分类的 Key 改动可能变更可服务模型集 → 托盘「Codex 模型」子菜单候选需同步重建
@@ -224,7 +231,7 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
       // loadCategory 来自 store，本组件已卸载后仍可安全调用（更新的是全局状态，非本组件 state）。
       void (async () => {
         try {
-          await api.checkHealth(key.id);
+          await api.checkHealth(saved.id);
           await loadCategory(activeCategory);
         } catch {
           // 探测异常忽略：Key 已保存，后台定时健康检查仍会兜底刷新

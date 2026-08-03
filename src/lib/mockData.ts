@@ -385,10 +385,17 @@ export const mockBridge = {
   async upsertKey(key: ProviderKey) {
     await delay();
     const list = store[key.categoryId];
-    const idx = list.findIndex((k) => k.id === key.id);
-    if (idx >= 0) list[idx] = clone(key);
-    else list.push({ ...clone(key), id: key.id || `k_${list.length + 1}` });
-    return clone(key);
+    // 与后端一致：id 为空时在此生成并**随返回值回传**（P3-5）。
+    // 原先只在 push 时补 id 却 `return clone(key)`（仍是空 id），mock 模式下调用方拿不到
+    // 真实 id，后续 saveSecret/checkHealth 会打到一条不存在的 Key 上。
+    const withId: ProviderKey =
+      key.id.trim() === ""
+        ? { ...clone(key), id: crypto.randomUUID() }
+        : clone(key);
+    const idx = list.findIndex((k) => k.id === withId.id);
+    if (idx >= 0) list[idx] = clone(withId);
+    else list.push(clone(withId));
+    return clone(withId);
   },
   async deleteKey(keyId: string) {
     await delay();

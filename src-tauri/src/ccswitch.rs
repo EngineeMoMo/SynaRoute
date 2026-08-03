@@ -366,9 +366,17 @@ fn build_candidates(store: &Arc<Store>, raws: &[RawProvider]) -> Vec<ImportCandi
     candidates
 }
 
-/// 生成新 Key 的 id，与前端 `k_${Date.now()}` 同构，并加序号避免同批毫秒内碰撞。
-fn new_key_id(seq: usize) -> String {
-    format!("k_{}_{seq}", chrono::Utc::now().timestamp_millis())
+/// 生成新 Key 的 id。
+///
+/// 用 uuid v4 而非时间戳（P3-5）：id 被 `portable.rs` 与 `Store::apply_imported_config`
+/// 当作**全局唯一标识**做「同 id 即同一条 Key」的覆盖判据。时间戳在跨机场景会碰撞——
+/// 「两台机器照同一份教程配置」是真实场景，落在同一毫秒即撞号，跨机导入会把一条**完全
+/// 无关**的本机 Key 静默覆盖成对方的 base_url/协议/映射。配 P2-3 的孤儿密钥问题还会得到
+/// 「新配置 + 旧密钥」的嵌合体，转发 401 而界面一切正常。
+///
+/// `seq` 参数保留但不再参与 id 生成（uuid 自身已无碰撞之虞），仅为调用点签名稳定。
+fn new_key_id(_seq: usize) -> String {
+    crate::store::new_key_id()
 }
 
 /// 按 source_id 导入选中的候选。**只写 SynaRoute 自己的 Key 与密钥库**，
