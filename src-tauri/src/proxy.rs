@@ -407,7 +407,10 @@ async fn handle_request(
         Err(_) => return Ok(error_resp(StatusCode::BAD_REQUEST, "读取请求体失败")),
     };
 
-    let req_json: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+    // `mut`：最后一个候选会用 `mem::take` 把它移交给转发函数（P2-5 零拷贝），
+    // 之前的候选只借用。取走后本地变为 `Value::Null`，而循环里此后不再读它——
+    // 唯一的读取点就是构造 `body_for_attempt`，且那之后立刻 break/return。
+    let mut req_json: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
     let client_model = req_json
         .get("model")
         .and_then(|m| m.as_str())
@@ -734,11 +737,31 @@ async fn handle_request(
             store.append_event(category, "failover", Some(&failed.id), &detail);
         };
 
+        // 本次尝试传给转发函数的 body（P2-5 第二步）。
+        //
+        // **只有「没有后续候选」时才交出所有权**（零拷贝移动）；只要还有下一个候选，
+        // 就必须传 Borrowed 让对方自己克隆——否则本次的改写（model / effort 注入）会污染
+        // 原始 body，下一个候选拿到的就是「上一个候选 resolve 后的模型名」，
+        // 那是静默的错路由（不报错、不 panic，只是打错了模型）。
+        //
+        // ⚠️ **必须在真正要用的那一刻才构造**，不能提到 `if wants_stream` 之前：
+        // 那样非流式分支走到时 req_json 已被 take 空，forward_to_key 会收到 `Null`
+        // （表现为发给上游的 body 只剩 `"messages": []`）。初版就是这么写的，
+        // 被 codex_effort_injected_end_to_end 等三条既有测试当场抓住。
+        let take_body = |req_json: &mut Value| -> std::borrow::Cow<'static, Value> {
+            std::borrow::Cow::Owned(std::mem::take(req_json))
+        };
+
         // 流式直通分支：下游要 stream 且无需跨协议转换 → 真流式透传（边收边发）。
         // 先探上游状态码：非 2xx 则照常切换下一个 Key（首字节尚未发出，切换安全）；
         // 2xx 则把上游 SSE 流原样转给下游，正确设置 content-type，直接返回（不再切换）。
         if wants_stream && can_stream(key) {
-            match try_stream_to_key(&store, category, key, &path, &req_json, &requested_model, &fwd_headers, req_log, remaining)
+            let body = if next.is_some() {
+                std::borrow::Cow::Borrowed(&req_json)
+            } else {
+                take_body(&mut req_json)
+            };
+            match try_stream_to_key(&store, category, key, &path, body, &requested_model, &fwd_headers, req_log, remaining)
                 .await
             {
                 Ok(StreamAttempt::Streaming { resp, url, real_model, request_body }) => {
@@ -833,8 +856,14 @@ async fn handle_request(
             continue;
         }
 
+        // 同上：只有没有后续候选时才交出所有权（零拷贝），否则借用让对方自己克隆。
+        let body = if next.is_some() {
+            std::borrow::Cow::Borrowed(&req_json)
+        } else {
+            take_body(&mut req_json)
+        };
         let result =
-            forward_to_key(&store, category, key, &path, &req_json, &requested_model, &fwd_headers, req_log, remaining)
+            forward_to_key(&store, category, key, &path, body, &requested_model, &fwd_headers, req_log, remaining)
                 .await;
         let elapsed = started.elapsed().as_millis() as u64;
         match result {
@@ -1185,7 +1214,10 @@ async fn try_stream_to_key(
     category: CategoryType,
     key: &ProviderKey,
     path: &str,
-    req_json: &Value,
+    // 下游请求体。用 `Cow` 而非 `&Value`（P2-5 第二步）：调用方对**最后一个候选**传
+    // `Cow::Owned`（零拷贝移动），之前的候选传 `Cow::Borrowed`（在函数内克隆，保证后续候选
+    // 拿到的仍是未被污染的原始 body）。同协议单候选是最常见路径，此时全程零深拷贝。
+    req_json: std::borrow::Cow<'_, Value>,
     requested_model: &str,
     fwd_headers: &[(String, String)],
     // 见 `forward_to_key` 同名形参：仅用于决定是否构造只喂给日志的请求体快照。
@@ -1206,17 +1238,41 @@ async fn try_stream_to_key(
     // 模型解析：映射 → 原生支持 → 默认兜底 → 第一个模型 → 透传（见 ProviderKey::resolve_model）
     let real_model = key.resolve_model(requested_model);
 
-    // 下游协议 → 上游 Key 协议：请求体按需转换（同协议 convert_request 内部直接克隆）。
     let downstream = downstream_protocol(path);
-    let mut payload = req_json.clone();
+    // SSE 翻译方向：同协议为 None（原样透传）；跨协议按方向重组事件流。
+    let sse_dir = crate::upstream::sse_direction(downstream, key.protocol);
+
+    // 响应侧翻译需要的三个工具集合**必须在消费 req_json 之前收集**（P2-5 第二步）。
+    //
+    // 只在跨协议（sse_dir.is_some()）时才收集：同协议是原样透传，用不到它们，
+    // 而同协议恰恰是最常见的路径——不能为了这里的便利给它增加无谓工作。
+    //
+    // 三者都是对下游 body 的**纯读取**（读 tools 声明），而下面只改 model / effort，
+    // 故「先收集再改」与「先改再收集」结果一致。
+    let tool_sets = sse_dir.map(|_| {
+        // 从下游请求 tools 收集 namespace 名（Codex 把 MCP 工具折叠成 type:"namespace"）。
+        // 响应侧回填 function_call 时据此把全名 <ns>__<sub> 拆回 {name, namespace} 两字段——
+        // Codex router 用结构化 ToolName{namespace,name} 查表，不拆 name 字符串，缺 namespace
+        // 字段就报 unsupported call（大脑聚合失效根因）。
+        let namespaces = crate::upstream::collect_tool_namespaces(&req_json);
+        let custom_tools = crate::upstream::collect_custom_tools(&req_json);
+        // Codex 的延迟工具检索器（type:"tool_search"）：模型对它的调用必须回程成
+        // tool_search_call，Codex 才会本地跑 BM25 检索并在下一轮把 MCP 工具真 schema
+        // 灌进 tool_search_output —— 那是 mcp__* 工具唯一的来源。
+        let search_tools = crate::upstream::collect_search_tools(&req_json);
+        (namespaces, custom_tools, search_tools)
+    });
+
+    // 下游协议 → 上游 Key 协议：请求体按需转换。
+    //
+    // `into_owned()`：调用方给的是 `Cow`——最后一个候选传 Owned（零拷贝移动），
+    // 之前的候选传 Borrowed（在此克隆一份，保证后续候选拿到的仍是未被污染的原始 body）。
+    let mut payload = req_json.into_owned();
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("model".into(), Value::String(real_model.clone()));
     }
     inject_default_effort(store, category, &mut payload, downstream, key.protocol);
     let payload = crate::upstream::convert_request_owned(payload, downstream, key.protocol);
-
-    // SSE 翻译方向：同协议为 None（原样透传）；跨协议按方向重组事件流。
-    let sse_dir = crate::upstream::sse_direction(downstream, key.protocol);
 
     // 同协议：原样保留下游路径 + query（count_tokens 等子路径正确透传）。
     // 跨协议：退回上游协议的补全端点。
@@ -1296,16 +1352,10 @@ async fn try_stream_to_key(
         // 用 stream::unfold 承载状态机（不引 async_stream 依赖）：累加器持有翻译器、上游流、
         // 以及「是否已冲刷收尾」标志。每步产出一个 Frame。
         Some(dir) => {
-            // 从下游请求 tools 收集 namespace 名（Codex 把 MCP 工具折叠成 type:"namespace"）。
-            // 响应侧回填 function_call 时据此把全名 <ns>__<sub> 拆回 {name, namespace} 两字段——
-            // Codex router 用结构化 ToolName{namespace,name} 查表，不拆 name 字符串，缺 namespace
-            // 字段就报 unsupported call（大脑聚合失效根因）。
-            let namespaces = crate::upstream::collect_tool_namespaces(req_json);
-            let custom_tools = crate::upstream::collect_custom_tools(req_json);
-            // Codex 的延迟工具检索器（type:"tool_search"）：模型对它的调用必须回程成
-            // tool_search_call，Codex 才会本地跑 BM25 检索并在下一轮把 MCP 工具真 schema
-            // 灌进 tool_search_output —— 那是 mcp__* 工具唯一的来源。
-            let search_tools = crate::upstream::collect_search_tools(req_json);
+            // 三个集合已在消费 req_json 之前收集好（见函数上方 tool_sets）。
+            // sse_dir 为 Some 时 tool_sets 必然也是 Some（同一个条件），故这里可以直接取。
+            let (namespaces, custom_tools, search_tools) =
+                tool_sets.expect("sse_dir 为 Some 时 tool_sets 必然已收集");
             let translator = crate::upstream::SseTranslator::with_namespaces_and_custom(
                 dir,
                 namespaces,
@@ -1487,7 +1537,9 @@ async fn forward_to_key(
     category: CategoryType,
     key: &ProviderKey,
     path: &str,
-    req_json: &Value,
+    // 见 `try_stream_to_key` 同名形参：`Cow` 让最后一个候选零拷贝移动，
+    // 之前的候选传 Borrowed 由本函数自行克隆（保证候选间 body 不被污染）。
+    req_json: std::borrow::Cow<'_, Value>,
     requested_model: &str,
     fwd_headers: &[(String, String)],
     // 调用模型日志开关（默认关）。由调用方传入而非在此重读 settings：
@@ -1509,7 +1561,21 @@ async fn forward_to_key(
 
     // 判定下游请求协议（按 path），与目标 Key 协议做适配
     let downstream = downstream_protocol(path);
-    let mut payload = req_json.clone();
+
+    // 响应侧翻译需要的两个工具集合**必须在消费 req_json 之前收集**（P2-5 第二步）。
+    // 只在跨协议时才需要（同协议响应原样透传），而同协议是最常见路径——
+    // 不能为这里的便利给它增加无谓工作。两者都是对下游 body 的纯读取（读 tools 声明），
+    // 而下面只改 model / effort，故先收集与后收集结果一致。
+    let resp_tool_sets = (downstream != key.protocol).then(|| {
+        (
+            crate::upstream::collect_custom_tools(&req_json),
+            crate::upstream::collect_search_tools(&req_json),
+        )
+    });
+
+    // `into_owned()`：最后一个候选传的是 Owned（零拷贝移动），之前的候选传 Borrowed
+    // （在此克隆，保证后续候选拿到未被污染的原始 body）。
+    let mut payload = req_json.into_owned();
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("model".into(), Value::String(real_model.clone()));
     }
@@ -1588,8 +1654,11 @@ async fn forward_to_key(
                 // custom_tool_call、tool_search 的改写为 tool_search_call（否则 Codex router
                 // 认不出：前者工具执行失败，后者检索发不起来→MCP 工具拿不到 schema）。
                 // 其他协议对不涉及此逻辑。
-                let custom_tools = crate::upstream::collect_custom_tools(req_json);
-                let search_tools = crate::upstream::collect_search_tools(req_json);
+                // 已在消费 req_json 之前收集好（见函数上方 resp_tool_sets）。
+                // 本分支的条件 `!same_protocol` 与那里的收集条件是同一个，故必然是 Some。
+                let (custom_tools, search_tools) = resp_tool_sets
+                    .clone()
+                    .expect("跨协议分支下 resp_tool_sets 必然已收集");
                 let translated = crate::upstream::convert_response_ext(
                     &v,
                     key.protocol,
@@ -2454,6 +2523,117 @@ mod tests {
                             .body(full_body(Bytes::from(body)))
                             .unwrap();
                         Ok::<_, std::convert::Infallible>(resp)
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// P2-5 第二步的核心防线：**候选之间不得互相污染请求体**。
+    ///
+    /// 零拷贝优化（最后一个候选 `mem::take` 走 body）一旦写错，症状是「第 2 个候选收到的
+    /// 模型名是第 1 个候选 resolve 后的值」——不报错、不 panic，只是静默打错模型。
+    /// 这里让两个候选映射到**不同的真实模型名**，断言各自收到自己那个。
+    ///
+    /// 顺带覆盖初版真实踩到的坑：`body_for_attempt` 曾被提到 `if wants_stream` 之前构造，
+    /// 于是非流式路径拿到已被 take 空的 body（发出去只剩 `"messages": []`）。
+    #[tokio::test]
+    async fn candidates_do_not_pollute_each_others_body() {
+        let cap = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        // 第一个候选返 500（触发故障转移），且要能抓到它收到的 body
+        let bad = spawn_capture_mock_with_status(cap.clone(), 500).await;
+        let good_cap = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let good = spawn_capture_mock_with_status(good_cap.clone(), 200).await;
+
+        let dir = temp_dir("no_pollute");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // 两条 Key 把同一个对外名映射到**不同**真实模型名
+        let mut k1 = key("k1", 0, &bad);
+        k1.mappings = vec![crate::model::ModelMapping {
+            id: "m1".into(),
+            expected_name: "outer".into(),
+            real_name: "real-FIRST".into(),
+        }];
+        let mut k2 = key("k2", 1, &good);
+        k2.mappings = vec![crate::model::ModelMapping {
+            id: "m2".into(),
+            expected_name: "outer".into(),
+            real_name: "real-SECOND".into(),
+        }];
+        store.upsert_key(k1).unwrap();
+        store.upsert_key(k2).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        store.secrets.write().set("k2", "y").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"outer","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "应故障转移到第二个候选");
+
+        let first = cap.lock().first().cloned().unwrap_or_default();
+        let second = good_cap.lock().first().cloned().unwrap_or_default();
+        assert!(
+            first.contains("real-FIRST"),
+            "第一个候选应收到自己的映射结果，实际: {first}"
+        );
+        assert!(
+            second.contains("real-SECOND"),
+            "第二个候选必须收到**自己**的映射结果（若被上一候选污染会是 real-FIRST），实际: {second}"
+        );
+        assert!(
+            !second.contains("real-FIRST"),
+            "第二个候选的 body 被上一个候选污染了: {second}"
+        );
+        // 非空校验：body 不能是被 take 空后的残壳
+        assert!(
+            second.contains("\"content\":\"hi\"") || second.contains("hi"),
+            "第二个候选收到的 body 不应是空壳（初版 take 时机写错就是这个症状）: {second}"
+        );
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 抓 body 且可指定返回状态码的 mock（用于构造「第一个候选失败」的故障转移场景）。
+    async fn spawn_capture_mock_with_status(
+        captured: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+        status: u16,
+    ) -> String {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let cap = captured.clone();
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let cap = cap.clone();
+                        async move {
+                            let bytes = req.into_body().collect().await.unwrap().to_bytes();
+                            cap.lock().push(String::from_utf8_lossy(&bytes).to_string());
+                            let resp = Response::builder()
+                                .status(status)
+                                .header("content-type", "application/json")
+                                .body(full_body(Bytes::from_static(
+                                    br#"{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}"#,
+                                )))
+                                .unwrap();
+                            Ok::<_, hyper::Error>(resp)
+                        }
                     });
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, svc)
