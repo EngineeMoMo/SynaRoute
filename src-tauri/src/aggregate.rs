@@ -863,7 +863,7 @@ async fn run_member_turns(
     // 工具结果历史的字符预算：累计超过就把较早轮次的结果压成占位（见 trim_tool_history）。
     // 传 0 = 不裁剪（关闭该保护）。
     tool_ctx_budget: usize,
-) -> Result<String, String> {
+) -> Result<String, MemberError> {
     let tools = match tool_env {
         Some(env) => crate::agent_tools::tool_defs(env),
         None => Vec::new(),
@@ -899,7 +899,7 @@ async fn run_member_turns(
         if turn_budget.is_zero() {
             // 连发一次请求的时间都没有了：有正文就交差，没有就如实报超时。
             return if preamble.trim().is_empty() {
-                Err(format!("超时（>{budget_ms}ms）且未给出结论"))
+                Err(MemberError::own(format!("超时（>{budget_ms}ms）且未给出结论")))
             } else {
                 store.append_event(
                     category,
@@ -931,7 +931,8 @@ async fn run_member_turns(
                 );
                 return Ok(preamble);
             }
-            Err(e) => return Err(format!("调用失败：{e}")),
+            // 唯一携带上游状态码的失败路径：交给 MemberError 结构化保存，供 4xx 判定使用。
+            Err(e) => return Err(MemberError::from_upstream(&e)),
         };
         match outcome {
             TurnOutcome::Text(t) if !t.trim().is_empty() => return Ok(t),
@@ -958,14 +959,18 @@ async fn run_member_turns(
                         ),
                     );
                     return if preamble.trim().is_empty() {
-                        Err(format!("工具调用已达 {rounds} 轮上限且未给出结论"))
+                        Err(MemberError::own(format!(
+                            "工具调用已达 {rounds} 轮上限且未给出结论"
+                        )))
                     } else {
                         Ok(preamble)
                     };
                 }
                 let Some(env) = tool_env else {
                     // 本次没声明任何工具却回了 tool_use：上游协议异常，如实报出不静默。
-                    return Err("上游返回了工具调用，但本次未声明任何工具".into());
+                    return Err(MemberError::own(
+                        "上游返回了工具调用，但本次未声明任何工具",
+                    ));
                 };
                 // 单轮工具调用数上限。**每个 call 仍必须回一条结果**（两家协议都要求一一对应，
                 // 缺一条上游直接 400），故超限的不是丢弃、而是回一条 is_error 结果且**不执行**
@@ -1076,8 +1081,10 @@ fn tool_call_brief(c: &upstream::ToolInvocation) -> String {
 ///
 /// 为什么必须显式提示：成员配的可能是纯文本模型，上游只回一个 400，用户在日志里看到的是
 /// 「调用失败：OpenAI HTTP 400: ...」，根因埋在响应体里，几乎没人能一眼看出是图片导致的。
-fn image_unsupported_hint(reason: &str, had_images: bool) -> String {
-    if !had_images || !mentions_4xx(reason) {
+/// 判 4xx 用 [`MemberError::is_4xx`]（结构化状态码），不再搜错误文本——理由见 `MemberError`。
+fn image_unsupported_hint(err: &MemberError, had_images: bool) -> String {
+    let reason = &err.msg;
+    if !had_images || !err.is_4xx() {
         return reason.to_string();
     }
     format!(
@@ -1086,12 +1093,38 @@ fn image_unsupported_hint(reason: &str, had_images: bool) -> String {
     )
 }
 
-/// 错误文本里是否出现 `HTTP 4xx`。
-fn mentions_4xx(reason: &str) -> bool {
-    reason.split("HTTP ").skip(1).any(|s| {
-        let d: Vec<char> = s.chars().take(3).collect();
-        d.len() == 3 && d[0] == '4' && d[1].is_ascii_digit() && d[2].is_ascii_digit()
-    })
+/// 成员调用失败：消息 + **结构化**上游状态码（`None` = 非上游 HTTP 错误，如超时、
+/// 轮次上限、连接层失败）。
+///
+/// 为什么不用裸 `String`：判「是否 4xx」曾经靠在错误文本里搜 `HTTP 4xx`，而该文本**拼进了
+/// 上游响应体前 400 字符**。上游返 500 但 body 里带 `HTTP 404` 字样时（网关回显原始报文是
+/// 常见形态），会被误判成 4xx → 给用户追加一句「模型可能不支持图片输入」，把排障方向
+/// 引到多模态能力上，而真因是上游 5xx。这与 `is_retriable_upstream_error` 曾经的
+/// 假阳性完全同形，只是后果是误导而非白重试。
+#[derive(Debug, Clone)]
+pub struct MemberError {
+    pub msg: String,
+    pub status: Option<u16>,
+}
+
+impl MemberError {
+    /// 我们自己产生的失败（超时、轮次上限、未声明工具…）：没有上游状态码。
+    fn own(msg: impl Into<String>) -> Self {
+        Self { msg: msg.into(), status: None }
+    }
+    /// 上游调用失败：从 `AppError` 取出结构化状态码，**不从文本反推**。
+    fn from_upstream(e: &AppError) -> Self {
+        Self { msg: format!("调用失败：{e}"), status: e.upstream_status() }
+    }
+    fn is_4xx(&self) -> bool {
+        matches!(self.status, Some(s) if (400..500).contains(&s))
+    }
+}
+
+impl std::fmt::Display for MemberError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
 }
 
 /// 工具开关开启且工作目录可用时，探测一次工具环境（codegraph 在此只解析一次，
@@ -1724,7 +1757,7 @@ async fn call_ref(
     let result = match timeout(Duration::from_millis(budget_ms), call).await {
         Ok(r) => r?,
         Err(_) => {
-            return Err(AppError::Upstream(format!(
+            return Err(AppError::upstream_msg(format!(
                 "调用 {} 超时（超过单次预算 {}ms）",
                 label_ref(store, reference),
                 budget_ms
@@ -1736,7 +1769,7 @@ async fn call_ref(
     // 显式判空 → 转成错误让调用方(决策者/汇总者/降级独答)按失败路径处理，或让 MCP
     // 客户端看到明确错误提示。
     if result.trim().is_empty() {
-        return Err(AppError::Upstream(format!(
+        return Err(AppError::upstream_msg(format!(
             "调用 {} 返回空响应（上游 200 但 content 为空，通常是限流后厂商降级）",
             label_ref(store, reference)
         )));
@@ -2246,23 +2279,56 @@ mod tests {
 
     #[test]
     fn image_hint_only_fires_for_4xx_with_images() {
-        let e400 = "调用失败：OpenAI HTTP 400: {\"error\":\"invalid image\"}";
+        let http = |s: u16, body: &str| MemberError {
+            msg: format!("调用失败：OpenAI HTTP {s}: {body}"),
+            status: Some(s),
+        };
+        let e400 = http(400, "{\"error\":\"invalid image\"}");
         // 带图 + 4xx → 点出「模型可能不支持图片」，否则根因埋在响应体里没人看得出来
-        assert!(image_unsupported_hint(e400, true).contains("不支持图片输入"));
+        assert!(image_unsupported_hint(&e400, true).contains("不支持图片输入"));
         // 没带图 → 不该乱加提示，误导排查方向
-        assert_eq!(image_unsupported_hint(e400, false), e400);
-        // 5xx / 超时 / 连接失败与图片无关
-        for e in [
-            "调用失败：Anthropic HTTP 529: overloaded",
-            "调用失败：Anthropic HTTP 500: boom",
-            "超时（>60000ms）",
-            "调用失败：连接 x 失败",
-        ] {
-            assert_eq!(image_unsupported_hint(e, true), e, "{e} 不该加图片提示");
+        assert_eq!(image_unsupported_hint(&e400, false), e400.msg);
+        // 5xx 与图片无关
+        for e in [http(529, "overloaded"), http(500, "boom")] {
+            assert_eq!(image_unsupported_hint(&e, true), e.msg, "{} 不该加图片提示", e.msg);
         }
-        assert!(mentions_4xx("HTTP 404 not found"));
-        assert!(!mentions_4xx("HTTP 4x not a status"));
-        assert!(!mentions_4xx("没有状态码"));
+        // 我们自己产生的失败（超时/连接层）没有状态码 → 一律不加提示
+        for e in [
+            MemberError::own("超时（>60000ms）"),
+            MemberError::own("调用失败：连接 x 失败"),
+        ] {
+            assert_eq!(image_unsupported_hint(&e, true), e.msg, "{} 不该加图片提示", e.msg);
+        }
+    }
+
+    /// 回归：4xx 判定必须只看**结构化状态码**，不能从错误文本里搜 `HTTP 4xx`。
+    ///
+    /// 故障注入判据：把 `MemberError::is_4xx` 改回文本搜索，第一条断言即变红。
+    /// 真实场景——网关把上游原始报文回显在响应体里（中转商常见），一个 500 的响应体里
+    /// 带着 `HTTP 404` 字样，文本搜索会误判成 4xx，给用户追加一句「模型可能不支持图片输入」，
+    /// 把排障方向从「上游 5xx」引到「多模态能力」上。
+    #[test]
+    fn is_4xx_uses_status_not_body_text() {
+        // 真状态码 500，但响应体里带 "HTTP 404" 字样
+        let poisoned = MemberError {
+            msg: "调用失败：OpenAI HTTP 500: upstream said HTTP 404 not found".into(),
+            status: Some(500),
+        };
+        assert!(!poisoned.is_4xx(), "状态码是 500，不能因响应体含 'HTTP 404' 就判成 4xx");
+        assert_eq!(
+            image_unsupported_hint(&poisoned, true),
+            poisoned.msg,
+            "5xx 不该被追加图片提示（哪怕 body 里有 4xx 字样）"
+        );
+
+        // 反向：真 4xx 但文本里完全没有 "HTTP" 字样，也必须判出来
+        let no_text = MemberError { msg: "上游拒绝".into(), status: Some(422) };
+        assert!(no_text.is_4xx(), "422 必须判为 4xx，即使消息里没有 'HTTP' 字样");
+
+        // 边界：399 / 500 不算 4xx
+        assert!(!MemberError { msg: String::new(), status: Some(399) }.is_4xx());
+        assert!(!MemberError { msg: String::new(), status: Some(500) }.is_4xx());
+        assert!(MemberError { msg: String::new(), status: Some(499) }.is_4xx());
     }
 
     #[test]

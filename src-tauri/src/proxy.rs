@@ -1099,7 +1099,7 @@ async fn try_stream_to_key(
         .secrets
         .read()
         .get(&key.id)?
-        .ok_or_else(|| AppError::Upstream("密钥缺失".into()))?;
+        .ok_or_else(|| AppError::upstream_msg("密钥缺失"))?;
 
     // 模型解析：映射 → 原生支持 → 默认兜底 → 第一个模型 → 透传（见 ProviderKey::resolve_model）
     let real_model = key.resolve_model(requested_model);
@@ -1153,7 +1153,7 @@ async fn try_stream_to_key(
     let resp = rb
         .send()
         .await
-        .map_err(|e| AppError::Upstream(format!("连接 {url} 失败: {e}")))?;
+        .map_err(|e| AppError::upstream_msg(format!("连接 {url} 失败: {e}")))?;
     let status = resp.status();
 
     if !status.is_success() {
@@ -1266,7 +1266,7 @@ async fn try_stream_to_key(
         .header("content-type", out_content_type)
         .header("cache-control", "no-cache")
         .body(body)
-        .map_err(|e| AppError::Upstream(e.to_string()))?;
+        .map_err(|e| AppError::upstream_msg(e.to_string()))?;
 
     // 转换后发往上游的请求体快照（供调用模型日志核对 reasoning→thinking 等映射）。
     // 开关关闭时不构造——理由同 `forward_to_key` 内同名变量（三处同进同退）。
@@ -1396,7 +1396,7 @@ async fn forward_to_key(
         .secrets
         .read()
         .get(&key.id)?
-        .ok_or_else(|| AppError::Upstream("密钥缺失".into()))?;
+        .ok_or_else(|| AppError::upstream_msg("密钥缺失"))?;
 
     // 模型解析：映射 → 原生支持 → 默认兜底 → 第一个模型 → 透传（FR-006，见 resolve_model）
     let real_model = key.resolve_model(requested_model);
@@ -1475,11 +1475,11 @@ async fn forward_to_key(
     let resp = rb
         .send()
         .await
-        .map_err(|e| AppError::Upstream(format!("连接 {url} 失败: {e}")))?;
+        .map_err(|e| AppError::upstream_msg(format!("连接 {url} 失败: {e}")))?;
     let status = resp.status();
     // Retry-After 须在 resp.bytes() 消费响应体之前取（bytes() 拿走所有权）。
     let retry_after = parse_retry_after(resp.headers());
-    let bytes = resp.bytes().await.map_err(|e| AppError::Upstream(e.to_string()))?;
+    let bytes = resp.bytes().await.map_err(|e| AppError::upstream_msg(e.to_string()))?;
 
     // 跨协议响应翻译：上游 2xx 时，把响应体从上游协议翻译回下游客户端期望的协议格式。
     // 请求已翻译（上面的 payload 转换），响应也必须翻译，否则下游客户端收到无法解析的异协议体。

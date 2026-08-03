@@ -165,6 +165,15 @@ pub fn is_candidate(health: &HealthState) -> bool {
 /// 但仍返回它们（忽略熔断窗口兜底），避免单 Key / 全熔断时整服务直接 503：
 /// 有一个能试的 Key 也比不可用强（熔断本为「多 Key 快速切换」设计，无处可切时不应自杀）。
 /// 返回 (候选列表, 是否触发了兜底)。
+///
+/// **生产路径已改走 `Store::candidates_for`**（它在一把读锁内筛选排序、只克隆入选者，
+/// 省掉这条路径的「两轮全量克隆」）。本函数保留为**纯函数参照实现**：
+/// - 原有 4 条熔断语义测试直接打它（不需要构造 Store）；
+/// - `candidates_for_matches_legacy_path` 用它做等价性基准——两者一旦漂移即测试失败。
+///
+/// 故标 `#[cfg(test)]`：既消掉生产构建的 dead_code 警告，也从编译期防止有人误把生产
+/// 调用点切回这条更慢的路径。
+#[cfg(test)]
 pub fn select_candidates(keys: Vec<crate::model::ProviderKey>) -> (Vec<crate::model::ProviderKey>, bool) {
     let primary: Vec<_> = keys.iter().filter(|k| is_candidate(&k.health)).cloned().collect();
     if !primary.is_empty() {

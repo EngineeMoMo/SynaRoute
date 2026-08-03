@@ -879,6 +879,61 @@ pub struct ProxyState {
     pub message: Option<String>,
 }
 
+/// 一次上游调用的 token 用量。两协议字段名不同，这里归一。
+///
+/// 为什么要有：用户在真机上遇到「一次聚合 2 分 38 秒、请求体 20 万字符」，
+/// 但**日志里看不到任何 token 数字**，无从判断是哪个环节吃掉了额度、也无法验证
+/// 「工具开关关掉后是否真的省了」。可观测性是控成本的前提。
+///
+/// 为什么定义在 `model` 而非 `upstream`：它是**领域观测量**，被 [`EventLogEntry`] 直接持有。
+/// 原先定义在 `upstream.rs` 会让本模块反向依赖那个 7000+ 行的协议模块（且 `model` 对
+/// upstream 的依赖仅此一处）。协议侧的解析采集逻辑（`extract_usage` 等）仍留在 `upstream`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsage {
+    /// 输入（prompt）token
+    pub input: u64,
+    /// 输出（completion）token
+    pub output: u64,
+    /// 命中缓存的输入 token（Anthropic 有，OpenAI 部分中转商也给）
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub cache_read: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+impl TokenUsage {
+    pub fn total(&self) -> u64 {
+        self.input + self.output
+    }
+    pub fn is_empty(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0
+    }
+    /// 累加（聚合各环节汇总用）。
+    pub fn add(&mut self, o: &TokenUsage) {
+        self.input += o.input;
+        self.output += o.output;
+        self.cache_read += o.cache_read;
+    }
+    /// 紧凑展示：`↑1.2k ↓340`（缓存命中不为 0 时附 `缓存 900`）。
+    pub fn fmt_compact(&self) -> String {
+        fn k(n: u64) -> String {
+            if n >= 10_000 {
+                format!("{:.1}k", n as f64 / 1000.0)
+            } else {
+                n.to_string()
+            }
+        }
+        let mut s = format!("↑{} ↓{}", k(self.input), k(self.output));
+        if self.cache_read > 0 {
+            s.push_str(&format!(" 缓存{}", k(self.cache_read)));
+        }
+        s
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventLogEntry {
@@ -909,7 +964,7 @@ pub struct EventLogEntry {
     /// 一次 2 分 38 秒、请求体 20 万字符的聚合，日志里却找不到任何 token 数字。
     /// `None` = 该中转商未返回用量（如实陈述，不写 0 冒充）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<crate::upstream::TokenUsage>,
+    pub usage: Option<TokenUsage>,
     /// 该条是否带链路快照。**列表接口会把 `trace` 正文剥掉**（见 `Store::strip_trace`），
     /// 但前端仍需知道「这行能不能展开看详情」，故单独留一个布尔位——它只有 1 字节，
     /// 而正文最坏 40000 字符。展开时前端按事件 id 走 `get_event_trace` 单取一条。

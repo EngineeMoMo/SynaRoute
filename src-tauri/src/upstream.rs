@@ -83,59 +83,16 @@ pub async fn fetch_models(key: &ProviderKey, secret: &str) -> AppResult<Vec<Stri
         last_err = format!("{url} 返回了 JSON 但其中没有模型列表（该站点可能不提供模型查询接口）");
     }
     // 末尾统一附「可手动录入」的出路：这条链路失败不阻塞用户继续配置。
-    Err(AppError::Upstream(format!("拉取模型失败：{last_err}")))
+    Err(AppError::upstream_msg(format!("拉取模型失败：{last_err}")))
 }
 
-/// 一次上游调用的 token 用量。两协议字段名不同，这里归一。
+/// `TokenUsage` 的**定义已移至 [`crate::model`]**（它是领域观测量，不是上游协议细节；
+/// 留在这里会让 `model.rs` 反向依赖本模块，`model` 对 upstream 的依赖原本仅此一处）。
 ///
-/// 为什么要有：用户在真机上遇到「一次聚合 2 分 38 秒、请求体 20 万字符」，
-/// 但**日志里看不到任何 token 数字**，无从判断是哪个环节吃掉了额度、也无法验证
-/// 「工具开关关掉后是否真的省了」。可观测性是控成本的前提。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TokenUsage {
-    /// 输入（prompt）token
-    pub input: u64,
-    /// 输出（completion）token
-    pub output: u64,
-    /// 命中缓存的输入 token（Anthropic 有，OpenAI 部分中转商也给）
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub cache_read: u64,
-}
-
-fn is_zero(v: &u64) -> bool {
-    *v == 0
-}
-
-impl TokenUsage {
-    pub fn total(&self) -> u64 {
-        self.input + self.output
-    }
-    pub fn is_empty(&self) -> bool {
-        self.input == 0 && self.output == 0 && self.cache_read == 0
-    }
-    /// 累加（聚合各环节汇总用）。
-    pub fn add(&mut self, o: &TokenUsage) {
-        self.input += o.input;
-        self.output += o.output;
-        self.cache_read += o.cache_read;
-    }
-    /// 紧凑展示：`↑1.2k ↓340`（缓存命中不为 0 时附 `缓存 900`）。
-    pub fn fmt_compact(&self) -> String {
-        fn k(n: u64) -> String {
-            if n >= 10_000 {
-                format!("{:.1}k", n as f64 / 1000.0)
-            } else {
-                n.to_string()
-            }
-        }
-        let mut s = format!("↑{} ↓{}", k(self.input), k(self.output));
-        if self.cache_read > 0 {
-            s.push_str(&format!(" 缓存{}", k(self.cache_read)));
-        }
-        s
-    }
-}
+/// 此处 re-export 保持 `crate::upstream::TokenUsage` 路径可用，故全部既有调用点零改动。
+/// **解析与采集逻辑仍留在本模块**（[`extract_usage`] / [`extract_usage_from_sse`] /
+/// [`record_usage`]）——那些依赖协议字段形态，属于 upstream 的职责。
+pub use crate::model::TokenUsage;
 
 /// 从上游响应体里提取 token 用量，**同时兼容两家协议**的字段名。
 ///
@@ -365,20 +322,28 @@ const OPENAI_CLIENT_UA: &str =
 /// Codex 的客户端来源标识头值（default_client.rs `DEFAULT_ORIGINATOR`）。
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 
-/// 判断上游错误是否「临时性、值得重试」：502/503/504/529 网关或过载错误、429 限流、连接层失败。
-/// 4xx（除 429）多为鉴权/参数问题，重试无意义，不重试。
+/// 判断上游错误是否「临时性、值得重试」：429 限流、502/503/504 网关、529 过载，以及连接层失败。
+/// 其余 4xx（401/403/404/422…）是鉴权或参数问题，重试无意义。
+///
+/// **按结构化状态码判定，不做文本嗅探。** 旧实现是
+/// `msg.contains("HTTP 502") || … || msg.contains("连接")`，而 `msg` 里**拼进了上游响应体
+/// 前 400 字符**（见 `anthropic_message` / `openai_chat` 的错误构造），于是：
+/// - 误判：上游返 401 而响应体含中转商常见文案「请检查网络连接后重试」→ 命中 `"连接"` →
+///   白重试 3 次并线性退避。聚合场景下每个成员各白等一轮，直接吃掉整轮
+///   `total_timeout_ms`，用户看到「聚合超时/部分成员无结果」，真因只是一次鉴权失败。
+///   网关回显原始报文里带 `HTTP 429` 字样时同样中招。
+/// - 漏判：英文 `connection reset by peer` 不含中文「连接」，本该重试的瞬时抖动被判死。
+///
+/// 两个方向的错误都由 `retriable_*` 测试用故障注入锁住（去掉状态码判定即变红）。
 pub fn is_retriable_upstream_error(e: &AppError) -> bool {
-    let AppError::Upstream(msg) = e else { return false };
-    msg.contains("HTTP 502")
-        || msg.contains("HTTP 503")
-        || msg.contains("HTTP 504")
-        || msg.contains("HTTP 429")
-        // 529 overloaded：上游明说「过载、稍后再来」，与 503 同级的临时性错误。
-        || msg.contains("HTTP 529")
-        // 连接层失败（build_client / send 失败）："连接 xxx 失败"
-        || msg.contains("连接")
-        || msg.contains("error sending request")
-        || msg.contains("error decoding response body")
+    if !e.is_upstream() {
+        return false;
+    }
+    match e.upstream_status() {
+        // 连接层失败（没拿到 HTTP 响应）：传输抖动，值得重试。
+        None => true,
+        Some(s) => matches!(s, 429 | 502 | 503 | 504 | 529),
+    }
 }
 
 /// 一次性文本请求（用于聚合成员/决策者/汇总模型调用）。
@@ -430,7 +395,7 @@ pub async fn text_completion(
         }
     }
     // 循环必然在上面 return，这里兜底（不应到达）。
-    Err(last_err.unwrap_or_else(|| AppError::Upstream("未知上游错误".into())))
+    Err(last_err.unwrap_or_else(|| AppError::upstream_msg("未知上游错误")))
 }
 
 tokio::task_local! {
@@ -615,15 +580,22 @@ async fn anthropic_message(
     // 直接 resp.json() 会得到笼统的「error decoding response body」，看不到上游到底返回了啥。
     let raw = resp.text().await?;
     if !status.is_success() {
-        return Err(AppError::Upstream(format!(
-            "Anthropic HTTP {status}: {}",
-            truncate_body(&raw)
-        )));
+        // 传**真实状态码**：消息里拼了响应体，绝不能让重试判定去里面猜（见
+        // `is_retriable_upstream_error` 的文档：401 + 响应体含「请检查网络连接」曾被误判可重试）。
+        return Err(AppError::upstream_http(
+            status.as_u16(),
+            format!("Anthropic HTTP {status}: {}", truncate_body(&raw)),
+        ));
     }
     record_usage_from_raw(&raw);
     // content: [{type:"text", text:"..."}]。兼容普通 JSON 与 SSE 流两种返回形态。
+    // 解析失败**不是** HTTP 错误（状态码是 2xx）：status 传 None 会被判为「连接层失败可重试」，
+    // 而重试一个格式不对的响应毫无意义。故显式给 status，让它落进「非临时错误」分支。
     let text = parse_anthropic_text(&raw).ok_or_else(|| {
-        AppError::Upstream(format!("Anthropic 响应无法解析: {}", truncate_body(&raw)))
+        AppError::upstream_http(
+            status.as_u16(),
+            format!("Anthropic 响应无法解析: {}", truncate_body(&raw)),
+        )
     })?;
     Ok(text)
 }
@@ -651,14 +623,19 @@ async fn openai_chat(
     let status = resp.status();
     let raw = resp.text().await?;
     if !status.is_success() {
-        return Err(AppError::Upstream(format!(
-            "OpenAI HTTP {status}: {}",
-            truncate_body(&raw)
-        )));
+        // 传真实状态码，理由同 `anthropic_message`。
+        return Err(AppError::upstream_http(
+            status.as_u16(),
+            format!("OpenAI HTTP {status}: {}", truncate_body(&raw)),
+        ));
     }
     record_usage_from_raw(&raw);
+    // 解析失败：状态码是 2xx，显式带上以免被当成「连接层失败」而白重试。
     let text = parse_openai_text(&raw).ok_or_else(|| {
-        AppError::Upstream(format!("OpenAI 响应无法解析: {}", truncate_body(&raw)))
+        AppError::upstream_http(
+            status.as_u16(),
+            format!("OpenAI 响应无法解析: {}", truncate_body(&raw)),
+        )
     })?;
     Ok(text)
 }
@@ -1198,7 +1175,7 @@ impl ToolSession {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| AppError::Upstream("未知上游错误".into())))
+        Err(last_err.unwrap_or_else(|| AppError::upstream_msg("未知上游错误")))
     }
 
     /// 单次请求（不重试）。协议分支只在这里，上面的重试逻辑与协议无关。
@@ -1279,22 +1256,25 @@ impl ToolSession {
             let status2 = resp2.status();
             let raw2 = resp2.text().await?;
             if !status2.is_success() {
-                return Err(AppError::Upstream(format!(
-                    "{label} HTTP {status2}: {}",
-                    truncate_body(&raw2)
-                )));
+                return Err(AppError::upstream_http(
+                    status2.as_u16(),
+                    format!("{label} HTTP {status2}: {}", truncate_body(&raw2)),
+                ));
             }
             record_usage_from_raw(&raw2);
             return parse_anthropic_turn(&raw2).ok_or_else(|| {
-                AppError::Upstream(format!("{label} 响应无法解析: {}", truncate_body(&raw2)))
+                AppError::upstream_http(
+                    status2.as_u16(),
+                    format!("{label} 响应无法解析: {}", truncate_body(&raw2)),
+                )
             });
         }
 
         if !status.is_success() {
-            return Err(AppError::Upstream(format!(
-                "{label} HTTP {status}: {}",
-                truncate_body(&raw)
-            )));
+            return Err(AppError::upstream_http(
+                status.as_u16(),
+                format!("{label} HTTP {status}: {}", truncate_body(&raw)),
+            ));
         }
         // 记 token 用量(含 cache_read/cache_creation)。命中缓存时 cache_read 会显著大于 0,
         // 即可在日志徽标里看到「缓存生效了」——这是本次改动可证伪的验收点。
@@ -1305,7 +1285,10 @@ impl ToolSession {
             parse_anthropic_turn(&raw)
         };
         parsed.ok_or_else(|| {
-            AppError::Upstream(format!("{label} 响应无法解析: {}", truncate_body(&raw)))
+            AppError::upstream_http(
+                status.as_u16(),
+                format!("{label} 响应无法解析: {}", truncate_body(&raw)),
+            )
         })
     }
 }
@@ -4278,6 +4261,75 @@ fn apply_models_auth(req: reqwest::RequestBuilder, secret: &str) -> reqwest::Req
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 重试判定必须只看**结构化状态码**，不做文本嗅探。
+    ///
+    /// 故障注入判据：把 `is_retriable_upstream_error` 改回
+    /// `msg.contains("HTTP 502") || … || msg.contains("连接")`，前两条断言立刻变红。
+    ///
+    /// 这两条是真实故障形态，不是臆造的边界：
+    /// - 中转商鉴权失败时响应体常写「请检查网络连接后重试」→ 命中 `"连接"` → 401 被
+    ///   当成临时错误白跑 3 次退避。聚合场景下每个成员各白等一轮，直接吃掉整轮墙钟预算，
+    ///   用户看到「聚合超时」，真因只是 Key 失效。
+    /// - 网关把上游原始报文回显进响应体（含 `HTTP 429` 字样）时同样中招。
+    #[test]
+    fn retriable_judges_by_status_not_message_text() {
+        // 401 + 响应体含中文「连接」：绝不可重试（旧实现会误判为可重试）
+        let auth_fail_with_connection_text = AppError::upstream_http(
+            401,
+            "Anthropic HTTP 401: {\"error\":\"invalid api key，请检查网络连接后重试\"}",
+        );
+        assert!(
+            !is_retriable_upstream_error(&auth_fail_with_connection_text),
+            "401 是鉴权问题，重试无意义——不能因响应体里有「连接」二字就重试"
+        );
+
+        // 401 + 响应体回显 `HTTP 429`：仍然不可重试
+        let auth_fail_echoing_429 =
+            AppError::upstream_http(401, "OpenAI HTTP 401: upstream returned HTTP 429 earlier");
+        assert!(
+            !is_retriable_upstream_error(&auth_fail_echoing_429),
+            "真实状态码是 401，不能因 body 里回显了 HTTP 429 就重试"
+        );
+
+        // 连接层失败（无状态码）：值得重试。旧实现靠英文子串匹配，
+        // `connection reset by peer` 不含中文「连接」会被漏判。
+        assert!(
+            is_retriable_upstream_error(&AppError::upstream_msg("connection reset by peer")),
+            "连接层失败应重试（且不依赖消息语言）"
+        );
+
+        // 真正的临时错误：按状态码放行
+        for s in [429u16, 502, 503, 504, 529] {
+            assert!(
+                is_retriable_upstream_error(&AppError::upstream_http(s, "x")),
+                "HTTP {s} 应判为可重试"
+            );
+        }
+        // 其余 4xx 与 2xx 解析失败：不重试
+        for s in [400u16, 401, 403, 404, 422, 200] {
+            assert!(
+                !is_retriable_upstream_error(&AppError::upstream_http(s, "x")),
+                "HTTP {s} 不应判为可重试"
+            );
+        }
+
+        // 非 Upstream 变体一律不重试
+        assert!(!is_retriable_upstream_error(&AppError::Invalid("bad".into())));
+        assert!(!is_retriable_upstream_error(&AppError::NotFound("x".into())));
+    }
+
+    /// `Display` 格式必须逐字保持 `上游请求错误: {msg}`——前端文案与 docs 里的实测
+    /// 字符串都按这个格式对过，改了会连带破坏那些判据。
+    #[test]
+    fn upstream_display_format_is_stable() {
+        let e = AppError::upstream_http(429, "OpenAI HTTP 429: rate limited");
+        assert_eq!(e.to_string(), "上游请求错误: OpenAI HTTP 429: rate limited");
+        assert_eq!(e.upstream_status(), Some(429));
+        let c = AppError::upstream_msg("连接 https://x 失败");
+        assert_eq!(c.to_string(), "上游请求错误: 连接 https://x 失败");
+        assert_eq!(c.upstream_status(), None, "连接层失败无状态码");
+    }
 
     /// 构造一个跑了若干轮工具的会话历史（assistant tool_use ↔ user tool_result 成对）。
     /// `sizes` 是每轮 tool_result 正文的字符数。
