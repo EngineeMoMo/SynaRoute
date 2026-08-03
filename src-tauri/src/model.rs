@@ -1029,6 +1029,21 @@ pub struct AppSettings {
     /// 后台定时健康检查间隔（秒）。用户可配置，默认 60s。
     #[serde(default = "default_health_interval")]
     pub health_check_interval_secs: u64,
+    /// **一次请求内**故障转移的总时间预算（毫秒）。默认 90s。
+    ///
+    /// 为什么需要：候选遍历原先只有 per-Key 超时，没有整体上限。用户配 6 条 Key、上游整体
+    /// 抖动（网关挂 30s 再回 502）时，单请求最坏 6×30s = **180 秒**才拿到 529。而客户端
+    /// （Claude Code / Codex）自身请求超时远短于此——它早已超时报错并重发，代理侧那条
+    /// 「僵尸链」还在继续逐个打上游、**继续烧额度**、继续写日志。
+    ///
+    /// 语义是「不再**开始**新的候选尝试」，不是硬掐正在进行的请求：
+    /// - 非流式：把剩余预算与 Key 自身超时取小值传给本次请求；
+    /// - 流式：只约束 `send()` 探头阶段，**绝不掐已建立的 SSE 流**（否则长回答会被截断，
+    ///   那是刻意设计的行为，见 `try_stream_to_key` 的超时注释）。
+    ///
+    /// 设 0 = 关闭整体预算（回到旧行为，仅受 per-Key 超时约束）。
+    #[serde(default = "default_failover_budget")]
+    pub failover_total_budget_ms: u64,
     /// 日志文件目录（None 时使用默认 %APPDATA%\SynaRoute\logs）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_dir: Option<String>,
@@ -1123,6 +1138,15 @@ fn default_health_interval() -> u64 {
     60
 }
 
+/// 故障转移总预算默认 90 秒。
+///
+/// 取值理由：要明显大于「单次正常生成耗时」以免误杀慢但正常的请求（非流式长回答几十秒
+/// 常见），又要明显小于「候选数 × per-Key 超时」的最坏值（6×30s = 180s）。90s 让
+/// 6 Key 场景最坏减半，同时给 2~3 个候选留出各自跑满 30s 的空间。
+fn default_failover_budget() -> u64 {
+    90_000
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -1134,6 +1158,7 @@ impl Default for AppSettings {
             request_log_enabled: false,
             log_downstream_raw_enabled: false,
             health_check_interval_secs: default_health_interval(),
+            failover_total_budget_ms: default_failover_budget(),
             log_dir: None,
             mcp_enabled: false,
             mcp_port: default_mcp_port(),

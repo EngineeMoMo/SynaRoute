@@ -302,6 +302,7 @@ let settings: AppSettings = {
   requestLogEnabled: false,
   aggregateTraceEnabled: false,
   healthCheckIntervalSecs: 60,
+  failoverTotalBudgetMs: 90000,
   mcpEnabled: false,
   mcpPort: 9527,
 };

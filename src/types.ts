@@ -298,6 +298,8 @@ export interface AppSettings {
   requestLogEnabled: boolean; // 调用模型日志（默认关，开启后记录每次转发）
   logDownstreamRawEnabled?: boolean; // 诊断：request 日志额外记「下游原始请求体」（转换前，体量大，默认关，仅排障用）
   healthCheckIntervalSecs: number;
+  /** 一次请求内故障转移的总时间预算（毫秒）。0 = 关闭该约束。默认 90000。 */
+  failoverTotalBudgetMs: number;
   logDir?: string;
   mcpEnabled?: boolean; // 内置 MCP 服务器：开启即随应用启动
   mcpPort?: number; // MCP 服务器端口（默认 9527，占用时自动向上找空闲端口）

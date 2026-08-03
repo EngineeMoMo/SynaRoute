@@ -48,6 +48,13 @@ const PROXY_PORT_FALLBACK_RANGE: u16 = 20;
 /// 「全部 Key 均失败」后的短路窗口（毫秒）：窗口内该分类的新请求**直接返回失败**，
 /// 不再逐个重打上游。
 ///
+/// 故障转移预算的最小切片：剩余预算低于此值时不再开始新的候选尝试。
+///
+/// 为什么要有下限而不是「有多少用多少」：剩下 200ms 时去打一次上游几乎必然超时，
+/// 既白烧一次额度、又把总耗时再拖长 200ms。5s 是「够一次快速失败（连接被拒/401 立即返回）」
+/// 与「不至于误杀一次正常应答」之间的折中。
+const MIN_ATTEMPT_SLICE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 为什么必须有：`health::select_candidates` 在「所有 Key 都已熔断」时会**忽略熔断窗口、
 /// 把全部 Key 原样返回**（避免单 Key 场景无处可切就自杀）。副作用是熔断在「全坏」这个最需要
 /// 它的场景下形同虚设——`record_live_failure` 攒够 3 次设了 `breaker_until`，但下一个请求照旧
@@ -609,7 +616,49 @@ async fn handle_request(
     // 最后一次失败的上游状态码（连接层失败为 None）。用于区分「等一等可能好」与
     // 「不可自愈的配置错误」——两者该给下游的状态码完全不同，见函数尾部。
     let mut last_status: Option<u16> = None;
+
+    // 故障转移总预算（FR：见 AppSettings::failover_total_budget_ms）。
+    //
+    // 语义是「不再**开始**新的候选尝试」——不硬掐正在进行的请求，尤其不掐已建立的 SSE 流。
+    // 没有它时最坏耗时 = 候选数 × per-Key 超时（6 Key × 30s = 180s），而客户端早已超时重发，
+    // 代理侧那条僵尸链仍在逐个打上游烧额度。
+    let deadline = store.failover_budget().map(|b| std::time::Instant::now() + b);
+
     for (i, key) in candidates.iter().enumerate() {
+        // 剩余预算。第一个候选永不因预算被跳过（i == 0 时至少要试一次，否则配置了极小预算
+        // 会变成「一个都不试直接 529」，那比慢更糟）。
+        let remaining = match deadline {
+            Some(d) => {
+                let left = d.saturating_duration_since(std::time::Instant::now());
+                // 夹一个下限：剩余时间太短时开始新尝试几乎必然超时，白打一次上游还拖长总耗时。
+                if i > 0 && left < MIN_ATTEMPT_SLICE {
+                    let skipped_by_budget = candidates.len() - i;
+                    if last_err.is_empty() {
+                        last_err = format!(
+                            "故障转移总预算耗尽，剩余 {skipped_by_budget} 个候选未尝试"
+                        );
+                    }
+                    store.append_event(
+                        category,
+                        "failover",
+                        None,
+                        &format!(
+                            "故障转移总预算耗尽，跳过剩余 {skipped_by_budget} 个候选（避免客户端已超时后仍继续打上游烧额度）"
+                        ),
+                    );
+                    break;
+                }
+                // 抬到最小可用片：预算约束的是「开启多少次新尝试」，而**已决定要开启的尝试
+                // 必须拿到可用的时间片**。否则会出现「第一个候选没被跳过、但拿到 0ms 超时
+                // 而瞬间失败」——那等于变相跳过，比慢更糟（用户配了很小的预算，或上一次
+                // 请求刚好耗尽窗口时就会踩到）。
+                //
+                // 对 i > 0 而言 left 已 ≥ MIN_ATTEMPT_SLICE，这里的 max 是恒等操作；
+                // 真正生效的是 i == 0 那种「预算已耗尽但仍必须试一次」的情形。
+                Some(left.max(MIN_ATTEMPT_SLICE))
+            }
+            None => None,
+        };
         let started = std::time::Instant::now();
         let next = candidates.get(i + 1);
         // 故障转移日志：写清「谁失败（客户端要什么/实际打的什么）→ 转给谁」，避免只写「尝试下一个」看不出链路。
@@ -646,7 +695,7 @@ async fn handle_request(
         // 先探上游状态码：非 2xx 则照常切换下一个 Key（首字节尚未发出，切换安全）；
         // 2xx 则把上游 SSE 流原样转给下游，正确设置 content-type，直接返回（不再切换）。
         if wants_stream && can_stream(key) {
-            match try_stream_to_key(&store, category, key, &path, &req_json, &requested_model, &fwd_headers, req_log)
+            match try_stream_to_key(&store, category, key, &path, &req_json, &requested_model, &fwd_headers, req_log, remaining)
                 .await
             {
                 Ok(StreamAttempt::Streaming { resp, url, real_model, request_body }) => {
@@ -742,7 +791,7 @@ async fn handle_request(
         }
 
         let result =
-            forward_to_key(&store, category, key, &path, &req_json, &requested_model, &fwd_headers, req_log)
+            forward_to_key(&store, category, key, &path, &req_json, &requested_model, &fwd_headers, req_log, remaining)
                 .await;
         let elapsed = started.elapsed().as_millis() as u64;
         match result {
@@ -1094,6 +1143,12 @@ async fn try_stream_to_key(
     fwd_headers: &[(String, String)],
     // 见 `forward_to_key` 同名形参：仅用于决定是否构造只喂给日志的请求体快照。
     req_log: bool,
+    // 故障转移剩余预算；None = 用户关闭了整体预算。
+    //
+    // **只用于约束 send() 探头阶段**（等上游返回响应头/状态码）。一旦拿到 2xx 并开始
+    // 转发 SSE，就完全不再受它约束——流式刻意不设总超时，掐断会把长回答截断，
+    // 那是本项目明确的设计判断（见下方 send() 处的注释）。
+    budget_left: Option<std::time::Duration>,
 ) -> AppResult<StreamAttempt> {
     let secret = store
         .secrets
@@ -1150,10 +1205,27 @@ async fn try_stream_to_key(
         rb = rb.header(h, v);
     }
 
-    let resp = rb
-        .send()
-        .await
-        .map_err(|e| AppError::upstream_msg(format!("连接 {url} 失败: {e}")))?;
+    // 故障转移预算**只约束这个探头阶段**（等上游返回响应头/状态码）。
+    //
+    // 为什么不能把预算套在整个流上：一旦 2xx 开始转发 SSE，掐断就等于把长回答截断——
+    // 那是本项目刻意避免的行为（同函数上方 `:1188` 注释：流式不设总超时）。而探头阶段
+    // 本身不产出内容、卡住只是白等，用预算约束它既能让故障转移及时进入下一个候选，
+    // 又不影响已建立的流。预算关闭（None）时行为与改动前完全一致。
+    let send_fut = rb.send();
+    let resp = match budget_left {
+        Some(b) => match tokio::time::timeout(b, send_fut).await {
+            Ok(r) => r.map_err(|e| AppError::upstream_msg(format!("连接 {url} 失败: {e}")))?,
+            Err(_) => {
+                return Err(AppError::upstream_msg(format!(
+                    "连接 {url} 超时（故障转移剩余预算 {}ms 内未拿到响应头）",
+                    b.as_millis()
+                )))
+            }
+        },
+        None => send_fut
+            .await
+            .map_err(|e| AppError::upstream_msg(format!("连接 {url} 失败: {e}")))?,
+    };
     let status = resp.status();
 
     if !status.is_success() {
@@ -1391,6 +1463,9 @@ async fn forward_to_key(
     // 一次转发里同一开关要被判多次，且调用方 `handle_request` 已在 `:449` 取过一次。
     // 传进来的唯一用途是决定「要不要构造那些只喂给日志的大字符串」——见下方 request_body。
     req_log: bool,
+    // 故障转移剩余预算；None = 用户关闭了整体预算。与 Key 自身超时取**小**值：
+    // 谁先到谁生效，既不让单个慢 Key 吃光整池预算，也不放宽用户为该 Key 设的上限。
+    budget_left: Option<std::time::Duration>,
 ) -> AppResult<ForwardOutcome> {
     let secret = store
         .secrets
@@ -1451,10 +1526,15 @@ async fn forward_to_key(
 
     // 先透传下游客户端头（User-Agent / anthropic-beta / x-app / x-stainless-* 等），
     // 让中转商识别为真实 Claude Code 客户端；再用本 Key 的鉴权头覆盖，确保鉴权用对密钥。
-    let mut rb = client
-        .post(&url)
-        .json(&payload)
-        .timeout(std::time::Duration::from_millis(key.params.timeout_ms.unwrap_or(30_000)));
+    // 本次请求的超时 = min(Key 自身超时, 故障转移剩余预算)。
+    // 取小值：既不让一个慢 Key 吃光整池预算（那会让后续候选无机会尝试），
+    // 也不放宽用户为该 Key 设的上限。预算关闭时退化为纯 Key 超时（旧行为）。
+    let key_to = std::time::Duration::from_millis(key.params.timeout_ms.unwrap_or(30_000));
+    let effective_to = match budget_left {
+        Some(b) => key_to.min(b),
+        None => key_to,
+    };
+    let mut rb = client.post(&url).json(&payload).timeout(effective_to);
     // `anthropic-beta` 单独算（1M 上下文需按落点模型追加特性），故先跳过原值再统一设置。
     let beta = effective_beta_header(fwd_headers, key, &real_model);
     for (h, v) in fwd_headers {
@@ -2334,6 +2414,169 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// 慢上游 mock：收到请求后先睡 `delay_ms` 再回，用于验证超时/预算行为。
+    async fn spawn_slow_mock(delay_ms: u64, status: u16, body: &'static str) -> String {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        let resp = Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .body(full_body(Bytes::from(body)))
+                            .unwrap();
+                        Ok::<_, std::convert::Infallible>(resp)
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// P1-1：故障转移总预算必须挡住「候选数 × per-Key 超时」的最坏累计等待。
+    ///
+    /// 没有预算时：3 个慢 Key 各让 per-Key 超时跑满，客户端要等 3 倍时间；而真实场景里
+    /// 客户端（Claude Code / Codex）早已自己超时重发，代理侧那条僵尸链仍在逐个打上游烧额度。
+    ///
+    /// 这里把预算设到「够第一个候选跑完、不够再开第二个」的量级，断言：
+    /// ① 总耗时明显小于「所有候选都跑满」；② 仍然如实返回失败（529）而非假装成功。
+    #[tokio::test]
+    async fn failover_budget_stops_walking_all_candidates() {
+        // 每个 Key 都慢到超过它自己的 timeout_ms（下面设 900ms），必然逐个失败
+        let slow = spawn_slow_mock(3_000, 200, r#"{"ok":true}"#).await;
+
+        let dir = temp_dir("failover_budget");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // 5 个候选都指向同一个慢上游；每个 Key 自身超时 900ms
+        for i in 0..5 {
+            let mut k = key(&format!("k{i}"), i as i32, &slow);
+            k.params.timeout_ms = Some(900);
+            store.upsert_key(k).unwrap();
+            store.secrets.write().set(&format!("k{i}"), "x").unwrap();
+        }
+        // 预算 1500ms：够第一个候选跑满 900ms，剩 600ms < MIN_ATTEMPT_SLICE(5s) → 后续全跳过
+        let mut s = store.get_settings();
+        s.failover_total_budget_ms = 1_500;
+        store.save_settings(s).unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+
+        let t0 = std::time::Instant::now();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+
+        assert_eq!(
+            resp.status().as_u16(),
+            529,
+            "全部候选失败应返回 529（过载/稍后重试），不能假装成功"
+        );
+        // 5 个候选各跑满 900ms ≈ 4.5s；有预算时应在 ~1s 量级结束。留足余量取 3s 上限，
+        // 既能证明「没有走完全部候选」，又不会因 CI 机器抖动而假红。
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "预算应阻止继续遍历剩余候选，实测耗时 {elapsed:?}（无预算时约 4.5s）"
+        );
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P1-1 边界：**第一个候选永不因预算被跳过**。
+    ///
+    /// 否则用户把预算配得很小（或上一次请求刚好耗尽窗口）时会变成「一个都不试直接 529」，
+    /// 那比慢更糟——至少要给一次机会。
+    #[tokio::test]
+    async fn failover_budget_never_skips_first_candidate() {
+        let good = spawn_mock(
+            200,
+            r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}"#,
+        )
+        .await;
+
+        let dir = temp_dir("failover_budget_first");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        store.upsert_key(key("k1", 0, &good)).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        // 预算设成 1ms：远小于 MIN_ATTEMPT_SLICE，但第一个候选仍必须被尝试
+        let mut s = store.get_settings();
+        s.failover_total_budget_ms = 1;
+        store.save_settings(s).unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "预算再小也必须尝试第一个候选，否则等于「一个都不试直接失败」"
+        );
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P1-1 回归：预算为 0（用户关闭）时行为与改动前完全一致——正常故障转移不受影响。
+    #[tokio::test]
+    async fn failover_budget_zero_disables_the_constraint() {
+        let bad = spawn_mock(401, r#"{"error":{"message":"unauthorized"}}"#).await;
+        let good = spawn_mock(
+            200,
+            r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}"#,
+        )
+        .await;
+
+        let dir = temp_dir("failover_budget_off");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        store.upsert_key(key("k1", 0, &bad)).unwrap();
+        store.upsert_key(key("k2", 1, &good)).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        store.secrets.write().set("k2", "y").unwrap();
+        let mut s = store.get_settings();
+        s.failover_total_budget_ms = 0; // 关闭
+        store.save_settings(s).unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "关闭预算后故障转移应照常工作");
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 端到端：高优先 Key 返 401 → 自动故障转移到低优先 Key 返 200，响应来自后者。

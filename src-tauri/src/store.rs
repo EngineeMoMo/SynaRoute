@@ -1074,6 +1074,15 @@ impl Store {
         self.config.read().settings.log_downstream_raw_enabled
     }
 
+    /// 一次请求内故障转移的总时间预算（毫秒）；`None` = 用户关闭了该约束（设为 0）。
+    ///
+    /// 窄读取器（与 `request_log_enabled` 等同一模式）：转发热路径每请求都要问一次，
+    /// 不能为取一个 u64 去 clone 整份 `AppSettings`（3 个 HashMap + 2 个 Vec）。
+    pub fn failover_budget(&self) -> Option<std::time::Duration> {
+        let ms = self.config.read().settings.failover_total_budget_ms;
+        (ms > 0).then(|| std::time::Duration::from_millis(ms))
+    }
+
     /// 某分类当前选定的「对外模型名」（空/未配时 None）。
     pub fn active_model_of(&self, category: &str) -> Option<String> {
         self.config

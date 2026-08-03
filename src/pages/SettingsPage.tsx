@@ -19,7 +19,7 @@ import type {
 } from "@/types";
 import {
   Sun, Moon, Monitor, ShieldCheck, KeyRound, Languages, ScrollText,
-  Activity, RefreshCw, FolderOpen, Info, Plug, BookOpen, Copy, Check, X, Brain, MousePointerClick, MessageSquareDot,
+  Activity, RefreshCw, FolderOpen, Info, Plug, BookOpen, Copy, Check, X, Brain, MousePointerClick, MessageSquareDot, Timer,
   Download, Upload, AlertTriangle, type LucideIcon,
 } from "lucide-react";
 
@@ -590,6 +590,32 @@ export function SettingsPage() {
                 {[0, 30, 60, 120, 300].map((s) => (
                   <option key={s} value={s}>
                     {t(`settings.health.${s}`)}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {/* 故障转移总预算（P1-1）：没有它时最坏耗时 = 候选数 × per-Key 超时
+                （6 Key × 30s = 180s），而客户端早已超时重发，代理侧仍在逐个打上游烧额度。 */}
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex gap-2.5">
+                <Timer size={16} className="mt-0.5 shrink-0 text-text-secondary" />
+                <div>
+                  <div className="text-sm font-medium text-text-primary">
+                    {t("settings.failoverBudgetTitle")}
+                  </div>
+                  <div className="text-xs text-text-muted">
+                    {t("settings.failoverBudgetDesc")}
+                  </div>
+                </div>
+              </div>
+              <select
+                className="shrink-0 rounded-control border border-border bg-surface px-2.5 py-1.5 text-xs text-text-primary"
+                value={settings?.failoverTotalBudgetMs ?? 90000}
+                onChange={(e) => update({ failoverTotalBudgetMs: Number(e.target.value) })}
+              >
+                {[0, 30000, 60000, 90000, 180000].map((ms) => (
+                  <option key={ms} value={ms}>
+                    {t(`settings.failoverBudget.${ms}`)}
                   </option>
                 ))}
               </select>
