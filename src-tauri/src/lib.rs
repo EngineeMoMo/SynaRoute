@@ -1456,15 +1456,25 @@ pub fn run() {
                         tokio::time::sleep(std::time::Duration::from_secs(DISABLED_POLL_SECS)).await;
                         continue;
                     }
-                    for cat in [
-                        CategoryType::ClaudeCli,
-                        CategoryType::ClaudeDesktop,
-                        CategoryType::Codex,
-                    ] {
-                        health::check_category(&store_bg, cat).await;
+                    let period =
+                        std::time::Duration::from_secs(interval.max(MIN_INTERVAL_SECS));
+                    // 一轮扫全部分类（P2-4）：三分类的 Key 拉平成一个任务流做有界并发，
+                    // 而非「分类串行 + 分类内逐 Key 串行」那样两层串行叠加。
+                    //
+                    // 整轮套 timeout(period)：保证**轮次不重叠**。旧实现下 6 条不可达的 Key
+                    // 一轮要 180s，长于默认 60s 间隔 → 轮次首尾相接、后台永不空闲。
+                    // 超时即放弃本轮剩余探测（下一轮会重来），不留悬挂任务。
+                    if tokio::time::timeout(period, health::check_all_categories(&store_bg))
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            "健康探测一轮未在 {:?} 内完成，已跳过剩余项（下一轮重试）",
+                            period
+                        );
                     }
                     // 每轮结束重读最新配置，改设置即时生效；设 10s 下限防误配把上游打爆。
-                    tokio::time::sleep(std::time::Duration::from_secs(interval.max(MIN_INTERVAL_SECS))).await;
+                    tokio::time::sleep(period).await;
                 }
             });
         });

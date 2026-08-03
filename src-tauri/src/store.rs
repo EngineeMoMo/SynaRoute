@@ -1295,6 +1295,23 @@ impl Store {
         (enabled.into_iter().cloned().collect(), used_fallback)
     }
 
+    /// 某分类下启用 Key 的 id 列表（按优先级升序）。
+    ///
+    /// 健康探测专用：它只需要 id 去调 `check_one`，而 `enabled_keys_sorted` 会克隆整个
+    /// `ProviderKey`（含 models / mappings 两个 Vec）。探测是「每轮 × 每分类」调用，
+    /// 6 条 Key 各挂 30 个 ModelInfo 时白克隆 180 个 ModelInfo。
+    pub fn enabled_key_ids(&self, category: CategoryType) -> Vec<String> {
+        let cfg = self.config.read();
+        let mut v: Vec<(&str, i32)> = cfg
+            .keys
+            .iter()
+            .filter(|k| k.category_id == category && k.enabled)
+            .map(|k| (k.id.as_str(), k.priority))
+            .collect();
+        v.sort_by_key(|(_, p)| *p);
+        v.into_iter().map(|(id, _)| id.to_string()).collect()
+    }
+
     /// 取某分类下按优先级升序排列的启用 Key（路由用）
     pub fn enabled_keys_sorted(&self, category: CategoryType) -> Vec<ProviderKey> {
         let mut v: Vec<ProviderKey> = self
@@ -1375,6 +1392,30 @@ impl Store {
     /// 「日志里附下游原始 body」开关（仅开了调用模型日志时才会被问到）。
     pub fn log_downstream_raw_enabled(&self) -> bool {
         self.config.read().settings.log_downstream_raw_enabled
+    }
+
+    /// 健康探测方式：`Some(测试消息)` = 用真实补全探测（消息已从列表随机取好，空列表回退
+    /// 内置 `"hi"`）；`None` = 用轻量连通探测（默认）。
+    ///
+    /// 窄读取器（与 `request_log_enabled` 同一模式）：探测是「每轮 × 每 Key」调用，
+    /// 不该为一个 bool + 一条短字符串去克隆整份 `AppSettings`（3 个 HashMap + 2 个 Vec）。
+    /// 随机选取放在锁内完成，避免把整个消息列表克隆出来。
+    pub fn probe_message_if_real(&self) -> Option<String> {
+        let cfg = self.config.read();
+        if !cfg.settings.health_probe_real_completion {
+            return None;
+        }
+        use rand::seq::SliceRandom;
+        let candidates: Vec<&String> = cfg
+            .settings
+            .health_probe_test_messages
+            .iter()
+            .filter(|m| !m.trim().is_empty())
+            .collect();
+        Some(match candidates.choose(&mut rand::thread_rng()) {
+            Some(m) => (*m).clone(),
+            None => "hi".to_string(),
+        })
     }
 
     /// 一次请求内故障转移的总时间预算（毫秒）；`None` = 用户关闭了该约束（设为 0）。

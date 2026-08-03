@@ -4257,16 +4257,20 @@ pub fn key_timeout(key: &ProviderKey) -> Duration {
     Duration::from_millis(key.params.timeout_ms.unwrap_or(30_000))
 }
 
-/// 元数据级快请求（健康探测 / 拉模型列表）的超时：取 key_timeout 但**封顶 30s**。
+/// 元数据级快请求（健康探测 / 拉模型列表）的超时：取 key_timeout 但**封顶 8s**。
 ///
 /// 为什么封顶：Key 超时开放用户设置后，慢厂商可能设 300s+；但
-/// - 健康检查是**串行**循环（health::check_category 逐 Key await），一个挂掉的慢 Key
-///   若跟随大超时，会把整个分类的探测阻塞几分钟；
+/// - 健康检查即便已改为有界并发（`PROBE_CONCURRENCY`），跟随大超时仍会让一轮拖到分钟级，
+///   使 UI 徽标与真实状态长时间背离——而它正是用户判断「该换哪条 Key」的依据；
 /// - 拉模型按候选端点顺序试（最多 4 个），跟随大超时时「拉取模型」按钮最坏挂 4×超时。
 ///
-/// 这些都是秒级应答的元数据 GET / 1-token 探测，30s 是宽裕上限，不该继承长生成超时。
+/// 这些都是**秒级应答**的元数据 GET / 1-token 探测。docs/02 §6.3 的原始设计口径是 3–5s；
+/// 这里取 8s 略宽于它，给跨境高 RTT 链路留余量（连接握手本身就可能 300~900ms），
+/// 同时把 6 Key 全不可达的一轮从 180s（串行 30s）压到约 16s（并发 4 × 8s）。
+///
+/// 注意这只影响**元数据探测**，不影响真实转发——后者走 `key_timeout`，慢厂商仍可设大值。
 pub fn fast_timeout(key: &ProviderKey) -> Duration {
-    key_timeout(key).min(Duration::from_secs(30))
+    key_timeout(key).min(Duration::from_secs(8))
 }
 
 /// 返回共享客户端（保留旧签名以最小化改动；总超时改由调用点逐请求 `.timeout()` 指定）。

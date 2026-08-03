@@ -16,14 +16,9 @@ const LIVE_SUCCESS_GRACE_MS: i64 = 120_000;
 
 /// 从「测试消息列表」随机取一条作为真实补全探测的 prompt。
 /// 列表为空（用户未配置）时回退内置 "hi"，保持旧行为。空白项过滤掉后仍为空也回退。
-fn pick_probe_message(messages: &[String]) -> String {
-    use rand::seq::SliceRandom;
-    let candidates: Vec<&String> = messages.iter().filter(|m| !m.trim().is_empty()).collect();
-    match candidates.choose(&mut rand::thread_rng()) {
-        Some(m) => (*m).clone(),
-        None => "hi".to_string(),
-    }
-}
+// 「从测试消息列表随机取一条」的逻辑已移入 `Store::probe_message_if_real`：
+// 那里能在**一次读锁内**完成「读开关 + 随机选取」，避免把整个消息列表克隆出来
+// （探测是每轮 × 每 Key 调用）。此处不再保留重复实现。
 
 /// 对单个 Key 执行一次健康检查并更新其状态。
 pub async fn check_one(store: &Arc<Store>, key_id: &str) {
@@ -44,14 +39,14 @@ pub async fn check_one(store: &Arc<Store>, key_id: &str) {
     };
 
     // 探测方式按设置切换：默认轻量连通探测；开启后用真实补全探测（与业务一致，消耗少量额度）。
-    let settings = store.get_settings();
-    let real_probe = settings.health_probe_real_completion;
-    let (ok, latency, err) = if real_probe {
-        // 真实补全探测用「测试消息列表」随机取一条（空则回退内置 "hi"）——见 pick_probe_message。
-        let msg = pick_probe_message(&settings.health_probe_test_messages);
-        upstream::health_probe_real(&key, &secret, &msg).await
-    } else {
-        upstream::health_probe(&key, &secret).await
+    //
+    // 用窄读取器而非 `get_settings()`：后者克隆整份 `AppSettings`（3 个 HashMap + 2 个 Vec），
+    // 而这里只要一个 bool 加（可能的）一条测试消息。探测是「每轮 × 每 Key」调用，
+    // 与 `request_log_enabled` 等热路径读取同一处理原则。
+    let (ok, latency, err) = match store.probe_message_if_real() {
+        // Some(msg) = 开启了真实补全探测，msg 已从列表里随机取好（空列表回退内置 "hi"）
+        Some(msg) => upstream::health_probe_real(&key, &secret, &msg).await,
+        None => upstream::health_probe(&key, &secret).await,
     };
     let now = Utc::now().timestamp_millis();
 
@@ -187,6 +182,9 @@ pub fn select_candidates(keys: Vec<crate::model::ProviderKey>) -> (Vec<crate::mo
 /// 后台定时健康检查（对某分类**已启用**的 Key）。
 /// 只探测启用的 Key：禁用的 Key 不参与路由，对它探测既白耗额度，又会因失败被判 Down/熔断，
 /// 在界面上留下无意义的「熔断中/不可用」状态污染。
+/// 生产路径已改走 [`check_all_categories`]（三分类拉平后有界并发，见 P2-4）。
+/// 本函数保留为**按分类探测**的入口，供测试与将来可能的「只重测某分类」功能使用。
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn check_category(store: &Arc<Store>, category: crate::model::CategoryType) {
     // 密钥库锁着（主口令模式未解锁）时取不到任何密钥：整轮探测会把每个 Key 都探成
     // Unknown/Down，UI 一片红，而真实原因只是没解锁。直接跳过，保留各 Key 现有健康态
@@ -194,10 +192,47 @@ pub async fn check_category(store: &Arc<Store>, category: crate::model::Category
     if store.secrets.read().is_locked() {
         return;
     }
-    let keys = store.enabled_keys_sorted(category);
-    for k in keys {
-        check_one(store, &k.id).await;
+    let ids: Vec<String> = store.enabled_key_ids(category);
+    probe_ids_concurrently(store, ids).await;
+}
+
+/// 一轮探测的并发上限（P2-4）。
+///
+/// 为什么必须**有界**而不是 `join_all` 无限并发：那会把「启动瞬间打爆上游」的风险从无变有
+/// ——多分类多 Key 时会同时发出几十个请求，中转商侧极可能触发限流，反而把好 Key 探成 Down。
+/// 4 是「显著缩短一轮墙钟」与「不给上游造成突发压力」之间的折中。
+const PROBE_CONCURRENCY: usize = 4;
+
+/// 并发（有界）探测一批 Key。
+///
+/// 为什么不再串行（旧实现 `for k in keys { check_one().await }`）：单次探测超时上限是
+/// `fast_timeout`（原 30s），串行下 6 条不可达的 Key 一轮就是 180 秒，**长于默认 60s 的探测
+/// 间隔**——轮次首尾相接、永不空闲，常驻一个后台任务持续打上游。更实际的后果是
+/// **健康状态严重滞后**：排在最后的 Key 要等前面全部超时完才被探到，UI 徽标与真实状态
+/// 可能差几分钟，而这正是用户判断「该换哪条 Key」的依据。
+async fn probe_ids_concurrently(store: &Arc<Store>, ids: Vec<String>) {
+    use futures_util::stream::StreamExt;
+    futures_util::stream::iter(ids)
+        .for_each_concurrent(PROBE_CONCURRENCY, |id| async move {
+            check_one(store, &id).await;
+        })
+        .await;
+}
+
+/// 一轮扫描全部分类（P2-4）：把三个分类的 Key **拉平成一个任务流**再有界并发。
+///
+/// 旧实现是「三分类串行 await，每分类内再串行逐 Key」（`lib.rs` 的后台循环里），
+/// 两层串行叠加使最坏一轮 = 全部 Key 数 × 单次超时。拉平后最坏一轮 ≈
+/// ⌈总 Key 数 / PROBE_CONCURRENCY⌉ × 单次超时。
+pub async fn check_all_categories(store: &Arc<Store>) {
+    if store.secrets.read().is_locked() {
+        return;
     }
+    let mut ids: Vec<String> = Vec::new();
+    for cat in crate::model::CategoryType::ALL {
+        ids.extend(store.enabled_key_ids(cat));
+    }
+    probe_ids_concurrently(store, ids).await;
 }
 
 #[cfg(test)]
@@ -268,6 +303,115 @@ mod tests {
             store.get_key("k1").unwrap().health.status,
             HealthStatus::Up,
             "整轮探测同样必须跳过"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P2-4：一轮探测的并发度必须**有上界**，且确实是并发（不是串行）。
+    ///
+    /// 上界是硬要求：用 `join_all` 无限并发会把「启动瞬间打爆上游」的风险从无变有——
+    /// 多分类多 Key 时同时发几十个请求，中转商极可能触发限流，反而把好 Key 探成 Down。
+    ///
+    /// 用一个慢 mock 上游 + 计数器测峰值：每个请求进入时 +1、离开时 -1，记录峰值。
+    /// 12 个 Key 全指向它，峰值必须恰好等于 PROBE_CONCURRENCY，且总耗时明显短于串行。
+    #[tokio::test]
+    async fn probe_concurrency_is_bounded_and_actually_concurrent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let inflight = StdArc::new(AtomicUsize::new(0));
+        let peak = StdArc::new(AtomicUsize::new(0));
+
+        // 慢 mock：每个请求睡 300ms，期间统计并发数
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        {
+            let inflight = inflight.clone();
+            let peak = peak.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else { break };
+                    let inflight = inflight.clone();
+                    let peak = peak.clone();
+                    tokio::spawn(async move {
+                        let io = hyper_util::rt::TokioIo::new(stream);
+                        let svc = hyper::service::service_fn(move |_req| {
+                            let inflight = inflight.clone();
+                            let peak = peak.clone();
+                            async move {
+                                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                                peak.fetch_max(now, Ordering::SeqCst);
+                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                inflight.fetch_sub(1, Ordering::SeqCst);
+                                Ok::<_, std::convert::Infallible>(
+                                    hyper::Response::builder()
+                                        .status(200)
+                                        .body(http_body_util::Full::new(bytes::Bytes::from(
+                                            r#"{"content":[{"type":"text","text":"ok"}]}"#,
+                                        )))
+                                        .unwrap(),
+                                )
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(io, svc)
+                            .await;
+                    });
+                }
+            });
+        }
+
+        let dir = std::env::temp_dir().join(format!("synaroute_probe_conc_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = StdArc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        const N: usize = 12;
+        for i in 0..N {
+            let id = format!("k{i}");
+            store
+                .upsert_key(crate::model::ProviderKey {
+                    id: id.clone(),
+                    category_id: CategoryType::ClaudeCli,
+                    name: id.clone(),
+                    vendor: "t".into(),
+                    base_url: format!("http://{addr}"),
+                    protocol: crate::model::Protocol::Anthropic,
+                    has_secret: true,
+                    enabled: true,
+                    priority: i as i32,
+                    headers_json: None,
+                    params: crate::model::KeyParams::default(),
+                    models: vec![],
+                    mappings: vec![],
+                    default_model: None,
+                    tier_haiku: None,
+                    tier_sonnet: None,
+                    tier_opus: None,
+                    health: HealthState::default(),
+                })
+                .unwrap();
+            store.secrets.write().set(&id, "sk").unwrap();
+        }
+
+        let t0 = std::time::Instant::now();
+        check_all_categories(&store).await;
+        let elapsed = t0.elapsed();
+
+        let observed_peak = peak.load(Ordering::SeqCst);
+        assert!(
+            observed_peak <= PROBE_CONCURRENCY,
+            "并发峰值 {observed_peak} 超过上限 {PROBE_CONCURRENCY}——无界并发会打爆上游"
+        );
+        assert!(
+            observed_peak > 1,
+            "峰值只有 {observed_peak}，说明退化成串行了（本条优化的目的就是不再串行）"
+        );
+        // 串行 12×300ms = 3.6s；并发 4 时约 ⌈12/4⌉×300ms = 900ms。取 2.5s 上限留足抖动余量。
+        assert!(
+            elapsed < std::time::Duration::from_millis(2500),
+            "一轮耗时 {elapsed:?}，看起来仍是串行（串行约 3.6s）"
         );
 
         std::fs::remove_dir_all(&dir).ok();
