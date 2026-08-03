@@ -126,6 +126,10 @@ export interface BrainConfig {
   toolsEnabled?: boolean;
   /** 工具调用轮数上限，后端 clamp 到 2~12（默认 6） */
   maxToolRounds?: number;
+  /** 工具历史字符预算：累计超过就把较早轮次结果压成占位；后端 clamp 到 8000~400000（默认 60000）；0=关闭裁剪 */
+  toolCtxBudgetChars?: number;
+  /** 单次工具结果字符上限：后端 clamp 到 1000~40000（默认 8000）；0=用默认 */
+  toolResultCapChars?: number;
 }
 
 /** 聚合运行结果 */
@@ -228,6 +232,16 @@ export interface RequestTrace {
 }
 
 /** 事件日志条目（FR-020，敏感信息已脱敏） */
+/** 一次上游调用的 token 用量（两家协议字段名已在后端归一）。 */
+export interface TokenUsage {
+  /** 输入（prompt）token */
+  input: number;
+  /** 输出（completion）token */
+  output: number;
+  /** 命中缓存的输入 token（为 0 时后端不下发该字段） */
+  cacheRead?: number;
+}
+
 export interface EventLogEntry {
   id: string;
   ts: number;
@@ -243,6 +257,13 @@ export interface EventLogEntry {
    * 时间线不会被压扁到看不出穿插关系。日志文件仍逐条完整写。
    */
   repeat?: number;
+  /**
+   * 本次调用的 token 用量（上游返回了才有）。
+   *
+   * 折叠条目上是**累计值**（N 次调用之和）——每次都真实烧了额度，
+   * 只留最后一次会让总量看着远小于实际消耗。
+   */
+  usage?: TokenUsage;
   /**
    * 该条是否带链路快照（可展开看详情）。
    *

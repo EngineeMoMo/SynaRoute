@@ -109,6 +109,11 @@ struct MemberCallMeta {
     base_url: String,
     model: String,
     latency_ms: u64,
+    /// 本成员整轮（含工具循环全部轮次）的 token 用量。
+    ///
+    /// 挂在 meta 上而不是 MemberAnswer：失败的成员**同样烧了额度**（尤其工具循环跑了
+    /// 几轮才超时的），不记就会让「这次聚合花了多少」的账对不上。
+    usage: upstream::TokenUsage,
 }
 
 /// gather_members 的结果：成功答案 + 统计（供结果面板展示「N 参与 / M 失败」）。
@@ -120,6 +125,8 @@ struct GatherOutcome {
     failed: usize,
     /// 因 Key 被禁用而跳过的成员数。
     skipped_disabled: usize,
+    /// 成员阶段合计 token 用量（成功 + 失败都计入）。
+    usage: upstream::TokenUsage,
 }
 
 /// Phase1: 参与者思考 + 决策者输出修改计划。
@@ -494,11 +501,16 @@ pub async fn run_mcp(
         "aggregate",
         None,
         &format!(
-            "参与者汇总 · 发起 {} · 成功 {} · 失败 {} · 禁用跳过 {}",
+            "参与者汇总 · 发起 {} · 成功 {} · 失败 {} · 禁用跳过 {}{}",
             members_attempted,
             answers.len(),
             members_failed,
-            members_skipped_disabled
+            members_skipped_disabled,
+            if gathered.usage.is_empty() {
+                String::new()
+            } else {
+                format!(" · 合计 {}", gathered.usage.fmt_compact())
+            }
         ),
     );
 
@@ -621,18 +633,35 @@ pub async fn run_mcp(
     let decider_started = std::time::Instant::now();
     // 决策者阶段：整轮剩余时间全给它（保底 decider_floor 已在前面阶段被保护）。
     let decider_budget = decider_phase_budget_ms(remaining_ms(deadline), PHASE_MIN_BUDGET_MS);
-    let analysis = match call_ref(store, &decider_ref, &decider_prompt, decider_budget).await {
+    let (decider_res, decider_used) = upstream::with_usage(call_ref(
+        store,
+        &decider_ref,
+        &decider_prompt,
+        decider_budget,
+    ))
+    .await;
+    let analysis = match decider_res {
         Ok(a) => {
             let latency = decider_started.elapsed().as_millis() as u64;
             // 带 trace：展开可见「喂给决策者的完整入参（原问题+聚合意见+文件）+ 决策者最终答案」。
-            store.append_event_trace(
+            store.append_event_full(
                 category,
                 "aggregate",
                 None,
-                &format!("决策者返回 · {} · {latency}ms", label_ref(store, &decider_ref)),
+                &format!(
+                    "决策者返回 · {} · {latency}ms{}",
+                    label_ref(store, &decider_ref),
+                    if decider_used.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", decider_used.fmt_compact())
+                    }
+                ),
                 store.get_settings().aggregate_trace_enabled
                     .then(|| trace_for_ref(store, &decider_ref, &decider_prompt, &a, latency, true))
                     .flatten(),
+                None,
+                (!decider_used.is_empty()).then_some(decider_used),
             );
             a
         }
@@ -662,6 +691,30 @@ pub async fn run_mcp(
             )
         }
     };
+
+    // 整次聚合的总账：这是用户判断「一次会诊花了多少额度」的唯一入口。
+    //
+    // 各环节的分项已各自落过日志，这里给合计 —— 没有它就只能靠人肉把
+    // N 条成员日志加起来，而失败成员的消耗最容易被漏掉。
+    let mut grand = gathered.usage;
+    grand.add(&decider_used);
+    if !grand.is_empty() {
+        store.append_event_full(
+            category,
+            "aggregate",
+            None,
+            &format!(
+                "本次聚合合计 · {} · 共 {} tokens（成员 {} + 决策者 {}）",
+                grand.fmt_compact(),
+                grand.total(),
+                gathered.usage.total(),
+                decider_used.total()
+            ),
+            None,
+            None,
+            Some(grand),
+        );
+    }
 
     Ok(McpAggregateResult {
         analysis,
@@ -760,6 +813,11 @@ const TOOL_LOOP_EXPLORE_PCT: u64 = 70;
 /// （只给 1 轮时收尾逻辑会立刻生效，等于开了开关却没有工具）。
 const TOOL_ROUNDS_RANGE: (u32, u32) = (2, 12);
 
+/// 工具历史字符预算的 clamp 区间。
+/// 下限 8000 = 一次工具结果的上限（RESULT_CHAR_CAP），再小就等于连一条完整结果都留不住；
+/// 上限 400000（约 20 万 token）够极端场景，再大就失去「控膨胀」的意义。
+const TOOL_CTX_BUDGET_RANGE: (usize, usize) = (8_000, 400_000);
+
 /// **单轮**内实际执行的工具调用数上限。超出的回一条 is_error 结果但不执行（不起子进程、不读盘）。
 ///
 /// 为什么需要：模型一轮可以返回任意多个 tool_use（协议无上界）。一份被提示注入的文件能诱导它
@@ -790,6 +848,10 @@ fn effective_rounds(has_tools: bool, configured: u32) -> u32 {
 /// 4. **收尾轮仍声明 tools**：Anthropic 规定「消息里出现过 tool_use/tool_result 就必须带 tools」，
 ///    收尾时抽掉 tools 会直接 400。故改用一条 user 指示让它别再调；它若仍要调，就采用
 ///    已积累的正文交差，而不是白跑一轮。
+// 参数确实多，但每个都是这条链路必需的运行时上下文（store/分类用于写日志、session 是可变状态、
+// 其余三个是配额与预算）。抽成 struct 只是把同样的东西换个地方传，还要动 7 个调用点 ——
+// 与 `Store::append_event_full` 同样的取舍。
+#[allow(clippy::too_many_arguments)]
 async fn run_member_turns(
     store: &Arc<Store>,
     category: CategoryType,
@@ -798,6 +860,9 @@ async fn run_member_turns(
     tool_env: Option<&crate::agent_tools::ToolEnv>,
     max_rounds: u32,
     budget_ms: u64,
+    // 工具结果历史的字符预算：累计超过就把较早轮次的结果压成占位（见 trim_tool_history）。
+    // 传 0 = 不裁剪（关闭该保护）。
+    tool_ctx_budget: usize,
 ) -> Result<String, String> {
     let tools = match tool_env {
         Some(env) => crate::agent_tools::tool_defs(env),
@@ -959,6 +1024,26 @@ async fn run_member_turns(
                 }
                 // 每个 call 都必须有结果：两家协议都要求一一对应，缺一条上游直接 400。
                 session.push_tool_results(&results);
+                // 控制历史膨胀：工具循环**每轮都重发完整历史**，真机实测一次成员调用的
+                // 请求体峰值达 20 万字符（约 10 万 token）。超预算时把较早轮次的工具结果
+                // 正文压成占位（消息条数与 id 配对不动，见 trim_tool_history）。
+                // 预算 0 = 该保护关闭，完全不裁剪。
+                let squashed = if tool_ctx_budget > 0 {
+                    session.trim_tool_history(tool_ctx_budget)
+                } else {
+                    0
+                };
+                if squashed > 0 {
+                    store.append_event(
+                        category,
+                        "aggregate",
+                        None,
+                        &format!(
+                            "上下文裁剪 · {} · 已省略较早的 {squashed} 条工具结果（预算 {tool_ctx_budget} 字符）",
+                            ctx.label
+                        ),
+                    );
+                }
             }
         }
     }
@@ -1044,6 +1129,12 @@ async fn prepare_tool_env(
         return None;
     }
     let env = crate::agent_tools::ToolEnv::detect(path).await;
+    // 单次结果上限：0 = 用内置默认（8000）；非 0 时 with_result_cap 自己会 clamp 到 1000~40000。
+    let env = if brain.tool_result_cap_chars == 0 {
+        env
+    } else {
+        env.with_result_cap(brain.tool_result_cap_chars)
+    };
     if let Some(note) = &env.codegraph_note {
         store.append_event(category, "aggregate", None, &format!("工具环境 · {note}"));
     }
@@ -1093,6 +1184,13 @@ async fn gather_members(
     });
     let had_images = mm.has_images();
     let max_tool_rounds = brain.max_tool_rounds;
+    // 工具历史字符预算：0 = 关闭裁剪（原样保留）；非 0 时 clamp 到合理区间，
+    // 防止用户误配一个过小的值把每轮结果都压成占位（等于工具白调）。
+    let tool_ctx_budget = if brain.tool_ctx_budget_chars == 0 {
+        0
+    } else {
+        (brain.tool_ctx_budget_chars as usize).clamp(TOOL_CTX_BUDGET_RANGE.0, TOOL_CTX_BUDGET_RANGE.1)
+    };
     // trace 里的入参：prompt 正文 + 图片计数。base64 正文刻意不记日志 —— 一张几 MB、且没有
     // 阅读价值，写进去只会让日志文件与 IPC 载荷暴涨（上一轮刚为此把日志载荷降了 99.5%）。
     let trace_prompt: Arc<str> = Arc::from(if had_images {
@@ -1173,13 +1271,14 @@ async fn gather_members(
             // 报出干净的「超时（>Xms）」而非 reqwest 的晦涩错误。
             let req_timeout = Duration::from_millis(budget_ms.saturating_add(5_000));
             let started = std::time::Instant::now();
-            let mk_meta = |latency_ms: u64| MemberCallMeta {
+            let mk_meta = |latency_ms: u64, usage: upstream::TokenUsage| MemberCallMeta {
                 key_name: key.name.clone(),
                 vendor: key.vendor.clone(),
                 protocol: key.protocol,
                 base_url: key.base_url.clone(),
                 model: model.clone(),
                 latency_ms,
+                usage,
             };
             let mut session = ToolSession::new(key.protocol, &mm);
             let ctx = MemberCallCtx {
@@ -1201,27 +1300,32 @@ async fn gather_members(
                 tool_env.as_deref(),
                 max_tool_rounds,
                 budget_ms,
+                tool_ctx_budget,
             );
-            match timeout(total_timeout, call).await {
+            // 用量 scope 包住整个成员调用（含工具循环的每一轮）：
+            // 失败/超时的成员同样烧了额度，四个分支都要把 used 记进 meta，
+            // 否则「这次聚合花了多少」的账会少算 —— 而工具循环跑几轮才超时恰恰是最贵的情形。
+            let (res, used) = upstream::with_usage(timeout(total_timeout, call)).await;
+            match res {
                 Ok(Ok(ans)) if !ans.trim().is_empty() => {
-                    let meta = mk_meta(started.elapsed().as_millis() as u64);
+                    let meta = mk_meta(started.elapsed().as_millis() as u64, used);
                     MemberOutcome::Ok(MemberAnswer { label, answer: ans }, meta)
                 }
                 Ok(Ok(_)) => MemberOutcome::Failed {
                     label,
                     reason: "返回空答案".into(),
-                    meta: Some(mk_meta(started.elapsed().as_millis() as u64)),
+                    meta: Some(mk_meta(started.elapsed().as_millis() as u64, used)),
                 },
                 Ok(Err(e)) => MemberOutcome::Failed {
                     label,
                     // e 已含 HTTP 状态码 / 连接失败详情；带图时再点出多模态支持这条可能根因。
                     reason: image_unsupported_hint(&e, had_images),
-                    meta: Some(mk_meta(started.elapsed().as_millis() as u64)),
+                    meta: Some(mk_meta(started.elapsed().as_millis() as u64, used)),
                 },
                 Err(_) => MemberOutcome::Failed {
                     label,
                     reason: format!("超时（>{}ms）", budget_ms),
-                    meta: Some(mk_meta(started.elapsed().as_millis() as u64)),
+                    meta: Some(mk_meta(started.elapsed().as_millis() as u64, used)),
                 },
             }
         }
@@ -1233,6 +1337,8 @@ async fn gather_members(
     let mut attempted = 0usize;
     let mut failed = 0usize;
     let mut skipped_disabled = 0usize;
+    // 整轮成员阶段的合计用量（成功 + 失败都算：失败的成员一样烧了额度）。
+    let mut total_usage = upstream::TokenUsage::default();
     for o in outcomes {
         match o {
             MemberOutcome::Ok(ans, meta) => {
@@ -1251,18 +1357,33 @@ async fn gather_members(
                     latency_ms: meta.latency_ms,
                     ok: true,
                 });
-                store.append_event_trace(
+                let usage_part = if meta.usage.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", meta.usage.fmt_compact())
+                };
+                total_usage.add(&meta.usage);
+                store.append_event_full(
                     category,
                     "aggregate",
                     None,
-                    &format!("参与者成功 · {} · {}ms", ans.label, meta.latency_ms),
+                    &format!(
+                        "参与者成功 · {} · {}ms{}",
+                        ans.label, meta.latency_ms, usage_part
+                    ),
                     trace,
+                    None,
+                    (!meta.usage.is_empty()).then_some(meta.usage),
                 );
                 answers.push(ans);
             }
             MemberOutcome::Failed { label, reason, meta } => {
                 attempted += 1;
                 failed += 1;
+                // 失败成员的用量**必须先取出来再消费 meta**：它同样烧了额度，
+                // 工具循环跑几轮才超时更是最贵的情形，漏记会让总账偏低。
+                let failed_usage = meta.as_ref().map(|m| m.usage).unwrap_or_default();
+                total_usage.add(&failed_usage);
                 // 失败原因落日志（归「大脑聚合」分组），不再静默吞；带 trace 供展开看入参。受开关控制。
                 let trace = meta.filter(|_| trace_enabled).map(|m| RequestTrace {
                     key_name: m.key_name,
@@ -1277,12 +1398,21 @@ async fn gather_members(
                     latency_ms: m.latency_ms,
                     ok: false,
                 });
-                store.append_event_trace(
+                store.append_event_full(
                     category,
                     "aggregate",
                     None,
-                    &format!("参与者失败 · {label} · {reason}"),
+                    &format!(
+                        "参与者失败 · {label} · {reason}{}",
+                        if failed_usage.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · 已消耗 {}", failed_usage.fmt_compact())
+                        }
+                    ),
                     trace,
+                    None,
+                    (!failed_usage.is_empty()).then_some(failed_usage),
                 );
             }
             MemberOutcome::Unavailable { label, reason } => {
@@ -1305,6 +1435,7 @@ async fn gather_members(
         attempted,
         failed,
         skipped_disabled,
+        usage: total_usage,
     }
 }
 
@@ -1329,7 +1460,9 @@ async fn compress(
          请提炼各位的关键要点、共识与分歧，压缩成简洁的要点清单，供最终决策参考。\n\n{joined}"
     );
     let started = std::time::Instant::now();
-    let result = call_ref(store, summarizer_ref, &sum_prompt, budget_ms).await?;
+    let (result, used) =
+        upstream::with_usage(call_ref(store, summarizer_ref, &sum_prompt, budget_ms)).await;
+    let result = result?;
     let latency = started.elapsed().as_millis() as u64;
     // 带 trace：展开可见「喂给汇总者的全部成员答案 + 压缩后的要点清单」。受开关控制。
     let trace = if store.get_settings().aggregate_trace_enabled {
@@ -1337,12 +1470,22 @@ async fn compress(
     } else {
         None
     };
-    store.append_event_trace(
+    store.append_event_full(
         category,
         "aggregate",
         None,
-        &format!("汇总成功 · {} · {latency}ms", label_ref(store, summarizer_ref)),
+        &format!(
+            "汇总成功 · {} · {latency}ms{}",
+            label_ref(store, summarizer_ref),
+            if used.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", used.fmt_compact())
+            }
+        ),
         trace,
+        None,
+        (!used.is_empty()).then_some(used),
     );
     Ok(result)
 }
@@ -2298,6 +2441,7 @@ mod tests {
             Some(&env),
             6,
             60_000,
+            0, // tool_ctx_budget: 测试不验证裁剪
         )
         .await
         .expect("循环应正常结束");
@@ -2327,6 +2471,24 @@ mod tests {
         // 第 2 轮仍须带 tools：Anthropic 规定历史里出现 tool_use/tool_result 就必须声明 tools
         assert!(reqs[1]["tools"].is_array(), "第二轮丢了 tools 会被上游 400");
 
+        // Prompt caching 端到端锁死:请求体必须真带上 cache_control 断点(否则缓存永不命中,
+        // 白改一场)。两处:tools 数组末尾 + 最后一条消息的最后一个 content 块。
+        let tools1 = reqs[1]["tools"].as_array().unwrap();
+        assert_eq!(
+            tools1.last().unwrap()["cache_control"]["type"],
+            "ephemeral",
+            "tools 末尾应带缓存断点"
+        );
+        let last_block = reqs[1]["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(
+            last_block["cache_control"]["type"], "ephemeral",
+            "最后一条消息的末块应带缓存断点(缓存到本轮为止的历史)"
+        );
+
         std::fs::remove_dir_all(&work).ok();
         std::fs::remove_dir_all(&sdir).ok();
     }
@@ -2353,6 +2515,7 @@ mod tests {
             Some(&env),
             2,
             60_000,
+            0, // tool_ctx_budget: 测试不验证裁剪
         )
         .await
         .expect("到上限应交出已有正文，而不是报错");
@@ -2405,6 +2568,7 @@ mod tests {
             Some(&env),
             6,
             60_000,
+            0, // tool_ctx_budget: 测试不验证裁剪
         )
         .await
         .expect("工具被拒不该让整个成员失败");
@@ -2444,6 +2608,7 @@ mod tests {
             Some(&env),
             6,
             60_000,
+            0, // tool_ctx_budget: 测试不验证裁剪
         )
         .await
         .unwrap();
@@ -2499,6 +2664,7 @@ mod tests {
             Some(&env),
             6,
             60_000,
+            0, // tool_ctx_budget: 测试不验证裁剪
         )
         .await
         .unwrap();
@@ -2546,6 +2712,7 @@ mod tests {
             None, // 工具关闭
             6,
             60_000,
+            0, // tool_ctx_budget: 测试不验证裁剪
         )
         .await
         .unwrap();

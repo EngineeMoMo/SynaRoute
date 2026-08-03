@@ -39,6 +39,42 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
   const [tierOpus, setTierOpus] = useState(initial?.tierOpus ?? "");
   const [fetching, setFetching] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 批量应用 Max Tokens 的状态与结果提示。成功走独立提示，不复用 error（那是红色告警样式）。
+  const [applyingAll, setApplyingAll] = useState(false);
+  const [applyAllMsg, setApplyAllMsg] = useState<string | null>(null);
+
+  /**
+   * 把当前输入框里的 Max Tokens 一次应用到本分类**全部** Key。
+   *
+   * 为什么要有：逐 Key 存是对的（各厂商上限不同），但漏改一个就会在故障转移落到它时按旧值
+   * 截断回答 —— 表现为「同一个问题有时完整、有时被切断」，极难联想到是某个备用 Key 的参数。
+   *
+   * 用的是**当前输入框的值**（可能尚未保存到本 Key）：用户改完数字直接点批量是最自然的流程，
+   * 要求先保存再批量反而绕。本 Key 自身的值仍由「保存」按钮落盘。
+   */
+  const applyMaxTokensToAll = async () => {
+    if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
+      setError(t("editor.errMaxTokensZero"));
+      return;
+    }
+    setApplyingAll(true);
+    setApplyAllMsg(null);
+    setError(null);
+    try {
+      const changed = await api.applyMaxTokensToCategory(activeCategory, maxTokens);
+      // 如实区分「改了 N 条」与「本就都是这个值」——后者报成功会让人以为刚生效。
+      setApplyAllMsg(
+        changed > 0
+          ? t("editor.maxTokensApplied", { n: String(changed) })
+          : t("editor.maxTokensNoChange"),
+      );
+      await loadCategory(activeCategory);
+    } catch (e) {
+      setError(t("editor.errApplyAll", { err: String(e) }));
+    } finally {
+      setApplyingAll(false);
+    }
+  };
   const [saving, setSaving] = useState(false);
   // 手动加模型输入框（不用原生 prompt()：WebView2 里行为不可靠）
   const [manualModel, setManualModel] = useState("");
@@ -306,6 +342,26 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
                 onChange={(e) => setTimeoutMs(e.target.value === "" ? "" : Number(e.target.value))}
               />
             </Field>
+          </div>
+
+          {/* Max Tokens 批量应用：漏改一个 Key 会在故障转移落到它时按旧值截断回答，
+              那种偶发性问题极难排查，故给一个「一次统一」的入口（含已停用的 Key）。 */}
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={applyMaxTokensToAll}
+              disabled={applyingAll || !Number.isFinite(maxTokens) || maxTokens <= 0}
+              title={t("editor.applyMaxTokensAllHint")}
+            >
+              {applyingAll ? (
+                <RefreshCw size={13} className="animate-spin" />
+              ) : (
+                <Gauge size={13} />
+              )}
+              {t("editor.applyMaxTokensAll", { n: String(maxTokens) })}
+            </Button>
+            {applyAllMsg && <span className="text-xs text-success">{applyAllMsg}</span>}
           </div>
 
           {/* 模型拉取 */}

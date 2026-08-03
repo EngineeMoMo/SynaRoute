@@ -165,6 +165,9 @@ const events: EventLogEntry[] = [
     detail: "厂商2 成功返回 opus-4-7",
     // 折叠计数：验证「×N」徽标的渲染（真实后端对连续同类成功记录会这样合并）
     repeat: 7,
+    // 用量在折叠条目上是**累计值**（7 次之和）。这里刻意给一个上万的输入量，
+    // 用来验证 ↑/↓ 徽标的 k 缩写与 tooltip 渲染。
+    usage: { input: 128400, output: 3120, cacheRead: 96000 },
   },
   {
     id: "e3",
@@ -207,6 +210,8 @@ const events: EventLogEntry[] = [
     type: "request",
     keyId: "k2",
     detail: "厂商2 · claude-opus-4 → glm-4.6 · 1240ms",
+    // 小额用量：验证 ↑/↓ 徽标在不足 1 万时不走 k 缩写（直接显示原数）。
+    usage: { input: 21, output: 34 },
     trace: {
       keyName: "厂商2",
       vendor: "zhipu",
@@ -381,6 +386,21 @@ export const mockBridge = {
         changed = true;
       }
     });
+    return changed;
+  },
+
+  // 批量设置 Max Tokens：与后端同语义 —— 含已停用的 Key、幂等（无改动返 0）。
+  async applyMaxTokensToCategory(categoryId: CategoryType, maxTokens: number) {
+    await delay();
+    if (maxTokens <= 0) throw new Error("Max Tokens 不能为 0（上游会直接拒绝请求）");
+    const list = store[categoryId] ?? [];
+    let changed = 0;
+    for (const k of list) {
+      if (k.params.maxTokens !== maxTokens) {
+        k.params = { ...k.params, maxTokens };
+        changed++;
+      }
+    }
     return changed;
   },
 

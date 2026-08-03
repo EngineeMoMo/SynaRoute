@@ -204,6 +204,11 @@ function FilterTab({
   );
 }
 
+/** token 数的紧凑展示：≥10k 用 k 缩写，避免长数字把行挤变形。与后端 fmt_compact 同口径。 */
+function fmtTokens(n: number): string {
+  return n >= 10_000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
 function LogRow({ entry, lang }: { entry: EventLogEntry; lang: string }) {
   const t = useT();
   const [open, setOpen] = useState(false);
@@ -258,6 +263,21 @@ function LogRow({ entry, lang }: { entry: EventLogEntry; lang: string }) {
         <span className={`flex-1 text-sm text-text-primary ${open ? "whitespace-pre-wrap break-words" : "truncate"}`}>
           {entry.detail}
         </span>
+        {/* token 用量徽标：额度消耗是用户最关心的成本信号，给它独立位置而不是只埋在 detail 里。
+            折叠条目上是 N 次的累计值（见后端 append_event_full 的说明）。 */}
+        {entry.usage && (entry.usage.input > 0 || entry.usage.output > 0) && (
+          <span
+            className="shrink-0 rounded-full bg-surface-hover px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-text-muted"
+            title={t("logs.usageHint", {
+              input: entry.usage.input.toLocaleString(),
+              output: entry.usage.output.toLocaleString(),
+              total: (entry.usage.input + entry.usage.output).toLocaleString(),
+              cache: (entry.usage.cacheRead ?? 0).toLocaleString(),
+            })}
+          >
+            ↑{fmtTokens(entry.usage.input)} ↓{fmtTokens(entry.usage.output)}
+          </span>
+        )}
         {/* 折叠计数：连续同类事件被合成一条时显示「×N」。1 不显示（避免每行都挂个 ×1 的噪音）。 */}
         {(entry.repeat ?? 1) > 1 && (
           <span

@@ -86,6 +86,120 @@ pub async fn fetch_models(key: &ProviderKey, secret: &str) -> AppResult<Vec<Stri
     Err(AppError::Upstream(format!("拉取模型失败：{last_err}")))
 }
 
+/// 一次上游调用的 token 用量。两协议字段名不同，这里归一。
+///
+/// 为什么要有：用户在真机上遇到「一次聚合 2 分 38 秒、请求体 20 万字符」，
+/// 但**日志里看不到任何 token 数字**，无从判断是哪个环节吃掉了额度、也无法验证
+/// 「工具开关关掉后是否真的省了」。可观测性是控成本的前提。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsage {
+    /// 输入（prompt）token
+    pub input: u64,
+    /// 输出（completion）token
+    pub output: u64,
+    /// 命中缓存的输入 token（Anthropic 有，OpenAI 部分中转商也给）
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+impl TokenUsage {
+    pub fn total(&self) -> u64 {
+        self.input + self.output
+    }
+    pub fn is_empty(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0
+    }
+    /// 累加（聚合各环节汇总用）。
+    pub fn add(&mut self, o: &TokenUsage) {
+        self.input += o.input;
+        self.output += o.output;
+        self.cache_read += o.cache_read;
+    }
+    /// 紧凑展示：`↑1.2k ↓340`（缓存命中不为 0 时附 `缓存 900`）。
+    pub fn fmt_compact(&self) -> String {
+        fn k(n: u64) -> String {
+            if n >= 10_000 {
+                format!("{:.1}k", n as f64 / 1000.0)
+            } else {
+                n.to_string()
+            }
+        }
+        let mut s = format!("↑{} ↓{}", k(self.input), k(self.output));
+        if self.cache_read > 0 {
+            s.push_str(&format!(" 缓存{}", k(self.cache_read)));
+        }
+        s
+    }
+}
+
+/// 从上游响应体里提取 token 用量，**同时兼容两家协议**的字段名。
+///
+/// Anthropic: `usage.{input_tokens, output_tokens, cache_read_input_tokens}`
+/// OpenAI:    `usage.{prompt_tokens, completion_tokens}`（缓存在
+///            `prompt_tokens_details.cached_tokens`）
+///
+/// 取不到就返回 `None`（而非 0）：0 会让日志显示「本次 0 token」，看着像 bug；
+/// `None` 表示「这家中转商没给用量」，是如实陈述。
+pub fn extract_usage(body: &Value) -> Option<TokenUsage> {
+    let u = body.get("usage")?;
+    let num = |keys: &[&str]| -> u64 {
+        keys.iter()
+            .find_map(|k| u.get(*k).and_then(|v| v.as_u64()))
+            .unwrap_or(0)
+    };
+    let cache = u
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            u.get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|v| v.as_u64())
+        })
+        .unwrap_or(0);
+    let usage = TokenUsage {
+        input: num(&["input_tokens", "prompt_tokens"]),
+        output: num(&["output_tokens", "completion_tokens"]),
+        cache_read: cache,
+    };
+    (!usage.is_empty()).then_some(usage)
+}
+
+/// 从**流式** SSE 全文里提取 token 用量。
+///
+/// 流式的 usage 不在单个 chunk 的固定位置：Anthropic 放在 `message_start`（input）与
+/// `message_delta`（output）两处，OpenAI 放在最后一个带 `usage` 的 chunk。
+/// 故扫描全部 data 行、把见到的最大值取出来（同一字段后出现的值是累计值，取最大即最终值）。
+pub fn extract_usage_from_sse(sse: &str) -> Option<TokenUsage> {
+    let mut acc = TokenUsage::default();
+    for line in sse.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        // Anthropic 的 message_start 把 usage 藏在 message 下
+        let candidates = [v.get("usage"), v.get("message").and_then(|m| m.get("usage"))];
+        for c in candidates.into_iter().flatten() {
+            if let Some(u) = extract_usage(&serde_json::json!({ "usage": c })) {
+                acc.input = acc.input.max(u.input);
+                acc.output = acc.output.max(u.output);
+                acc.cache_read = acc.cache_read.max(u.cache_read);
+            }
+        }
+    }
+    (!acc.is_empty()).then_some(acc)
+}
+
 /// 拉取模型时上游返回**非 JSON** 的可行动提示。
 ///
 /// 拆成纯函数是为了**可验证**：这条判据的价值全在措辞上，而端到端跑一次拉取需要真实上游。
@@ -319,6 +433,53 @@ pub async fn text_completion(
     Err(last_err.unwrap_or_else(|| AppError::Upstream("未知上游错误".into())))
 }
 
+tokio::task_local! {
+    /// 当前 async 任务的 token 用量累加器。
+    ///
+    /// 为什么用 task_local 而不是改 `text_completion` 的返回类型：它有三个调用点
+    /// （成员 / 汇总者 / 决策者）、又被 `ToolSession` 的多轮循环反复调用，把返回值从
+    /// `String` 改成 `(String, Usage)` 会波及每一处解构与错误分支，而这些路径刚在
+    /// 上一轮做过故障注入验证 —— 为了加一个观测字段去动它们，风险不划算。
+    ///
+    /// task_local 天然按 async 任务隔离：聚合的每个成员各跑在自己的 spawn 里，
+    /// 用量不会互相串台；没有 scope 包裹时（如普通代理转发）写入直接是 no-op。
+    pub static USAGE_ACC: std::cell::Cell<TokenUsage>;
+}
+
+/// 从原始响应体（普通 JSON 或 SSE 全文）提取用量并记进累加器。
+///
+/// 聚合走的是**非流式**调用，但部分中转商仍会以 SSE 形态返回，故两种形态都试。
+fn record_usage_from_raw(raw: &str) {
+    let u = serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|v| extract_usage(&v))
+        .or_else(|| extract_usage_from_sse(raw));
+    if let Some(u) = u {
+        record_usage(u);
+    }
+}
+
+/// 把本次上游调用的用量记进当前任务的累加器（无 scope 时静默忽略）。
+pub fn record_usage(u: TokenUsage) {
+    let _ = USAGE_ACC.try_with(|acc| {
+        let mut cur = acc.get();
+        cur.add(&u);
+        acc.set(cur);
+    });
+}
+
+/// 在一个带用量累加器的 scope 里跑 `fut`，返回 `(结果, 累计用量)`。
+pub async fn with_usage<T>(fut: impl std::future::Future<Output = T>) -> (T, TokenUsage) {
+    let cell = std::cell::Cell::new(TokenUsage::default());
+    USAGE_ACC
+        .scope(cell, async move {
+            let out = fut.await;
+            let used = USAGE_ACC.with(|c| c.get());
+            (out, used)
+        })
+        .await
+}
+
 /// 截断上游响应体用于错误展示（避免超长 body 撑爆日志/错误信息）。
 fn truncate_body(raw: &str) -> String {
     const CAP: usize = 400;
@@ -459,6 +620,7 @@ async fn anthropic_message(
             truncate_body(&raw)
         )));
     }
+    record_usage_from_raw(&raw);
     // content: [{type:"text", text:"..."}]。兼容普通 JSON 与 SSE 流两种返回形态。
     let text = parse_anthropic_text(&raw).ok_or_else(|| {
         AppError::Upstream(format!("Anthropic 响应无法解析: {}", truncate_body(&raw)))
@@ -494,6 +656,7 @@ async fn openai_chat(
             truncate_body(&raw)
         )));
     }
+    record_usage_from_raw(&raw);
     let text = parse_openai_text(&raw).ok_or_else(|| {
         AppError::Upstream(format!("OpenAI 响应无法解析: {}", truncate_body(&raw)))
     })?;
@@ -795,6 +958,20 @@ pub struct TurnParams<'a> {
 ///
 /// 两家 API 都是无状态的：每轮把**整份历史**重发。这也是工具循环显著更耗 token 的原因，
 /// 故上层开关默认关闭。
+/// 小于这个长度的工具结果不值得压缩（占位说明自身就有几十字符，压了反而更长）。
+const TRIM_PLACEHOLDER_MIN: usize = 200;
+
+/// 被裁剪掉的工具结果留下的占位说明。
+///
+/// **刻意不留空串**：空内容会让模型以为那次调用什么都没读到，于是重新调一遍同样的工具 ——
+/// 本意是省额度，结果更贵。这里如实写明「已省略、需要就重新取」，让模型能判断是否值得再调。
+fn trim_placeholder(original_chars: usize) -> String {
+    format!(
+        "[此前一轮的工具结果（约 {original_chars} 字符）已省略以控制上下文长度。\
+         若这部分内容对回答仍然必要，请重新调用相应工具获取。]"
+    )
+}
+
 pub struct ToolSession {
     protocol: Protocol,
     /// 协议原生形态的消息历史。
@@ -860,6 +1037,109 @@ impl ToolSession {
                 .collect();
             self.messages.push(json!({ "role": "user", "content": blocks }));
         }
+    }
+
+    /// 历史里工具结果正文的总字符数（用于判断是否该裁剪）。
+    fn tool_result_chars(&self) -> usize {
+        self.messages
+            .iter()
+            .map(|m| {
+                let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                if role == "tool" {
+                    // OpenAI：一条 tool 消息一个结果
+                    m.get("content").and_then(|c| c.as_str()).map_or(0, |s| s.chars().count())
+                } else if role == "user" {
+                    // Anthropic：tool_result 块打包在 user 消息的 content 数组里
+                    m.get("content")
+                        .and_then(|c| c.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                                .map(|b| {
+                                    b.get("content").and_then(|c| c.as_str()).map_or(0, |s| s.chars().count())
+                                })
+                                .sum()
+                        })
+                        .unwrap_or(0)
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
+    /// 把历史里**较早轮次**的工具结果正文压成占位说明，直到总量落回 `budget` 以内。
+    ///
+    /// ## 为什么不是删消息
+    ///
+    /// 两家协议都要求 `tool_use` / `tool_result` **一一对应**，删掉任何一条结果都会让上游
+    /// 直接 400（不是忽略）。assistant 消息更不能动 —— 里面带扩展思考的 `signature`，
+    /// 改一个字节签名校验就失败。故这里**只替换 tool_result 的正文字符串**：
+    /// 消息条数、角色顺序、id 配对关系全部原样保留。
+    ///
+    /// ## 为什么从最旧的开始压
+    ///
+    /// 工具循环的信息价值随轮次递增：模型最后几轮读的正是它判断出「关键」的文件，
+    /// 而第一轮往往是 `list_dir` 摸目录结构这类一次性信息。保新弃旧。
+    ///
+    /// ## 为什么保留占位说明而不是空串
+    ///
+    /// 空串会让模型以为那次调用什么都没读到、于是**重新读一遍**，反而更贵。
+    /// 占位里写明「已省略、如仍需要请重新调用」，让它能判断是否值得再取。
+    ///
+    /// 返回被压缩的结果条数（0 = 未触发裁剪），供日志如实告知用户。
+    pub fn trim_tool_history(&mut self, budget: usize) -> usize {
+        // 本地递减计数，不在 iter_mut 循环里重新借用 self.messages。
+        let mut total = self.tool_result_chars();
+        if total <= budget {
+            return 0;
+        }
+        // 最后一条带工具结果的消息**永不压缩**：那是模型刚拿到、正要用的材料。
+        let last_tool_idx = self.messages.iter().rposition(|m| {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            role == "tool"
+                || (role == "user"
+                    && m.get("content").and_then(|c| c.as_array()).is_some_and(|a| {
+                        a.iter()
+                            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                    }))
+        });
+        let mut compressed = 0usize;
+        // 就地把一个 tool_result 正文换成占位，并把节省量从 total 里扣掉。
+        let squash = |c: &mut Value, total: &mut usize, compressed: &mut usize| {
+            let before = c.as_str().map_or(0, |s| s.chars().count());
+            if before <= TRIM_PLACEHOLDER_MIN {
+                return;
+            }
+            let ph = trim_placeholder(before);
+            *total = total.saturating_sub(before.saturating_sub(ph.chars().count()));
+            *c = json!(ph);
+            *compressed += 1;
+        };
+        for (i, m) in self.messages.iter_mut().enumerate() {
+            // 到最近一轮就停；已达标也停（避免把还够用的历史全压掉）
+            if Some(i) == last_tool_idx || total <= budget {
+                break;
+            }
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("").to_string();
+            if role == "tool" {
+                if let Some(c) = m.get_mut("content") {
+                    squash(c, &mut total, &mut compressed);
+                }
+            } else if role == "user" {
+                if let Some(arr) = m.get_mut("content").and_then(|c| c.as_array_mut()) {
+                    for b in arr.iter_mut() {
+                        if b.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                            continue; // text / image 块不动
+                        }
+                        if let Some(c) = b.get_mut("content") {
+                            squash(c, &mut total, &mut compressed);
+                        }
+                    }
+                }
+            }
+        }
+        compressed
     }
 
     /// 追加一条来自 user 的补充指示（如「已到轮数上限，请直接出结论」）。
@@ -951,25 +1231,74 @@ impl ToolSession {
             }
         }
 
-        let mut req = client.post(&url).json(&payload).timeout(p.request_timeout);
-        if !openai {
-            req = req.header("anthropic-version", "2023-06-01");
+        // Prompt caching：
+        // - OpenAI 协议**自动**缓存(≥1024 token 前缀,无需任何字段),我们已保证 messages
+        //   前缀稳定(assistant 照抄、tool_result 只追加),它自然命中,故这里不动。
+        // - Anthropic 协议要显式打 `cache_control` 断点。但你路由的是一堆第三方中转,
+        //   个别严格中转会对未知字段回 400。故:已知不支持的端点直接不带;其余先带,
+        //   若因它回 400 则自愈(去掉重发 + 记住该端点)。
+        let want_cache = !openai && !cache_known_unsupported(&key.base_url);
+        if want_cache {
+            inject_anthropic_cache(&mut payload, !tools.is_empty());
         }
-        req = apply_auth(req, key, p.secret);
-        req = apply_client_identity(req, self.protocol);
 
-        let resp = req.send().await?;
+        let send = |body: &Value| {
+            let mut req = client.post(&url).json(body).timeout(p.request_timeout);
+            if !openai {
+                req = req.header("anthropic-version", "2023-06-01");
+                // 官方要求携带该 beta 头才启用扩展缓存能力；真 Anthropic 认，
+                // 兼容中转忽略,严格中转的 400 会走下面的自愈。
+                req = req.header("anthropic-beta", "prompt-caching-2024-07-31");
+            }
+            req = apply_auth(req, key, p.secret);
+            req = apply_client_identity(req, self.protocol);
+            req.send()
+        };
+
+        let resp = send(&payload).await?;
         let status = resp.status();
         // 同 text_completion：先读文本再解析，否则上游回 HTML 错误页时只能看到笼统的
         // 「error decoding response body」，看不出上游到底说了什么。
         let raw = resp.text().await?;
         let label = if openai { "OpenAI" } else { "Anthropic" };
+
+        // 自愈：带了缓存字段、上游回 400、且响应体确认是缓存问题 → 去掉缓存重发一次,
+        // 并记住该端点以后不再带。判据保守(见 looks_like_cache_rejection),不吞真正的 400。
+        if want_cache && status == reqwest::StatusCode::BAD_REQUEST && looks_like_cache_rejection(&raw)
+        {
+            mark_cache_unsupported(&key.base_url);
+            let mut plain = json!({
+                "model": model,
+                "max_tokens": p.max_tokens,
+                "messages": self.messages,
+            });
+            if !tools.is_empty() {
+                plain["tools"] = anthropic_tools(tools);
+            }
+            let resp2 = send(&plain).await?;
+            let status2 = resp2.status();
+            let raw2 = resp2.text().await?;
+            if !status2.is_success() {
+                return Err(AppError::Upstream(format!(
+                    "{label} HTTP {status2}: {}",
+                    truncate_body(&raw2)
+                )));
+            }
+            record_usage_from_raw(&raw2);
+            return parse_anthropic_turn(&raw2).ok_or_else(|| {
+                AppError::Upstream(format!("{label} 响应无法解析: {}", truncate_body(&raw2)))
+            });
+        }
+
         if !status.is_success() {
             return Err(AppError::Upstream(format!(
                 "{label} HTTP {status}: {}",
                 truncate_body(&raw)
             )));
         }
+        // 记 token 用量(含 cache_read/cache_creation)。命中缓存时 cache_read 会显著大于 0,
+        // 即可在日志徽标里看到「缓存生效了」——这是本次改动可证伪的验收点。
+        record_usage_from_raw(&raw);
         let parsed = if openai {
             parse_openai_turn(&raw)
         } else {
@@ -978,6 +1307,80 @@ impl ToolSession {
         parsed.ok_or_else(|| {
             AppError::Upstream(format!("{label} 响应无法解析: {}", truncate_body(&raw)))
         })
+    }
+}
+
+/// 已知**不支持** `cache_control` 的上游 base_url（进程级记忆）。
+///
+/// 自愈回退用:某个中转因 `cache_control` 回 400 后,把它的 base_url 记进来,
+/// 后续请求直接不带缓存字段,不再每次都先撞一次 400 再重发。
+/// 进程级即可——换机/重启后重新探测一次无妨,且避免持久化一个可能随中转升级而变化的判断。
+static CACHE_UNSUPPORTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn cache_unsupported() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    CACHE_UNSUPPORTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn cache_known_unsupported(base_url: &str) -> bool {
+    cache_unsupported()
+        .lock()
+        .map(|s| s.contains(base_url))
+        .unwrap_or(false)
+}
+
+fn mark_cache_unsupported(base_url: &str) {
+    if let Ok(mut s) = cache_unsupported().lock() {
+        s.insert(base_url.to_string());
+    }
+}
+
+/// 某个 HTTP 400 的响应体是否**疑似**因 `cache_control` 引起(而非模型名错、参数错等真问题)。
+///
+/// 判据保守:必须明确提到 cache 相关字样才回退,否则会把「model is required」这类真正的 400
+/// 也误当成缓存问题去掉缓存重发——那只会白发一次、真问题依旧,且掩盖了根因。
+fn looks_like_cache_rejection(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    b.contains("cache_control")
+        || b.contains("cache control")
+        || (b.contains("cache") && (b.contains("unexpected") || b.contains("unsupported") || b.contains("unknown")))
+}
+
+/// 给 Anthropic 请求体的**稳定前缀**打缓存断点(5 分钟 TTL)。
+///
+/// 前缀缓存的顺序是 tools → system → messages,任何字节变动使其后失效。工具循环里:
+/// - `tools` 声明整个循环不变 → 断点①钉在 tools 数组**最后一个**元素上,缓存全部工具声明
+/// - `messages` 只追加不改写 → 断点②钉在**最后一条消息的最后一个 content 块**上,
+///   缓存「到本轮为止的全部历史」;下一轮请求的前缀恰好是这一份,自动命中(0.1x 价)
+///
+/// 只对 **content 已是数组**的消息打断点:字符串型 content(第一轮的初始问题)若包成数组,
+/// 会与后续轮次的字符串形态不一致、破坏前缀逐字节匹配;而工具循环从第二轮起最后一条
+/// 必是 tool_result 数组,正是缓存收益最大处,不损失。
+///
+/// **零信息损失**:只加元数据,模型看到的内容一字不变。
+fn inject_anthropic_cache(payload: &mut Value, has_tools: bool) {
+    let ephemeral = json!({ "type": "ephemeral" });
+    // 断点①:tools 末尾
+    if has_tools {
+        if let Some(arr) = payload.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            if let Some(last) = arr.last_mut() {
+                if let Some(obj) = last.as_object_mut() {
+                    obj.insert("cache_control".into(), ephemeral.clone());
+                }
+            }
+        }
+    }
+    // 断点②:最后一条消息的最后一个 content 块(仅当 content 是块数组时)
+    if let Some(msgs) = payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        if let Some(last_msg) = msgs.last_mut() {
+            if let Some(blocks) = last_msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                if let Some(last_block) = blocks.last_mut() {
+                    if let Some(obj) = last_block.as_object_mut() {
+                        obj.insert("cache_control".into(), ephemeral);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3848,6 +4251,263 @@ fn apply_models_auth(req: reqwest::RequestBuilder, secret: &str) -> reqwest::Req
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 构造一个跑了若干轮工具的会话历史（assistant tool_use ↔ user tool_result 成对）。
+    /// `sizes` 是每轮 tool_result 正文的字符数。
+    ///
+    /// 每轮正文带**唯一标记** `<<ROUND_i>>`：断言必须能精确区分「哪一轮还在、哪一轮被压了」。
+    /// 若都用同一个填充字符，长正文会包含短正文（`"x".repeat(20000)` 里必然含
+    /// `"x".repeat(6000)`），「较早轮次已被压掉」这条就永远判不出来 —— 实测踩过。
+    fn session_with_tool_rounds(protocol: Protocol, sizes: &[usize]) -> ToolSession {
+        let mut s = ToolSession::new(protocol, &MultimodalPrompt::from_text("开始"));
+        for (i, &n) in sizes.iter().enumerate() {
+            let id = format!("call_{i}");
+            // assistant 那条：形状按协议区分（trim 只读 role/tool_result，assistant 内容不重要）
+            let assistant = if protocol.is_openai() {
+                json!({ "role": "assistant", "content": null,
+                        "tool_calls": [{ "id": &id, "type": "function",
+                                         "function": { "name": "read_file", "arguments": "{}" } }] })
+            } else {
+                json!({ "role": "assistant",
+                        "content": [{ "type": "tool_use", "id": &id, "name": "read_file", "input": {} }] })
+            };
+            s.messages.push(assistant);
+            s.push_tool_results(&[ToolResultMsg {
+                id: id.clone(),
+                content: round_body(i, n),
+                is_error: false,
+            }]);
+        }
+        s
+    }
+
+    /// 第 i 轮的正文：唯一标记 + 填充到 n 字符。
+    fn round_body(i: usize, n: usize) -> String {
+        let marker = format!("<<ROUND_{i}>>");
+        let pad = n.saturating_sub(marker.chars().count());
+        format!("{marker}{}", "x".repeat(pad))
+    }
+
+    fn round_marker(i: usize) -> String {
+        format!("<<ROUND_{i}>>")
+    }
+
+    /// 裁剪必须**保留 tool_use/tool_result 的一一对应**（删任何一条上游 400），
+    /// 只把较早轮次的正文换成占位。两协议都验。
+    #[test]
+    fn inject_anthropic_cache_marks_tools_tail_and_last_message_block() {
+        // 断点应钉在两处稳定前缀:tools 数组末尾 + 最后一条消息的最后一个 content 块。
+        // 这正是工具循环里「到本轮为止的全部历史」的边界,下一轮请求前缀恰好命中。
+        let mut payload = json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1024,
+            "tools": [
+                { "name": "read_file", "description": "d1", "input_schema": {} },
+                { "name": "grep", "description": "d2", "input_schema": {} }
+            ],
+            "messages": [
+                { "role": "user", "content": "问题" },
+                { "role": "assistant", "content": [ { "type": "tool_use", "id": "c1", "name": "grep", "input": {} } ] },
+                { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "c1", "content": "命中" } ] }
+            ]
+        });
+        inject_anthropic_cache(&mut payload, true);
+
+        // 断点①:tools 的**最后一个**才带,前面的不带(否则浪费断点额度)
+        let tools = payload["tools"].as_array().unwrap();
+        assert!(tools[0].get("cache_control").is_none(), "非末尾 tool 不该带断点");
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral", "tools 末尾应打断点");
+
+        // 断点②:最后一条消息的最后一个 content 块
+        let msgs = payload["messages"].as_array().unwrap();
+        assert!(
+            msgs[0].get("content").unwrap().is_string(),
+            "第一条是字符串型 content,不该被强行改成数组(会破坏前缀逐字节匹配)"
+        );
+        let last_block = msgs[2]["content"].as_array().unwrap().last().unwrap();
+        assert_eq!(last_block["cache_control"]["type"], "ephemeral", "最后一块应打断点");
+    }
+
+    #[test]
+    fn inject_cache_is_noop_on_string_content_and_missing_tools() {
+        // 收尾轮无 tools + 初始只有字符串 user:不应崩、不应把字符串包成数组。
+        let mut p = json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [ { "role": "user", "content": "只有一条字符串" } ]
+        });
+        inject_anthropic_cache(&mut p, false); // has_tools=false
+        assert!(p.get("tools").is_none());
+        assert!(
+            p["messages"][0]["content"].is_string(),
+            "字符串 content 不带块级断点,保持原样"
+        );
+    }
+
+    #[test]
+    fn cache_rejection_detector_is_conservative() {
+        // 只有明确提到 cache 才回退,否则会把真正的 400(model 错等)误当缓存问题白重发一次。
+        assert!(looks_like_cache_rejection(
+            r#"{"error":{"message":"unexpected field cache_control"}}"#
+        ));
+        assert!(looks_like_cache_rejection("Unsupported parameter: cache control"));
+        assert!(looks_like_cache_rejection(r#"{"error":"unknown cache field"}"#));
+        // 真正的 400,与缓存无关 → 不回退
+        assert!(!looks_like_cache_rejection(
+            r#"{"error":{"message":"model is required"}}"#
+        ));
+        assert!(!looks_like_cache_rejection(
+            r#"{"error":{"message":"max_tokens must be > 0"}}"#
+        ));
+        assert!(!looks_like_cache_rejection("Failed to parse request body"));
+    }
+
+    #[test]
+    fn cache_unsupported_endpoint_memory_roundtrips() {
+        let url = "https://strict-relay.test/v1";
+        assert!(!cache_known_unsupported(url), "初始未知");
+        mark_cache_unsupported(url);
+        assert!(cache_known_unsupported(url), "标记后应记住");
+        // 别的端点不受影响
+        assert!(!cache_known_unsupported("https://other.test/v1"));
+    }
+
+    #[test]
+    fn trim_tool_history_preserves_pairing_and_keeps_latest() {
+        for proto in [Protocol::Anthropic, Protocol::OpenaiChat] {
+            // 5 轮，各 5000 字符 = 25000；预算 8000 → 应压掉最早几轮
+            let mut s = session_with_tool_rounds(proto, &[5000, 5000, 5000, 5000, 5000]);
+            let before_msgs = s.messages.len();
+            let squashed = s.trim_tool_history(8000);
+
+            assert!(squashed >= 3, "{proto:?}: 25000 压到 8000 至少要动 3 轮，实际 {squashed}");
+            // 消息条数一条都不能少（配对不破）
+            assert_eq!(s.messages.len(), before_msgs, "{proto:?}: 裁剪不得删除任何消息");
+            // 总量已落回预算内
+            assert!(s.tool_result_chars() <= 8000, "{proto:?}: 裁剪后仍超预算");
+            let joined: String = s.messages.iter().map(|m| m.to_string()).collect();
+            // 最近一轮（第 4 轮）必须原样保留 —— 那是模型正要用的材料
+            assert!(
+                joined.contains(&round_marker(4)),
+                "{proto:?}: 最近一轮结果不该被压缩"
+            );
+            // 最早一轮必须已被压掉（标记随正文一起消失）
+            assert!(
+                !joined.contains(&round_marker(0)),
+                "{proto:?}: 最早一轮应被压成占位"
+            );
+            // 占位说明必须非空且提示可重新获取（空串会诱使模型重复调用）
+            assert!(joined.contains("已省略") && joined.contains("重新调用"), "{proto:?}: 占位文案缺失");
+        }
+    }
+
+    /// 预算够大时不裁剪；小于阈值的结果也不值得压。
+    #[test]
+    fn trim_tool_history_noop_when_under_budget() {
+        let mut s = session_with_tool_rounds(Protocol::Anthropic, &[3000, 3000]);
+        assert_eq!(s.trim_tool_history(60000), 0, "总量 6000 < 预算，不该动");
+        // 全是小结果（各 100 字符 < TRIM_PLACEHOLDER_MIN=200），即便超预算也压不动
+        let mut s2 = session_with_tool_rounds(Protocol::Anthropic, &[100, 100, 100, 100, 100]);
+        assert_eq!(s2.trim_tool_history(50), 0, "小于阈值的结果不压（占位比原文还长）");
+    }
+
+    /// **最新一轮永不压缩**，即便它自己就超预算。
+    ///
+    /// 这条比 preserves 那条更能锁住豁免逻辑：最后一轮 20000 > 预算 8000，若不豁免就会被压成占位。
+    /// 去掉 `last_tool_idx` 豁免（改成 None）时，这条立刻变红。
+    #[test]
+    fn trim_tool_history_never_squashes_the_latest_even_if_it_alone_exceeds_budget() {
+        for proto in [Protocol::Anthropic, Protocol::OpenaiChat] {
+            let mut s = session_with_tool_rounds(proto, &[6000, 6000, 20000]);
+            s.trim_tool_history(8000);
+            let joined: String = s.messages.iter().map(|m| m.to_string()).collect();
+            assert!(
+                joined.contains(&round_marker(2)),
+                "{proto:?}: 最新一轮（20000）必须原样保留，即便它自己就超预算"
+            );
+            // 较早两轮应已被压（用唯一标记判定，不受长短包含关系干扰）
+            assert!(
+                !joined.contains(&round_marker(0)) && !joined.contains(&round_marker(1)),
+                "{proto:?}: 较早轮次应被压成占位"
+            );
+        }
+    }
+
+    /// 两家协议的 usage 字段名不同，必须都能取到 —— 取不到就等于用户看不到额度消耗。
+    #[test]
+    fn extract_usage_handles_both_protocol_field_names() {
+        // Anthropic
+        let a = serde_json::json!({
+            "usage": { "input_tokens": 1200, "output_tokens": 340, "cache_read_input_tokens": 900 }
+        });
+        let u = extract_usage(&a).expect("Anthropic usage 应能取到");
+        assert_eq!((u.input, u.output, u.cache_read), (1200, 340, 900));
+        assert_eq!(u.total(), 1540);
+
+        // OpenAI（缓存在 prompt_tokens_details.cached_tokens 里）
+        let o = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 800,
+                "completion_tokens": 120,
+                "total_tokens": 920,
+                "prompt_tokens_details": { "cached_tokens": 512 }
+            }
+        });
+        let u = extract_usage(&o).expect("OpenAI usage 应能取到");
+        assert_eq!((u.input, u.output, u.cache_read), (800, 120, 512));
+
+        // 上游没给 usage → None（不是 0）。写 0 会让日志显示「本次 0 token」，看着像 bug。
+        assert!(extract_usage(&serde_json::json!({ "content": [] })).is_none());
+        assert!(extract_usage(&serde_json::json!({ "usage": {} })).is_none());
+    }
+
+    /// 流式 SSE：Anthropic 把 input 放 message_start、output 放 message_delta，
+    /// 分散在不同 chunk 里，只看某一条会漏。
+    #[test]
+    fn extract_usage_from_sse_merges_across_chunks() {
+        let sse = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1500,\"output_tokens\":1}}}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":420}}\n\
+\n\
+data: [DONE]\n";
+        let u = extract_usage_from_sse(sse).expect("SSE 应能取到用量");
+        assert_eq!(u.input, 1500, "input 在 message_start 里");
+        assert_eq!(u.output, 420, "output 取累计后的最终值，不是首个 chunk 的 1");
+
+        // OpenAI 形态：usage 在最后一个 chunk
+        let sse2 = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\
+\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":77,\"completion_tokens\":9}}\n\
+\n\
+data: [DONE]\n";
+        let u = extract_usage_from_sse(sse2).expect("OpenAI SSE 应能取到");
+        assert_eq!((u.input, u.output), (77, 9));
+
+        // 无 usage 的流 → None
+        assert!(extract_usage_from_sse("data: {\"choices\":[]}\n\ndata: [DONE]\n").is_none());
+    }
+
+    #[test]
+    fn token_usage_add_and_format() {
+        let mut a = TokenUsage { input: 1200, output: 340, cache_read: 0 };
+        a.add(&TokenUsage { input: 800, output: 60, cache_read: 500 });
+        assert_eq!((a.input, a.output, a.cache_read), (2000, 400, 500));
+        // 展示：≥10k 用 k 缩写，缓存不为 0 才附加
+        assert_eq!(
+            TokenUsage { input: 12_345, output: 400, cache_read: 0 }.fmt_compact(),
+            "↑12.3k ↓400"
+        );
+        assert!(TokenUsage { input: 10, output: 2, cache_read: 900 }
+            .fmt_compact()
+            .contains("缓存900"));
+        assert!(TokenUsage::default().is_empty());
+    }
 
     /// 真机反例（2026-08-02）：中转商把请求挡在 HTML 页上，用户只看到
     /// `expected value at line 1 column 1`，完全不知道该改什么。

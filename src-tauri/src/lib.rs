@@ -233,6 +233,30 @@ fn set_primary_key(
     Ok(changed)
 }
 
+/// 把 Max Tokens 一次应用到该分类下全部 Key（FR-005 批量设置）。
+///
+/// 规则在 [`Store::apply_max_tokens_to_category`] 里（单一事实来源）。返回实际改动条数，
+/// 前端据此如实提示「已应用到 N 条」——全都已是该值时返回 0，不谎报「已保存」。
+#[tauri::command]
+fn apply_max_tokens_to_category(
+    state: tauri::State<AppState>,
+    category_id: CategoryType,
+    max_tokens: u32,
+) -> AppResult<usize> {
+    let changed = state
+        .store
+        .apply_max_tokens_to_category(category_id, max_tokens)?;
+    if changed > 0 {
+        state.store.append_event(
+            category_id,
+            "config",
+            None,
+            &format!("批量设置 Max Tokens = {max_tokens}（本分类 {changed} 条 Key 已更新）"),
+        );
+    }
+    Ok(changed)
+}
+
 // ============ 从 cc-switch 导入历史 Key ============
 //
 // 只读 cc-switch 的 SQLite 库（先复制到临时文件再打开），把它的供应商档映射成
@@ -1556,6 +1580,7 @@ pub fn run() {
             detect_codegraph,
             codegraph_init,
             set_primary_key,
+            apply_max_tokens_to_category,
             get_master_password_state,
             unlock_master_password,
             lock_master_password,

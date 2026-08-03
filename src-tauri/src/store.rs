@@ -226,6 +226,24 @@ impl Store {
         trace: Option<RequestTrace>,
         collapse_key: Option<String>,
     ) {
+        self.append_event_full(category, kind, key_id, detail, trace, collapse_key, None);
+    }
+
+    /// 带 token 用量的事件写入（其余重载最终都汇到这里，保持单一构造点）。
+    ///
+    /// 折叠时用量会**累加**：折叠的语义是「同一件事发生了 N 次」，那 N 次各自烧掉的额度
+    /// 理应合并计数 —— 只保留最后一次的用量会让界面显示的总量远小于真实消耗。
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_event_full(
+        &self,
+        category: CategoryType,
+        kind: &str,
+        key_id: Option<&str>,
+        detail: &str,
+        trace: Option<RequestTrace>,
+        collapse_key: Option<String>,
+        usage: Option<crate::upstream::TokenUsage>,
+    ) {
         let entry = EventLogEntry {
             id: uuid::Uuid::new_v4().to_string(),
             ts: chrono::Utc::now().timestamp_millis(),
@@ -235,6 +253,7 @@ impl Store {
             detail: detail.to_string(),
             repeat: 1,
             collapse_key: collapse_key.clone(),
+            usage,
             has_trace: trace.is_some(),
             trace,
         };
@@ -253,6 +272,15 @@ impl Store {
                     // trace 同理替换成最近一次（只保留一份，避免 N 条正文堆在内存里）。
                     last.has_trace = entry.has_trace;
                     last.trace = entry.trace;
+                    // 用量**累加**而非替换：折叠的语义是「这件事发生了 N 次」，
+                    // 每次都真实烧了额度。只留最后一次会让界面总量远小于实际消耗，
+                    // 那正是本项目要防的「看起来没花多少」。
+                    if let Some(u) = entry.usage {
+                        match last.usage.as_mut() {
+                            Some(acc) => acc.add(&u),
+                            None => last.usage = Some(u),
+                        }
+                    }
                     return;
                 }
             }
@@ -744,6 +772,56 @@ impl Store {
         Ok(true)
     }
 
+    /// 把 `max_tokens` 一次应用到该分类下**全部** Key（FR-005 批量设置）。
+    ///
+    /// ## 为什么需要
+    ///
+    /// `max_tokens` 逐 Key 存是对的（各厂商上限不同，必须能分别配），但实际用法里用户往往
+    /// 希望整个分类统一。一条条改十来个 Key 既繁琐又容易漏掉一个 —— 而**漏掉的那个会在
+    /// 故障转移落到它时按旧值截断回答**，表现为「同一个问题有时答得完整、有时被切断」，
+    /// 这种偶发性问题极难联想到是某个备用 Key 的参数没跟上。
+    ///
+    /// ## 含已停用的 Key
+    ///
+    /// 停用只是暂时不进候选池。若跳过它们，日后重新启用时又带着旧值回来，
+    /// 上面那种偶发截断会再次出现。要统一就真的统一。
+    ///
+    /// 幂等：全部 Key 已是该值时返回 0 且**不落盘**（避免每次点击都整份重写 config.json）。
+    /// 返回实际改动的条数，供前端如实提示「已应用到 N 条」而不是一律报成功。
+    pub fn apply_max_tokens_to_category(
+        &self,
+        category: CategoryType,
+        max_tokens: u32,
+    ) -> AppResult<usize> {
+        // 0 会让上游直接 400。单 Key 编辑时用户能立刻看到失败，但批量操作是「一次毁掉整个
+        // 分类」，故在入口就挡住 —— 这类操作的错误代价不对称，该严。
+        if max_tokens == 0 {
+            return Err(AppError::Invalid(
+                "Max Tokens 不能为 0（上游会直接拒绝请求）".into(),
+            ));
+        }
+        let ids: Vec<String> = {
+            let cfg = self.config.read();
+            cfg.keys
+                .iter()
+                .filter(|k| k.category_id == category && k.params.max_tokens != Some(max_tokens))
+                .map(|k| k.id.clone())
+                .collect()
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.mutate_and_persist(|cfg| {
+            for k in cfg.keys.iter_mut() {
+                if ids.iter().any(|id| id == &k.id) {
+                    k.params.max_tokens = Some(max_tokens);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(ids.len())
+    }
+
     /// 更新某 Key 的健康状态（健康检查模块调用）。
     /// 仅当「熔断相关」字段（status / fail_count / breaker_until）变化时才落盘——
     /// last_checked / latency 每轮都变但无需持久化（内存态已更新，UI 走内存态实时展示），
@@ -816,6 +894,8 @@ impl Store {
                 auto_follow_active: false,
                 tools_enabled: false,
                 max_tool_rounds: 6,
+                tool_ctx_budget_chars: 60_000,
+                tool_result_cap_chars: 8_000,
             })
     }
 
@@ -1476,6 +1556,47 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 折叠时 token 用量必须**累加**。
+    ///
+    /// 折叠的语义是「同一件事发生了 N 次」，那 N 次各自都真实烧了额度。
+    /// 若只保留最后一次的用量，界面显示的总量会远小于实际消耗 —— 而用户正是
+    /// 靠这个数字判断「工具开关关掉后是否真的省了」，少算等于把账做平了。
+    #[test]
+    fn collapsed_events_accumulate_token_usage() {
+        use crate::upstream::TokenUsage;
+        let dir = temp_dir("collapse_usage");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        let ck = Some("ok:k1:m:false".to_string());
+        let u = |i: u64, o: u64| {
+            Some(TokenUsage { input: i, output: o, cache_read: 0 })
+        };
+
+        store.append_event_full(CategoryType::ClaudeCli, "route", Some("k1"), "第1次", None, ck.clone(), u(100, 20));
+        store.append_event_full(CategoryType::ClaudeCli, "route", Some("k1"), "第2次", None, ck.clone(), u(200, 30));
+        store.append_event_full(CategoryType::ClaudeCli, "route", Some("k1"), "第3次", None, ck.clone(), u(300, 50));
+
+        let ev = store.list_all_events();
+        assert_eq!(ev.len(), 1, "三条同类应折叠成一条");
+        assert_eq!(ev[0].repeat, 3);
+        let got = ev[0].usage.expect("折叠后应保留用量");
+        assert_eq!(
+            (got.input, got.output),
+            (600, 100),
+            "用量必须是三次之和，不能只留最后一次"
+        );
+
+        // 首条无用量、后续有 → 也要能记上（不能因为第一条是 None 就丢掉后面的）
+        let ck2 = Some("ok:k2:m:false".to_string());
+        store.append_event_full(CategoryType::ClaudeCli, "route", Some("k2"), "无量", None, ck2.clone(), None);
+        store.append_event_full(CategoryType::ClaudeCli, "route", Some("k2"), "有量", None, ck2.clone(), u(70, 8));
+        let ev = store.list_all_events();
+        let last = ev.last().unwrap();
+        assert_eq!(last.repeat, 2);
+        assert_eq!(last.usage.map(|x| (x.input, x.output)), Some((70, 8)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 不带 collapse_key 的事件永不折叠（配置变更、错误等每条都要独立可见）。
     #[test]
     fn events_without_collapse_key_never_merge() {
@@ -1595,6 +1716,94 @@ mod tests {
             "已是主应返回 false"
         );
         assert_eq!(std::fs::read(&cfg).unwrap(), before, "幂等时磁盘不应被改写");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 批量应用 Max Tokens：覆盖全分类（**含已停用**）、不牵连别的分类。
+    ///
+    /// 「含已停用」是关键判据：跳过它们的话，日后重新启用又带着旧值回来，
+    /// 故障转移落到它时按旧值截断回答 —— 表现为「同一问题有时完整、有时被切断」，
+    /// 而这种偶发性极难联想到是某个备用 Key 的参数没跟上。
+    #[test]
+    fn apply_max_tokens_covers_whole_category_including_disabled() {
+        let dir = temp_dir("mt_all");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        let mut a = sample_key("a", 0);
+        a.params.max_tokens = Some(4096);
+        let mut b = sample_key("b", 1);
+        b.enabled = false; // 已停用，同样要被覆盖
+        b.params.max_tokens = Some(1024);
+        let c = sample_key("c", 2); // 从未设过（None）
+        // 另一个分类：一个字节都不该动
+        let mut other = sample_key("z", 0);
+        other.category_id = CategoryType::Codex;
+        other.params.max_tokens = Some(2048);
+
+        for k in [a, b, c, other] {
+            store.upsert_key(k).unwrap();
+        }
+
+        let changed = store
+            .apply_max_tokens_to_category(CategoryType::ClaudeCli, 32000)
+            .unwrap();
+        assert_eq!(changed, 3, "三条都该被改（含已停用的 b 与未设过的 c）");
+
+        for id in ["a", "b", "c"] {
+            assert_eq!(
+                store.get_key(id).unwrap().params.max_tokens,
+                Some(32000),
+                "{id} 应已更新"
+            );
+        }
+        assert_eq!(
+            store.get_key("z").unwrap().params.max_tokens,
+            Some(2048),
+            "别的分类不得被牵连"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 幂等 + 拒绝 0：全都已是该值时返回 0 且不写盘；0 在入口就挡住。
+    ///
+    /// 拒绝 0 的理由：它会让上游直接 400。单 Key 编辑时用户能立刻看到失败，
+    /// 但批量是「一次毁掉整个分类」，错误代价不对称，该严。
+    #[test]
+    fn apply_max_tokens_is_idempotent_and_rejects_zero() {
+        let dir = temp_dir("mt_idem");
+        let cfg = dir.join("config.json");
+        let store = Store::new_at(cfg.clone(), dir.join("secrets.enc")).unwrap();
+        store.upsert_key(sample_key("a", 0)).unwrap();
+        store.upsert_key(sample_key("b", 1)).unwrap();
+
+        assert_eq!(
+            store
+                .apply_max_tokens_to_category(CategoryType::ClaudeCli, 8192)
+                .unwrap(),
+            2
+        );
+        let after_first = std::fs::read(&cfg).unwrap();
+
+        // 再来一次：无改动、不落盘（否则每次点击都整份重写 config.json）
+        assert_eq!(
+            store
+                .apply_max_tokens_to_category(CategoryType::ClaudeCli, 8192)
+                .unwrap(),
+            0,
+            "全都已是该值时应返回 0"
+        );
+        assert_eq!(
+            std::fs::read(&cfg).unwrap(),
+            after_first,
+            "幂等时磁盘不应被改写"
+        );
+
+        // 0 必须被拒，且不改动任何 Key
+        let err = store
+            .apply_max_tokens_to_category(CategoryType::ClaudeCli, 0)
+            .expect_err("0 必须被拒绝");
+        assert!(format!("{err}").contains('0'), "错误应说明原因：{err}");
+        assert_eq!(store.get_key("a").unwrap().params.max_tokens, Some(8192));
         std::fs::remove_dir_all(&dir).ok();
     }
 

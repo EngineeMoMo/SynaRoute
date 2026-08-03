@@ -439,6 +439,28 @@ export function BrainPage() {
                 <div className="text-[11px] leading-relaxed text-text-muted">
                   {t("brain.toolsRoundsHint")}
                 </div>
+                <NumberField
+                  label={t("brain.toolCtxBudget")}
+                  value={config.toolCtxBudgetChars ?? 60000}
+                  min={0}
+                  max={400000}
+                  step={1000}
+                  onChange={(v) => update({ toolCtxBudgetChars: v })}
+                />
+                <div className="text-[11px] leading-relaxed text-text-muted">
+                  {t("brain.toolCtxBudgetHint")}
+                </div>
+                <NumberField
+                  label={t("brain.toolResultCap")}
+                  value={config.toolResultCapChars ?? 8000}
+                  min={0}
+                  max={40000}
+                  step={500}
+                  onChange={(v) => update({ toolResultCapChars: v })}
+                />
+                <div className="text-[11px] leading-relaxed text-text-muted">
+                  {t("brain.toolResultCapHint")}
+                </div>
                 {/*
                   工作目录入口：仅当「文件检索」关着时才在这里出现 —— 检索开着时它已在检索卡里显示，
                   两处都渲染会出现两个改同一个 workDir 的控件。工具需要工作目录（MCP 调用可由 cwd 提供，

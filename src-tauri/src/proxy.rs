@@ -478,14 +478,22 @@ async fn handle_request(
                        request_body: String,
                        response_body: String,
                        status: u16,
-                       streaming: bool| {
+                       streaming: bool,
+                       usage: Option<crate::upstream::TokenUsage>| {
         let verb = if streaming { "流式返回" } else { "成功返回" };
+        // token 用量直接写进 detail：这是用户判断「额度花在哪」的唯一入口，
+        // 藏在链路快照里等于没有（快照默认关、且要展开才看得到）。
+        let usage_part = usage
+            .as_ref()
+            .map(|u| format!(" · {}", u.fmt_compact()))
+            .unwrap_or_default();
         let detail = format!(
-            "{} · {} · {} · {}ms",
+            "{} · {} · {} · {}ms{}",
             key.name,
             verb,
             fmt_route_model_for_key(key, &requested_model),
-            elapsed
+            elapsed,
+            usage_part
         );
         // 链路快照只在「调用模型日志」开关开启时产生（正文可达 2×20000 字符）。
         let trace = req_log.then(|| RequestTrace {
@@ -502,13 +510,14 @@ async fn handle_request(
             ok: true,
         });
         let collapse = format!("ok:{}:{}:{}", key.id, requested_model, streaming);
-        store.append_event_collapsible(
+        store.append_event_full(
             category,
             "route",
             Some(&key.id),
             &detail,
             trace,
             Some(collapse),
+            usage,
         );
     };
 
@@ -671,6 +680,11 @@ async fn handle_request(
                         "（流式响应：边收边发，body 不留存。如需完整响应体，请在客户端侧抓取）".to_string(),
                         200,
                         true,
+                        // 流式直通拿不到 usage：SSE 是边收边发、不缓存全文，用量藏在
+                        // 最后几个 chunk 里，要取就得把整个流缓存下来 —— 那会毁掉流式的
+                        // 首字节延迟优势。故如实留空，而不是编一个数字。
+                        // （聚合走的是非流式路径，那里有完整 usage，见 aggregate。）
+                        None,
                     );
                     return Ok(resp);
                 }
@@ -736,6 +750,11 @@ async fn handle_request(
                 health::record_live_success(&store, &key.id);
                 // 有 Key 能用了 → 立即解除「全部失败」短路，不等窗口自然到期。
                 clear_all_failed_gate(&gate_key);
+                // 非流式有完整响应体 → 能真取到 token 用量（两协议字段名已在
+                // extract_usage 里归一）。上游没给用量时返回 None，日志如实不显示。
+                let usage = serde_json::from_slice::<Value>(&outcome.bytes)
+                    .ok()
+                    .and_then(|v| crate::upstream::extract_usage(&v));
                 log_success(
                     &store,
                     key,
@@ -746,6 +765,7 @@ async fn handle_request(
                     resp_text,
                     outcome.status,
                     false,
+                    usage,
                 );
                 return Ok(json_resp(StatusCode::OK, outcome.bytes));
             }

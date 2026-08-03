@@ -797,6 +797,26 @@ pub struct BrainConfig {
     /// 到顶后强制它基于已有材料出结论。运行时会 clamp 到 2~12。
     #[serde(default = "default_max_tool_rounds")]
     pub max_tool_rounds: u32,
+    /// 工具结果历史的**字符预算**：累计超过就把较早轮次的工具结果压成占位说明
+    /// （消息条数与配对不动），控制「每轮重发完整历史」导致的额度膨胀。
+    ///
+    /// 真机实测：不加限制时一次成员调用请求体峰值达 20 万字符（约 10 万 token）。
+    /// 默认 60000 字符（约 3 万 token），运行时 clamp 到 8000~400000；**0 = 关闭裁剪**。
+    #[serde(default = "default_tool_ctx_budget")]
+    pub tool_ctx_budget_chars: u32,
+    /// **单次**工具结果的字符上限（原先硬编码 8000）。调小能直接压低每轮的增量，
+    /// 代价是模型每次看到的文件片段更短、可能要多调几次。
+    /// 默认 8000，运行时 clamp 到 1000~40000。
+    #[serde(default = "default_tool_result_cap")]
+    pub tool_result_cap_chars: u32,
+}
+
+fn default_tool_result_cap() -> u32 {
+    8_000
+}
+
+fn default_tool_ctx_budget() -> u32 {
+    60_000
 }
 
 fn default_max_tool_rounds() -> u32 {
@@ -883,6 +903,13 @@ pub struct EventLogEntry {
     /// 折叠判据：同 key 的连续事件才合并。仅后端内存态使用，不下发前端。
     #[serde(skip)]
     pub collapse_key: Option<String>,
+    /// 本次调用的 token 用量（上游给了才有）。
+    ///
+    /// 没有它就无法回答「这次聚合花了多少额度、哪个环节花得多」——真机上用户遇到
+    /// 一次 2 分 38 秒、请求体 20 万字符的聚合，日志里却找不到任何 token 数字。
+    /// `None` = 该中转商未返回用量（如实陈述，不写 0 冒充）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::upstream::TokenUsage>,
     /// 该条是否带链路快照。**列表接口会把 `trace` 正文剥掉**（见 `Store::strip_trace`），
     /// 但前端仍需知道「这行能不能展开看详情」，故单独留一个布尔位——它只有 1 字节，
     /// 而正文最坏 40000 字符。展开时前端按事件 id 走 `get_event_trace` 单取一条。

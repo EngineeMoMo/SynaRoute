@@ -187,6 +187,13 @@ const zh: Dict = {
   "editor.errNeedName": "请填写 Key 名称",
   "editor.errNeedBaseUrl2": "请填写 base_url",
   "editor.errSave": "保存失败：{err}",
+  "editor.applyMaxTokensAll": "应用 {n} 到本分类全部 Key",
+  "editor.applyMaxTokensAllHint":
+    "把上面的 Max Tokens 一次写入本分类所有 Key（含已停用的）。漏改一个的后果是：故障转移落到它时按旧值截断回答，表现为「同一问题有时完整、有时被切断」，很难排查。",
+  "editor.maxTokensApplied": "已应用到 {n} 条 Key",
+  "editor.maxTokensNoChange": "本分类全部 Key 已是该值，无需修改",
+  "editor.errMaxTokensZero": "Max Tokens 必须大于 0（上游会直接拒绝请求）",
+  "editor.errApplyAll": "批量应用失败：{err}",
 
   // 大脑聚合
   "brain.title": "大脑聚合",
@@ -265,6 +272,12 @@ const zh: Dict = {
     "会明显增加额度消耗：每一轮工具调用都要把完整对话历史重发一次。建议先在单个分类上试。",
   "brain.maxToolRounds": "工具调用轮数上限",
   "brain.toolsRoundsHint": "到上限后会要求模型基于已获得的信息直接出结论，不再调用工具。",
+  "brain.toolCtxBudget": "工具历史字符预算",
+  "brain.toolCtxBudgetHint":
+    "工具循环每轮都重发完整历史，累计超过此值就把较早轮次的结果压成占位（不影响最近一轮，也不删消息）。默认 60000（约 3 万 token）；设 0 关闭裁剪。",
+  "brain.toolResultCap": "单次工具结果字符上限",
+  "brain.toolResultCapHint":
+    "单个 read_file / grep 结果最多给这么多字符，调小能直接压低每轮增量，代价是模型可能要多调几次。默认 8000；设 0 用默认。",
   "brain.toolsWorkDirHint":
     "需要工作目录：由客户端调用时传 cwd，或在上面开启「自动跟随」/ 填写工作目录。三者都没有时本轮不提供工具（运行日志会写明原因）。",
   "brain.toolsSafetyHint":
@@ -321,6 +334,7 @@ const zh: Dict = {
   "logs.trace.responseBody": "模型返回",
   "logs.trace.copy": "复制",
   "logs.repeatHint": "连续多次同类记录已合并（日志文件里仍是逐条完整记录）",
+  "logs.usageHint": "token 用量：输入 {input} · 输出 {output} · 合计 {total}（缓存命中 {cache}）。合并记录上是累计值",
   "logs.trace.loading": "正在加载链路详情…",
   "logs.trace.evicted": "该条的链路详情已超出内存保留窗口（仅保留最近 500 条），日志文件里仍有完整记录。",
 
@@ -674,6 +688,13 @@ const en: Dict = {
   "editor.errNeedName": "Please enter a key name",
   "editor.errNeedBaseUrl2": "Please enter base_url",
   "editor.errSave": "Save failed: {err}",
+  "editor.applyMaxTokensAll": "Apply {n} to every key in this category",
+  "editor.applyMaxTokensAllHint":
+    "Write the Max Tokens above to every key in this category (including disabled ones). Missing one means that when failover lands on it, replies get truncated at the old value — showing up as \"sometimes complete, sometimes cut off\", which is hard to trace.",
+  "editor.maxTokensApplied": "Applied to {n} key(s)",
+  "editor.maxTokensNoChange": "Every key in this category already uses this value",
+  "editor.errMaxTokensZero": "Max Tokens must be greater than 0 (upstream rejects the request outright)",
+  "editor.errApplyAll": "Bulk apply failed: {err}",
 
   "brain.title": "Brain Aggregation",
   "brain.enabled": "Enabled",
@@ -741,6 +762,12 @@ const en: Dict = {
     "Noticeably increases token spend: every tool round resends the full conversation history. Try it on one category first.",
   "brain.maxToolRounds": "Max tool rounds",
   "brain.toolsRoundsHint": "Once the cap is hit, the model is told to conclude from what it already has and stop calling tools.",
+  "brain.toolCtxBudget": "Tool-history char budget",
+  "brain.toolCtxBudgetHint":
+    "Every tool round re-sends the full history; once the accumulated results exceed this, older rounds are squashed to placeholders (the latest round and message pairing are untouched). Default 60000 (~30k tokens); set 0 to disable trimming.",
+  "brain.toolResultCap": "Per-result char cap",
+  "brain.toolResultCapHint":
+    "Each read_file / grep result is capped at this many characters; lowering it directly shrinks each round's growth, at the cost of the model possibly calling more often. Default 8000; set 0 to use the default.",
   "brain.toolsWorkDirHint":
     "Requires a working directory: either the client passes cwd, or you enable “Auto-follow” / fill in a directory above. With none of those, no tools are offered for that round (the run log says why).",
   "brain.toolsSafetyHint":
@@ -807,6 +834,7 @@ const en: Dict = {
   "logs.trace.responseBody": "Model response",
   "logs.trace.copy": "Copy",
   "logs.repeatHint": "Consecutive identical entries were merged (the log file still records each one separately)",
+  "logs.usageHint": "Tokens: input {input} · output {output} · total {total} (cache hits {cache}). Merged rows show the accumulated total",
   "logs.trace.loading": "Loading trace…",
   "logs.trace.evicted": "This entry's trace is no longer in the in-memory window (last 500 events only); the log file still has the full record.",
 

@@ -78,6 +78,11 @@ pub struct ToolEnv {
     codegraph: Option<String>,
     /// codegraph 不可用的原因，供聚合日志展示（未安装 / 该项目未建索引）。不静默。
     pub codegraph_note: Option<String>,
+    /// 单次工具结果的字符上限（可配，默认 [`RESULT_CHAR_CAP`]）。
+    ///
+    /// 做成字段而不是常量：它直接决定每轮历史的增量，是用户控成本最直接的旋钮。
+    /// 调小 → 每次看到的片段更短、可能多调几次；调大 → 单次信息更全但额度涨得快。
+    result_cap: usize,
 }
 
 impl ToolEnv {
@@ -99,7 +104,14 @@ impl ToolEnv {
             work_dir: work_dir.to_path_buf(),
             codegraph,
             codegraph_note: note,
+            result_cap: RESULT_CHAR_CAP,
         }
+    }
+
+    /// 设置单次工具结果的字符上限。0 或过小值会让工具变得无用，故 clamp 到 1000~40000。
+    pub fn with_result_cap(mut self, cap: u32) -> Self {
+        self.result_cap = (cap as usize).clamp(1_000, 40_000);
+        self
     }
 
     /// 仅测试/内部构造：不探测 codegraph。
@@ -109,6 +121,7 @@ impl ToolEnv {
             work_dir: work_dir.to_path_buf(),
             codegraph: None,
             codegraph_note: None,
+            result_cap: RESULT_CHAR_CAP,
         }
     }
 }
@@ -421,7 +434,7 @@ pub async fn execute(env: &ToolEnv, call: &ToolInvocation) -> ToolResultMsg {
     match result {
         Ok(content) => ToolResultMsg {
             id: call.id.clone(),
-            content: cap_result(content),
+            content: cap_result(content, env.result_cap),
             is_error: false,
         },
         Err(msg) => ToolResultMsg {
@@ -448,12 +461,13 @@ pub fn over_limit_result(call: &ToolInvocation, limit: usize) -> ToolResultMsg {
 }
 
 /// 单次结果截断。明确告诉模型「被截断了、该怎么缩小范围」——静默截断会让它以为文件就这么长。
-fn cap_result(s: String) -> String {    if s.chars().count() <= RESULT_CHAR_CAP {
+fn cap_result(s: String, cap: usize) -> String {
+    if s.chars().count() <= cap {
         return s;
     }
-    let head: String = s.chars().take(RESULT_CHAR_CAP).collect();
+    let head: String = s.chars().take(cap).collect();
     format!(
-        "{head}\n… [结果已截断至 {RESULT_CHAR_CAP} 字符。请缩小范围重查：read_file 用 \
+        "{head}\n… [结果已截断至 {cap} 字符。请缩小范围重查：read_file 用 \
          start_line/end_line，grep 用更具体的 pattern 或 glob]"
     )
 }
@@ -592,7 +606,7 @@ fn read_file_tool(env: &ToolEnv, args: &Value) -> Result<String, String> {
         if lineno > end {
             break;
         }
-        let remaining = RESULT_CHAR_CAP.saturating_sub(chars);
+        let remaining = env.result_cap.saturating_sub(chars);
         if remaining == 0 {
             // 这一行一个字符都没给出去 → 续读必须**从它本身**开始。
             hit_cap = true;
@@ -1625,11 +1639,11 @@ mod tests {
     #[test]
     fn cap_result_tells_model_how_to_narrow() {
         let long = "x".repeat(RESULT_CHAR_CAP + 100);
-        let out = cap_result(long);
+        let out = cap_result(long, RESULT_CHAR_CAP);
         assert!(out.chars().count() < RESULT_CHAR_CAP + 200);
         // 静默截断会让模型以为文件就这么长，据此下错结论
         assert!(out.contains("已截断") && out.contains("start_line"), "{out}");
-        assert_eq!(cap_result("短".into()), "短");
+        assert_eq!(cap_result("短".into(), RESULT_CHAR_CAP), "短");
     }
 
     #[test]
