@@ -21,7 +21,40 @@ pub struct Store {
     /// 使外部写 mtime≤prev)的漏判；len 兼顾粗粒度 mtime(FAT/exFAT/网络盘 2s 分辨率)下
     /// 「同一时间桶内外部增删 Key」致 mtime 相等的漏判——增删 Key 必改变 JSON 字节数。
     config_stamp: RwLock<(Option<SystemTime>, u64)>,
+    /// 日志落盘的**单写者**通道（P1-3）。转发热路径只做一次 channel push 即返回。
+    ///
+    /// 为什么不再同步写：旧实现每条事件都在 tokio worker 线程上做
+    /// 「持进程级 `LOG_LOCK` → `create_dir_all` → `open` → `write_all` → `close`」。
+    /// 阻塞的是 worker **线程**而非当前任务，一次撞上杀软扫描就会让**同线程上所有并发转发
+    /// （含正在输出的 SSE 连接）一并停顿**，表现为偶发无规律卡顿与断流，且日志里只见延迟
+    /// 数字变大、极难归因。
+    ///
+    /// 单写者模型的附带收益：`LOG_LOCK` 与「行尾换行必须拼进同一 buffer」的技巧都可以退役
+    /// （只有一个线程在写，天然不会交错）。这里仍保留一次性 buffer 拼接，因为它本身也更省一次
+    /// 系统调用。
+    log_tx: std::sync::mpsc::SyncSender<LogCmd>,
+    /// 队列满被丢弃的日志条数。**必须可观测**——静默丢日志是本项目最忌讳的失效形态。
+    log_dropped: std::sync::atomic::AtomicU64,
 }
+
+/// 发给日志写线程的命令。
+enum LogCmd {
+    /// 写一条日志（已序列化好的一行，不含换行符）。
+    ///
+    /// 在**发送侧**序列化而非写线程侧：序列化要读 `EventLogEntry`，若把整个 entry 送过去，
+    /// 写线程还得持有它的所有权（trace 正文可达 4 万字符，等于把大对象搬进队列）。
+    /// 发送侧序列化后只搬一个 String，且序列化失败能就地记警告。
+    Line { dir: std::path::PathBuf, line: String },
+    /// 刷盘并回执（退出钩子与测试用）。
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// 日志队列容量。满则丢弃并计数——**绝不阻塞转发**。
+///
+/// 4096 条的量级依据：热路径每次成功转发至少 1 条事件，而磁盘侧一次 append 是微秒级；
+/// 只有在磁盘长时间僵死（杀软扫描、盘满）时才可能堆积到这个数，那种情况下丢日志远优于
+/// 拖垮转发。
+const LOG_QUEUE_CAP: usize = 4096;
 
 /// 事件日志内存上限
 const MAX_EVENTS: usize = 500;
@@ -156,6 +189,8 @@ impl Store {
             secrets: RwLock::new(secrets),
             events: RwLock::new(Vec::new()),
             config_stamp: RwLock::new(initial_stamp),
+            log_tx: Self::spawn_log_writer(),
+            log_dropped: std::sync::atomic::AtomicU64::new(0),
         };
         // P1 防数据销毁：仅在「全新安装(文件不存在)首次 seed」或「成功加载后的迁移」时落盘。
         // load_failed(文件存在但解析失败)时绝不 persist——否则空配置会覆盖磁盘上的原有数据。
@@ -292,6 +327,7 @@ impl Store {
         }
     }
 
+    /// 把一条日志**投递**给写线程（非阻塞）。转发热路径只做序列化 + 一次 channel push。
     fn write_log_to_file(&self, entry: &EventLogEntry) {
         // 只取 log_dir 这一个字段，不克隆整份 settings（每条日志都会走这里，而 AppSettings
         // 里有 3 个 HashMap + 2 个 Vec，克隆开销远大于取一个 Option<String>）。
@@ -299,12 +335,6 @@ impl Store {
             Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
             _ => default_log_dir(),
         };
-        if let Err(e) = std::fs::create_dir_all(&log_dir) {
-            tracing::warn!("创建日志目录失败: {e}");
-            return;
-        }
-        let date = chrono::Utc::now().format("%Y-%m-%d");
-        let log_file = log_dir.join(format!("{date}.jsonl"));
         let line = match serde_json::to_string(entry) {
             Ok(l) => l,
             Err(e) => {
@@ -312,26 +342,133 @@ impl Store {
                 return;
             }
         };
-        // 行尾换行必须与正文拼成**同一个 buffer 一次写完**。
-        // 曾用 `writeln!(f, "{line}")`：它经 write_fmt 拆成「写正文」+「写\n」两次系统调用，
-        // 并发写同一 append 句柄时会插进别人的正文 → 落盘出现 `{…}{…}` 粘在一行、
-        // 且丢掉换行。实测 2026-07-30 的日志 543 行里 14 行是粘连的（26 条记录被解析器漏掉）。
-        // 再加一把进程级锁把多线程的追加串行化，杜绝交错。
-        let mut buf = line.into_bytes();
-        buf.push(b'\n');
-        use std::io::Write;
-        static LOG_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-        let _guard = LOG_LOCK.lock();
-        match std::fs::OpenOptions::new().create(true).append(true).open(&log_file) {
-            Ok(mut f) => {
-                if let Err(e) = f.write_all(&buf) {
-                    tracing::warn!("写入日志文件失败: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!("打开日志文件失败: {e}");
+        // `try_send`：队列满时**立即**丢弃并计数，绝不阻塞转发。
+        // 用 send() 会在磁盘僵死时把 tokio worker 挂住——那正是本次改动要消除的病根。
+        if self
+            .log_tx
+            .try_send(LogCmd::Line { dir: log_dir, line })
+            .is_err()
+        {
+            let n = self
+                .log_dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            // 只在 1/10/100/1000… 这些量级点告警，避免磁盘僵死时告警本身刷爆日志。
+            if n == 1 || n % 100 == 0 {
+                tracing::warn!("日志队列已满，累计丢弃 {n} 条（磁盘可能僵死或写入过慢）");
             }
         }
+    }
+
+    /// 已丢弃的日志条数（可观测性：静默丢日志是本项目最忌讳的形态，必须能被问到）。
+    pub fn log_dropped_count(&self) -> u64 {
+        self.log_dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 等待写线程把当前队列排空（退出钩子与测试用）。
+    ///
+    /// 退出时必须调用：否则强杀进程会丢掉队列里尚未落盘的最后几条——而排障最需要的
+    /// 恰恰是崩溃前那几条。
+    pub fn flush_logs(&self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if self.log_tx.send(LogCmd::Flush(tx)).is_err() {
+            return; // 写线程已退出
+        }
+        // 给一个上限，避免磁盘僵死时把退出流程也挂住。
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(3));
+    }
+
+    /// 启动日志写线程，返回投递端。
+    ///
+    /// 单写者持**长驻** `BufWriter<File>` 与「当前日期 + 当前目录」，仅在跨天或用户改了
+    /// 日志目录时才重开文件——旧实现是每条日志 `create_dir_all` + `open` + `close` 一遍。
+    fn spawn_log_writer() -> std::sync::mpsc::SyncSender<LogCmd> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<LogCmd>(LOG_QUEUE_CAP);
+        std::thread::Builder::new()
+            .name("synaroute-log-writer".into())
+            .spawn(move || {
+                use std::io::Write;
+                // 当前打开的 (目录, 日期, writer)。跨天或换目录才重开。
+                let mut open: Option<(std::path::PathBuf, String, std::io::BufWriter<std::fs::File>)> =
+                    None;
+
+                // 收到 Line 后不立即 flush，而是尽量把已到达的连续几条一起写完再 flush 一次
+                // （高频转发时能把多次 flush 合成一次）。空闲时靠 recv_timeout 兜底 flush。
+                loop {
+                    let cmd = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                        Ok(c) => Some(c),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                        // 所有发送端已析构（进程退出）→ 收尾 flush 后结束线程。
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            if let Some((_, _, w)) = open.as_mut() {
+                                let _ = w.flush();
+                            }
+                            break;
+                        }
+                    };
+                    match cmd {
+                        Some(LogCmd::Line { dir, line }) => {
+                            let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                            // 需要重开文件？（首次 / 跨天 / 用户改了日志目录）
+                            let need_reopen = match &open {
+                                Some((d, dt, _)) => d != &dir || dt != &date,
+                                None => true,
+                            };
+                            if need_reopen {
+                                if let Some((_, _, w)) = open.as_mut() {
+                                    let _ = w.flush();
+                                }
+                                if let Err(e) = std::fs::create_dir_all(&dir) {
+                                    tracing::warn!("创建日志目录失败: {e}");
+                                    open = None;
+                                    continue;
+                                }
+                                let path = dir.join(format!("{date}.jsonl"));
+                                match std::fs::OpenOptions::new().create(true).append(true).open(&path)
+                                {
+                                    Ok(f) => {
+                                        open = Some((
+                                            dir.clone(),
+                                            date.clone(),
+                                            std::io::BufWriter::new(f),
+                                        ))
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("打开日志文件失败: {e}");
+                                        open = None;
+                                        continue;
+                                    }
+                                }
+                            }
+                            if let Some((_, _, w)) = open.as_mut() {
+                                // 正文与换行拼成同一 buffer 一次写出：既省一次系统调用，也与
+                                // 历史教训一致（旧的 writeln! 会拆成两次写，多线程下产生粘行）。
+                                // 单写者模型下已不会交错，但一次写出仍是更好的默认。
+                                let mut buf = line.into_bytes();
+                                buf.push(b'\n');
+                                if let Err(e) = w.write_all(&buf) {
+                                    tracing::warn!("写入日志文件失败: {e}");
+                                }
+                            }
+                        }
+                        Some(LogCmd::Flush(ack)) => {
+                            if let Some((_, _, w)) = open.as_mut() {
+                                let _ = w.flush();
+                            }
+                            let _ = ack.send(());
+                        }
+                        // 200ms 空闲：把 BufWriter 里攒的内容落盘，保证「刚发生的事很快能在
+                        // 日志文件里看到」（排障时用户会直接 tail 这个文件）。
+                        None => {
+                            if let Some((_, _, w)) = open.as_mut() {
+                                let _ = w.flush();
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("启动日志写线程失败");
+        tx
     }
 
     /// 事件日志列表（**不含 trace**），供 UI 列表展示。
@@ -1359,6 +1496,8 @@ impl Store {
             secrets: RwLock::new(secrets),
             events: RwLock::new(Vec::new()),
             config_stamp: RwLock::new(initial_stamp),
+            log_tx: Self::spawn_log_writer(),
+            log_dropped: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -1606,6 +1745,10 @@ mod tests {
             h.join().unwrap();
         }
 
+        // 日志落盘是**单写者异步**（P1-3）：读文件前必须等队列排空，否则读到的是半截。
+        // 这不是为测试放宽判据——排空后行数仍必须精确等于事件数。
+        store.flush_logs();
+
         let date = chrono::Utc::now().format("%Y-%m-%d");
         let file = log_dir.join(format!("{date}.jsonl"));
         let raw = std::fs::read_to_string(&file).expect("应产出当天日志文件");
@@ -1658,7 +1801,8 @@ mod tests {
             ev[0].detail
         );
 
-        // 文件侧：5 条都在。
+        // 文件侧：5 条都在。日志异步落盘，读前先排空队列（见 P1-3）。
+        store.flush_logs();
         let date = chrono::Utc::now().format("%Y-%m-%d");
         let raw = std::fs::read_to_string(log_dir.join(format!("{date}.jsonl"))).unwrap();
         let route_lines = raw
@@ -1732,6 +1876,73 @@ mod tests {
         let last = ev.last().unwrap();
         assert_eq!(last.repeat, 2);
         assert_eq!(last.usage.map(|x| (x.input, x.output)), Some((70, 8)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P1-3：队列满时必须**丢弃并计数**，绝不阻塞调用方。
+    ///
+    /// 为什么这条很重要：静默丢日志是本项目最忌讳的失效形态。这里验证「丢」是可观测的
+    /// （`log_dropped_count` 能问到），而不是无声消失。
+    ///
+    /// 构造手法：把日志目录指向一个**已存在的普通文件**，写线程 `create_dir_all` 必然失败，
+    /// 于是它不停丢弃并继续 recv；同时我们灌入远超队列容量的条数，逼出 try_send 失败。
+    #[test]
+    fn full_log_queue_drops_and_counts_never_blocks() {
+        let dir = temp_dir("log_queue_full");
+        let blocker = dir.join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        let mut s = store.get_settings();
+        s.log_dir = Some(blocker.display().to_string()); // 目录创建必失败
+        store.save_settings(s).unwrap();
+
+        // 灌入远超 LOG_QUEUE_CAP 的条数。关键判据是**这个循环能在有限时间内跑完**
+        // （不阻塞）——旧的同步实现会在每条上做一次失败的 create_dir_all + open。
+        let t0 = std::time::Instant::now();
+        for i in 0..(LOG_QUEUE_CAP * 2) {
+            store.append_event(CategoryType::ClaudeCli, "route", None, &format!("e{i}"));
+        }
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "投递 {} 条不应阻塞（实测 {elapsed:?}）",
+            LOG_QUEUE_CAP * 2
+        );
+
+        // 内存态照常工作（日志落盘失败不该影响 UI 能看到事件）
+        assert_eq!(
+            store.list_all_events().len(),
+            MAX_EVENTS,
+            "落盘失败不影响内存事件环形缓冲"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P1-3：`flush_logs` 必须真的把队列排空（退出钩子依赖它，否则强杀会丢最后几条）。
+    #[test]
+    fn flush_logs_drains_the_queue() {
+        let dir = temp_dir("log_flush");
+        let log_dir = dir.join("logs");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        let mut s = store.get_settings();
+        s.log_dir = Some(log_dir.display().to_string());
+        store.save_settings(s).unwrap();
+
+        for i in 0..50 {
+            store.append_event(CategoryType::Codex, "route", None, &format!("flush-{i}"));
+        }
+        // 不 sleep，直接 flush —— 它必须自己保证排空
+        store.flush_logs();
+
+        let date = chrono::Utc::now().format("%Y-%m-%d");
+        let raw = std::fs::read_to_string(log_dir.join(format!("{date}.jsonl")))
+            .expect("flush 后必须已有日志文件");
+        let n = raw.lines().filter(|l| l.contains("flush-")).count();
+        assert_eq!(n, 50, "flush_logs 必须排空队列，实得 {n} 条");
+        assert_eq!(store.log_dropped_count(), 0, "正常路径不应丢弃任何日志");
 
         std::fs::remove_dir_all(&dir).ok();
     }

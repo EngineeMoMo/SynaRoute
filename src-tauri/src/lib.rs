@@ -1588,8 +1588,23 @@ pub fn run() {
             disable_master_password,
             change_master_password,
         ])
-        .run(tauri::generate_context!())
-        .expect("运行 SynaRoute 失败");
+        .build(tauri::generate_context!())
+        .expect("构建 SynaRoute 失败")
+        .run(|app, event| {
+            // 退出前把日志写线程的队列排空（P1-3）。
+            //
+            // 必须做：日志落盘改成单写者异步后，队列里可能还有尚未写盘的条目，而排障最需要的
+            // 恰恰是退出/崩溃前那几条。`flush_logs` 内部带 3s 上限，磁盘僵死时也不会把退出挂住。
+            if let tauri::RunEvent::Exit = event {
+                let state = app.state::<AppState>();
+                state.store.flush_logs();
+                let dropped = state.store.log_dropped_count();
+                if dropped > 0 {
+                    // 丢弃必须留痕：静默丢日志是本项目最忌讳的失效形态。
+                    tracing::warn!("本次运行共丢弃 {dropped} 条日志（队列满 / 磁盘写入过慢）");
+                }
+            }
+        });
 }
 
 /// 构建系统托盘（FR-022）
