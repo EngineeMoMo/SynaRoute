@@ -3490,6 +3490,34 @@ impl SseTranslator {
                     "object": "chat.completion.chunk",
                     "choices": [ { "index": 0, "delta": {}, "finish_reason": finish } ]
                 })));
+                // usage 收尾 chunk。**此前这条方向从不发 usage**：`self.input_tokens` /
+                // `output_tokens` 在本方向被写入却永不读出，下游拿不到任何 token 数字。
+                // 与其它四个方向的能力漂移（各自都发 usage），修掉它。
+                //
+                // Chat Completions 的约定是：最后一个 chunk 带 `usage`、`choices` 为空数组
+                // （OpenAI `stream_options.include_usage` 的形状）。取 Responses 事件里的
+                // usage，取不到时回退到流中累积的字段值。
+                let (it, ot) = ev
+                    .get("response")
+                    .and_then(|r| r.get("usage"))
+                    .map(|u| {
+                        (
+                            u.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(self.input_tokens),
+                            u.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(self.output_tokens),
+                        )
+                    })
+                    .unwrap_or((self.input_tokens, self.output_tokens));
+                if it > 0 || ot > 0 {
+                    out.push_str(&sse_data(&json!({
+                        "object": "chat.completion.chunk",
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": it,
+                            "completion_tokens": ot,
+                            "total_tokens": it + ot
+                        }
+                    })));
+                }
                 out
             }
             _ => String::new(),
@@ -3677,6 +3705,31 @@ impl SseTranslator {
     fn anthropic_event_to_chat(&mut self, ev: &Value) -> String {
         let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match ty {
+            // Anthropic 的 token 用量分两处给：message_start 带 input_tokens，
+            // message_delta 带累计的 output_tokens。**此前本方向完全不处理这两个事件**，
+            // 于是 self.input_tokens / output_tokens 永不被写入、也永不发给下游——
+            // 下游拿不到任何 token 数字（其它四个方向都发 usage，这是能力漂移）。
+            "message_start" => {
+                if let Some(it) = ev
+                    .get("message")
+                    .and_then(|m| m.get("usage"))
+                    .and_then(|u| u.get("input_tokens"))
+                    .and_then(|t| t.as_u64())
+                {
+                    self.input_tokens = it;
+                }
+                String::new()
+            }
+            "message_delta" => {
+                if let Some(ot) = ev
+                    .get("usage")
+                    .and_then(|u| u.get("output_tokens"))
+                    .and_then(|t| t.as_u64())
+                {
+                    self.output_tokens = ot;
+                }
+                String::new()
+            }
             "content_block_start" => {
                 let idx = ev.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                 let block = ev.get("content_block");
@@ -3757,11 +3810,23 @@ impl SseTranslator {
                 // 有工具调用时 finish_reason 必须是 tool_calls：报 stop 会让下游客户端
                 // 认定本轮结束而不执行工具（与 →Anthropic 方向的 stop_reason 同一道理）。
                 let finish = if self.tool_calls.is_empty() { "stop" } else { "tool_calls" };
-                let chunk = json!({
+                let mut out = sse_data(&json!({
                     "object": "chat.completion.chunk",
                     "choices": [ { "index": 0, "delta": {}, "finish_reason": finish }]
-                });
-                sse_data(&chunk)
+                }));
+                // usage 收尾 chunk（Chat Completions 约定：末片带 usage、choices 为空数组）。
+                if self.input_tokens > 0 || self.output_tokens > 0 {
+                    out.push_str(&sse_data(&json!({
+                        "object": "chat.completion.chunk",
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": self.input_tokens,
+                            "completion_tokens": self.output_tokens,
+                            "total_tokens": self.input_tokens + self.output_tokens
+                        }
+                    })));
+                }
+                out
             }
             _ => String::new(),
         }
@@ -4261,6 +4326,64 @@ fn apply_models_auth(req: reqwest::RequestBuilder, secret: &str) -> reqwest::Req
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P3-1：两个 `→Chat` 方向必须发 usage 收尾 chunk。
+    ///
+    /// 这是一处**能力漂移**：另外四个方向都发 usage，只有 `anthropic_event_to_chat` 与
+    /// `responses_event_to_chat` 不发——它们的 `self.input_tokens/output_tokens` 被写入
+    /// （或压根没被写入）却永不读出，下游拿不到任何 token 数字，用户无法核对额度消耗。
+    /// 成因是流式转换是「第二套矩阵」（6 个手写有向方法），改一处不会强制改另一处。
+    ///
+    /// 故障注入判据：删掉任一方向的 usage chunk，对应断言立刻变红。
+    #[test]
+    fn both_to_chat_directions_emit_usage() {
+        // ---- Anthropic → Chat ----
+        let mut t = SseTranslator::new(SseDirection::AnthropicToChat);
+        // Anthropic 分两处给用量：message_start 带 input，message_delta 带累计 output
+        let out = t.push(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude\",\"usage\":{\"input_tokens\":120}}}\n\n",
+        );
+        assert!(!out.contains("usage"), "message_start 阶段不该提前发 usage");
+        t.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n");
+        t.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":34}}\n\n");
+        let tail = t.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        assert!(
+            tail.contains("\"prompt_tokens\":120"),
+            "Anthropic→Chat 必须把 input_tokens 作为 prompt_tokens 发出: {tail}"
+        );
+        assert!(
+            tail.contains("\"completion_tokens\":34"),
+            "Anthropic→Chat 必须把 output_tokens 作为 completion_tokens 发出: {tail}"
+        );
+        assert!(tail.contains("\"total_tokens\":154"), "总数应为 120+34: {tail}");
+
+        // ---- Responses → Chat ----
+        let mut t2 = SseTranslator::new(SseDirection::ResponsesToChat);
+        t2.push(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n");
+        let tail2 = t2.push(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n\n",
+        );
+        assert!(
+            tail2.contains("\"prompt_tokens\":7") && tail2.contains("\"completion_tokens\":9"),
+            "Responses→Chat 必须发 usage: {tail2}"
+        );
+        assert!(tail2.contains("\"total_tokens\":16"), "总数应为 7+9: {tail2}");
+        // Chat Completions 的约定：带 usage 的末片 choices 为空数组
+        assert!(
+            tail2.contains("\"choices\":[]"),
+            "usage chunk 的 choices 应为空数组（OpenAI include_usage 形状）: {tail2}"
+        );
+
+        // 无用量时不硬造 0（如实陈述「上游没给」，与 extract_usage 返回 None 同一原则）
+        let mut t3 = SseTranslator::new(SseDirection::ResponsesToChat);
+        let tail3 = t3.push(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        );
+        assert!(
+            !tail3.contains("usage"),
+            "上游没给用量时不应发 usage chunk（不写 0 冒充）: {tail3}"
+        );
+    }
 
     /// 重试判定必须只看**结构化状态码**，不做文本嗅探。
     ///
