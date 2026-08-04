@@ -1,0 +1,52 @@
+: 来源等级：**按 OpenAI Responses 流式规范构造**（非抓包）。
+: 原因同 upstream_chat.sse：本机日志里没有 Responses 上游的真实响应体，抓新的需要真实 API Key。
+: 构造时对齐规范的事件谱与嵌套形态（item 先 added、增量、再 done；usage 只在 response.completed 里）。
+: **若日后抓到真流，应整份替换本文件并把本行改成真实来源。**
+: 事件谱：created → in_progress → item.added(message) → reasoning_summary_text.delta×2
+:        → output_text.delta×3(含中文) → output_text.done → item.done(message)
+:        → item.added(function_call) → function_call_arguments.delta×2 → item.done(function_call)
+:        → response.completed(usage)
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_upstream_01","object":"response","status":"in_progress","model":"gpt-5.5","output":[]}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"resp_upstream_01","status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_upstream_02","type":"message","role":"assistant","content":[]}}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","item_id":"msg_upstream_02","output_index":0,"summary_index":0,"delta":"用户问天气，"}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","item_id":"msg_upstream_02","output_index":0,"summary_index":0,"delta":"需要调用工具。"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_upstream_02","output_index":0,"content_index":0,"delta":"我来帮你查一下"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_upstream_02","output_index":0,"content_index":0,"delta":"北京的天气"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_upstream_02","output_index":0,"content_index":0,"delta":"。"}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","item_id":"msg_upstream_02","output_index":0,"content_index":0,"text":"我来帮你查一下北京的天气。"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_upstream_02","type":"message","role":"assistant","content":[{"type":"output_text","text":"我来帮你查一下北京的天气。"}]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_upstream_01","type":"function_call","call_id":"call_upstream_2","name":"get_weather","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_upstream_01","output_index":1,"delta":"{\"city\":"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_upstream_01","output_index":1,"delta":"\"北京\"}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":1,"item":{"id":"fc_upstream_01","type":"function_call","call_id":"call_upstream_2","name":"get_weather","arguments":"{\"city\":\"北京\"}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_upstream_01","object":"response","status":"completed","model":"gpt-5.5","usage":{"input_tokens":128,"output_tokens":42,"total_tokens":170}}}

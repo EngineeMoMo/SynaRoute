@@ -1,0 +1,2 @@
+# SSE 夹具与黄金输出做逐字节比对，Windows 上 git 默认的 LF→CRLF 转换会让新克隆一测就红。
+*.sse text eol=lf

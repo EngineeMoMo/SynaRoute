@@ -1,0 +1,33 @@
+: 来源等级：**按 OpenAI Chat Completions 流式规范构造**（非抓包）。
+: 原因：本机运行日志里只留下了一份 Anthropic 上游的真实响应体，没有 Chat 上游的；
+: 而抓一份新的需要真实厂商 API Key，此处不具备条件。构造时严格对齐规范的分片形态：
+:   - 首片带 role，后续片只带增量；
+:   - reasoning_content 是 DeepSeek/GLM 等推理模型的事实标准字段（非 OpenAI 官方，但本项目要转它）；
+:   - tool_calls 首片带 id+name，后续片只带 arguments 片段，且 index 用于拼装；
+:   - include_usage 时末尾有一片 choices 为空、只带 usage 的独立片；
+:   - 流尾是 data: [DONE]。
+: **若日后抓到真流，应整份替换本文件并把本行改成真实来源** —— 手写夹具能守住「重构前后行为一致」，
+: 但守不住「我们对上游形态的理解本身就错了」。
+: 事件谱：role 首片 → reasoning_content×2 → content×3(含中文) → tool_calls 分片×2
+:        → finish_reason:tool_calls → usage 独立片 → [DONE]
+data: {"id":"chatcmpl-upstream01","object":"chat.completion.chunk","created":1730000000,"model":"glm-4.6","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-upstream01","object":"chat.completion.chunk","created":1730000000,"model":"glm-4.6","choices":[{"index":0,"delta":{"reasoning_content":"用户问天气，"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-upstream01","object":"chat.completion.chunk","created":1730000000,"model":"glm-4.6","choices":[{"index":0,"delta":{"reasoning_content":"需要调用工具查询。"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-upstream01","object":"chat.completion.chunk","created":1730000000,"model":"glm-4.6","choices":[{"index":0,"delta":{"content":"我来帮你查一下"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-upstream01","object":"chat.completion.chunk","created":1730000000,"model":"glm-4.6","choices":[{"index":0,"delta":{"content":"北京的天气"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-upstream01","object":"chat.completion.chunk","created":1730000000,"model":"glm-4.6","choices":[{"index":0,"delta":{"content":"。"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-upstream01","object":"chat.completion.chunk","created":1730000000,"model":"glm-4.6","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_upstream_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-upstream01","object":"chat.completion.chunk","created":1730000000,"model":"glm-4.6","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"北京\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-upstream01","object":"chat.completion.chunk","created":1730000000,"model":"glm-4.6","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-upstream01","object":"chat.completion.chunk","created":1730000000,"model":"glm-4.6","choices":[],"usage":{"prompt_tokens":128,"completion_tokens":42,"total_tokens":170}}
+
+data: [DONE]

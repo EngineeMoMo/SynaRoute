@@ -3115,7 +3115,9 @@ pub fn sse_direction(downstream: Protocol, upstream: Protocol) -> Option<SseDire
 /// 内部按行缓冲——上游一个 chunk 可能切在半行中间，累积到 `\n` 才处理整行。
 pub struct SseTranslator {
     dir: SseDirection,
-    buf: String,
+    /// 未处理完的上游字节。**缓冲字节而非字符串**：多字节字符可能被 TCP 分段切开，
+    /// 逐块解码会把它腐蚀成 U+FFFD（详见 push 的注释）。
+    buf: Vec<u8>,
     /// 目标形态里输出消息/响应的 id（首次需要时惰性生成）。
     resp_id: String,
     msg_id: String,
@@ -3181,7 +3183,7 @@ impl SseTranslator {
     pub fn with_namespaces(dir: SseDirection, tool_namespaces: Vec<String>) -> Self {
         Self {
             dir,
-            buf: String::new(),
+            buf: Vec::new(),
             resp_id: format!("resp_{}", uuid_like()),
             msg_id: format!("msg_{}", uuid_like()),
             started: false,
@@ -3223,13 +3225,25 @@ impl SseTranslator {
     }
 
     /// 喂入一块上游字节，返回应发给下游的 SSE 文本（可能为空）。
+    ///
+    /// **缓冲的是字节而不是字符串**，且只对**完整行**解码 —— 这一点是必须的，不是风格问题。
+    /// 原先写的是 `buf.push_str(&String::from_utf8_lossy(chunk))`：对每一块入参各自解码。
+    /// 而上游是流式的，一个 3 字节的中文字符完全可能被 TCP 分段切开、分两次 push 进来，
+    /// 逐块解码时前后两半各自都是非法 UTF-8、各自被替换成 U+FFFD，
+    /// 于是用户看到的回答里凭空出现「」。
+    ///
+    /// 按完整行解码则安全：SSE 协议保证上游按行发 JSON，行内必然是完整的 UTF-8 序列。
+    /// 回归测试见 `sse_multibyte_text_survives_arbitrary_chunk_boundaries`。
     pub fn push(&mut self, chunk: &[u8]) -> String {
-        self.buf.push_str(&String::from_utf8_lossy(chunk));
+        self.buf.extend_from_slice(chunk);
         let mut out = String::new();
         // 逐个完整行处理，保留最后不完整的一段在 buf。
-        while let Some(nl) = self.buf.find('\n') {
-            let line: String = self.buf.drain(..=nl).collect();
-            let line = line.trim_end_matches(['\r', '\n']);
+        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
+            // raw 是独立的 owned Vec，text 借的是 raw 而非 self，
+            // 故下面调 `self.process_line(&mut self, ..)` 不会撞借用检查。
+            let raw: Vec<u8> = self.buf.drain(..=nl).collect();
+            let text = String::from_utf8_lossy(&raw);
+            let line = text.trim_end_matches(['\r', '\n']);
             if let Some(ev) = self.process_line(line) {
                 out.push_str(&ev);
             }
@@ -4354,6 +4368,9 @@ fn apply_models_auth(req: reqwest::RequestBuilder, secret: &str) -> reqwest::Req
     req.header("authorization", format!("Bearer {secret}"))
         .header("x-api-key", secret)
 }
+
+#[cfg(test)]
+mod sse_golden;
 
 #[cfg(test)]
 mod tests {
@@ -5944,6 +5961,48 @@ data: [DONE]\n";
         assert!(out.contains("event: message_stop"), "缺 message_stop");
         // 纯文本流不得声明工具：stop_reason 必须是 end_turn。
         assert!(out.contains("\"stop_reason\":\"end_turn\""), "纯文本应 end_turn:\n{out}");
+    }
+
+    /// 中文不得因 TCP 分段而腐蚀成 `�`（真实缺陷回归）。
+    ///
+    /// 缺陷形态：`push` 原先对**每一块**入参做 `String::from_utf8_lossy`。而上游是流式的，
+    /// 一个 3 字节的中文字符完全可能被 TCP 分段切开、分两次 `push` 进来 ——
+    /// 逐块解码时前半截和后半截各自都是非法 UTF-8，各自被替换成 U+FFFD，
+    /// 于是用户看到的回答里凭空出现「」。
+    ///
+    /// 为什么此前没被发现：所有既有流式测试都是**整行整块**喂进去的，永远切不断字符。
+    /// 而真机上分段位置由网络决定，表现为「中文偶尔乱码、重试一次又好了」——
+    /// 典型的没人能稳定复现、最后归咎于「上游抽风」的那类问题。
+    ///
+    /// 判据：逐字节喂入（最狠的切分）的输出，必须与整块喂入完全一致。
+    #[test]
+    fn sse_multibyte_text_survives_arbitrary_chunk_boundaries() {
+        // 含中文的文本增量。注意「你好，世界」每个字都是 3 字节。
+        let raw = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你好，世界\"}}\n\n";
+
+        let whole = {
+            let mut tr = SseTranslator::new(SseDirection::AnthropicToChat);
+            let mut o = tr.push(raw.as_bytes());
+            o.push_str(&tr.finish());
+            o
+        };
+
+        let by_byte = {
+            let mut tr = SseTranslator::new(SseDirection::AnthropicToChat);
+            let mut o = String::new();
+            for b in raw.as_bytes() {
+                o.push_str(&tr.push(&[*b]));
+            }
+            o.push_str(&tr.finish());
+            o
+        };
+
+        assert!(whole.contains("你好，世界"), "整块喂入本就应该是好的：\n{whole}");
+        assert!(
+            !by_byte.contains('\u{FFFD}'),
+            "逐字节喂入出现了替换字符 U+FFFD —— 中文被 TCP 分段切开后腐蚀了：\n{by_byte}"
+        );
+        assert_eq!(by_byte, whole, "翻译结果必须与字节切分方式无关");
     }
 
     /// 把 SSE 文本里的所有 `data:` 行解析成 JSON 值，便于对结构做精确断言

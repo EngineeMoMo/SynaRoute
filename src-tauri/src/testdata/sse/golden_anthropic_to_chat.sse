@@ -1,0 +1,12 @@
+data: {"choices":[{"delta":{"content":"你好！我是一个编程助手，可以帮你处理代码与调试相关的任务"},"finish_reason":null,"index":0}],"object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"。\n\n当前工作区是空的。有什么我可以"},"finish_reason":null,"index":0}],"object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"帮你的吗？比如写代码、调试、分析项目。"},"finish_reason":null,"index":0}],"object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"object":"chat.completion.chunk"}
+
+data: {"choices":[],"object":"chat.completion.chunk","usage":{"completion_tokens":67,"prompt_tokens":3629,"total_tokens":3696}}
+
+data: [DONE]
+

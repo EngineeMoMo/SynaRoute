@@ -1,0 +1,24 @@
+event: response.created
+data: {"response":{"id":"<RESP>","model":"claude-opus-4.8","object":"response","status":"in_progress"},"type":"response.created"}
+
+event: response.output_item.added
+data: {"item":{"content":[],"id":"<MSG>","role":"assistant","status":"in_progress","type":"message"},"output_index":0,"type":"response.output_item.added"}
+
+event: response.output_text.delta
+data: {"content_index":0,"delta":"你好！我是一个编程助手，可以帮你处理代码与调试相关的任务","item_id":"<MSG>","output_index":0,"type":"response.output_text.delta"}
+
+event: response.output_text.delta
+data: {"content_index":0,"delta":"。\n\n当前工作区是空的。有什么我可以","item_id":"<MSG>","output_index":0,"type":"response.output_text.delta"}
+
+event: response.output_text.delta
+data: {"content_index":0,"delta":"帮你的吗？比如写代码、调试、分析项目。","item_id":"<MSG>","output_index":0,"type":"response.output_text.delta"}
+
+event: response.output_text.done
+data: {"content_index":0,"item_id":"<MSG>","output_index":0,"text":"你好！我是一个编程助手，可以帮你处理代码与调试相关的任务。\n\n当前工作区是空的。有什么我可以帮你的吗？比如写代码、调试、分析项目。","type":"response.output_text.done"}
+
+event: response.output_item.done
+data: {"item":{"content":[{"annotations":[],"text":"你好！我是一个编程助手，可以帮你处理代码与调试相关的任务。\n\n当前工作区是空的。有什么我可以帮你的吗？比如写代码、调试、分析项目。","type":"output_text"}],"id":"<MSG>","role":"assistant","status":"completed","type":"message"},"output_index":0,"type":"response.output_item.done"}
+
+event: response.completed
+data: {"response":{"id":"<RESP>","model":"claude-opus-4.8","object":"response","output":[{"content":[{"annotations":[],"text":"你好！我是一个编程助手，可以帮你处理代码与调试相关的任务。\n\n当前工作区是空的。有什么我可以帮你的吗？比如写代码、调试、分析项目。","type":"output_text"}],"id":"<MSG>","role":"assistant","status":"completed","type":"message"}],"status":"completed","usage":{"input_tokens":3629,"output_tokens":67,"total_tokens":3696}},"type":"response.completed"}
+
