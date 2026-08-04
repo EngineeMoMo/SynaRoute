@@ -120,6 +120,11 @@ export function SettingsPage() {
     if (!mcpEnabled) setMcp(null);
   }, [mcpEnabled]);
   // `enabled` 跟随 MCP 开关；窗口不可见时停表（见 usePolling）。
+  //
+  // **刻意保留 3s、不改成 30s 兜底**（UX#5 的例外）：MCP 是独立的服务进程，后端没有它的
+  // 状态变更信号可推；而这个数字恰恰是用户刚点完开关后**盯着看**的东西
+  //（「启动中」→「运行中」，或启动失败的原因）。拉长到 30s 会把一个即时反馈变成
+  // 「点了没反应」。它只在 MCP 开着时才跑，代价可控。
   usePolling(
     () => {
       void api.mcpStatus().then((s) => setMcp(s)).catch(() => {

@@ -1,4 +1,5 @@
 import { usePolling } from "@/lib/usePolling";
+import { FALLBACK_POLL_MS } from "@/lib/useBackendEvents";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/bridge";
 import { useStore } from "@/store";
@@ -979,7 +980,12 @@ function WorkDirBlock({
 /** 显示当前检测到的活跃项目（每 5s 刷新）。auto_follow 模式下取代 workDir 字段。 */
 function ActiveProjectDisplay({ t }: { t: TFunc }) {  const [active, setActive] = useState<RecentWorkdir | null>(null);
 
-  // 窗口不可见时停表（见 usePolling）。这条尤其值得——它每 5s 起一次子进程级的工作目录探测。
+  // 拉长到 30s（UX#5）。这条尤其值得——它每次都要起一次子进程级的工作目录探测，
+  // 是全应用最贵的一个定时任务。**后端无从推送**：活跃项目的判据是外部文件系统状态
+  // （别的进程刚动过哪个目录），SynaRoute 不知道它何时变，所以这里只能是轮询。
+  // 30s 的代价是「用户切了项目目录后最多等 30s 才显示」——而用户在大脑页通常是在配置，
+  // 不是在盯这个数字变化，这个延迟换掉 6 倍的探测开销是划算的。
+  // 窗口不可见时停表（见 usePolling）。
   usePolling(() => {
     void (async () => {
       try {
@@ -989,7 +995,7 @@ function ActiveProjectDisplay({ t }: { t: TFunc }) {  const [active, setActive] 
         setActive(null);
       }
     })();
-  }, 5000);
+  }, FALLBACK_POLL_MS);
 
   const formatAge = (ts?: number) => {
     if (!ts) return "";

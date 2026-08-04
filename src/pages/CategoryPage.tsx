@@ -1,4 +1,5 @@
 import { usePolling } from "@/lib/usePolling";
+import { useBackendEvent, FALLBACK_POLL_MS } from "@/lib/useBackendEvents";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "@/store";
 import { KeyCard } from "@/components/KeyCard";
@@ -30,9 +31,11 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
   const [gapDialogOpen, setGapDialogOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
 
-  // 窗口不可见时自动停表（见 usePolling）。注意这里**不再**在挂载时单独 refresh 一次——
-  // usePolling 自己会立即执行一次。
-  usePolling(() => void refreshCategory(), 5000);
+  // 兜底轮询（UX#5）。真正的实时性由 App 层的 useBackendEvents 承担：代理启停、
+  // 配置落盘、健康态翻转会被后端主动推过来、界面即时跟随。这里退成 30s 只为兜住
+  // 「推送队列满被丢」与「监听注册前的窗口」两种漏网情况。
+  // 窗口不可见时自动停表（见 usePolling）。挂载时 usePolling 自己会立即执行一次。
+  usePolling(() => void refreshCategory(), FALLBACK_POLL_MS);
 
   // 排序：按优先级
   const sorted = useMemo(
@@ -72,10 +75,15 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
   }, [activeCategory]);
 
   // 桌面端接入是否已被其他工具接管（cc-switch 重写 _meta.json）。
-  // 只对桌面端查，且跟随 5s 轮询刷新——用户可能在 SynaRoute 开着的时候去点 cc-switch。
+  //
+  // **这条只能轮询**（UX#5 的另一个例外）：判据是**外部文件**被别的程序改写，
+  // 后端不知道它何时变，除非加一套文件监视 —— 那是另一套机制，而接管是低频事件。
+  //
+  // 拉长到 30s 不会让用户等：`usePolling` 有「窗口重新可见时立即补一次」的语义，
+  // 而这里的真实场景恰恰是「用户切到 cc-switch 点了一下，再切回 SynaRoute」——
+  // 切回来那一刻就会刷新，根本走不到周期。
   const isDesktop = activeCategory === "claude-desktop";
   // `enabled` 只对桌面端开：其余分类没有「被 cc-switch 接管」这回事，不必白问。
-  // 窗口不可见时停表（见 usePolling）。
   usePolling(
     () => {
       const gen = genRef.current;
@@ -88,22 +96,27 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
           // 预览读不出来（路径不存在等）不影响主界面，静默即可
         });
     },
-    5000,
+    FALLBACK_POLL_MS,
     isDesktop,
   );
 
   // 密钥库是否锁着（主口令模式尚未解锁）。锁着时**每一次转发都会失败**，
   // 而失败原因藏在运行日志里 —— 必须在最显眼的位置常驻提示，否则用户会以为 Key 配错了。
-  // 跟随 5s 轮询：用户可能在设置页解锁后切回来，也可能点了「立即锁定」。
   // 这条与分类无关（全局密钥库），故不参与代际作废。
-  usePolling(() => {
+  //
+  // 锁/解锁由后端 `vault` 主题即时推送（在设置页点「立即锁定」后切回本页应已是最新），
+  // 30s 轮询只作兜底。刻意留在本页而不搬进 App 层 hub：状态就在这里用，
+  // 提到全局反而多一层传递。
+  const refreshVault = () => {
     void api
       .getMasterPasswordState()
       .then((s) => setVaultLocked(s.enabled && s.locked))
       .catch(() => {
         // 读不到就不提示（宁可漏提示，也不要因一次 IPC 抖动弹个假警告）
       });
-  }, 5000);
+  };
+  useBackendEvent(["vault"], refreshVault);
+  usePolling(refreshVault, FALLBACK_POLL_MS);
 
   /**
    * 最近一次转发失败（UX#11）。
@@ -123,7 +136,7 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
    * 就会把「Codex 刚失败」的红条挂到 Claude CLI 页上（详见 genRef 的注释）。
    */
   const FRESH_MS = 5 * 60 * 1000; // 5 分钟内的失败才算「最近」
-  usePolling(() => {
+  const refreshRecentFailure = () => {
     const gen = genRef.current;
     const cat = activeCategory;
     void api
@@ -134,7 +147,12 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
       .catch(() => {
         // 读不到就不提示（宁可漏提示，也不要因一次 IPC 抖动弹个假警告）
       });
-  }, 5000);
+  };
+  // 订阅 `logs`：转发失败会写事件，所以这条横幅要跟着日志走而不是跟着配置走。
+  // 后端已对 logs 主题限速 1500ms（见 events.rs 的 min_interval_ms），
+  // 密集失败时不会把这个查询打成高频。
+  useBackendEvent(["logs"], refreshRecentFailure);
+  usePolling(refreshRecentFailure, FALLBACK_POLL_MS);
 
   return (
     <div className="flex h-full flex-col">

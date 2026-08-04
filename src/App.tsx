@@ -13,6 +13,7 @@ import { Toast } from "@/components/Toast";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { ConfigAppliedDialog } from "@/components/ConfigAppliedDialog";
 import { useStore, applyTheme } from "@/store";
+import { useBackendEvents } from "@/lib/useBackendEvents";
 import { isTauri } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
 import type { CategoryType, ProviderKey } from "@/types";
@@ -30,6 +31,10 @@ export default function App() {
   const refreshCategory = useStore((s) => s.refreshCategory);
   const onboarding = useStore((s) => s.onboarding);
   const loadOnboarding = useStore((s) => s.loadOnboarding);
+
+  // 后端状态推送（UX#5）：代理启停、配置落盘、健康态翻转、托盘快切模型等
+  // 会由后端主动推过来，界面即时跟随；各页轮询退成 30s 兜底。
+  useBackendEvents();
   const theme = useStore((s) => s.theme);
   const t = useT();
   const [nav, setNav] = useState<NavKey>("claude-cli");

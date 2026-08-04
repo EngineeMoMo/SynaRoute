@@ -321,6 +321,15 @@ impl Store {
         // 先写文件：文件是逐条完整的事实来源，不受下面的界面折叠影响。
         self.write_log_to_file(&entry);
 
+        // 内存态的写入抽成独立方法，让 events 写锁**随该方法返回即释放** ——
+        // 原先这把锁活到函数末尾（且折叠分支还会中途 return），emit 无处可放。
+        // 「emit 前放光锁」的纪律见 events::emit 的文档。
+        self.push_event_in_memory(entry, collapse_key);
+        crate::events::emit(crate::events::Topic::Logs, Some(category));
+    }
+
+    /// 把一条事件并入内存环形缓冲（含折叠）。调用返回即释放 events 写锁。
+    fn push_event_in_memory(&self, entry: EventLogEntry, collapse_key: Option<String>) {
         let mut ev = self.events.write();
         // 折叠：仅当本条带 collapse_key 且与**最后一条**相同。
         if let Some(ck) = &collapse_key {
@@ -624,7 +633,12 @@ impl Store {
             return Ok(value);
         }
         match self.persist() {
-            Ok(()) => Ok(value),
+            Ok(()) => {
+                // 配置落盘的 choke point 之一（UX#5）。此处写锁已在上面的块里释放、
+                // persist 也已返回，不持有任何 guard —— 满足「emit 前必须放光锁」的纪律。
+                crate::events::emit(crate::events::Topic::Config, None);
+                Ok(value)
+            }
             Err(e) => {
                 // 与 mutate_and_persist 同一套：从磁盘对账回滚，既撤销本次未落盘的脏改，
                 // 又保留并发写者已提交的变更（详见那个函数的文档）。
@@ -653,7 +667,11 @@ impl Store {
         };
         match outcome {
             Ok(value) => match self.persist() {
-                Ok(()) => Ok(value),
+                Ok(()) => {
+                    // 配置落盘的 choke point 之二（UX#5）。同样已无锁在手。
+                    crate::events::emit(crate::events::Topic::Config, None);
+                    Ok(value)
+                }
                 Err(e) => {
                     self.rollback_from_disk(snapshot);
                     Err(e)
@@ -1188,6 +1206,18 @@ impl Store {
     where
         F: FnOnce(&mut HealthState) -> bool,
     {
+        // 健康态的**可见摘要**：只含真正会上屏的两项。
+        //
+        // 这是 UX#5 里推送去抖的关键判断：`mutate_health` 确实是高频后台写
+        // （每请求收尾 + 每轮探测 × 每条 Key），但**它的高频部分恰好不改变界面**——
+        // `record_live_failure` 每次都改 fail_count（所以落盘判据恒真），可 HealthBadge
+        // 根本不显示 fail_count；探测每轮都刷 latency/last_checked，那两个只进 title 提示。
+        //
+        // 所以这里按「可见摘要变没变」决定推不推，而不是按「有没有落盘」。
+        // **摘要法是语义正确的去抖，比定时去抖更好**：定时去抖会让一次真实的 up↔down 翻转
+        // 最坏晚 N 毫秒才到；摘要法是「变了就立刻到、没变就一次都不发」。
+        // 实际推送频率因此降到每条 Key 每分钟个位数（翻转、熔断武装、熔断解除）。
+        let digest_before = self.health_visible_digest(key_id);
         let need_persist = {
             let mut cfg = self.config.write();
             match cfg.keys.iter_mut().find(|k| k.id == key_id) {
@@ -1195,6 +1225,12 @@ impl Store {
                 None => false,
             }
         };
+        // 读摘要要在写锁**释放之后**（health_visible_digest 内部自己取读锁，
+        // parking_lot 不可重入，在写锁里调它会死锁）。
+        let digest_after = self.health_visible_digest(key_id);
+        if digest_before != digest_after {
+            crate::events::emit(crate::events::Topic::Health, None);
+        }
         if need_persist {
             // **标脏，不在此落盘**（P1-3 后半）。转发热路径上的 record_live_failure/success
             // 会走到这里，而 persist() 要序列化整份 AppConfig（实测 ~20KB）再走 atomic_write
@@ -1207,6 +1243,21 @@ impl Store {
             self.mark_health_dirty();
         }
         Ok(())
+    }
+
+    /// 一条 Key 的健康**可见摘要**：`(状态, 是否处于熔断中)`。
+    ///
+    /// 只含真正会上屏的两项。`fail_count` / `latency_ms` / `last_checked` 刻意不算进来 ——
+    /// 它们每次转发、每轮探测都在变，但 HealthBadge 要么不显示、要么只放进 title 提示，
+    /// 把它们算进摘要会让推送退化回「和轮询一样吵」。
+    ///
+    /// Key 不存在时返回 None，与「存在但状态未知」区分开（删除一条 Key 也是可见变化）。
+    fn health_visible_digest(&self, key_id: &str) -> Option<(HealthStatus, bool)> {
+        let cfg = self.config.read();
+        cfg.keys
+            .iter()
+            .find(|k| k.id == key_id)
+            .map(|k| (k.health.status, k.health.breaker_until.is_some()))
     }
 
     /// 标记「健康态有未落盘的变更」。由 `flush_health_if_dirty` 合并落盘。
@@ -1249,6 +1300,8 @@ impl Store {
     ///
     /// 换言之：这里容忍「内存领先磁盘」，因为该背离会被下一次流量自动抹平。
     pub fn update_health(&self, key_id: &str, health: HealthState) -> AppResult<()> {
+        // 与 mutate_health 同一套「可见摘要」判据（见那里的长注释）。
+        let digest_before = self.health_visible_digest(key_id);
         let changed = {
             let mut cfg = self.config.write();
             if let Some(k) = cfg.keys.iter_mut().find(|k| k.id == key_id) {
@@ -1261,6 +1314,10 @@ impl Store {
                 false
             }
         };
+        // 摘要必须在写锁释放之后读（parking_lot 不可重入）。
+        if digest_before != self.health_visible_digest(key_id) {
+            crate::events::emit(crate::events::Topic::Health, None);
+        }
         if changed {
             // 同 `mutate_health`：标脏由后台合并落盘，不在调用线程上做 20KB 序列化 + atomic_write。
             self.mark_health_dirty();
@@ -1668,7 +1725,12 @@ impl Store {
                     .insert(category.to_string(), trimmed.to_string());
                 true
             }
-        })
+        })?;
+        // 推 Settings 而非 Config（UX#5）。放在 store 层是为了让**两个入口都覆盖**：
+        // 主窗口的 set_active_model 命令，以及托盘的 Codex 模型快切。
+        // 后者原先改完主窗口下拉永远不跟着变（既有缺陷），本项顺带修掉。
+        crate::events::emit(crate::events::Topic::Settings, None);
+        Ok(())
     }
 
     /// 设置某分类的「默认推理强度」（Codex 用；后端自管字段专用写入，绕过 save_settings 旧快照覆盖）。
@@ -1688,7 +1750,10 @@ impl Store {
                     .insert(category.to_string(), trimmed.to_string());
                 true
             }
-        })
+        })?;
+        // 同 set_active_model：命令与托盘两条路径共用这一处推送。
+        crate::events::emit(crate::events::Topic::Settings, None);
+        Ok(())
     }
 
     /// 设置某分类代理的首选端口（粘滞：绑定回退后写回实际端口作下次首选，或前端手改端口）。
@@ -2926,8 +2991,63 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 首启向导标记必须扛得住「前端切主题时提交的旧快照」（UX#1）。
+    /// 健康「可见摘要」只含真正会上屏的两项 —— 这是状态推送去抖的判据（UX#5）。
     ///
+    /// 为什么要钉住：`fail_count` / `latency_ms` / `last_checked` **每次转发、每轮探测都在变**，
+    /// 但界面上要么不显示、要么只进 title 提示。哪天有人「顺手」把它们加进摘要，
+    /// 推送就会退化回「和 2 秒轮询一样吵」，而且没有任何测试会红、没有任何报错 ——
+    /// 只是电脑变烫、日志页疯狂重拉。这条测试就是为了让那次改动立刻变红。
+    #[test]
+    fn health_visible_digest_ignores_invisible_churn() {
+        let dir = temp_dir("health_digest");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        store.upsert_key(sample_key("k1", 0)).unwrap();
+
+        let base = store.health_visible_digest("k1");
+        assert!(base.is_some(), "存在的 Key 应有摘要");
+
+        // 只动不上屏的字段：摘要必须不变（否则每次转发都会推一条）
+        store
+            .mutate_health("k1", |h| {
+                h.fail_count += 7;
+                h.latency_ms = Some(999);
+                h.last_checked = Some(123_456);
+                h.last_live_success = Some(123_456);
+                true
+            })
+            .unwrap();
+        assert_eq!(
+            store.health_visible_digest("k1"),
+            base,
+            "fail_count/latency/last_checked 变化不该触发推送——它们不上屏，却每次请求都在变"
+        );
+
+        // 动状态：摘要必须变
+        store
+            .mutate_health("k1", |h| {
+                h.status = HealthStatus::Down;
+                true
+            })
+            .unwrap();
+        let after_down = store.health_visible_digest("k1");
+        assert_ne!(after_down, base, "up→down 是可见变化，必须推送");
+
+        // 武装熔断：摘要必须变
+        store
+            .mutate_health("k1", |h| {
+                h.breaker_until = Some(9_999_999);
+                true
+            })
+            .unwrap();
+        assert_ne!(store.health_visible_digest("k1"), after_down, "熔断武装是可见变化，必须推送");
+
+        // 不存在的 Key 返回 None，与「存在但状态未知」区分开
+        assert_eq!(store.health_visible_digest("nope"), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 首启向导标记必须扛得住「前端切主题时提交的旧快照」（UX#1）。
     /// 这是本仓修过的那个 P0 的同一形态：`store.settings` 是前端挂载时的快照，
     /// 用户走完向导后随手切个主题，那份**不含 onboarding_done 的**旧对象就会整份提交回来。
     /// 没有保留防线的话标记被顶回 None，下次启动向导又冒出来 —— 而用户明明已经配好了。

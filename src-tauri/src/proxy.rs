@@ -331,18 +331,36 @@ impl ProxyManager {
             category.as_str().to_string(),
             RunningProxy { port, handle, shutdown: shutdown_tx },
         );
+        // 显式放锁再 emit。这个 guard 是在 318 行取的、本来会活到函数末尾 ——
+        // 「emit 前放光锁」的纪律见 events::emit 的文档。
+        drop(running);
+        crate::events::emit(crate::events::Topic::Proxy, Some(category));
         Ok(port)
     }
 
     pub fn stop(&self, category: CategoryType) {
-        if let Some(p) = self.running.lock().remove(category.as_str()) {
-            // 先广播关闭信号（断开已建立的 keep-alive 连接），再 abort accept 循环。
-            let _ = p.shutdown.send(true);
-            p.handle.abort();
-        }
+        // 必须先把 guard 取出来再用：写成 `if let Some(p) = self.running.lock().remove(..)`
+        // 的话，那个临时 MutexGuard 会活到整个 if-let 语句结束，emit 就落在持锁期间了。
+        // 泵的设计让持锁 emit 也不至于死锁，但「emit 前放光锁」这条纪律要守住 ——
+        // 它防的是将来有人把泵简化掉、换成直接 app.emit 时悄悄埋雷。
+        let was_running = {
+            let mut running = self.running.lock();
+            match running.remove(category.as_str()) {
+                Some(p) => {
+                    // 先广播关闭信号（断开已建立的 keep-alive 连接），再 abort accept 循环。
+                    let _ = p.shutdown.send(true);
+                    p.handle.abort();
+                    true
+                }
+                None => false,
+            }
+        };
         // 停止时也清一次：代理已不在服务，残留的短路窗口对下一次启动毫无意义（语义更干净，
         // 也让「stop → 立刻 start」这条路径不依赖 start 侧的清理）。
         clear_all_failed_gate(&self.gate_key(category));
+        if was_running {
+            crate::events::emit(crate::events::Topic::Proxy, Some(category));
+        }
     }
 }
 

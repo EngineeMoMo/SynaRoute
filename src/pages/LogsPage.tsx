@@ -4,6 +4,7 @@ import { Badge } from "@/components/ui/Badge";
 import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
 import { usePolling } from "@/lib/usePolling";
+import { useBackendEvent, FALLBACK_POLL_MS } from "@/lib/useBackendEvents";
 import type { CategoryType, EventLogEntry, RequestTrace } from "@/types";
 import {
   ArrowLeftRight,
@@ -82,10 +83,17 @@ export function LogsPage() {
   // 排障时找一条具体记录（某个 Key、某个模型、某条错误）非常费劲。
   const [query, setQuery] = useState("");
 
-  // 实时刷新：每 2s 拉一次事件（仅事件，不重载 keys/proxy，开销小）。
-  // 走 usePolling：**窗口不可见时自动停表**，切回来立即补一次（见该 hook 的文档）。
-  // 本页是全应用最密的轮询（2s），最值得省。
-  usePolling(() => void refreshEvents(), 2000);
+  // 实时刷新（UX#5）：改由后端在**有新事件写入时**推送，日志页收到即拉。
+  // 这是全应用最密的轮询（原 2s），也是最值得改成推送的一处：空闲时降到 30s 兜底，
+  // 而有流量时反而比 2s 更及时。
+  //
+  // 后端对 `logs` 主题限速 1500ms（见 events.rs 的 min_interval_ms）——
+  // 转发热路径每次要写好几条事件，不限速的话这里会被打成比原来还高的频率，
+  // 而本页对每次推送的反应是**重拉 500 条事件**。
+  //
+  // 走 usePolling 兜底：窗口不可见时自动停表，切回来立即补一次（见该 hook 的文档）。
+  useBackendEvent(["logs"], () => void refreshEvents());
+  usePolling(() => void refreshEvents(), FALLBACK_POLL_MS);
 
   // 计数与可见列表**一趟算完**（原先是 5 个各自遍历 events 的 useMemo：两个 Record 累加 +
   // 两个 filter().length + 一次 reverse+filter，合计 5 次全量遍历 + 2 次数组拷贝。日志每 2s

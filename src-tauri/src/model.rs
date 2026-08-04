@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// 三个目标工具分类
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CategoryType {
     #[serde(rename = "claude-cli")]
     ClaudeCli,

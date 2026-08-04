@@ -7,6 +7,7 @@ mod ccswitch;
 mod codegraph;
 mod crypto;
 mod error;
+mod events;
 mod health;
 mod mcp;
 mod model;
@@ -179,8 +180,10 @@ fn get_master_password_state(state: tauri::State<AppState>) -> secret::MasterPas
 /// 用主口令解锁本次进程。解锁前取不到任何密钥（转发会报「需解锁」）。
 #[tauri::command]
 fn unlock_master_password(state: tauri::State<AppState>, password: String) -> AppResult<()> {
+    // 写锁在语句结束即释放，emit 在其后（纪律见 events::emit 文档）。
     state.store.secrets.write().unlock(&password)?;
     tracing::info!("密钥库已用主口令解锁");
+    events::emit(events::Topic::Vault, None);
     Ok(())
 }
 
@@ -188,6 +191,7 @@ fn unlock_master_password(state: tauri::State<AppState>, password: String) -> Ap
 #[tauri::command]
 fn lock_master_password(state: tauri::State<AppState>) -> AppResult<()> {
     state.store.secrets.write().lock();
+    events::emit(events::Topic::Vault, None);
     Ok(())
 }
 
@@ -1249,6 +1253,9 @@ async fn export_diagnostics(
     let _ = writeln!(r, "- 配置文件：{}", store.config_path_display());
     let _ = writeln!(r, "- 日志目录：{}", store.effective_log_dir().display());
     let _ = writeln!(r, "- 丢弃日志条数（队列满/磁盘慢）：{}", store.log_dropped_count());
+    // 状态推送也可能丢（队列满）。丢了不影响正确性——前端 30s 兜底轮询会追上——
+    // 但「界面偶尔慢半拍」的排障线索就在这个数字里，必须能被问到。
+    let _ = writeln!(r, "- 丢弃状态推送数（队列满）：{}", events::dropped_count());
     let _ = writeln!(r);
 
     // ---- 代理与 Key 状态 ----
@@ -1747,6 +1754,10 @@ pub fn run() {
         .manage(AppState { store, proxy, mcp })
         .setup(|app| {
             build_tray(app.handle())?;
+            // 状态推送（UX#5）。必须在这里装 —— Store/ProxyManager/后台探测线程都在
+            // tauri::Builder 之前就构造好了，那时还没有 AppHandle（详见 events.rs 模块注释）。
+            // 装好之前的 emit 是空操作，不会 panic。
+            events::init(app.handle());
             let state = app.state::<AppState>();
             let settings = state.store.get_settings();
 
