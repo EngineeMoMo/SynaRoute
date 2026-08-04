@@ -37,3 +37,4 @@ secrets.enc
 *.key
 .tmp-release/
 .codegraph/
+.plans/

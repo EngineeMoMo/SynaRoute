@@ -166,6 +166,16 @@ const zh: Dict = {
   "editor.baseUrlPlaceholder": "https://api.example.com",
   "editor.protocolMismatch": "接口地址看起来是 {guess} 协议，与当前选择不一致——协议选错会导致每次请求都失败。",
   "editor.protocolAdopt": "采纳",
+  // 桌面端对外模型名即时校验（UX#4）。不合规名会被桌面端**静默过滤**，全被过滤则选择器为空。
+  "editor.desktopNameBadRow":
+    "「{name}」会被 Claude 桌面端过滤掉：对外名须含 claude/opus/sonnet/haiku 之一，且不能含 glm/gpt/grok/deepseek 等厂商名。",
+  "editor.desktopNameFixTo": "改为 {name}",
+  "editor.desktopNameBadBanner":
+    "{n} 个对外模型名不被 Claude 桌面端接受。桌面端加载配置时会把它们从模型列表里删掉——全被删完则模型选择器为空、打开会话报 ModelsNotDiscoveredError。",
+  "editor.desktopNameFixAll": "一键加映射（{n} 条）",
+  "editor.desktopNameFixAllHint":
+    "给模型列表里每个模型各加一条映射：不合规的换成建议的合规对外名，其余保持原名。上游仍然请求真实模型名。",
+  "editor.desktopNamePrefixUseless": "注意：claude-synaroute- 前缀对桌面端无效，厂商名黑名单优先。",
   "editor.apiKey": "API 密钥",
   "editor.apiKeyConfigured": "API 密钥（已配置，留空则不修改）",
   "editor.apiKeyPlaceholderNew": "sk-...",
@@ -410,6 +420,9 @@ const zh: Dict = {
   "settings.debug": "调试",
   "settings.reqLogTitle": "记录调用模型日志",
   "settings.reqLogDesc": "开启后，每次代理转发都会完整记录：原始请求、经转换后发往哪个厂商的哪个模型、请求体与上游返回内容，可在运行日志里展开查看。默认关（避免记录请求内容）",
+  // 代价要说清才能让用户正确决策：只写「含敏感信息」他判断不了要不要开。
+  // 两条代价——① 记的是**完整对话正文**（含 system prompt，不只是元数据）；② 日志页刷新开销上升。
+  "settings.reqLogCost": "代价：日志会包含完整对话正文（含 system prompt），且日志页刷新开销上升。排障完成后建议关闭。",
   "settings.rawLogTitle": "附记下游原始请求体（排障用）",
   "settings.rawLogDesc": "仅在「记录调用模型日志」开启时生效。额外在日志里附上客户端（如 Codex）转换前发来的原始请求体，用于核对它到底发了哪些字段。该 body 可达十几万字符，仅排障时临时开启，查完即关。默认关。",
   "settings.aggTraceTitle": "记录大脑聚合详情",
@@ -705,6 +718,16 @@ const en: Dict = {
   "editor.baseUrlPlaceholder": "https://api.example.com",
   "editor.protocolMismatch": "The endpoint looks like the {guess} protocol, which differs from your selection — a wrong protocol makes every request fail.",
   "editor.protocolAdopt": "Use it",
+  "editor.desktopNameBadRow":
+    "Claude Desktop will drop “{name}”: an outward name must contain one of claude/opus/sonnet/haiku and must not contain a vendor name such as glm/gpt/grok/deepseek.",
+  "editor.desktopNameFixTo": "Change to {name}",
+  "editor.desktopNameBadBanner":
+    "{n} outward model names are not accepted by Claude Desktop. It drops them from the model list when loading the config — if all of them are dropped, the model picker is empty and opening a chat throws ModelsNotDiscoveredError.",
+  "editor.desktopNameFixAll": "Add mappings ({n})",
+  "editor.desktopNameFixAllHint":
+    "Adds one mapping for every model in the list: non-compliant ones get a suggested compliant outward name, the rest keep theirs. Requests still hit the real upstream model.",
+  "editor.desktopNamePrefixUseless":
+    "Note: the claude-synaroute- prefix does not help here — the vendor blocklist takes precedence.",
   "editor.apiKey": "API Key",
   "editor.apiKeyConfigured": "API Key (configured; leave blank to keep)",
   "editor.apiKeyPlaceholderNew": "sk-...",
@@ -947,6 +970,7 @@ const en: Dict = {
   "settings.debug": "Debug",
   "settings.reqLogTitle": "Log model calls",
   "settings.reqLogDesc": "When on, every proxied forward is fully recorded: the original request, which vendor/model it was translated and sent to, the request body and the upstream response — expandable in Logs. Off by default (avoids recording request content)",
+  "settings.reqLogCost": "Cost: logs will contain full conversation text (including the system prompt), and the Logs page gets heavier to refresh. Turn this back off once you're done troubleshooting.",
   "settings.rawLogTitle": "Also log downstream raw request (for debugging)",
   "settings.rawLogDesc": "Only takes effect when \"Log model calls\" is on. Additionally records the client's (e.g. Codex) pre-conversion raw request body, to verify exactly which fields it sent. This body can be hundreds of thousands of characters — enable temporarily for debugging, then turn it off. Off by default.",
   "settings.aggTraceTitle": "Log brain aggregation details",

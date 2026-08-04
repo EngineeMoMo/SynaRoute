@@ -525,6 +525,126 @@ pub fn is_desktop_acceptable_model_id(name: &str) -> bool {
         || DESKTOP_ALLOW_KEYWORDS.iter().any(|k| lower.contains(k))
 }
 
+/// 一个不被桌面端接受的对外模型名，以及给它的合规替代建议。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopModelNameIssue {
+    /// 用户当前填的对外名（不合规的那个）
+    pub name: String,
+    /// 建议改成的合规名
+    pub suggestion: String,
+}
+
+/// 某个 Key 的桌面端对外模型名体检结果。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopModelNameReport {
+    /// 是否适用（只有 Claude 桌面端分类才适用；其余分类恒为 false，前端据此完全不显示提示）
+    pub applicable: bool,
+    /// 体检了多少个对外名
+    pub total: usize,
+    /// 不合规的那些（空 = 全部合规）
+    pub issues: Vec<DesktopModelNameIssue>,
+}
+
+/// 为一个不合规的对外名生成合规替代。
+///
+/// **档位靠猜，但猜错不影响路由**：自由映射的 exact match 优先于三档家族匹配
+/// （见 `resolve_model`），档位只决定桌面端把它归到哪个 `anthropicFamilyTier` 家族桶里显示。
+/// 所以这里宁可给一个「一定能用」的名字，也不追求档位判断精准。
+///
+/// `taken` 是已被占用的名字，用于同批去重：`glm-4.6` 与 `gpt-4.6` 若都推 `claude-sonnet-4-6`，
+/// 第二条映射的对外名会与第一条撞车而永远匹配不到。
+///
+/// **返回前必须再过一次 `is_desktop_acceptable_model_id`**：这个函数是拼字符串拼出来的，
+/// 万一源串里带了黑名单词而被原样带进结果（例如版本段解析出意外内容），
+/// 就会给用户一个「点了采纳、保存仍被拒」的死循环。过不了就退回最朴素的 `claude-<档位>`。
+pub fn suggest_desktop_model_name(source: &str, taken: &[String]) -> String {
+    let lower = source.trim().to_ascii_lowercase();
+
+    // 档位：按规格词猜。小规格词 → haiku，重推理词 → opus，其余 sonnet。
+    let tier = if ["air", "lite", "mini", "flash", "small", "nano", "turbo"]
+        .iter()
+        .any(|k| lower.contains(k))
+    {
+        "haiku"
+    } else if ["reasoner", "thinking", "max", "ultra", "pro", "plus"]
+        .iter()
+        .any(|k| lower.contains(k))
+    {
+        "opus"
+    } else {
+        "sonnet"
+    };
+
+    // 版本：取末尾的数字/点片段（glm-4.6 → 4.6 → 4-6）。取不到就用 4-5。
+    let ver = {
+        let tail: String = lower
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let t = tail.trim_matches('.');
+        if t.is_empty() { "4-5".to_string() } else { t.replace('.', "-") }
+    };
+
+    let base = format!("claude-{tier}-{ver}");
+    // 同批去重：撞了就追加 -2 / -3 …
+    let mut candidate = base.clone();
+    let mut n = 2;
+    while taken.iter().any(|t| t.eq_ignore_ascii_case(&candidate)) {
+        candidate = format!("{base}-{n}");
+        n += 1;
+    }
+    if is_desktop_acceptable_model_id(&candidate) {
+        candidate
+    } else {
+        format!("claude-{tier}")
+    }
+}
+
+/// 对一组对外名逐个体检，返回不合规的那些及其建议。
+///
+/// `taken` 先装入**已经合规**的那些名字：建议出来的新名字不能和用户已有的合规名撞车。
+/// 每生成一个建议就压回 `taken`，保证同一次调用内的多个建议互不相同。
+pub fn desktop_model_name_issues(outward: &[String]) -> Vec<DesktopModelNameIssue> {
+    let mut taken: Vec<String> = outward
+        .iter()
+        .filter(|m| is_desktop_acceptable_model_id(m))
+        .cloned()
+        .collect();
+    let mut issues = Vec::new();
+    for name in outward {
+        if is_desktop_acceptable_model_id(name) {
+            continue;
+        }
+        let suggestion = suggest_desktop_model_name(name, &taken);
+        taken.push(suggestion.clone());
+        issues.push(DesktopModelNameIssue { name: name.clone(), suggestion });
+    }
+    issues
+}
+
+/// 一个 Key 的桌面端对外模型名体检。
+///
+/// **输入源必须是 `serviceable_models()`**，与保存拦截
+/// （`lib.rs` 的 `reject_desktop_key_with_unusable_model_names`）看的是同一个集合。
+/// 两边若各自 filter，迟早会出现「界面说没问题、保存却被拒」这种自相矛盾。
+pub fn desktop_model_name_report(key: &ProviderKey) -> DesktopModelNameReport {
+    if key.category_id != CategoryType::ClaudeDesktop {
+        return DesktopModelNameReport { applicable: false, total: 0, issues: Vec::new() };
+    }
+    let outward = key.serviceable_models();
+    DesktopModelNameReport {
+        applicable: true,
+        total: outward.len(),
+        issues: desktop_model_name_issues(&outward),
+    }
+}
+
 /// `resolve_model` 的命中路径，供日志展示「为什么变成这个模型」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelResolveKind {
@@ -1804,5 +1924,125 @@ mod tests {
         assert!(s.tray_model_switch_enabled, "旧配置缺该字段应默认开启");
         // active_models 缺失应为空 map（不 panic）。
         assert!(s.active_models.is_empty());
+    }
+
+    // ===== 桌面端对外模型名「建议」（UX#4 即时校验的可点修法） =====
+
+    /// 给出的建议**自己必须合规**，否则用户点了「采纳」保存仍被拒 —— 那比不给建议更糟
+    /// （他会以为按钮坏了，或以为自己哪里还没改对）。
+    ///
+    /// 遍历全部 50 条厂商名黑名单 + 词边界项各造一个 `<厂商名>-4.6` 送进去，
+    /// 只要有一条建议不合规就红。
+    #[test]
+    fn suggest_desktop_name_is_always_accepted_by_desktop() {
+        let mut sources: Vec<String> =
+            DESKTOP_DENY_SUBSTRINGS.iter().map(|k| format!("{k}-4.6")).collect();
+        // 词边界项（不在子串黑名单里，靠 \b 匹配拒掉）也要覆盖
+        for k in ["ling", "unic", "ds-v3", "k2.5", "m2.1", "phi4"] {
+            sources.push(format!("{k}-4.6"));
+        }
+        for src in &sources {
+            let s = suggest_desktop_model_name(src, &[]);
+            assert!(
+                is_desktop_acceptable_model_id(&s),
+                "对 {src} 给出的建议 {s} 本身不被桌面端接受"
+            );
+        }
+    }
+
+    /// 同一份报告里的多个建议必须互不相同。
+    ///
+    /// 判据：两条映射若用同一个对外名，`resolve_model` 取首个命中，第二条**永远匹配不到** ——
+    /// 表现为「配了映射但那个模型一直路由到别处」，极难联想到是重名。
+    #[test]
+    fn suggest_desktop_name_dedups_within_one_report() {
+        let issues = desktop_model_name_issues(&["glm-4.6".into(), "gpt-4.6".into()]);
+        assert_eq!(issues.len(), 2);
+        assert_ne!(
+            issues[0].suggestion, issues[1].suggestion,
+            "同一批建议撞名会让后一条映射永远匹配不到"
+        );
+    }
+
+    /// 建议要保留版本数字，用户才能一眼对上是哪个上游模型（不然不敢点）。
+    #[test]
+    fn suggest_desktop_name_keeps_version_digits() {
+        let s = suggest_desktop_model_name("glm-4.6", &[]);
+        assert!(s.contains("4-6"), "建议 {s} 丢了版本号，用户对不上是哪个模型");
+    }
+
+    /// 不能撞上三档追加的家族代表名。
+    ///
+    /// 配了三档时 `serviceable_models` 会追加 `claude-*-4-5`（见本文件 serviceable_models 规则 3），
+    /// 建议若正好等于它，就会把档位代表名顶掉。
+    #[test]
+    fn suggest_desktop_name_avoids_taken_tier_family_names() {
+        let taken = vec!["claude-opus-4-5".to_string()];
+        let s = suggest_desktop_model_name("glm-4.5-max", &taken);
+        assert_ne!(s, "claude-opus-4-5", "不得与已占用的档位代表名相同");
+        assert!(is_desktop_acceptable_model_id(&s), "去重后仍须合规");
+    }
+
+    /// 非桌面端分类一律「不适用」，一个提示都不该出。
+    ///
+    /// 判据：CLI 有 `to_gateway_model_id` 包 `claude-synaroute-` 前缀救回、Codex 走 OpenAI 形态，
+    /// 在那两个分类报警会逼用户去改**本来就正常**的配置。
+    #[test]
+    fn desktop_report_not_applicable_for_cli_and_codex() {
+        for cat in [CategoryType::ClaudeCli, CategoryType::Codex] {
+            let mut k = key_with(vec![model("glm-4.6"), model("gpt-5")], vec![], None);
+            k.category_id = cat;
+            let r = desktop_model_name_report(&k);
+            assert!(!r.applicable, "{cat:?} 不该适用桌面端模型名判据");
+            assert!(r.issues.is_empty());
+        }
+    }
+
+    /// **一键修法必须给每个模型都建映射**，只给不合规的建会静默吞掉合规模型。
+    ///
+    /// 判据来自 `serviceable_models` 的语义：只要存在任意一条有效映射，`models` 列表就被
+    /// **整份忽略**、对外集合只由映射决定。所以 models=[glm-4.6, claude-opus-4-8] 时
+    /// 若只给 glm-4.6 加映射，`claude-opus-4-8` 会从桌面端选择器里**消失**
+    /// —— 用户「修完一个问题、丢了一个模型」，且毫无提示。
+    #[test]
+    fn applying_report_suggestions_makes_key_saveable() {
+        let mut k = key_with(
+            vec![model("glm-4.6"), model("grok-4.5"), model("claude-opus-4-8")],
+            vec![],
+            None,
+        );
+        k.category_id = CategoryType::ClaudeDesktop;
+
+        let before = desktop_model_name_report(&k);
+        assert_eq!(before.issues.len(), 2, "glm 与 grok 两条不合规");
+
+        // 照抄前端「一键加映射」的规则：models 里**每一个**模型都建一条，
+        // 不合规的用 suggestion 作对外名，合规的建 realName→realName 的恒等映射。
+        k.mappings = k
+            .models
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let outward = before
+                    .issues
+                    .iter()
+                    .find(|x| x.name == m.real_name)
+                    .map(|x| x.suggestion.clone())
+                    .unwrap_or_else(|| m.real_name.clone());
+                ModelMapping {
+                    id: format!("m_{i}"),
+                    expected_name: outward,
+                    real_name: m.real_name.clone(),
+                }
+            })
+            .collect();
+
+        let after = desktop_model_name_report(&k);
+        assert!(after.issues.is_empty(), "修法之后不应再有不合规名：{:?}", after.issues);
+        assert_eq!(
+            k.serviceable_models().len(),
+            3,
+            "三个模型都要仍然对外可见（漏建恒等映射会吞掉合规的那个）"
+        );
     }
 }

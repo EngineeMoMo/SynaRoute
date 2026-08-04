@@ -66,17 +66,14 @@ fn upsert_key(state: tauri::State<AppState>, key: ProviderKey) -> AppResult<Prov
 /// （老版本存的、或 cc-switch 导入后补的模型），放行只会让它继续以不可用状态留在库里，
 /// 到接入那一刻才炸。宁可在用户下一次触碰它时就要求修好。
 fn reject_desktop_key_with_unusable_model_names(key: &ProviderKey) -> AppResult<()> {
-    if key.category_id != CategoryType::ClaudeDesktop {
+    // 与前端即时校验（`check_desktop_model_names`）共用同一份体检，
+    // 保证「界面上提示的」与「保存时拦的」永远是同一批名字、同一个建议。
+    // 两边各自 filter 是这类功能最典型的漂移源：用户点了界面给的修法，保存仍被拒。
+    let report = crate::model::desktop_model_name_report(key);
+    if report.issues.is_empty() {
         return Ok(());
     }
-    let bad: Vec<String> = key
-        .serviceable_models()
-        .into_iter()
-        .filter(|m| !crate::model::is_desktop_acceptable_model_id(m))
-        .collect();
-    if bad.is_empty() {
-        return Ok(());
-    }
+    let bad: Vec<&str> = report.issues.iter().map(|i| i.name.as_str()).collect();
     Err(error::AppError::Invalid(format!(
         "Claude 桌面端不接受这些对外模型名：{}\n\n\
          桌面端会在加载配置时把它们从模型列表里过滤掉。全部被过滤后模型选择器为空，\
@@ -85,11 +82,25 @@ fn reject_desktop_key_with_unusable_model_names(key: &ProviderKey) -> AppResult<
          且不得含 glm/gpt/grok/deepseek/qwen/kimi/llama 等厂商名\
          （判据取自桌面端 app.asar v1.24012.9）。\
          注意 claude-synaroute- 前缀对桌面端无效——厂商名黑名单优先。\n\n\
-         修法：在「模型映射」里配一条 claude-opus-4-8 → {}，\
-         对外用 claude-opus-4-8、上游仍打原名。",
+         修法：在「模型映射」里配一条 {} → {}，\
+         对外用合规名、上游仍打原名。",
         bad.join("、"),
-        bad.first().map(String::as_str).unwrap_or("上游真实名")
+        report.issues[0].suggestion,
+        report.issues[0].name
     )))
+}
+
+/// 桌面端对外模型名**即时**体检（UX#4），供 KeyEditor 边打字边提示。
+///
+/// 刻意设计成**纯函数命令**：不收 `tauri::State`、不碰 store、全程不取任何 parking_lot 锁。
+/// 它会随用户打字高频触发（防抖 250ms），若在这里取锁就会与转发热路径抢同一把锁。
+///
+/// 判据不在前端复刻：那是 50+ 条厂商名子串加一套词边界匹配，两份规则必然漂移，
+/// 而漂移的两个方向都很糟——「界面说没问题、保存被拒」，或更糟的
+/// 「界面放行、桌面端静默过滤掉」（后者表现为模型选择器为空，极难排查）。
+#[tauri::command]
+fn check_desktop_model_names(key: ProviderKey) -> crate::model::DesktopModelNameReport {
+    crate::model::desktop_model_name_report(&key)
 }
 
 #[tauri::command]
@@ -1819,6 +1830,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_keys,
             upsert_key,
+            check_desktop_model_names,
             delete_key,
             save_secret,
             reveal_secret,

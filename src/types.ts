@@ -55,8 +55,25 @@ export interface ModelMapping {
   realName: string; // 厂商真实模型名，如 GLM5.1
 }
 
-/** 单条厂商 Key 配置（FR-002 / FR-005 / FR-006） */
-export interface ProviderKey {
+/** 一个不被 Claude 桌面端接受的对外模型名，及其合规替代建议（UX#4）。 */
+export interface DesktopModelNameIssue {
+  name: string;
+  suggestion: string;
+}
+
+/**
+ * 桌面端对外模型名体检结果。
+ *
+ * `applicable` 为 false 表示当前分类根本不适用这套判据（CLI / Codex），
+ * 前端据此**完全不显示**任何提示 —— 在那两个分类报警会逼用户去改本来正常的配置。
+ */
+export interface DesktopModelNameReport {
+  applicable: boolean;
+  total: number;
+  issues: DesktopModelNameIssue[];
+}
+
+/** 单条厂商 Key 配置（FR-002 / FR-005 / FR-006） */export interface ProviderKey {
   id: string;
   categoryId: CategoryType;
   name: string; // 备注名

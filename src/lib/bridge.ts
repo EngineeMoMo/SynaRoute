@@ -10,6 +10,7 @@ import type {
   CcSwitchImportReport,
   CcSwitchScanResult,
   CodegraphState,
+  DesktopModelNameReport,
   EventLogEntry,
   ExportOutcome,
   ImportMode,
@@ -60,6 +61,20 @@ export const api = {
   // 新增/更新 Key（secret 单独走 saveSecret，不随对象下发）
   upsertKey: (key: ProviderKey) =>
     call<ProviderKey>("upsert_key", { key }, () => mockBridge.upsertKey(key)),
+
+  /**
+   * 桌面端对外模型名即时体检（UX#4）。跟着打字走，故后端那条命令刻意是纯函数、零锁。
+   *
+   * **mock 刻意返回「不适用」而不复刻判据**：在前端造第二份规则正是本功能要消灭的漂移源
+   * （判据是 50+ 条厂商名子串 + 词边界匹配，逆向自桌面端 app.asar）。
+   * 代价是浏览器预览模式下不显示该提示 —— 可以接受，因为它本来就只对桌面端分类有意义。
+   */
+  checkDesktopModelNames: (key: ProviderKey) =>
+    call<DesktopModelNameReport>("check_desktop_model_names", { key }, async () => ({
+      applicable: false,
+      total: 0,
+      issues: [],
+    })),
 
   // 删除 Key
   deleteKey: (keyId: string) =>

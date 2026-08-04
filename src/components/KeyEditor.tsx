@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "@/lib/bridge";
 import { useStore } from "@/store";
 import { useT } from "@/lib/useT";
 import { Button } from "@/components/ui/Button";
 import { Combobox } from "@/components/ui/Combobox";
 import { BrandIcon } from "@/components/BrandIcon";
-import type { ModelInfo, ModelMapping, ProviderKey, Protocol } from "@/types";
+import type { DesktopModelNameIssue, ModelInfo, ModelMapping, ProviderKey, Protocol } from "@/types";
 import { X, RefreshCw, Plus, Trash2, ArrowRight, Eye, EyeOff, Zap, Gauge, Brain, Download, AlertTriangle } from "lucide-react";
 
 interface KeyEditorProps {
@@ -244,35 +244,121 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
     if (added.length) setModels([...models, ...added]);
   };
 
+  /**
+   * 把当前表单拼成一个 ProviderKey 草稿。
+   *
+   * 抽出来是为了让「保存」与「即时校验」看的是**同一个对象**：桌面端模型名校验的输入源是
+   * `serviceable_models()`，而它的结果取决于映射是否完整（有任一条完整映射，`models` 列表
+   * 就被整份忽略、对外集合只由映射决定）。两边若各拼各的，就会出现「界面提示有问题、
+   * 保存却成功」或反过来的自相矛盾。尤其是 `mappings.filter(...)` 那一条 ——
+   * 少了它，没填完的映射行会混进校验集合，用户会收到一条保存时根本不存在的警告。
+   */
+  const buildDraftKey = (): ProviderKey => ({
+    // 新建时留空，**由后端生成 uuid v4**（P3-5）。原先是 `k_${Date.now()}`：
+    // id 被导入逻辑当作全局唯一标识做「同 id 即同一条 Key」的覆盖判据，而
+    // 「两台机器照同一份教程配置」是真实场景，落在同一毫秒即撞号 → 跨机导入会把一条
+    // 完全无关的本机 Key 静默覆盖成对方的配置。后端 upsert_key 会回填 id 并随返回值给回。
+    id: initial?.id ?? "",
+    categoryId: activeCategory,
+    name: name.trim(),
+    vendor,
+    baseUrl: baseUrl.trim(),
+    protocol,
+    hasSecret: initial?.hasSecret || secret.length > 0,
+    enabled: initial?.enabled ?? false,
+    priority: initial?.priority ?? 999,
+    params: { ...initial?.params, temperature, maxTokens, timeoutMs: typeof timeoutMs === "number" && timeoutMs >= 1000 ? timeoutMs : undefined },
+    models,
+    mappings: mappings.filter((m) => m.expectedName && m.realName),
+    defaultModel: defaultModel.trim() || undefined,
+    // 三档仅 Claude CLI/桌面端有意义；Codex 一律不落三档，避免 claude-*opus* 类名字被误改写路由
+    // （即使该 Key 早前存过三档，此处也强制清空）。
+    tierHaiku: activeCategory === "codex" ? undefined : tierHaiku.trim() || undefined,
+    tierSonnet: activeCategory === "codex" ? undefined : tierSonnet.trim() || undefined,
+    tierOpus: activeCategory === "codex" ? undefined : tierOpus.trim() || undefined,
+    health: initial?.health ?? { status: "unknown", failCount: 0 },
+  });
+
+  /**
+   * 桌面端对外模型名的**即时**体检（UX#4）。
+   *
+   * 为什么值得单开一条 IPC：对外名不合规会被 Claude 桌面端**静默过滤掉**，
+   * 全被过滤则模型选择器为空、打开会话报 ModelsNotDiscoveredError ——
+   * 这是本项目记录过的最难排查的症状之一。此前只在「保存」那一刻拦，
+   * 用户可能已经填完整个表单（13 个字段）才被拒。
+   *
+   * **判据不在前端复刻**：那是 50+ 条厂商名子串加一套词边界匹配（逆向自桌面端 app.asar）。
+   * 两份规则必然漂移，而漂移的两个方向都很糟 —— 轻则「界面说没问题、保存被拒」，
+   * 重则「界面放行、桌面端静默过滤」。故调后端那份唯一事实。
+   *
+   * 三条约束：
+   * 1. **250ms 防抖**：这个 effect 跟着打字走，不防抖会每键一发 IPC。
+   * 2. **cancelled 标志**：慢的旧响应回来会盖掉新结果，表现为「明明改好了黄条还在」。
+   * 3. **失败只清空、绝不阻断保存**：即时校验只是把反馈提前，真正的防线仍是后端保存拦截
+   *    （无条件、且能覆盖历史 Key）。同理不因有问题就 disable 保存按钮 ——
+   *    那样用户反而看不到后端那段带后果与修法的完整说明。
+   */
+  const [desktopIssues, setDesktopIssues] = useState<DesktopModelNameIssue[]>([]);
+  useEffect(() => {
+    if (activeCategory !== "claude-desktop") {
+      setDesktopIssues([]);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      void api
+        .checkDesktopModelNames(buildDraftKey())
+        .then((r) => {
+          if (!cancelled) setDesktopIssues(r.applicable ? r.issues : []);
+        })
+        .catch(() => {
+          if (!cancelled) setDesktopIssues([]);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+    // deps 精确取 serviceable_models() 真正会读的那几项，别用整个 draft（每次渲染都是新对象）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCategory, models, mappings, tierHaiku, tierSonnet, tierOpus]);
+
+  /** 是否已有「填完整」的映射行——决定 serviceable_models 走映射还是走 models 列表。 */
+  const hasEffectiveMapping = mappings.some((m) => m.expectedName.trim() && m.realName.trim());
+
+  /** 把某一行映射的对外名改成建议值。 */
+  const applySuggestion = (rowId: string, suggestion: string) =>
+    setMappings(mappings.map((m) => (m.id === rowId ? { ...m, expectedName: suggestion } : m)));
+
+  /**
+   * 一键修法：给 `models` 里的**每一个**模型都建一条映射。
+   *
+   * **必须是每一个，不能只给不合规的建** —— `serviceable_models()` 的语义是「只要存在任意一条
+   * 完整映射，models 列表就被整份忽略」。若只给 glm-4.6 建映射，同列表里本来合规的
+   * claude-opus-4-8 会直接从桌面端选择器里**消失**，用户「修好一个问题、丢了一个模型」，
+   * 而且没有任何提示。合规的那些建 realName → realName 的恒等映射即可。
+   * （model.rs 的 applying_report_suggestions_makes_key_saveable 用故障注入钉住了这条。）
+   *
+   * id 用 `m_${Date.now()}_${i}`：批量生成会落在同一毫秒，只用 Date.now() 会撞号 ——
+   * React key 重复，且按 id 删除时会一次删掉多条。
+   */
+  const fixAllByAddingMappings = () => {
+    const now = Date.now();
+    setMappings(
+      models.map((m, i) => ({
+        id: `m_${now}_${i}`,
+        expectedName:
+          desktopIssues.find((x) => x.name === m.realName)?.suggestion ?? m.realName,
+        realName: m.realName,
+      })),
+    );
+  };
+
   const save = async () => {
     if (!name.trim()) return setError(t("editor.errNeedName"));
     if (!baseUrl.trim()) return setError(t("editor.errNeedBaseUrl2"));
 
-    const key: ProviderKey = {
-      // 新建时留空，**由后端生成 uuid v4**（P3-5）。原先是 `k_${Date.now()}`：
-      // id 被导入逻辑当作全局唯一标识做「同 id 即同一条 Key」的覆盖判据，而
-      // 「两台机器照同一份教程配置」是真实场景，落在同一毫秒即撞号 → 跨机导入会把一条
-      // 完全无关的本机 Key 静默覆盖成对方的配置。后端 upsert_key 会回填 id 并随返回值给回。
-      id: initial?.id ?? "",
-      categoryId: activeCategory,
-      name: name.trim(),
-      vendor,
-      baseUrl: baseUrl.trim(),
-      protocol,
-      hasSecret: initial?.hasSecret || secret.length > 0,
-      enabled: initial?.enabled ?? false,
-      priority: initial?.priority ?? 999,
-      params: { ...initial?.params, temperature, maxTokens, timeoutMs: typeof timeoutMs === "number" && timeoutMs >= 1000 ? timeoutMs : undefined },
-      models,
-      mappings: mappings.filter((m) => m.expectedName && m.realName),
-      defaultModel: defaultModel.trim() || undefined,
-      // 三档仅 Claude CLI/桌面端有意义；Codex 一律不落三档，避免 claude-*opus* 类名字被误改写路由
-      // （即使该 Key 早前存过三档，此处也强制清空）。
-      tierHaiku: activeCategory === "codex" ? undefined : tierHaiku.trim() || undefined,
-      tierSonnet: activeCategory === "codex" ? undefined : tierSonnet.trim() || undefined,
-      tierOpus: activeCategory === "codex" ? undefined : tierOpus.trim() || undefined,
-      health: initial?.health ?? { status: "unknown", failCount: 0 },
-    };
+    const key = buildDraftKey();
 
     setSaving(true);
     setError(null);
@@ -596,44 +682,92 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
               </Button>
             </div>
             <div className="space-y-1.5">
+              {/* 批量警告条（UX#4）：只在「还没配任何有效映射」时出——此时用户的对外名就是
+                  models 里的真实名，一个都不合规，逐行提示会刷屏，给一键修法才是正解。
+                  一旦有了映射，就转为逐行提示（下面那段），因为那时问题是具体某一行填错了。 */}
+              {desktopIssues.length > 0 && !hasEffectiveMapping && (
+                <div className="space-y-1.5 rounded-control border border-warning/40 bg-warning/10 px-2.5 py-2">
+                  <div className="flex items-start gap-2 text-[11px] leading-relaxed text-warning">
+                    <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+                    <span className="flex-1">
+                      {t("editor.desktopNameBadBanner", { n: desktopIssues.length })}
+                    </span>
+                  </div>
+                  <div className="text-[11px] leading-relaxed text-text-muted">
+                    {t("editor.desktopNameFixAllHint")}
+                    <br />
+                    {t("editor.desktopNamePrefixUseless")}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={fixAllByAddingMappings}
+                    className="rounded border border-warning/40 px-2 py-0.5 text-[11px] font-medium text-warning hover:bg-warning/20"
+                  >
+                    {t("editor.desktopNameFixAll", { n: models.length })}
+                  </button>
+                </div>
+              )}
               {mappings.length === 0 && (
                 <span className="text-xs text-text-muted">{t("editor.noMapping")}</span>
               )}
-              {mappings.map((m, i) => (
-                <div key={m.id} className="flex items-center gap-1.5">
-                  <div className="flex-1">
-                    <Combobox
-                      className={`${inputCls} font-mono`}
-                      value={m.realName}
-                      options={models.map((mm) => mm.realName)}
-                      placeholder="GLM5.1"
-                      emptyHint={t("editor.comboNoModels")}
-                      onChange={(val) => {
-                        const next = [...mappings];
-                        next[i] = { ...m, realName: val };
-                        setMappings(next);
-                      }}
-                    />
+              {mappings.map((m, i) => {
+                // 逐行提示：只有「这一行的对外名」出现在体检结果里才提示。
+                // realName 还空着的行不会进 serviceable_models，也就不会有 issue —— 刻意如此，
+                // 否则用户填了一半就被警告、而保存其实会成功，属于假警报。
+                const issue = desktopIssues.find((x) => x.name === m.expectedName.trim());
+                return (
+                  <div key={m.id} className="space-y-1">
+                    <div className="flex items-center gap-1.5">
+                      <div className="flex-1">
+                        <Combobox
+                          className={`${inputCls} font-mono`}
+                          value={m.realName}
+                          options={models.map((mm) => mm.realName)}
+                          placeholder="GLM5.1"
+                          emptyHint={t("editor.comboNoModels")}
+                          onChange={(val) => {
+                            const next = [...mappings];
+                            next[i] = { ...m, realName: val };
+                            setMappings(next);
+                          }}
+                        />
+                      </div>
+                      <ArrowRight size={14} className="shrink-0 text-text-muted" />
+                      <input
+                        className={`${inputCls} flex-1 font-mono ${issue ? "border-warning" : ""}`}
+                        placeholder="opus-4-7"
+                        value={m.expectedName}
+                        onChange={(e) => {
+                          const next = [...mappings];
+                          next[i] = { ...m, expectedName: e.target.value };
+                          setMappings(next);
+                        }}
+                      />
+                      <button
+                        onClick={() => setMappings(mappings.filter((x) => x.id !== m.id))}
+                        className="shrink-0 rounded p-1.5 text-text-muted hover:bg-surface-hover hover:text-danger"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                    {issue && (
+                      <div className="flex items-start gap-2 rounded-control bg-warning/10 px-2 py-1 text-[11px] leading-relaxed text-warning">
+                        <AlertTriangle size={11} className="mt-0.5 shrink-0" />
+                        <span className="flex-1">
+                          {t("editor.desktopNameBadRow", { name: issue.name })}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => applySuggestion(m.id, issue.suggestion)}
+                          className="shrink-0 whitespace-nowrap rounded border border-warning/40 px-1.5 py-0.5 font-medium hover:bg-warning/20"
+                        >
+                          {t("editor.desktopNameFixTo", { name: issue.suggestion })}
+                        </button>
+                      </div>
+                    )}
                   </div>
-                  <ArrowRight size={14} className="shrink-0 text-text-muted" />
-                  <input
-                    className={`${inputCls} flex-1 font-mono`}
-                    placeholder="opus-4-7"
-                    value={m.expectedName}
-                    onChange={(e) => {
-                      const next = [...mappings];
-                      next[i] = { ...m, expectedName: e.target.value };
-                      setMappings(next);
-                    }}
-                  />
-                  <button
-                    onClick={() => setMappings(mappings.filter((x) => x.id !== m.id))}
-                    className="shrink-0 rounded p-1.5 text-text-muted hover:bg-surface-hover hover:text-danger"
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
 
