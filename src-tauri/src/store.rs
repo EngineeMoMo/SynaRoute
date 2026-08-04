@@ -66,15 +66,6 @@ const LOG_QUEUE_CAP: usize = 4096;
 /// 事件日志内存上限
 const MAX_EVENTS: usize = 500;
 
-/// 默认日志目录：安装目录（exe 同级）下的 `logs/`。
-/// 路径动态解析（current_exe），禁止硬编码（dev-hard-rules 规则2）。
-/// 若安装目录不可写（如装在 Program Files 需管理员权限），回退到 %APPDATA%\SynaRoute\logs。
-///
-/// **结果进程内缓存一次**（`OnceLock`）：本函数原先每写一行日志都被调一次，每次都做
-/// 「建 `.write-probe` → 写 → 删」的探测；而日志写入是并发的（代理转发、健康检查各自的 tokio
-/// 任务），多线程共用同一探针文件名会互删对方的探针，导致偶发探测失败 → 个别日志行漏回退到
-/// `%APPDATA%`，日志被劈成两处（实测 368 行落安装目录、1 行漏到 AppData）。缓存后每进程只探测
-/// 一次，路径从此稳定；探针名另加进程 id + 随机后缀，杜绝同机多实例互删。
 /// 生成新 Key 的 id（uuid v4）。
 ///
 /// **必须由后端生成**（P3-5）：id 是 `portable.rs` 导入逻辑的**全局唯一标识**，
@@ -93,6 +84,15 @@ pub fn new_key_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// 默认日志目录：安装目录（exe 同级）下的 `logs/`。
+/// 路径动态解析（current_exe），禁止硬编码（dev-hard-rules 规则2）。
+/// 若安装目录不可写（如装在 Program Files 需管理员权限），回退到 %APPDATA%\SynaRoute\logs。
+///
+/// **结果进程内缓存一次**（`OnceLock`）：本函数原先每写一行日志都被调一次，每次都做
+/// 「建 `.write-probe` → 写 → 删」的探测；而日志写入是并发的（代理转发、健康检查各自的 tokio
+/// 任务），多线程共用同一探针文件名会互删对方的探针，导致偶发探测失败 → 个别日志行漏回退到
+/// `%APPDATA%`，日志被劈成两处（实测 368 行落安装目录、1 行漏到 AppData）。缓存后每进程只探测
+/// 一次，路径从此稳定；探针名另加进程 id + 随机后缀，杜绝同机多实例互删。
 pub fn default_log_dir() -> PathBuf {
     static CACHED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     CACHED.get_or_init(resolve_default_log_dir).clone()
@@ -539,6 +539,29 @@ impl Store {
     /// **不含 trace**，理由见 [`Self::strip_trace`]。
     pub fn list_all_events(&self) -> Vec<EventLogEntry> {
         self.events.read().iter().map(Self::strip_trace).collect()
+    }
+
+    /// 某分类**最近一条**失败事件（error / failover），且必须够新。
+    ///
+    /// 为什么单开一个窄查询、而不让前端拿 `list_all_events` 自己找（UX#11）：
+    /// 分类页每 5s 轮询一次，若为了显示一条失败摘要就把 500 条事件全量搬过 IPC，
+    /// 等于把 P1-6 刚省下来的开销又还回去（那条修的正是「列表接口搬运过多」）。
+    /// 这里在后端内存里倒序找一条、只回这一条。
+    ///
+    /// `fresh_ms` = 只认这么新的失败。陈旧失败不该一直挂在界面上让用户以为「现在还坏着」
+    /// —— 与「陈旧探测结论不显示成确定不可达」同一处理原则。
+    pub fn recent_failure(&self, category: CategoryType, fresh_ms: i64) -> Option<EventLogEntry> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let ev = self.events.read();
+        // 倒序找最近一条失败；找到后再单独判新旧（过期即当作没有）。
+        let latest = ev
+            .iter()
+            .rev()
+            .find(|e| e.category_id == category && (e.kind == "error" || e.kind == "failover"))?;
+        if now - latest.ts > fresh_ms {
+            return None;
+        }
+        Some(Self::strip_trace(latest))
     }
 
     /// 按事件 id 取该条的链路快照（列表里剥掉了，用户展开某行时才按需取一条）。

@@ -3110,11 +3110,12 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// mock 服务器抓到的请求头：外层每次请求一条，内层是该次请求的 (name, value) 列表。
+    /// 抽成别名只为可读性 —— 测试里这个类型要重复写好几处。
+    type CapturedHeaders = std::sync::Arc<parking_lot::Mutex<Vec<Vec<(String, String)>>>>;
+
     /// 抓请求头的 mock（返回 SSE 或 JSON 由 `sse` 决定，以便同一个 mock 服务两条转发路径）。
-    async fn spawn_header_capture_mock(
-        captured: std::sync::Arc<parking_lot::Mutex<Vec<Vec<(String, String)>>>>,
-        sse: bool,
-    ) -> String {
+    async fn spawn_header_capture_mock(captured: CapturedHeaders, sse: bool) -> String {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
             .unwrap();
@@ -3210,7 +3211,7 @@ mod tests {
                 .unwrap();
         }
 
-        let pick = |v: &std::sync::Arc<parking_lot::Mutex<Vec<Vec<(String, String)>>>>| {
+        let pick = |v: &CapturedHeaders| {
             let g = v.lock();
             let mut hs = g.first().cloned().unwrap_or_default();
             // 剔除逐请求必然不同 / 由 reqwest 自行计算的头

@@ -433,6 +433,13 @@ export interface ImportReport {
   secretsPruned: number;
   /** replace 模式下导入前备份的 config 路径 */
   backupPath?: string;
+  /**
+   * replace 模式下、真的删了旧密钥时备份的 secrets.enc 路径。
+   *
+   * 必须和 backupPath 一起显示：只导回配置备份会得到「Key 都回来了、密钥没了」的半截状态，
+   * 密钥库要用户手动拷回去（它不是能被「导入」的格式）。
+   */
+  secretsBackupPath?: string;
   /** 非致命提示（如「需重新录入密钥」） */
   warnings: string[];
 }

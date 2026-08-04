@@ -759,6 +759,13 @@ export function SettingsPage() {
                 </div>
                 <div className="mt-1 text-[11px] leading-relaxed text-text-muted">
                   {t("settings.diagDesc")}
+                  {/* 「不含密钥」这句单独加粗：它决定用户敢不敢把报告发出去。
+                      不能写成 Markdown `**…**`——本页没有 Markdown 渲染器，会显示成字面星号。 */}
+                  <span className="font-semibold text-text-secondary">
+                    {" "}
+                    {t("settings.diagDescNoSecrets")}
+                  </span>
+                  {t("settings.diagDescTail")}
                 </div>
               </div>
             </div>
@@ -1185,6 +1192,19 @@ function ImportDialog({
             <div className="text-[11px] leading-relaxed text-text-muted">
               {t("backup.backupRestoreHint")}
             </div>
+            {/* 删过旧密钥时，密钥库的备份必须并列给出并单独说明怎么用：
+                secrets.enc 不是能被「导入」的格式，只能手动拷回去。
+                少了这一句，用户按上面那行导回配置，会得到「Key 都回来了、密钥没了」的半截状态。 */}
+            {report.secretsBackupPath && (
+              <>
+                <div className="break-all font-mono text-[11px] text-text-secondary">
+                  {t("backup.secretsBackupSaved", { path: report.secretsBackupPath })}
+                </div>
+                <div className="text-[11px] leading-relaxed text-text-muted">
+                  {t("backup.secretsBackupRestoreHint")}
+                </div>
+              </>
+            )}
           </div>
         )}
         {report.warnings.length > 0 && (

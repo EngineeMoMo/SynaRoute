@@ -6,12 +6,23 @@ import { Button } from "@/components/ui/Button";
 import { Combobox } from "@/components/ui/Combobox";
 import { BrandIcon } from "@/components/BrandIcon";
 import type { ModelInfo, ModelMapping, ProviderKey, Protocol } from "@/types";
-import { X, RefreshCw, Plus, Trash2, ArrowRight, Eye, EyeOff, Zap, Gauge, Brain, Download } from "lucide-react";
+import { X, RefreshCw, Plus, Trash2, ArrowRight, Eye, EyeOff, Zap, Gauge, Brain, Download, AlertTriangle } from "lucide-react";
 
 interface KeyEditorProps {
   initial: ProviderKey | null; // null = 新增
   onClose: () => void;
 }
+
+/**
+ * 协议下拉里的显示名。刻意提到模块作用域：它是常量，放组件里每次渲染都要重建一个对象。
+ * 与下拉的三个 `<option>` 文案保持一致 —— 提示条说「看起来是 X 协议」，用户要能在
+ * 下拉里找到同名的那一项。
+ */
+const PROTOCOL_LABEL: Record<Protocol, string> = {
+  anthropic: "Anthropic",
+  openai_chat: "OpenAI Chat",
+  openai_responses: "OpenAI Responses",
+};
 
 /** 新增/编辑 Key 抽屉面板（FR-002/004/005/006） */
 export function KeyEditor({ initial, onClose }: KeyEditorProps) {
@@ -94,6 +105,57 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
     if (baseUrlUntouched && next.defaultBaseUrl) setBaseUrl(next.defaultBaseUrl);
     if (baseUrlUntouched) setProtocol(next.defaultProtocol);
   };
+
+  /**
+   * 从 baseUrl 推断上游协议（UX#3）。
+   *
+   * 为什么需要：协议选错是新手最容易踩、且**症状最难懂**的坑——填一个 OpenAI 兼容中转商
+   * 却留着默认的 `anthropic`，结果每次转发都 400，而界面上一切看着都对。此前 vendor 下拉
+   * 切换会带出默认协议，但**用户手贴 baseUrl 时没有任何推断**（自定义厂商是最常见情形）。
+   *
+   * **判据顺序刻意是「先路径、后域名」**：路径是协议本身的一部分（各家 SDK 硬编码），
+   * 域名只是个名字。中转商域名里带 `claude` / `anthropic` 却提供 OpenAI 兼容接口
+   * 极常见（`https://claude-relay.example.com/v1/chat/completions`），若先看域名就会
+   * 把它判成 Anthropic —— 正好造出这个功能本要消灭的那种故障。故域名关键词只在
+   * 路径给不出任何信号时才作为兜底。
+   *
+   * 返回 `null` = 认不出，此时**不动**用户当前的选择（宁可不猜，也不要猜错后悄悄改掉）。
+   */
+  const inferProtocol = (url: string): Protocol | null => {
+    const u = url.trim().toLowerCase();
+    if (!u) return null;
+    // 第一优先：端点路径（协议的标志性特征，各家 SDK 里写死的那几条）
+    if (u.includes("/messages")) return "anthropic";
+    if (u.includes("/responses")) return "openai_responses";
+    if (u.includes("/chat/completions") || u.includes("/completions")) return "openai_chat";
+    // 兜底：路径无特征（多数中转商只给到 `https://x.com/v1`）时才看域名关键词
+    if (u.includes("anthropic") || u.includes("claude")) return "anthropic";
+    return null;
+  };
+
+  /**
+   * baseUrl 失焦时按推断改协议。三重限制，避免「悄悄改掉用户的配置」：
+   *
+   * 1. `protocolTouched`——用户亲自动过协议下拉就绝不覆盖；
+   * 2. `initial && baseUrl === initial.baseUrl`——编辑既有 Key 时，只要地址没被改过就不动。
+   *    否则用户只是 Tab 键路过输入框，一个**正在正常工作**的 Key 的协议就被改了，
+   *    而他毫无察觉——这正是本项目反复防的静默失效；
+   * 3. 推断不出（`null`）时不动。
+   *
+   * 三条都不满足时仍会出提示条（见 `protocolHint`），只是不自动改。
+   */
+  const [protocolTouched, setProtocolTouched] = useState(false);
+  const handleBaseUrlBlur = () => {
+    if (protocolTouched) return;
+    if (initial && baseUrl.trim() === (initial.baseUrl ?? "").trim()) return;
+    const guess = inferProtocol(baseUrl);
+    if (guess && guess !== protocol) setProtocol(guess);
+  };
+  // 推断结果与当前选择不一致时给一条**提示而非强改**（用户动过协议、或编辑既有 Key 的情况）。
+  const protocolHint = (() => {
+    const guess = inferProtocol(baseUrl);
+    return guess && guess !== protocol ? guess : null;
+  })();
 
   // 老 Key 的 vendor 值可能不在当前厂商列表里（自由文本历史值），补一个兜底 option 不丢显示
   const vendorMissing = vendor !== "" && !vendors.some((v) => v.id === vendor);
@@ -292,7 +354,15 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
               </div>
             </Field>
             <Field label={t("editor.protocol")} className="w-48">
-              <select className={inputCls} value={protocol} onChange={(e) => setProtocol(e.target.value as Protocol)}>
+              <select
+                className={inputCls}
+                value={protocol}
+                onChange={(e) => {
+                  // 记住用户亲自动过：此后 baseUrl 推断只提示、不再覆盖他的选择。
+                  setProtocolTouched(true);
+                  setProtocol(e.target.value as Protocol);
+                }}
+              >
                 <option value="anthropic">Anthropic</option>
                 <option value="openai_chat">OpenAI Chat</option>
                 <option value="openai_responses">OpenAI Responses</option>
@@ -300,8 +370,35 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
             </Field>
           </div>
 
+          {/* 推断结果与当前选择不一致 → 提示 + 一键采纳。不强改，因为用户可能确实知道
+              自己在做什么（例如中转商把 Anthropic 协议挂在 /v1 这种非标准路径下）。 */}
+          {protocolHint && (
+            <div className="flex items-center gap-2 rounded-control bg-warning/10 px-2.5 py-1.5 text-[11px] text-warning">
+              <AlertTriangle size={12} className="shrink-0" />
+              <span className="flex-1">
+                {t("editor.protocolMismatch", { guess: PROTOCOL_LABEL[protocolHint] })}
+              </span>
+              <button
+                type="button"
+                onClick={() => setProtocol(protocolHint)}
+                className="shrink-0 rounded border border-warning/40 px-1.5 py-0.5 font-medium hover:bg-warning/20"
+              >
+                {t("editor.protocolAdopt")}
+              </button>
+            </div>
+          )}
+
           <Field label={t("editor.baseUrl")}>
-            <input className={`${inputCls} font-mono`} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder={t("editor.baseUrlPlaceholder")} />
+            {/* 失焦时按 URL 推断协议（UX#3）：协议选错是新手最易踩、症状最难懂的坑
+                （填 OpenAI 兼容中转商却留着默认 anthropic → 每次转发 400，界面看着全对）。
+                只在用户没亲自动过协议下拉时才自动改，动过就只提示不覆盖。 */}
+            <input
+              className={`${inputCls} font-mono`}
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              onBlur={handleBaseUrlBlur}
+              placeholder={t("editor.baseUrlPlaceholder")}
+            />
           </Field>
 
           <Field label={initial?.hasSecret ? t("editor.apiKeyConfigured") : t("editor.apiKey")}>

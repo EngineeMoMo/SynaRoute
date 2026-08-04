@@ -124,6 +124,9 @@ const zh: Dict = {
   "category.mappingGapView": "查看",
   "category.mappingGapHint": "CLI 的 /model 选择器只显示所有启用 Key 共有的模型（交集）。下列主 Key 模型因在部分备用 Key 上缺映射而没进选择器；去对应 Key 补一条映射即可让它出现。",
   "category.mappingGapItem": "模型 {expected} 在 {keys} 上缺映射，故未进入选择器",
+  // 最近失败原因常驻条（UX#11）：转发失败时客户端只显示 502/529，真因藏在日志页里。
+  "category.recentFailure": "最近一次转发失败：",
+  "category.recentFailureView": "查看日志",
   "category.empty": "还没有配置任何 Key",
   "category.addFirst": "添加第一个 Key",
   "category.activeModel": "当前模型",
@@ -161,6 +164,8 @@ const zh: Dict = {
   "editor.protocol": "协议",
   "editor.baseUrl": "Base URL",
   "editor.baseUrlPlaceholder": "https://api.example.com",
+  "editor.protocolMismatch": "接口地址看起来是 {guess} 协议，与当前选择不一致——协议选错会导致每次请求都失败。",
+  "editor.protocolAdopt": "采纳",
   "editor.apiKey": "API 密钥",
   "editor.apiKeyConfigured": "API 密钥（已配置，留空则不修改）",
   "editor.apiKeyPlaceholderNew": "sk-...",
@@ -437,7 +442,12 @@ const zh: Dict = {
   "settings.logReset": "恢复默认",
   "settings.logOpenDir": "打开日志目录",
   "settings.diagExport": "导出诊断报告",
-  "settings.diagDesc": "诊断报告用于报障：包含版本、路径、各 Key 健康状态、脱敏后的配置与最近事件摘要。**不含任何密钥，也不含对话正文**——保存后可自行打开核对再发出。",
+  // 拆成三段是为了让中间那句真的**渲染成粗体**。这里没有 Markdown 渲染器，
+  // 整句里写 `**…**` 只会让用户看到一对字面星号——偏偏这句是决定用户敢不敢把
+  // 报告发出去的那句，不能显示成排版故障。
+  "settings.diagDesc": "诊断报告用于报障：包含版本、路径、各 Key 健康状态、脱敏后的配置与最近事件摘要。",
+  "settings.diagDescNoSecrets": "不含任何密钥，也不含对话正文",
+  "settings.diagDescTail": "——保存后可自行打开核对再发出。",
   "settings.diagSaved": "诊断报告已保存到 {path}",
   "settings.startup": "启动",
   "settings.autoStartTitle": "开机自启动并最小化到托盘",
@@ -485,6 +495,8 @@ const zh: Dict = {
   "backup.importDone": "导入完成：新增 {added} / 覆盖 {overwritten} / 删除 {removed} 个 Key，密钥 {secrets} 条",
   "backup.backupSaved": "导入前配置已备份到 {path}",
   "backup.backupRestoreHint": "如需回退到导入前的状态：用「替换导入」模式导入上面这个备份文件即可。",
+  "backup.secretsBackupSaved": "密钥库已备份到 {path}",
+  "backup.secretsBackupRestoreHint": "本次删掉了随 Key 一并移除的旧密钥。若要连密钥一起回退，光导回上面的配置备份不够——还需先关闭 SynaRoute，把这个密钥库备份文件改名回 secrets.enc 覆盖原文件。",
   "backup.secretsPruned": "已清理 {n} 条随 Key 一并移除的旧密钥（它们对应的 Key 已不在配置里）。",
 
   // MCP 服务器
@@ -654,6 +666,8 @@ const en: Dict = {
   "category.mappingGapView": "View",
   "category.mappingGapHint": "The CLI /model picker only lists models shared by every enabled key (the intersection). The primary-key models below are missing a mapping on some backup keys, so they don’t appear — add a mapping on each of those keys to include them.",
   "category.mappingGapItem": "Model {expected} has no mapping on {keys}, so it’s not in the picker",
+  "category.recentFailure": "Last forwarding failure:",
+  "category.recentFailureView": "View logs",
   "category.empty": "No keys configured yet",
   "category.addFirst": "Add your first key",
   "category.activeModel": "Active model",
@@ -689,6 +703,8 @@ const en: Dict = {
   "editor.protocol": "Protocol",
   "editor.baseUrl": "Base URL",
   "editor.baseUrlPlaceholder": "https://api.example.com",
+  "editor.protocolMismatch": "The endpoint looks like the {guess} protocol, which differs from your selection — a wrong protocol makes every request fail.",
+  "editor.protocolAdopt": "Use it",
   "editor.apiKey": "API Key",
   "editor.apiKeyConfigured": "API Key (configured; leave blank to keep)",
   "editor.apiKeyPlaceholderNew": "sk-...",
@@ -963,7 +979,9 @@ const en: Dict = {
   "settings.logReset": "Reset to default",
   "settings.logOpenDir": "Open log folder",
   "settings.diagExport": "Export diagnostics",
-  "settings.diagDesc": "For bug reports: includes version, paths, per-key health, redacted config and a recent-event summary. **No API keys and no conversation content** — open the file and check it yourself before sending.",
+  "settings.diagDesc": "For bug reports: includes version, paths, per-key health, redacted config and a recent-event summary.",
+  "settings.diagDescNoSecrets": "No API keys and no conversation content",
+  "settings.diagDescTail": "— open the file and check it yourself before sending.",
   "settings.diagSaved": "Diagnostics saved to {path}",
   "settings.startup": "Startup",
   "settings.autoStartTitle": "Auto-start and minimize to tray",
@@ -1011,6 +1029,8 @@ const en: Dict = {
   "backup.importDone": "Import done: {added} added / {overwritten} overwritten / {removed} removed keys, {secrets} secrets",
   "backup.backupSaved": "Previous config backed up to {path}",
   "backup.backupRestoreHint": "To roll back to the state before this import: import the backup file above using \"Replace\" mode.",
+  "backup.secretsBackupSaved": "Secret vault backed up to {path}",
+  "backup.secretsBackupRestoreHint": "This import also deleted the stored secrets of the removed keys. Importing the config backup above is not enough to get them back — quit SynaRoute first, then rename this vault backup to secrets.enc and overwrite the original.",
   "backup.secretsPruned": "Cleaned up {n} stale API key(s) belonging to keys that are no longer in the config.",
 
   // MCP server

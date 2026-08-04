@@ -29,6 +29,16 @@ export default {
         control: "10px",
         pill: "9999px",
       },
+      // Tailwind 3.4 的 opacity 标度只有 5 的倍数，`bg-warning/8`、`bg-danger/12` 这类
+      // 非 5 倍数的透明度修饰符**不会报错，只是一条 CSS 规则都不生成** —— 元素照常渲染，
+      // 只是底色悄悄没了。全仓有 20 处这么写（各类警告横幅 + Badge 的全部彩色变体），
+      // 一直表现为「有边框有字色、独独没有底色」，因为看着仍像个提示框而长期没被发现。
+      // 在此把这两档补进标度，而不是把 20 处类名改成 /10 —— 保住设计稿原本的 8%/12%。
+      // 判据：`npm run build` 后 `dist/assets/*.css` 里应能搜到 `.bg-warning\/8`。
+      opacity: {
+        8: "0.08",
+        12: "0.12",
+      },
       fontFamily: {
         sans: ['"Segoe UI"', '"Microsoft YaHei"', "system-ui", "sans-serif"],
         mono: ['"Cascadia Code"', "Consolas", "monospace"],

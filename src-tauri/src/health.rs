@@ -14,11 +14,10 @@ const BREAKER_COOLDOWN_MS: i64 = 60_000;
 /// 「近期有真实转发成功」宽限窗口（毫秒）：窗口内后台探测失败不熔断，因真实流量证明该 Key 可用。
 const LIVE_SUCCESS_GRACE_MS: i64 = 120_000;
 
-/// 从「测试消息列表」随机取一条作为真实补全探测的 prompt。
-/// 列表为空（用户未配置）时回退内置 "hi"，保持旧行为。空白项过滤掉后仍为空也回退。
-// 「从测试消息列表随机取一条」的逻辑已移入 `Store::probe_message_if_real`：
+// 「从测试消息列表随机取一条作为真实补全探测 prompt」的逻辑已移入 `Store::probe_message_if_real`：
 // 那里能在**一次读锁内**完成「读开关 + 随机选取」，避免把整个消息列表克隆出来
 // （探测是每轮 × 每 Key 调用）。此处不再保留重复实现。
+// 列表为空（用户未配置）时回退内置 "hi"，保持旧行为；空白项过滤掉后仍为空也回退。
 
 /// 对单个 Key 执行一次健康检查并更新其状态。
 pub async fn check_one(store: &Arc<Store>, key_id: &str) {
@@ -54,8 +53,8 @@ pub async fn check_one(store: &Arc<Store>, key_id: &str) {
     // 绝不碰 breaker_until / fail_count。可达即 Up、连接层不可达即 Down；此 status 仅供
     // UI 展示，不参与路由门槛（is_candidate 只看熔断窗口）。故一次探测端点 401 / 探测模型名
     // 不匹配，再也不会把一个真实流量本可成功的 Key 踢出路由——熔断只由真实流量驱动。
-    // 探测可能长达 30s，期间 health 可能已被真实流量更新 breaker/fail_count，故读最新快照，
-    // 只覆盖 status/latency/last_checked 三个探测字段，其余原样保留。
+    // 探测可能长达 8s（`fast_timeout` 封顶），期间 health 可能已被真实流量更新 breaker/fail_count，
+    // 故读最新快照，只覆盖 status/latency/last_checked 三个探测字段，其余原样保留。
     let prev = store.get_key(key_id).map(|k| k.health).unwrap_or_default();
 
     // 探测失败落日志（归「健康检查」分组）——供排查，但不触发任何熔断动作。

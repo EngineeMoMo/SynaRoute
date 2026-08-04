@@ -98,7 +98,9 @@ export default function App() {
     if (nav === "vendors") return <VendorPage />;
     if (nav === "settings") return <SettingsPage />;
     if (nav === "about") return <AboutPage />;
-    return <CategoryPage onAddKey={openAdd} onEditKey={openEdit} />;
+    // onOpenLogs：分类页的「最近失败原因」横幅要能一键跳到运行日志页看详情
+    // （与 UpdateBanner 的 onOpenSettings 同一模式——nav 是 App 的局部状态，靠回调上抛）。
+    return <CategoryPage onAddKey={openAdd} onEditKey={openEdit} onOpenLogs={() => handleNav("logs")} />;
   };
 
   return (

@@ -140,6 +140,13 @@ pub struct ImportReport {
     /// Replace 模式下导入前备份的 config 路径（Merge 模式为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<String>,
+    /// Replace 模式下、真的要删旧密钥时备份的 secrets.enc 路径。
+    ///
+    /// 必须与 `backup_path` 并列给到用户：只回滚 config.json 会得到「Key 都回来了、
+    /// 密钥没了」的半截状态，两个文件要一起还原才是真正的回滚。
+    /// 没有 Key 被移除、或库文件本就不存在时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secrets_backup_path: Option<String>,
     /// 非致命提示（如「某 Key 有密钥标记但文件里没有对应密钥」）
     pub warnings: Vec<String>,
 }
@@ -390,7 +397,9 @@ pub fn apply_import(
     };
 
     // 配置整体落盘（走 store 的带回滚写路径）。返回 Replace 模式下被移除的 Key id。
-    let removed_ids = store.apply_imported_config(&file.payload, mode)?;
+    let mut removed_ids = store.apply_imported_config(&file.payload, mode)?;
+    // 密钥库备份路径（只有真的要删旧密钥时才产生），随报告一并交给用户。
+    let mut secrets_backup: Option<String> = None;
 
     // 清理被移除 Key 的密钥（P2-3）。**必须在配置落盘成功之后**——反之若配置落盘失败，
     // Key 会在下次启动时复活而密钥已没了（`has_secret=true` 却取不到的孤儿）。
@@ -405,6 +414,28 @@ pub fn apply_import(
     let mut secrets_pruned = 0usize;
     if !removed_ids.is_empty() {
         let mut guard = store.secrets.write();
+        // **删密钥前必须先备份整个 secrets.enc**，且备份不成就一条都不删。
+        //
+        // 为什么：上面 :372 的 `backup_config_before_import` 只备份了 config.json。
+        // 若在此直接 `remove`，`SecretStore::remove` 会立刻整份重写 secrets.enc ——
+        // 用户拿着报告里的 backup_path 把 config.json 还原回去，那些 Key 全部复活，
+        // 密钥密文却已被覆盖掉，只能去各中转商后台重新取一遍。**配置可回滚而密钥不可回滚，
+        // 等于没有回滚**（选错文件做 Replace 导入是很容易发生的误操作）。
+        //
+        // 备份失败时**跳过清理而不是中止导入**：此刻配置已经落盘、回不去了，中止没有意义；
+        // 而残留几条孤儿密钥是无害的（UI 有 `prune_orphan_secrets` 兜底，且它自己也会先备份）。
+        // 「没有安全网就不做这个不可逆动作」比「删了再说」正确。
+        match guard.backup_before_rewrite("import-replace") {
+            Ok(Some(bak)) => secrets_backup = Some(bak.to_string_lossy().into_owned()),
+            Ok(None) => {} // 库文件还不存在（本机从没存过密钥），没什么可删也没什么可备份
+            Err(e) => {
+                warnings.push(format!(
+                    "备份密钥库失败，已跳过清理 {} 条被移除 Key 的旧密钥（它们仍留在库中，可稍后用设置页的「清理孤儿密钥」处理）: {e}",
+                    removed_ids.len()
+                ));
+                removed_ids.clear();
+            }
+        }
         for id in &removed_ids {
             match guard.remove(id) {
                 Ok(()) => secrets_pruned += 1,
@@ -465,6 +496,7 @@ pub fn apply_import(
         secrets_imported,
         secrets_pruned,
         backup_path,
+        secrets_backup_path: secrets_backup,
         warnings,
     })
 }
@@ -961,7 +993,51 @@ mod tests {
         std::fs::remove_dir_all(&dst_dir).ok();
     }
 
-    /// P2-3：`prune_orphan_secrets` 兜住历史遗留孤儿，且**锁定态必须跳过**（不误删）。
+    /// Replace 导入删旧密钥**之前必须先备份 secrets.enc**，且备份路径要随报告交给用户。
+    ///
+    /// 为什么这条一定要有测试：`backup_config_before_import` 只备份 config.json，看起来
+    /// 「导入是可回滚的」；但删密钥走的是 `SecretStore::remove` → 立即整份重写 secrets.enc。
+    /// 少了这道备份，用户拿 `backup_path` 还原配置后 Key 全回来了、密钥却永久没了，
+    /// 只能去各中转商后台重取——而这一切在报告里看不出任何异常（`secrets_pruned` 还显示成功）。
+    /// 故障注入验证：把 `backup_before_rewrite("import-replace")` 那几行删掉，本测试必须变红。
+    #[test]
+    fn replace_import_backs_up_secret_vault_before_pruning() {
+        let src_dir = temp_dir("secbak_src");
+        let dst_dir = temp_dir("secbak_dst");
+
+        let src = store_at(&src_dir);
+        src.upsert_key(key("keep", "留下的")).unwrap();
+        let file = build_export(&src, "1.0.0", None).unwrap().0;
+
+        let dst = store_at(&dst_dir);
+        dst.upsert_key(key("keep", "本机的")).unwrap();
+        dst.upsert_key(key("gone", "将被移除")).unwrap();
+        dst.secrets.write().set("keep", "sk-keep").unwrap();
+        dst.secrets.write().set("gone", "sk-gone").unwrap();
+
+        let report = apply_import(&dst, &file, ImportMode::Replace, None).unwrap();
+        assert_eq!(report.secrets_pruned, 1, "前置条件：确实删了一条密钥");
+
+        let bak = report
+            .secrets_backup_path
+            .as_deref()
+            .expect("删密钥前必须备份密钥库，并把路径交给用户");
+        let bak = std::path::Path::new(bak);
+        assert!(bak.exists(), "报告给出的密钥库备份路径必须真实存在: {bak:?}");
+
+        // 备份必须是**删除之前**的那一份：拿它替换回去，被删的密钥要能重新读出来。
+        // 只断言「文件存在」是不够的——备份成一个空文件同样能过。
+        std::fs::copy(bak, dst_dir.join("secrets.enc")).unwrap();
+        let restored = crate::secret::SecretStore::load(dst_dir.join("secrets.enc")).unwrap();
+        assert_eq!(
+            restored.get("gone").unwrap().as_deref().map(String::as_str),
+            Some("sk-gone"),
+            "备份必须早于删除，否则回滚拿不回被删的密钥"
+        );
+
+        std::fs::remove_dir_all(&src_dir).ok();
+        std::fs::remove_dir_all(&dst_dir).ok();
+    }
     #[test]
     fn prune_orphan_secrets_cleans_history_and_skips_when_locked() {
         let dir = temp_dir("prune_history");

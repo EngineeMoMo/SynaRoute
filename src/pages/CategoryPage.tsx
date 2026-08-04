@@ -1,5 +1,5 @@
 import { usePolling } from "@/lib/usePolling";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "@/store";
 import { KeyCard } from "@/components/KeyCard";
 import { ProxyStatusBar } from "@/components/ProxyStatusBar";
@@ -8,13 +8,15 @@ import { Button } from "@/components/ui/Button";
 import { Combobox } from "@/components/ui/Combobox";
 import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
-import type { ProviderKey } from "@/types";
+import type { EventLogEntry, ProviderKey } from "@/types";
 import { Plus, AlertTriangle, Inbox, X, Database } from "lucide-react";
 
 /** 分类主页：代理状态条 + 模型映射兜底提示 + Key 卡片列表 */
-export function CategoryPage({ onAddKey, onEditKey }: {
+export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
   onAddKey: () => void;
   onEditKey: (k: ProviderKey) => void;
+  /** 跳转到运行日志页（「最近失败原因」横幅的「查看详情」用）。 */
+  onOpenLogs: () => void;
 }) {
   // 细粒度订阅（勿改回整店解构 `useStore()`）：整店订阅会让本页在 LogsPage 每 2s
   // 刷新 events 时也全量重渲染——连同它下面的全部 KeyCard。
@@ -52,20 +54,47 @@ export function CategoryPage({ onAddKey, onEditKey }: {
   const activeModel = settings?.activeModels?.[activeCategory] ?? "";
   const activeEffort = settings?.activeEfforts?.[activeCategory] ?? "";
 
+  /**
+   * 分类切换时作废「所有在途异步结果」的代际号。
+   *
+   * 为什么必须有：本页在三个分类间切换时**不会卸载**（App.tsx 对三个分类渲染的是同一个
+   * `<CategoryPage>`、没给 `key`，切换只改 store 里的 activeCategory），所以：
+   *
+   * 1. 切换前发出的 IPC 请求会在切换**之后**才 resolve，然后把上一个分类的数据
+   *    `setState` 进来——于是「Codex 刚刚转发失败」那条红色横幅会挂在 Claude CLI 页上，
+   *    「桌面端被 cc-switch 接管」的警告会出现在根本没有这回事的 Codex 页上；
+   * 2. 各条状态本身也不会因为换了分类而自动清空。
+   *
+   * 尤其阴险的是 takeover 那条：它的轮询 `enabled = isDesktop`，切到非桌面端后定时器就停了，
+   * **没有下一次轮询来纠正它**，那条假警告会一直挂到用户再切回桌面端为止。
+   *
+   * 故：切换分类时 ① 递增代际号，在途结果回来时代际对不上就丢弃；② 立即清空这些
+   * 跨分类不通用的状态，不等下一次轮询（等的话最坏要顶着错误信息 5 秒）。
+   */
+  const genRef = useRef(0);
+  const [takeover, setTakeover] = useState<string | null>(null);
+  const [vaultLocked, setVaultLocked] = useState(false);
+  const [recentFailure, setRecentFailure] = useState<EventLogEntry | null>(null);
+  useEffect(() => {
+    genRef.current += 1;
+    setTakeover(null);
+    setRecentFailure(null);
+    // vaultLocked 刻意**不清**：密钥库锁没锁与分类无关，是全局状态，清了反而会闪一下。
+  }, [activeCategory]);
+
   // 桌面端接入是否已被其他工具接管（cc-switch 重写 _meta.json）。
   // 只对桌面端查，且跟随 5s 轮询刷新——用户可能在 SynaRoute 开着的时候去点 cc-switch。
-  const [takeover, setTakeover] = useState<string | null>(null);
   const isDesktop = activeCategory === "claude-desktop";
-  useEffect(() => {
-    if (!isDesktop) setTakeover(null);
-  }, [isDesktop]);
   // `enabled` 只对桌面端开：其余分类没有「被 cc-switch 接管」这回事，不必白问。
   // 窗口不可见时停表（见 usePolling）。
   usePolling(
     () => {
+      const gen = genRef.current;
       void api
         .getToolConfigPreview("claude-desktop")
-        .then((p) => setTakeover(p.takeoverWarning ?? null))
+        .then((p) => {
+          if (gen === genRef.current) setTakeover(p.takeoverWarning ?? null);
+        })
         .catch(() => {
           // 预览读不出来（路径不存在等）不影响主界面，静默即可
         });
@@ -77,11 +106,42 @@ export function CategoryPage({ onAddKey, onEditKey }: {
   // 密钥库是否锁着（主口令模式尚未解锁）。锁着时**每一次转发都会失败**，
   // 而失败原因藏在运行日志里 —— 必须在最显眼的位置常驻提示，否则用户会以为 Key 配错了。
   // 跟随 5s 轮询：用户可能在设置页解锁后切回来，也可能点了「立即锁定」。
-  const [vaultLocked, setVaultLocked] = useState(false);
+  // 这条与分类无关（全局密钥库），故不参与代际作废。
   usePolling(() => {
     void api
       .getMasterPasswordState()
       .then((s) => setVaultLocked(s.enabled && s.locked))
+      .catch(() => {
+        // 读不到就不提示（宁可漏提示，也不要因一次 IPC 抖动弹个假警告）
+      });
+  }, 5000);
+
+  /**
+   * 最近一次转发失败（UX#11）。
+   *
+   * 为什么要常驻在这里：转发失败时用户在客户端只看到 502/529 之类的状态码，
+   * 而真实原因（哪个 Key、什么错、是鉴权还是限流）藏在运行日志页里——用户得先想到去翻日志。
+   * 这条把它提到最显眼的位置，与上面 vaultLocked / takeover 两条警告同一模式
+   * （那个模式已被证明好用）。
+   *
+   * **为什么走后端 `recentFailure` 而不在前端遍历 `events`**：`refreshCategory`（本页 5s 轮询）
+   * 只拉 keys + proxy，**不含 events**——events 只在 `loadCategory`（挂载/切分类）时拉一次。
+   * 若在前端算，这条横幅就会一直显示挂载那一刻的旧快照、不随新失败更新；
+   * 而把 `listAllEvents` 加进 5s 轮询又会把 P1-6 刚消掉的「每 2s 搬 500 条」重新引回来。
+   * 后端这个命令只返回**一条**已剥离 trace 的事件，代价可忽略。
+   *
+   * 结果要过 `genRef` 代际校验：切分类时本页不卸载，上一个分类的在途结果若直接写进来，
+   * 就会把「Codex 刚失败」的红条挂到 Claude CLI 页上（详见 genRef 的注释）。
+   */
+  const FRESH_MS = 5 * 60 * 1000; // 5 分钟内的失败才算「最近」
+  usePolling(() => {
+    const gen = genRef.current;
+    const cat = activeCategory;
+    void api
+      .recentFailure(cat, FRESH_MS)
+      .then((ev) => {
+        if (gen === genRef.current) setRecentFailure(ev);
+      })
       .catch(() => {
         // 读不到就不提示（宁可漏提示，也不要因一次 IPC 抖动弹个假警告）
       });
@@ -175,6 +235,26 @@ export function CategoryPage({ onAddKey, onEditKey }: {
         <div className="mx-6 mb-2 flex items-start gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-xs text-warning">
           <AlertTriangle size={14} className="mt-0.5 shrink-0" />
           <span className="flex-1 leading-relaxed">{takeover}</span>
+        </div>
+      )}
+
+      {/* 最近一次转发失败（UX#11）：客户端只会显示 502/529 之类的状态码，真实原因
+          （哪个 Key、鉴权还是限流）此前只藏在运行日志页里，用户得先想到去翻。
+          放在 vaultLocked / takeover 之后：那两条是「全盘不可用」，这条是「刚刚失败过一次」。 */}
+      {recentFailure && (
+        <div className="mx-6 mb-2 flex items-start gap-2 rounded-control border border-danger/30 bg-danger/8 px-3 py-2 text-xs text-danger">
+          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+          <div className="flex-1 leading-relaxed">
+            <span className="font-medium">{t("category.recentFailure")}</span>
+            <span className="ml-1 break-all">{recentFailure.detail}</span>
+          </div>
+          <button
+            type="button"
+            onClick={onOpenLogs}
+            className="shrink-0 whitespace-nowrap underline underline-offset-2 hover:opacity-80"
+          >
+            {t("category.recentFailureView")}
+          </button>
         </div>
       )}
 

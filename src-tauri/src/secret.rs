@@ -500,22 +500,25 @@ impl SecretStore {
     }
 
     /// 整份重写前的备份（带用途标签与时间戳，可回滚 —— dev-hard-rules）。
-    /// 文件不存在时不算失败（首次启用、库还没落过盘）。
+    /// 文件不存在时返回 `Ok(None)`，不算失败（首次启用、库还没落过盘）。
     ///
-    /// `pub(crate)`：孤儿密钥清理（P2-3）也是不可逆的删除操作，必须先备份。
-    pub(crate) fn backup_before_rewrite(&self, tag: &str) -> AppResult<()> {
+    /// `pub(crate)`：孤儿密钥清理（P2-3）与 Replace 导入清理旧密钥都是不可逆的删除操作，
+    /// 必须先备份。**返回备份路径**，好让调用方把它交到用户手里 —— 一个用户找不到的
+    /// 备份文件等于没有备份（Replace 导入那条路径尤其重要：报告里已有 config.json 的
+    /// 备份路径，密钥库的必须并列给出，否则用户按报告回滚配置后才发现密钥回不来了）。
+    pub(crate) fn backup_before_rewrite(&self, tag: &str) -> AppResult<Option<PathBuf>> {
         if !self.path.exists() {
-            return Ok(());
+            return Ok(None);
         }
         let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
         let bak = self.path.with_extension(format!("enc.{tag}-{ts}"));
         std::fs::copy(&self.path, &bak).map_err(|e| {
             AppError::Other(format!(
-                "切换密钥加密模式前备份密钥库失败，已放弃操作（避免整份重写写坏后无从恢复）: {e}"
+                "整份重写密钥库前的备份失败（用途：{tag}），已放弃该操作（避免写坏后无从恢复）: {e}"
             ))
         })?;
-        tracing::info!("切换密钥加密模式前已备份密钥库到 {bak:?}");
-        Ok(())
+        tracing::info!("密钥库整份重写前已备份到 {bak:?}（用途：{tag}）");
+        Ok(Some(bak))
     }
 
     fn persist(&mut self) -> AppResult<()> {

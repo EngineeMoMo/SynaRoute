@@ -159,6 +159,21 @@ export const api = {
     call<EventLogEntry[]>("list_all_events", undefined, () => mockBridge.listAllEvents()),
 
   /**
+   * 最近一次「够新」的转发失败（UX#11 的分类页常驻提示用）。
+   *
+   * **为什么必须走后端而不在前端从 `events` 里挑**：分类页的 5s 轮询走
+   * `refreshCategory`，它只拉 keys + proxy，**不拉 events**（events 只在
+   * `loadCategory` 即挂载/切分类时拉一次）。若在前端从 store 的 `events` 里筛，
+   * 拿到的是挂载那一刻的快照，转发失败后不会更新——正是本项目反复防的静默失效。
+   * 而把 `listAllEvents` 加进 5s 轮询又会把 P1-6 刚消掉的「每轮搬运 500 条」重新引回来。
+   * 故让后端只回**一条**已剥离 trace 的事件，每轮开销恒定。
+   *
+   * `freshMs` 之外的旧失败返回 null——陈旧失败不该一直挂着让用户以为现在还坏着。
+   */
+  recentFailure: (categoryId: CategoryType, freshMs: number) =>
+    call<EventLogEntry | null>("recent_failure", { categoryId, freshMs }, async () => null),
+
+  /**
    * 按事件 id 取链路快照（用户展开某行日志时才调）。
    *
    * 列表接口不返回 trace 正文——每 2s 全量轮询 × 单条最坏 40000 字符会把界面拖卡。

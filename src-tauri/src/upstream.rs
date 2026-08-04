@@ -1453,8 +1453,9 @@ pub async fn health_probe_real(
     };
     let start = std::time::Instant::now();
     // 极小请求：一个字 prompt、max_tokens=1。不重试（探测要快、如实反映当下）。
-    // 探测超时封顶 30s（fast_timeout）：1 token 秒回,不跟随用户为慢厂商设的长超时,
-    // 否则串行探测循环会被一个挂掉的慢 Key 拖住几分钟。
+    // 探测超时封顶 8s（fast_timeout）：1 token 秒回，不跟随用户为慢厂商设的长超时，
+    // 否则一个挂掉的慢 Key 会把它所在的那条探测并发槽占满（见 health::sweep_all_enabled，
+    // PROBE_CONCURRENCY = 4），拖慢整轮扫描。
     let result = text_completion(key, secret, &model, message, 1, false, fast_timeout(key)).await;
     let latency = start.elapsed().as_millis() as u64;
     match result {

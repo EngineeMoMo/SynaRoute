@@ -130,8 +130,8 @@ fn save_secret(state: tauri::State<AppState>, key_id: String, secret: String) ->
 /// 实际只是没人去刷新过那个陈旧快照。
 ///
 /// 「刚把它启用」正是最需要知道它当下可用性的时刻，故在这里补一次探测。
-/// 探测**异步跑、不阻塞返回**：它最长可达 30s（`fast_timeout`），
-/// 若同步等待，用户点一下开关会看到界面卡住半分钟。
+/// 探测**异步跑、不阻塞返回**：它最长可达 8s（`fast_timeout`），
+/// 若同步等待，用户点一下开关会看到界面明显卡顿。
 /// 探测本身只写 status/latency、绝不碰熔断字段（见 `health::check_one`）。
 #[tauri::command]
 fn toggle_key(
@@ -576,6 +576,25 @@ fn list_events(state: tauri::State<AppState>, category_id: CategoryType) -> Vec<
 #[tauri::command]
 fn list_all_events(state: tauri::State<AppState>) -> Vec<EventLogEntry> {
     state.store.list_all_events()
+}
+
+/// 某分类「最近一次失败」（error/failover），供分类页顶部常驻提示条用（UX#11）。
+///
+/// 为什么单开一个命令而不让前端复用 `list_all_events` 自己筛：那个接口返回全部 500 条，
+/// 而分类页 5s 轮询一次 —— 为了显示一行摘要搬 500 条是把 P1-6 刚省下的开销又花回去。
+/// 这里只回一条（或 None），`fresh_ms` 由调用方指定「多新才算最近」。
+///
+/// 单位统一用**毫秒**，与 `Store::recent_failure` 及 `EventLogEntry.ts` 一致。
+/// （此处原先叫 `fresh_secs` 却把值原样传给按毫秒解释的 store 方法 —— 前端传 300 秒
+/// 会被当成 300 毫秒，任何超过 0.3 秒的失败都被判为「不够新」而永不显示。
+/// 这类单位错配不会报错、只会让功能静默失效，故两侧命名必须一致。）
+#[tauri::command]
+fn recent_failure(
+    state: tauri::State<AppState>,
+    category_id: CategoryType,
+    fresh_ms: i64,
+) -> Option<EventLogEntry> {
+    state.store.recent_failure(category_id, fresh_ms)
 }
 
 /// 按事件 id 取链路快照（用户展开某行日志时才调）。
@@ -1820,6 +1839,7 @@ pub fn run() {
             restore_tool_config,
             list_events,
             list_all_events,
+            recent_failure,
             get_event_trace,
             get_settings,
             save_settings,
