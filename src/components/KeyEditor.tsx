@@ -11,6 +11,8 @@ import { X, RefreshCw, Plus, Trash2, ArrowRight, Eye, EyeOff, Zap, Gauge, Brain,
 interface KeyEditorProps {
   initial: ProviderKey | null; // null = 新增
   onClose: () => void;
+  /** 保存成功时回调（带后端回填 uuid 的那条 Key）。与 onClose 分开，因为 onClose 在取消时也会触发 */
+  onSaved?: (saved: ProviderKey) => void;
 }
 
 /**
@@ -25,7 +27,7 @@ const PROTOCOL_LABEL: Record<Protocol, string> = {
 };
 
 /** 新增/编辑 Key 抽屉面板（FR-002/004/005/006） */
-export function KeyEditor({ initial, onClose }: KeyEditorProps) {
+export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const activeCategory = useStore((s) => s.activeCategory);
   const loadCategory = useStore((s) => s.loadCategory);
   const vendors = useStore((s) => s.vendors);
@@ -377,6 +379,10 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
       const saved = await api.upsertKey(key);
       if (secret) await api.saveSecret(saved.id, secret);
       await loadCategory(activeCategory);
+      // 保存成功的专用回调。**不能用 onClose 代替**：onClose 在「保存成功」与「点取消」
+      // 两条路径上都会被调用，调用方无法区分。首启向导需要拿到后端回填了 uuid 的那条 Key
+      // 才能接着自动启用它。App.tsx 现有用法不传该 prop，行为不变。
+      onSaved?.(saved);
       onClose(); // 落盘即关闭：健康探测移出关键路径，避免等上游往返「像卡住」
       // Codex 分类的 Key 改动可能变更可服务模型集 → 托盘「Codex 模型」子菜单候选需同步重建
       // （托盘菜单静态构建，不自动跟数据变）。仅 Codex 需要，其余分类无此子菜单。

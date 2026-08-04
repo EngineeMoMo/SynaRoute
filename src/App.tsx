@@ -8,6 +8,7 @@ import { AboutPage } from "@/pages/AboutPage";
 import { VendorPage } from "@/pages/VendorPage";
 import { KeyEditor } from "@/components/KeyEditor";
 import { CommandPalette } from "@/components/CommandPalette";
+import { OnboardingWizard } from "@/components/OnboardingWizard";
 import { Toast } from "@/components/Toast";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { ConfigAppliedDialog } from "@/components/ConfigAppliedDialog";
@@ -27,6 +28,8 @@ export default function App() {
   const loadSettings = useStore((s) => s.loadSettings);
   const loadVendors = useStore((s) => s.loadVendors);
   const refreshCategory = useStore((s) => s.refreshCategory);
+  const onboarding = useStore((s) => s.onboarding);
+  const loadOnboarding = useStore((s) => s.loadOnboarding);
   const theme = useStore((s) => s.theme);
   const t = useT();
   const [nav, setNav] = useState<NavKey>("claude-cli");
@@ -39,6 +42,7 @@ export default function App() {
     void loadSettings();
     void loadVendors();
     void loadCategory(activeCategory);
+    void loadOnboarding();
     // 启动后静默检查更新（失败不弹窗，仅供顶部横幅 / 设置页展示）。
     // 不加 isTauri 守卫：浏览器预览下 bridge 会走 mock，正好能验证横幅布局；
     // 真实环境走 Tauri 命令。两边都不弹窗，失败仅落进 updateCheck.error。
@@ -172,6 +176,17 @@ export default function App() {
 
       <Toast />
       <ConfigAppliedDialog />
+
+      {/* 首启向导（UX#1）：仅在「标记未完成 且 一条 Key 都没有」时显示，可跳过。
+          必须传 handleNav 本体——它同时做 setNav 与 setActiveCategory，
+          只传 setActiveCategory 会让侧栏高亮与向导选的客户端对不上。 */}
+      {onboarding?.shouldShow && (
+        <OnboardingWizard
+          ccswitchAvailable={onboarding.ccswitchAvailable}
+          onPickCategory={handleNav}
+          onOpenLogs={() => handleNav("logs")}
+        />
+      )}
 
       {/* 浏览器预览模式提示（Tauri 环境不显示） */}
       {!isTauri() && (

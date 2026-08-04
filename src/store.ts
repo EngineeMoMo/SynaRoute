@@ -5,6 +5,7 @@ import type {
   BrainConfig,
   CategoryType,
   EventLogEntry,
+  OnboardingState,
   ProviderKey,
   ProxyState,
   ThemePref,
@@ -57,6 +58,8 @@ interface AppState {
   brain: BrainConfig | null;
   events: EventLogEntry[];
   settings: AppSettings | null;
+  /** 首启向导状态（UX#1）。null = 尚未拉取 */
+  onboarding: OnboardingState | null;
   vendors: Vendor[];
   loading: boolean;
 
@@ -88,6 +91,8 @@ interface AppState {
   refreshCategory: () => Promise<void>;
   refreshEvents: () => Promise<void>;
   loadSettings: () => Promise<void>;
+  loadOnboarding: () => Promise<void>;
+  dismissOnboarding: () => Promise<void>;
   loadVendors: () => Promise<void>;
   toggleKey: (keyId: string, enabled: boolean) => Promise<void>;
   moveKey: (keyId: string, direction: "up" | "down") => Promise<void>;
@@ -102,7 +107,7 @@ interface AppState {
   setPrimaryKey: (keyId: string) => Promise<boolean>;
   deleteKey: (keyId: string) => Promise<void>;
   checkHealth: (keyId: string) => Promise<void>;
-  startProxy: () => Promise<void>;
+  startProxy: (opts?: { announce?: boolean }) => Promise<boolean>;
   stopProxy: () => Promise<void>;
   // 应用内「对外模型名」选择（借鉴 EchoBird）：客户端菜单拉不到中转模型时在应用内选，
   // 代理转发时覆盖客户端发来的模型名。走后端专用命令直写，即时生效、免重启客户端。
@@ -122,6 +127,7 @@ export const useStore = create<AppState>((set, get) => ({
   brain: null,
   events: [],
   settings: null,
+  onboarding: null,
   vendors: [],
   loading: false,
 
@@ -236,6 +242,32 @@ export const useStore = create<AppState>((set, get) => ({
     const settings = await api.getSettings();
     set({ settings, theme: settings.theme, lang: settings.language ?? "zh" });
     applyTheme(settings.theme);
+  },
+
+  /** 拉首启向导状态（UX#1）。失败不影响主流程——宁可不显示向导，也不要拿报错挡住启动。 */
+  async loadOnboarding() {
+    try {
+      set({ onboarding: await api.getOnboardingState() });
+    } catch (e) {
+      console.error("getOnboardingState failed", e);
+    }
+  },
+
+  /**
+   * 关闭向导（完成或跳过）。
+   *
+   * 先乐观关闭再落盘，且**落盘失败不回滚**：把已经关掉的向导再弹回用户面前，
+   * 比标记丢失糟糕得多。真丢了也只是下次启动再出现一次，而那时用户已经有 Key 了，
+   * `shouldShow` 的 `totalKeys === 0` 条件会兜住。
+   */
+  async dismissOnboarding() {
+    const cur = get().onboarding;
+    if (cur) set({ onboarding: { ...cur, shouldShow: false, done: true } });
+    try {
+      await api.setOnboardingDone(true);
+    } catch (e) {
+      console.error("setOnboardingDone failed", e);
+    }
   },
 
   async loadVendors() {
@@ -371,7 +403,14 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  async startProxy() {
+  async startProxy(opts) {
+    // announce：是否弹「已写入工具配置」对话框。首启向导要自己承接这一步的反馈
+    // （第③步就在说明写了什么），再弹一个对话框会盖住向导。默认 true 保持既有行为。
+    //
+    // **必须复用本函数而不是在向导里重写一遍 start + apply**：语义得与界面按钮、托盘完全一致
+    //（起 = 顺带写工具配置）。三处各写一份必然漂移，而漂移的表现是「托盘说已启动、
+    // 客户端却没走代理」这类无头案。
+    const announce = opts?.announce ?? true;
     const cat = get().activeCategory;
     // 启动失败（端口被占等）必须可见，不能静默吞掉——ProxyStatusBar 以 void 调用本函数。
     try {
@@ -380,18 +419,20 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (e) {
       console.error("startProxy failed", e);
       get().showToast("error", String((e as Error)?.message ?? e));
-      return; // 代理没起来，不继续写工具配置
+      return false; // 代理没起来，不继续写工具配置
     }
     // 启动即写入目标工具配置，省去用户再手点一次「写入工具配置」。
     // 写入失败不回滚代理（代理已起来可用），仅弹提示告知。
     try {
       await api.applyToolConfig(cat);
       await get().loadCategory(cat);
-      set({ configAppliedCategory: cat });
+      if (announce) set({ configAppliedCategory: cat });
     } catch (e) {
       console.error("applyToolConfig after start failed", e);
       get().showToast("error", String((e as Error)?.message ?? e));
     }
+    // 代理已可用即算成功——写配置失败属于降级而非失败，与上面「不回滚」的语义一致。
+    return true;
   },
 
   async stopProxy() {

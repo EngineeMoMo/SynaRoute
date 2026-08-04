@@ -628,6 +628,38 @@ fn get_settings(state: tauri::State<AppState>) -> AppSettings {
     state.store.get_settings()
 }
 
+/// 首启向导该不该显示（UX#1）。
+///
+/// `should_show` 的判据是「标记未完成 **且** 一条 Key 都没有」。加后一个条件是纵深防御：
+/// 万一标记因为某种原因是 false 而用户其实已经配好了，也不该拿一个空向导挡住他。
+#[tauri::command]
+fn get_onboarding_state(state: tauri::State<AppState>) -> OnboardingState {
+    // 两条独立语句：各自的锁随语句结束即释放，不会跨调用持有。
+    let done = state.store.get_settings().onboarding_done.unwrap_or(false);
+    let total_keys = state.store.total_key_count();
+    OnboardingState {
+        should_show: !done && total_keys == 0,
+        done,
+        total_keys,
+        ccswitch_available: ccswitch::db_available(),
+    }
+}
+
+#[tauri::command]
+fn set_onboarding_done(state: tauri::State<AppState>, done: bool) -> AppResult<()> {
+    state.store.set_onboarding_done(done)
+}
+
+/// 自某时刻起该分类有没有真的收到过转发请求（首启向导第④步的正反馈）。
+#[tauri::command]
+fn first_request_since(
+    state: tauri::State<AppState>,
+    category_id: CategoryType,
+    since_ms: i64,
+) -> FirstRequestProbe {
+    state.store.first_request_since(category_id, since_ms)
+}
+
 #[tauri::command]
 async fn save_settings(
     app: tauri::AppHandle,
@@ -1739,6 +1771,17 @@ pub fn run() {
                 }
             }
 
+            // 首启向导标记的启动对账（UX#1）。
+            //
+            // 老用户升级上来配置里没有 onboarding_done 字段（反序列化成 None）。若不对账，
+            // 他们哪天把 Key 全删了（换厂商、清理重配）就会突然被首启向导拦住 ——
+            // 一个用了半年的软件毫无征兆地弹「欢迎使用」。这里一次性据当前 Key 数定下来。
+            match state.store.reconcile_onboarding_flag() {
+                Ok(Some(v)) => tracing::info!("首启向导标记已对账为 {v}（据当前 Key 数判定）"),
+                Ok(None) => {}
+                Err(e) => tracing::warn!("首启向导标记对账失败: {e}"),
+            }
+
             // 开机自启动（FR-025）的两件事：
             //
             // 1) **状态对账**。config.json 里的 auto_start 与系统实际注册项可能背离——用户手动
@@ -1855,6 +1898,9 @@ pub fn run() {
             get_event_trace,
             get_settings,
             save_settings,
+            get_onboarding_state,
+            set_onboarding_done,
+            first_request_since,
             set_active_model,
             set_active_effort,
             rebuild_tray_menu,

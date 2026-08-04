@@ -58,6 +58,36 @@ const zh: Dict = {
   "palette.addKey": "新建 Key",
   "palette.launcher": "搜索与命令",
 
+  // 首启四步向导（UX#1 / UX#2）
+  "onboarding.title": "欢迎使用 SynaRoute",
+  "onboarding.subtitle": "四步接入，全程约一分钟",
+  "onboarding.skip": "跳过",
+  "onboarding.back": "上一步",
+  "onboarding.next": "下一步",
+  "onboarding.finish": "完成",
+  "onboarding.step1": "选客户端",
+  "onboarding.step2": "加 Key",
+  "onboarding.step3": "启动接入",
+  "onboarding.step4": "验证",
+  "onboarding.s1Desc": "先选一个你要接入的客户端。之后随时可以在左侧切换，为其它客户端各配一套。",
+  "onboarding.s2Desc": "加一条厂商 Key。多条 Key 会按优先级自动故障转移，现在先配一条就够。",
+  "onboarding.s2Import": "从 cc-switch 导入",
+  "onboarding.s2ImportHint": "检测到本机装有 cc-switch，可直接读取已配好的厂商，免去重填。",
+  "onboarding.s2Manual": "手动添加",
+  "onboarding.s2ManualHint": "填 Base URL 与密钥；协议会按 Base URL 自动判断。",
+  "onboarding.s2Done": "已有 {n} 条 Key，可以继续",
+  "onboarding.s3Desc": "启动本地代理，并把接入配置写进客户端。",
+  "onboarding.s3What":
+    "会做两件事：① 在本机起一个只监听 127.0.0.1 的代理；② 把该客户端的配置指向这个代理（原配置会先自动备份，停止代理时自动还原）。",
+  "onboarding.s3Action": "启动并接入",
+  "onboarding.s3Running": "代理已启动，配置已写入",
+  "onboarding.startFailed": "启动失败。常见原因是端口被占用——可在设置里换一个端口再试。",
+  "onboarding.s4Desc": "现在打开 {cat}，随便发一句话。收到请求后这里会自动打勾。",
+  "onboarding.s4Waiting": "等待第一个请求…（客户端若已开着，需要重启它才会读到新配置）",
+  "onboarding.s4Got": "已收到第一个请求，接入成功",
+  "onboarding.s4Failed": "收到了请求，但转发失败",
+  "onboarding.s4OpenLogs": "查看运行日志",
+
   // 关于作者页
   "about.title": "关于作者",
   "about.subtitle": "SynaRoute 由个人开发者维护，欢迎反馈问题与建议",
@@ -645,6 +675,41 @@ const en: Dict = {
   "palette.stopProxy": "Stop proxy: {cat}",
   "palette.addKey": "New key",
   "palette.launcher": "Search & commands",
+
+  // First-run wizard (UX#1 / UX#2)
+  "onboarding.title": "Welcome to SynaRoute",
+  "onboarding.subtitle": "Four steps, about a minute",
+  "onboarding.skip": "Skip",
+  "onboarding.back": "Back",
+  "onboarding.next": "Next",
+  "onboarding.finish": "Done",
+  "onboarding.step1": "Client",
+  "onboarding.step2": "Add key",
+  "onboarding.step3": "Start",
+  "onboarding.step4": "Verify",
+  "onboarding.s1Desc":
+    "Pick the client you want to route. You can switch in the sidebar later and set up the others too.",
+  "onboarding.s2Desc":
+    "Add one provider key. Multiple keys fail over automatically by priority — one is enough for now.",
+  "onboarding.s2Import": "Import from cc-switch",
+  "onboarding.s2ImportHint":
+    "cc-switch was found on this machine — read your existing providers instead of retyping them.",
+  "onboarding.s2Manual": "Add manually",
+  "onboarding.s2ManualHint": "Enter a base URL and key; the protocol is inferred from the URL.",
+  "onboarding.s2Done": "{n} key(s) configured — you can continue",
+  "onboarding.s3Desc": "Start the local proxy and write the connection config into the client.",
+  "onboarding.s3What":
+    "Two things happen: (1) a proxy starts, bound to 127.0.0.1 only; (2) the client's config is pointed at it. Your original config is backed up first and restored when you stop the proxy.",
+  "onboarding.s3Action": "Start and connect",
+  "onboarding.s3Running": "Proxy started, config written",
+  "onboarding.startFailed":
+    "Failed to start. Usually the port is taken — pick a different one in Settings and retry.",
+  "onboarding.s4Desc": "Now open {cat} and send any message. This will tick automatically once a request arrives.",
+  "onboarding.s4Waiting":
+    "Waiting for the first request… (if the client is already running, restart it so it picks up the new config)",
+  "onboarding.s4Got": "First request received — you're connected",
+  "onboarding.s4Failed": "A request arrived, but forwarding failed",
+  "onboarding.s4OpenLogs": "Open logs",
 
   // About page
   "about.title": "About the author",

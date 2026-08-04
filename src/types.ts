@@ -328,6 +328,32 @@ export interface AppSettings {
   activeEfforts?: Record<string, string>; // 各分类默认推理强度（key=分类，值 minimal/low/medium/high/xhigh）。Codex 对自定义 provider 不发 reasoning.effort，故在此配置、转发时注入。后端自管，走 setActiveEffort 专用命令
   trayModelSwitchEnabled?: boolean; // 托盘快切 Codex 模型子菜单开关（默认开）。开启后右键托盘可直接切 Codex 当前对外模型，免打开主窗口
   proxyPorts?: Record<string, number>; // 各分类代理首选监听端口（key=分类）。粘滞固定端口：默认 CLI=47100/Codex=47101/Desktop=47102，改端口走 setProxyPort（重启代理+重写客户端 config）
+  /**
+   * 首启向导是否已完成（UX#1）。**三态**：null/undefined = 从未判定（旧配置或全新安装），
+   * true = 已完成或已跳过，false = 该显示向导。
+   *
+   * 后端自管字段：只能走 setOnboardingDone 专用命令改，saveSettings 不会覆盖它
+   * （后端有保留防线）。前端别指望通过 update({ onboardingDone }) 生效。
+   */
+  onboardingDone?: boolean | null;
+}
+
+/** 首启向导该不该显示，以及显示时需要的上下文（UX#1）。 */
+export interface OnboardingState {
+  shouldShow: boolean;
+  done: boolean;
+  totalKeys: number;
+  /** 这台机器上有没有 cc-switch 库。有则把「从 cc-switch 导入」作为默认高亮的主选项 */
+  ccswitchAvailable: boolean;
+}
+
+/** 首启向导第④步的探针结果：自某时刻起有没有真的收到过转发请求。 */
+export interface FirstRequestProbe {
+  routed: boolean;
+  ts?: number;
+  detail?: string;
+  failed: boolean;
+  failureDetail?: string;
 }
 
 /** MCP 服务器运行状态（供设置页展示连接指示灯与故障原因） */

@@ -5,6 +5,8 @@
 import type {
   AggregateResult,
   AppSettings,
+  OnboardingState,
+  FirstRequestProbe,
   BrainConfig,
   CategoryType,
   CcSwitchImportReport,
@@ -204,6 +206,24 @@ export const api = {
 
   saveSettings: (settings: AppSettings) =>
     call<void>("save_settings", { settings }, () => mockBridge.saveSettings(settings)),
+
+  // ---- 首启向导（UX#1）----
+  // 浏览器预览刻意返回 shouldShow=true，好让预览模式能验证向导布局
+  // （与 UpdateBanner 不加 isTauri 守卫同一惯例）。
+  getOnboardingState: () =>
+    call<OnboardingState>("get_onboarding_state", undefined, async () => ({
+      shouldShow: true,
+      done: false,
+      totalKeys: 0,
+      ccswitchAvailable: true,
+    })),
+  setOnboardingDone: (done: boolean) =>
+    call<void>("set_onboarding_done", { done }, async () => {}),
+  firstRequestSince: (categoryId: CategoryType, sinceMs: number) =>
+    call<FirstRequestProbe>("first_request_since", { categoryId, sinceMs }, async () => ({
+      routed: false,
+      failed: false,
+    })),
 
   // 设置某分类当前选定的「对外模型名」（应用内模型下拉专用，后端自管字段）。
   // 空串清除该分类选择，回到透传客户端发来的模型名。每请求实时读取，改选即时生效。

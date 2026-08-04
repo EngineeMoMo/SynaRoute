@@ -1563,13 +1563,94 @@ impl Store {
             // 根本没有 master 头部，解锁无从进行、密钥也读不出来（自造死局）。
             // 只能由 enable/disable_master_password 在**库迁移成功之后**改，以及启动时的对账修正。
             settings.master_password_enabled = cfg.settings.master_password_enabled;
+            // onboarding_done 同为后端自管字段。不保留的后果很具体：用户走完向导后随手切个主题，
+            // 前端挂载时那份**不含该字段**的旧快照就会把「已完成」顶回 None ——
+            // 下次启动首启向导又冒出来，而用户已经配好了。
+            // Option<bool> 是 Copy，直接赋值即可，不必 mem::take。
+            settings.onboarding_done = cfg.settings.onboarding_done;
             cfg.settings = settings;
             Ok(())
         })
     }
 
+    /// 首启向导标记的专用写入（后端自管字段，绕过 save_settings 的旧快照覆盖）。
+    /// 已是目标值则幂等跳过写盘。
+    pub fn set_onboarding_done(&self, done: bool) -> AppResult<()> {
+        self.mutate_and_persist_if(|cfg| {
+            if cfg.settings.onboarding_done == Some(done) {
+                false
+            } else {
+                cfg.settings.onboarding_done = Some(done);
+                true
+            }
+        })
+    }
+
+    /// 启动时对账首启向导标记（UX#1）。
+    ///
+    /// **为什么必须有这一步**：老用户升级上来，配置里根本没有 `onboarding_done` 字段
+    /// （反序列化成 `None`）。若不对账，他们哪天把 Key 全删了（换厂商、清理重配），
+    /// 就会突然被首启向导拦住 —— 一个用了半年的软件毫无征兆地弹出「欢迎使用」。
+    /// 这里在启动时一次性据当前 Key 数定下来：有 Key 就是老用户（标记为已完成），
+    /// 没 Key 才是真的需要向导。
+    ///
+    /// 返回 `Ok(None)` 表示已判定过、什么都没做。
+    ///
+    /// 锁使用注意：两次 `config.read()` 是**两条独立语句**，各自的读锁随语句结束即释放。
+    /// 不能写成把读锁 guard 存进变量再调 `set_onboarding_done`（它内部要取写锁）——
+    /// parking_lot 不可重入且写者优先，那样会死锁。
+    pub fn reconcile_onboarding_flag(&self) -> AppResult<Option<bool>> {
+        let undecided = self.config.read().settings.onboarding_done.is_none();
+        if !undecided {
+            return Ok(None);
+        }
+        let has_keys = !self.config.read().keys.is_empty();
+        self.set_onboarding_done(has_keys)?;
+        Ok(Some(has_keys))
+    }
+
+    /// 全部分类的 Key 总数（首启向导判断「一条都还没有」用）。
+    pub fn total_key_count(&self) -> usize {
+        self.config.read().keys.len()
+    }
+
+    /// 自 `since_ms` 起，某分类有没有真的收到过转发请求（首启向导第④步的正反馈）。
+    ///
+    /// 这是向导里唯一能回答「我配对了吗」的东西 —— 在此之前，用户接入完客户端后
+    /// 没有任何东西告诉他成功了，只能自己去开一个会话试。
+    ///
+    /// 同时采集失败：接入配错时用户同样卡在这一步，只显示「还没收到请求」帮不了他，
+    /// 得让他看见「收到了，但 401」。
+    ///
+    /// 实现是**倒序单趟扫描**，遇到早于 `since_ms` 的事件立即 break —— events 严格按时间
+    /// 递增（append 只 push、折叠只改最后一条、超限 drain 只从头砍），所以倒序遇到第一条
+    /// 过期的就可以停，不必扫完整个环形缓冲。
+    pub fn first_request_since(&self, category: CategoryType, since_ms: i64) -> FirstRequestProbe {
+        let ev = self.events.read();
+        let mut probe = FirstRequestProbe::default();
+        for e in ev.iter().rev() {
+            if e.ts < since_ms {
+                break; // 再往前都是向导开始之前的历史事件，与本次接入无关
+            }
+            if e.category_id != category {
+                continue;
+            }
+            if e.kind == "route" && !probe.routed {
+                probe.routed = true;
+                probe.ts = Some(e.ts);
+                probe.detail = Some(e.detail.clone());
+            } else if (e.kind == "error" || e.kind == "failover") && !probe.failed {
+                probe.failed = true;
+                probe.failure_detail = Some(e.detail.clone());
+            }
+            if probe.routed && probe.failed {
+                break;
+            }
+        }
+        probe
+    }
+
     /// 设置某分类当前选定的对外模型名（后端自管字段专用写入，绕过 save_settings 的旧快照覆盖）。
-    /// 空串视为清除该分类的选择（回到「透传客户端发来的模型名」）。已是目标值则幂等跳过写盘。
     pub fn set_active_model(&self, category: &str, model: &str) -> AppResult<()> {
         // 走 `mutate_and_persist_if`：落盘失败时磁盘对账回滚。旧写法是「改内存 → persist()」，
         // 落盘失败即内存领先磁盘，而该方向**永不自愈**（mtime 自愈只认「磁盘比内存新」）——
@@ -2845,8 +2926,108 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 首启向导标记必须扛得住「前端切主题时提交的旧快照」（UX#1）。
+    ///
+    /// 这是本仓修过的那个 P0 的同一形态：`store.settings` 是前端挂载时的快照，
+    /// 用户走完向导后随手切个主题，那份**不含 onboarding_done 的**旧对象就会整份提交回来。
+    /// 没有保留防线的话标记被顶回 None，下次启动向导又冒出来 —— 而用户明明已经配好了。
+    #[test]
+    fn onboarding_flag_survives_stale_settings_save() {
+        let dir = temp_dir("onboarding_stale_save");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        store.set_onboarding_done(true).unwrap();
+
+        // 前端旧快照：字段还是 None（挂载时向导尚未完成），只想改主题。
+        let mut stale = store.get_settings();
+        stale.onboarding_done = None;
+        stale.theme = "dark".into();
+        store.save_settings(stale).unwrap();
+
+        assert_eq!(
+            store.get_settings().onboarding_done,
+            Some(true),
+            "向导完成标记不得被前端旧快照顶回，否则下次启动向导会再次弹出"
+        );
+        assert_eq!(store.get_settings().theme, "dark", "非自管字段应正常更新");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 启动对账：老用户（有 Key）不该被首启向导拦住；全新安装（无 Key）才显示。
+    #[test]
+    fn reconcile_onboarding_marks_existing_users_as_done() {
+        let dir = temp_dir("onboarding_reconcile_old");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        store.upsert_key(sample_key("k1", 0)).unwrap();
+
+        // 模拟从旧版本升级：配置里没有该字段 → None
+        store.save_settings(AppSettings::default()).unwrap();
+        store
+            .mutate_and_persist_if(|cfg| {
+                cfg.settings.onboarding_done = None;
+                true
+            })
+            .unwrap();
+
+        let r = store.reconcile_onboarding_flag().unwrap();
+        assert_eq!(r, Some(true), "有 Key 的老用户应被判定为已完成");
+        assert_eq!(store.get_settings().onboarding_done, Some(true));
+
+        // 幂等：再对账一次什么都不做（已判定）。
+        assert_eq!(store.reconcile_onboarding_flag().unwrap(), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reconcile_onboarding_marks_fresh_install_as_pending() {
+        let dir = temp_dir("onboarding_reconcile_new");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        let r = store.reconcile_onboarding_flag().unwrap();
+        assert_eq!(r, Some(false), "一条 Key 都没有 → 判定为需要显示向导");
+        assert_eq!(store.get_settings().onboarding_done, Some(false));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 第④步的探针：只认**向导开始之后**的事件，且能区分「成功路由」与「收到了但失败」。
+    #[test]
+    fn first_request_since_ignores_history_and_reports_failure() {
+        let dir = temp_dir("first_request_probe");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        // 向导开始**之前**就有一条成功路由（用户之前自己试过）——不该被算进来，
+        // 否则向导会在用户还没接入时就打勾，那是个假的正反馈。
+        store.append_event(CategoryType::ClaudeCli, "route", None, "历史成功");
+
+        // 用真实时间切分前后（append_event 自己打 chrono 时间戳，测的就是真实写入路径）。
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let since = chrono::Utc::now().timestamp_millis();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let probe = store.first_request_since(CategoryType::ClaudeCli, since);
+        assert!(!probe.routed, "向导开始前的历史事件不得算作本次接入成功");
+
+        // 之后收到一次失败
+        store.append_event(CategoryType::ClaudeCli, "error", None, "401 未授权");
+        let probe = store.first_request_since(CategoryType::ClaudeCli, since);
+        assert!(!probe.routed);
+        assert!(probe.failed, "收到了请求但失败，必须能告诉用户，只说「还没收到」帮不了他");
+        assert_eq!(probe.failure_detail.as_deref(), Some("401 未授权"));
+
+        // 再收到一次成功
+        store.append_event(CategoryType::ClaudeCli, "route", None, "opus-4-8 → 厂商1");
+        let probe = store.first_request_since(CategoryType::ClaudeCli, since);
+        assert!(probe.routed);
+        assert_eq!(probe.detail.as_deref(), Some("opus-4-8 → 厂商1"));
+
+        // 分类隔离：别的分类的事件不算
+        let other = store.first_request_since(CategoryType::Codex, since);
+        assert!(!other.routed && !other.failed, "其它分类的事件不得串台");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 应用内「对外模型名」选择：set_active_model 直写并持久化；空串清除；
-    /// 且不被前端携带的陈旧 save_settings 快照顶回（与 mcp_* 同一保全策略）。
     #[test]
     fn set_active_model_persists_and_survives_stale_save_settings() {
         let dir = temp_dir("active_model");

@@ -1122,6 +1122,37 @@ impl TokenUsage {
     }
 }
 
+/// 首启向导第④步的探针结果：自某个时刻起，某分类有没有真的收到过转发请求。
+///
+/// 这是向导里**唯一的正反馈**——用户接入完客户端后，此前没有任何东西告诉他「成功了」。
+/// 同时带上失败信息：接入配错时用户同样卡在这一步，只说「还没收到请求」帮不了他。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FirstRequestProbe {
+    /// 是否已收到至少一次成功路由的请求
+    pub routed: bool,
+    /// 那一次的时间戳
+    pub ts: Option<i64>,
+    /// 那一次的摘要（哪个模型、走了哪条 Key）
+    pub detail: Option<String>,
+    /// 是否出现过失败（错误或故障转移）
+    pub failed: bool,
+    /// 失败摘要
+    pub failure_detail: Option<String>,
+}
+
+/// 首启向导该不该显示，以及显示时需要的上下文。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnboardingState {
+    pub should_show: bool,
+    pub done: bool,
+    pub total_keys: usize,
+    /// 这台机器上有没有 cc-switch 的库。有则把「从 cc-switch 导入」作为默认高亮的主选项 ——
+    /// 对已经在用 cc-switch 的用户，那是比手工填 13 个字段快得多的路。
+    pub ccswitch_available: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventLogEntry {
@@ -1292,6 +1323,20 @@ pub struct AppSettings {
     /// 作为下次首选（与 mcp_port 同一粘滞策略）。缺省时用 default_proxy_port(category)。
     #[serde(default)]
     pub proxy_ports: std::collections::HashMap<String, u16>,
+    /// 首启向导是否已完成（UX#1）。**三态**：
+    /// - `None` = 从未判定。旧版本升级上来的配置里没这个字段，全新安装第一次启动也是这个值。
+    /// - `Some(true)` = 已完成或用户主动跳过 → 不再显示。
+    /// - `Some(false)` = 判定过、该显示向导。
+    ///
+    /// 为什么要三态而不是 `bool`：`bool` 的默认值 `false` 会让**所有老用户**升级后
+    /// 突然被首启向导拦住 —— 他们早就配好了。`None` 让启动时的对账
+    /// （`Store::reconcile_onboarding_flag`）能区分「没判定过」与「判定过、结论是要显示」，
+    /// 据当前 Key 数一次性定下来。
+    ///
+    /// 后端自管字段：由专用命令 `set_onboarding_done` 更新，不随通用 `save_settings`
+    /// 的陈旧快照覆盖（与 `mcp_*` / `active_models` 同一保全策略）。
+    #[serde(default)]
+    pub onboarding_done: Option<bool>,
 }
 
 /// 各分类代理的默认首选端口。选用冷门段避开常见软件占用
@@ -1359,6 +1404,9 @@ impl Default for AppSettings {
             active_efforts: std::collections::HashMap::new(),
             tray_model_switch_enabled: true,
             proxy_ports: std::collections::HashMap::new(),
+            // None = 从未判定。启动时 reconcile_onboarding_flag 会据当前 Key 数定下来，
+            // 老用户因此不会突然被首启向导拦住。
+            onboarding_done: None,
         }
     }
 }

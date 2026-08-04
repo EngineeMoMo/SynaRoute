@@ -27,6 +27,16 @@ fn ccswitch_db_path() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
+/// 这台机器上有没有 cc-switch 的库（首启向导第②步用）。
+///
+/// 刻意不复用 `scan()`：那个会把整个 db 复制到临时目录再开 sqlite 连接、逐条解析候选。
+/// 向导只需要「有没有」这一个 bit 来决定默认高亮哪个主选项 —— 对已经在用 cc-switch 的用户，
+/// 「从这里导入」比手工填 13 个字段快得多，值得默认选中；没装的人则不该看到一个无用选项。
+/// 真正的候选列表仍由用户点开 `CcSwitchImportDialog` 时的 `scan()` 提供。
+pub fn db_available() -> bool {
+    ccswitch_db_path().is_some()
+}
+
 /// 一条可导入（或明确不可导入）的候选。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
