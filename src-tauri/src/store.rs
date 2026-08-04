@@ -2452,6 +2452,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 状态条「当前主 Key」的口径：**首个启用 Key**，不是 `priority == 0` 那条（UX#6）。
+    ///
+    /// 为什么单独钉一条：`priority == 0` 是个极易写错的近似。禁用一条 Key 时并不会重排
+    /// 优先级，所以完全可能出现「priority 为 0 的那条是禁用的」——此时真正先被使用的是
+    /// 下一条。若状态条按 `priority == 0` 显示，用户会看到一个**根本不参与路由**的 Key
+    /// 被标成「主 Key」，而真正在跑的是另一条。这类错误不会报错、只会让人对着日志发懵。
+    ///
+    /// 前端 `routingPrimaryKey()`（src/lib/modelSets.ts）必须与本断言同口径，
+    /// 托盘的「主 Key」子菜单也是（只列启用的 —— 把禁用 Key 设为主毫无意义，它不进候选池）。
+    #[test]
+    fn enabled_keys_sorted_head_is_routing_primary_even_if_priority0_disabled() {
+        let dir = temp_dir("primary_head");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        // priority 最小的那条是**禁用**的：它不进候选池，不该被视为主 Key。
+        let mut disabled_first = sample_key("disabled_p0", 0);
+        disabled_first.enabled = false;
+        store.upsert_key(disabled_first).unwrap();
+        store.upsert_key(sample_key("real_primary", 1)).unwrap();
+        store.upsert_key(sample_key("backup", 2)).unwrap();
+
+        let sorted = store.enabled_keys_sorted(CategoryType::ClaudeCli);
+        assert_eq!(
+            sorted.first().map(|k| k.id.as_str()),
+            Some("real_primary"),
+            "主 Key 是首个**启用**的，不是 priority==0 那条（后者已禁用、根本不进候选池）"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 设为主 Key：目标提到 priority 0，其余按原序顺延，整列重编号为连续值。
     #[test]
     fn set_primary_key_promotes_and_renumbers_contiguously() {

@@ -5,9 +5,10 @@ import { KeyCard } from "@/components/KeyCard";
 import { ProxyStatusBar } from "@/components/ProxyStatusBar";
 import { CcSwitchImportDialog } from "@/components/CcSwitchImportDialog";
 import { Button } from "@/components/ui/Button";
-import { Combobox } from "@/components/ui/Combobox";
 import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
+// 与状态条共用：两份实现必然漂移，而漂移后果是「状态条列出的模型在某备用 Key 上其实路由不了」
+import { keyExpectedSet } from "@/lib/modelSets";
 import type { EventLogEntry, ProviderKey } from "@/types";
 import { Plus, AlertTriangle, Inbox, X, Database } from "lucide-react";
 
@@ -25,9 +26,6 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
   const proxy = useStore((s) => s.proxy);
   const loading = useStore((s) => s.loading);
   const refreshCategory = useStore((s) => s.refreshCategory);
-  const settings = useStore((s) => s.settings);
-  const setActiveModel = useStore((s) => s.setActiveModel);
-  const setActiveEffort = useStore((s) => s.setActiveEffort);
   const t = useT();
   const [gapDialogOpen, setGapDialogOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
@@ -44,15 +42,6 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
 
   // 模型映射兜底检查（FR-006a）：统计启用 Key 中，各期望模型的覆盖缺口
   const gaps = useMemo(() => detectMappingGaps(keys.filter((k) => k.enabled)), [keys]);
-
-  // 应用内「当前模型」下拉：仅 Codex 需要（其模型菜单是内置固定清单、拉不到中转模型）。
-  // 候选与后端 /v1/models「交集」口径一致（discoverableModels），故选中的名字在所有候选 Key 都能路由。
-  const discoverable = useMemo(
-    () => discoverableModels(keys.filter((k) => k.enabled)),
-    [keys]
-  );
-  const activeModel = settings?.activeModels?.[activeCategory] ?? "";
-  const activeEffort = settings?.activeEfforts?.[activeCategory] ?? "";
 
   /**
    * 分类切换时作废「所有在途异步结果」的代际号。
@@ -171,53 +160,6 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
         />
       )}
 
-      {/* 应用内「当前模型」下拉（仅 Codex）：其模型菜单是内置固定清单、拉不到中转模型，
-          在此选定实际使用的对外模型名，代理转发时覆盖客户端发来的模型名，即时生效免重启。 */}
-      {activeCategory === "codex" && (
-        <div className="mx-6 mb-2 rounded-control border border-border bg-surface px-3 py-2.5">
-          <div className="mb-1.5 flex items-center justify-between gap-2">
-            <span className="text-xs font-medium text-text-secondary">{t("category.activeModel")}</span>
-            {activeModel && (
-              <button
-                type="button"
-                onClick={() => void setActiveModel(activeCategory, "")}
-                className="text-xs text-text-muted underline underline-offset-2 hover:text-text-secondary"
-              >
-                {t("category.activeModelAuto")}
-              </button>
-            )}
-          </div>
-          <Combobox
-            value={activeModel}
-            options={discoverable}
-            onChange={(v) => void setActiveModel(activeCategory, v)}
-            allowCustom={false}
-            placeholder={t("category.activeModelAuto")}
-            emptyHint={t("category.activeModelEmpty")}
-            className="w-full rounded-control border border-border bg-surface-hover px-3 py-1.5 font-mono text-xs text-text-primary outline-none focus:border-primary"
-          />
-          <p className="mt-1.5 text-[11px] leading-relaxed text-text-muted">{t("category.activeModelHint")}</p>
-
-          {/* 推理强度（方案 A）：Codex 对自定义 provider 不发 reasoning.effort，故在此配默认强度，
-              转发时补进请求体（Anthropic 上游映射成 thinking / Chat 上游映射成 reasoning_effort）。
-              选「跟随（不注入）」则保持现状不补。 */}
-          <div className="mt-3 border-t border-border pt-2.5">
-            <span className="text-xs font-medium text-text-secondary">{t("category.effortTitle")}</span>
-            <select
-              value={activeEffort}
-              onChange={(e) => void setActiveEffort(activeCategory, e.target.value)}
-              className="mt-1.5 w-full rounded-control border border-border bg-surface-hover px-3 py-1.5 text-xs text-text-primary outline-none focus:border-primary"
-            >
-              <option value="">{t("category.effort.off")}</option>
-              <option value="low">{t("category.effort.low")}</option>
-              <option value="medium">{t("category.effort.medium")}</option>
-              <option value="high">{t("category.effort.high")}</option>
-              <option value="xhigh">{t("category.effort.xhigh")}</option>
-            </select>
-            <p className="mt-1.5 text-[11px] leading-relaxed text-text-muted">{t("category.effortHint")}</p>
-          </div>
-        </div>
-      )}
 
       {/* 桌面端接入被其他工具接管（cc-switch 一被点开就整份重写 _meta.json）：
           档还在磁盘上、代理也在跑，但桌面端实际走的是别人那一档 → 表现为「接入了但不生效」。
@@ -320,48 +262,6 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
 interface Gap {
   expected: string;
   missingKeys: string[];
-}
-
-/**
- * 某个 Key 对外「可服务」的模型名集合 —— 必须与后端 `ProviderKey::serviceable_models` 同口径：
- * - 有完整映射 → 只取映射对外名（expectedName），不并入 models 真实名
- * - 无映射 → 取 models 真实名
- * - 已配三档 → 追加 claude-*-4-5 家族代表名
- */
-function keyExpectedSet(k: ProviderKey): Set<string> {
-  const set = new Set<string>();
-  const complete = k.mappings.filter(
-    (mp) => mp.expectedName.trim() && mp.realName.trim(),
-  );
-  if (complete.length > 0) {
-    for (const mp of complete) set.add(mp.expectedName.trim());
-  } else {
-    for (const m of k.models) {
-      const n = m.realName.trim();
-      if (n) set.add(n);
-    }
-  }
-  if (k.tierOpus?.trim()) set.add("claude-opus-4-5");
-  if (k.tierSonnet?.trim()) set.add("claude-sonnet-4-5");
-  if (k.tierHaiku?.trim()) set.add("claude-haiku-4-5");
-  return set;
-}
-
-/**
- * 应用内「当前模型」下拉的候选集 —— 与后端 `discoverable_models`（GET /v1/models）同口径：
- * 主 Key（优先级最高的启用 Key）可服务模型集，与各备用 Key 取交集；空交集时回退主 Key。
- * 保证选中的任意名字在所有候选 Key 都能 resolve、故障转移无感。
- */
-function discoverableModels(enabledKeys: ProviderKey[]): string[] {
-  const sorted = [...enabledKeys].sort((a, b) => a.priority - b.priority);
-  const primary = sorted[0];
-  if (!primary) return [];
-  const primaryModels = [...keyExpectedSet(primary)];
-  const backups = sorted.slice(1).map((k) => keyExpectedSet(k));
-  if (backups.length === 0) return primaryModels;
-  const intersection = primaryModels.filter((m) => backups.every((s) => s.has(m)));
-  // 空交集：对外名不统一，回退主 Key（与后端一致，保证下拉不空且主 Key 一定能路由）
-  return intersection.length > 0 ? intersection : primaryModels;
 }
 
 /**

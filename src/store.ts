@@ -91,15 +91,23 @@ interface AppState {
   loadVendors: () => Promise<void>;
   toggleKey: (keyId: string, enabled: boolean) => Promise<void>;
   moveKey: (keyId: string, direction: "up" | "down") => Promise<void>;
-  setPrimaryKey: (keyId: string) => Promise<void>;
+  /**
+   * 三个「切换后要弹成功 toast」的 action 返回 `boolean`：true = 无错。
+   *
+   * 为什么不靠 try/catch：这三个 action **内部**已经在失败时 `showToast("error", ...)` 了，
+   * 调用方再包一层 catch 会弹两条；而 toast 是单值不是队列（后一条顶掉前一条），
+   * 结果就是用户只看到后弹的那条。用返回值判断，才能做到「失败时只有错误提示、
+   * 成功时才报成功」——否则会出现「明明失败了却提示已切换」。
+   */
+  setPrimaryKey: (keyId: string) => Promise<boolean>;
   deleteKey: (keyId: string) => Promise<void>;
   checkHealth: (keyId: string) => Promise<void>;
   startProxy: () => Promise<void>;
   stopProxy: () => Promise<void>;
   // 应用内「对外模型名」选择（借鉴 EchoBird）：客户端菜单拉不到中转模型时在应用内选，
   // 代理转发时覆盖客户端发来的模型名。走后端专用命令直写，即时生效、免重启客户端。
-  setActiveModel: (category: CategoryType, model: string) => Promise<void>;
-  setActiveEffort: (category: CategoryType, effort: string) => Promise<void>;
+  setActiveModel: (category: CategoryType, model: string) => Promise<boolean>;
+  setActiveEffort: (category: CategoryType, effort: string) => Promise<boolean>;
 }
 
 export const useStore = create<AppState>((set, get) => ({
@@ -299,19 +307,23 @@ export const useStore = create<AppState>((set, get) => ({
       .filter((k) => k.categoryId === cat)
       .sort((a, b) => a.priority - b.priority);
     const idx = ordered.findIndex((k) => k.id === keyId);
-    if (idx <= 0) return; // 不存在或已是主，无需处理
+    // 已是主（或压根不存在）→ 不是失败，返回 true 让调用方照常给正反馈。
+    if (idx <= 0) return true;
     const [target] = ordered.splice(idx, 1);
     ordered.unshift(target);
     const renumbered = ordered.map((k, i) => ({ ...k, priority: i }));
     const byId = new Map(renumbered.map((k) => [k.id, k]));
     set({ keys: get().keys.map((k) => byId.get(k.id) ?? k) });
+    let ok = true;
     try {
       await api.setPrimaryKey(cat, keyId);
     } catch (e) {
       console.error("setPrimaryKey failed", e);
       get().showToast("error", String((e as Error)?.message ?? e));
+      ok = false;
     }
     await get().loadCategory(cat);
+    return ok;
   },
 
   async deleteKey(keyId) {
@@ -415,7 +427,9 @@ export const useStore = create<AppState>((set, get) => ({
       get().showToast("error", String((e as Error)?.message ?? e));
       // 落盘失败：重新拉后端权威值回滚乐观更新，避免 UI 与实际不一致
       await get().loadSettings();
+      return false;
     }
+    return true;
   },
 
   async setActiveEffort(category, effort) {
@@ -433,7 +447,9 @@ export const useStore = create<AppState>((set, get) => ({
       console.error("setActiveEffort failed", e);
       get().showToast("error", String((e as Error)?.message ?? e));
       await get().loadSettings();
+      return false;
     }
+    return true;
   },
 }));
 

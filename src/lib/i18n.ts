@@ -80,6 +80,17 @@ const zh: Dict = {
   // 仍是绿点，用户要点进列表才知道。这与「托盘说已启动、客户端没走代理」是同类的可见性缺口。
   "proxy.allKeysDown": "全部 {n} 个 Key 当前不可用",
   "proxy.someKeysDown": "{down}/{total} 个 Key 当前不可用",
+  "proxy.someKeysDownHint": "当前探测为不可用",
+  // 状态条快切（UX#6 / UX#8）。「即时生效、无需重启客户端」这句要反复出现——
+  // 用户默认以为改了配置就得重启客户端，不说清就不敢在会话中途切。
+  "proxy.primaryKey": "主 Key",
+  "proxy.primaryKeyHint": "故障转移最先使用这条。切换即时生效，无需重启客户端。",
+  "proxy.primaryKeyNone": "无启用的 Key",
+  "proxy.primaryKeySwitched": "已切换主 Key：{name}（即时生效，无需重启客户端）",
+  "proxy.modelSwitched": "已切换当前模型：{name}（即时生效，无需重启 Codex）",
+  "proxy.modelSwitchedAuto": "已改为跟随客户端透传（即时生效，无需重启 Codex）",
+  "proxy.effortSwitched": "已切换推理强度：{name}（即时生效，无需重启 Codex）",
+  "proxy.effortSwitchedOff": "已关闭推理强度注入（即时生效，无需重启 Codex）",
   "proxy.applyConfig": "写入工具配置",
   "proxy.configAppliedTitle": "配置已写入",
   "proxy.configAppliedDesc": "已自动将代理端点写入 {tool} 的配置文件。请退出并重启 {tool} 客户端，以使新配置生效。",
@@ -637,6 +648,21 @@ const en: Dict = {
   "proxy.copyEndpoint": "Copy endpoint",
   "proxy.allKeysDown": "All {n} keys currently unavailable",
   "proxy.someKeysDown": "{down}/{total} keys currently unavailable",
+  "proxy.someKeysDownHint": "Currently probing as unavailable",
+  "proxy.primaryKey": "Primary key",
+  "proxy.primaryKeyHint":
+    "Tried first on failover. Switching takes effect immediately — no client restart needed.",
+  "proxy.primaryKeyNone": "No enabled keys",
+  "proxy.primaryKeySwitched":
+    "Primary key switched to {name} — effective immediately, no client restart needed",
+  "proxy.modelSwitched":
+    "Active model switched to {name} — effective immediately, no need to restart Codex",
+  "proxy.modelSwitchedAuto":
+    "Switched to follow-client passthrough — effective immediately, no need to restart Codex",
+  "proxy.effortSwitched":
+    "Reasoning effort switched to {name} — effective immediately, no need to restart Codex",
+  "proxy.effortSwitchedOff":
+    "Reasoning-effort injection turned off — effective immediately, no need to restart Codex",
   "proxy.applyConfig": "Apply tool config",
   "proxy.configAppliedTitle": "Config Applied",
   "proxy.configAppliedDesc": "The proxy endpoint has been written to {tool}'s configuration. Please quit and restart {tool} to apply the new settings.",
