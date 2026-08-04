@@ -13,6 +13,7 @@ import {
   Building2,
   UserRound,
   Waypoints,
+  Search,
   type LucideIcon,
 } from "lucide-react";
 
@@ -39,9 +40,10 @@ const NAV: NavItem[] = [
 interface SidebarProps {
   active: NavKey;
   onSelect: (key: NavKey) => void;
+  onOpenPalette: () => void;
 }
 
-export function Sidebar({ active, onSelect }: SidebarProps) {
+export function Sidebar({ active, onSelect, onOpenPalette }: SidebarProps) {
   const t = useT();
   const updateCheck = useStore((s) => s.updateCheck);
   const hasUpdate = updateCheck?.status === "available";
@@ -113,6 +115,22 @@ export function Sidebar({ active, onSelect }: SidebarProps) {
       </div>
 
       <nav className="flex-1 overflow-y-auto px-2 py-2">
+        {/*
+          命令面板入口（UX#7）。纯快捷键的功能等于没做 —— 没人会去猜一个没有任何视觉线索的
+          Ctrl+K。这一条同时承担「告诉用户有这个功能」和「鼠标用户也能用」两件事，
+          右侧的 kbd 片是让用户学会快捷键、之后就不必再来点它。
+        */}
+        <button
+          onClick={onOpenPalette}
+          className="mb-3 flex w-full items-center gap-2.5 rounded-control px-3 py-2 text-sm text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary"
+        >
+          <Search size={16} className="shrink-0" />
+          <span className="truncate">{t("palette.launcher")}</span>
+          <kbd className="ml-auto shrink-0 rounded border border-border bg-background px-1.5 py-0.5 text-[10px] text-text-muted">
+            Ctrl K
+          </kbd>
+        </button>
+
         {renderGroup("category", t("sidebar.groupTools"))}
         {renderGroup("feature", t("sidebar.groupFeature"))}
         {renderGroup("system", t("sidebar.groupSystem"))}

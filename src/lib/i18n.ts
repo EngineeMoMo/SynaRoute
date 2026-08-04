@@ -41,6 +41,23 @@ const zh: Dict = {
   "nav.settings": "设置",
   "nav.about": "关于作者",
 
+  // 命令面板（Ctrl/Cmd+K）
+  "palette.title": "命令面板",
+  "palette.placeholder": "搜索 Key、模型、页面，或执行操作…",
+  "palette.noResults": "没有匹配项",
+  "palette.groupNav": "跳转",
+  "palette.groupKeys": "密钥",
+  "palette.groupActions": "操作",
+  "palette.fieldVendor": "厂商",
+  "palette.fieldModel": "模型",
+  "palette.fieldOutward": "对外名",
+  "palette.setPrimary": "设为主 Key：{name}",
+  "palette.primaryDone": "已将「{name}」设为主 Key",
+  "palette.startProxy": "启动代理：{cat}",
+  "palette.stopProxy": "停止代理：{cat}",
+  "palette.addKey": "新建 Key",
+  "palette.launcher": "搜索与命令",
+
   // 关于作者页
   "about.title": "关于作者",
   "about.subtitle": "SynaRoute 由个人开发者维护，欢迎反馈问题与建议",
@@ -611,6 +628,23 @@ const en: Dict = {
   "nav.vendors": "Vendors",
   "nav.settings": "Settings",
   "nav.about": "About",
+
+  // Command palette (Ctrl/Cmd+K)
+  "palette.title": "Command palette",
+  "palette.placeholder": "Search keys, models, pages, or run an action…",
+  "palette.noResults": "No matches",
+  "palette.groupNav": "Go to",
+  "palette.groupKeys": "Keys",
+  "palette.groupActions": "Actions",
+  "palette.fieldVendor": "Vendor",
+  "palette.fieldModel": "Model",
+  "palette.fieldOutward": "Outward name",
+  "palette.setPrimary": "Set as primary: {name}",
+  "palette.primaryDone": "\"{name}\" is now the primary key",
+  "palette.startProxy": "Start proxy: {cat}",
+  "palette.stopProxy": "Stop proxy: {cat}",
+  "palette.addKey": "New key",
+  "palette.launcher": "Search & commands",
 
   // About page
   "about.title": "About the author",

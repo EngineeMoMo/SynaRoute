@@ -7,6 +7,7 @@ import { Switch } from "@/components/ui/Switch";
 import { Button } from "@/components/ui/Button";
 import { useT } from "@/lib/useT";
 import { LANGS } from "@/lib/i18n";
+import { openLogDir } from "@/lib/openLogDir";
 import type {
   AppSettings,
   McpStatus,
@@ -207,15 +208,12 @@ export function SettingsPage() {
   const effectiveLogDir = settings?.logDir?.trim() || defaultLogDir;
 
   /**
-   * 打开日志目录（UX#13）。后端先确保目录存在（一条日志都没写过时它不存在，
-   * 直接交给资源管理器会报「找不到路径」），再由前端走 shell 插件打开——
-   * 与关于页打开外链同一做法（WebView 里 window.open 不可靠）。
+   * 打开日志目录（UX#13）。实现在 `lib/openLogDir`，与命令面板共用一条 ——
+   * 两份拷贝会漂移，而漂移在这里是隐形的（详见该文件注释）。
    */
   const handleOpenLogDir = async () => {
     try {
-      const dir = await api.prepareLogDir();
-      const { open } = await import("@tauri-apps/plugin-shell");
-      await open(dir);
+      await openLogDir();
     } catch (e) {
       showToast("error", String((e as Error)?.message ?? e));
     }

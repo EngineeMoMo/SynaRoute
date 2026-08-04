@@ -7,6 +7,7 @@ import { SettingsPage } from "@/pages/SettingsPage";
 import { AboutPage } from "@/pages/AboutPage";
 import { VendorPage } from "@/pages/VendorPage";
 import { KeyEditor } from "@/components/KeyEditor";
+import { CommandPalette } from "@/components/CommandPalette";
 import { Toast } from "@/components/Toast";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { ConfigAppliedDialog } from "@/components/ConfigAppliedDialog";
@@ -31,6 +32,7 @@ export default function App() {
   const [nav, setNav] = useState<NavKey>("claude-cli");
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingKey, setEditingKey] = useState<ProviderKey | null>(null);
+  const [paletteOpen, setPaletteOpen] = useState(false);
 
   // 初次加载
   useEffect(() => {
@@ -42,6 +44,32 @@ export default function App() {
     // 真实环境走 Tauri 命令。两边都不弹窗，失败仅落进 updateCheck.error。
     void useStore.getState().checkForUpdates({ silent: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /**
+   * 全局快捷键 Ctrl/Cmd+K 开关命令面板（UX#7）。
+   *
+   * 三个判据，每个都对应一类真实故障：
+   * - **`e.isComposing` 必须先挡**：中文输入法组字期间的 keydown 属于输入法，
+   *   抢走会打断组字。本项目的 Key 备注名、大脑提示词都是中文输入重灾区。
+   * - **用 `e.code === "KeyK"` 打头**：它是物理键位、与键盘布局无关；`e.key` 在
+   *   非 US 布局下可能不是 "k"。两者都判是为了兼容 code 缺失的老 WebView。
+   * - **排除 `altKey`**：避免和 Ctrl+Alt+K 一类输入法/系统组合抢键。
+   *
+   * 刻意**不检测 activeElement 是不是输入框**：Ctrl+K 带修饰键，不存在裸字母冲突；
+   * 加了反而会让用户在面板自己的搜索框里按 Ctrl+K 关不掉面板。
+   */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing) return;
+      const isK = e.code === "KeyK" || e.key?.toLowerCase() === "k";
+      if (isK && (e.ctrlKey || e.metaKey) && !e.altKey) {
+        e.preventDefault();
+        setPaletteOpen((v) => !v); // 再按一次关闭
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   // 窗口重新聚焦/可见时立即刷新到磁盘最新（纵深防御）。
@@ -109,13 +137,37 @@ export default function App() {
       <UpdateBanner onOpenSettings={() => handleNav("settings")} />
 
       <div className="flex min-h-0 flex-1">
-        <Sidebar active={nav} onSelect={handleNav} />
+        <Sidebar active={nav} onSelect={handleNav} onOpenPalette={() => setPaletteOpen(true)} />
 
         <main className="flex-1 overflow-hidden">{renderMain()}</main>
       </div>
 
       {editorOpen && (
-        <KeyEditor initial={editingKey} onClose={() => setEditorOpen(false)} />
+        // key 强制重挂载：命令面板造出了「编辑器已开着、再从面板挑另一条 Key」这条路径。
+        // React 18 会把 setEditorOpen(false) 与 openEdit(k) 批处理成 editorOpen 恒为 true，
+        // 同类型同位置的元素不会重新挂载，而 KeyEditor 的字段全是 useState(initial?.x)
+        // 只在挂载时取一次 —— 结果是抽屉标题换了、表单里还是上一条 Key 的 baseUrl 与密钥态。
+        <KeyEditor key={editingKey?.id ?? "new"} initial={editingKey} onClose={() => setEditorOpen(false)} />
+      )}
+
+      {paletteOpen && (
+        <CommandPalette
+          onClose={() => setPaletteOpen(false)}
+          // 每个动作都先关掉编辑器：面板可以跨分类跳转，而开着的编辑器属于旧分类，
+          // 留着它会让用户在 A 分类的页面上对着 B 分类的 Key 表单。
+          onNavigate={(k) => {
+            setEditorOpen(false);
+            handleNav(k);
+          }}
+          onEditKey={(k) => {
+            setEditorOpen(false);
+            openEdit(k);
+          }}
+          onAddKey={() => {
+            setEditorOpen(false);
+            openAdd();
+          }}
+        />
       )}
 
       <Toast />

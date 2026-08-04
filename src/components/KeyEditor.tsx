@@ -176,7 +176,8 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
       // 用当前编辑中的字段拼草稿 key，后端用其 baseUrl+protocol+secret 探测
       const draft: ProviderKey = {
         id: draftId,
-        categoryId: activeCategory,
+        // 同 buildDraftKey：探测用的草稿也要跟随 Key 自己的分类，不跟随当前页。
+        categoryId: initial?.categoryId ?? activeCategory,
         name: name.trim() || draftId,
         vendor,
         baseUrl: baseUrl.trim(),
@@ -259,7 +260,14 @@ export function KeyEditor({ initial, onClose }: KeyEditorProps) {
     // 「两台机器照同一份教程配置」是真实场景，落在同一毫秒即撞号 → 跨机导入会把一条
     // 完全无关的本机 Key 静默覆盖成对方的配置。后端 upsert_key 会回填 id 并随返回值给回。
     id: initial?.id ?? "",
-    categoryId: activeCategory,
+    // 编辑已有 Key 时用**它自己的分类**，不是当前页的分类。
+    //
+    // 编辑器 UI 根本不提供「改分类」，所以这里取 initial 才是语义正确的。
+    // 原先写 activeCategory 一直没出事，只因为编辑器过去只能从当前分类页打开 ——
+    // 那是个**载荷性的巧合**：一旦出现「编辑器已开着、再切到别的分类」的路径
+    // （命令面板就能造出来），用户一保存就会把这条 Key 静默搬到另一个分类去，
+    // 旧分类少一条、新分类多一条，且优先级顺序全乱。
+    categoryId: initial?.categoryId ?? activeCategory,
     name: name.trim(),
     vendor,
     baseUrl: baseUrl.trim(),
