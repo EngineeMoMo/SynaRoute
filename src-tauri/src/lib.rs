@@ -19,6 +19,10 @@ mod secret;
 mod store;
 mod tools;
 mod upstream;
+/// upstream 对外契约守卫。**必须放在 upstream 外面**才能真正验证可见性，
+/// 详见该文件的模块注释。
+#[cfg(test)]
+mod upstream_api_surface;
 mod workdirs;
 
 use error::AppResult;
