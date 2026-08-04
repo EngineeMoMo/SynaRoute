@@ -14,14 +14,19 @@
 // ① 两个子模块出现同名项时 glob 会 E0659 歧义；
 // ② glob 会把只在内部用的名字也导出去，而未被使用的 re-export 会触发 unused_imports。
 // 契约由文件末尾的 api_surface 守卫在编译期兜住。
+mod cache;
 mod endpoint;
+mod usage;
 mod util;
 
 pub use endpoint::join_endpoint;
+pub use usage::{extract_usage, with_usage, TokenUsage};
 
 // 子模块里被本文件使用的项。`pub(super)` 的项对父模块可见需要显式 use ——
 // Rust 的私有项可见性只向**下**流（父的私有项对子可见），反向必须显式提升并引入。
+use cache::{cache_known_unsupported, inject_anthropic_cache, looks_like_cache_rejection, mark_cache_unsupported};
 use endpoint::model_endpoints;
+use usage::record_usage_from_raw;
 use util::{extract_text_content, uuid_like};
 
 use crate::error::{AppError, AppResult};
@@ -101,77 +106,6 @@ pub async fn fetch_models(key: &ProviderKey, secret: &str) -> AppResult<Vec<Stri
     }
     // 末尾统一附「可手动录入」的出路：这条链路失败不阻塞用户继续配置。
     Err(AppError::upstream_msg(format!("拉取模型失败：{last_err}")))
-}
-
-/// `TokenUsage` 的**定义已移至 [`crate::model`]**（它是领域观测量，不是上游协议细节；
-/// 留在这里会让 `model.rs` 反向依赖本模块，`model` 对 upstream 的依赖原本仅此一处）。
-///
-/// 此处 re-export 保持 `crate::upstream::TokenUsage` 路径可用，故全部既有调用点零改动。
-/// **解析与采集逻辑仍留在本模块**（[`extract_usage`] / [`extract_usage_from_sse`] /
-/// [`record_usage`]）——那些依赖协议字段形态，属于 upstream 的职责。
-pub use crate::model::TokenUsage;
-
-/// 从上游响应体里提取 token 用量，**同时兼容两家协议**的字段名。
-///
-/// Anthropic: `usage.{input_tokens, output_tokens, cache_read_input_tokens}`
-/// OpenAI:    `usage.{prompt_tokens, completion_tokens}`（缓存在
-///            `prompt_tokens_details.cached_tokens`）
-///
-/// 取不到就返回 `None`（而非 0）：0 会让日志显示「本次 0 token」，看着像 bug；
-/// `None` 表示「这家中转商没给用量」，是如实陈述。
-pub fn extract_usage(body: &Value) -> Option<TokenUsage> {
-    let u = body.get("usage")?;
-    let num = |keys: &[&str]| -> u64 {
-        keys.iter()
-            .find_map(|k| u.get(*k).and_then(|v| v.as_u64()))
-            .unwrap_or(0)
-    };
-    let cache = u
-        .get("cache_read_input_tokens")
-        .and_then(|v| v.as_u64())
-        .or_else(|| {
-            u.get("prompt_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(|v| v.as_u64())
-        })
-        .unwrap_or(0);
-    let usage = TokenUsage {
-        input: num(&["input_tokens", "prompt_tokens"]),
-        output: num(&["output_tokens", "completion_tokens"]),
-        cache_read: cache,
-    };
-    (!usage.is_empty()).then_some(usage)
-}
-
-/// 从**流式** SSE 全文里提取 token 用量。
-///
-/// 流式的 usage 不在单个 chunk 的固定位置：Anthropic 放在 `message_start`（input）与
-/// `message_delta`（output）两处，OpenAI 放在最后一个带 `usage` 的 chunk。
-/// 故扫描全部 data 行、把见到的最大值取出来（同一字段后出现的值是累计值，取最大即最终值）。
-pub fn extract_usage_from_sse(sse: &str) -> Option<TokenUsage> {
-    let mut acc = TokenUsage::default();
-    for line in sse.lines() {
-        let Some(data) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(data) else {
-            continue;
-        };
-        // Anthropic 的 message_start 把 usage 藏在 message 下
-        let candidates = [v.get("usage"), v.get("message").and_then(|m| m.get("usage"))];
-        for c in candidates.into_iter().flatten() {
-            if let Some(u) = extract_usage(&serde_json::json!({ "usage": c })) {
-                acc.input = acc.input.max(u.input);
-                acc.output = acc.output.max(u.output);
-                acc.cache_read = acc.cache_read.max(u.cache_read);
-            }
-        }
-    }
-    (!acc.is_empty()).then_some(acc)
 }
 
 /// 拉取模型时上游返回**非 JSON** 的可行动提示。
@@ -315,53 +249,6 @@ pub async fn text_completion(
     }
     // 循环必然在上面 return，这里兜底（不应到达）。
     Err(last_err.unwrap_or_else(|| AppError::upstream_msg("未知上游错误")))
-}
-
-tokio::task_local! {
-    /// 当前 async 任务的 token 用量累加器。
-    ///
-    /// 为什么用 task_local 而不是改 `text_completion` 的返回类型：它有三个调用点
-    /// （成员 / 汇总者 / 决策者）、又被 `ToolSession` 的多轮循环反复调用，把返回值从
-    /// `String` 改成 `(String, Usage)` 会波及每一处解构与错误分支，而这些路径刚在
-    /// 上一轮做过故障注入验证 —— 为了加一个观测字段去动它们，风险不划算。
-    ///
-    /// task_local 天然按 async 任务隔离：聚合的每个成员各跑在自己的 spawn 里，
-    /// 用量不会互相串台；没有 scope 包裹时（如普通代理转发）写入直接是 no-op。
-    pub static USAGE_ACC: std::cell::Cell<TokenUsage>;
-}
-
-/// 从原始响应体（普通 JSON 或 SSE 全文）提取用量并记进累加器。
-///
-/// 聚合走的是**非流式**调用，但部分中转商仍会以 SSE 形态返回，故两种形态都试。
-fn record_usage_from_raw(raw: &str) {
-    let u = serde_json::from_str::<Value>(raw)
-        .ok()
-        .and_then(|v| extract_usage(&v))
-        .or_else(|| extract_usage_from_sse(raw));
-    if let Some(u) = u {
-        record_usage(u);
-    }
-}
-
-/// 把本次上游调用的用量记进当前任务的累加器（无 scope 时静默忽略）。
-pub fn record_usage(u: TokenUsage) {
-    let _ = USAGE_ACC.try_with(|acc| {
-        let mut cur = acc.get();
-        cur.add(&u);
-        acc.set(cur);
-    });
-}
-
-/// 在一个带用量累加器的 scope 里跑 `fut`，返回 `(结果, 累计用量)`。
-pub async fn with_usage<T>(fut: impl std::future::Future<Output = T>) -> (T, TokenUsage) {
-    let cell = std::cell::Cell::new(TokenUsage::default());
-    USAGE_ACC
-        .scope(cell, async move {
-            let out = fut.await;
-            let used = USAGE_ACC.with(|c| c.get());
-            (out, used)
-        })
-        .await
 }
 
 /// 截断上游响应体用于错误展示（避免超长 body 撑爆日志/错误信息）。
@@ -1209,80 +1096,6 @@ impl ToolSession {
                 format!("{label} 响应无法解析: {}", truncate_body(&raw)),
             )
         })
-    }
-}
-
-/// 已知**不支持** `cache_control` 的上游 base_url（进程级记忆）。
-///
-/// 自愈回退用:某个中转因 `cache_control` 回 400 后,把它的 base_url 记进来,
-/// 后续请求直接不带缓存字段,不再每次都先撞一次 400 再重发。
-/// 进程级即可——换机/重启后重新探测一次无妨,且避免持久化一个可能随中转升级而变化的判断。
-static CACHE_UNSUPPORTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::OnceLock::new();
-
-fn cache_unsupported() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    CACHE_UNSUPPORTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-}
-
-fn cache_known_unsupported(base_url: &str) -> bool {
-    cache_unsupported()
-        .lock()
-        .map(|s| s.contains(base_url))
-        .unwrap_or(false)
-}
-
-fn mark_cache_unsupported(base_url: &str) {
-    if let Ok(mut s) = cache_unsupported().lock() {
-        s.insert(base_url.to_string());
-    }
-}
-
-/// 某个 HTTP 400 的响应体是否**疑似**因 `cache_control` 引起(而非模型名错、参数错等真问题)。
-///
-/// 判据保守:必须明确提到 cache 相关字样才回退,否则会把「model is required」这类真正的 400
-/// 也误当成缓存问题去掉缓存重发——那只会白发一次、真问题依旧,且掩盖了根因。
-fn looks_like_cache_rejection(body: &str) -> bool {
-    let b = body.to_ascii_lowercase();
-    b.contains("cache_control")
-        || b.contains("cache control")
-        || (b.contains("cache") && (b.contains("unexpected") || b.contains("unsupported") || b.contains("unknown")))
-}
-
-/// 给 Anthropic 请求体的**稳定前缀**打缓存断点(5 分钟 TTL)。
-///
-/// 前缀缓存的顺序是 tools → system → messages,任何字节变动使其后失效。工具循环里:
-/// - `tools` 声明整个循环不变 → 断点①钉在 tools 数组**最后一个**元素上,缓存全部工具声明
-/// - `messages` 只追加不改写 → 断点②钉在**最后一条消息的最后一个 content 块**上,
-///   缓存「到本轮为止的全部历史」;下一轮请求的前缀恰好是这一份,自动命中(0.1x 价)
-///
-/// 只对 **content 已是数组**的消息打断点:字符串型 content(第一轮的初始问题)若包成数组,
-/// 会与后续轮次的字符串形态不一致、破坏前缀逐字节匹配;而工具循环从第二轮起最后一条
-/// 必是 tool_result 数组,正是缓存收益最大处,不损失。
-///
-/// **零信息损失**:只加元数据,模型看到的内容一字不变。
-fn inject_anthropic_cache(payload: &mut Value, has_tools: bool) {
-    let ephemeral = json!({ "type": "ephemeral" });
-    // 断点①:tools 末尾
-    if has_tools {
-        if let Some(arr) = payload.get_mut("tools").and_then(|t| t.as_array_mut()) {
-            if let Some(last) = arr.last_mut() {
-                if let Some(obj) = last.as_object_mut() {
-                    obj.insert("cache_control".into(), ephemeral.clone());
-                }
-            }
-        }
-    }
-    // 断点②:最后一条消息的最后一个 content 块(仅当 content 是块数组时)
-    if let Some(msgs) = payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        if let Some(last_msg) = msgs.last_mut() {
-            if let Some(blocks) = last_msg.get_mut("content").and_then(|c| c.as_array_mut()) {
-                if let Some(last_block) = blocks.last_mut() {
-                    if let Some(obj) = last_block.as_object_mut() {
-                        obj.insert("cache_control".into(), ephemeral);
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -4526,82 +4339,9 @@ mod tests {
 
     /// 裁剪必须**保留 tool_use/tool_result 的一一对应**（删任何一条上游 400），
     /// 只把较早轮次的正文换成占位。两协议都验。
-    #[test]
-    fn inject_anthropic_cache_marks_tools_tail_and_last_message_block() {
-        // 断点应钉在两处稳定前缀:tools 数组末尾 + 最后一条消息的最后一个 content 块。
-        // 这正是工具循环里「到本轮为止的全部历史」的边界,下一轮请求前缀恰好命中。
-        let mut payload = json!({
-            "model": "claude-opus-4-8",
-            "max_tokens": 1024,
-            "tools": [
-                { "name": "read_file", "description": "d1", "input_schema": {} },
-                { "name": "grep", "description": "d2", "input_schema": {} }
-            ],
-            "messages": [
-                { "role": "user", "content": "问题" },
-                { "role": "assistant", "content": [ { "type": "tool_use", "id": "c1", "name": "grep", "input": {} } ] },
-                { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "c1", "content": "命中" } ] }
-            ]
-        });
-        inject_anthropic_cache(&mut payload, true);
 
-        // 断点①:tools 的**最后一个**才带,前面的不带(否则浪费断点额度)
-        let tools = payload["tools"].as_array().unwrap();
-        assert!(tools[0].get("cache_control").is_none(), "非末尾 tool 不该带断点");
-        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral", "tools 末尾应打断点");
 
-        // 断点②:最后一条消息的最后一个 content 块
-        let msgs = payload["messages"].as_array().unwrap();
-        assert!(
-            msgs[0].get("content").unwrap().is_string(),
-            "第一条是字符串型 content,不该被强行改成数组(会破坏前缀逐字节匹配)"
-        );
-        let last_block = msgs[2]["content"].as_array().unwrap().last().unwrap();
-        assert_eq!(last_block["cache_control"]["type"], "ephemeral", "最后一块应打断点");
-    }
 
-    #[test]
-    fn inject_cache_is_noop_on_string_content_and_missing_tools() {
-        // 收尾轮无 tools + 初始只有字符串 user:不应崩、不应把字符串包成数组。
-        let mut p = json!({
-            "model": "m", "max_tokens": 10,
-            "messages": [ { "role": "user", "content": "只有一条字符串" } ]
-        });
-        inject_anthropic_cache(&mut p, false); // has_tools=false
-        assert!(p.get("tools").is_none());
-        assert!(
-            p["messages"][0]["content"].is_string(),
-            "字符串 content 不带块级断点,保持原样"
-        );
-    }
-
-    #[test]
-    fn cache_rejection_detector_is_conservative() {
-        // 只有明确提到 cache 才回退,否则会把真正的 400(model 错等)误当缓存问题白重发一次。
-        assert!(looks_like_cache_rejection(
-            r#"{"error":{"message":"unexpected field cache_control"}}"#
-        ));
-        assert!(looks_like_cache_rejection("Unsupported parameter: cache control"));
-        assert!(looks_like_cache_rejection(r#"{"error":"unknown cache field"}"#));
-        // 真正的 400,与缓存无关 → 不回退
-        assert!(!looks_like_cache_rejection(
-            r#"{"error":{"message":"model is required"}}"#
-        ));
-        assert!(!looks_like_cache_rejection(
-            r#"{"error":{"message":"max_tokens must be > 0"}}"#
-        ));
-        assert!(!looks_like_cache_rejection("Failed to parse request body"));
-    }
-
-    #[test]
-    fn cache_unsupported_endpoint_memory_roundtrips() {
-        let url = "https://strict-relay.test/v1";
-        assert!(!cache_known_unsupported(url), "初始未知");
-        mark_cache_unsupported(url);
-        assert!(cache_known_unsupported(url), "标记后应记住");
-        // 别的端点不受影响
-        assert!(!cache_known_unsupported("https://other.test/v1"));
-    }
 
     #[test]
     fn trim_tool_history_preserves_pairing_and_keeps_latest() {
@@ -4662,83 +4402,6 @@ mod tests {
                 "{proto:?}: 较早轮次应被压成占位"
             );
         }
-    }
-
-    /// 两家协议的 usage 字段名不同，必须都能取到 —— 取不到就等于用户看不到额度消耗。
-    #[test]
-    fn extract_usage_handles_both_protocol_field_names() {
-        // Anthropic
-        let a = serde_json::json!({
-            "usage": { "input_tokens": 1200, "output_tokens": 340, "cache_read_input_tokens": 900 }
-        });
-        let u = extract_usage(&a).expect("Anthropic usage 应能取到");
-        assert_eq!((u.input, u.output, u.cache_read), (1200, 340, 900));
-        assert_eq!(u.total(), 1540);
-
-        // OpenAI（缓存在 prompt_tokens_details.cached_tokens 里）
-        let o = serde_json::json!({
-            "usage": {
-                "prompt_tokens": 800,
-                "completion_tokens": 120,
-                "total_tokens": 920,
-                "prompt_tokens_details": { "cached_tokens": 512 }
-            }
-        });
-        let u = extract_usage(&o).expect("OpenAI usage 应能取到");
-        assert_eq!((u.input, u.output, u.cache_read), (800, 120, 512));
-
-        // 上游没给 usage → None（不是 0）。写 0 会让日志显示「本次 0 token」，看着像 bug。
-        assert!(extract_usage(&serde_json::json!({ "content": [] })).is_none());
-        assert!(extract_usage(&serde_json::json!({ "usage": {} })).is_none());
-    }
-
-    /// 流式 SSE：Anthropic 把 input 放 message_start、output 放 message_delta，
-    /// 分散在不同 chunk 里，只看某一条会漏。
-    #[test]
-    fn extract_usage_from_sse_merges_across_chunks() {
-        let sse = "\
-event: message_start\n\
-data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1500,\"output_tokens\":1}}}\n\
-\n\
-event: content_block_delta\n\
-data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\
-\n\
-event: message_delta\n\
-data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":420}}\n\
-\n\
-data: [DONE]\n";
-        let u = extract_usage_from_sse(sse).expect("SSE 应能取到用量");
-        assert_eq!(u.input, 1500, "input 在 message_start 里");
-        assert_eq!(u.output, 420, "output 取累计后的最终值，不是首个 chunk 的 1");
-
-        // OpenAI 形态：usage 在最后一个 chunk
-        let sse2 = "\
-data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\
-\n\
-data: {\"choices\":[],\"usage\":{\"prompt_tokens\":77,\"completion_tokens\":9}}\n\
-\n\
-data: [DONE]\n";
-        let u = extract_usage_from_sse(sse2).expect("OpenAI SSE 应能取到");
-        assert_eq!((u.input, u.output), (77, 9));
-
-        // 无 usage 的流 → None
-        assert!(extract_usage_from_sse("data: {\"choices\":[]}\n\ndata: [DONE]\n").is_none());
-    }
-
-    #[test]
-    fn token_usage_add_and_format() {
-        let mut a = TokenUsage { input: 1200, output: 340, cache_read: 0 };
-        a.add(&TokenUsage { input: 800, output: 60, cache_read: 500 });
-        assert_eq!((a.input, a.output, a.cache_read), (2000, 400, 500));
-        // 展示：≥10k 用 k 缩写，缓存不为 0 才附加
-        assert_eq!(
-            TokenUsage { input: 12_345, output: 400, cache_read: 0 }.fmt_compact(),
-            "↑12.3k ↓400"
-        );
-        assert!(TokenUsage { input: 10, output: 2, cache_read: 900 }
-            .fmt_compact()
-            .contains("缓存900"));
-        assert!(TokenUsage::default().is_empty());
     }
 
     /// 真机反例（2026-08-02）：中转商把请求挡在 HTML 页上，用户只看到
