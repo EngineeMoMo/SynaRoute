@@ -23,6 +23,7 @@ mod upstream;
 /// 详见该文件的模块注释。
 #[cfg(test)]
 mod upstream_api_surface;
+mod service;
 mod workdirs;
 
 use error::AppResult;
@@ -49,51 +50,10 @@ fn list_keys(state: tauri::State<AppState>, category_id: CategoryType) -> Vec<Pr
 
 #[tauri::command]
 fn upsert_key(state: tauri::State<AppState>, key: ProviderKey) -> AppResult<ProviderKey> {
-    reject_desktop_key_with_unusable_model_names(&key)?;
+    service::reject_desktop_key_with_unusable_model_names(&key)?;
     state.store.upsert_key(key)
 }
 
-/// 桌面端 Key 的**对外模型名**必须是 Claude 桌面端会接受的形态，否则拒绝落盘。
-///
-/// 为什么在保存时就拦（而非只在接入时告警）：不合规的名字会被桌面端在加载配置时
-/// **过滤掉**（不是提示）。全部被过滤 → 模型选择器为空 → 打开会话抛
-/// `ModelsNotDiscoveredError`，症状与「卡在登录页」同级难排查，而用户此刻已经看不出
-/// 是几天前存 Key 时埋下的。故在源头拒绝，不让不可用的配置进库。
-///
-/// 校验对象是 `serviceable_models()`（即真正写进 gateway 档 `inferenceModels` 的那份对外名），
-/// **不是** `models`。真实上游名不受限制——配一条映射 `claude-opus-4-8` → `glm-4.6` 即可：
-/// 对外用合规名，上游仍打 `glm-4.6`。
-///
-/// 只拦桌面端分类：CLI 只要求 `claude`/`anthropic` 前缀（且 `to_gateway_model_id` 会自动包
-/// `claude-synaroute-` 前缀救回来），Codex 走 OpenAI 形态、无此约束。
-///
-/// **无条件校验**（不因「只改了优先级」而放行）：库里若已有不合规的历史 Key
-/// （老版本存的、或 cc-switch 导入后补的模型），放行只会让它继续以不可用状态留在库里，
-/// 到接入那一刻才炸。宁可在用户下一次触碰它时就要求修好。
-fn reject_desktop_key_with_unusable_model_names(key: &ProviderKey) -> AppResult<()> {
-    // 与前端即时校验（`check_desktop_model_names`）共用同一份体检，
-    // 保证「界面上提示的」与「保存时拦的」永远是同一批名字、同一个建议。
-    // 两边各自 filter 是这类功能最典型的漂移源：用户点了界面给的修法，保存仍被拒。
-    let report = crate::model::desktop_model_name_report(key);
-    if report.issues.is_empty() {
-        return Ok(());
-    }
-    let bad: Vec<&str> = report.issues.iter().map(|i| i.name.as_str()).collect();
-    Err(error::AppError::Invalid(format!(
-        "Claude 桌面端不接受这些对外模型名：{}\n\n\
-         桌面端会在加载配置时把它们从模型列表里过滤掉。全部被过滤后模型选择器为空，\
-         打开会话会报 ModelsNotDiscoveredError（症状与「卡在登录页」同级难排查）。\n\n\
-         要求：名字须含 claude/opus/sonnet/haiku/fable/mythos/anthropic 之一，\
-         且不得含 glm/gpt/grok/deepseek/qwen/kimi/llama 等厂商名\
-         （判据取自桌面端 app.asar v1.24012.9）。\
-         注意 claude-synaroute- 前缀对桌面端无效——厂商名黑名单优先。\n\n\
-         修法：在「模型映射」里配一条 {} → {}，\
-         对外用合规名、上游仍打原名。",
-        bad.join("、"),
-        report.issues[0].suggestion,
-        report.issues[0].name
-    )))
-}
 
 /// 桌面端对外模型名**即时**体检（UX#4），供 KeyEditor 边打字边提示。
 ///
@@ -209,7 +169,7 @@ fn lock_master_password(state: tauri::State<AppState>) -> AppResult<()> {
 #[tauri::command]
 fn enable_master_password(state: tauri::State<AppState>, password: String) -> AppResult<usize> {
     let migrated = state.store.secrets.write().enable_master_password(&password)?;
-    sync_master_flag(&state.store, true);
+    service::sync_master_flag(&state.store, true);
     tracing::info!("已启用主口令模式，迁移 {migrated} 条密钥");
     Ok(migrated)
 }
@@ -218,7 +178,7 @@ fn enable_master_password(state: tauri::State<AppState>, password: String) -> Ap
 #[tauri::command]
 fn disable_master_password(state: tauri::State<AppState>, password: String) -> AppResult<usize> {
     let migrated = state.store.secrets.write().disable_master_password(&password)?;
-    sync_master_flag(&state.store, false);
+    service::sync_master_flag(&state.store, false);
     tracing::info!("已关闭主口令模式，迁移 {migrated} 条密钥回 DPAPI");
     Ok(migrated)
 }
@@ -239,15 +199,6 @@ fn change_master_password(
     Ok(n)
 }
 
-/// 把 settings 里的 UI 镜像字段对齐到密钥库的真实模式。
-///
-/// best-effort：写失败只告警。真实模式记在密钥库里，镜像不一致最多让开关显示错，
-/// 下次启动的对账会修正——不该让「设置落盘失败」把已成功的密钥迁移回滚掉。
-fn sync_master_flag(store: &Arc<Store>, enabled: bool) {
-    if let Err(e) = store.set_master_password_flag(enabled) {
-        tracing::warn!("同步主口令开关到设置失败（密钥库已切换成功，显示可能暂不同步）: {e}");
-    }
-}
 
 /// 把某 Key 设为该分类的主 Key（优先级 0）。
 ///
@@ -546,11 +497,7 @@ async fn apply_tool_config_for(
     // （模型选择器为空 / ModelsNotDiscoveredError）往下要排查很久，得在运行日志里留痕。
     // 用 error 而非新增 warn kind：前端 LogsPage 的分组映射是穷举的，且这条本质是「配置不可用」。
     if category_id == CategoryType::ClaudeDesktop {
-        let bad: Vec<&str> = models
-            .iter()
-            .filter(|m| !crate::model::is_desktop_acceptable_model_id(m))
-            .map(String::as_str)
-            .collect();
+        let bad = service::desktop_unacceptable_models(&models);
         if !bad.is_empty() {
             store.append_event(
                 category_id,
@@ -810,37 +757,13 @@ fn mcp_status(state: tauri::State<AppState>) -> McpStatus {
     }
 }
 
-/// MCP 服务器地址（供前端展示实际绑定端口的接入地址）。
-fn mcp_url_for(port: u16) -> String {
-    format!("http://127.0.0.1:{port}/mcp")
-}
 
-/// MCP 客户端单次工具调用超时（毫秒）= 各分类整轮预算 total_timeout_ms 的最大值 + 余量，
-/// 且不低于历史兜底下限（tools::MCP_TOOL_TIMEOUT_MS）。
-///
-/// 联动的意义：服务端聚合是整轮墙钟预算（见 aggregate.rs），客户端 MCP 超时必须不小于
-/// 「该预算 + 余量」，才能保证服务端总在客户端杀连接**之前**优雅降级返回（哪怕是部分结果）。
-/// 用户在任一分类调大整轮预算，下次注册/端口漂移重写时客户端超时自动跟随。MCP 客户端一个
-/// server 只有一个 timeout，而分类各有自己的 total——故取最大值覆盖所有分类。
-fn mcp_client_timeout_ms(store: &Arc<Store>) -> u64 {
-    /// 客户端超时相对服务端整轮预算的余量（毫秒）：留给降级结果序列化 + 网络回传，
-    /// 保证服务端先返回、客户端后到点。
-    const MARGIN_MS: u64 = 30_000;
-    let max_total = CategoryType::ALL
-        .iter()
-        .map(|c| store.get_brain(*c).total_timeout_ms)
-        .max()
-        .unwrap_or(0);
-    max_total
-        .saturating_add(MARGIN_MS)
-        .max(tools::MCP_TOOL_TIMEOUT_MS)
-}
 
 /// 把 synaroute MCP 注册进指定分类对应工具的客户端配置，并把该分类记进
 /// settings.mcp_registered_categories（去重）。写盘/跳过都记一条事件日志，方便用户排查。
 fn register_and_record(state: &AppState, category: CategoryType, port: u16) {
-    let url = mcp_url_for(port);
-    let timeout_ms = mcp_client_timeout_ms(&state.store);
+    let url = service::mcp_url_for(port);
+    let timeout_ms = service::mcp_client_timeout_ms(&state.store);
     match tools::register_mcp_client(category, &url, timeout_ms) {
         Ok((msg, _wrote)) => {
             state.store.append_event(category, "config", None, &msg);
@@ -861,8 +784,8 @@ fn register_and_record(state: &AppState, category: CategoryType, port: u16) {
 
 /// 端口漂移后，用新端口重写所有已注册分类的客户端配置（url 里的端口跟着变）。
 fn rewrite_registered_clients(state: &AppState, port: u16) {
-    let url = mcp_url_for(port);
-    let timeout_ms = mcp_client_timeout_ms(&state.store);
+    let url = service::mcp_url_for(port);
+    let timeout_ms = service::mcp_client_timeout_ms(&state.store);
     let cats = state.store.get_settings().mcp_registered_categories;
     for category in cats {
         {
@@ -1100,77 +1023,46 @@ fn get_app_version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
-/// 检查更新的结构化结果（前端徽章 / 设置页共用）。
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateCheckResult {
-    /// available | up_to_date | error
-    status: String,
-    current_version: String,
-    /// 远端新版本号（仅 available）
-    version: Option<String>,
-    /// 发布说明（可选）
-    notes: Option<String>,
-    /// 人类可读错误（仅 error）；已对私有仓库 404 等做友好化
-    error: Option<String>,
-}
 
-fn friendly_updater_error(raw: &str) -> String {
-    let lower = raw.to_ascii_lowercase();
-    if lower.contains("could not fetch a valid release json")
-        || lower.contains("404")
-        || lower.contains("not found")
-    {
-        return format!(
-            "无法拉取更新清单 latest.json（常见原因：GitHub 仓库为私有，\
-             公开 URL 返回 404；或尚未上传 Release 资产）。\
-             请把 Release 资产放到可匿名访问的地址，或将仓库设为公开。原始错误: {raw}"
-        );
-    }
-    if lower.contains("signature") || lower.contains("minisign") {
-        return format!("更新包签名校验失败（公钥与发版签名不匹配）。原始错误: {raw}");
-    }
-    format!("检查更新失败: {raw}")
-}
 
 #[tauri::command]
-async fn check_for_updates(app: tauri::AppHandle) -> AppResult<UpdateCheckResult> {
+async fn check_for_updates(app: tauri::AppHandle) -> AppResult<service::UpdateCheckResult> {
     use tauri_plugin_updater::UpdaterExt;
     let current_version = app.package_info().version.to_string();
     let updater = match app.updater() {
         Ok(u) => u,
         Err(e) => {
-            return Ok(UpdateCheckResult {
+            return Ok(service::UpdateCheckResult {
                 status: "error".into(),
                 current_version,
                 version: None,
                 notes: None,
-                error: Some(friendly_updater_error(&e.to_string())),
+                error: Some(service::friendly_updater_error(&e.to_string())),
             });
         }
     };
     match updater.check().await {
-        Ok(Some(u)) => Ok(UpdateCheckResult {
+        Ok(Some(u)) => Ok(service::UpdateCheckResult {
             status: "available".into(),
             current_version,
             version: Some(u.version.clone()),
             notes: u.body.clone(),
             error: None,
         }),
-        Ok(None) => Ok(UpdateCheckResult {
+        Ok(None) => Ok(service::UpdateCheckResult {
             status: "up_to_date".into(),
             current_version,
             version: None,
             notes: None,
             error: None,
         }),
-        Err(e) => Ok(UpdateCheckResult {
+        Err(e) => Ok(service::UpdateCheckResult {
             // 不抛 Err：前端永远能渲染结果，避免仅靠 catch 字符串猜原因
             status: "error".into(),
             current_version,
             version: None,
             notes: None,
-            error: Some(friendly_updater_error(&e.to_string())),
+            error: Some(service::friendly_updater_error(&e.to_string())),
         }),
     }
 }
@@ -1185,7 +1077,7 @@ async fn install_update(app: tauri::AppHandle) -> AppResult<String> {
     let update = updater
         .check()
         .await
-        .map_err(|e| error::AppError::Other(friendly_updater_error(&e.to_string())))?
+        .map_err(|e| error::AppError::Other(service::friendly_updater_error(&e.to_string())))?
         .ok_or_else(|| error::AppError::Other("当前已是最新版本，无需安装".into()))?;
     let ver = update.version.clone();
     update
@@ -1864,7 +1756,7 @@ pub fn run() {
                             // 客户端配置，使 ~/.claude.json / config.toml 里的 url 端口跟真实端口一致，
                             // 用户重启客户端即可用，无需手动重配（幂等：端口没变则不写盘）。
                             let url = format!("http://127.0.0.1:{bound}/mcp");
-                            let timeout_ms = mcp_client_timeout_ms(&store_bg);
+                            let timeout_ms = service::mcp_client_timeout_ms(&store_bg);
                             let cats = store_bg.get_settings().mcp_registered_categories;
                             for category in cats {
                                 {
@@ -2445,7 +2337,6 @@ fn handle_tray_set_primary(app: &tauri::AppHandle, id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model::{HealthState, KeyParams, ModelInfo, ModelMapping};
 
     /// 「随系统启动」的判据必须是启动参数，**不能**是 `auto_start` 配置。
     ///
@@ -2548,128 +2439,5 @@ mod tests {
 
         let mut empty: Vec<u8> = vec![];
         assert!(!desaturate_rgba_in_place(&mut empty));
-    }
-
-    fn key(category: CategoryType) -> ProviderKey {
-        ProviderKey {
-            id: "k1".into(),
-            category_id: category,
-            name: "k".into(),
-            vendor: "test".into(),
-            base_url: "https://example.com".into(),
-            protocol: Protocol::Anthropic,
-            has_secret: true,
-            enabled: true,
-            priority: 0,
-            headers_json: None,
-            params: KeyParams::default(),
-            models: vec![],
-            mappings: vec![],
-            default_model: None,
-            tier_haiku: None,
-            tier_sonnet: None,
-            tier_opus: None,
-            health: HealthState::default(),
-        }
-    }
-
-    fn model(real_name: &str) -> ModelInfo {
-        ModelInfo {
-            real_name: real_name.into(),
-            source: "manual".into(),
-            context_window: None,
-            fetched_at: None,
-        }
-    }
-
-    /// 桌面端 Key 的对外名不合规 → 拒绝落盘，且错误信息要能直接照做。
-    ///
-    /// 这是数据可用性防线：不合规名会被桌面端**过滤掉**（不是提示），全被过滤后模型选择器为空、
-    /// 打开会话抛 ModelsNotDiscoveredError。若放行到接入那一刻才报，用户已经看不出是存 Key 时埋的。
-    #[test]
-    fn desktop_key_with_unusable_outward_names_is_rejected() {
-        let mut k = key(CategoryType::ClaudeDesktop);
-        k.models = vec![model("glm-4.6"), model("grok-4.5")];
-        let err = reject_desktop_key_with_unusable_model_names(&k)
-            .expect_err("桌面端对外名不合规必须拒绝落盘");
-        let msg = err.to_string();
-        assert!(msg.contains("glm-4.6") && msg.contains("grok-4.5"), "要列出具体名字: {msg}");
-        assert!(
-            msg.contains("ModelsNotDiscoveredError"),
-            "要说清后果，否则用户不知道为什么必须改: {msg}"
-        );
-        assert!(msg.contains("模型映射"), "要给出可照做的修法: {msg}");
-        assert!(
-            msg.contains("claude-synaroute-"),
-            "要明说该前缀对桌面端无效，否则会有人以为包前缀能绕过: {msg}"
-        );
-    }
-
-    /// 有映射时校验的是**对外名**，上游真实名不受限——这正是官方给的解法。
-    #[test]
-    fn desktop_key_mapping_makes_noncompliant_upstream_name_acceptable() {
-        let mut k = key(CategoryType::ClaudeDesktop);
-        // 上游真实名是 glm-4.6（不合规），但对外只暴露 claude-opus-4-8。
-        k.models = vec![model("glm-4.6")];
-        k.mappings = vec![ModelMapping {
-            id: "m1".into(),
-            expected_name: "claude-opus-4-8".into(),
-            real_name: "glm-4.6".into(),
-        }];
-        assert_eq!(
-            k.serviceable_models(),
-            vec!["claude-opus-4-8".to_string()],
-            "前置条件：有映射时只暴露对外名"
-        );
-        assert!(
-            reject_desktop_key_with_unusable_model_names(&k).is_ok(),
-            "对外名合规即可放行，上游真实名不该受限"
-        );
-    }
-
-    /// 只拦桌面端：CLI 靠 to_gateway_model_id 包前缀救回，Codex 走 OpenAI 形态无此约束。
-    #[test]
-    fn cli_and_codex_keys_are_not_restricted_by_desktop_rule() {
-        for cat in [CategoryType::ClaudeCli, CategoryType::Codex] {
-            let mut k = key(cat);
-            k.models = vec![model("glm-4.6"), model("gpt-5")];
-            assert!(
-                reject_desktop_key_with_unusable_model_names(&k).is_ok(),
-                "{cat:?} 不该受桌面端模型名判据约束"
-            );
-        }
-    }
-
-    /// 校验是**无条件**的：即使这次只动了优先级，历史遗留的不合规 Key 也必须先修好。
-    ///
-    /// 取舍理由（用户拍板「该严，避免不可用」）：放行只会让不可用的 Key 继续留在库里，
-    /// 到接入那一刻才炸。代价是老数据调优先级/开关会被拦，但报错已给出修法。
-    #[test]
-    fn desktop_rule_applies_even_when_only_priority_changed() {
-        let mut k = key(CategoryType::ClaudeDesktop);
-        k.models = vec![model("glm-4.6")];
-        k.priority = 7; // 模拟「只改了优先级」的那次保存
-        assert!(
-            reject_desktop_key_with_unusable_model_names(&k).is_err(),
-            "历史不合规 Key 即使只改优先级也必须拦，否则不可用状态会一直留在库里"
-        );
-    }
-
-    /// 三档配了会追加 claude-*-4-5 家族名（合规），不该因此被误拦。
-    #[test]
-    fn desktop_key_with_only_tiers_passes() {
-        let mut k = key(CategoryType::ClaudeDesktop);
-        k.tier_opus = Some("glm-4.5".into()); // 档位真实名不合规不影响：它不进对外集合
-        assert_eq!(k.serviceable_models(), vec!["claude-opus-4-5".to_string()]);
-        assert!(reject_desktop_key_with_unusable_model_names(&k).is_ok());
-    }
-
-    /// 无模型、无映射的空 Key（如 cc-switch 刚导入）→ 对外集合为空，放行。
-    /// 导入语义是「先导进来、用户再补模型」，此刻拦截无意义；补模型时走上面那条拦截。
-    #[test]
-    fn desktop_key_without_any_model_passes() {
-        let k = key(CategoryType::ClaudeDesktop);
-        assert!(k.serviceable_models().is_empty());
-        assert!(reject_desktop_key_with_unusable_model_names(&k).is_ok());
     }
 }
