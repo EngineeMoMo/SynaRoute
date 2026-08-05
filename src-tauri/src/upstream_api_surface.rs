@@ -14,8 +14,9 @@
 //! 挪到 crate 根之后才是真正的外部视角：这里引用得到的，proxy.rs / aggregate.rs
 //! 也一定引用得到。
 //!
-//! 顺带查出两个名字其实**不需要对外**：`apply_auth` 与 `parse_openai_tool_call`
-//! 在 upstream 之外只出现在注释里，从没被真正调用过。
+//! 顺带查出三个名字其实**不需要对外**：`apply_auth` / `parse_openai_tool_call` /
+//! `is_retriable_upstream_error` —— 它们在 upstream 之外只出现在注释里，从没被真正调用过。
+//! 这类「看着像对外 API、其实没人用」的名字只有在拆分时才会暴露出来。
 
 /// 类型：用 `Option<T>` 引用，避免要求它们实现 Default 或可构造。
 #[test]
@@ -49,7 +50,6 @@ fn public_functions_stay_reachable() {
     let _ = crate::upstream::collect_search_tools;
     let _ = crate::upstream::convert_request_owned;
     let _ = crate::upstream::convert_response_ext;
-    let _ = crate::upstream::is_retriable_upstream_error;
     // with_usage 是泛型 async：给足类型参数太啰嗦，用一个具体调用点证明它可达即可。
     let _fut = crate::upstream::with_usage(async {});
 }
