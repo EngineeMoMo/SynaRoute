@@ -204,7 +204,9 @@ fn gate_key_of(ns: u64, category: CategoryType) -> String {
 /// 代理管理器：管理各分类的代理生命周期
 pub struct ProxyManager {
     store: Arc<Store>,
-    running: Mutex<HashMap<String, RunningProxy>>,
+    /// key 用 CategoryType 而非字符串（P2-8）：字符串键与枚举并存是两套真相，
+    /// 拼错一个字母就是「静默启动到另一个分类」而非编译失败。
+    running: Mutex<HashMap<CategoryType, RunningProxy>>,
     /// 本实例的短路窗口命名空间（见 [`all_failed_gate`]）。生产环境只有一个实例，
     /// 故与「按分类」等价；测试里每个用例各建一个实例，天然互不干扰。
     gate_ns: u64,
@@ -227,11 +229,11 @@ impl ProxyManager {
     }
 
     pub fn port_of(&self, category: CategoryType) -> Option<u16> {
-        self.running.lock().get(category.as_str()).map(|p| p.port)
+        self.running.lock().get(&category).map(|p| p.port)
     }
 
     pub fn is_running(&self, category: CategoryType) -> bool {
-        self.running.lock().contains_key(category.as_str())
+        self.running.lock().contains_key(&category)
     }
 
     /// 启动某分类的代理，返回监听端口。
@@ -249,7 +251,7 @@ impl ProxyManager {
         // 客户端追不上（config 只在客户端启动时读一次）。
         let preferred = settings
             .proxy_ports
-            .get(category.as_str())
+            .get(&category)
             .copied()
             .unwrap_or(category.meta().default_port);
         let end = preferred.saturating_add(PROXY_PORT_FALLBACK_RANGE);
@@ -274,8 +276,8 @@ impl ProxyManager {
             .map_err(|e| AppError::Proxy(e.to_string()))?
             .port();
         // 端口粘滞：实际绑定端口若与首选不同（回退了），写回配置作为下次首选，避免每次都回退漂移。
-        if settings.proxy_ports.get(category.as_str()).copied() != Some(port) {
-            let _ = self.store.set_proxy_port(category.as_str(), port);
+        if settings.proxy_ports.get(&category).copied() != Some(port) {
+            let _ = self.store.set_proxy_port(category, port);
         }
 
         // 关闭信号通道：stop() 时 send(true)，accept 循环退出、每个连接任务 select 到即断开。
@@ -316,7 +318,7 @@ impl ProxyManager {
         // 若别的调用已插入，则放弃我们刚建的这套（发关闭信号 + abort，释放刚绑的端口），
         // 返回已存在的端口——避免泄漏一个无法再被 stop 的监听器。
         let mut running = self.running.lock();
-        if let Some(existing) = running.get(category.as_str()) {
+        if let Some(existing) = running.get(&category) {
             let _ = shutdown_tx.send(true);
             handle.abort();
             return Ok(existing.port);
@@ -328,7 +330,7 @@ impl ProxyManager {
         // 仍被挡成失败，用户视角是「刚点了启动却说全部 Key 不可用」。
         clear_all_failed_gate(&self.gate_key(category));
         running.insert(
-            category.as_str().to_string(),
+            category,
             RunningProxy { port, handle, shutdown: shutdown_tx },
         );
         // 显式放锁再 emit。这个 guard 是在 318 行取的、本来会活到函数末尾 ——
@@ -345,7 +347,7 @@ impl ProxyManager {
         // 它防的是将来有人把泵简化掉、换成直接 app.emit 时悄悄埋雷。
         let was_running = {
             let mut running = self.running.lock();
-            match running.remove(category.as_str()) {
+            match running.remove(&category) {
                 Some(p) => {
                     // 先广播关闭信号（断开已建立的 keep-alive 连接），再 abort accept 循环。
                     let _ = p.shutdown.send(true);
@@ -439,7 +441,7 @@ async fn handle_request(
     // 每请求实时读 get_settings，改选即时生效、免重启客户端。空/未选时透传客户端原值。
     // 覆盖后的名字仍走下游各 Key 的 resolve_model（映射→三档→原生→兜底），故多 Key 故障转移不受影响。
     let requested_model = store
-        .active_model_of(category.as_str())
+        .active_model_of(category)
         .unwrap_or(client_model);
 
     // 下游是否要求流式（Claude Code / Codex 默认 stream:true）。
@@ -1519,7 +1521,7 @@ fn inject_default_effort(
     }
     // 用**本请求所属分类**取 effort，而非硬编码 Codex：分类各有独立端口与独立设置，
     // 硬编码会让「把某个 Responses 客户端接到别的分类端口」时读到 Codex 的强度（口径串台）。
-    let effort = match store.active_effort_of(category.as_str()) {
+    let effort = match store.active_effort_of(category) {
         Some(e) => e,
         None => return, // 未配默认强度：保持现状，不注入
     };
@@ -2100,8 +2102,8 @@ mod tests {
         );
         // active_efforts 是后端自管字段：save_settings 会刻意剥掉入参里的它（防前端旧快照
         // 顶回用户刚选的值），故必须走专用写入方法 set_active_effort。
-        store.set_active_effort(CategoryType::Codex.as_str(), "high").unwrap();
-        store.set_active_effort(CategoryType::ClaudeDesktop.as_str(), "low").unwrap();
+        store.set_active_effort(CategoryType::Codex, "high").unwrap();
+        store.set_active_effort(CategoryType::ClaudeDesktop, "low").unwrap();
         let inject = |cat: CategoryType| -> Value {
             let mut payload = json!({ "model": "m", "input": [] });
             inject_default_effort(
@@ -3281,7 +3283,7 @@ mod tests {
         store.upsert_key(k).unwrap();
         store.secrets.write().set("k1", "x").unwrap();
         // 用户在 Codex 分类设了 xhigh。
-        store.set_active_effort("codex", "xhigh").unwrap();
+        store.set_active_effort(CategoryType::Codex, "xhigh").unwrap();
 
         let pm = ProxyManager::new(store.clone());
         let port = pm.start(CategoryType::Codex).await.unwrap();
@@ -3429,7 +3431,7 @@ mod tests {
         k.protocol = Protocol::OpenaiResponses;
         store.upsert_key(k).unwrap();
         store.secrets.write().set("k1", "x").unwrap();
-        store.set_active_effort("codex", "high").unwrap();
+        store.set_active_effort(CategoryType::Codex, "high").unwrap();
 
         let pm = ProxyManager::new(store.clone());
         let port = pm.start(CategoryType::Codex).await.unwrap();

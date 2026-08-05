@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// 三个目标工具分类
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum CategoryType {
     #[serde(rename = "claude-cli")]
     ClaudeCli,
@@ -1343,8 +1343,8 @@ pub struct AppSettings {
     pub mcp_port: u16,
     /// 已自动注册 MCP 的目标工具分类（如 ["claude-cli"]）。端口变化时据此重写这些客户端配置，
     /// 关闭 MCP 时据此移除。避免每次都盲扫三个工具。
-    #[serde(default)]
-    pub mcp_registered_categories: Vec<String>,
+    #[serde(default, deserialize_with = "de_category_vec")]
+    pub mcp_registered_categories: Vec<CategoryType>,
     /// 上游临时错误（502/503/504 及连接失败）自动重试。默认开启：中转商偶发网关故障时
     /// 自动重试 1-2 次，大幅减少「偶发 502 → 熔断 → 无响应」。
     #[serde(default = "default_true")]
@@ -1369,8 +1369,8 @@ pub struct AppSettings {
     /// 每请求实时读取（get_settings），改选即时生效、免重启客户端。
     /// 后端自管字段：由专用命令 set_active_model 更新，不随通用 save_settings 的陈旧快照覆盖
     /// （与 mcp_* 字段同一保全策略）。
-    #[serde(default)]
-    pub active_models: std::collections::HashMap<String, String>,
+    #[serde(default, deserialize_with = "de_category_map")]
+    pub active_models: std::collections::BTreeMap<CategoryType, String>,
     /// 托盘「Codex 模型」快切子菜单开关。开启后右键托盘可直接切换 Codex 当前对外模型，
     /// 免打开主窗口（借鉴 cc-switch 托盘切换范式）。默认开。关闭则托盘只留显示/退出。
     #[serde(default = "default_true")]
@@ -1382,16 +1382,16 @@ pub struct AppSettings {
     /// 仅在下游为 Responses(Codex) 且上游非原生 Responses 时注入（OpenAI 官方 Responses 直通不碰）。
     /// 后端自管字段：由专用命令 set_active_effort 更新，不随通用 save_settings 的陈旧快照覆盖
     /// （与 active_models / mcp_* 同一保全策略）。空/未配 = 不注入，保持现状。
-    #[serde(default)]
-    pub active_efforts: std::collections::HashMap<String, String>,
+    #[serde(default, deserialize_with = "de_category_map")]
+    pub active_efforts: std::collections::BTreeMap<CategoryType, String>,
     /// 各分类代理的「首选监听端口」（key=分类字符串，value=端口）。
     /// 缘由：早期用 OS 随机端口（bind 0），SynaRoute 每次重启端口都变，而客户端
     /// （Codex/Claude）只在自身启动时读一次 config，不追踪端口变化 → 重启后客户端仍打旧端口、
     /// 连不上（error sending request）。改为「粘滞固定端口」：各分类有稳定默认端口，
     /// config.toml 写一次即长期有效；端口被占时在 [port, port+FALLBACK] 内向上兜底并写回此处
     /// 作为下次首选（与 mcp_port 同一粘滞策略）。缺省时用 CategoryType::meta().default_port。
-    #[serde(default)]
-    pub proxy_ports: std::collections::HashMap<String, u16>,
+    #[serde(default, deserialize_with = "de_category_map")]
+    pub proxy_ports: std::collections::BTreeMap<CategoryType, u16>,
     /// 首启向导是否已完成（UX#1）。**三态**：
     /// - `None` = 从未判定。旧版本升级上来的配置里没这个字段，全新安装第一次启动也是这个值。
     /// - `Some(true)` = 已完成或用户主动跳过 → 不再显示。
@@ -1406,6 +1406,50 @@ pub struct AppSettings {
     /// 的陈旧快照覆盖（与 `mcp_*` / `active_models` 同一保全策略）。
     #[serde(default)]
     pub onboarding_done: Option<bool>,
+}
+
+
+/// 容错反序列化：把磁盘上的 `{"claude-cli": V}` 读成 `BTreeMap<CategoryType, V>`（P2-8）。
+///
+/// **必须容错**：配置文件是用户可编辑的、也可能来自别的机器或更新的版本。
+/// 若用 serde 默认行为，一个不认识的分类键（比如未来版本加的 `gemini`，或用户手滑打错的键）
+/// 会让**整份 config.json 解析失败** —— 那会走 .corrupt 备份路径，用户的全部配置一次性消失。
+/// 这里只丢弃认不出的那一项并记一行日志，其余照常读出。
+///
+/// 用 BTreeMap 而不是 HashMap：序列化顺序稳定。HashMap 的迭代顺序每次进程都不同，
+/// 会让导出文件的 sha256 自校验随机失败 —— 那种失败没有规律、极难归因。
+fn de_category_map<'de, D, V>(d: D) -> Result<std::collections::BTreeMap<CategoryType, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    let raw = Option::<std::collections::BTreeMap<String, V>>::deserialize(d)?.unwrap_or_default();
+    let mut out = std::collections::BTreeMap::new();
+    for (k, v) in raw {
+        match CategoryType::from_str(&k) {
+            Some(c) => {
+                out.insert(c, v);
+            }
+            None => tracing::warn!("配置里有未知分类键 {k}，已忽略该项（其余配置照常读出）"),
+        }
+    }
+    Ok(out)
+}
+
+/// 同 []，用于分类**列表**（已注册 MCP 的分类）。
+fn de_category_vec<'de, D>(d: D) -> Result<Vec<CategoryType>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Vec<String>>::deserialize(d)?.unwrap_or_default();
+    let mut out = Vec::new();
+    for k in raw {
+        match CategoryType::from_str(&k) {
+            Some(c) => out.push(c),
+            None => tracing::warn!("配置里有未知分类 {k}，已忽略（其余配置照常读出）"),
+        }
+    }
+    Ok(out)
 }
 
 fn default_true() -> bool {
@@ -1458,10 +1502,10 @@ impl Default for AppSettings {
             health_probe_real_completion: false,
             health_probe_test_messages: Vec::new(),
             aggregate_trace_enabled: false,
-            active_models: std::collections::HashMap::new(),
-            active_efforts: std::collections::HashMap::new(),
+            active_models: std::collections::BTreeMap::new(),
+            active_efforts: std::collections::BTreeMap::new(),
             tray_model_switch_enabled: true,
-            proxy_ports: std::collections::HashMap::new(),
+            proxy_ports: std::collections::BTreeMap::new(),
             // None = 从未判定。启动时 reconcile_onboarding_flag 会据当前 Key 数定下来，
             // 老用户因此不会突然被首启向导拦住。
             onboarding_done: None,
@@ -2067,8 +2111,82 @@ mod tests {
         assert!(s.active_models.is_empty());
     }
 
-    // ===== 桌面端对外模型名「建议」（UX#4 即时校验的可点修法） =====
+    /// **P2-8 最关键的一条**：settings 的分类键从字符串换成枚举后，磁盘 JSON 形状必须**零变化**。
+    ///
+    /// 这条守的是数据丢失级事故：`config.json` 是**已经落在用户机器上的**文件。
+    /// 若序列化出来的键名变了（比如 `claude-cli` 变成 `ClaudeCli`），老用户升级后
+    /// 那几项会落进「未知字段」被静默丢弃 —— 已选模型、粘滞端口、MCP 注册记录全部归零，
+    /// 而且**没有任何报错**，只是「设置好像被重置了」。
+    ///
+    /// 用**手写的字符串字面量**而不是 `to_string(&Default::default())`：后者会随代码一起变，
+    /// 测不出格式回归，那才是这条测试的全部价值。
+    #[test]
+    fn legacy_settings_json_round_trips_with_identical_shape() {
+        // 一份「旧格式」settings：分类键都是字符串。这正是用户磁盘上的形态。
+        const LEGACY: &str = r#"{
+            "theme": "dark",
+            "language": "en",
+            "autoStart": true,
+            "mcpPort": 9531,
+            "mcpRegisteredCategories": ["claude-cli", "codex"],
+            "activeModels": { "codex": "gpt-5", "claude-cli": "claude-opus-4-8" },
+            "activeEfforts": { "codex": "xhigh" },
+            "proxyPorts": { "claude-cli": 47100, "codex": 47101 }
+        }"#;
 
+        let s: AppSettings = serde_json::from_str(LEGACY).expect("旧格式必须能读出来");
+
+        // 值都落到了正确的枚举键上
+        assert_eq!(s.active_models.get(&CategoryType::Codex).map(String::as_str), Some("gpt-5"));
+        assert_eq!(
+            s.active_models.get(&CategoryType::ClaudeCli).map(String::as_str),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(s.active_efforts.get(&CategoryType::Codex).map(String::as_str), Some("xhigh"));
+        assert_eq!(s.proxy_ports.get(&CategoryType::ClaudeCli).copied(), Some(47100));
+        assert_eq!(s.proxy_ports.get(&CategoryType::Codex).copied(), Some(47101));
+        assert_eq!(
+            s.mcp_registered_categories,
+            vec![CategoryType::ClaudeCli, CategoryType::Codex]
+        );
+        assert!(s.auto_start);
+        assert_eq!(s.mcp_port, 9531);
+
+        // 写回后，那几段的 JSON 形状必须与读进来时**完全一致**。
+        // 比较 serde_json::Value 而非字节：键顺序允许变（BTreeMap 会排序），键集与值不许变。
+        let back = serde_json::to_value(&s).unwrap();
+        let orig: serde_json::Value = serde_json::from_str(LEGACY).unwrap();
+        for field in ["mcpRegisteredCategories", "activeModels", "activeEfforts", "proxyPorts"] {
+            assert_eq!(
+                back.get(field),
+                orig.get(field),
+                "{field} 写回后与原始磁盘格式不一致 —— 老用户的这一项会丢"
+            );
+        }
+    }
+
+    /// 未知分类键必须**只丢那一项**，不能连累整份配置。
+    ///
+    /// 场景：用户装过某个未来版本（多了第 4 个分类）后又降级回来，或手改过 config.json。
+    /// 若整份解析失败，会走 `.corrupt` 备份路径 —— 用户看到的是「配置全没了」，
+    /// 而实际只是多了一个不认识的键。
+    #[test]
+    fn unknown_category_key_is_dropped_without_losing_the_rest() {
+        const JSON: &str = r#"{
+            "theme": "system",
+            "activeModels": { "codex": "gpt-5", "gemini-cli": "gemini-3" },
+            "proxyPorts": { "claude-cli": 47100, "some-future-tool": 47999 },
+            "mcpRegisteredCategories": ["codex", "not-a-real-category"]
+        }"#;
+        let s: AppSettings = serde_json::from_str(JSON).expect("有未知键也必须能读出来");
+        assert_eq!(s.active_models.len(), 1, "只保留认识的那一项");
+        assert_eq!(s.active_models.get(&CategoryType::Codex).map(String::as_str), Some("gpt-5"));
+        assert_eq!(s.proxy_ports.get(&CategoryType::ClaudeCli).copied(), Some(47100));
+        assert_eq!(s.mcp_registered_categories, vec![CategoryType::Codex]);
+        assert_eq!(s.theme, "system", "其余字段不受影响");
+    }
+
+    // ===== 桌面端对外模型名「建议」（UX#4 即时校验的可点修法） =====
     /// 给出的建议**自己必须合规**，否则用户点了「采纳」保存仍被拒 —— 那比不给建议更糟
     /// （他会以为按钮坏了，或以为自己哪里还没改对）。
     ///

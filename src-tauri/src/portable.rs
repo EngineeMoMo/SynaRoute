@@ -840,9 +840,9 @@ mod tests {
         let src_dir = temp_dir("ml_src");
         let dst_dir = temp_dir("ml_dst");
         let src = store_at(&src_dir);
-        src.set_proxy_port("claude-cli", 47199).unwrap();
+        src.set_proxy_port(CategoryType::ClaudeCli, 47199).unwrap();
         src.set_mcp_port(9599).unwrap();
-        src.add_registered_category("claude-cli").unwrap();
+        src.add_registered_category(CategoryType::ClaudeCli).unwrap();
         {
             let mut s = src.get_settings();
             s.log_dir = Some("E:\\源机器专属日志目录".into());
@@ -865,13 +865,13 @@ mod tests {
 
         // 导入侧：本机现有值必须保住（哪怕有人手改导出文件塞了别的机器的端口）
         let dst = store_at(&dst_dir);
-        dst.set_proxy_port("claude-cli", 47155).unwrap();
+        dst.set_proxy_port(CategoryType::ClaudeCli, 47155).unwrap();
         dst.set_mcp_port(9527).unwrap();
-        dst.add_registered_category("codex").unwrap();
+        dst.add_registered_category(CategoryType::Codex).unwrap();
         let mut tampered = file.clone();
-        tampered.payload.settings.proxy_ports.insert("claude-cli".into(), 1);
+        tampered.payload.settings.proxy_ports.insert(CategoryType::ClaudeCli, 1);
         tampered.payload.settings.mcp_port = 2;
-        tampered.payload.settings.mcp_registered_categories = vec!["claude-desktop".into()];
+        tampered.payload.settings.mcp_registered_categories = vec![CategoryType::ClaudeDesktop];
         tampered.payload.settings.auto_start = true;
         // 手改载荷后校验和会不匹配——这里直接调 apply_import（跳过 parse_and_verify），
         // 正是为了验证「即使绕过校验和，导入逻辑本身也不会覆盖本机运行态」这道纵深防线。
@@ -879,14 +879,14 @@ mod tests {
 
         let now = dst.get_settings();
         assert_eq!(
-            now.proxy_ports.get("claude-cli").copied(),
+            now.proxy_ports.get(&CategoryType::ClaudeCli).copied(),
             Some(47155),
             "本机粘滞端口不得被导入值顶掉"
         );
         assert_eq!(now.mcp_port, 9527, "本机 MCP 端口不得被顶掉");
         assert_eq!(
             now.mcp_registered_categories,
-            vec!["codex".to_string()],
+            vec![CategoryType::Codex],
             "本机 MCP 注册记录不得被顶掉"
         );
         assert!(!now.auto_start, "自启动状态由本机系统实际情况决定，不得被导入值顶开");

@@ -1557,23 +1557,23 @@ impl Store {
     }
 
     /// 某分类当前选定的「对外模型名」（空/未配时 None）。
-    pub fn active_model_of(&self, category: &str) -> Option<String> {
+    pub fn active_model_of(&self, category: CategoryType) -> Option<String> {
         self.config
             .read()
             .settings
             .active_models
-            .get(category)
+            .get(&category)
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
 
     /// 某分类的「默认推理强度」（空/未配时 None）。
-    pub fn active_effort_of(&self, category: &str) -> Option<String> {
+    pub fn active_effort_of(&self, category: CategoryType) -> Option<String> {
         self.config
             .read()
             .settings
             .active_efforts
-            .get(category)
+            .get(&category)
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
@@ -1708,7 +1708,7 @@ impl Store {
     }
 
     /// 设置某分类当前选定的对外模型名（后端自管字段专用写入，绕过 save_settings 的旧快照覆盖）。
-    pub fn set_active_model(&self, category: &str, model: &str) -> AppResult<()> {
+    pub fn set_active_model(&self, category: CategoryType, model: &str) -> AppResult<()> {
         // 走 `mutate_and_persist_if`：落盘失败时磁盘对账回滚。旧写法是「改内存 → persist()」，
         // 落盘失败即内存领先磁盘，而该方向**永不自愈**（mtime 自愈只认「磁盘比内存新」）——
         // 表现为用户在应用内改选的模型「看着生效了」，重启后悄悄回退。
@@ -1716,13 +1716,13 @@ impl Store {
             let trimmed = model.trim();
             if trimmed.is_empty() {
                 // 本来就没有该项 → 无变化，不必落盘（幂等）。
-                cfg.settings.active_models.remove(category).is_some()
-            } else if cfg.settings.active_models.get(category).map(|s| s.as_str()) == Some(trimmed) {
+                cfg.settings.active_models.remove(&category).is_some()
+            } else if cfg.settings.active_models.get(&category).map(|s| s.as_str()) == Some(trimmed) {
                 false
             } else {
                 cfg.settings
                     .active_models
-                    .insert(category.to_string(), trimmed.to_string());
+                    .insert(category, trimmed.to_string());
                 true
             }
         })?;
@@ -1736,18 +1736,18 @@ impl Store {
     /// 设置某分类的「默认推理强度」（Codex 用；后端自管字段专用写入，绕过 save_settings 旧快照覆盖）。
     /// 空串视为清除（回到不注入、保持上游默认）。已是目标值则幂等跳过写盘。
     /// 取值：low/medium/high/xhigh（minimal 亦可，映射侧按不开思考处理）。
-    pub fn set_active_effort(&self, category: &str, effort: &str) -> AppResult<()> {
+    pub fn set_active_effort(&self, category: CategoryType, effort: &str) -> AppResult<()> {
         self.mutate_and_persist_if(|cfg| {
             let trimmed = effort.trim();
             if trimmed.is_empty() {
-                cfg.settings.active_efforts.remove(category).is_some()
-            } else if cfg.settings.active_efforts.get(category).map(|s| s.as_str()) == Some(trimmed)
+                cfg.settings.active_efforts.remove(&category).is_some()
+            } else if cfg.settings.active_efforts.get(&category).map(|s| s.as_str()) == Some(trimmed)
             {
                 false
             } else {
                 cfg.settings
                     .active_efforts
-                    .insert(category.to_string(), trimmed.to_string());
+                    .insert(category, trimmed.to_string());
                 true
             }
         })?;
@@ -1758,14 +1758,14 @@ impl Store {
 
     /// 设置某分类代理的首选端口（粘滞：绑定回退后写回实际端口作下次首选，或前端手改端口）。
     /// 后端自管字段专用写入，绕过 save_settings 旧快照覆盖。已是目标值则幂等跳过写盘。
-    pub fn set_proxy_port(&self, category: &str, port: u16) -> AppResult<()> {
+    pub fn set_proxy_port(&self, category: CategoryType, port: u16) -> AppResult<()> {
         // 这条的落盘失败后果最具体：粘滞端口丢了 → 重启后端口重新漂移 → 客户端配置里
         // 写的旧端口连不上，而这正是引入粘滞端口本要解决的问题。必须带回滚。
         self.mutate_and_persist_if(|cfg| {
-            if cfg.settings.proxy_ports.get(category).copied() == Some(port) {
+            if cfg.settings.proxy_ports.get(&category).copied() == Some(port) {
                 return false;
             }
-            cfg.settings.proxy_ports.insert(category.to_string(), port);
+            cfg.settings.proxy_ports.insert(category, port);
             true
         })
     }
@@ -1776,27 +1776,27 @@ impl Store {
     /// 的 `mem::take` 保留逻辑吞掉（把刚 push 的新值换回旧值），导致该集合永远为空——
     /// 端口漂移后其它已注册分类的客户端配置永不更新、关闭 MCP 时注销循环也读到空。
     /// 返回 true 表示本次新增（原本不含），false 表示已存在（幂等跳过写盘）。
-    pub fn add_registered_category(&self, category: &str) -> AppResult<bool> {
+    pub fn add_registered_category(&self, category: CategoryType) -> AppResult<bool> {
         // 落盘失败若不回滚：内存记着「已注册」而磁盘没有 → 端口漂移时的批量重写会漏掉
         // 该分类，客户端 MCP 指向死端口；且该方向永不自愈。
         //
         // `mutate_and_persist_when`：闭包同时给出「返回值」与「是否需要落盘」，
         // 于是幂等命中时既能返回 false 又不白写一次盘。
         self.mutate_and_persist_when(|cfg| {
-            if cfg.settings.mcp_registered_categories.iter().any(|c| c == category) {
+            if cfg.settings.mcp_registered_categories.contains(&category) {
                 return (false, false);
             }
-            cfg.settings.mcp_registered_categories.push(category.to_string());
+            cfg.settings.mcp_registered_categories.push(category);
             (true, true)
         })
     }
 
     /// 移除单个已注册分类记录并落盘（per-category 注销 MCP 时用）。后端专用，
     /// 与 add_registered_category 对称。返回 true 表示确实移除，false 表示原本不含（幂等跳过写盘）。
-    pub fn remove_registered_category(&self, category: &str) -> AppResult<bool> {
+    pub fn remove_registered_category(&self, category: CategoryType) -> AppResult<bool> {
         self.mutate_and_persist_when(|cfg| {
             let before = cfg.settings.mcp_registered_categories.len();
-            cfg.settings.mcp_registered_categories.retain(|c| c != category);
+            cfg.settings.mcp_registered_categories.retain(|c| *c != category);
             let removed = cfg.settings.mcp_registered_categories.len() != before;
             (removed, removed)
         })
@@ -2967,7 +2967,7 @@ mod tests {
         // 后端把 MCP 控制面粘滞成 (enabled=true, port=9529, 已注册 [claude-cli])。
         store.set_mcp_enabled_flag(true).unwrap();
         store.set_mcp_port(9529).unwrap();
-        store.add_registered_category("claude-cli").unwrap();
+        store.add_registered_category(CategoryType::ClaudeCli).unwrap();
 
         // 前端持有旧快照：enabled=false / port=9527 / categories=[]，切主题时提交整个 settings。
         let mut stale = store.get_settings();
@@ -2983,7 +2983,7 @@ mod tests {
         assert_eq!(now.mcp_port, 9529, "mcp_port 应保留粘滞值，不被前端旧端口顶回");
         assert_eq!(
             now.mcp_registered_categories,
-            vec!["claude-cli".to_string()],
+            vec![CategoryType::ClaudeCli],
             "已注册分类不应被前端空 vec 清空"
         );
         assert_eq!(now.theme, "dark", "非控制面字段应正常更新");
@@ -3154,29 +3154,29 @@ mod tests {
         let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
 
         // 用户在应用内为 codex 选定对外模型名。
-        store.set_active_model("codex", "claude-opus-4-8").unwrap();
+        store.set_active_model(CategoryType::Codex, "claude-opus-4-8").unwrap();
         assert_eq!(
-            store.get_settings().active_models.get("codex").map(|s| s.as_str()),
+            store.get_settings().active_models.get(&CategoryType::Codex).map(|s| s.as_str()),
             Some("claude-opus-4-8"),
         );
 
         // 前端切主题时提交的旧快照 active_models 为空：不得清除已选模型。
         let mut stale = store.get_settings();
-        stale.active_models = std::collections::HashMap::new();
+        stale.active_models = std::collections::BTreeMap::new();
         stale.theme = "dark".into();
         store.save_settings(stale).unwrap();
         assert_eq!(
-            store.get_settings().active_models.get("codex").map(|s| s.as_str()),
+            store.get_settings().active_models.get(&CategoryType::Codex).map(|s| s.as_str()),
             Some("claude-opus-4-8"),
             "已选模型应保留，不被前端空快照顶回",
         );
         assert_eq!(store.get_settings().theme, "dark", "非自管字段应正常更新");
 
         // 空串清除该分类选择（回到透传）；重开 Store 后仍为空。
-        store.set_active_model("codex", "").unwrap();
-        assert!(!store.get_settings().active_models.contains_key("codex"));
+        store.set_active_model(CategoryType::Codex, "").unwrap();
+        assert!(!store.get_settings().active_models.contains_key(&CategoryType::Codex));
         let store2 = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
-        assert!(!store2.get_settings().active_models.contains_key("codex"), "清除后应持久");
+        assert!(!store2.get_settings().active_models.contains_key(&CategoryType::Codex), "清除后应持久");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3188,28 +3188,28 @@ mod tests {
         let dir = temp_dir("active_effort");
         let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
 
-        store.set_active_effort("codex", "xhigh").unwrap();
+        store.set_active_effort(CategoryType::Codex, "xhigh").unwrap();
         assert_eq!(
-            store.get_settings().active_efforts.get("codex").map(|s| s.as_str()),
+            store.get_settings().active_efforts.get(&CategoryType::Codex).map(|s| s.as_str()),
             Some("xhigh"),
         );
 
         // 前端切主题携带的旧快照 active_efforts 为空：不得清除已配强度。
         let mut stale = store.get_settings();
-        stale.active_efforts = std::collections::HashMap::new();
+        stale.active_efforts = std::collections::BTreeMap::new();
         stale.theme = "dark".into();
         store.save_settings(stale).unwrap();
         assert_eq!(
-            store.get_settings().active_efforts.get("codex").map(|s| s.as_str()),
+            store.get_settings().active_efforts.get(&CategoryType::Codex).map(|s| s.as_str()),
             Some("xhigh"),
             "已配强度应保留，不被前端空快照顶回",
         );
 
         // 空串清除；重开 Store 后仍为空。
-        store.set_active_effort("codex", "").unwrap();
-        assert!(!store.get_settings().active_efforts.contains_key("codex"));
+        store.set_active_effort(CategoryType::Codex, "").unwrap();
+        assert!(!store.get_settings().active_efforts.contains_key(&CategoryType::Codex));
         let store2 = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
-        assert!(!store2.get_settings().active_efforts.contains_key("codex"), "清除后应持久");
+        assert!(!store2.get_settings().active_efforts.contains_key(&CategoryType::Codex), "清除后应持久");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3384,8 +3384,8 @@ mod tests {
             preset_models: vec![],
         };
         store.upsert_vendor(mk_vendor("v1", "厂商1")).unwrap();
-        store.set_proxy_port("claude-cli", 47100).unwrap();
-        assert!(store.add_registered_category("claude-cli").unwrap());
+        store.set_proxy_port(CategoryType::ClaudeCli, 47100).unwrap();
+        assert!(store.add_registered_category(CategoryType::ClaudeCli).unwrap());
 
         // 制造确定性落盘失败（同 delete_key 那条的手法）：把 config.json 变成目录。
         std::fs::remove_file(&cfg_path).unwrap();
@@ -3410,19 +3410,19 @@ mod tests {
         );
 
         // set_proxy_port：改成新端口应失败并回滚到 47100
-        let r = store.set_proxy_port("claude-cli", 47999);
+        let r = store.set_proxy_port(CategoryType::ClaudeCli, 47999);
         assert!(r.is_err(), "落盘失败必须上抛错误");
         assert_eq!(
-            store.config.read().settings.proxy_ports.get("claude-cli").copied(),
+            store.config.read().settings.proxy_ports.get(&CategoryType::ClaudeCli).copied(),
             Some(47100),
             "set_proxy_port 落盘失败必须回滚，否则粘滞端口丢失、重启后端口漂移"
         );
 
         // add_registered_category：新增另一分类应失败并回滚
-        let r = store.add_registered_category("codex");
+        let r = store.add_registered_category(CategoryType::Codex);
         assert!(r.is_err(), "落盘失败必须上抛错误");
         assert!(
-            !store.config.read().settings.mcp_registered_categories.iter().any(|c| c == "codex"),
+            !store.config.read().settings.mcp_registered_categories.contains(&CategoryType::Codex),
             "add_registered_category 落盘失败必须回滚，否则批量重写会漏掉该分类"
         );
 
@@ -3439,7 +3439,7 @@ mod tests {
         let cfg_path = dir.join("config.json");
         let store = Store::new_at(cfg_path.clone(), dir.join("secrets.enc")).unwrap();
 
-        store.set_active_model("codex", "gpt-5").unwrap();
+        store.set_active_model(CategoryType::Codex, "gpt-5").unwrap();
         let mtime1 = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
 
         // ⚠️ 必须**先把值取出来再调用**，不能写成
@@ -3447,14 +3447,14 @@ mod tests {
         // 参数表达式里的读守卫活到整条语句结束，而被调方法内部要取 `config.write()`，
         // parking_lot 的写锁会等所有读守卫释放 → 自锁挂死（本测试初版就这么挂了 60s+）。
         // 这与 `mutate_health` 文档里「闭包内禁调取锁方法」是同一根因的变体。
-        let cur_port = store.config.read().settings.proxy_ports.get("codex").copied();
+        let cur_port = store.config.read().settings.proxy_ports.get(&CategoryType::Codex).copied();
         let cur_mcp = store.config.read().settings.mcp_enabled;
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         // 重复写同一个值 → 不该落盘
-        store.set_active_model("codex", "gpt-5").unwrap();
+        store.set_active_model(CategoryType::Codex, "gpt-5").unwrap();
         if let Some(p) = cur_port {
-            store.set_proxy_port("codex", p).unwrap();
+            store.set_proxy_port(CategoryType::Codex, p).unwrap();
         }
         store.set_mcp_enabled_flag(cur_mcp).unwrap();
         let mtime2 = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
@@ -3462,7 +3462,7 @@ mod tests {
 
         // 真改值 → 必须落盘
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        store.set_active_model("codex", "gpt-5-codex").unwrap();
+        store.set_active_model(CategoryType::Codex, "gpt-5-codex").unwrap();
         let mtime3 = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
         assert_ne!(mtime2, mtime3, "值真变了必须落盘");
 
@@ -3572,7 +3572,7 @@ mod tests {
 
         // 后端自管字段先落盘（专用方法直写）。
         store.set_mcp_port(9531).unwrap();
-        store.set_active_model("codex", "claude-opus-4-8").unwrap();
+        store.set_active_model(CategoryType::Codex, "claude-opus-4-8").unwrap();
         let mut s = store.get_settings();
         s.theme = "light".into();
         store.save_settings(s).unwrap();
@@ -3591,7 +3591,7 @@ mod tests {
         assert_eq!(now.theme, "light", "persist 失败必须回滚，不留内存领先态");
         assert_eq!(now.mcp_port, 9531, "回滚不得丢掉后端自管的粘滞端口");
         assert_eq!(
-            now.active_models.get("codex").map(|s| s.as_str()),
+            now.active_models.get(&CategoryType::Codex).map(|s| s.as_str()),
             Some("claude-opus-4-8"),
             "回滚不得丢掉后端自管的已选模型"
         );

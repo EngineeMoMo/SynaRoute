@@ -467,7 +467,7 @@ async fn set_proxy_port(
     port: u16,
 ) -> AppResult<ProxyState> {
     // 先落盘新首选端口，再重启代理使其按新端口绑定。
-    state.store.set_proxy_port(category_id.as_str(), port)?;
+    state.store.set_proxy_port(category_id, port)?;
     let was_running = state.proxy.is_running(category_id);
     state.proxy.stop(category_id);
     let bound = state.proxy.start(category_id).await?;
@@ -756,7 +756,7 @@ async fn set_active_model(
     category_id: CategoryType,
     model: String,
 ) -> AppResult<()> {
-    state.store.set_active_model(category_id.as_str(), &model)?;
+    state.store.set_active_model(category_id, &model)?;
     // 主窗口下拉改选后，同步刷新托盘子菜单的勾选态（托盘菜单静态构建，需主动重建）。
     let _ = rebuild_tray(&app);
     Ok(())
@@ -773,7 +773,7 @@ async fn set_active_effort(
     category_id: CategoryType,
     effort: String,
 ) -> AppResult<()> {
-    state.store.set_active_effort(category_id.as_str(), &effort)?;
+    state.store.set_active_effort(category_id, &effort)?;
     // 主窗口改推理强度后，同步刷新托盘子菜单勾选态（与 set_active_model 对称，托盘菜单静态构建需主动重建）。
     let _ = rebuild_tray(&app);
     Ok(())
@@ -835,7 +835,7 @@ fn register_and_record(state: &AppState, category: CategoryType, port: u16) {
             state.store.append_event(category, "config", None, &msg);
             // 走后端专用写入（不能用 get_settings→push→save_settings，会被 save_settings
             // 的 mem::take 保留逻辑吞掉，导致该集合永远为空）。
-            let _ = state.store.add_registered_category(category.as_str());
+            let _ = state.store.add_registered_category(category);
         }
         Err(e) => {
             state.store.append_event(
@@ -853,8 +853,8 @@ fn rewrite_registered_clients(state: &AppState, port: u16) {
     let url = mcp_url_for(port);
     let timeout_ms = mcp_client_timeout_ms(&state.store);
     let cats = state.store.get_settings().mcp_registered_categories;
-    for c in cats {
-        if let Some(category) = CategoryType::from_str(&c) {
+    for category in cats {
+        {
             match tools::register_mcp_client(category, &url, timeout_ms) {
                 Ok((msg, wrote)) => {
                     if wrote {
@@ -941,7 +941,7 @@ async fn unregister_mcp_for_category(
             return Err(e);
         }
     }
-    let _ = state.store.remove_registered_category(category_id.as_str());
+    let _ = state.store.remove_registered_category(category_id);
     Ok(McpStatus {
         running: state.mcp.is_running(),
         port: state.mcp.running_port(),
@@ -994,8 +994,10 @@ async fn set_mcp_enabled(
         state.store.set_mcp_enabled_flag(false)?;
         // 关闭开关：从已注册分类移除 synaroute，并清空记录。
         let cats = state.store.get_settings().mcp_registered_categories.clone();
-        for c in &cats {
-            if let Some(category) = CategoryType::from_str(c) {
+        // mcp_registered_categories 现在直接是 Vec<CategoryType>（P2-8）——
+        // 不再需要「字符串解析 + 解析失败静默跳过」那一层，漏配一个分类从此是编译错误。
+        for &category in &cats {
+            {
                 match tools::unregister_mcp_client(category) {
                     Ok((msg, wrote)) => {
                         if wrote {
@@ -1853,8 +1855,8 @@ pub fn run() {
                             let url = format!("http://127.0.0.1:{bound}/mcp");
                             let timeout_ms = mcp_client_timeout_ms(&store_bg);
                             let cats = store_bg.get_settings().mcp_registered_categories;
-                            for c in cats {
-                                if let Some(category) = CategoryType::from_str(&c) {
+                            for category in cats {
+                                {
                                     match tools::register_mcp_client(category, &url, timeout_ms) {
                                         Ok((msg, wrote)) => {
                                             if wrote {
@@ -2080,7 +2082,7 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<ta
         let models = proxy::discoverable_models(&candidates);
         let active = settings
             .active_models
-            .get(CategoryType::Codex.as_str())
+            .get(&CategoryType::Codex)
             .cloned()
             .unwrap_or_default();
 
@@ -2121,7 +2123,7 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<ta
         // 当前项打勾（active_efforts["codex"]，空=关）。切换复用 set_active_effort，每请求实时重读、免重启。
         let active_effort = settings
             .active_efforts
-            .get(CategoryType::Codex.as_str())
+            .get(&CategoryType::Codex)
             .cloned()
             .unwrap_or_default();
         let effort_submenu = Submenu::new(app, "Codex 推理强度", true)?;
@@ -2148,7 +2150,7 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<ta
 fn tray_tooltip(app: &tauri::AppHandle) -> String {
     let state = app.state::<AppState>();
     let settings = state.store.get_settings();
-    match settings.active_models.get(CategoryType::Codex.as_str()) {
+    match settings.active_models.get(&CategoryType::Codex) {
         Some(m) if !m.trim().is_empty() => format!("SynaRoute · Codex: {m}"),
         _ => "SynaRoute".to_string(),
     }
@@ -2263,7 +2265,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                     // 复用 set_active_model：每请求实时重读，切换即时生效、免重启 Codex。
                     let model = id.strip_prefix(TRAY_MODEL_PREFIX).unwrap_or("");
                     let state = app.state::<AppState>();
-                    if let Err(e) = state.store.set_active_model(CategoryType::Codex.as_str(), model) {
+                    if let Err(e) = state.store.set_active_model(CategoryType::Codex, model) {
                         state.store.append_event(
                             CategoryType::Codex,
                             "error",
@@ -2287,7 +2289,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                     // 复用 set_active_effort：每请求实时重读，切换即时生效、免重启 Codex。
                     let effort = id.strip_prefix(TRAY_EFFORT_PREFIX).unwrap_or("");
                     let state = app.state::<AppState>();
-                    if let Err(e) = state.store.set_active_effort(CategoryType::Codex.as_str(), effort) {
+                    if let Err(e) = state.store.set_active_effort(CategoryType::Codex, effort) {
                         state.store.append_event(
                             CategoryType::Codex,
                             "error",
