@@ -12,9 +12,9 @@ use crate::model::Protocol;
 use serde_json::{json, Value};
 
 use super::util::uuid_like;
-use super::{
-    join_namespaced_tool_name, rewrite_to_tool_search_call, split_namespaced_tool_name,
-    unpack_custom_tool_input,
+use super::convert::rewrite_to_tool_search_call;
+use super::tools_meta::{
+    join_namespaced_tool_name, split_namespaced_tool_name, unpack_custom_tool_input,
 };
 
 // ---- 流式 SSE 跨协议翻译（Task #16）----
