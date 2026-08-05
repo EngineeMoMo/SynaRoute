@@ -455,37 +455,36 @@ fn save_settings(state: tauri::State<AppState>, settings: UserPrefs) -> AppResul
 /// 从无任何代码去注册自启动项，开关看起来生效了、重启后什么也不发生 ——
 /// 一个静默失效的开关比「明确标注未完成」更坑。
 ///
-/// 顺序：先动系统（可能失败），成功后才落盘；**落盘失败则把系统改回原状**。
-/// 三种顺序都考虑过：
-/// - 先落盘后动系统：系统失败时留下「配置说开、系统没开」，而用户看设置页是开着的，无从察觉。
-/// - 先动系统后落盘、失败不回滚：留下「系统已注册、配置说关」，下次启动时 setup 的状态对账
-///   会按配置把它关掉 —— 用户点开了、重启后又没了，同样无从察觉。
-/// - 先动系统后落盘、失败回滚（当前）：两边始终一致。最坏是「回滚也失败」，那时只能记日志
-///   并如实上报，但那已是两次系统调用都失败的极端情况。
-///
-/// **不用「配置值是否变化」决定要不要动系统**：若用户手改过注册表（或用清理工具删了启动项），
-/// 配置说 true、系统实际 false，此时点「关」再点「开」——第二次点开时配置值已经是 true，
-/// 按「没变」跳过就会两边都不动，开关**点不动**。插件本身幂等，故这里无条件同步。
+/// 编排（三步顺序、回滚目标为何是落盘前的值、为何不用「配置值是否变化」做判据）在
+/// [`service::toggle_auto_start`]。这里只负责把 `AppHandle` 包成它要的
+/// [`service::AutostartToggle`]。
 #[tauri::command]
 async fn set_auto_start(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> AppResult<()> {
-    let prev = state.store.get_settings().auto_start;
-    sync_autostart(&app, enabled)?;
-    let saved = state.store.set_auto_start_flag(enabled);
-    if saved.is_err() {
-        // 落盘失败：把系统改回**落盘前的配置值**（不是 !enabled ——
-        // 幂等场景下那会把系统改成与配置相反）。
-        // 回滚本身失败只记日志：原始错误（落盘失败）更重要，不该被回滚错误盖掉。
-        if let Err(re) = sync_autostart(&app, prev) {
-            tracing::error!(
-                "自启动开关落盘失败后回滚系统状态也失败（系统侧现为 {enabled}、配置侧为 {prev}）: {re}"
-            );
-        }
+    service::toggle_auto_start(&state.store, &PluginAutostart(&app), enabled)
+}
+
+/// 用 `tauri-plugin-autostart` 实现 [`service::AutostartToggle`]。
+///
+/// Windows 下写/删注册表 `Run` 键，跨平台由插件适配。插件对「已启用再 enable」不报错，
+/// 满足接口要求的幂等性。
+struct PluginAutostart<'a>(&'a tauri::AppHandle);
+
+impl service::AutostartToggle for PluginAutostart<'_> {
+    fn is_enabled(&self) -> Result<bool, String> {
+        use tauri_plugin_autostart::ManagerExt;
+        self.0.autolaunch().is_enabled().map_err(|e| e.to_string())
     }
-    saved
+
+    fn set(&self, enable: bool) -> Result<(), String> {
+        use tauri_plugin_autostart::ManagerExt;
+        let mgr = self.0.autolaunch();
+        let r = if enable { mgr.enable() } else { mgr.disable() };
+        r.map_err(|e| e.to_string())
+    }
 }
 
 /// 注册自启动项时附加的启动参数：让被系统拉起的实例可自我识别。
@@ -502,25 +501,6 @@ where
     S: AsRef<str>,
 {
     args.into_iter().any(|a| a.as_ref() == AUTOSTART_FLAG)
-}
-
-/// 把「开机自启动」开关同步到系统（FR-025）。
-///
-/// 走 `tauri-plugin-autostart`：Windows 下写/删注册表 `Run` 键，跨平台由插件适配。
-/// 幂等——插件内部对「已启用再 enable」不报错。
-///
-/// 失败必须上抛（而非只记日志）：注册自启动项可能因权限、注册表被策略锁定而失败，
-/// 静默吞掉会让用户以为开成了。上抛后前端会弹错误、开关不落盘，状态保持一致。
-fn sync_autostart(app: &tauri::AppHandle, enable: bool) -> AppResult<()> {
-    use tauri_plugin_autostart::ManagerExt;
-    let mgr = app.autolaunch();
-    let r = if enable { mgr.enable() } else { mgr.disable() };
-    r.map_err(|e| {
-        error::AppError::Other(format!(
-            "{}开机自启动失败：{e}。可能是注册表被组策略锁定或权限不足。",
-            if enable { "启用" } else { "关闭" }
-        ))
-    })
 }
 
 /// 设置某分类当前选定的「对外模型名」（应用内模型下拉专用）。
@@ -710,147 +690,33 @@ fn get_effective_log_dir(state: tauri::State<AppState>) -> String {
 
 /// 导出诊断报告（UX#12）：把排障要用的东西汇成**一个纯文本文件**，供用户报障时附上。
 ///
-/// **为什么是纯文本而不是 zip**（docs/15 原建议 zip）：
-/// 1. 用户能在发出前**亲眼看清里面没有密钥**——这直接决定他敢不敢发。zip 里的东西看不见，
-///    要额外解释「我保证脱敏了」，信任成本高得多；
-/// 2. 不引入 `zip` 直接依赖；
-/// 3. 报障场景下贴一段文本比传附件更顺手。
-///
-/// **绝不包含**：任何密钥明文（config 走 `redact_config_secrets` 脱敏）、
-/// trace 正文（调用模型日志的请求/响应体，可达数万字符且含完整对话）。
-/// 头部显式列出「包含什么、不含什么」，让用户不必逐行审也能判断。
+/// 报告正文的拼装（含「为何是纯文本而不是 zip」、包含/不含什么）在
+/// [`service::build_diagnostics_report`]。这里只做它做不到的两件事：
+/// 取包版本号（要 `AppHandle`）与弹保存对话框。
 #[tauri::command]
 async fn export_diagnostics(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> AppResult<Option<String>> {
     use tauri_plugin_dialog::DialogExt;
-    use std::fmt::Write as _;
 
-    let store = &state.store;
-    let mut r = String::with_capacity(16 * 1024);
+    let env = service::DiagnosticsEnv {
+        app_version: app.package_info().version.to_string(),
+        exe_path: std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "?".into()),
+        proxy: CategoryType::ALL
+            .iter()
+            .map(|c| (*c, state.proxy.is_running(*c), state.proxy.port_of(*c)))
+            .collect(),
+    };
+    let report = service::build_diagnostics_report(&state.store, &env);
 
-    let _ = writeln!(r, "# SynaRoute 诊断报告");
-    let _ = writeln!(r, "生成时间：{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z"));
-    let _ = writeln!(r);
-    let _ = writeln!(r, "## 本文件包含什么");
-    let _ = writeln!(r, "- 版本、运行环境、各路径（供核对 MSIX 虚拟化导致的「平行宇宙」问题）");
-    let _ = writeln!(r, "- 配置（**已脱敏**：所有密钥字段替换为 ***）");
-    let _ = writeln!(r, "- 各 Key 的健康状态与代理运行状态");
-    let _ = writeln!(r, "- 最近的事件日志摘要");
-    let _ = writeln!(r);
-    let _ = writeln!(r, "## 本文件**不**包含");
-    let _ = writeln!(r, "- 任何 API 密钥明文");
-    let _ = writeln!(r, "- 对话正文（「调用模型日志」的请求体/响应体一律不含）");
-    let _ = writeln!(r);
-
-    // ---- 环境与路径 ----
-    let _ = writeln!(r, "## 环境");
-    let _ = writeln!(r, "- 应用版本：{}", app.package_info().version);
-    let _ = writeln!(r, "- 操作系统：{} {}", std::env::consts::OS, std::env::consts::ARCH);
-    let _ = writeln!(
-        r,
-        "- 当前 exe：{}",
-        std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into())
-    );
-    // 路径是 MSIX 虚拟化问题的关键证据：用户双击启动与被包内进程启动看到的是不同副本。
-    let _ = writeln!(r, "- 配置文件：{}", store.config_path_display());
-    let _ = writeln!(r, "- 日志目录：{}", store.effective_log_dir().display());
-    let _ = writeln!(r, "- 丢弃日志条数（队列满/磁盘慢）：{}", store.log_dropped_count());
-    // 状态推送也可能丢（队列满）。丢了不影响正确性——前端 30s 兜底轮询会追上——
-    // 但「界面偶尔慢半拍」的排障线索就在这个数字里，必须能被问到。
-    let _ = writeln!(r, "- 丢弃状态推送数（队列满）：{}", events::dropped_count());
-    let _ = writeln!(r);
-
-    // ---- 代理与 Key 状态 ----
-    let _ = writeln!(r, "## 代理状态");
-    for cat in CategoryType::ALL {
-        let _ = writeln!(
-            r,
-            "- {}: {} 端口={:?}",
-            cat.as_str(),
-            if state.proxy.is_running(cat) { "running" } else { "stopped" },
-            state.proxy.port_of(cat)
-        );
-    }
-    let _ = writeln!(r);
-
-    let _ = writeln!(r, "## Key 健康状态（不含密钥）");
-    for cat in CategoryType::ALL {
-        let keys = store.list_keys(cat);
-        if keys.is_empty() {
-            continue;
-        }
-        let _ = writeln!(r, "### {}", cat.as_str());
-        for k in keys {
-            let _ = writeln!(
-                r,
-                "- [{}] {} | 协议={:?} | 优先级={} | 启用={} | 有密钥={} | 状态={:?} 失败计数={} 熔断至={:?} 延迟={:?}ms | 模型数={} 映射数={}",
-                k.id,
-                k.name,
-                k.protocol,
-                k.priority,
-                k.enabled,
-                k.has_secret,
-                k.health.status,
-                k.health.fail_count,
-                k.health.breaker_until,
-                k.health.latency_ms,
-                k.models.len(),
-                k.mappings.len()
-            );
-            // base_url 单列一行：它常是问题根源（协议选错、路径写错），但不含密钥，可以给。
-            let _ = writeln!(r, "  base_url: {}", k.base_url);
-        }
-    }
-    let _ = writeln!(r);
-
-    // ---- 脱敏后的配置 ----
-    let _ = writeln!(r, "## 配置（已脱敏）");
-    let _ = writeln!(r, "```json");
-    match store.redacted_config_json() {
-        Ok(s) => {
-            let _ = writeln!(r, "{s}");
-        }
-        Err(e) => {
-            let _ = writeln!(r, "（读取配置失败：{e}）");
-        }
-    }
-    let _ = writeln!(r, "```");
-    let _ = writeln!(r);
-
-    // ---- 最近事件（不含 trace 正文）----
-    const MAX_EVENTS_IN_REPORT: usize = 200;
-    let events = store.list_all_events();
-    let total = events.len();
-    let _ = writeln!(
-        r,
-        "## 最近事件（共 {total} 条，取最后 {}；**不含**调用模型日志的请求/响应正文）",
-        MAX_EVENTS_IN_REPORT.min(total)
-    );
-    for e in events.iter().rev().take(MAX_EVENTS_IN_REPORT).rev() {
-        let ts = chrono::DateTime::from_timestamp_millis(e.ts)
-            .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| e.ts.to_string());
-        let _ = writeln!(
-            r,
-            "[{ts}] {} {} {}{}",
-            e.category_id.as_str(),
-            e.kind,
-            e.detail,
-            if e.repeat > 1 { format!(" (×{})", e.repeat) } else { String::new() }
-        );
-    }
-
-    let default_name = format!(
-        "synaroute-diagnostics-{}.txt",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
-    );
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
         .set_title("保存 SynaRoute 诊断报告")
-        .set_file_name(&default_name)
+        .set_file_name(service::diagnostics_file_name())
         .add_filter("文本文件", &["txt"])
         .save_file(move |p| {
             let _ = tx.send(p);
@@ -859,7 +725,7 @@ async fn export_diagnostics(
         return Ok(None); // 用户取消，不算错误
     };
     let path = path.to_string();
-    std::fs::write(&path, r.as_bytes())
+    std::fs::write(&path, report.as_bytes())
         .map_err(|e| error::AppError::Other(format!("写入诊断报告失败（{path}）: {e}")))?;
     Ok(Some(path))
 }
@@ -887,21 +753,9 @@ fn prepare_log_dir(state: tauri::State<AppState>) -> AppResult<String> {
 
 // ============ 配置导入 / 导出（FR-021）============
 //
-// 导出体不含 DPAPI 密文——那玩意儿绑当前 Windows 账户、换机解不出。含密钥导出时改用
-// 用户口令重新加密（Argon2id + AES-GCM，见 crate::crypto）。详见 crate::portable 模块注释。
-
-/// 导出结果。
-///
-/// **必须带上 `undecryptable`**：解不出的 Key 是被跳过而非导出失败（见
-/// [`portable::build_export`]）。若只回一个路径，用户会拿到「声称含密钥、实际少几条」的文件，
-/// 到新机器导入后才发现——那时已经离开源机器、无从补救。
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ExportOutcome {
-    path: String,
-    /// 密钥解不出、已跳过的 Key 数（0 表示全部带上了）
-    undecryptable: usize,
-}
+// 编排在 [`service`]：导出体不含 DPAPI 密文（绑当前 Windows 账户、换机解不出），
+// 含密钥导出改用用户口令重新加密。这里三条命令只负责弹文件对话框 —— 那是唯一
+// 需要 AppHandle、也唯一无法单测的部分。
 
 /// 导出配置到用户选定的文件。`password` 非空则包含密钥段（口令加密）。
 /// 返回实际写入的路径 + 跳过条数；用户取消选择时返回 None。
@@ -910,27 +764,20 @@ async fn export_config(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     password: Option<String>,
-) -> AppResult<Option<ExportOutcome>> {
+) -> AppResult<Option<service::ExportOutcome>> {
     use tauri_plugin_dialog::DialogExt;
-    // 空串视为「不含密钥」：前端未勾选时可能传空串而非 null，两者语义应当一致。
-    let pw = password.as_deref().filter(|s| !s.is_empty());
-    // 先构建再弹框：构建可能失败（如密钥库损坏），失败时不该已经让用户挑好了文件。
-    let (file, undecryptable) = portable::build_export(
+    // 先构建再弹框（见 service::build_export_bytes 的理由）。
+    let (data, undecryptable, with_secrets) = service::build_export_bytes(
         &state.store,
         app.package_info().version.to_string().as_str(),
-        pw,
+        password.as_ref(),
     )?;
-    let data = serde_json::to_vec_pretty(&file)?;
 
-    let default_name = format!(
-        "synaroute-config-{}.json",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
-    );
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
         .set_title("导出 SynaRoute 配置")
-        .set_file_name(&default_name)
+        .set_file_name(service::export_file_name())
         .add_filter("SynaRoute 配置", &["json"])
         .save_file(move |p| {
             let _ = tx.send(p);
@@ -941,27 +788,7 @@ async fn export_config(
     let path = path
         .into_path()
         .map_err(|e| error::AppError::Other(format!("解析保存路径失败: {e}")))?;
-    // 走 atomic_write：与配置落盘同一套（含跨设备 rename 回退），避免半写文件。
-    secret::atomic_write(&path, &data)?;
-    state.store.append_event(
-        CategoryType::ClaudeCli,
-        "config",
-        None,
-        &format!(
-            "已导出配置到 {}（{}密钥{}）",
-            path.display(),
-            if pw.is_some() { "含" } else { "不含" },
-            if undecryptable > 0 {
-                format!("，{undecryptable} 条密钥解不出已跳过")
-            } else {
-                String::new()
-            }
-        ),
-    );
-    Ok(Some(ExportOutcome {
-        path: path.display().to_string(),
-        undecryptable,
-    }))
+    service::write_export(&state.store, &path, &data, undecryptable, with_secrets).map(Some)
 }
 
 /// 让用户选一个导出文件并**只做校验与预检**（不改任何配置）。
@@ -986,18 +813,12 @@ async fn pick_and_preview_import(
     let path = path
         .into_path()
         .map_err(|e| error::AppError::Other(format!("解析文件路径失败: {e}")))?;
-    let raw = std::fs::read(&path)?;
-    // 校验（版本 + sha256）放在这里：让用户在**点确认之前**就知道文件是不是好的。
-    let file = portable::parse_and_verify(&raw)?;
-    let preview = portable::preview_import(&state.store, &file);
+    let preview = service::preview_import(&state.store, &path)?;
     Ok(Some((path.display().to_string(), preview)))
 }
 
 /// 执行导入。`path` 来自 `pick_and_preview_import`；`mode` 由用户当场选。
-///
-/// 刻意重新读盘 + 重新校验，而不是缓存预检时的解析结果：预检与确认之间用户可能改动了文件，
-/// 且缓存跨 IPC 调用要么塞进全局状态（多了一处可变共享态）要么把整份配置回传前端再传回来
-/// （白绕一圈、还多一个被篡改的机会）。重新读一次几毫秒，换来「校验的就是即将导入的字节」。
+/// 编排（含「为何重新读盘而不缓存预检结果」）在 [`service::apply_import_config`]。
 #[tauri::command]
 async fn apply_import_config(
     state: tauri::State<'_, AppState>,
@@ -1005,30 +826,7 @@ async fn apply_import_config(
     mode: portable::ImportMode,
     password: Option<String>,
 ) -> AppResult<portable::ImportReport> {
-    let raw = std::fs::read(&path)?;
-    let file = portable::parse_and_verify(&raw)?;
-    let pw = password.as_deref().filter(|s| !s.is_empty());
-    let report = portable::apply_import(&state.store, &file, mode, pw)?;
-    state.store.append_event(
-        CategoryType::ClaudeCli,
-        "config",
-        None,
-        &format!(
-            "已导入配置（{:?}）：新增 {} / 覆盖 {} / 删除 {} 个 Key，密钥 {} 条{}",
-            report.mode,
-            report.keys_added,
-            report.keys_overwritten,
-            report.keys_removed,
-            report.secrets_imported,
-            // 清理掉的旧密钥要写进事件日志：密钥是敏感材料，删了几条应当留痕。
-            if report.secrets_pruned > 0 {
-                format!("，清理随 Key 一并移除的旧密钥 {} 条", report.secrets_pruned)
-            } else {
-                String::new()
-            }
-        ),
-    );
-    Ok(report)
+    service::apply_import_config(&state.store, &path, mode, password.as_ref())
 }
 
 /// 统计孤儿密钥条数（P2-3）：密钥库里有、但配置里已无对应 Key 的残留。
@@ -1249,67 +1047,23 @@ pub fn run() {
             // 装好之前的 emit 是空操作，不会 panic。
             events::init(app.handle());
             let state = app.state::<AppState>();
-            let settings = state.store.get_settings();
 
-            // 主口令开关的启动对账（与 FR-025 自启动同思路，但**方向相反**）：
-            // 真实模式的事实来源是密钥库文件里的 master 头部，settings 只是 UI 镜像。
-            // 故这里以**库**为准去修配置，而不是以配置为准去改库——后者会把用户真实的
-            // 加密状态改掉。背离的成因：导入了另一台机器的配置（config 可搬、secrets.enc
-            // 不可搬）、手动改过 config.json、或旧版本残留的字段值。
-            {
-                let real = state.store.secrets.read().is_master_mode();
-                if settings.master_password_enabled != real {
-                    match state.store.set_master_password_flag(real) {
-                        Ok(()) => tracing::info!(
-                            "主口令开关已按密钥库真实状态对账为 {real}（配置此前为 {}）",
-                            settings.master_password_enabled
-                        ),
-                        Err(e) => tracing::warn!("主口令开关对账失败: {e}"),
-                    }
-                }
-                if real {
-                    tracing::info!("密钥库处于主口令模式，需解锁后才能转发（等待用户输入主口令）");
-                }
-            }
-
-            // 首启向导标记的启动对账（UX#1）。
-            //
-            // 老用户升级上来配置里没有 onboarding_done 字段（反序列化成 None）。若不对账，
-            // 他们哪天把 Key 全删了（换厂商、清理重配）就会突然被首启向导拦住 ——
-            // 一个用了半年的软件毫无征兆地弹「欢迎使用」。这里一次性据当前 Key 数定下来。
+            // 三项启动对账。编排都在 [`service`]，这里只按顺序调 ——
+            // 三者的**方向不同**，别照着其中一个去改另一个：
+            // - 主口令：以**密钥库**为准修配置（事实来源是 secrets.enc 里有无 master 头部）
+            // - 首启向导：以**当前 Key 数**一次性定下（老配置里没这个字段）
+            // - 开机自启动：以**配置**为准修系统（事实来源是用户在设置页的选择）
+            service::reconcile_master_password_flag(&state.store);
             match state.store.reconcile_onboarding_flag() {
                 Ok(Some(v)) => tracing::info!("首启向导标记已对账为 {v}（据当前 Key 数判定）"),
                 Ok(None) => {}
                 Err(e) => tracing::warn!("首启向导标记对账失败: {e}"),
             }
+            service::reconcile_auto_start(&state.store, &PluginAutostart(app.handle()));
 
-            // 开机自启动（FR-025）的两件事：
-            //
-            // 1) **状态对账**。config.json 里的 auto_start 与系统实际注册项可能背离——用户手动
-            //    改过注册表 Run 键、用清理工具删过启动项、或从旧版本升级（旧版只存字段、从不
-            //    注册）。以配置为准把系统拉回一致，让开关「所见即所得」。
-            // 2) **随系统启动时最小化到托盘**（需求原文要求）。判据是启动参数里有
-            //    `--autostart`（注册自启动项时带上的），而非「auto_start 为真」——后者在用户
-            //    手动双击时也成立，那时不该把窗口藏起来。
-            {
-                let want = settings.auto_start;
-                let mgr = {
-                    use tauri_plugin_autostart::ManagerExt;
-                    app.autolaunch()
-                };
-                match mgr.is_enabled() {
-                    Ok(actual) if actual != want => {
-                        let r = if want { mgr.enable() } else { mgr.disable() };
-                        match r {
-                            Ok(()) => tracing::info!("开机自启动已对账为 {want}（此前系统侧为 {actual}）"),
-                            // 对账失败不阻断启动：功能降级，但应用照常可用。
-                            Err(e) => tracing::warn!("开机自启动对账失败（配置={want} 系统={actual}）: {e}"),
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("读取开机自启动状态失败: {e}"),
-                }
-            }
+            // 随系统启动时最小化到托盘（FR-025 需求原文要求）。判据是启动参数里有
+            // `--autostart`（注册自启动项时带上的），而非「auto_start 为真」——
+            // 后者在用户手动双击时也成立，那时把窗口藏起来会让人以为程序没启动。
             if launched_by_autostart(std::env::args()) {
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.hide();
@@ -1320,7 +1074,10 @@ pub fn run() {
             // 内置 MCP 服务器：用户已启用则随应用启动（Q8），端口取自设置（默认 9527，Q7）。
             // 跑在 Tauri 托管异步运行时上，生命周期与应用一致 ——
             // 早期用 std::thread + 临时 Runtime + block_on 会让 Runtime drop 掉 accept 循环。
-            if settings.mcp_enabled {
+            //
+            // 现读而不用上面的快照：三项对账刚改过 settings（虽然都不碰 mcp_enabled），
+            // 在 setup 里留一份「对账前的旧快照」正是本项目出过 P0 的形状。
+            if state.store.get_settings().mcp_enabled {
                 let mcp_bg = state.mcp.clone();
                 let store_bg = state.store.clone();
                 tauri::async_runtime::spawn(async move {

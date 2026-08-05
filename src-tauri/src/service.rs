@@ -797,6 +797,440 @@ pub(crate) async fn start_mcp_on_launch(store: &Store, mcp: &McpManager) {
     }
 }
 
+// ==== 开机自启动（FR-025）====
+
+/// 「开机自启动」在系统侧的读写抽象。
+///
+/// 为什么要这层 trait：真实实现是 `tauri-plugin-autostart`（Windows 下写注册表 `Run` 键），
+/// 拿它做单测等于**真去改开发机的注册表**。而这里最该被测的恰恰是那套三步顺序与
+/// 回滚逻辑 —— 它出过一次 P0（切主题把用户刚关掉的自启动重新装回系统）。
+/// 把系统副作用收进一个两方法的接口后，编排本身就能在内存里跑。
+///
+/// 只有两个方法、都可能失败：读系统当前状态、把系统设成某个状态。
+pub(crate) trait AutostartToggle {
+    /// 系统侧当前是否已注册自启动项。
+    fn is_enabled(&self) -> Result<bool, String>;
+    /// 把系统侧设成 `enable`。**必须幂等**（已启用再启用不算错）。
+    fn set(&self, enable: bool) -> Result<(), String>;
+}
+
+/// 切换开机自启动开关：**先动系统，成功后才落盘；落盘失败则把系统改回原状**。
+///
+/// 三种顺序都考虑过，只有这一种两边始终一致：
+/// - 先落盘后动系统：系统失败时留下「配置说开、系统没开」，而用户看设置页是开着的，无从察觉。
+/// - 先动系统后落盘、失败不回滚：留下「系统已注册、配置说关」，下次启动时的状态对账
+///   会按配置把它关掉 —— 用户点开了、重启后又没了，同样无从察觉。
+/// - 先动系统后落盘、失败回滚（当前）：最坏是「回滚也失败」，那时只记日志并如实上报，
+///   但那已是两次系统调用都失败的极端情况。
+///
+/// 回滚目标写成**落盘前的配置值** `prev` 而不是 `!enabled`：后者只在
+/// 「落盘失败 ⇒ 值确实发生了变化」时才等价，而那是 `Store::set_auto_start_flag`
+/// 的内部实现细节（值相同时它幂等跳过、不落盘、不会失败）。写 `prev` 直接表达意图
+/// —— 回到落盘前的状态 —— 不依赖那条推理。**故这一处的差别当前无法用测试区分**，
+/// 靠的是意图明确，不是判据。
+///
+/// **不用「配置值是否变化」决定要不要动系统**：若用户手改过注册表（或用清理工具删了启动项），
+/// 配置说 true、系统实际 false，此时点「关」再点「开」——第二次点开时配置值已经是 true，
+/// 按「没变」跳过就会两边都不动，**开关点不动**。故无条件同步（依赖 `set` 的幂等性）。
+pub(crate) fn toggle_auto_start(
+    store: &Store,
+    sys: &dyn AutostartToggle,
+    enabled: bool,
+) -> AppResult<()> {
+    let prev = store.get_settings().auto_start;
+    sys.set(enabled).map_err(|e| {
+        AppError::Other(format!(
+            "{}开机自启动失败：{e}。可能是注册表被组策略锁定或权限不足。",
+            if enabled { "启用" } else { "关闭" }
+        ))
+    })?;
+    let saved = store.set_auto_start_flag(enabled);
+    if saved.is_err() {
+        // 回滚本身失败只记日志：原始错误（落盘失败）更重要，不该被回滚错误盖掉。
+        if let Err(re) = sys.set(prev) {
+            tracing::error!(
+                "自启动开关落盘失败后回滚系统状态也失败（系统侧现为 {enabled}、配置侧为 {prev}）: {re}"
+            );
+        }
+    }
+    saved
+}
+
+/// 启动时把系统侧的自启动状态对账成配置里的值（**以配置为准**）。
+///
+/// 背离的成因：用户手动改过注册表 Run 键、用清理工具删过启动项、
+/// 或从旧版本升级（旧版只存字段、从不注册 —— 那正是 FR-025 修掉的静默失效开关）。
+///
+/// 与主口令对账**方向相反**（那边以密钥库为准去修配置），因为两者的事实来源不同：
+/// 自启动的事实来源是用户在设置页的选择，系统注册项只是它的执行结果；
+/// 而主口令的事实来源是密钥库文件本身，配置只是 UI 镜像。
+///
+/// 返回 `Some(want)` 表示做了修正，`None` 表示本来就一致。失败只告警不阻断启动：
+/// 功能降级，但应用照常可用。
+pub(crate) fn reconcile_auto_start(store: &Store, sys: &dyn AutostartToggle) -> Option<bool> {
+    let want = store.get_settings().auto_start;
+    match sys.is_enabled() {
+        Ok(actual) if actual != want => match sys.set(want) {
+            Ok(()) => {
+                tracing::info!("开机自启动已对账为 {want}（此前系统侧为 {actual}）");
+                Some(want)
+            }
+            Err(e) => {
+                tracing::warn!("开机自启动对账失败（配置={want} 系统={actual}）: {e}");
+                None
+            }
+        },
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("读取开机自启动状态失败: {e}");
+            None
+        }
+    }
+}
+
+/// 启动时把 settings 里的主口令镜像对账成密钥库的真实模式（**以库为准**）。
+///
+/// 真实模式的事实来源是密钥库文件里有无 `master` 头部，settings 只是 UI 镜像。
+/// 故这里以库为准去修配置，而**不能**反过来以配置为准去改库 —— 后者会把用户真实的
+/// 加密状态改掉。背离的成因：导入了另一台机器的配置（config 可搬、`secrets.enc` 不可搬，
+/// 它绑 DPAPI 当前账户）、手动改过 config.json、或旧版本残留的字段值。
+///
+/// 返回 `Some(real)` 表示做了修正。
+pub(crate) fn reconcile_master_password_flag(store: &Store) -> Option<bool> {
+    let real = store.secrets.read().is_master_mode();
+    if store.get_settings().master_password_enabled == real {
+        if real {
+            tracing::info!("密钥库处于主口令模式，需解锁后才能转发（等待用户输入主口令）");
+        }
+        return None;
+    }
+    match store.set_master_password_flag(real) {
+        Ok(()) => {
+            tracing::info!("主口令开关已按密钥库真实状态对账为 {real}");
+            Some(real)
+        }
+        Err(e) => {
+            tracing::warn!("主口令开关对账失败: {e}");
+            None
+        }
+    }
+}
+
+// ==== 诊断报告（UX#12）====
+
+/// 诊断报告里那些**只能由 lib.rs 提供**的运行环境信息。
+///
+/// 为什么单独立个结构：应用版本要 `AppHandle::package_info()`、代理运行状态要
+/// `&ProxyManager`。把它们做成入参后，报告拼装本身成了可测的纯逻辑 ——
+/// 而这里最该被测的正是**脱敏**：报告是用户要发给别人的，漏一个密钥字段就是真实泄露。
+pub(crate) struct DiagnosticsEnv {
+    pub(crate) app_version: String,
+    pub(crate) exe_path: String,
+    /// 各分类代理的 (运行中, 端口)。
+    pub(crate) proxy: Vec<(CategoryType, bool, Option<u16>)>,
+}
+
+/// 报告里最多附多少条事件。
+///
+/// 取最后 200 条而非全部：内存日志上限 500 条、单条 detail 可达数百字符，
+/// 全带上会让报告膨胀到用户不愿意打开看 —— 而「用户敢不敢发」正是纯文本方案的立足点。
+const MAX_EVENTS_IN_REPORT: usize = 200;
+
+/// 拼装诊断报告正文（UX#12）：把排障要用的东西汇成**一个纯文本**，供用户报障时附上。
+///
+/// **为什么是纯文本而不是 zip**（docs/15 原建议 zip）：
+/// 1. 用户能在发出前**亲眼看清里面没有密钥** —— 这直接决定他敢不敢发。zip 里的东西看不见，
+///    要额外解释「我保证脱敏了」，信任成本高得多；
+/// 2. 不引入 `zip` 直接依赖；
+/// 3. 报障场景下贴一段文本比传附件更顺手。
+///
+/// **绝不包含**：任何密钥明文（config 走 `redacted_config_json` 脱敏）、
+/// trace 正文（调用模型日志的请求/响应体，可达数万字符且含完整对话）。
+/// 头部显式列出「包含什么、不含什么」，让用户不必逐行审也能判断。
+pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> String {
+    use std::fmt::Write as _;
+    let mut r = String::with_capacity(16 * 1024);
+
+    let _ = writeln!(r, "# SynaRoute 诊断报告");
+    let _ = writeln!(
+        r,
+        "生成时间：{}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z")
+    );
+    let _ = writeln!(r);
+    let _ = writeln!(r, "## 本文件包含什么");
+    let _ = writeln!(r, "- 版本、运行环境、各路径（供核对 MSIX 虚拟化导致的「平行宇宙」问题）");
+    let _ = writeln!(r, "- 配置（**已脱敏**：所有密钥字段替换为 ***）");
+    let _ = writeln!(r, "- 各 Key 的健康状态与代理运行状态");
+    let _ = writeln!(r, "- 最近的事件日志摘要");
+    let _ = writeln!(r);
+    let _ = writeln!(r, "## 本文件**不**包含");
+    let _ = writeln!(r, "- 任何 API 密钥明文");
+    let _ = writeln!(r, "- 对话正文（「调用模型日志」的请求体/响应体一律不含）");
+    let _ = writeln!(r);
+
+    let _ = writeln!(r, "## 环境");
+    let _ = writeln!(r, "- 应用版本：{}", env.app_version);
+    let _ = writeln!(
+        r,
+        "- 操作系统：{} {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    let _ = writeln!(r, "- 当前 exe：{}", env.exe_path);
+    // 路径是 MSIX 虚拟化问题的关键证据：用户双击启动与被包内进程启动看到的是不同副本。
+    let _ = writeln!(r, "- 配置文件：{}", store.config_path_display());
+    let _ = writeln!(r, "- 日志目录：{}", store.effective_log_dir().display());
+    let _ = writeln!(r, "- 丢弃日志条数（队列满/磁盘慢）：{}", store.log_dropped_count());
+    // 状态推送也可能丢（队列满）。丢了不影响正确性——前端 30s 兜底轮询会追上——
+    // 但「界面偶尔慢半拍」的排障线索就在这个数字里，必须能被问到。
+    let _ = writeln!(r, "- 丢弃状态推送数（队列满）：{}", crate::events::dropped_count());
+    let _ = writeln!(r);
+
+    let _ = writeln!(r, "## 代理状态");
+    for (cat, running, port) in &env.proxy {
+        let _ = writeln!(
+            r,
+            "- {}: {} 端口={:?}",
+            cat.as_str(),
+            if *running { "running" } else { "stopped" },
+            port
+        );
+    }
+    let _ = writeln!(r);
+
+    let _ = writeln!(r, "## Key 健康状态（不含密钥）");
+    for cat in CategoryType::ALL {
+        let keys = store.list_keys(cat);
+        if keys.is_empty() {
+            continue;
+        }
+        let _ = writeln!(r, "### {}", cat.as_str());
+        for k in keys {
+            let _ = writeln!(
+                r,
+                "- [{}] {} | 协议={:?} | 优先级={} | 启用={} | 有密钥={} | 状态={:?} 失败计数={} 熔断至={:?} 延迟={:?}ms | 模型数={} 映射数={}",
+                k.id,
+                k.name,
+                k.protocol,
+                k.priority,
+                k.enabled,
+                k.has_secret,
+                k.health.status,
+                k.health.fail_count,
+                k.health.breaker_until,
+                k.health.latency_ms,
+                k.models.len(),
+                k.mappings.len()
+            );
+            // base_url 单列一行：它常是问题根源（协议选错、路径写错），但不含密钥，可以给。
+            let _ = writeln!(r, "  base_url: {}", k.base_url);
+        }
+    }
+    let _ = writeln!(r);
+
+    let _ = writeln!(r, "## 配置（已脱敏）");
+    let _ = writeln!(r, "```json");
+    match store.redacted_config_json() {
+        Ok(s) => {
+            let _ = writeln!(r, "{s}");
+        }
+        Err(e) => {
+            let _ = writeln!(r, "（读取配置失败：{e}）");
+        }
+    }
+    let _ = writeln!(r, "```");
+    let _ = writeln!(r);
+
+    let events = store.list_all_events();
+    let total = events.len();
+    let _ = writeln!(
+        r,
+        "## 最近事件（共 {total} 条，取最后 {}；**不含**调用模型日志的请求/响应正文）",
+        MAX_EVENTS_IN_REPORT.min(total)
+    );
+    for e in events.iter().rev().take(MAX_EVENTS_IN_REPORT).rev() {
+        let ts = chrono::DateTime::from_timestamp_millis(e.ts)
+            .map(|d| {
+                d.with_timezone(&chrono::Local)
+                    .format("%m-%d %H:%M:%S")
+                    .to_string()
+            })
+            .unwrap_or_else(|| e.ts.to_string());
+        let _ = writeln!(
+            r,
+            "[{ts}] {} {} {}{}",
+            e.category_id.as_str(),
+            e.kind,
+            e.detail,
+            if e.repeat > 1 {
+                format!(" (×{})", e.repeat)
+            } else {
+                String::new()
+            }
+        );
+    }
+
+    // **整份再过一遍脱敏**，而不是只脱敏「配置」那一段。
+    //
+    // 原先只有配置段走了 `redacted_config_json`，而报告里还有两处会打印用户输入的自由文本：
+    // Key 健康状态段的 `name` / `base_url`，以及事件日志的 `detail`。用户把 Key 命名成
+    // 含 token 的串（贴错、图省事）并不离谱，那时报告里就有一份未脱敏的凭据 ——
+    // 而这份文件的全部意义是「用户敢直接发给别人」，任何一处漏了都等于泄露。
+    //
+    // 在出口统一处理，日后新增的段落自动被覆盖：这是「默认安全」而非「记得加就安全」。
+    // 脱敏是幂等的（替换成 `***`，不含可再匹配的形态），故与配置段那次不冲突。
+    crate::tools::redact_config_secrets(&r)
+}
+
+/// 诊断报告的默认文件名（带时间戳，避免多次导出互相覆盖）。
+pub(crate) fn diagnostics_file_name() -> String {
+    format!(
+        "synaroute-diagnostics-{}.txt",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    )
+}
+
+// ==== 配置导入 / 导出（FR-021）====
+//
+// 导出体不含 DPAPI 密文——那玩意儿绑当前 Windows 账户、换机解不出。含密钥导出时改用
+// 用户口令重新加密（Argon2id + AES-GCM，见 crate::crypto）。详见 crate::portable 模块注释。
+
+/// 导出结果。
+///
+/// **必须带上 `undecryptable`**：解不出的 Key 是被跳过而非导出失败（见
+/// [`crate::portable::build_export`]）。若只回一个路径，用户会拿到「声称含密钥、实际少几条」
+/// 的文件，到新机器导入后才发现 —— 那时已经离开源机器、无从补救。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExportOutcome {
+    pub(crate) path: String,
+    /// 密钥解不出、已跳过的 Key 数（0 表示全部带上了）
+    pub(crate) undecryptable: usize,
+}
+
+/// 把「密码是否有效」统一成一个判据：空串视为**不含密钥**。
+///
+/// 前端未勾选「包含密钥」时可能传空串而非 null，两者语义必须一致 ——
+/// 否则空串会被当成真口令，导出一份用 `""` 加密的密钥段（等于没加密）。
+fn effective_password(password: Option<&String>) -> Option<&str> {
+    password.map(String::as_str).filter(|s| !s.is_empty())
+}
+
+/// 构建导出字节（**在弹保存对话框之前**调）。
+///
+/// 顺序有意义：构建可能失败（密钥库损坏、口令派生失败），失败时不该已经让用户挑好了文件 ——
+/// 那会得到「选了路径然后报错」的体验，用户还得怀疑是不是那个目录不能写。
+pub(crate) fn build_export_bytes(
+    store: &Store,
+    app_version: &str,
+    password: Option<&String>,
+) -> AppResult<(Vec<u8>, usize, bool)> {
+    let pw = effective_password(password);
+    let (file, undecryptable) = crate::portable::build_export(store, app_version, pw)?;
+    let data = serde_json::to_vec_pretty(&file)?;
+    Ok((data, undecryptable, pw.is_some()))
+}
+
+/// 导出的默认文件名（带时间戳）。
+pub(crate) fn export_file_name() -> String {
+    format!(
+        "synaroute-config-{}.json",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    )
+}
+
+/// 落盘导出文件并记事件。返回给前端的结果对象。
+///
+/// 走 `secret::atomic_write` 而非 `fs::write`：与配置落盘同一套（含跨设备 rename 回退），
+/// 避免留下半写文件 —— 一份半写的导出文件会在新机器上通过 sha256 校验失败，
+/// 但用户此时已经离开源机器了。
+pub(crate) fn write_export(
+    store: &Store,
+    path: &std::path::Path,
+    data: &[u8],
+    undecryptable: usize,
+    with_secrets: bool,
+) -> AppResult<ExportOutcome> {
+    crate::secret::atomic_write(path, data)?;
+    store.append_event(
+        CategoryType::ClaudeCli,
+        "config",
+        None,
+        &format!(
+            "已导出配置到 {}（{}密钥{}）",
+            path.display(),
+            if with_secrets { "含" } else { "不含" },
+            if undecryptable > 0 {
+                format!("，{undecryptable} 条密钥解不出已跳过")
+            } else {
+                String::new()
+            }
+        ),
+    );
+    Ok(ExportOutcome {
+        path: path.display().to_string(),
+        undecryptable,
+    })
+}
+
+/// 读盘 + 校验 + 预检（**不改任何配置**）。
+///
+/// 校验（版本 + sha256）放在这一步：让用户在**点确认之前**就知道文件是不是好的。
+pub(crate) fn preview_import(
+    store: &Store,
+    path: &std::path::Path,
+) -> AppResult<crate::portable::ImportPreview> {
+    let raw = std::fs::read(path)?;
+    let file = crate::portable::parse_and_verify(&raw)?;
+    Ok(crate::portable::preview_import(store, &file))
+}
+
+/// 执行导入。
+///
+/// **刻意重新读盘 + 重新校验**，而不是缓存预检时的解析结果：预检与确认之间用户可能改动了
+/// 文件；且缓存跨 IPC 调用要么塞进全局状态（多一处可变共享态）、要么把整份配置回传前端
+/// 再传回来（白绕一圈、还多一个被篡改的机会）。重新读一次几毫秒，
+/// 换来「校验的就是即将导入的字节」。
+pub(crate) fn apply_import_config(
+    store: &Store,
+    path: &str,
+    mode: crate::portable::ImportMode,
+    password: Option<&String>,
+) -> AppResult<crate::portable::ImportReport> {
+    let raw = std::fs::read(path)?;
+    let file = crate::portable::parse_and_verify(&raw)?;
+    let report = crate::portable::apply_import(store, &file, mode, effective_password(password))?;
+    store.append_event(
+        CategoryType::ClaudeCli,
+        "config",
+        None,
+        &import_summary(&report),
+    );
+    Ok(report)
+}
+
+/// 导入结果的事件日志文案。
+///
+/// 抽成纯函数是为了可测其中一条要点：**清理掉的旧密钥数必须出现在文案里**。
+/// 密钥是敏感材料，删了几条应当留痕 —— 而这条信息只在 Replace 模式下非零，
+/// 恰恰是最容易在改文案时被顺手删掉的那个分支。
+fn import_summary(report: &crate::portable::ImportReport) -> String {
+    format!(
+        "已导入配置（{:?}）：新增 {} / 覆盖 {} / 删除 {} 个 Key，密钥 {} 条{}",
+        report.mode,
+        report.keys_added,
+        report.keys_overwritten,
+        report.keys_removed,
+        report.secrets_imported,
+        if report.secrets_pruned > 0 {
+            format!("，清理随 Key 一并移除的旧密钥 {} 条", report.secrets_pruned)
+        } else {
+            String::new()
+        }
+    )
+}
+
 // ==== 更新检查 ====
 
 /// 检查更新的结构化结果（前端徽章 / 设置页共用）。
@@ -1508,5 +1942,321 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- 批 5：自启动 / 对账 / 诊断 / 导入导出 ----
+
+    /// 内存版 [`AutostartToggle`]：记录每一次 `set` 调用，并可注入失败。
+    ///
+    /// 有了它，那套三步顺序与回滚逻辑才第一次可测 —— 真实实现写注册表，
+    /// 拿它做单测等于真去改开发机的系统状态。
+    struct FakeAutostart {
+        enabled: std::cell::Cell<bool>,
+        /// 每次 `set(x)` 都追加 x，用于断言「究竟动了几次、方向如何」。
+        calls: std::cell::RefCell<Vec<bool>>,
+        /// 为真时 `set` 一律失败（模拟注册表被组策略锁定）。
+        set_fails: bool,
+        /// 为真时 `is_enabled` 失败（模拟读注册表失败）。
+        read_fails: bool,
+    }
+
+    impl FakeAutostart {
+        fn new(enabled: bool) -> Self {
+            Self {
+                enabled: std::cell::Cell::new(enabled),
+                calls: std::cell::RefCell::new(Vec::new()),
+                set_fails: false,
+                read_fails: false,
+            }
+        }
+        fn failing_set() -> Self {
+            Self { set_fails: true, ..Self::new(false) }
+        }
+        fn failing_read() -> Self {
+            Self { read_fails: true, ..Self::new(false) }
+        }
+        fn calls(&self) -> Vec<bool> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl AutostartToggle for FakeAutostart {
+        fn is_enabled(&self) -> Result<bool, String> {
+            if self.read_fails {
+                return Err("读注册表失败".into());
+            }
+            Ok(self.enabled.get())
+        }
+        fn set(&self, enable: bool) -> Result<(), String> {
+            self.calls.borrow_mut().push(enable);
+            if self.set_fails {
+                return Err("注册表被组策略锁定".into());
+            }
+            self.enabled.set(enable);
+            Ok(())
+        }
+    }
+
+    /// 系统调用失败时**绝不落盘**：否则留下「配置说开、系统没开」，
+    /// 而用户看设置页是开着的、无从察觉。
+    #[test]
+    fn auto_start_does_not_persist_when_the_system_call_fails() {
+        let (store, dir) = temp_store("autostart_fail");
+        let sys = FakeAutostart::failing_set();
+
+        let err = toggle_auto_start(&store, &sys, true);
+        assert!(err.is_err(), "系统失败必须上抛，不能静默吞掉让用户以为开成了");
+        assert!(
+            err.unwrap_err().to_string().contains("组策略"),
+            "错误信息要带上原始原因，那是用户唯一的线索"
+        );
+        assert!(!store.get_settings().auto_start, "系统没成功就不许落盘");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 成功路径：系统与配置双双落地。
+    #[test]
+    fn auto_start_syncs_system_then_persists() {
+        let (store, dir) = temp_store("autostart_ok");
+        let sys = FakeAutostart::new(false);
+
+        toggle_auto_start(&store, &sys, true).unwrap();
+        assert!(sys.is_enabled().unwrap(), "系统侧要被打开");
+        assert!(store.get_settings().auto_start, "配置侧也要落盘");
+        assert_eq!(sys.calls(), vec![true], "只该动系统一次，没有多余的回滚");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **无条件同步系统**，不因「配置值没变」跳过。
+    ///
+    /// 这条守的是一个真实故障：用户手改过注册表（或清理工具删了启动项）后，
+    /// 配置说 true、系统实际 false。此时点「关」再点「开」——第二次点开时配置值已是 true，
+    /// 若按「没变」跳过就会两边都不动，**开关点不动**、用户完全无从下手。
+    #[test]
+    fn auto_start_always_touches_the_system_even_when_the_flag_is_unchanged() {
+        let (store, dir) = temp_store("autostart_idem");
+        store.set_auto_start_flag(true).unwrap();
+        // 模拟用户手动删掉了启动项：配置 true、系统 false。
+        let sys = FakeAutostart::new(false);
+
+        toggle_auto_start(&store, &sys, true).unwrap();
+
+        assert_eq!(sys.calls(), vec![true], "必须真去动系统，不能因为配置值没变就跳过");
+        assert!(sys.is_enabled().unwrap(), "系统侧要被修回来");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 启动对账：**以配置为准**修系统。配置 false、系统 true → 关掉系统。
+    #[test]
+    fn reconcile_auto_start_pulls_the_system_back_to_the_config() {
+        let (store, dir) = temp_store("autostart_rec");
+        assert!(!store.get_settings().auto_start, "前置：配置默认关");
+        let sys = FakeAutostart::new(true); // 系统里却有启动项（旧版残留 / 手动加的）
+
+        assert_eq!(reconcile_auto_start(&store, &sys), Some(false));
+        assert!(!sys.is_enabled().unwrap(), "系统要被拉回配置的值");
+
+        // 已一致时不动系统（不做无谓的注册表写入）。
+        let sys2 = FakeAutostart::new(false);
+        assert_eq!(reconcile_auto_start(&store, &sys2), None);
+        assert!(sys2.calls().is_empty(), "本来就一致，一次都不该写");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 读系统状态失败时**不阻断启动、也不瞎改**：返回 None 且一次 set 都不发。
+    ///
+    /// 「读不到」不等于「不一致」。此时若按配置强写一遍，遇到注册表被锁的机器会每次启动
+    /// 都尝试失败并刷一条告警，而真实状态谁也不知道。
+    #[test]
+    fn reconcile_auto_start_gives_up_quietly_when_it_cannot_read_the_system() {
+        let (store, dir) = temp_store("autostart_recfail");
+        let sys = FakeAutostart::failing_read();
+
+        assert_eq!(reconcile_auto_start(&store, &sys), None);
+        assert!(sys.calls().is_empty(), "读不到状态就不该动系统");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 主口令对账：**以密钥库为准**修配置（与自启动方向相反）。
+    ///
+    /// 背离的典型成因是搬了另一台机器的 config.json 过来（`secrets.enc` 绑 DPAPI 账户、
+    /// 搬不动）。若反过来以配置为准去改库，就会把用户真实的加密状态改掉。
+    #[test]
+    fn reconcile_master_flag_follows_the_vault_not_the_config() {
+        let (store, dir) = temp_store("master_rec");
+        // 制造背离：配置说开着，而库里其实还是 DPAPI（没有 master 头部）。
+        store.set_master_password_flag(true).unwrap();
+        assert!(!store.secrets.read().is_master_mode(), "前置：库仍是 DPAPI");
+
+        assert_eq!(reconcile_master_password_flag(&store), Some(false));
+        assert!(
+            !store.get_settings().master_password_enabled,
+            "必须按库的真实状态改配置"
+        );
+        // 已一致 → 不再写。
+        assert_eq!(reconcile_master_password_flag(&store), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 诊断报告**绝不能含密钥明文**，且必须自带「包含/不含什么」的声明。
+    ///
+    /// 这是报告能被用户放心发出去的唯一前提。
+    ///
+    /// 判据取的是**真实泄露路径**：转发失败的事件 detail 里带着上游响应体前若干字符，
+    /// 而上游报鉴权失败时把收到的 key 回显在响应体里是很常见的；同理 Key 的名字
+    /// 也可能被用户贴成一串 token。这两处都是自由文本，早先只有「配置」那一段过了脱敏，
+    /// 它们原样进报告。
+    ///
+    /// 反过来说，这条测试**不**用 `config.json` 里的字段做判据：那份文件本就不存
+    /// API key（密钥在 `secrets.enc` 里，报告压根不读它），拿它断言会得到一条假绿的测试。
+    #[test]
+    fn diagnostics_report_never_leaks_a_secret() {
+        let (store, dir) = temp_store("diag");
+        const LEAKED: &str = "sk-upstream-echoed-this-back";
+        let mut k = key(CategoryType::ClaudeCli);
+        k.name = format!("误贴成密钥的名字 {LEAKED}");
+        store.upsert_key(k).unwrap();
+        // 模拟转发失败事件：上游 401 的响应体里回显了我们发过去的 key。
+        store.append_event(
+            CategoryType::ClaudeCli,
+            "error",
+            Some("k1"),
+            &format!("上游 HTTP 401: {{\"error\":\"invalid key {LEAKED}\"}}"),
+        );
+
+        let env = DiagnosticsEnv {
+            app_version: "9.9.9".into(),
+            exe_path: "C:\\test\\synaroute.exe".into(),
+            proxy: vec![(CategoryType::ClaudeCli, true, Some(8787))],
+        };
+        let report = build_diagnostics_report(&store, &env);
+
+        assert!(
+            !report.contains(LEAKED),
+            "报告里出现了密钥明文——这是直接的凭据泄露。报告全文:\n{report}"
+        );
+        assert!(report.contains("sk-***"), "应被替换为掩码而非整段删掉（否则排障丢上下文）");
+        assert!(report.contains("本文件**不**包含"), "必须自带声明，用户才敢发出去");
+        assert!(report.contains("任何 API 密钥明文"));
+        assert!(report.contains("9.9.9") && report.contains("synaroute.exe"), "环境信息要在");
+        // 路径是 MSIX「平行宇宙」问题的关键证据，不能省。
+        assert!(report.contains("配置文件："), "必须打印实际配置路径");
+        assert!(report.contains("running 端口=Some(8787)"), "代理状态要如实反映");
+        assert!(report.contains("上游 HTTP 401"), "脱敏不该把排障信息本身抹掉");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 落盘失败时**把系统改回原状**：否则留下「系统已注册、配置说关」，
+    /// 下次启动的对账会按配置把它关掉 —— 用户点开了、重启后又没了，无从察觉。
+    ///
+    /// 用「把 config.json 变成目录」制造确定性落盘失败（同 store.rs 那批回滚测试的手法）。
+    #[test]
+    fn auto_start_rolls_the_system_back_when_persisting_fails() {
+        let (store, dir) = temp_store("autostart_rollback");
+        let cfg = dir.join("config.json");
+        std::fs::remove_file(&cfg).ok();
+        std::fs::create_dir_all(&cfg).unwrap();
+        let sys = FakeAutostart::new(false);
+
+        let r = toggle_auto_start(&store, &sys, true);
+
+        assert!(r.is_err(), "落盘失败必须如实上报");
+        assert_eq!(
+            sys.calls(),
+            vec![true, false],
+            "先按请求动系统，落盘失败后再改回落盘前的值"
+        );
+        assert!(!sys.is_enabled().unwrap(), "系统侧最终要与配置一致（都是关）");
+        assert!(!store.get_settings().auto_start);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空口令与 `None` 语义**必须一致**：都表示「不含密钥」。
+    ///
+    /// 前端未勾选时可能传空串而非 null。若空串被当成真口令，就会导出一份用 `""`
+    /// 加密的密钥段——等于没加密，而用户以为它是受保护的。
+    #[test]
+    fn empty_password_means_no_secrets_just_like_none() {
+        assert_eq!(effective_password(None), None);
+        assert_eq!(effective_password(Some(&String::new())), None);
+        assert_eq!(
+            effective_password(Some(&"pw".to_string())),
+            Some("pw"),
+            "非空口令要原样透过"
+        );
+    }
+
+    /// 导出事件日志要如实说明**含不含密钥**、以及**跳过了几条**。
+    ///
+    /// `undecryptable` 那部分不是锦上添花：解不出的 Key 是被跳过而非导出失败，
+    /// 不写出来用户会拿到一份「声称含密钥、实际少几条」的文件，
+    /// 到新机器导入后才发现——那时已经离开源机器、无从补救。
+    #[test]
+    fn export_event_states_whether_secrets_are_included_and_what_was_skipped() {
+        let (store, dir) = temp_store("export_evt");
+        let path = dir.join("out.json");
+
+        write_export(&store, &path, b"{}", 2, true).unwrap();
+        let detail = store
+            .list_events(CategoryType::ClaudeCli)
+            .into_iter()
+            .find(|e| e.detail.contains("已导出配置"))
+            .expect("导出要留一条事件")
+            .detail;
+        assert!(detail.contains("含密钥"), "要说明含密钥: {detail}");
+        assert!(detail.contains("2 条密钥解不出已跳过"), "跳过条数必须写出: {detail}");
+        assert!(path.exists(), "文件要真的落盘");
+
+        // 不含密钥 + 无跳过：文案不该带「跳过」尾巴。
+        write_export(&store, &path, b"{}", 0, false).unwrap();
+        let latest = store
+            .list_events(CategoryType::ClaudeCli)
+            .into_iter()
+            .rfind(|e| e.detail.contains("已导出配置"))
+            .unwrap()
+            .detail;
+        assert!(latest.contains("不含密钥"), "{latest}");
+        assert!(!latest.contains("跳过"), "无跳过时不该有这段: {latest}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 导入事件必须写出**清理掉的旧密钥条数**。
+    ///
+    /// 密钥是敏感材料，删了几条应当留痕。这个分支只在 Replace 模式下非零，
+    /// 恰恰是改文案时最容易被顺手删掉的那一个。
+    #[test]
+    fn import_summary_records_pruned_secrets() {
+        use crate::portable::{ImportMode, ImportReport};
+        let mut report = ImportReport {
+            mode: ImportMode::Replace,
+            keys_added: 3,
+            keys_overwritten: 1,
+            keys_removed: 2,
+            vendors_imported: 0,
+            brain_imported: 0,
+            secrets_imported: 3,
+            secrets_pruned: 2,
+            backup_path: Some("config.json.bak".into()),
+            secrets_backup_path: Some("secrets.enc.bak".into()),
+            warnings: vec![],
+        };
+        let s = import_summary(&report);
+        assert!(s.contains("清理随 Key 一并移除的旧密钥 2 条"), "删密钥必须留痕: {s}");
+        assert!(s.contains("新增 3") && s.contains("覆盖 1") && s.contains("删除 2"));
+
+        report.secrets_pruned = 0;
+        assert!(
+            !import_summary(&report).contains("清理"),
+            "没清理时不该凭空写一句"
+        );
     }
 }
