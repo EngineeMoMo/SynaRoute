@@ -50,8 +50,7 @@ fn list_keys(state: tauri::State<AppState>, category_id: CategoryType) -> Vec<Pr
 
 #[tauri::command]
 fn upsert_key(state: tauri::State<AppState>, key: ProviderKey) -> AppResult<ProviderKey> {
-    service::reject_desktop_key_with_unusable_model_names(&key)?;
-    state.store.upsert_key(key)
+    service::save_key(&state.store, key)
 }
 
 
@@ -85,30 +84,15 @@ fn reveal_secret(state: tauri::State<AppState>, key_id: String) -> AppResult<Opt
 
 #[tauri::command]
 fn save_secret(state: tauri::State<AppState>, key_id: String, secret: String) -> AppResult<()> {
-    // 顺序很重要：先把密钥写进加密库，成功后再置 has_secret=true 落盘 config。
-    // 反过来（先标记后写密钥）若写密钥失败，会留下「config 记有密钥、库里实际没有」的
-    // 不一致：UI 依据 has_secret 显示已配置，但 reveal_secret/fetch_models/代理转发取不到
-    // 密钥，报「未配置密钥」，用户难察觉。先写密钥则失败时直接返回 Err，标记不会被写脏。
-    state.store.secrets.write().set(&key_id, &secret)?;
-    if let Some(mut k) = state.store.get_key(&key_id) {
-        k.has_secret = true;
-        state.store.upsert_key(k)?;
-    }
-    Ok(())
+    service::save_secret(&state.store, &key_id, &secret)
 }
 
 /// 启用/停用某条 Key。
 ///
-/// **启用时顺带探测一次**（2026-08-02 加）：定时健康检查只扫**启用**的 Key，
-/// 故一条 Key 在停用期间的 `status` 会一直冻结在它上次被探测时的结论上。
-/// 真机实测过这个坑：一条禁用 Key 的卡片显示「探测不可达 · 10 天前」，
-/// 而那家上游早就恢复了、真实转发也能成功 —— 用户以为「现在就是坏的」，
-/// 实际只是没人去刷新过那个陈旧快照。
-///
-/// 「刚把它启用」正是最需要知道它当下可用性的时刻，故在这里补一次探测。
-/// 探测**异步跑、不阻塞返回**：它最长可达 8s（`fast_timeout`），
-/// 若同步等待，用户点一下开关会看到界面明显卡顿。
-/// 探测本身只写 status/latency、绝不碰熔断字段（见 `health::check_one`）。
+/// 编排（含「启用时为何要补一次探测」的完整理由）在 [`service::toggle_key`]。
+/// 这里只负责它无法做的那件事：用 `AppHandle` 取 store 的 `Arc` 送进 `spawn`
+/// （不能把 `tauri::State` 跨 await 送进去），并让探测**异步跑、不阻塞返回**
+/// —— 它最长可达 8s，同步等待会让用户点一下开关就看到界面明显卡顿。
 #[tauri::command]
 fn toggle_key(
     app: tauri::AppHandle,
@@ -116,9 +100,7 @@ fn toggle_key(
     key_id: String,
     enabled: bool,
 ) -> AppResult<()> {
-    state.store.toggle_key(&key_id, enabled)?;
-    if enabled {
-        // 用 AppHandle 取 store 的 Arc（不能把 tauri::State 跨 await 送进 spawn）。
+    if service::toggle_key(&state.store, &key_id, enabled)? {
         let store = app.state::<AppState>().store.clone();
         tauri::async_runtime::spawn(async move {
             health::check_one(&store, &key_id).await;
@@ -159,28 +141,16 @@ fn lock_master_password(state: tauri::State<AppState>) -> AppResult<()> {
     Ok(())
 }
 
-/// 启用主口令：把库里全部 DPAPI 密文改用口令派生密钥重新封装。
-///
-/// 返回迁移的密钥条数。**先整库解密成功、备份原库，才写盘**（见
-/// [`secret::SecretStore::enable_master_password`] 的三条硬要求）。
-///
-/// settings 镜像在库迁移**成功之后**才更新：反过来会出现「配置说开着、库里其实还是
-/// DPAPI」的死局（下次启动按配置要求解锁，而库里没有 master 头部，解不了也用不了）。
+/// 启用主口令。编排（含「settings 镜像为何必须后写」）在 [`service::enable_master_password`]。
 #[tauri::command]
 fn enable_master_password(state: tauri::State<AppState>, password: String) -> AppResult<usize> {
-    let migrated = state.store.secrets.write().enable_master_password(&password)?;
-    service::sync_master_flag(&state.store, true);
-    tracing::info!("已启用主口令模式，迁移 {migrated} 条密钥");
-    Ok(migrated)
+    service::enable_master_password(&state.store, &password)
 }
 
-/// 关闭主口令：用口令解出全部密钥、改回 DPAPI 加密。需要输入当前主口令确认。
+/// 关闭主口令：改回 DPAPI。需要输入当前主口令确认。
 #[tauri::command]
 fn disable_master_password(state: tauri::State<AppState>, password: String) -> AppResult<usize> {
-    let migrated = state.store.secrets.write().disable_master_password(&password)?;
-    service::sync_master_flag(&state.store, false);
-    tracing::info!("已关闭主口令模式，迁移 {migrated} 条密钥回 DPAPI");
-    Ok(migrated)
+    service::disable_master_password(&state.store, &password)
 }
 
 /// 修改主口令（旧口令验证 + 全库用新口令重新封装，含新盐与新校验串）。
@@ -202,9 +172,9 @@ fn change_master_password(
 
 /// 把某 Key 设为该分类的主 Key（优先级 0）。
 ///
-/// 重排规则在 [`Store::set_primary_key`] 里（单一事实来源）。前端原先自己算重排再逐个
-/// `upsertKey`，现在改调本命令 —— 因为托盘也要这个功能（FR-022），两处各写一份必然漂移。
-/// 命令返回是否真的改了（已是主则 `false`），前端可据此决定要不要刷新与提示。
+/// 编排在 [`service::set_primary_key`]（重排规则、日志、幂等语义都在那里）。
+/// 这里只补它做不到的那件事：托盘的「主 Key」子菜单要跟着更新勾选
+/// —— 无论这次是从界面还是从托盘触发的。
 #[tauri::command]
 fn set_primary_key(
     app: tauri::AppHandle,
@@ -212,47 +182,27 @@ fn set_primary_key(
     category_id: CategoryType,
     key_id: String,
 ) -> AppResult<bool> {
-    let changed = state.store.set_primary_key(category_id, &key_id)?;
+    let changed = service::set_primary_key(
+        &state.store,
+        category_id,
+        &key_id,
+        service::PrimarySource::Ui,
+    )?;
     if changed {
-        let name = state
-            .store
-            .get_key(&key_id)
-            .map(|k| k.name)
-            .unwrap_or_else(|| key_id.clone());
-        state.store.append_event(
-            category_id,
-            "config",
-            Some(&key_id),
-            &format!("设为主 Key：{name}（优先级 0，其余顺延）"),
-        );
-        // 托盘的「主 Key」子菜单要跟着更新勾选（无论这次是从界面还是从托盘触发的）。
         let _ = rebuild_tray(&app);
     }
     Ok(changed)
 }
 
 /// 把 Max Tokens 一次应用到该分类下全部 Key（FR-005 批量设置）。
-///
-/// 规则在 [`Store::apply_max_tokens_to_category`] 里（单一事实来源）。返回实际改动条数，
-/// 前端据此如实提示「已应用到 N 条」——全都已是该值时返回 0，不谎报「已保存」。
+/// 编排（含「为何返回实际改动条数」）在 [`service::apply_max_tokens_to_category`]。
 #[tauri::command]
 fn apply_max_tokens_to_category(
     state: tauri::State<AppState>,
     category_id: CategoryType,
     max_tokens: u32,
 ) -> AppResult<usize> {
-    let changed = state
-        .store
-        .apply_max_tokens_to_category(category_id, max_tokens)?;
-    if changed > 0 {
-        state.store.append_event(
-            category_id,
-            "config",
-            None,
-            &format!("批量设置 Max Tokens = {max_tokens}（本分类 {changed} 条 Key 已更新）"),
-        );
-    }
-    Ok(changed)
+    service::apply_max_tokens_to_category(&state.store, category_id, max_tokens)
 }
 
 // ============ 从 cc-switch 导入历史 Key ============
@@ -281,64 +231,18 @@ async fn fetch_models(
     state: tauri::State<'_, AppState>,
     key_id: String,
 ) -> AppResult<Vec<ModelInfo>> {
-    let key = state
-        .store
-        .get_key(&key_id)
-        .ok_or_else(|| error::AppError::NotFound(key_id.clone()))?;
-    let secret = state
-        .store
-        .secrets
-        .read()
-        .get(&key_id)?
-        .ok_or_else(|| error::AppError::Invalid("未配置密钥".into()))?;
-
-    let names = upstream::fetch_models(&key, &secret).await?;
-    let now = chrono::Utc::now().timestamp_millis();
-    let old_ctx: std::collections::HashMap<String, Option<u32>> = key
-        .models
-        .iter()
-        .map(|m| (m.real_name.clone(), m.context_window))
-        .collect();
-    let models: Vec<ModelInfo> = names
-        .into_iter()
-        .map(|n| {
-            let cw = old_ctx.get(&n).copied().flatten();
-            ModelInfo { real_name: n, source: "fetched".into(), fetched_at: Some(now), context_window: cw }
-        })
-        .collect();
-    state.store.set_models(&key_id, models.clone())?;
-    Ok(models)
+    service::fetch_models_for_key(&state.store, &key_id).await
 }
 
-/// 用编辑器里正在填写的 Key 草稿（可能尚未保存）直接探测模型列表。
-/// 新增 Key 时前端还没有真实 id（是临时 `k_new`），无法走 store 查找，
-/// 因此改为直接传入 key 对象 + secret。secret 为空时（编辑已有 Key 未重填密钥）
-/// 回退到 store 中已存的密钥。不落盘，模型随 save 一并持久化。
+/// 用编辑器里正在填写的 Key 草稿（可能尚未保存）直接探测模型列表，不落盘。
+/// 编排在 [`service::fetch_models_for_draft`]。
 #[tauri::command]
 async fn fetch_models_draft(
     state: tauri::State<'_, AppState>,
     key: ProviderKey,
     secret: Option<String>,
 ) -> AppResult<Vec<ModelInfo>> {
-    // 统一成 Zeroizing：两个来源（前端传入的草稿密钥 / 库里已存的）都是明文，
-    // 都该在用完后清零，没理由只保护其中一个。
-    let secret: zeroize::Zeroizing<String> = match secret {
-        Some(s) if !s.is_empty() => zeroize::Zeroizing::new(s),
-        _ => state
-            .store
-            .secrets
-            .read()
-            .get(&key.id)?
-            .ok_or_else(|| error::AppError::Invalid("未配置密钥".into()))?,
-    };
-
-    let names = upstream::fetch_models(&key, &secret).await?;
-    let now = chrono::Utc::now().timestamp_millis();
-    let models: Vec<ModelInfo> = names
-        .into_iter()
-        .map(|n| ModelInfo { real_name: n, source: "fetched".into(), fetched_at: Some(now), context_window: None })
-        .collect();
-    Ok(models)
+    service::fetch_models_for_draft(&state.store, &key, secret).await
 }
 
 #[tauri::command]
@@ -1446,25 +1350,11 @@ fn count_orphan_secrets(state: tauri::State<AppState>) -> usize {
     state.store.count_orphan_secrets()
 }
 
-/// 清理孤儿密钥（P2-3）。**破坏性操作**：先备份密钥库，再删。
-///
-/// 返回被清理的条数。锁定态下 `Store::prune_orphan_secrets` 会直接返回 0（不误删），
-/// 故这里无需另做判断。
+/// 清理孤儿密钥（P2-3）。**破坏性操作**：编排（先备份再删、备份失败即放弃）在
+/// [`service::prune_orphan_secrets`]。
 #[tauri::command]
 fn prune_orphan_secrets(state: tauri::State<AppState>) -> AppResult<usize> {
-    // 删密钥前先备份整库：这是唯一能挽回误删的手段（硬规则「改配置前必备份」）。
-    // 备份失败即放弃清理——孤儿残留是无害的，为整洁去冒「删了没法恢复」的风险不值。
-    state.store.secrets.read().backup_before_rewrite("prune-orphans")?;
-    let n = state.store.prune_orphan_secrets();
-    if n > 0 {
-        state.store.append_event(
-            CategoryType::ClaudeCli,
-            "config",
-            None,
-            &format!("已清理 {n} 条孤儿密钥（配置中已无对应 Key），清理前已备份密钥库"),
-        );
-    }
-    Ok(n)
+    service::prune_orphan_secrets(&state.store)
 }
 
 // ============ 厂商预设命令 ============
@@ -2308,19 +2198,9 @@ fn handle_tray_set_primary(app: &tauri::AppHandle, id: &str) {
     let Some(category) = parse_tray_category(cat_str) else { return };
 
     let state = app.state::<AppState>();
-    match state.store.set_primary_key(category, key_id) {
+    match service::set_primary_key(&state.store, category, key_id, service::PrimarySource::Tray) {
+        // 改成功：刷托盘让勾选跟上。
         Ok(true) => {
-            let name = state
-                .store
-                .get_key(key_id)
-                .map(|k| k.name)
-                .unwrap_or_else(|| key_id.to_string());
-            state.store.append_event(
-                category,
-                "config",
-                Some(key_id),
-                &format!("托盘设为主 Key：{name}（优先级 0，其余顺延）"),
-            );
             let _ = rebuild_tray(app);
         }
         // 已经是主：无动作、不记日志（用户点了当前项，属正常操作，不该刷日志）。
