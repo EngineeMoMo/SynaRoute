@@ -2003,15 +2003,6 @@ const TRAY_PROXY_PREFIX: &str = "proxy::";
 /// （`Store::set_primary_key` 对「id 存在但分类不符」会拒绝，见其测试）。
 const TRAY_PRIMARY_PREFIX: &str = "primary::";
 
-/// 托盘菜单里各分类的显示名。用中文短名而非 `as_str()` 的 kebab id——托盘是给人看的。
-fn tray_category_label(c: CategoryType) -> &'static str {
-    match c {
-        CategoryType::ClaudeCli => "Claude CLI",
-        CategoryType::ClaudeDesktop => "Claude 桌面端",
-        CategoryType::Codex => "Codex",
-    }
-}
-
 /// 构建托盘菜单：显示主窗口 +（可选）Codex 模型快切子菜单 + 退出。
 /// 候选与 /v1/models、应用内下拉同源（discoverable_models 交集口径），当前选中项打勾。
 /// 借鉴 cc-switch 托盘切换范式：右键托盘即可切 Codex 当前对外模型，免打开主窗口。
@@ -2036,8 +2027,8 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<ta
         let running = state.proxy.is_running(c);
         // 标签带端口：用户一眼看到「在哪个端口上跑」，省去打开主窗口核对。
         let label = match state.proxy.port_of(c) {
-            Some(p) if running => format!("{} · {p}", tray_category_label(c)),
-            _ => tray_category_label(c).to_string(),
+            Some(p) if running => format!("{} · {p}", c.display_name()),
+            _ => c.display_name().to_string(),
         };
         let item = CheckMenuItem::with_id(
             app,
@@ -2062,7 +2053,7 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<ta
             continue;
         }
         any_key = true;
-        let sub = Submenu::new(app, tray_category_label(c), true)?;
+        let sub = Submenu::new(app, c.display_name(), true)?;
         for (i, k) in keys.iter().enumerate() {
             let item = CheckMenuItem::with_id(
                 app,

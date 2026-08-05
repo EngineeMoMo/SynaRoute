@@ -114,12 +114,7 @@ fn norm_url(s: &str) -> String {
 
 /// cc-switch 的 app_type → SynaRoute 分类。gemini 等未支持端返回 None。
 fn map_category(app_type: &str) -> Option<CategoryType> {
-    match app_type {
-        "claude" => Some(CategoryType::ClaudeCli),
-        "claude-desktop" => Some(CategoryType::ClaudeDesktop),
-        "codex" => Some(CategoryType::Codex),
-        _ => None,
-    }
+    CategoryType::ALL.into_iter().find(|c| c.meta().ccswitch_app_type == app_type)
 }
 
 /// providers 表里的一行原始数据。

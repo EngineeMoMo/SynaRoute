@@ -14,6 +14,66 @@ pub enum CategoryType {
     Codex,
 }
 
+/// 一个分类的**全部固有属性**（P2-8：查表化）。
+///
+/// 建这张表是为了消灭「同一个属性散落在 8 处 match 里」的局面。散落的代价不是难看，
+/// 而是**加第 4 个分类时漏改一处只会静默走错**：漏了端口就撞端口、漏了协议就发错格式、
+/// 漏了模型名过滤就让桌面端模型选择器变空 —— 每一种都不报错，只在真机上表现为
+/// 「某个分类莫名其妙不好使」。
+///
+/// 表建好之后，`meta()` 是**全仓唯一**的分类属性 match，禁止 `_ =>` 兜底：
+/// 新增分类时编译器就是清单，逼你逐字段回答。这与 `Protocol` 的能力方法是同一条纪律。
+#[derive(Debug, Clone, Copy)]
+pub struct CategoryMeta {
+    pub id: CategoryType,
+    /// 落盘与 IPC 上的字符串形态。**改它等于改磁盘格式**，老配置会读不出来。
+    pub wire_id: &'static str,
+    /// 界面与托盘上的显示名
+    pub display_name: &'static str,
+    /// 代理的默认首选端口。选用冷门段避开常见软件占用（8080/8888/3000/5173/7890/9527…），
+    /// 且三分类连续好记
+    pub default_port: u16,
+    /// 是否参与「三档（快/中/强 = haiku/sonnet/opus）」改写。
+    /// Codex 为 false：它发 GPT 名或应用内下拉覆盖的对外名，落到三档会被误改写到无关档位。
+    pub tier_rewrite: bool,
+    /// 对外模型名是否受**硬过滤**约束。仅 Claude 桌面端为 true ——
+    /// 不合规的名字会被它从模型列表里静默过滤掉，全被滤掉时选择器为空、
+    /// 打开会话报 ModelsNotDiscoveredError（判据取自 app.asar）
+    pub strict_model_id: bool,
+    /// cc-switch 库里对应的 appType
+    pub ccswitch_app_type: &'static str,
+}
+
+const ROW_CLAUDE_CLI: CategoryMeta = CategoryMeta {
+    id: CategoryType::ClaudeCli,
+    wire_id: "claude-cli",
+    display_name: "Claude CLI",
+    default_port: 47100,
+    tier_rewrite: true,
+    strict_model_id: false,
+    ccswitch_app_type: "claude",
+};
+
+const ROW_CLAUDE_DESKTOP: CategoryMeta = CategoryMeta {
+    id: CategoryType::ClaudeDesktop,
+    wire_id: "claude-desktop",
+    display_name: "Claude 桌面端",
+    default_port: 47102,
+    tier_rewrite: true,
+    strict_model_id: true,
+    ccswitch_app_type: "claude-desktop",
+};
+
+const ROW_CODEX: CategoryMeta = CategoryMeta {
+    id: CategoryType::Codex,
+    wire_id: "codex",
+    display_name: "Codex",
+    default_port: 47101,
+    tier_rewrite: false,
+    strict_model_id: false,
+    ccswitch_app_type: "codex",
+};
+
 impl CategoryType {
     /// 全部分类（遍历用，如聚合 MCP 客户端超时联动需取各分类 total_timeout_ms 的最大值）。
     pub const ALL: [CategoryType; 3] = [
@@ -22,22 +82,31 @@ impl CategoryType {
         CategoryType::Codex,
     ];
 
-    pub fn as_str(&self) -> &'static str {
+    /// 本分类的属性行。**全仓唯一的分类属性 match**，禁止 `_ =>` 兜底。
+    ///
+    /// 返回 `&'static` 走的是 rvalue static promotion：`CategoryMeta` 无 Drop、
+    /// 无内部可变性，可安全提升。刻意不写成 `&TABLE[i]` —— 那种形式的常量提升
+    /// 没有语言保证。
+    pub fn meta(self) -> &'static CategoryMeta {
         match self {
-            CategoryType::ClaudeCli => "claude-cli",
-            CategoryType::ClaudeDesktop => "claude-desktop",
-            CategoryType::Codex => "codex",
+            CategoryType::ClaudeCli => &ROW_CLAUDE_CLI,
+            CategoryType::ClaudeDesktop => &ROW_CLAUDE_DESKTOP,
+            CategoryType::Codex => &ROW_CODEX,
         }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        self.meta().wire_id
+    }
+
+    /// 界面与托盘显示名
+    pub fn display_name(&self) -> &'static str {
+        self.meta().display_name
     }
 
     /// 从字符串解析分类（MCP 工具参数用）。未知值返回 None。
     pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "claude-cli" => Some(CategoryType::ClaudeCli),
-            "claude-desktop" => Some(CategoryType::ClaudeDesktop),
-            "codex" => Some(CategoryType::Codex),
-            _ => None,
-        }
+        Self::ALL.iter().map(|c| c.meta()).find(|m| m.wire_id == s).map(|m| m.id)
     }
 }
 
@@ -634,7 +703,7 @@ pub fn desktop_model_name_issues(outward: &[String]) -> Vec<DesktopModelNameIssu
 /// （`lib.rs` 的 `reject_desktop_key_with_unusable_model_names`）看的是同一个集合。
 /// 两边若各自 filter，迟早会出现「界面说没问题、保存却被拒」这种自相矛盾。
 pub fn desktop_model_name_report(key: &ProviderKey) -> DesktopModelNameReport {
-    if key.category_id != CategoryType::ClaudeDesktop {
+    if !key.category_id.meta().strict_model_id {
         return DesktopModelNameReport { applicable: false, total: 0, issues: Vec::new() };
     }
     let outward = key.serviceable_models();
@@ -798,7 +867,7 @@ impl ProviderKey {
         // 覆盖的对外名（可能含 claude-*opus* 之类），一旦落到三档会被误改写到无关档位真实名
         // （如 claude-opus-4-8 → deepseek-reasoner）。故 Codex 分类一律不走三档，从后端根治
         // 误改写——不依赖前端保存守卫（旧数据可能仍带三档字段）。
-        if matches!(self.category_id, CategoryType::Codex) {
+        if !self.category_id.meta().tier_rewrite {
             return None;
         }
         let lower = requested_model.to_ascii_lowercase();
@@ -1320,7 +1389,7 @@ pub struct AppSettings {
     /// （Codex/Claude）只在自身启动时读一次 config，不追踪端口变化 → 重启后客户端仍打旧端口、
     /// 连不上（error sending request）。改为「粘滞固定端口」：各分类有稳定默认端口，
     /// config.toml 写一次即长期有效；端口被占时在 [port, port+FALLBACK] 内向上兜底并写回此处
-    /// 作为下次首选（与 mcp_port 同一粘滞策略）。缺省时用 default_proxy_port(category)。
+    /// 作为下次首选（与 mcp_port 同一粘滞策略）。缺省时用 CategoryType::meta().default_port。
     #[serde(default)]
     pub proxy_ports: std::collections::HashMap<String, u16>,
     /// 首启向导是否已完成（UX#1）。**三态**：
@@ -1337,17 +1406,6 @@ pub struct AppSettings {
     /// 的陈旧快照覆盖（与 `mcp_*` / `active_models` 同一保全策略）。
     #[serde(default)]
     pub onboarding_done: Option<bool>,
-}
-
-/// 各分类代理的默认首选端口。选用冷门段避开常见软件占用
-/// （避开 8080/8888/3000/5173/7890/9527 等），且三分类连续好记。
-pub fn default_proxy_port(category: &str) -> u16 {
-    match category {
-        "claude-cli" => 47100,
-        "codex" => 47101,
-        "claude-desktop" => 47102,
-        _ => 47103,
-    }
 }
 
 fn default_true() -> bool {
@@ -1440,6 +1498,41 @@ pub struct AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 表里的 wire_id 必须与 serde 的 rename 完全一致（P2-8）。
+    ///
+    /// 这两处是**两套独立的字符串**：serde 的 rename 决定磁盘与 IPC 上的形态，
+    /// 表里的 wire_id 决定 as_str()/from_str() 的行为。它们分叉不会编译失败，
+    /// 只会让「配置文件里写 claude-cli，代码里却认 claude_cli」这类问题在运行时才炸。
+    #[test]
+    fn category_wire_id_matches_serde_representation() {
+        for c in CategoryType::ALL {
+            let json = serde_json::to_string(&c).unwrap();
+            let expect = format!("\"{}\"", c.meta().wire_id);
+            assert_eq!(json, expect, "{c:?} 的 serde 形态与表里的 wire_id 不一致");
+            assert_eq!(CategoryType::from_str(c.meta().wire_id), Some(c), "from_str 回不去");
+        }
+    }
+
+    /// 三个分类的默认端口必须互不相同，否则两个代理会撞端口、后起的那个起不来。
+    #[test]
+    fn category_default_ports_are_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for c in CategoryType::ALL {
+            assert!(seen.insert(c.meta().default_port), "{c:?} 的默认端口与别的分类撞了");
+        }
+    }
+
+    /// ALL 必须覆盖全部变体：漏一个会让「遍历所有分类」的逻辑静默漏掉它
+    /// （表现为某个分类的代理不会随应用启动、托盘菜单里少一项）。
+    #[test]
+    fn category_all_covers_every_variant() {
+        assert_eq!(CategoryType::ALL.len(), 3);
+        for c in CategoryType::ALL {
+            assert_eq!(c.meta().id, c, "表行的 id 字段与它所属的分类不一致");
+        }
+    }
+
 
     fn model(name: &str) -> ModelInfo {
         ModelInfo {

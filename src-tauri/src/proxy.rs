@@ -243,7 +243,7 @@ impl ProxyManager {
         let lan = settings.lan_exposure;
         let host = if lan { [0, 0, 0, 0] } else { [127, 0, 0, 1] };
 
-        // 粘滞固定端口：首选端口取配置里该分类的值（缺省用 default_proxy_port）。
+        // 粘滞固定端口：首选端口取配置里该分类的值（缺省用分类表里的 default_port）。
         // 从首选端口起在 [preferred, preferred+FALLBACK_RANGE] 内逐个尝试，绑上即用；
         // 全被占才报错提示改端口。避免早期「bind 0 随机端口」导致每次重启端口漂移、
         // 客户端追不上（config 只在客户端启动时读一次）。
@@ -251,7 +251,7 @@ impl ProxyManager {
             .proxy_ports
             .get(category.as_str())
             .copied()
-            .unwrap_or_else(|| crate::model::default_proxy_port(category.as_str()));
+            .unwrap_or(category.meta().default_port);
         let end = preferred.saturating_add(PROXY_PORT_FALLBACK_RANGE);
         let mut listener = None;
         let mut last_err = String::new();
