@@ -311,9 +311,9 @@ fn stop_proxy(
 }
 
 /// 设置某分类代理的首选监听端口（粘滞固定端口）。
-/// 持久化新端口 → 停当前代理 → 用新端口重启 → 重写该分类客户端 config（指向新端口）。
-/// 端口是启动时绑定的，故改端口必须重启代理才生效；重写 config 让客户端下次读到新端口。
-/// 客户端（Codex/Claude）需重启才会重读 config —— 但因端口从此固定，仅此一次。
+/// 编排（落盘 → 重启 → 重写客户端 config，以及为何用真实绑定端口）在
+/// [`service::set_proxy_port`]。这里只补它做不到的：托盘菜单里那条「代理 · <端口>」
+/// 标签要跟着更新。
 #[tauri::command]
 async fn set_proxy_port(
     app: tauri::AppHandle,
@@ -321,36 +321,7 @@ async fn set_proxy_port(
     category_id: CategoryType,
     port: u16,
 ) -> AppResult<ProxyState> {
-    // 先落盘新首选端口，再重启代理使其按新端口绑定。
-    state.store.set_proxy_port(category_id, port)?;
-    let was_running = state.proxy.is_running(category_id);
-    state.proxy.stop(category_id);
-    let bound = state.proxy.start(category_id).await?;
-    // 重写该分类客户端 config，指向实际绑定端口（可能因占用回退，用真实值）。
-    let endpoint = format!("http://127.0.0.1:{bound}");
-    // 模型列表必须与 apply_tool_config、GET /v1/models 完全同源——多 Key 取交集
-    // （proxy::discoverable_models），而非主 Key 的 serviceable_models() 超集。否则改端口会把
-    // 桌面端 gateway 档的 inferenceModels 从接入时的安全交集重写回超集，故障转移到备用 Key 后
-    // 选中备用 Key 无法服务的模型必然 404（与 apply_tool_config 的修复自相矛盾）。
-    let keys = state.store.enabled_keys_sorted(category_id);
-    let models = crate::proxy::discoverable_models(&keys);
-    if let Err(e) = tools::apply(category_id, &endpoint, &models, &keys) {
-        state.store.append_event(
-            category_id,
-            "error",
-            None,
-            &format!("改端口后重写客户端配置失败: {e}"),
-        );
-    } else {
-        state.store.append_event(
-            category_id,
-            "config",
-            None,
-            &format!("代理端口已改为 {bound}，已重写客户端配置（客户端需重启读取新端口）"),
-        );
-    }
-    let _ = was_running;
-    // 改端口会 stop→start，托盘菜单里那条「代理 · <端口>」标签要跟着更新。
+    let bound = service::set_proxy_port(&state.store, &state.proxy, category_id, port).await?;
     let _ = rebuild_tray(&app);
     Ok(ProxyState {
         category_id,
@@ -366,62 +337,7 @@ async fn apply_tool_config(
     state: tauri::State<'_, AppState>,
     category_id: CategoryType,
 ) -> AppResult<String> {
-    apply_tool_config_for(&state.store, &state.proxy, category_id).await
-}
-
-/// 接入写盘的实际逻辑，供 IPC 命令与**托盘的代理开关**共用。
-///
-/// 为什么要抽出来：托盘启停代理必须与界面按钮语义完全一致——起代理即写工具配置、
-/// 停代理即还原。若托盘只 `proxy.start()` 不写 config，客户端读到的仍是官方端点，
-/// 用户会看到「托盘显示已启动，但 Claude/Codex 根本没走代理」。
-///
-/// 收 `Arc` 而非 `tauri::State`：托盘的菜单事件回调是同步闭包，要在 `async_runtime::spawn`
-/// 里跨 await 使用，`State` 借用 `AppHandle` 无法跨过去。
-async fn apply_tool_config_for(
-    store: &Arc<Store>,
-    proxy: &Arc<ProxyManager>,
-    category_id: CategoryType,
-) -> AppResult<String> {
-    // 确保代理已启动
-    let port = proxy.start(category_id).await?;
-    let endpoint = format!("http://127.0.0.1:{port}");
-    // 可服务对外名列表（三端语义不同，禁止混写）：
-    // - Claude CLI：取首个写 env.ANTHROPIC_MODEL + 顶层 model（对外名；策略 A 不写 DEFAULT_*）
-    // - Codex：取首个写 config.toml 的 model（OpenAI 形态，无 ANTHROPIC_*）
-    // - 桌面端：整份写进 gateway 档的 inferenceModels（3p 部署模式，见 tools::apply_claude_desktop）
-    //
-    // 口径必须与 GET /v1/models 完全一致 —— 用 proxy::discoverable_models（多 Key 取交集），
-    // 而非主 Key 的 serviceable_models()：否则桌面端选择器会列出备用 Key 无法服务的对外名，
-    // 故障转移到备用 Key 后该模型必然 404。
-    let keys = store.enabled_keys_sorted(category_id);
-    let models = crate::proxy::discoverable_models(&keys);
-    let msg = tools::apply(category_id, &endpoint, &models, &keys)?;
-    store.append_event(category_id, "config", None, &format!("写入工具配置: {endpoint}"));
-    // 桌面端不接受的对外名另记一条 error 事件：接入弹窗一关就没了，而这个问题的症状
-    // （模型选择器为空 / ModelsNotDiscoveredError）往下要排查很久，得在运行日志里留痕。
-    // 用 error 而非新增 warn kind：前端 LogsPage 的分组映射是穷举的，且这条本质是「配置不可用」。
-    if category_id == CategoryType::ClaudeDesktop {
-        let bad = service::desktop_unacceptable_models(&models);
-        if !bad.is_empty() {
-            store.append_event(
-                category_id,
-                "error",
-                None,
-                &format!(
-                    "{} 个对外模型名不被 Claude 桌面端接受（{}）：桌面端会过滤掉它们{}。\
-                     请在「模型映射」里改成含 claude/opus/sonnet/haiku 的对外名。",
-                    bad.len(),
-                    bad.join("、"),
-                    if bad.len() == models.len() {
-                        "，模型选择器将为空、打开会话报 ModelsNotDiscoveredError"
-                    } else {
-                        ""
-                    }
-                ),
-            );
-        }
-    }
-    Ok(msg)
+    service::apply_tool_config(&state.store, &state.proxy, category_id).await
 }
 
 /// 只读预览：当前分类对应工具的配置路径 + 磁盘原文（token 脱敏）。
@@ -1872,8 +1788,9 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<ta
     // Codex 模型快切子菜单（开关开启时）：列出 Codex 启用 Key 可服务模型的交集，当前项打勾，
     // 末尾附「跟随客户端（透传）」。关闭开关则托盘只留显示/退出，不构建此段。
     if settings.tray_model_switch_enabled {
-        let candidates = state.store.enabled_keys_sorted(CategoryType::Codex);
-        let models = proxy::discoverable_models(&candidates);
+        // 候选与接入写盘、GET /v1/models 同源（交集口径，见 service::models_for_apply）：
+        // 托盘若自己算一份，就会出现「托盘能选的模型接入时没写进去」。
+        let models = service::models_for_apply(&state.store, CategoryType::Codex);
         let active = settings
             .active_models
             .get(&CategoryType::Codex)
@@ -2144,7 +2061,7 @@ fn parse_tray_category(rest: &str) -> Option<CategoryType> {
 /// 托盘「代理」项被点击：切换该分类代理的启停。
 ///
 /// **语义必须与界面按钮一致**，否则会造出「托盘说在跑、客户端却没走代理」的错觉：
-/// - 启动 = `apply_tool_config_for`（起代理 **并** 写客户端配置），等价于前端 `startProxy`
+/// - 启动 = [`service::apply_tool_config`]（起代理 **并** 写客户端配置），等价于前端 `startProxy`
 /// - 停止 = `proxy.stop` + `tools::restore`（还原客户端配置），等价于前端 `stopProxy`
 ///
 /// 全程 best-effort 记事件：托盘操作没有可回显的 UI，出错只能落运行日志，
@@ -2179,7 +2096,7 @@ fn handle_tray_proxy_toggle(app: &tauri::AppHandle, id: &str) {
 
     // 启动：菜单事件回调是同步的，而起代理是 async，故丢到 Tauri 托管运行时上跑。
     tauri::async_runtime::spawn(async move {
-        match apply_tool_config_for(&store, &proxy, category).await {
+        match service::apply_tool_config(&store, &proxy, category).await {
             Ok(_) => store.append_event(category, "config", None, "托盘启动代理并写入工具配置"),
             Err(e) => store.append_event(category, "error", None, &format!("托盘启动代理失败: {e}")),
         }

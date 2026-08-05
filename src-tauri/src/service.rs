@@ -30,7 +30,142 @@
 
 use crate::error::{AppError, AppResult};
 use crate::model::*;
+use crate::proxy::ProxyManager;
 use crate::store::Store;
+use std::sync::Arc;
+
+// ==== 代理与工具接入 ====
+
+/// 写进客户端配置的**对外模型名**列表。
+///
+/// 口径必须与 `GET /v1/models`、应用内模型下拉**完全一致**：都用
+/// [`crate::proxy::discoverable_models`]（多 Key 取**交集**），而非主 Key 的
+/// `serviceable_models()`（那是超集）。
+///
+/// 为什么这一条值得单独抽出来：它有三个调用点（接入、改端口后重写、托盘模型子菜单），
+/// 历史上其中一个用了超集口径，症状是桌面端模型选择器列出备用 Key 无法服务的名字，
+/// 故障转移到备用 Key 后那个模型必然 404。三处各写一遍就迟早再漂移一次。
+pub(crate) fn models_for_apply(store: &Store, category: CategoryType) -> Vec<String> {
+    crate::proxy::discoverable_models(&store.enabled_keys_sorted(category))
+}
+
+/// 起代理并写入目标工具配置（接入）。返回给用户看的提示文案。
+///
+/// 收 `&Arc<..>` 而非 `tauri::State`：托盘的菜单事件回调是同步闭包，要在
+/// `async_runtime::spawn` 里跨 await 使用，`State` 借用 `AppHandle` 过不去。
+/// 而托盘启停**必须**与界面按钮语义完全一致——起代理即写工具配置、停代理即还原。
+/// 若托盘只 `proxy.start()` 不写 config，客户端读到的仍是官方端点，
+/// 用户会看到「托盘显示已启动，但 Claude/Codex 根本没走代理」。
+pub(crate) async fn apply_tool_config(
+    store: &Arc<Store>,
+    proxy: &Arc<ProxyManager>,
+    category: CategoryType,
+) -> AppResult<String> {
+    let port = proxy.start(category).await?;
+    let endpoint = format!("http://127.0.0.1:{port}");
+    // 三端写入字段语义不同（禁止混写）：
+    // - Claude CLI：取首个写 env.ANTHROPIC_MODEL + 顶层 model（对外名；策略 A 不写 DEFAULT_*）
+    // - Codex：取首个写 config.toml 的 model（OpenAI 形态，无 ANTHROPIC_*）
+    // - 桌面端：整份写进 gateway 档的 inferenceModels（3p 部署模式）
+    let keys = store.enabled_keys_sorted(category);
+    let models = crate::proxy::discoverable_models(&keys);
+    let msg = crate::tools::apply(category, &endpoint, &models, &keys)?;
+    record_apply_success(store, category, &models, &format!("写入工具配置: {endpoint}"));
+    Ok(msg)
+}
+
+/// 接入写盘**成功之后**的统一记账：记一条 config 事件 + 对桌面端做一次对外名体检。
+///
+/// 把两件事捆成一个函数、而不是让每条接入路径各写两句：现在有两条路径
+/// （接入、改端口后重写），日后若加第三条，分开写时最容易漏掉的恰恰是第二句
+/// —— 而它的症状（模型选择器为空 / `ModelsNotDiscoveredError`）最难排查。
+/// 捆在一起后要忘也只能整条忘掉，那是编译期就看得见的缺失。
+///
+/// 只在**成功**时调：失败时模型压根没写进去，此时提示「这些名字桌面端不接受」是噪音。
+fn record_apply_success(
+    store: &Store,
+    category: CategoryType,
+    models: &[String],
+    detail: &str,
+) {
+    store.append_event(category, "config", None, detail);
+    warn_desktop_unacceptable_models(store, category, models);
+}
+
+/// 桌面端接入时，把「不被桌面端接受的对外模型名」另记一条 error 事件。
+///
+/// 为什么必须落日志而不只靠弹窗：接入弹窗一关就没了，而这个问题的症状
+/// （模型选择器为空 / `ModelsNotDiscoveredError`）往下要排查很久，得在运行日志里留痕。
+///
+/// 用 `error` 而不新增 `warn` kind：前端 LogsPage 的分组映射是穷举的，
+/// 加新 kind 会落到「未分类」里；且这条本质就是「配置不可用」。
+fn warn_desktop_unacceptable_models(store: &Store, category: CategoryType, models: &[String]) {
+    if category != CategoryType::ClaudeDesktop {
+        return;
+    }
+    let bad = desktop_unacceptable_models(models);
+    if bad.is_empty() {
+        return;
+    }
+    store.append_event(
+        category,
+        "error",
+        None,
+        &format!(
+            "{} 个对外模型名不被 Claude 桌面端接受（{}）：桌面端会过滤掉它们{}。\
+             请在「模型映射」里改成含 claude/opus/sonnet/haiku 的对外名。",
+            bad.len(),
+            bad.join("、"),
+            if bad.len() == models.len() {
+                "，模型选择器将为空、打开会话报 ModelsNotDiscoveredError"
+            } else {
+                ""
+            }
+        ),
+    );
+}
+
+/// 设置某分类代理的**首选监听端口**（粘滞固定端口）。返回实际绑定到的端口。
+///
+/// 顺序：落盘新端口 → 停当前代理 → 用新端口重启 → 重写该分类客户端 config。
+/// 端口是启动时绑定的，故改端口必须重启代理才生效；重写 config 让客户端下次读到新端口。
+/// 客户端（Codex / Claude）需重启才会重读 config —— 但因端口从此固定，仅此一次。
+///
+/// 重写用的模型列表走 [`models_for_apply`]，与接入同源。**这一点是必须的**：
+/// 若这里退回主 Key 的超集口径，改一次端口就会把桌面端 gateway 档的 `inferenceModels`
+/// 从接入时的安全交集重写回超集，与接入路径自相矛盾。
+///
+/// 写 config 失败**不让整个改端口失败**：端口已经落盘、代理已按新端口跑起来了，
+/// 此时返回 Err 会让前端以为改端口没成功，而实际状态已变——只记一条 error 事件。
+pub(crate) async fn set_proxy_port(
+    store: &Arc<Store>,
+    proxy: &Arc<ProxyManager>,
+    category: CategoryType,
+    port: u16,
+) -> AppResult<u16> {
+    store.set_proxy_port(category, port)?;
+    proxy.stop(category);
+    let bound = proxy.start(category).await?;
+    // 用**真实绑定端口**而非请求端口：首选端口被占用时会回退，写错客户端就连不上。
+    let endpoint = format!("http://127.0.0.1:{bound}");
+    let keys = store.enabled_keys_sorted(category);
+    let models = crate::proxy::discoverable_models(&keys);
+    match crate::tools::apply(category, &endpoint, &models, &keys) {
+        Ok(_) => record_apply_success(
+            store,
+            category,
+            &models,
+            &format!("代理端口已改为 {bound}，已重写客户端配置（客户端需重启读取新端口）"),
+        ),
+        Err(e) => store.append_event(
+            category,
+            "error",
+            None,
+            &format!("改端口后重写客户端配置失败: {e}"),
+        ),
+    }
+    Ok(bound)
+}
 
 // ==== Key 与密钥 ====
 
@@ -858,5 +993,130 @@ mod tests {
             !merged.iter().any(|m| m.real_name == "已下线的模型"),
             "旧列表里上游已不返回的模型不该被带回来"
         );
+    }
+
+    // ---- 批 3：接入写盘的模型口径 ----
+
+    /// `models_for_apply` 必须是**交集**口径（不是主 Key 的超集）。
+    ///
+    /// 这是三个调用点（接入、改端口后重写、托盘模型子菜单）共用的单一事实来源。
+    /// 历史上其中一处用了主 Key 的 `serviceable_models()`，症状是桌面端模型选择器
+    /// 列出备用 Key 无法服务的名字，故障转移到备用 Key 后那个模型必然 404 ——
+    /// 而故障转移本身是偶发的，用户看到的是「这个模型有时候能用有时候 404」。
+    #[test]
+    fn models_for_apply_is_the_intersection_not_the_primary_superset() {
+        let (store, dir) = temp_store("models_apply");
+
+        let mut primary = key(CategoryType::ClaudeCli);
+        primary.id = "ka".into();
+        primary.priority = 0;
+        primary.models = vec![model("claude-opus-4-5"), model("claude-sonnet-4-5")];
+        let mut backup = key(CategoryType::ClaudeCli);
+        backup.id = "kb".into();
+        backup.priority = 1;
+        backup.models = vec![model("claude-sonnet-4-5")]; // 备用 Key 服务不了 opus
+        store.upsert_key(primary).unwrap();
+        store.upsert_key(backup).unwrap();
+
+        assert_eq!(
+            models_for_apply(&store, CategoryType::ClaudeCli),
+            vec!["claude-sonnet-4-5".to_string()],
+            "只写两边都能服务的名字，否则转移到备用 Key 后 404"
+        );
+
+        // 停用备用 Key → 交集不再受它约束，主 Key 全集恢复可见。
+        store.toggle_key("kb", false).unwrap();
+        assert_eq!(
+            models_for_apply(&store, CategoryType::ClaudeCli).len(),
+            2,
+            "停用的 Key 不该继续收窄可用模型"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 桌面端接入时，不合规的对外名要在**运行日志**里留痕（不只弹窗）。
+    ///
+    /// 接入弹窗一关就没了，而症状（选择器为空 / `ModelsNotDiscoveredError`）
+    /// 往下要排查很久。另一条判据是「全部不合规」时文案要更重——那才是死局。
+    #[test]
+    fn desktop_apply_records_unacceptable_names_in_the_event_log() {
+        let (store, dir) = temp_store("desktop_warn");
+
+        // 部分不合规：提示里不该出现「选择器将为空」。
+        warn_desktop_unacceptable_models(
+            &store,
+            CategoryType::ClaudeDesktop,
+            &["claude-opus-4-5".into(), "glm-4.6".into()],
+        );
+        let partial = store
+            .list_events(CategoryType::ClaudeDesktop)
+            .into_iter()
+            .find(|e| e.detail.contains("不被 Claude 桌面端接受"))
+            .expect("应记一条 error 事件");
+        assert_eq!(partial.kind, "error", "必须是 error（LogsPage 的分组是穷举的）");
+        assert!(partial.detail.contains("glm-4.6"));
+        assert!(
+            !partial.detail.contains("模型选择器将为空"),
+            "还有合规名时不该报死局: {}",
+            partial.detail
+        );
+
+        // 全部不合规：必须点明后果。
+        warn_desktop_unacceptable_models(&store, CategoryType::ClaudeDesktop, &["glm-4.6".into()]);
+        let fatal = store
+            .list_events(CategoryType::ClaudeDesktop)
+            .into_iter()
+            .filter(|e| e.detail.contains("不被 Claude 桌面端接受"))
+            .count();
+        assert_eq!(fatal, 2, "两次调用各留一条");
+        assert!(
+            store
+                .list_events(CategoryType::ClaudeDesktop)
+                .iter()
+                .any(|e| e.detail.contains("ModelsNotDiscoveredError")),
+            "全部不合规时必须点明会报 ModelsNotDiscoveredError"
+        );
+
+        // 非桌面端分类：一条都不该记（CLI 有前缀兜底、Codex 无此约束）。
+        warn_desktop_unacceptable_models(&store, CategoryType::ClaudeCli, &["glm-4.6".into()]);
+        warn_desktop_unacceptable_models(&store, CategoryType::Codex, &["gpt-5".into()]);
+        assert!(
+            store.list_events(CategoryType::ClaudeCli).is_empty()
+                && store.list_events(CategoryType::Codex).is_empty(),
+            "只有桌面端受这条判据约束"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 接入成功后的记账必须**两件事都做**：记 config 事件 + 桌面端对外名体检。
+    ///
+    /// 这条守的是「日后加第三条接入路径时漏掉体检」——把两件事捆进
+    /// `record_apply_success` 就是为此，而这条测试保证捆绑本身不被拆开。
+    #[test]
+    fn apply_success_records_both_the_config_event_and_the_desktop_check() {
+        let (store, dir) = temp_store("apply_record");
+
+        record_apply_success(
+            &store,
+            CategoryType::ClaudeDesktop,
+            &["glm-4.6".into()],
+            "写入工具配置: http://127.0.0.1:8788",
+        );
+
+        let events = store.list_events(CategoryType::ClaudeDesktop);
+        assert!(
+            events.iter().any(|e| e.kind == "config" && e.detail.contains("写入工具配置")),
+            "接入成功要留一条 config 事件: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == "error" && e.detail.contains("不被 Claude 桌面端接受")),
+            "同时必须做桌面端对外名体检，否则症状要排查很久: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
