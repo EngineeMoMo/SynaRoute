@@ -1,0 +1,74 @@
+name: Deploy site
+
+# 只有官网目录变动才触发 —— 改 Rust / 桌面端前端不该重新发布官网。
+# 也支持手动触发，便于在不改代码的情况下重新部署（例如只改了 GitHub 上的 Release 说明）。
+on:
+  push:
+    branches: [master]
+    paths:
+      - "site/**"
+      - ".github/workflows/deploy-site.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时刻只跑一个部署；新提交进来时不取消正在跑的那个，
+# 避免把 Pages 停在一个部署了一半的状态。
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      # 用 ci 而不是 install：锁文件对不上时直接失败，而不是悄悄装成另一套版本
+      - name: Install
+        working-directory: site
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: site
+        run: npm run typecheck
+
+      - name: Build
+        working-directory: site
+        run: npm run build
+
+      # 可证伪的构建判据：这三样缺任何一个都说明 postbuild 没跑对，
+      # 与其部署一个深链会 404、自定义域名会掉的站点，不如让 CI 红在这里。
+      - name: Verify build output
+        working-directory: site
+        run: |
+          test -f dist/404.html      || { echo "缺 404.html：SPA 深链会真的 404"; exit 1; }
+          test -f dist/CNAME         || { echo "缺 CNAME：自定义域名会失效"; exit 1; }
+          test -f dist/sitemap.xml   || { echo "缺 sitemap.xml"; exit 1; }
+          grep -q "synaroute.mofamilys.com" dist/CNAME || { echo "CNAME 内容不对"; exit 1; }
+          echo "构建产物校验通过"
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
