@@ -2005,6 +2005,7 @@ const MAX_RETRY_AFTER_SECS: i64 = 300;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::UserPrefs;
     use crate::model::{CategoryType, HealthState, KeyParams, Protocol, ProviderKey};
     use crate::store::Store;
     use serde_json::json;
@@ -2689,7 +2690,7 @@ mod tests {
         // 预算 1500ms：够第一个候选跑满 900ms，剩 600ms < MIN_ATTEMPT_SLICE(5s) → 后续全跳过
         let mut s = store.get_settings();
         s.failover_total_budget_ms = 1_500;
-        store.save_settings(s).unwrap();
+        store.save_settings(UserPrefs::from(&s)).unwrap();
 
         let pm = ProxyManager::new(store.clone());
         let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
@@ -2740,7 +2741,7 @@ mod tests {
         // 预算设成 1ms：远小于 MIN_ATTEMPT_SLICE，但第一个候选仍必须被尝试
         let mut s = store.get_settings();
         s.failover_total_budget_ms = 1;
-        store.save_settings(s).unwrap();
+        store.save_settings(UserPrefs::from(&s)).unwrap();
 
         let pm = ProxyManager::new(store.clone());
         let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
@@ -2781,7 +2782,7 @@ mod tests {
         store.secrets.write().set("k2", "y").unwrap();
         let mut s = store.get_settings();
         s.failover_total_budget_ms = 0; // 关闭
-        store.save_settings(s).unwrap();
+        store.save_settings(UserPrefs::from(&s)).unwrap();
 
         let pm = ProxyManager::new(store.clone());
         let port = pm.start(CategoryType::ClaudeCli).await.unwrap();

@@ -14,22 +14,23 @@ import type {
 } from "@/types";
 import type { Lang } from "@/lib/i18n";
 import { api, isTauri } from "@/lib/bridge";
+import { pickPrefs } from "@/lib/prefs";
 
 /**
  * 只改 settings 里的一两个字段并落盘，**基线取磁盘最新值而非内存快照**。
  *
  * 为什么不能直接 `{...get().settings, theme}`：`store.settings` 只在 App 挂载时 `loadSettings()`
- * 写过一次，设置页此后改的字段（自启动、日志目录、健康探测间隔、局域网暴露…）只进它自己的
+ * 写过一次，设置页此后改的字段（日志目录、健康探测间隔、局域网暴露…）只进它自己的
  * 局部 state，store 这份是**挂载那一刻的旧快照**。拿旧快照整份提交，会把用户刚改的字段全部
- * 顶回旧值。
+ * 顶回旧值。故先 `getSettings()` 拉磁盘权威值，再合并本次要改的字段。
  *
- * 后端 `Store::save_settings` 对 `mcp_*` / `active_*` / `proxy_ports` /
- * `master_password_enabled` 做了「一律保留后端值」的防线，但 `auto_start` / `log_dir` /
- * `request_log_enabled` / `lan_exposure` / `health_*` 这批没有，且 `auto_start` 现在会真的
- * 去写系统自启动项 —— 用旧快照提交就等于「用户刚关掉自启动，切个主题又给装回去了」，
- * 而设置页显示的仍是「关」。这正是本轮刚修掉的那类静默背离。
+ * 提交前过一次 `pickPrefs` 白名单。后端 `save_settings` 的入参类型已经是 `UserPrefs`
+ * （多余的键会被静默丢弃），这里再过一次是为了让「前端不该发 runtime 字段」在前端代码里
+ * 也可读 —— 而且 `pickPrefs` 是逐字段列举的，日后后端加自管字段时，
+ * 这里不会因为整店展开而把它带出去。
  *
- * 故先 `getSettings()` 拉磁盘权威值，再合并本次要改的字段。
+ * 注意 `autoStart` **不再走这条路径**：它有系统副作用（写注册表），已改走专用命令
+ * `api.setAutoStart`。那正是出过 P0 的地方 —— 切主题会把用户刚关掉的自启动重新装回系统。
  */
 async function persistOneSetting(
   patch: Partial<AppSettings>,
@@ -38,7 +39,7 @@ async function persistOneSetting(
   try {
     const latest = await api.getSettings();
     const next = { ...latest, ...patch };
-    await api.saveSettings(next);
+    await api.saveSettings(pickPrefs(next));
     // 落盘成功后同步 store 副本，避免它继续陈旧下去（下一次调用仍会重拉，这里只是保持一致）
     useStore.setState({ settings: next });
   } catch (e) {

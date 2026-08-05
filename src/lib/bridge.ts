@@ -30,6 +30,7 @@ import type {
   UpdateCheckResult,
   Vendor,
 } from "@/types";
+import type { UserPrefs } from "@/lib/prefs";
 import { mockBridge } from "./mockData";
 
 /** 是否运行在 Tauri 环境内 */
@@ -204,8 +205,21 @@ export const api = {
   // ---- 设置 ----
   getSettings: () => call<AppSettings>("get_settings", undefined, () => mockBridge.getSettings()),
 
-  saveSettings: (settings: AppSettings) =>
-    call<void>("save_settings", { settings }, () => mockBridge.saveSettings(settings)),
+  /**
+   * 保存**用户偏好**。入参是白名单类型 `UserPrefs` —— 后端自管字段（粘滞端口、
+   * MCP 注册记录、已选模型、密钥库模式镜像、开机自启动…）在类型上就不存在。
+   * 后端另有同名白名单兜底，多余的键会被静默丢弃。
+   */
+  saveSettings: (prefs: UserPrefs) =>
+    call<void>("save_settings", { settings: prefs }, () => mockBridge.saveSettings(prefs)),
+
+  /**
+   * 开机自启动开关。**专用命令，不走 saveSettings**：它伴随系统副作用（写注册表 Run 键），
+   * 而批量保存路径的入参是前端挂载时的旧快照 —— 那正是出过 P0 的地方
+   * （切主题把用户刚关掉的自启动重新装回系统）。
+   */
+  setAutoStart: (enabled: boolean) =>
+    call<void>("set_auto_start", { enabled }, () => mockBridge.setAutoStart(enabled)),
 
   // ---- 首启向导（UX#1）----
   // 浏览器预览刻意返回 shouldShow=true，好让预览模式能验证向导布局

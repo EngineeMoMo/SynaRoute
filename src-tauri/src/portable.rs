@@ -504,6 +504,7 @@ pub fn apply_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::UserPrefs;
     use crate::model::{
         AggregateMode, CategoryType, HealthState, KeyParams, ModelInfo, Protocol,
     };
@@ -848,7 +849,7 @@ mod tests {
             s.log_dir = Some("E:\\源机器专属日志目录".into());
             s.auto_start = true;
             s.theme = "dark".into(); // 非本机绑定字段，应当被带走
-            src.save_settings(s).unwrap();
+            src.save_settings(UserPrefs::from(&s)).unwrap();
         }
 
         let file = build_export(&src, "1.0.0", None).unwrap().0;

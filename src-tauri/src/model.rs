@@ -1482,6 +1482,107 @@ fn default_failover_budget() -> u64 {
     90_000
 }
 
+/// **前端可写的那部分设置**（`save_settings` 的入参类型）。
+///
+/// ## 它解决的问题
+///
+/// `AppSettings` 里混着两类字段：用户偏好（前端是唯一写者）与后端自管的运行态
+/// （粘滞端口、MCP 注册记录、已选模型、密钥库模式镜像、开机自启动…）。
+/// 而前端保存设置时提交的是它**挂载那一刻的整份快照** —— 用户切个主题，
+/// 那份旧快照就会把后端刚写的运行态一起顶回去。
+///
+/// 此前的防线是**黑名单**：`save_settings` 里逐个字段 `mem::take` 保留后端值。
+/// 它出过 P0 —— `auto_start` 不在名单里，于是切主题/切语言会把用户刚关掉的开机自启动
+/// 重新装回系统。黑名单的问题是「默认不安全」：日后给后端加一个自管字段，
+/// 只要忘了往名单里补一行，就又是一次同形态的事故，而且没有任何东西会提醒你。
+///
+/// 换成白名单后，前端**在类型上就无法表达**「我要改 mcpPort」这件事：多余的键在
+/// 反序列化时被 serde 静默丢弃。日后给 `AppSettings` 加后端自管字段，默认就是安全的。
+///
+/// ## 为什么不把 AppSettings 物理拆成两个结构
+///
+/// 那样要改 60 多处 `settings.X` 的字段路径，而收益与本方案**完全相同** ——
+/// 安全性来自「入参类型里没有那些字段」，不来自「它们住在不同结构里」。
+/// 磁盘格式也因此完全不受影响（`AppSettings` 的序列化一个字节都没动）。
+///
+/// ## 加字段时怎么办
+///
+/// 新增的字段若是用户偏好，同时加进这里与 `AppSettings`，并在 `apply_to` 里赋值；
+/// 若是后端自管的，**只**加进 `AppSettings` 并配一个专用写入方法。
+/// `apply_to` 是逐字段显式赋值（不是 `..Default::default()` 展开）——
+/// 漏了新字段会表现为「用户改了但没保存」，所以那里配了一条守卫测试。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserPrefs {
+    pub theme: String,
+    #[serde(default = "default_language")]
+    pub language: String,
+    #[serde(default)]
+    pub lan_exposure: bool,
+    #[serde(default)]
+    pub request_log_enabled: bool,
+    #[serde(default)]
+    pub log_downstream_raw_enabled: bool,
+    #[serde(default = "default_health_interval")]
+    pub health_check_interval_secs: u64,
+    #[serde(default = "default_failover_budget")]
+    pub failover_total_budget_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_dir: Option<String>,
+    #[serde(default = "default_true")]
+    pub upstream_retry_enabled: bool,
+    #[serde(default)]
+    pub health_probe_real_completion: bool,
+    #[serde(default)]
+    pub health_probe_test_messages: Vec<String>,
+    #[serde(default)]
+    pub aggregate_trace_enabled: bool,
+    #[serde(default = "default_true")]
+    pub tray_model_switch_enabled: bool,
+}
+
+impl UserPrefs {
+    /// 把这些偏好写进一份完整设置，**不碰任何后端自管字段**。
+    ///
+    /// 逐字段显式赋值是刻意的：用 `..` 展开或整份替换都会把 runtime 字段一起带走，
+    /// 那正是本类型要防的事。
+    pub fn apply_to(self, s: &mut AppSettings) {
+        s.theme = self.theme;
+        s.language = self.language;
+        s.lan_exposure = self.lan_exposure;
+        s.request_log_enabled = self.request_log_enabled;
+        s.log_downstream_raw_enabled = self.log_downstream_raw_enabled;
+        s.health_check_interval_secs = self.health_check_interval_secs;
+        s.failover_total_budget_ms = self.failover_total_budget_ms;
+        s.log_dir = self.log_dir;
+        s.upstream_retry_enabled = self.upstream_retry_enabled;
+        s.health_probe_real_completion = self.health_probe_real_completion;
+        s.health_probe_test_messages = self.health_probe_test_messages;
+        s.aggregate_trace_enabled = self.aggregate_trace_enabled;
+        s.tray_model_switch_enabled = self.tray_model_switch_enabled;
+    }
+}
+
+impl From<&AppSettings> for UserPrefs {
+    fn from(s: &AppSettings) -> Self {
+        Self {
+            theme: s.theme.clone(),
+            language: s.language.clone(),
+            lan_exposure: s.lan_exposure,
+            request_log_enabled: s.request_log_enabled,
+            log_downstream_raw_enabled: s.log_downstream_raw_enabled,
+            health_check_interval_secs: s.health_check_interval_secs,
+            failover_total_budget_ms: s.failover_total_budget_ms,
+            log_dir: s.log_dir.clone(),
+            upstream_retry_enabled: s.upstream_retry_enabled,
+            health_probe_real_completion: s.health_probe_real_completion,
+            health_probe_test_messages: s.health_probe_test_messages.clone(),
+            aggregate_trace_enabled: s.aggregate_trace_enabled,
+            tray_model_switch_enabled: s.tray_model_switch_enabled,
+        }
+    }
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {

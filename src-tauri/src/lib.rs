@@ -668,42 +668,53 @@ fn first_request_since(
     state.store.first_request_since(category_id, since_ms)
 }
 
+/// 保存用户偏好。入参是白名单类型 `UserPrefs` —— 后端自管字段（粘滞端口、MCP 注册记录、
+/// 已选模型、密钥库模式镜像、开机自启动…）在类型上就不存在，前端连表达「我要改它」都做不到。
+///
+/// 此前这里是黑名单：`Store::save_settings` 内部逐个字段保留后端值。那出过 P0 ——
+/// `auto_start` 不在名单里，切主题/切语言会把用户刚关掉的开机自启动重新装回系统。
+///
+/// **开机自启动已移出本命令**，改走专用的 `set_auto_start`：它伴随系统副作用（写注册表），
+/// 而批量保存路径的入参是前端挂载时的旧快照 —— 凡「落盘之外还要动系统」的开关都不该待在
+/// 那条路径上。
 #[tauri::command]
-async fn save_settings(
+fn save_settings(state: tauri::State<AppState>, settings: UserPrefs) -> AppResult<()> {
+    state.store.save_settings(settings)
+}
+
+/// 开机自启动开关（FR-025）。**专用命令**，不走批量保存。
+///
+/// 必须与系统状态同步落地，不能只存字段：此前只把 auto_start 写进 config.json、
+/// 从无任何代码去注册自启动项，开关看起来生效了、重启后什么也不发生 ——
+/// 一个静默失效的开关比「明确标注未完成」更坑。
+///
+/// 顺序：先动系统（可能失败），成功后才落盘；**落盘失败则把系统改回原状**。
+/// 三种顺序都考虑过：
+/// - 先落盘后动系统：系统失败时留下「配置说开、系统没开」，而用户看设置页是开着的，无从察觉。
+/// - 先动系统后落盘、失败不回滚：留下「系统已注册、配置说关」，下次启动时 setup 的状态对账
+///   会按配置把它关掉 —— 用户点开了、重启后又没了，同样无从察觉。
+/// - 先动系统后落盘、失败回滚（当前）：两边始终一致。最坏是「回滚也失败」，那时只能记日志
+///   并如实上报，但那已是两次系统调用都失败的极端情况。
+///
+/// **不用「配置值是否变化」决定要不要动系统**：若用户手改过注册表（或用清理工具删了启动项），
+/// 配置说 true、系统实际 false，此时点「关」再点「开」——第二次点开时配置值已经是 true，
+/// 按「没变」跳过就会两边都不动，开关**点不动**。插件本身幂等，故这里无条件同步。
+#[tauri::command]
+async fn set_auto_start(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    settings: AppSettings,
+    enabled: bool,
 ) -> AppResult<()> {
-    // 开机自启动（FR-025）必须与系统状态**同步落地**，不能只存字段。
-    //
-    // 此前只把 auto_start 写进 config.json、从无任何代码去注册自启动项：开关看起来生效了、
-    // 重启后什么也不发生 —— 一个静默失效的开关比「明确标注未完成」更坑。
-    //
-    // 顺序：先动系统（可能失败），成功后才落盘；**落盘失败则把系统改回去**。
-    // 三种顺序都考虑过：
-    // - 先落盘后动系统：系统失败时留下「配置说开、系统没开」，而用户看设置页是开着的，无从察觉。
-    // - 先动系统后落盘、失败不回滚：留下「系统已注册、配置说关」，下次启动时 setup 的状态对账
-    //   会按配置把它关掉 —— 用户点开了、重启后又没了，同样无从察觉。
-    // - 先动系统后落盘、失败回滚系统（当前）：两边始终一致，最坏情况是「回滚也失败」，
-    //   那时只能记日志并如实上报，但那已是两次系统调用都失败的极端情况。
-    let want_autostart = settings.auto_start;
-    let autostart_changed = want_autostart != state.store.get_settings().auto_start;
-    if autostart_changed {
-        sync_autostart(&app, want_autostart)?;
-    }
-    // 只落非 MCP 控制面字段。mcp_port / mcp_enabled / mcp_registered_categories 在
-    // Store::save_settings 内部保留后端值 —— 前端切主题 / 语言的入参不会顶回粘滞端口，
-    // 也不会触发无谓的 mcp.start / stop。MCP 控制面走专用命令：
-    //   set_mcp_enabled — 开关 + 端口 + 首次注册
-    //   restart_mcp     — 停后起 + 重注客户端配置
-    //   set_mcp_port    — 后端粘滞端口（不经此路径）
-    let saved = state.store.save_settings(settings);
-    if saved.is_err() && autostart_changed {
-        // 落盘失败：把刚改的系统状态改回去，避免「系统已注册、配置说关」的背离。
-        // 回滚本身失败只记日志——原始错误（落盘失败）更重要，不该被回滚错误盖掉。
-        if let Err(re) = sync_autostart(&app, !want_autostart) {
+    let prev = state.store.get_settings().auto_start;
+    sync_autostart(&app, enabled)?;
+    let saved = state.store.set_auto_start_flag(enabled);
+    if saved.is_err() {
+        // 落盘失败：把系统改回**落盘前的配置值**（不是 !enabled ——
+        // 幂等场景下那会把系统改成与配置相反）。
+        // 回滚本身失败只记日志：原始错误（落盘失败）更重要，不该被回滚错误盖掉。
+        if let Err(re) = sync_autostart(&app, prev) {
             tracing::error!(
-                "设置落盘失败后回滚开机自启动状态也失败（系统侧现为 {want_autostart}、配置侧为旧值）: {re}"
+                "自启动开关落盘失败后回滚系统状态也失败（系统侧现为 {enabled}、配置侧为 {prev}）: {re}"
             );
         }
     }
@@ -1915,6 +1926,7 @@ pub fn run() {
             get_event_trace,
             get_settings,
             save_settings,
+            set_auto_start,
             get_onboarding_state,
             set_onboarding_done,
             first_request_since,

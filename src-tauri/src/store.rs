@@ -1585,48 +1585,36 @@ impl Store {
     ///
     /// **闭包内先做「后端自管字段保留」再整份覆盖**——顺序不能反：那几个字段的值必须取自
     /// 当前内存态（即最后已提交态），故必须在 `cfg.settings = settings` 之前从 `cfg` 里取走。
-    pub fn save_settings(&self, settings: AppSettings) -> AppResult<()> {
+    /// 保存**用户偏好**。入参是白名单类型 [`UserPrefs`]，后端自管字段在类型上就不存在。
+    ///
+    /// 这里原先是一段 30 行的**黑名单**：逐个字段 `mem::take` 把后端值保留下来，
+    /// 防止前端挂载时的旧快照把运行态顶回去。它出过 P0 —— `auto_start` 不在名单里，
+    /// 于是切主题/切语言会把用户刚关掉的开机自启动重新装回系统。
+    ///
+    /// 黑名单的根本问题是「默认不安全」：日后加一个后端自管字段，忘了补一行就是同形态事故，
+    /// 而且没有任何东西会提醒你。换成白名单后，前端连表达「我要改 mcpPort」都做不到 ——
+    /// 多余的键在反序列化时被 serde 静默丢弃，日后加字段默认就是安全的。
+    ///
+    /// 各字段为什么归后端自管，见 [`UserPrefs`] 的文档与各专用写入方法。
+    pub fn save_settings(&self, prefs: UserPrefs) -> AppResult<()> {
         self.mutate_and_persist(move |cfg| {
-            let mut settings = settings;
-            // mcp_registered_categories 是后端自管字段：前端 saveSettings 不携带它（序列化为空 vec），
-            // 若直接覆盖会在每次切主题/语言时清空注册记录。故这里始终保留已有值——
-            // 该字段只能由后端专用方法（add/clear_registered_category）更新，
-            // 绝不随 save_settings 的入参变动（无论入参空或非空）。
-            settings.mcp_registered_categories =
-                std::mem::take(&mut cfg.settings.mcp_registered_categories);
-            // mcp_port / mcp_enabled 同理归后端「MCP 控制面」自管，由 set_mcp_enabled /
-            // set_mcp_port / restart_mcp 三个专用命令负责。
-            //
-            // 若允许通用 save_settings 从入参覆盖：前端切主题 / 语言时传入的是 zustand 里
-            // **加载时的旧快照**，端口占用回退后被 set_mcp_port 粘滞的新端口会被这个旧值
-            // **顶回**，粘滞被无声撤销 —— 且随后触发 mcp.start(旧端口) 使当前运行的 MCP
-            // 被 stop + 重扫，非本次操作要动的连接全部断开。
-            //
-            // 因此这两个字段一律保留后端持久化值，与前端入参无关。
-            settings.mcp_port = cfg.settings.mcp_port;
-            settings.mcp_enabled = cfg.settings.mcp_enabled;
-            // active_models 同为后端自管字段：前端 saveSettings 携带的是加载时旧快照，
-            // 用户在应用内改选模型走专用命令 set_active_model 直写，若被这里的旧快照覆盖，
-            // 会把刚选的模型顶回旧值（与 mcp_* 同一保全策略）。始终保留后端持久化值。
-            settings.active_models = std::mem::take(&mut cfg.settings.active_models);
-            // active_efforts 同为后端自管字段（Codex 默认推理强度），策略同 active_models。
-            settings.active_efforts = std::mem::take(&mut cfg.settings.active_efforts);
-            // proxy_ports 同为后端自管字段（粘滞端口）：由 set_proxy_port（用户改端口 / 占用回退写回）
-            // 直写，前端 saveSettings 的旧快照不得覆盖，否则粘滞端口被顶回、下次重启又漂移。
-            settings.proxy_ports = std::mem::take(&mut cfg.settings.proxy_ports);
-            // master_password_enabled 同为后端自管字段，且性质更严重：它只是**密钥库真实模式的
-            // UI 镜像**（真实模式记在 secrets.enc 的 master 头部里）。若允许前端入参覆盖，
-            // 用户切个主题就可能把它写成 true —— 下次启动便按「已启用」要求解锁，而密钥库里
-            // 根本没有 master 头部，解锁无从进行、密钥也读不出来（自造死局）。
-            // 只能由 enable/disable_master_password 在**库迁移成功之后**改，以及启动时的对账修正。
-            settings.master_password_enabled = cfg.settings.master_password_enabled;
-            // onboarding_done 同为后端自管字段。不保留的后果很具体：用户走完向导后随手切个主题，
-            // 前端挂载时那份**不含该字段**的旧快照就会把「已完成」顶回 None ——
-            // 下次启动首启向导又冒出来，而用户已经配好了。
-            // Option<bool> 是 Copy，直接赋值即可，不必 mem::take。
-            settings.onboarding_done = cfg.settings.onboarding_done;
-            cfg.settings = settings;
+            prefs.apply_to(&mut cfg.settings);
             Ok(())
+        })
+    }
+
+    /// 开机自启动标记的专用写入（后端自管字段）。已是目标值则幂等跳过写盘。
+    ///
+    /// 系统侧的注册由 `lib.rs` 的 `set_auto_start` 命令负责，两侧的一致性在那个命令里保证 ——
+    /// 这里只管配置。分开是因为 store 不该知道 tauri 插件的存在。
+    pub fn set_auto_start_flag(&self, enabled: bool) -> AppResult<()> {
+        self.mutate_and_persist_if(|cfg| {
+            if cfg.settings.auto_start == enabled {
+                false
+            } else {
+                cfg.settings.auto_start = enabled;
+                true
+            }
         })
     }
 
@@ -2148,7 +2136,7 @@ mod tests {
         let log_dir = dir.join("logs");
         let mut settings = store.get_settings();
         settings.log_dir = Some(log_dir.display().to_string());
-        store.save_settings(settings).unwrap();
+        store.save_settings(UserPrefs::from(&settings)).unwrap();
 
         const THREADS: usize = 8;
         const PER_THREAD: usize = 60;
@@ -2204,7 +2192,7 @@ mod tests {
         let log_dir = dir.join("logs");
         let mut settings = store.get_settings();
         settings.log_dir = Some(log_dir.display().to_string());
-        store.save_settings(settings).unwrap();
+        store.save_settings(UserPrefs::from(&settings)).unwrap();
 
         let ck = Some("ok:k1:claude-opus-4-8:false".to_string());
         for i in 0..5 {
@@ -2400,7 +2388,7 @@ mod tests {
         let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
         let mut s = store.get_settings();
         s.log_dir = Some(blocker.display().to_string()); // 目录创建必失败
-        store.save_settings(s).unwrap();
+        store.save_settings(UserPrefs::from(&s)).unwrap();
 
         // 灌入远超 LOG_QUEUE_CAP 的条数。关键判据是**这个循环能在有限时间内跑完**
         // （不阻塞）——旧的同步实现会在每条上做一次失败的 create_dir_all + open。
@@ -2433,7 +2421,7 @@ mod tests {
         let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
         let mut s = store.get_settings();
         s.log_dir = Some(log_dir.display().to_string());
-        store.save_settings(s).unwrap();
+        store.save_settings(UserPrefs::from(&s)).unwrap();
 
         for i in 0..50 {
             store.append_event(CategoryType::Codex, "route", None, &format!("flush-{i}"));
@@ -2861,7 +2849,7 @@ mod tests {
         let mut s = store.get_settings();
         s.master_password_enabled = true;
         s.theme = "dark".into();
-        store.save_settings(s).unwrap();
+        store.save_settings(UserPrefs::from(&s)).unwrap();
 
         assert!(
             !store.get_settings().master_password_enabled,
@@ -2873,7 +2861,7 @@ mod tests {
         store.set_master_password_flag(true).unwrap();
         let mut s2 = store.get_settings();
         s2.master_password_enabled = false;
-        store.save_settings(s2).unwrap();
+        store.save_settings(UserPrefs::from(&s2)).unwrap();
         assert!(
             store.get_settings().master_password_enabled,
             "反向同样不得被前端覆盖——真实模式只由密钥库迁移与启动对账决定"
@@ -2975,7 +2963,7 @@ mod tests {
         stale.mcp_port = 9527;
         stale.mcp_registered_categories = vec![]; // 前端序列化通常就是空
         stale.theme = "dark".into(); // 真正想改的字段
-        store.save_settings(stale).unwrap();
+        store.save_settings(UserPrefs::from(&stale)).unwrap();
 
         // 三个后端自管字段全部**保留**，前端入参不生效；其它字段（theme）正常落。
         let now = store.get_settings();
@@ -3047,6 +3035,70 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **白名单的核心判据**：前端保存偏好时，后端自管字段**一个都不能动**。
+    ///
+    /// 这条替代了原先「逐字段黑名单」的那批断言。区别很关键：黑名单测的是
+    /// 「这几个我记得住的字段没被顶掉」，白名单测的是「凡不在 UserPrefs 里的都动不了」——
+    /// 后者在日后新增后端字段时**自动成立**，而前者需要有人记得补一行。
+    ///
+    /// 这就是本次改动的全部意义：把「默认不安全、靠人记得」变成「默认安全、想不安全都难」。
+    #[test]
+    fn save_settings_cannot_touch_backend_owned_state() {
+        let dir = temp_dir("prefs_whitelist");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        // 后端把全部自管字段写成非默认值
+        store.set_mcp_enabled_flag(true).unwrap();
+        store.set_mcp_port(9529).unwrap();
+        store.add_registered_category(CategoryType::ClaudeCli).unwrap();
+        store.set_active_model(CategoryType::Codex, "gpt-5").unwrap();
+        store.set_active_effort(CategoryType::Codex, "xhigh").unwrap();
+        store.set_proxy_port(CategoryType::Codex, 47999).unwrap();
+        store.set_master_password_flag(true).unwrap();
+        store.set_auto_start_flag(true).unwrap();
+        store.set_onboarding_done(true).unwrap();
+
+        // 前端提交偏好（模拟「用户只是切了个主题」）。
+        // 注意这里**在类型上就无法**表达「我要改 mcpPort」——那正是白名单的作用。
+        let mut prefs = UserPrefs::from(&store.get_settings());
+        prefs.theme = "dark".into();
+        store.save_settings(prefs).unwrap();
+
+        let now = store.get_settings();
+        assert!(now.mcp_enabled, "mcp_enabled 不得被顶掉");
+        assert_eq!(now.mcp_port, 9529, "粘滞端口不得被顶回");
+        assert_eq!(now.mcp_registered_categories, vec![CategoryType::ClaudeCli]);
+        assert_eq!(now.active_models.get(&CategoryType::Codex).map(String::as_str), Some("gpt-5"));
+        assert_eq!(now.active_efforts.get(&CategoryType::Codex).map(String::as_str), Some("xhigh"));
+        assert_eq!(now.proxy_ports.get(&CategoryType::Codex).copied(), Some(47999));
+        assert!(now.master_password_enabled, "密钥库模式镜像不得被顶掉（会自造解锁死局）");
+        assert!(now.auto_start, "开机自启动不得被顶掉 —— 这正是那个 P0 的形态");
+        assert_eq!(now.onboarding_done, Some(true));
+        assert_eq!(now.theme, "dark", "偏好本身要正常落下");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `auto_start` 的专用写入是幂等的，且能双向改。
+    #[test]
+    fn set_auto_start_flag_is_idempotent_and_persists() {
+        let dir = temp_dir("auto_start_flag");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        store.set_auto_start_flag(true).unwrap();
+        assert!(store.get_settings().auto_start);
+        store.set_auto_start_flag(true).unwrap(); // 幂等
+        assert!(store.get_settings().auto_start);
+
+        store.set_auto_start_flag(false).unwrap();
+        assert!(!store.get_settings().auto_start);
+
+        // 重开确认落盘
+        let store2 = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        assert!(!store2.get_settings().auto_start);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 首启向导标记必须扛得住「前端切主题时提交的旧快照」（UX#1）。
     /// 这是本仓修过的那个 P0 的同一形态：`store.settings` 是前端挂载时的快照，
     /// 用户走完向导后随手切个主题，那份**不含 onboarding_done 的**旧对象就会整份提交回来。
@@ -3062,7 +3114,7 @@ mod tests {
         let mut stale = store.get_settings();
         stale.onboarding_done = None;
         stale.theme = "dark".into();
-        store.save_settings(stale).unwrap();
+        store.save_settings(UserPrefs::from(&stale)).unwrap();
 
         assert_eq!(
             store.get_settings().onboarding_done,
@@ -3081,7 +3133,7 @@ mod tests {
         store.upsert_key(sample_key("k1", 0)).unwrap();
 
         // 模拟从旧版本升级：配置里没有该字段 → None
-        store.save_settings(AppSettings::default()).unwrap();
+        store.save_settings(UserPrefs::from(&AppSettings::default())).unwrap();
         store
             .mutate_and_persist_if(|cfg| {
                 cfg.settings.onboarding_done = None;
@@ -3164,7 +3216,7 @@ mod tests {
         let mut stale = store.get_settings();
         stale.active_models = std::collections::BTreeMap::new();
         stale.theme = "dark".into();
-        store.save_settings(stale).unwrap();
+        store.save_settings(UserPrefs::from(&stale)).unwrap();
         assert_eq!(
             store.get_settings().active_models.get(&CategoryType::Codex).map(|s| s.as_str()),
             Some("claude-opus-4-8"),
@@ -3198,7 +3250,7 @@ mod tests {
         let mut stale = store.get_settings();
         stale.active_efforts = std::collections::BTreeMap::new();
         stale.theme = "dark".into();
-        store.save_settings(stale).unwrap();
+        store.save_settings(UserPrefs::from(&stale)).unwrap();
         assert_eq!(
             store.get_settings().active_efforts.get(&CategoryType::Codex).map(|s| s.as_str()),
             Some("xhigh"),
@@ -3575,7 +3627,7 @@ mod tests {
         store.set_active_model(CategoryType::Codex, "claude-opus-4-8").unwrap();
         let mut s = store.get_settings();
         s.theme = "light".into();
-        store.save_settings(s).unwrap();
+        store.save_settings(UserPrefs::from(&s)).unwrap();
         assert_eq!(store.get_settings().theme, "light");
         assert_eq!(store.get_settings().mcp_port, 9531);
 
@@ -3585,7 +3637,7 @@ mod tests {
 
         let mut dirty = store.get_settings();
         dirty.theme = "dark".into();
-        assert!(store.save_settings(dirty).is_err(), "落盘失败必须上抛错误");
+        assert!(store.save_settings(UserPrefs::from(&dirty)).is_err(), "落盘失败必须上抛错误");
 
         let now = store.get_settings();
         assert_eq!(now.theme, "light", "persist 失败必须回滚，不留内存领先态");

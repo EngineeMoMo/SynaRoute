@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/Button";
 import { useT } from "@/lib/useT";
 import { LANGS } from "@/lib/i18n";
 import { openLogDir } from "@/lib/openLogDir";
+import { pickPrefs } from "@/lib/prefs";
 import type {
   AppSettings,
   McpStatus,
@@ -144,7 +145,7 @@ export function SettingsPage() {
     // **并回滚开关状态**——否则 UI 显示已开、系统实际没开（自启动这类「后端要动系统」的
     // 设置尤其致命：用户以为开成了，重启后什么也没发生）。
     void api
-      .saveSettings(next)
+      .saveSettings(pickPrefs(next))
       .then(() => {
         // 成功后同步 store 副本：store.settings 是切主题/语言时的落盘基线之一，
         // 留着旧值会让那条路径把刚改的字段顶回去（见 store.ts persistOneSetting）。
@@ -152,6 +153,32 @@ export function SettingsPage() {
       })
       .catch((e) => {
         console.error("saveSettings failed", e);
+        setSettings(prev);
+        showToast("error", String((e as Error)?.message ?? e));
+      });
+  };
+
+  /**
+   * 开机自启动走**专用命令**，不走 update()。
+   *
+   * 它伴随系统副作用（写注册表 Run 键），而 update() 提交的是本页局部 state 的整份快照 ——
+   * 那正是出过 P0 的地方：切主题/切语言会把用户刚关掉的自启动重新装回系统。
+   * 现在 `autoStart` 根本不在 `saveSettings` 的入参类型里，物理上走不到那条路。
+   *
+   * 失败必须回滚开关：UI 显示已开、系统实际没开是这类设置最坑的形态
+   * （用户以为开成了，重启后什么也没发生）。
+   */
+  const handleToggleAutoStart = (v: boolean) => {
+    if (!settings) return;
+    const prev = settings;
+    setSettings({ ...settings, autoStart: v });
+    void api
+      .setAutoStart(v)
+      .then(() => {
+        useStore.setState({ settings: { ...prev, autoStart: v } });
+      })
+      .catch((e) => {
+        console.error("setAutoStart failed", e);
         setSettings(prev);
         showToast("error", String((e as Error)?.message ?? e));
       });
@@ -714,7 +741,7 @@ export function SettingsPage() {
               title={t("settings.autoStartTitle")}
               desc={t("settings.autoStartDesc")}
               checked={settings?.autoStart ?? false}
-              onChange={(v) => update({ autoStart: v })}
+              onChange={handleToggleAutoStart}
             />
           </CardContent>
         </Card>

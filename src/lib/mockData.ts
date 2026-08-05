@@ -16,6 +16,7 @@ import type {
   ProxyState,
   Vendor,
 } from "@/types";
+import type { UserPrefs } from "@/lib/prefs";
 
 const now = Date.now();
 
@@ -670,9 +671,19 @@ export const mockBridge = {
     await delay();
     return clone(settings);
   },
-  async saveSettings(next: AppSettings) {
+  /**
+   * 收 UserPrefs 并**浅合并**，不是整份替换。
+   *
+   * 整份替换会把 runtime 字段（autoStart / mcpPort / activeModels…）抹成 undefined，
+   * 与真机行为背离 —— 而本项目已经吃过「预览验证通过、真机不对」的亏（见验收纪律）。
+   */
+  async saveSettings(next: UserPrefs) {
     await delay();
-    settings = clone(next);
+    Object.assign(settings, next);
+  },
+  async setAutoStart(enabled: boolean) {
+    await delay();
+    settings.autoStart = enabled;
   },
   async listVendors(): Promise<Vendor[]> {
     await delay();
