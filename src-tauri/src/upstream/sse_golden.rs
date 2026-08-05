@@ -23,7 +23,7 @@
 //! 手写夹具能守住「重构前后行为一致」，但守不住「我们对上游形态的理解本身就错了」——
 //! 这个区别必须留在文档里，不能让后人以为三份都是抓包。
 
-use super::{sse_direction, SseDirection, SseTranslator};
+use super::sse::{sse_direction, SseDirection, SseTranslator};
 use crate::model::Protocol;
 
 const FIXTURE_ANTHROPIC: &str = include_str!("../testdata/sse/upstream_anthropic.sse");

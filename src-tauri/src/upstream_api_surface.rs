@@ -15,7 +15,8 @@
 //! 也一定引用得到。
 //!
 //! 顺带查出三个名字其实**不需要对外**：`apply_auth` / `parse_openai_tool_call` /
-//! `is_retriable_upstream_error` —— 它们在 upstream 之外只出现在注释里，从没被真正调用过。
+//! `is_retriable_upstream_error` / `SseDirection` —— 它们在 upstream 之外只出现在注释里，
+//! 或者根本不需要被命名（SseDirection 只作为 sse_direction 的返回值被解构后直接传参）。
 //! 这类「看着像对外 API、其实没人用」的名字只有在拆分时才会暴露出来。
 
 /// 类型：用 `Option<T>` 引用，避免要求它们实现 Default 或可构造。
@@ -31,7 +32,6 @@ fn public_types_stay_reachable() {
     let _: Option<crate::upstream::ToolSession> = None;
     let _: Option<crate::upstream::TurnOutcome> = None;
     let _: Option<crate::upstream::TurnParams> = None;
-    let _: Option<crate::upstream::SseDirection> = None;
 }
 
 /// 函数：取函数项本身，不调用（有些要网络、有些是 async）。
