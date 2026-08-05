@@ -16,22 +16,28 @@
 // 契约由文件末尾的 api_surface 守卫在编译期兜住。
 mod cache;
 mod client;
+mod completion;
+mod discovery;
 mod endpoint;
+mod probe;
 mod usage;
 mod util;
 
 pub use client::{is_retriable_upstream_error, shared_client};
+pub use completion::text_completion;
+pub use discovery::fetch_models;
+pub use probe::{health_probe, health_probe_real};
 pub use endpoint::join_endpoint;
 pub use usage::{extract_usage, with_usage, TokenUsage};
 
 // 子模块里被本文件使用的项。`pub(super)` 的项对父模块可见需要显式 use ——
 // Rust 的私有项可见性只向**下**流（父的私有项对子可见），反向必须显式提升并引入。
 use client::{
-    apply_auth, apply_client_identity, apply_models_auth, build_client, fast_timeout,
+    apply_auth, apply_client_identity, build_client,
     truncate_body, RETRY_BASE_BACKOFF_MS, RETRY_MAX_ATTEMPTS,
 };
+use completion::{parse_anthropic_text, parse_openai_text};
 use cache::{cache_known_unsupported, inject_anthropic_cache, looks_like_cache_rejection, mark_cache_unsupported};
-use endpoint::model_endpoints;
 use usage::record_usage_from_raw;
 use util::{extract_text_content, uuid_like};
 
@@ -40,364 +46,8 @@ use crate::model::{Protocol, ProviderKey};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-/// 拉取模型列表（FR-004）。返回真实模型名数组。
-pub async fn fetch_models(key: &ProviderKey, secret: &str) -> AppResult<Vec<String>> {
-    let client = build_client(key)?;
-
-    // 不同厂商的模型端点路径不一致（DeepSeek 等第三方对 /v1/models 返回 404），
-    // 依次尝试候选路径，任一 2xx 即用；全失败则汇总错误。
-    let mut last_err = String::from("无候选端点");
-    for url in model_endpoints(&key.base_url) {
-        let mut req = client.get(&url).timeout(fast_timeout(key));
-        // /models 用双鉴权头（Bearer + x-api-key），兼容把 Anthropic 挂子路径的 OpenAI 风格 /models
-        req = apply_models_auth(req, secret);
-
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                // 连接层失败：区分「域名解析不了/连不上」与「超时」，并直接给出该查什么。
-                // 原先只有 `e.to_string()`（`error sending request for url (…)`），
-                // 用户看不出是自己网络问题、base_url 写错、还是上游真的挂了。
-                last_err = if e.is_timeout() {
-                    format!("连接超时（{url}）：上游无响应，可能是网络受限或该站点当前不可用")
-                } else if e.is_connect() {
-                    format!(
-                        "连不上 {url}：请检查 Base URL 是否写错、域名能否解析、\
-                         以及是否需要代理/VPN 才能访问该站点"
-                    )
-                } else {
-                    format!("请求 {url} 失败：{e}")
-                };
-                continue;
-            }
-        };
-        let status = resp.status();
-        if !status.is_success() {
-            // 带上状态码的可行动含义：401/403 是密钥问题，404 是路径问题（会自动换下个候选）。
-            let hint = match status.as_u16() {
-                401 | 403 => "（密钥无效或无权限，请检查密钥是否填对、是否已过期）",
-                404 | 405 => "（该路径不存在，将自动尝试其他候选路径）",
-                429 => "（被限流，稍后再试）",
-                s if s >= 500 => "（上游服务异常，与本地配置无关）",
-                _ => "",
-            };
-            last_err = format!("HTTP {status} @ {url}{hint}");
-            // 404/405 说明路径不对，换下一个候选；其他状态码同样重试下一个
-            continue;
-        }
-        // 响应体必须是 JSON。**不能直接 `resp.json().await?`**：上游返回 HTML 错误页/登录页时，
-        // serde 只会抛出 `expected value at line 1 column 1`（实测用户就是被这句卡住的）——
-        // 那是「第 1 行第 1 列不是合法 JSON」的字面意思，对用户毫无指向性。
-        // 这里先取文本再解析，失败时报出「拿到的不是 JSON」并附开头片段，让用户一眼看出
-        // 究竟是被挡在了登录页、还是 base_url 少了 `/v1`。
-        let text = match resp.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                last_err = format!("读取 {url} 的响应失败：{e}");
-                continue;
-            }
-        };
-        let body: Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(_) => {
-                last_err = non_json_models_hint(&url, &text);
-                continue;
-            }
-        };
-        let names = parse_model_names(&body);
-        if !names.is_empty() {
-            return Ok(names);
-        }
-        last_err = format!("{url} 返回了 JSON 但其中没有模型列表（该站点可能不提供模型查询接口）");
-    }
-    // 末尾统一附「可手动录入」的出路：这条链路失败不阻塞用户继续配置。
-    Err(AppError::upstream_msg(format!("拉取模型失败：{last_err}")))
-}
-
-/// 拉取模型时上游返回**非 JSON** 的可行动提示。
-///
-/// 拆成纯函数是为了**可验证**：这条判据的价值全在措辞上，而端到端跑一次拉取需要真实上游。
-///
-/// 真机背景（2026-08-02）：用户配了一个中转商，拉取模型时只看到
-/// `error decoding response body ← expected value at line 1 column 1`。
-/// 那是 serde 在说「第 1 行第 1 列不是合法 JSON」，对用户零指向性 —— 实际原因是该站点
-/// 把请求挡在了 HTML 页面上。提示必须说清「拿到的是网页」以及「该去改 Base URL」。
-fn non_json_models_hint(url: &str, text: &str) -> String {
-    let head: String = text.trim().chars().take(80).collect();
-    let low = head.to_ascii_lowercase();
-    if low.starts_with("<!doctype") || low.starts_with("<html") || low.starts_with("<?xml") {
-        format!(
-            "{url} 返回的是网页而不是 JSON（可能被挡在登录页/防护页，或 Base URL 指向了站点首页）。\
-             请确认 Base URL 填的是接口地址（通常以 /v1 结尾）"
-        )
-    } else if head.is_empty() {
-        format!("{url} 返回了空响应（该地址可能不是模型查询接口）")
-    } else {
-        format!("{url} 返回的内容不是合法 JSON，开头是「{head}」")
-    }
-}
 
 
-/// 从模型列表响应解析模型名，兼容多种结构：
-/// - OpenAI/Anthropic: `{data:[{id}]}`
-/// - 部分厂商: `{models:[{id/name}]}` 或顶层数组 `[{id/name}]`
-fn parse_model_names(body: &Value) -> Vec<String> {
-    let pick = |item: &Value| -> Option<String> {
-        item.get("id")
-            .or_else(|| item.get("name"))
-            .or_else(|| item.get("model"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            // 纯字符串数组（["gpt-4", ...]）也支持
-            .or_else(|| item.as_str().map(|s| s.to_string()))
-    };
-    let arr = body
-        .get("data")
-        .and_then(|d| d.as_array())
-        .or_else(|| body.get("models").and_then(|d| d.as_array()))
-        .or_else(|| body.as_array());
-    match arr {
-        Some(items) => items.iter().filter_map(pick).collect(),
-        None => vec![],
-    }
-}
-
-
-/// 一次性文本请求（用于聚合成员/决策者/汇总模型调用）。
-/// prompt 作为单条 user 消息发送，返回助手文本。
-/// `retry` 为 true 时，对临时性上游错误（502/503/504/429/连接失败）自动重试。
-///
-/// `request_timeout` 为**单次 HTTP 请求**的超时（含上游完整生成时间）。此前硬用
-/// `key_timeout`（默认 30s）——那是给代理转发/健康探测的量级；非流式补全要等上游把
-/// 整篇内容生成完才返回，30s 必然掐死正常长回答，再叠加 3 次重试 ≈ 91s 全灭，
-/// 表象是「error sending request / error decoding response body」而健康探测（max_tokens=1
-/// 秒回）始终显示可用。聚合路径应传入 brain 总预算量级的超时。
-pub async fn text_completion(
-    key: &ProviderKey,
-    secret: &str,
-    model: &str,
-    prompt: &str,
-    max_tokens: u32,
-    retry: bool,
-    request_timeout: Duration,
-) -> AppResult<String> {
-    let max_attempts = if retry { RETRY_MAX_ATTEMPTS } else { 1 };
-    let mut last_err = None;
-    for attempt in 1..=max_attempts {
-        let client = build_client(key)?;
-        let result = match key.protocol {
-            Protocol::Anthropic => {
-                anthropic_message(&client, key, secret, model, prompt, max_tokens, request_timeout).await
-            }
-            // 大脑聚合成员探测走 Chat Completions；Responses 上游此处也用 Chat 形态发最小请求
-            // （聚合成员探测为尽力而为，非主转发路径）。
-            Protocol::OpenaiChat | Protocol::OpenaiResponses => {
-                openai_chat(&client, key, secret, model, prompt, max_tokens, request_timeout).await
-            }
-        };
-        match result {
-            Ok(text) => return Ok(text),
-            Err(e) => {
-                // 不可重试错误（鉴权/参数）或已是最后一次：直接返回。
-                if attempt >= max_attempts || !is_retriable_upstream_error(&e) {
-                    return Err(e);
-                }
-                last_err = Some(e);
-                // 线性退避后重试。
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    RETRY_BASE_BACKOFF_MS * attempt as u64,
-                ))
-                .await;
-            }
-        }
-    }
-    // 循环必然在上面 return，这里兜底（不应到达）。
-    Err(last_err.unwrap_or_else(|| AppError::upstream_msg("未知上游错误")))
-}
-
-
-/// 从原始响应体解析 Anthropic 文本，兼容两种形态：
-/// ① 普通 JSON：`{"content":[{"type":"text","text":".."}]}`
-/// ② SSE 流：多行 `data: {...}`，逐行取 content_block_delta 的 text 累加。
-fn parse_anthropic_text(raw: &str) -> Option<String> {
-    // 先试普通 JSON
-    if let Ok(body) = serde_json::from_str::<Value>(raw) {
-        if let Some(text) = anthropic_text_from_json(&body) {
-            return Some(text);
-        }
-    }
-    // 再试 SSE：累加 content_block_delta 的 delta.text
-    let mut acc = String::new();
-    let mut saw_event = false;
-    for line in raw.lines() {
-        let line = line.trim_start();
-        let Some(data) = line.strip_prefix("data:") else { continue };
-        let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        if let Ok(ev) = serde_json::from_str::<Value>(data) {
-            saw_event = true;
-            if let Some(t) = ev
-                .get("delta")
-                .and_then(|d| d.get("text"))
-                .and_then(|t| t.as_str())
-            {
-                acc.push_str(t);
-            }
-        }
-    }
-    if saw_event {
-        Some(acc)
-    } else {
-        None
-    }
-}
-
-/// 从已解析的 Anthropic JSON 取 content 里的文本拼接。
-fn anthropic_text_from_json(body: &Value) -> Option<String> {
-    let arr = body.get("content")?.as_array()?;
-    Some(
-        arr.iter()
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join(""),
-    )
-}
-
-/// 从原始响应体解析 OpenAI 文本，兼容普通 JSON 与 SSE 流（choices[].delta.content）。
-fn parse_openai_text(raw: &str) -> Option<String> {
-    if let Ok(body) = serde_json::from_str::<Value>(raw) {
-        if let Some(text) = openai_text_from_json(&body) {
-            return Some(text);
-        }
-    }
-    let mut acc = String::new();
-    let mut saw_event = false;
-    for line in raw.lines() {
-        let line = line.trim_start();
-        let Some(data) = line.strip_prefix("data:") else { continue };
-        let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        if let Ok(ev) = serde_json::from_str::<Value>(data) {
-            saw_event = true;
-            if let Some(t) = ev
-                .get("choices")
-                .and_then(|c| c.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|c| c.get("delta"))
-                .and_then(|d| d.get("content"))
-                .and_then(|c| c.as_str())
-            {
-                acc.push_str(t);
-            }
-        }
-    }
-    if saw_event {
-        Some(acc)
-    } else {
-        None
-    }
-}
-
-/// 从已解析的 OpenAI JSON 取 choices[0].message.content。
-fn openai_text_from_json(body: &Value) -> Option<String> {
-    body.get("choices")?
-        .as_array()?
-        .first()?
-        .get("message")?
-        .get("content")?
-        .as_str()
-        .map(|s| s.to_string())
-}
-
-async fn anthropic_message(
-    client: &reqwest::Client,
-    key: &ProviderKey,
-    secret: &str,
-    model: &str,
-    prompt: &str,
-    max_tokens: u32,
-    request_timeout: Duration,
-) -> AppResult<String> {
-    let url = join_endpoint(&key.base_url, "/v1/messages");
-    let payload = json!({
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": [{ "role": "user", "content": prompt }]
-    });
-    // 版本头由 apply_auth 按协议统一添加（见那里的注释），此处不再单独补。
-    let mut req = client.post(&url).json(&payload).timeout(request_timeout);
-    req = apply_auth(req, key, secret);
-    req = apply_client_identity(req, key.protocol);
-
-    let resp = req.send().await?;
-    let status = resp.status();
-    // 先读文本再解析：上游可能返回 SSE 流（data: {...}）、HTML 错误页或非标准 JSON，
-    // 直接 resp.json() 会得到笼统的「error decoding response body」，看不到上游到底返回了啥。
-    let raw = resp.text().await?;
-    if !status.is_success() {
-        // 传**真实状态码**：消息里拼了响应体，绝不能让重试判定去里面猜（见
-        // `is_retriable_upstream_error` 的文档：401 + 响应体含「请检查网络连接」曾被误判可重试）。
-        return Err(AppError::upstream_http(
-            status.as_u16(),
-            format!("Anthropic HTTP {status}: {}", truncate_body(&raw)),
-        ));
-    }
-    record_usage_from_raw(&raw);
-    // content: [{type:"text", text:"..."}]。兼容普通 JSON 与 SSE 流两种返回形态。
-    // 解析失败**不是** HTTP 错误（状态码是 2xx）：status 传 None 会被判为「连接层失败可重试」，
-    // 而重试一个格式不对的响应毫无意义。故显式给 status，让它落进「非临时错误」分支。
-    let text = parse_anthropic_text(&raw).ok_or_else(|| {
-        AppError::upstream_http(
-            status.as_u16(),
-            format!("Anthropic 响应无法解析: {}", truncate_body(&raw)),
-        )
-    })?;
-    Ok(text)
-}
-
-async fn openai_chat(
-    client: &reqwest::Client,
-    key: &ProviderKey,
-    secret: &str,
-    model: &str,
-    prompt: &str,
-    max_tokens: u32,
-    request_timeout: Duration,
-) -> AppResult<String> {
-    let url = join_endpoint(&key.base_url, "/v1/chat/completions");
-    let payload = json!({
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": [{ "role": "user", "content": prompt }]
-    });
-    let mut req = client.post(&url).json(&payload).timeout(request_timeout);
-    req = apply_auth(req, key, secret);
-    req = apply_client_identity(req, key.protocol);
-
-    let resp = req.send().await?;
-    let status = resp.status();
-    let raw = resp.text().await?;
-    if !status.is_success() {
-        // 传真实状态码，理由同 `anthropic_message`。
-        return Err(AppError::upstream_http(
-            status.as_u16(),
-            format!("OpenAI HTTP {status}: {}", truncate_body(&raw)),
-        ));
-    }
-    record_usage_from_raw(&raw);
-    // 解析失败：状态码是 2xx，显式带上以免被当成「连接层失败」而白重试。
-    let text = parse_openai_text(&raw).ok_or_else(|| {
-        AppError::upstream_http(
-            status.as_u16(),
-            format!("OpenAI 响应无法解析: {}", truncate_body(&raw)),
-        )
-    })?;
-    Ok(text)
-}
 
 // ===========================================================================
 // 多模态（图片）+ 工具调用：大脑聚合成员的 agent 循环用
@@ -1052,102 +702,6 @@ impl ToolSession {
     }
 }
 
-/// 某次探测拿到的 HTTP 状态码是否代表「该 Key 可作路由候选」。
-///
-/// 借鉴 cc-switch 的健康判定：**可达性 ≠ 特定 API 路径返回 2xx**。只要拿到 HTTP 响应，
-/// 就说明 endpoint 活着；4xx/5xx 多是路径不支持（如上游不暴露 /models 返 404/405）、
-/// 限流（429）或临时故障（5xx），这些都不代表该 Key 的 chat 端点不可用——真正的可用性
-/// 由请求时的故障转移兜底。唯一例外是鉴权失败（401/403）：密钥本身无效，留在候选池只会
-/// 每次请求白跑一轮再转移，故直接判为不可用。
-fn status_is_healthy(status: u16) -> bool {
-    !matches!(status, 401 | 403)
-}
-
-/// 轻量健康探测（判「可达性」，而非旧版的「/v1/models 返回 2xx」）。
-///
-/// 旧实现用 `fetch_models` 判活：上游若不暴露 /models（404/405）会被误判为不可用、被路由
-/// 排除，即便其 chat 端点完全正常（DeepSeek 等第三方即命中此坑）。现改为：拿到任意 HTTP
-/// 响应即视为可达（鉴权失败 401/403 除外），仅连接层失败（DNS/连接/超时）判为不可达。
-/// 返回 (是否健康, 延迟毫秒, 失败原因)。失败原因带出具体状态码或连接错误详情，供落日志排查——
-/// 旧实现只返回 bool，日志只能打一句笼统的「连接层错误或 401/403」，无从定位。
-pub async fn health_probe(key: &ProviderKey, secret: &str) -> (bool, u64, Option<String>) {
-    let client = match build_client(key) {
-        Ok(c) => c,
-        Err(e) => return (false, 0, Some(format!("构建 HTTP 客户端失败：{e}"))),
-    };
-    // 用最便宜的 models 候选端点探测；只关心「有没有回应 + 状态码」，不解析 body。
-    let url = model_endpoints(&key.base_url)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| key.base_url.trim_end_matches('/').to_string());
-    let mut req = apply_models_auth(client.get(&url).timeout(fast_timeout(key)), secret);
-    // Anthropic 真实 API 的 GET /v1/models 需带版本头，否则 400（不影响健康判定，但让
-    // 有效 Key 能拿到真实 200 与准确延迟）。
-    //
-    // 这里不能用 `apply_auth`（它会按协议只设一种鉴权头），因为 `apply_models_auth` 刻意
-    // **两种鉴权头都带**——兼容把 Anthropic 协议挂在子路径、而模型列表是 OpenAI 风格的厂商。
-    // 但版本头仍走 Protocol 的穷举能力方法，与其余四处同源。
-    if let Some((h, v)) = key.protocol.version_header() {
-        req = req.header(h, v);
-    }
-
-    let start = std::time::Instant::now();
-    let (healthy, reason) = match req.send().await {
-        Ok(resp) => {
-            let code = resp.status().as_u16();
-            if status_is_healthy(code) {
-                (true, None)
-            } else {
-                // 拿到响应但鉴权失败（401/403）：密钥无效。带出确切状态码与端点。
-                (false, Some(format!("连通探测鉴权失败 HTTP {code}（GET {url}）")))
-            }
-        }
-        // 连接层失败（超时/连不上/DNS）：带出 reqwest 错误详情。
-        Err(e) => (false, Some(format!("连接层失败（GET {url}）：{e}"))),
-    };
-    let latency = start.elapsed().as_millis() as u64;
-    (healthy, latency, reason)
-}
-
-/// 真实补全健康探测（用户开启后使用）：发一个极小的真实 completion 请求，判「业务是否真能出结果」。
-///
-/// 与轻量探测的区别：轻量只看端点连通性（能 ping 通就算 up），真实探测发一次最小 completion
-/// （max_tokens=1、prompt 一个字），能拿到成功响应才算 up。这样「可用/熔断」与真实业务一致，
-/// 消除「连通正常却熔断」的割裂——代价是消耗极少量额度（1 token 输出）。
-///
-/// 探测模型用 `key.probe_model()`：优先取「映射 real_name / default_model / 模型列表 / 三档」里
-/// **保证被上游接受的真实模型名**——这正是真实请求经映射改写后发出去的名字，使探测与业务同路。
-/// 修复了旧实现「只看 default_model+models、Key 仅配自由映射时 models 为空 → 退回轻量 /models 探测
-/// → 被 401/403 误杀熔断」的 bug。都没有可探测模型时才退回轻量探测。
-///
-/// 返回 (是否成功, 延迟毫秒, 失败原因)。失败原因供调用方落日志——旧实现丢弃了它，导致探测
-/// 失败静默、无从排查。
-pub async fn health_probe_real(
-    key: &ProviderKey,
-    secret: &str,
-    message: &str,
-) -> (bool, u64, Option<String>) {
-    let Some(model) = key.probe_model() else {
-        // 该 Key 没有任何可探测的真实模型名 → 无法发补全，退回轻量连通探测。
-        let (ok, latency, reason) = health_probe(key, secret).await;
-        return (
-            ok,
-            latency,
-            reason.map(|r| format!("无可探测模型，退回轻量连通探测：{r}")),
-        );
-    };
-    let start = std::time::Instant::now();
-    // 极小请求：一个字 prompt、max_tokens=1。不重试（探测要快、如实反映当下）。
-    // 探测超时封顶 8s（fast_timeout）：1 token 秒回，不跟随用户为慢厂商设的长超时，
-    // 否则一个挂掉的慢 Key 会把它所在的那条探测并发槽占满（见 health::sweep_all_enabled，
-    // PROBE_CONCURRENCY = 4），拖慢整轮扫描。
-    let result = text_completion(key, secret, &model, message, 1, false, fast_timeout(key)).await;
-    let latency = start.elapsed().as_millis() as u64;
-    match result {
-        Ok(_) => (true, latency, None),
-        Err(e) => (false, latency, Some(format!("模型 {model}：{e}"))),
-    }
-}
 
 // ---- 协议字段转换（proxy 跨协议故障转移时使用）----
 //
@@ -4166,68 +3720,8 @@ mod tests {
         }
     }
 
-    /// 真机反例（2026-08-02）：中转商把请求挡在 HTML 页上，用户只看到
-    /// `expected value at line 1 column 1`，完全不知道该改什么。
-    /// 提示必须说清「拿到的是网页」并指向 Base URL。
-    #[test]
-    fn non_json_models_response_says_it_got_a_webpage_not_serde_jargon() {
-        let url = "https://nimabo.cn/v1/models";
-        for html in [
-            "<!DOCTYPE html><html><head><title>登录</title></head></html>",
-            "<html><body>Just a moment...</body></html>",
-            "  \n<!doctype HTML>\n<html>",
-        ] {
-            let msg = non_json_models_hint(url, html);
-            assert!(msg.contains("网页"), "应说明拿到的是网页，实际：{msg}");
-            assert!(msg.contains("Base URL"), "应指向 Base URL，实际：{msg}");
-            assert!(msg.contains(url), "应带上具体端点，实际：{msg}");
-            // 反例护栏：不得再把 serde 的行列术语抛给用户
-            assert!(
-                !msg.contains("expected value") && !msg.contains("column"),
-                "不该出现 serde 术语，实际：{msg}"
-            );
-        }
-    }
 
-    /// 非 HTML 的垃圾响应：报出开头片段，让用户自己判断拿到了什么；
-    /// 空响应单独说，避免出现「开头是「」」这种空洞提示。
-    #[test]
-    fn non_json_models_response_quotes_head_and_handles_empty() {
-        let url = "https://x.test/v1/models";
 
-        let msg = non_json_models_hint(url, "upstream connect error or disconnect");
-        assert!(msg.contains("不是合法 JSON"), "实际：{msg}");
-        assert!(msg.contains("upstream connect error"), "应引用开头片段，实际：{msg}");
-
-        for empty in ["", "   \n\t  "] {
-            let msg = non_json_models_hint(url, empty);
-            assert!(msg.contains("空响应"), "空响应应单独措辞，实际：{msg}");
-            assert!(!msg.contains("开头是「」"), "不该出现空洞的开头引用，实际：{msg}");
-        }
-    }
-
-    /// 过长响应体不得整段塞进错误信息（截到 80 字符）。
-    #[test]
-    fn non_json_models_hint_truncates_long_bodies() {
-        let msg = non_json_models_hint("https://x.test/v1/models", &"A".repeat(5000));
-        assert!(msg.len() < 400, "错误信息不该被响应体撑爆，长度：{}", msg.len());
-    }
-
-    #[test]
-    fn health_status_treats_reachable_as_up() {
-        // 拿到响应即「可达」：2xx 正常；404/405 多为不暴露该路径；429 限流；5xx 临时故障。
-        // 这些都由请求时故障转移兜底，不应把 Key 踢出路由。
-        for s in [200u16, 400, 404, 405, 429, 500, 502, 503] {
-            assert!(status_is_healthy(s), "{s} 应判为可达");
-        }
-    }
-
-    #[test]
-    fn health_status_treats_auth_failure_as_down() {
-        // 鉴权失败：密钥本身无效，留在候选池只会每次白跑一轮，直接判不可用。
-        assert!(!status_is_healthy(401));
-        assert!(!status_is_healthy(403));
-    }
 
 
     #[test]
@@ -4420,42 +3914,10 @@ mod tests {
 
     // ---- 响应解析：兼容普通 JSON 与 SSE 流 ----
 
-    #[test]
-    fn parse_anthropic_plain_json() {
-        let raw = r#"{"content":[{"type":"text","text":"你好"},{"type":"text","text":"世界"}]}"#;
-        assert_eq!(parse_anthropic_text(raw).as_deref(), Some("你好世界"));
-    }
 
-    #[test]
-    fn parse_anthropic_sse_stream() {
-        // 中转站强制 SSE：逐行 data: 累加 delta.text
-        let raw = "event: content_block_delta\n\
-                   data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"你\"}}\n\n\
-                   data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"好\"}}\n\n\
-                   data: [DONE]\n";
-        assert_eq!(parse_anthropic_text(raw).as_deref(), Some("你好"));
-    }
 
-    #[test]
-    fn parse_openai_plain_json() {
-        let raw = r#"{"choices":[{"message":{"content":"答案"}}]}"#;
-        assert_eq!(parse_openai_text(raw).as_deref(), Some("答案"));
-    }
 
-    #[test]
-    fn parse_openai_sse_stream() {
-        let raw = "data: {\"choices\":[{\"delta\":{\"content\":\"答\"}}]}\n\n\
-                   data: {\"choices\":[{\"delta\":{\"content\":\"案\"}}]}\n\n\
-                   data: [DONE]\n";
-        assert_eq!(parse_openai_text(raw).as_deref(), Some("答案"));
-    }
 
-    #[test]
-    fn parse_returns_none_on_garbage() {
-        // HTML 错误页 / 非 JSON 非 SSE → None，触发上层「响应无法解析」并带原文诊断。
-        assert!(parse_anthropic_text("<html>502 Bad Gateway</html>").is_none());
-        assert!(parse_openai_text("<html>502 Bad Gateway</html>").is_none());
-    }
 
 
     // ---- Responses ↔ Chat 转换 ----
