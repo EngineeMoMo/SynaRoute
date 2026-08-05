@@ -29,6 +29,7 @@
 //! （模型名校验、超时计算、报告拼装），编排本身仍靠真机验证。
 
 use crate::error::{AppError, AppResult};
+use crate::mcp::McpManager;
 use crate::model::*;
 use crate::proxy::ProxyManager;
 use crate::store::Store;
@@ -500,6 +501,300 @@ pub(crate) fn mcp_client_timeout_ms(store: &Store) -> u64 {
     max_total
         .saturating_add(MARGIN_MS)
         .max(crate::tools::MCP_TOOL_TIMEOUT_MS)
+}
+
+/// 当前 MCP 状态快照（前端指示灯）。
+pub(crate) fn mcp_status(mcp: &McpManager) -> McpStatus {
+    McpStatus {
+        running: mcp.is_running(),
+        port: mcp.running_port(),
+        last_error: mcp.last_error(),
+    }
+}
+
+/// 客户端配置重写的**触发场合**。只影响失败时的日志文案，不影响行为。
+///
+/// 为什么要区分：这三种场合的排障方向完全不同。「端口变化后」说明端口漂移了但客户端没跟上
+/// （客户端仍指向死端口，症状是工具调用连不上）；「重启后」是用户刚点过按钮、正等着看结果；
+/// 「启动后」发生在无人看着的时候，日志是唯一线索。混成一句话会让日志读者
+/// 分不清是自动漂移、开机自愈、还是自己刚点的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RewriteReason {
+    /// 实际绑定端口与首选端口不同（被占用后向上回退）。
+    PortDrift,
+    /// 手动重启 MCP 服务后的重新注入。
+    Restart,
+    /// 应用启动时 MCP 随之启动后的重新注入。
+    Startup,
+}
+
+impl RewriteReason {
+    fn describe(self) -> &'static str {
+        match self {
+            RewriteReason::PortDrift => "MCP 端口变化后重写客户端失败",
+            RewriteReason::Restart => "MCP 重启后重写客户端失败",
+            RewriteReason::Startup => "MCP 启动后重写客户端失败",
+        }
+    }
+}
+
+/// 把 synaroute MCP 注册进某分类对应工具的客户端配置，并把该分类记入
+/// `settings.mcp_registered_categories`（去重）。
+///
+/// 记入集合这件事必须走 `Store::add_registered_category` 这条**后端专用**写入 ——
+/// 不能用「读 settings → push → save_settings」：`save_settings` 的入参是白名单类型
+/// `UserPrefs`，这个字段在类型上就不存在，那样写等于该集合永远为空，
+/// 而它一空，端口漂移时的批量重写就会漏掉所有分类（客户端 MCP 指向死端口，永不自愈）。
+///
+/// 失败只记事件、不返回 Err：注册失败时 MCP 服务本身还在跑，
+/// 让整个「启用 MCP」失败反而更糟（用户以为服务没起来）。
+pub(crate) fn register_and_record(store: &Store, category: CategoryType, port: u16) {
+    let url = mcp_url_for(port);
+    let timeout_ms = mcp_client_timeout_ms(store);
+    match crate::tools::register_mcp_client(category, &url, timeout_ms) {
+        Ok((msg, _wrote)) => {
+            store.append_event(category, "config", None, &msg);
+            let _ = store.add_registered_category(category);
+        }
+        Err(e) => store.append_event(
+            category,
+            "error",
+            None,
+            &format!("MCP 自动注册到客户端失败: {e}"),
+        ),
+    }
+}
+
+/// 用新端口重写**所有已注册分类**的客户端配置（url 里的端口跟着变）。
+///
+/// 只在真写了盘时记事件（`wrote`）：`register_mcp_client` 内容相同即跳过写盘，
+/// 无条件记录会让每次重启都在日志里刷出三条「已重写」而其实什么都没变。
+pub(crate) fn rewrite_registered_clients(store: &Store, port: u16, reason: RewriteReason) {
+    let url = mcp_url_for(port);
+    let timeout_ms = mcp_client_timeout_ms(store);
+    for category in store.get_settings().mcp_registered_categories {
+        match crate::tools::register_mcp_client(category, &url, timeout_ms) {
+            Ok((msg, wrote)) => {
+                if wrote {
+                    store.append_event(category, "config", None, &msg);
+                }
+            }
+            Err(e) => store.append_event(
+                category,
+                "error",
+                None,
+                &format!("{}: {e}", reason.describe()),
+            ),
+        }
+    }
+}
+
+/// 从某分类的客户端配置移除 synaroute，并从已注册集合剔除。
+fn unregister_and_forget(store: &Store, category: CategoryType) -> AppResult<()> {
+    match crate::tools::unregister_mcp_client(category) {
+        Ok((msg, wrote)) => {
+            if wrote {
+                store.append_event(category, "config", None, &msg);
+            }
+        }
+        Err(e) => {
+            store.append_event(category, "error", None, &format!("MCP 断开失败: {e}"));
+            return Err(e);
+        }
+    }
+    let _ = store.remove_registered_category(category);
+    Ok(())
+}
+
+/// 确保 MCP 服务在跑，返回**实际绑定端口**。
+///
+/// 未运行则以首选端口启动。端口回退时（首选被占用）做两件事：重写已注册分类的客户端配置、
+/// 把实际端口粘为下次首选。**粘住这一步不能省**：否则每次启动都从被占的旧端口重新回退、
+/// 重新重写配置，客户端每次都要重启才能跟上——治标不治本。
+async fn ensure_mcp_running(store: &Store, mcp: &McpManager) -> Result<u16, String> {
+    if let Some(p) = mcp.running_port() {
+        return Ok(p);
+    }
+    let preferred = store.get_settings().mcp_port;
+    let bound = mcp.start(preferred).await?;
+    // 启动即视为 MCP 开启：持久化 enabled=true，否则下次冷启前端读配置以为没开。
+    let _ = store.set_mcp_enabled_flag(true);
+    if bound != preferred {
+        rewrite_registered_clients(store, bound, RewriteReason::PortDrift);
+        let _ = store.set_mcp_port(bound);
+    }
+    Ok(bound)
+}
+
+/// 单分类接入 MCP 大脑聚合：只给该分类写客户端配置，不影响其它分类。
+///
+/// 与 [`set_mcp_enabled`] 的区别：后者是全局开关且只认「当前活跃分类」，做不到多端同时接入；
+/// 本函数 per-category 独立，可让 CLI 与 Codex 各自接入、互不干扰。
+///
+/// 前置是**服务必须在跑**（未跑则先启动）：客户端写了地址也连不上的话，
+/// 用户看到的是「显示已接入但工具用不了」。
+pub(crate) async fn register_mcp_for_category(
+    store: &Store,
+    mcp: &McpManager,
+    category: CategoryType,
+) -> AppResult<McpStatus> {
+    let bound = match ensure_mcp_running(store, mcp).await {
+        Ok(b) => b,
+        Err(e) => {
+            store.append_event(
+                category,
+                "error",
+                None,
+                &format!("MCP 启动失败，无法接入 {}: {e}", category.as_str()),
+            );
+            return Err(AppError::Proxy(e));
+        }
+    };
+    register_and_record(store, category, bound);
+    Ok(mcp_status(mcp))
+}
+
+/// 单分类断开：只从该分类客户端配置移除 synaroute，不停服务、不动其它分类。
+pub(crate) fn unregister_mcp_for_category(
+    store: &Store,
+    mcp: &McpManager,
+    category: CategoryType,
+) -> AppResult<McpStatus> {
+    unregister_and_forget(store, category)?;
+    Ok(mcp_status(mcp))
+}
+
+/// 启用/停用 MCP 全局开关，并自动注册到「当前活跃分类」对应的工具。
+///
+/// **`enabled` 的落盘时序按启动结果决定**，不能先写 true 再启动：那样会造出
+/// 「服务没起来但配置说开着」的错乱状态，前端下次冷启以为服务在跑、而 `mcp_status`
+/// 显示 stopped。端口候选则**先落盘**（用户在设置里改的端口要保留，即便本次启动失败）。
+///
+/// 启动失败时回滚 `enabled=false` 并记事件，但**不返回 Err**：端口已经保存成功了，
+/// 返回 Err 会让前端把「端口没存上」和「服务没起来」混为一谈。
+pub(crate) async fn set_mcp_enabled(
+    store: &Store,
+    mcp: &McpManager,
+    category: CategoryType,
+    enabled: bool,
+    port: u16,
+) -> AppResult<McpStatus> {
+    store.set_mcp_port(port)?;
+    if enabled {
+        match mcp.start(port).await {
+            Ok(bound) => {
+                store.set_mcp_enabled_flag(true)?;
+                // 用**实际绑定端口**注册，保证客户端地址与真实端口一致。
+                register_and_record(store, category, bound);
+                if bound != port {
+                    rewrite_registered_clients(store, bound, RewriteReason::PortDrift);
+                    let _ = store.set_mcp_port(bound);
+                }
+            }
+            Err(e) => {
+                let _ = store.set_mcp_enabled_flag(false);
+                store.append_event(
+                    category,
+                    "error",
+                    None,
+                    &format!("MCP 启动失败（enabled 已回滚为 false）: {e}"),
+                );
+                tracing::warn!("MCP 服务器启动失败: {e}");
+            }
+        }
+    } else {
+        mcp.stop();
+        store.set_mcp_enabled_flag(false)?;
+        // 关开关 = 从所有已注册分类移除 synaroute 并清空记录。
+        // 逐条 best-effort：某一端的客户端文件被占用不该让其余端留着死配置。
+        for category in store.get_settings().mcp_registered_categories {
+            match crate::tools::unregister_mcp_client(category) {
+                Ok((msg, wrote)) => {
+                    if wrote {
+                        store.append_event(category, "config", None, &msg);
+                    }
+                }
+                Err(e) => {
+                    store.append_event(category, "error", None, &format!("MCP 注销失败: {e}"))
+                }
+            }
+        }
+        store.clear_registered_categories()?;
+    }
+    Ok(mcp_status(mcp))
+}
+
+/// 手动重启 MCP 服务：先停后起（强制重新绑定端口），并重新注入客户端配置。
+///
+/// 用途：改了端口后立即重绑、端口冲突排障、客户端连不上时强制重连。
+/// 注意大脑聚合参数（超时/Token/成员/决策者）是每次调用实时读的，改了保存即生效、
+/// **不需要**走这里——本函数只影响 MCP 服务本身的监听与客户端 url 同步。
+///
+/// 无论端口是否变化都重新注入：手动重启的语义就是「把客户端配置也对齐一次」，
+/// 这正是排障时最想要的动作。
+pub(crate) async fn restart_mcp(store: &Store, mcp: &McpManager) -> AppResult<McpStatus> {
+    let port = store.get_settings().mcp_port;
+    mcp.stop();
+    store.append_event(
+        CategoryType::ClaudeCli,
+        "config",
+        None,
+        &format!("MCP 重启：已停止旧服务，准备绑定端口 {port}"),
+    );
+    match mcp.start(port).await {
+        Ok(bound) => {
+            if bound != port {
+                let _ = store.set_mcp_port(bound);
+            }
+            rewrite_registered_clients(store, bound, RewriteReason::Restart);
+            // 一个分类都没注册、但开关是开的：按默认分类注入一次，
+            // 避免留下「服务在跑但客户端没有任何配置」这种看起来正常的空转状态。
+            if store.get_settings().mcp_registered_categories.is_empty() {
+                register_and_record(store, CategoryType::ClaudeCli, bound);
+            }
+            store.append_event(
+                CategoryType::ClaudeCli,
+                "config",
+                None,
+                &format!("MCP 重启完成：{}（已重写客户端配置）", mcp_url_for(bound)),
+            );
+        }
+        Err(e) => {
+            tracing::warn!("MCP 重启失败: {e}");
+            store.append_event(
+                CategoryType::ClaudeCli,
+                "error",
+                None,
+                &format!("MCP 重启失败: {e}"),
+            );
+        }
+    }
+    Ok(mcp_status(mcp))
+}
+
+/// 应用启动时随之拉起 MCP 服务（用户已启用时）。
+///
+/// 与 [`ensure_mcp_running`] 的区别：这里**不写** `enabled` 标记（它本来就是 true，
+/// 正是它把我们带到这条路径上的），且失败只告警不返回 —— 启动期的 MCP 拉不起来
+/// 不该影响应用本身可用。
+///
+/// 端口「粘住」这一步是必须的：某些机器上首选端口（9527 / 9528）被系统服务
+/// （WUDFHost / 指纹服务）永久占用，每次开机都被迫回退。不把实际端口写回设置，
+/// 就会每次开机重复「绑定失败 → 向上探测 → 回退 → 重写客户端」，
+/// 而客户端配置只在客户端启动时读一次，用户那边表现为「时不时要重启 Claude 才能用」。
+pub(crate) async fn start_mcp_on_launch(store: &Store, mcp: &McpManager) {
+    let preferred = store.get_settings().mcp_port;
+    match mcp.start(preferred).await {
+        Ok(bound) => {
+            if bound != preferred {
+                let _ = store.set_mcp_port(bound);
+            }
+            // 无条件重写（不只在端口变化时）：客户端配置里的 url 可能来自上一次
+            // 不同端口的运行，幂等写入内部会比对内容、没变就不写盘。
+            rewrite_registered_clients(store, bound, RewriteReason::Startup);
+        }
+        Err(e) => tracing::warn!("MCP 服务器启动失败: {e}"),
+    }
 }
 
 // ==== 更新检查 ====
@@ -1115,6 +1410,101 @@ mod tests {
                 .iter()
                 .any(|e| e.kind == "error" && e.detail.contains("不被 Claude 桌面端接受")),
             "同时必须做桌面端对外名体检，否则症状要排查很久: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- 批 4：MCP 控制面 ----
+    //
+    // 注意这一批**刻意不测** register_and_record / rewrite_registered_clients / 启用路径：
+    // 它们经 crate::tools::register_mcp_client 真写开发机上的 ~/.claude.json 与
+    // Codex config.toml（且在包身份下写的是虚拟副本，见 CLAUDE.md 的平行宇宙陷阱）。
+    // 单测里跑会破坏本机真实客户端配置——这类编排靠真机验证，不靠 mock 文件系统。
+    // 能测的是它周围那几层：状态快照、日志文案的可分辨性、以及**关开关**这条不碰文件的路径。
+
+    /// 三种重写场合的日志文案必须**互不相同**。
+    ///
+    /// 它们的排障方向完全不同：端口漂移=客户端指着死端口；手动重启=用户正等结果；
+    /// 开机启动=无人看着、日志是唯一线索。若两条文案撞车，日志读者就分不清
+    /// 「是自动漂移还是我刚点的」，而这恰好决定下一步该查什么。
+    #[test]
+    fn rewrite_reason_messages_stay_distinguishable() {
+        let all = [
+            RewriteReason::PortDrift,
+            RewriteReason::Restart,
+            RewriteReason::Startup,
+        ];
+        let msgs: Vec<&str> = all.iter().map(|r| r.describe()).collect();
+        let uniq: std::collections::HashSet<&&str> = msgs.iter().collect();
+        assert_eq!(uniq.len(), all.len(), "文案撞车会让日志无法分辨来源: {msgs:?}");
+        assert!(
+            msgs.iter().all(|m| m.contains("重写客户端失败")),
+            "都要含这个可检索的共同片段，便于一次捞出全部重写失败: {msgs:?}"
+        );
+    }
+
+    /// MCP 地址格式：**必须绑定 127.0.0.1**，且带 `/mcp` 路径。
+    ///
+    /// 不能写成 0.0.0.0 或本机 IP：这是给本机客户端用的回环地址，写成对外地址等于
+    /// 把大脑聚合入口暴露到局域网（局域网暴露是代理那一侧独立的开关，不该由这里顺带打开）。
+    #[test]
+    fn mcp_url_is_loopback_with_the_mcp_path() {
+        assert_eq!(mcp_url_for(9527), "http://127.0.0.1:9527/mcp");
+        assert!(
+            !mcp_url_for(9527).contains("0.0.0.0"),
+            "绝不能绑 0.0.0.0：那会把聚合入口暴露到局域网"
+        );
+    }
+
+    /// 未启动时的状态快照：`running=false`、无端口、无错误。
+    ///
+    /// 前端设置页的指示灯直接读这三项。若 `running` 在没起服务时就为 true，
+    /// 用户会以为服务在跑、却怎么都连不上。
+    #[test]
+    fn mcp_status_reports_stopped_before_any_start() {
+        let (store, dir) = temp_store("mcp_status");
+        let mcp = McpManager::new(store.clone());
+
+        let st = mcp_status(&mcp);
+        assert!(!st.running, "没起服务就不能报 running");
+        assert_eq!(st.port, None);
+        assert_eq!(st.last_error, None, "没试过启动就不该有错误");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 关 MCP 开关：**端口候选先落盘**，且 `enabled` 落成 false。
+    ///
+    /// 端口先落盘这一点有独立意义：用户在设置里改了端口又把开关关掉，
+    /// 那个端口值必须留下来（下次开启时用），不能因为「这次没启动」就丢掉。
+    /// 故本例刻意先把 enabled 置 true，才能真的验证它被改回 false ——
+    /// 默认值本就是 false，不做这个前置的话这条断言恒真、等于没测。
+    ///
+    /// **「关开关要清空已注册集合」这一条无法在单测里验证**：清空前要先逐个
+    /// `unregister_mcp_client`，那会真写开发机的 ~/.claude.json 与 Codex config.toml。
+    /// 故本例把集合保持为空（不触碰任何文件），那条编排靠真机验证。
+    /// 这里如实记下来，免得日后有人以为它已被覆盖。
+    #[tokio::test]
+    async fn disabling_mcp_keeps_the_port_choice_and_turns_the_flag_off() {
+        let (store, dir) = temp_store("mcp_disable");
+        let mcp = McpManager::new(store.clone());
+        store.set_mcp_enabled_flag(true).unwrap();
+        assert!(
+            store.get_settings().mcp_registered_categories.is_empty(),
+            "前置条件：没有已注册分类，本测试才不会去写真实客户端配置"
+        );
+
+        let st = set_mcp_enabled(&store, &mcp, CategoryType::ClaudeCli, false, 9600)
+            .await
+            .unwrap();
+
+        assert!(!st.running);
+        let s = store.get_settings();
+        assert_eq!(s.mcp_port, 9600, "改过的端口候选必须留下，供下次开启时用");
+        assert!(
+            !s.mcp_enabled,
+            "开关必须落成 false，否则前端下次冷启以为服务在跑"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

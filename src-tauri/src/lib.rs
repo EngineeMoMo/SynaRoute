@@ -570,141 +570,31 @@ async fn rebuild_tray_menu(app: tauri::AppHandle) -> AppResult<()> {
 /// MCP 服务器运行状态（供设置页展示连接指示灯）
 #[tauri::command]
 fn mcp_status(state: tauri::State<AppState>) -> McpStatus {
-    McpStatus {
-        running: state.mcp.is_running(),
-        port: state.mcp.running_port(),
-        last_error: state.mcp.last_error(),
-    }
+    service::mcp_status(&state.mcp)
 }
 
-
-
-/// 把 synaroute MCP 注册进指定分类对应工具的客户端配置，并把该分类记进
-/// settings.mcp_registered_categories（去重）。写盘/跳过都记一条事件日志，方便用户排查。
-fn register_and_record(state: &AppState, category: CategoryType, port: u16) {
-    let url = service::mcp_url_for(port);
-    let timeout_ms = service::mcp_client_timeout_ms(&state.store);
-    match tools::register_mcp_client(category, &url, timeout_ms) {
-        Ok((msg, _wrote)) => {
-            state.store.append_event(category, "config", None, &msg);
-            // 走后端专用写入（不能用 get_settings→push→save_settings，会被 save_settings
-            // 的 mem::take 保留逻辑吞掉，导致该集合永远为空）。
-            let _ = state.store.add_registered_category(category);
-        }
-        Err(e) => {
-            state.store.append_event(
-                category,
-                "error",
-                None,
-                &format!("MCP 自动注册到客户端失败: {e}"),
-            );
-        }
-    }
-}
-
-/// 端口漂移后，用新端口重写所有已注册分类的客户端配置（url 里的端口跟着变）。
-fn rewrite_registered_clients(state: &AppState, port: u16) {
-    let url = service::mcp_url_for(port);
-    let timeout_ms = service::mcp_client_timeout_ms(&state.store);
-    let cats = state.store.get_settings().mcp_registered_categories;
-    for category in cats {
-        {
-            match tools::register_mcp_client(category, &url, timeout_ms) {
-                Ok((msg, wrote)) => {
-                    if wrote {
-                        state.store.append_event(category, "config", None, &msg);
-                    }
-                }
-                Err(e) => state.store.append_event(
-                    category,
-                    "error",
-                    None,
-                    &format!("MCP 端口变化后重写客户端失败: {e}"),
-                ),
-            }
-        }
-    }
-}
-
-/// 单分类接入 MCP 大脑聚合：只给指定分类写入客户端 MCP 配置（Claude CLI=~/.claude.json，
-/// Codex=config.toml，桌面端=claude_desktop_config），不影响其它分类。
-/// 与 set_mcp_enabled 的区别：后者是全局开关且只认「当前活跃分类」，做不到多端同时接入；
-/// 本命令 per-category 独立，可让 CLI 与 Codex 各自接入、互不干扰。
-/// 前置：MCP 服务必须在运行（未运行则先按首选端口启动），否则客户端写了地址也连不上。
+/// 单分类接入 MCP 大脑聚合（Claude CLI=~/.claude.json、Codex=config.toml、桌面端=stdio）。
+/// 编排（含服务未跑时先启动、端口回退时粘住实际端口）在 [`service::register_mcp_for_category`]。
 #[tauri::command]
 async fn register_mcp_for_category(
     state: tauri::State<'_, AppState>,
     category_id: CategoryType,
 ) -> AppResult<McpStatus> {
-    // 确保服务在跑：未运行则以首选端口启动（复用粘滞端口逻辑）。
-    let bound = match state.mcp.running_port() {
-        Some(p) => p,
-        None => {
-            let port = state.store.get_settings().mcp_port;
-            match state.mcp.start(port).await {
-                Ok(b) => {
-                    // 启动即视为 MCP 开启，持久化 enabled=true 并粘住实际端口。
-                    let _ = state.store.set_mcp_enabled_flag(true);
-                    if b != port {
-                        rewrite_registered_clients(&state, b);
-                        let _ = state.store.set_mcp_port(b);
-                    }
-                    b
-                }
-                Err(e) => {
-                    state.store.append_event(
-                        category_id,
-                        "error",
-                        None,
-                        &format!("MCP 启动失败，无法接入 {}: {e}", category_id.as_str()),
-                    );
-                    return Err(error::AppError::Proxy(e));
-                }
-            }
-        }
-    };
-    // 只给这一个分类注册 + 记入已注册集合（供端口漂移时重写、关闭时注销）。
-    register_and_record(&state, category_id, bound);
-    Ok(McpStatus {
-        running: state.mcp.is_running(),
-        port: state.mcp.running_port(),
-        last_error: state.mcp.last_error(),
-    })
+    service::register_mcp_for_category(&state.store, &state.mcp, category_id).await
 }
 
-/// 单分类断开 MCP 大脑聚合：只从指定分类的客户端配置移除 synaroute，并从已注册集合剔除。
-/// 不停 MCP 服务、不动其它分类——与 register_mcp_for_category 对称。
+/// 单分类断开：只从该分类客户端配置移除 synaroute，不停服务、不动其它分类。
 #[tauri::command]
 async fn unregister_mcp_for_category(
     state: tauri::State<'_, AppState>,
     category_id: CategoryType,
 ) -> AppResult<McpStatus> {
-    match tools::unregister_mcp_client(category_id) {
-        Ok((msg, wrote)) => {
-            if wrote {
-                state.store.append_event(category_id, "config", None, &msg);
-            }
-        }
-        Err(e) => {
-            state.store.append_event(
-                category_id,
-                "error",
-                None,
-                &format!("MCP 断开失败: {e}"),
-            );
-            return Err(e);
-        }
-    }
-    let _ = state.store.remove_registered_category(category_id);
-    Ok(McpStatus {
-        running: state.mcp.is_running(),
-        port: state.mcp.running_port(),
-        last_error: state.mcp.last_error(),
-    })
+    service::unregister_mcp_for_category(&state.store, &state.mcp, category_id)
 }
 
 /// 启用/停用 MCP 并自动注册到「当前活跃分类」对应的工具。
 /// 前端 MCP 开关走这里（携带 activeCategory），而非通用 save_settings。
+/// 编排（含 enabled 落盘时序为何按启动结果决定）在 [`service::set_mcp_enabled`]。
 #[tauri::command]
 async fn set_mcp_enabled(
     state: tauri::State<'_, AppState>,
@@ -712,128 +602,13 @@ async fn set_mcp_enabled(
     enabled: bool,
     port: u16,
 ) -> AppResult<McpStatus> {
-    // 端口候选先落盘（用户在设置里改端口需要保留候选值，即便本次启动失败）；
-    // enabled 落盘时序按启动结果决定：先写 true 再启动会导致「服务没起来但配置说开着」
-    // 的状态错乱，前端下次冷启会以为服务已在跑却 mcp_status 显示 stopped。
-    state.store.set_mcp_port(port)?;
-    if enabled {
-        match state.mcp.start(port).await {
-            Ok(bound) => {
-                // 启动成功后才把开关置 true，UI/持久化状态与实际服务一致。
-                state.store.set_mcp_enabled_flag(true)?;
-                // 实际绑定端口可能因占用而回退；用它注册，保证客户端地址与真实端口一致。
-                register_and_record(&state, category_id, bound);
-                // 若端口漂移，其它已注册分类也要跟着改，并把 bound 粘为下次首选端口
-                // （否则每次启动都从被占的旧端口重新回退、重写配置——治标不治本）。
-                if bound != port {
-                    rewrite_registered_clients(&state, bound);
-                    let _ = state.store.set_mcp_port(bound);
-                }
-            }
-            Err(e) => {
-                // 启动失败：回滚 enabled=false，让 UI/持久化如实反映当前无服务。
-                let _ = state.store.set_mcp_enabled_flag(false);
-                state.store.append_event(
-                    category_id,
-                    "error",
-                    None,
-                    &format!("MCP 启动失败（enabled 已回滚为 false）: {e}"),
-                );
-                tracing::warn!("MCP 服务器启动失败: {e}");
-            }
-        }
-    } else {
-        state.mcp.stop();
-        // 先把开关落成 false（服务已停，配置立刻反映）。
-        state.store.set_mcp_enabled_flag(false)?;
-        // 关闭开关：从已注册分类移除 synaroute，并清空记录。
-        let cats = state.store.get_settings().mcp_registered_categories.clone();
-        // mcp_registered_categories 现在直接是 Vec<CategoryType>（P2-8）——
-        // 不再需要「字符串解析 + 解析失败静默跳过」那一层，漏配一个分类从此是编译错误。
-        for &category in &cats {
-            {
-                match tools::unregister_mcp_client(category) {
-                    Ok((msg, wrote)) => {
-                        if wrote {
-                            state.store.append_event(category, "config", None, &msg);
-                        }
-                    }
-                    Err(e) => state.store.append_event(
-                        category,
-                        "error",
-                        None,
-                        &format!("MCP 注销失败: {e}"),
-                    ),
-                }
-            }
-        }
-        // 已注册分类记录走后端专用清空（save_settings 不再触碰该字段）。
-        state.store.clear_registered_categories()?;
-    }
-    Ok(McpStatus {
-        running: state.mcp.is_running(),
-        port: state.mcp.running_port(),
-        last_error: state.mcp.last_error(),
-    })
+    service::set_mcp_enabled(&state.store, &state.mcp, category_id, enabled, port).await
 }
 
-/// 手动重启 MCP 服务：先停后起（强制重新绑定端口），并重新注入客户端配置。
-/// 用途：改了端口后立即重绑、端口冲突排障、或客户端连不上时强制重连。
-/// 注意：大脑聚合参数（超时/Token/成员/决策者）是每次调用实时从配置读的，
-/// 改了保存即生效，无需重启——本命令只影响 MCP 服务本身的监听与客户端 url 同步。
+/// 手动重启 MCP 服务。编排在 [`service::restart_mcp`]。
 #[tauri::command]
 async fn restart_mcp(state: tauri::State<'_, AppState>) -> AppResult<McpStatus> {
-    let settings = state.store.get_settings();
-    let port = settings.mcp_port;
-    // 1) 先停旧监听（abort accept 循环）
-    state.mcp.stop();
-    state.store.append_event(
-        CategoryType::ClaudeCli,
-        "config",
-        None,
-        &format!("MCP 重启：已停止旧服务，准备绑定端口 {port}"),
-    );
-    // 2) 再起新监听
-    match state.mcp.start(port).await {
-        Ok(bound) => {
-            // 端口回退时粘住
-            if bound != port {
-                let _ = state.store.set_mcp_port(bound);
-            }
-            // 3) 无论端口是否变化，都重新注入已注册分类的客户端配置（url + timeout），
-            //    保证 ~/.claude.json / config.toml 与真实绑定端口一致。
-            rewrite_registered_clients(&state, bound);
-            // 若还没有任何已注册分类，但开关是开的：按默认分类注入一次，避免「服务在跑但客户端没配置」。
-            if state
-                .store
-                .get_settings()
-                .mcp_registered_categories
-                .is_empty()
-            {
-                register_and_record(&state, CategoryType::ClaudeCli, bound);
-            }
-            state.store.append_event(
-                CategoryType::ClaudeCli,
-                "config",
-                None,
-                &format!("MCP 重启完成：http://127.0.0.1:{bound}/mcp（已重写客户端配置）"),
-            );
-        }
-        Err(e) => {
-            tracing::warn!("MCP 重启失败: {e}");
-            state.store.append_event(
-                CategoryType::ClaudeCli,
-                "error",
-                None,
-                &format!("MCP 重启失败: {e}"),
-            );
-        }
-    }
-    Ok(McpStatus {
-        running: state.mcp.is_running(),
-        port: state.mcp.running_port(),
-        last_error: state.mcp.last_error(),
-    })
+    service::restart_mcp(&state.store, &state.mcp).await
 }
 
 // ============ 版本与更新 ============
@@ -1542,48 +1317,14 @@ pub fn run() {
                 tracing::info!("随系统启动，已最小化到托盘（{AUTOSTART_FLAG}）");
             }
 
-            // 内置 MCP 服务器：若用户已启用，则随应用启动（Q8），端口取自设置（默认 9527，Q7）。
-            // 跑在 Tauri 托管异步运行时上，生命周期与应用一致（避免临时 Runtime drop 杀掉 accept 循环）。
+            // 内置 MCP 服务器：用户已启用则随应用启动（Q8），端口取自设置（默认 9527，Q7）。
+            // 跑在 Tauri 托管异步运行时上，生命周期与应用一致 ——
+            // 早期用 std::thread + 临时 Runtime + block_on 会让 Runtime drop 掉 accept 循环。
             if settings.mcp_enabled {
                 let mcp_bg = state.mcp.clone();
                 let store_bg = state.store.clone();
-                let port = settings.mcp_port;
                 tauri::async_runtime::spawn(async move {
-                    match mcp_bg.start(port).await {
-                        Ok(bound) => {
-                            // 端口“粘住”：某些机器上首选端口（如 9527/9528）被系统服务
-                            // （WUDFHost / Goodix 指纹服务）永久占用，每次启动都被迫回退。
-                            // 把实际绑定端口写回设置作为下次首选，避免每次开机重复
-                            // “绑定失败→向上探测→回退→重写客户端”的漂移过程。
-                            if bound != port {
-                                let _ = store_bg.set_mcp_port(bound);
-                            }
-                            // 启动时端口可能因占用回退到别的值：用实际绑定端口重写所有已注册分类的
-                            // 客户端配置，使 ~/.claude.json / config.toml 里的 url 端口跟真实端口一致，
-                            // 用户重启客户端即可用，无需手动重配（幂等：端口没变则不写盘）。
-                            let url = format!("http://127.0.0.1:{bound}/mcp");
-                            let timeout_ms = service::mcp_client_timeout_ms(&store_bg);
-                            let cats = store_bg.get_settings().mcp_registered_categories;
-                            for category in cats {
-                                {
-                                    match tools::register_mcp_client(category, &url, timeout_ms) {
-                                        Ok((msg, wrote)) => {
-                                            if wrote {
-                                                store_bg.append_event(category, "config", None, &msg);
-                                            }
-                                        }
-                                        Err(e) => store_bg.append_event(
-                                            category,
-                                            "error",
-                                            None,
-                                            &format!("MCP 启动后重写客户端失败: {e}"),
-                                        ),
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => tracing::warn!("MCP 服务器启动失败: {e}"),
-                    }
+                    service::start_mcp_on_launch(&store_bg, &mcp_bg).await;
                 });
             }
             Ok(())
