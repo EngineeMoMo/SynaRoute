@@ -1,0 +1,158 @@
+name: macOS check
+
+# macOS 移植的**编译反馈回路**（阶段 0）。
+#
+# 为什么需要它：mac 平台分支（`#[cfg(target_os = "macos")]`）在 Windows 上编不了，
+# 手上又没有 Mac。没有这个 workflow，每一行 mac 代码都只是「我说它能编译」——
+# 而本项目的验收纪律（docs/14 第七节、memory `verification-discipline`）明确
+# 禁止把未验证的东西报成完成。有了它，mac 分支的编译与单测都是可证伪的。
+#
+# 刻意**不做**的事：不出安装包、不签名、不公证。那些属阶段 3，另开 workflow。
+# 这里只回答一个问题：mac 上编得过吗、单测过几条。
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "src-tauri/**"
+      - "src/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/macos-check.yml"
+  pull_request:
+    paths:
+      - "src-tauri/**"
+      - "src/**"
+      # 必须带上本文件：否则「只改 workflow」的 PR 不会触发它自己，
+      # 改动无从验证（本 workflow 首次落地就是这种 PR）。
+      - ".github/workflows/macos-check.yml"
+  # 阶段 0 摸基线全靠手动触发
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # macos-latest 现为 arm64（Apple Silicon），即主目标平台。
+    # x86_64 (macos-13) 待阶段 3 出双架构包时再加 matrix。
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # 用 ci 而不是 install：锁文件对不上直接失败，不悄悄装成另一套版本
+      - name: Install frontend deps
+        run: npm ci
+
+      # 必须先出 dist/：lib.rs 的 `tauri::generate_context!()` 要嵌入 frontendDist
+      # （tauri.conf.json 指向 ../dist），目录不存在则编译期报错。
+      # 副产物：这一步同时在 macOS 上跑了 tsc（package.json 的 build = tsc && vite build）。
+      - name: Build frontend (dist/ 是 generate_context! 的前置)
+        run: npm run build
+
+      # `--locked`：Cargo.lock 已入库，CI 必须按它解析。少了这个标志，cargo 会在
+      # 版本可升时**改写 Cargo.lock**，于是最后那步 `git diff --quiet` 红在一个
+      # 与 mac 毫无关系的原因上（而且看起来像「故障注入没复原」，最难查的那种误报）。
+      - name: cargo check
+        working-directory: src-tauri
+        run: cargo check --locked --lib --all-targets
+
+      # 与本项目既有基线口径一致（CLAUDE.md：`cargo clippy --lib --all-targets` 零警告）。
+      # 暂不加 `-D warnings`：先看 macOS 上有没有 Windows 上看不见的警告，
+      # 清完再收紧（收紧动作记在 docs 的 mac 移植笔记里）。
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --locked --lib --all-targets
+
+      # 与既有基线同一条命令（CLAUDE.md：`cargo test --lib`）。
+      # continue-on-error：阶段 0 的目的是**取到数字**，不是一红了之——
+      # 真正的红/绿判定交给下一步，它会把通过数写进 Step Summary 再决定退出码。
+      - name: cargo test --lib
+        id: unit
+        working-directory: src-tauri
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo test --locked --lib --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/test.log"
+
+      - name: Report baseline
+        working-directory: src-tauri
+        run: |
+          log="$RUNNER_TEMP/test.log"
+          {
+            echo "## macOS 单测基线"
+            echo
+            echo '```'
+            grep -E "^test result:" "$log" || echo "(未取到 test result 行)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=$(grep -oE "[0-9]+ failed" "$log" | grep -oE "[0-9]+" | awk '{s+=$1} END {print s+0}')
+          passed=$(grep -oE "[0-9]+ passed" "$log" | grep -oE "[0-9]+" | awk '{s+=$1} END {print s+0}')
+          echo "macOS 基线: $passed passed / $failed failed"
+          if [ "$passed" -eq 0 ]; then
+            echo "::error::一条测试都没跑起来 —— 大概率是编译失败，不是「全绿」"
+            exit 1
+          fi
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::macOS 上有 $failed 条测试失败"
+            exit 1
+          fi
+
+      # ---- 故障注入自检 ----
+      #
+      # 这一步回答「本 workflow 到底证明了什么」。上面全绿有两种可能：
+      # (a) mac 分支真的编译通过了；(b) mac 分支压根没被编译，绿是假的。
+      # 往源码里塞一个**只在 macOS 下存在**的类型错误即可区分：cargo check 必须变红，
+      # 且必须是因为这个错误变红。与项目里三道路径防线的验证手法同源
+      # （去掉防线测试必须变红，见 agent_tools.rs 模块注释）。
+      - name: Fault-injection self-check
+        working-directory: src-tauri
+        run: |
+          probe='
+          #[cfg(target_os = "macos")]
+          fn _synaroute_ci_fault_probe() -> u32 { "not a u32" }
+          '
+          printf '%s\n' "$probe" >> src/proc.rs
+
+          if cargo check --locked --lib > "$RUNNER_TEMP/probe.log" 2>&1; then
+            git checkout -- src/proc.rs
+            echo "::error::注入的 mac 专属故障未被发现 —— mac 分支未被编译，本 workflow 证明不了任何事"
+            exit 1
+          fi
+
+          if ! grep -qE "_synaroute_ci_fault_probe|mismatched types" "$RUNNER_TEMP/probe.log"; then
+            git checkout -- src/proc.rs
+            echo "::error::cargo check 确实失败了，但不是因为注入的故障 —— 判据不成立"
+            cat "$RUNNER_TEMP/probe.log"
+            exit 1
+          fi
+
+          git checkout -- src/proc.rs
+          echo "故障注入已被 cargo check 抓到，且原因正确 ✓"
+
+      # 判据刻意用 `git diff`（只看**已跟踪**文件）而不是 `git status --porcelain`：
+      # 前面的 npm ci / npm run build 会产出 node_modules 与 dist（均已 gitignore），
+      # 用 status 会把它们当成「未复原」误红。cargo 那边加了 `--locked`，Cargo.lock 不会被改写。
+      - name: Verify working tree restored
+        run: |
+          if ! git diff --quiet; then
+            echo "::error::故障注入后工作区未复原"
+            git diff --stat
+            exit 1
+          fi
+          echo "工作区已复原 ✓"
