@@ -595,9 +595,34 @@ fn dpapi_decrypt(cipher: &[u8]) -> AppResult<Vec<u8>> {
     aes_decrypt(&fallback_key(), cipher)
 }
 
+/// 非 Windows 的**开发期**回退密钥。
+///
+/// ⚠️ **不是生产可用的方案**，且刻意在运行时喊出来。这把密钥是编译进二进制的常量 ——
+/// 谁拿到 `secrets.enc` 加一份程序就能全解出来。macOS 的正解是 Keychain（绑登录态，
+/// 与 Windows 的 DPAPI 信任模型对等），属 mac 移植阶段 1 的工作。
+///
+/// **发现史**（说明这条路径从未被走过）：原实现返回 `*b"synaroute-dev-fallback-key-32byte"`
+/// —— 那个字面量是 **33 字节**（名字里写着 32，数错了），于是整个
+/// `#[cfg(not(windows))]` 分支**根本编译不过**。注释声称「开发期在其他平台也能编译」，
+/// 而在 macOS runner 上首次编译即 E0308。这也解释了为什么这个缺陷能长期存在：
+/// Windows 上永远看不到它。
 #[cfg(not(windows))]
 fn fallback_key() -> [u8; 32] {
-    *b"synaroute-dev-fallback-key-32byte"
+    // 每进程只喊一次，避免转发热路径把日志刷爆；但一定要喊 ——
+    // 本项目反复防的就是「看起来在加密、其实等于明文」这种静默降级。
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::error!(
+            "密钥库正在使用**编译期常量**回退密钥（非 Windows 平台）。\
+             这等同于明文存储，仅供开发调试。生产分发前必须接 Keychain 或强制主口令模式。"
+        );
+    });
+
+    // 从固定串取前 32 字节。刻意不改成「凑成 32 字节的新字面量」——
+    // 那样只是把数错的字节数掩盖掉，而这把密钥的问题不在长度、在于它是常量。
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&b"synaroute-dev-fallback-key-32byt"[..32]);
+    key
 }
 
 /// AES-256-GCM（仅非 Windows 开发回退使用）

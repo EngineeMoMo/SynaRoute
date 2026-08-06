@@ -33,6 +33,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// 注：`creation_flags` 是 `tokio::process::Command` 在 Windows 上的**固有方法**，
 /// 不需要 `use std::os::windows::process::CommandExt`（那是给 `std` 的 Command 用的）。
 pub fn hidden(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    // `mut` 只有 Windows 分支用得上（`creation_flags` 取 `&mut self`）。非 Windows 上
+    // 它是死的，clippy/rustc 会报 unused_mut —— 在 macOS runner 上首次编译才看得见。
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut cmd = Command::new(program);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
