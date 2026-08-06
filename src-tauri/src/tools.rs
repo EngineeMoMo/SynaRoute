@@ -2466,6 +2466,86 @@ mod tests {
         assert!(once.contains("\"apiKey\": \"***\""), "掩码形态应保持: {once}");
     }
 
+    /// **同一个键名出现多次**时，每一处都要按自己的值类型独立处理。
+    ///
+    /// 这条是上面那个 bail-out 修复的直接后果：修法把不匹配时的游标落点从
+    /// `after_colon` 改成了 `after_key`，也就是「让那段原文交给后续循环重新扫」。
+    /// 若这个落点选错（例如落回 `rest` 开头），多次出现就会死循环或漏掉后面的；
+    /// 落得太远（跳过整个值）则会漏掉紧跟其后的另一处同名键。
+    ///
+    /// 这里刻意把布尔与字符串**交替排列**：非字符串那次走 bail-out、字符串那次走替换，
+    /// 两条路径交错走完还要保持各自正确。
+    #[test]
+    fn redact_handles_the_same_key_appearing_repeatedly() {
+        let raw = concat!(
+            "{\n",
+            "  \"apiKey\": true,\n",
+            "  \"nested\": { \"apiKey\": \"leak-one\" },\n",
+            "  \"apiKey\": 0,\n",
+            "  \"tail\": { \"apiKey\": \"leak-two\" }\n",
+            "}"
+        );
+        let out = redact_config_secrets(raw);
+
+        assert!(!out.contains("leak-one"), "第一个字符串值必须被掩码: {out}");
+        assert!(!out.contains("leak-two"), "最后一个也必须被掩码（游标落点若跳太远会漏掉它）: {out}");
+        assert!(out.contains("\"apiKey\": true,"), "布尔那次要原样保留: {out}");
+        assert!(out.contains("\"apiKey\": 0,"), "数值那次要原样保留: {out}");
+        assert_eq!(out.matches("\"***\"").count(), 2, "应恰好掩掉两处: {out}");
+        assert_eq!(redact_config_secrets(&out), out, "多次出现的情形也必须幂等");
+    }
+
+    /// 端到端：配置只读预览读**真实形状**的 `~/.claude.json`，必须掩掉密钥、
+    /// 且不弄坏其余 JSON。
+    ///
+    /// 上面那几条只测脱敏函数本身。这条走 `read_preview_text` —— 用户在
+    /// 「配置预览」面板里看到的就是它的返回值。夹具按 `apply_claude_cli` 真实写入的字段
+    /// 拼（`env.ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / 顶层 `model` / `mcpServers`），
+    /// 再掺进一个布尔字段 —— 那正是空白翻倍缺陷发作的位置。
+    ///
+    /// 判据里包含「输出仍是合法 JSON」：脱敏是纯文本替换，切错一个引号就会让整段
+    /// 预览变成不可读的乱码，而那种坏法在只断言「不含密钥」的测试下是绿的。
+    #[test]
+    fn preview_of_a_realistic_claude_config_masks_secrets_and_stays_valid_json() {
+        let path = temp_file("preview_real", ".claude.json");
+        let raw = concat!(
+            "{\n",
+            "  \"env\": {\n",
+            "    \"ANTHROPIC_BASE_URL\": \"http://127.0.0.1:8787\",\n",
+            "    \"ANTHROPIC_AUTH_TOKEN\": \"sk-ant-real-looking-token-value\",\n",
+            "    \"GATEWAY_MODEL_DISCOVERY\": \"1\"\n",
+            "  },\n",
+            "  \"model\": \"claude-opus-4-5\",\n",
+            "  \"hasSecret\": true,\n",
+            "  \"mcpServers\": {\n",
+            "    \"synaroute\": { \"type\": \"http\", \"url\": \"http://127.0.0.1:9527/mcp\", \"timeout\": 600000 }\n",
+            "  }\n",
+            "}\n"
+        );
+        std::fs::write(&path, raw).unwrap();
+
+        let (exists, text) = read_preview_text(&path, true).unwrap();
+        assert!(exists);
+        let text = text.expect("应读到内容");
+
+        // 密钥掩掉，但排障要用的其余字段一个不能少。
+        assert!(!text.contains("sk-ant-real-looking-token-value"), "令牌必须被掩码:\n{text}");
+        assert!(text.contains("http://127.0.0.1:8787"), "baseUrl 要留着（它常是问题根源）:\n{text}");
+        assert!(text.contains("claude-opus-4-5"), "模型名要留着:\n{text}");
+        assert!(text.contains("\"timeout\": 600000"), "MCP timeout 要留着:\n{text}");
+        // 布尔字段原样（空白翻倍缺陷正是在这里发作）。
+        assert!(text.contains("\"hasSecret\": true,"), "布尔字段间距被改动了:\n{text}");
+
+        // 仍是合法 JSON —— 切错引号的坏法只有这条能抓到。
+        let parsed: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("脱敏后不再是合法 JSON（{e}）:\n{text}"));
+        assert_eq!(parsed["env"]["ANTHROPIC_AUTH_TOKEN"], "***");
+        assert_eq!(parsed["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8787");
+        assert_eq!(parsed["hasSecret"], true);
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
     #[test]
     fn redact_handles_non_ascii_without_panic() {
         // 配置常含中文路径/工作目录（本机 Windows 用户名即中文）。脱敏必须按字符边界扫描，
