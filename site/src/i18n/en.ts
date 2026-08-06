@@ -30,6 +30,7 @@ export const en: Dict = {
 
   // ---------- Nav ----------
   "nav.home": "Home",
+  "nav.brain": "Brain",
   "nav.features": "Features",
   "nav.screenshots": "Screenshots",
   "nav.download": "Download",
@@ -39,11 +40,13 @@ export const en: Dict = {
 
   // ---------- Hero ----------
   "hero.badge": "Windows desktop app · Runs entirely on your machine",
-  "hero.title": "When one key fails, the next one takes over",
+  // Split in two so Hero can lock the tail with whitespace-nowrap — see zh.ts.
+  "hero.titleLead": "When one key fails, ",
+  "hero.titleTail": "the next takes over",
   "hero.desc":
-    "SynaRoute runs a local API routing proxy on your own machine, managing API keys from multiple vendors for Claude CLI, the Claude desktop app and the Codex desktop app. When your primary key times out or errors, requests fail over to the next available key in priority order — no config edits, no client restart.",
+    "A local API routing proxy that manages keys from multiple vendors for Claude CLI, the Claude desktop app and the Codex desktop app.",
   "hero.descSecond":
-    "Keys stay on your machine, encrypted at rest. There is no cloud account and nothing is uploaded.",
+    "When the primary key errors out, the next one takes over — no config edits, no client restart.",
   "hero.ctaPrimary": "Download for Windows",
   "hero.ctaPrimaryMacHint": "macOS build coming soon",
   "hero.ctaSecondary": "View on GitHub",
@@ -80,7 +83,7 @@ export const en: Dict = {
     "Anthropic Messages, OpenAI Chat Completions and OpenAI Responses convert both ways, streaming and non-streaming alike.",
 
   // ---------- Features ----------
-  "features.title": "Features",
+  "features.title": "Everything else",
   "features.subtitle": "Built around three problems: many keys, many clients, many protocols.",
 
   "features.failover.name": "Failover routing",
@@ -127,6 +130,39 @@ export const en: Dict = {
   "features.tray.short": "Lives in the tray; start/stop proxies and switch primary keys from there.",
   "features.tray.desc":
     "The tray icon reflects whether proxies are running. Its menu starts and stops each category's proxy and switches the primary key. Optional autostart launches the app minimised to the tray with Windows.",
+
+  // ---------- Brain aggregation spotlight ----------
+  // Only claims the app actually delivers. The "decider is required" and "tools are off
+  // by default and cost more" notes are deliberate: state the cost up front.
+  "brain.badge": "Signature capability",
+  "brain.title": "Let several models think it through, then have one decide",
+  "brain.subtitle":
+    "The same question goes to multiple models in parallel, then a decider model you pick synthesises the final answer. Useful for code review, design work and hard debugging — tasks where a single model tends to miss angles.",
+
+  "brain.flow.members": "Members answer in parallel",
+  "brain.flow.membersHint": "2–4 key + model pairs, running at once",
+  "brain.flow.merge": "Merge",
+  "brain.flow.mergeHint": "Condense to save quota, or pass everything through",
+  "brain.flow.decider": "Decider concludes",
+  "brain.flow.deciderHint": "Required — pick your strongest model",
+
+  "brain.cap.strategy.title": "Two merge strategies",
+  "brain.cap.strategy.desc":
+    "Condensed merge has a summariser trim each answer first, which saves quota when you have several members. Full context hands the decider every answer verbatim, which keeps the most information. Concurrency cap and per-member timeout are both adjustable.",
+  "brain.cap.retrieval.title": "Reads your code on demand",
+  "brain.cap.retrieval.desc":
+    "You can enable a set of read-only tools so members decide for themselves which files to read, what to search for and which symbols to look up. The tools never write files or run commands, and stay inside the working directory. Off by default — every round resends the full history, so it costs noticeably more quota.",
+  "brain.cap.images.title": "Accepts images",
+  "brain.cap.images.desc":
+    "Error screenshots and design mockups work as input: up to 4 images, 5MB each. If any image fails validation the whole call errors out and tells you why — it never silently drops one and hands you an answer that didn't actually look at it.",
+  "brain.cap.mcp.title": "Also works as an MCP tool",
+  "brain.cap.mcp.desc":
+    "Turn on the MCP server and Codex CLI or Claude Code can call it directly. That channel only returns suggestions and never touches your files — your client still makes every edit.",
+
+  "brain.ctaDocs": "Read the guide",
+  "brain.ctaMcp": "Use it via MCP",
+  "brain.screenshotAlt":
+    "Brain aggregation settings: member list, final decider, merge strategy, concurrency and timeout",
 
   // ---------- Screenshots ----------
   "screenshots.title": "A look at the app",
@@ -278,14 +314,17 @@ export const en: Dict = {
   "footer.privacy": "Privacy policy",
   "footer.terms": "Terms of use",
   "footer.email": "Email",
-  "footer.authorSite": "Author's site",
+  "footer.authorSite": "Author @{name}",
   "footer.copyright": "© {year} SynaRoute. All rights reserved.",
   "footer.sourceNote": "Source available on GitHub (no open-source license attached yet).",
 
   // ---------- Platforms ----------
   "platform.windows.name": "Windows",
+  "platform.windows.format": "exe · NSIS installer",
   "platform.macos.name": "macOS",
+  "platform.macos.format": "dmg",
   "platform.linux.name": "Linux",
+  "platform.linux.format": "AppImage",
 
   // ---------- Docs ----------
   "docs.title": "Documentation",

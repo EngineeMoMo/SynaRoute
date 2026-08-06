@@ -39,7 +39,7 @@ export function HeroDownloadButton() {
     const win = resolveDownload(windows, release);
     return (
       <div className="flex flex-col items-center gap-2 sm:items-start">
-        <span className="inline-flex h-14 cursor-not-allowed items-center justify-center gap-2 rounded-control border border-dashed border-border px-7 text-base font-medium text-text-muted">
+        <span className="inline-flex h-14 cursor-not-allowed items-center justify-center gap-2 rounded-control border border-dashed border-border px-7 text-base font-medium text-text-secondary">
           <Clock size={18} aria-hidden="true" />
           {t("hero.ctaPrimaryMacHint")}
         </span>
@@ -65,7 +65,7 @@ export function HeroDownloadButton() {
   );
 }
 
-/** Hero 下方那行「支持平台」图标，未发布的平台半透明并标注 */
+/** Hero 下方那行「支持平台」图标，未发布的平台配「即将推出」小标签 */
 export function PlatformBadges({ className }: { className?: string }) {
   const t = useT();
   return (
@@ -74,17 +74,13 @@ export function PlatformBadges({ className }: { className?: string }) {
         const Icon = PLATFORM_ICON[p.id];
         const soon = p.status === "coming-soon";
         return (
-          <li
-            key={p.id}
-            className={cn(
-              "inline-flex items-center gap-1.5 text-sm",
-              soon ? "text-text-muted" : "text-text-secondary"
-            )}
-          >
-            <Icon size={16} aria-hidden="true" className={cn(soon && "opacity-60")} />
+          // 「未发布」不靠调淡文字表达（深色模式下 text-muted 只有 2.5:1 读不清），
+          // 而是靠右侧那个明确写着「即将推出」的标签 + 图标降透明度
+          <li key={p.id} className="inline-flex items-center gap-1.5 text-sm text-text-secondary">
+            <Icon size={16} aria-hidden="true" className={cn(soon && "opacity-50")} />
             <span>{t(`platform.${p.id}.name`)}</span>
             {soon && (
-              <span className="rounded-pill bg-surface-hover px-1.5 py-0.5 text-[11px] text-text-muted">
+              <span className="rounded-pill border border-border px-1.5 py-0.5 text-[11px] text-text-secondary">
                 {t("common.comingSoon")}
               </span>
             )}
@@ -124,7 +120,7 @@ export function PlatformCard({
       )}
     >
       {recommended && (
-        <span className="absolute -top-2.5 left-6 rounded-pill bg-primary px-2.5 py-0.5 text-[11px] font-medium text-primary-foreground">
+        <span className="absolute -top-2.5 left-6 rounded-pill bg-primary-solid px-2.5 py-0.5 text-[11px] font-medium text-primary-foreground">
           {t("download.recommended")}
         </span>
       )}
@@ -133,30 +129,30 @@ export function PlatformCard({
         <span
           className={cn(
             "inline-flex h-11 w-11 items-center justify-center rounded-control",
-            soon ? "bg-surface-hover text-text-muted" : "bg-primary/12 text-primary"
+            soon ? "bg-surface-hover text-text-secondary" : "bg-primary/12 text-primary"
           )}
         >
           <Icon size={22} aria-hidden="true" />
         </span>
         <div>
           <h3 className="text-base font-semibold text-text-primary">{t(`platform.${platform.id}.name`)}</h3>
-          <p className="text-xs text-text-muted">{platform.format}</p>
+          <p className="text-[13px] text-text-secondary">{t(`platform.${platform.id}.format`)}</p>
         </div>
       </div>
 
       <dl className="mt-5 space-y-2 text-sm">
         <div className="flex justify-between gap-3">
-          <dt className="text-text-muted">{t("download.version")}</dt>
-          <dd className="font-mono text-text-secondary">{soon ? "—" : release.version}</dd>
+          <dt className="text-text-secondary">{t("download.version")}</dt>
+          <dd className="font-mono text-text-primary">{soon ? "—" : release.version}</dd>
         </div>
         <div className="flex justify-between gap-3">
-          <dt className="shrink-0 text-text-muted">{t("download.minOS")}</dt>
-          <dd className="text-right text-text-secondary">{platform.minOS}</dd>
+          <dt className="shrink-0 text-text-secondary">{t("download.minOS")}</dt>
+          <dd className="text-right text-text-primary">{platform.minOS}</dd>
         </div>
         {!soon && dl.size > 0 && (
           <div className="flex justify-between gap-3">
-            <dt className="text-text-muted">{t("download.size")}</dt>
-            <dd className="text-text-secondary">{formatBytes(dl.size)}</dd>
+            <dt className="text-text-secondary">{t("download.size")}</dt>
+            <dd className="text-text-primary">{formatBytes(dl.size)}</dd>
           </div>
         )}
       </dl>
@@ -170,7 +166,7 @@ export function PlatformCard({
         ) : (
           <span
             aria-disabled="true"
-            className="inline-flex h-12 w-full cursor-not-allowed items-center justify-center gap-2 rounded-control border border-dashed border-border px-6 text-[15px] font-medium text-text-muted"
+            className="inline-flex h-12 w-full cursor-not-allowed items-center justify-center gap-2 rounded-control border border-dashed border-border px-6 text-[15px] font-medium text-text-secondary"
           >
             <Clock size={17} aria-hidden="true" />
             {t("download.buttonComingSoon")}
@@ -179,7 +175,7 @@ export function PlatformCard({
       </div>
 
       {soon && (
-        <p className="mt-3 text-xs leading-relaxed text-text-muted">
+        <p className="mt-3 text-[13px] leading-relaxed text-text-secondary">
           {platform.id === "macos" ? t("download.macNote") : t("download.linuxNote")}
         </p>
       )}
@@ -208,7 +204,7 @@ export function PlatformGrid({ className }: { className?: string }) {
       </div>
 
       {release.source === "fallback" && (
-        <p className="mt-5 text-center text-xs leading-relaxed text-text-muted">
+        <p className="mt-5 text-center text-[13px] leading-relaxed text-text-secondary">
           {t("download.fallbackNote")}{" "}
           <a
             href={siteConfig.github.releases}

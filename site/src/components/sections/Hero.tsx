@@ -6,13 +6,16 @@ import { Screenshot } from "@/components/ui/Screenshot";
 import { heroScreenshot } from "@/data/screenshots";
 import { siteConfig } from "@/config/site";
 import { useLatestRelease } from "@/hooks/useRelease";
-import { useT } from "@/hooks/useLang";
+import { useLang, useT } from "@/hooks/useLang";
 import { useTheme } from "@/hooks/useTheme";
 
 export function Hero() {
   const t = useT();
+  const lang = useLang();
   const { theme } = useTheme();
   const { release } = useLatestRelease();
+  // 只有中文需要锁住换行点，理由见下面 h1 处的注释
+  const lockWrap = lang === "zh" ? "whitespace-nowrap" : undefined;
 
   return (
     <section className="relative overflow-hidden pt-28 sm:pt-32 lg:pt-36">
@@ -24,19 +27,27 @@ export function Hero() {
       />
 
       <Container>
-        <div className="mx-auto max-w-3xl text-center">
+        <div className="mx-auto max-w-4xl text-center">
           <p className="animate-fade-in inline-flex items-center rounded-pill border border-border bg-surface px-3.5 py-1.5 text-xs font-medium text-text-secondary">
             {t("hero.badge")}
           </p>
 
-          <h1 className="animate-fade-up mt-6 text-hero-sm font-bold text-text-primary sm:text-hero">
-            {t("hero.title")}
+          {/* 标题排版，中英各有各的坑：
+              · text-balance 让浏览器均分各行宽度 —— 没有它，桌面端会断成
+                「…下一个自动接」+ 孤零零一个「上」
+              · 中文额外把两段各锁成整体：中文没有词边界，浏览器可在任意两字之间断行，
+                会断出「一个 Key 失 / 效，」这种半个词。英文**不能**锁 ——
+                实测 320px 下单段就要 325px，锁死会被 section 的 overflow-hidden 裁掉
+              · max-w-4xl（不是 3xl）给 3.5rem 的字号留够横向空间 */}
+          <h1 className="animate-fade-up mt-6 text-balance text-hero-sm font-bold text-text-primary sm:text-hero">
+            <span className={lockWrap}>{t("hero.titleLead")}</span>
+            <span className={lockWrap}>{t("hero.titleTail")}</span>
           </h1>
 
-          <p className="animate-fade-up mt-6 text-base leading-relaxed text-text-secondary sm:text-lg">
+          <p className="animate-fade-up mx-auto mt-6 max-w-2xl text-balance text-base leading-relaxed text-text-secondary sm:text-lg">
             {t("hero.desc")}
           </p>
-          <p className="animate-fade-up mt-3 text-sm leading-relaxed text-text-muted sm:text-base">
+          <p className="animate-fade-up mx-auto mt-3 max-w-xl text-balance text-sm leading-relaxed text-text-secondary sm:text-[15px]">
             {t("hero.descSecond")}
           </p>
 
@@ -50,7 +61,7 @@ export function Hero() {
 
           <div className="mt-6 flex flex-col items-center gap-3">
             <PlatformBadges className="justify-center" />
-            <p className="text-xs text-text-muted">
+            <p className="text-xs text-text-secondary">
               {t("hero.versionPrefix")} <span className="font-mono">{release.version}</span>
             </p>
           </div>

@@ -1,14 +1,14 @@
 import { Section, SectionTitle, Reveal } from "@/components/ui/Section";
 import { features } from "@/data/features";
 import { useT } from "@/hooks/useLang";
-import { cn } from "@/lib/utils";
 
 /**
- * 核心功能区，Bento 布局。
+ * 常规功能区，Bento 布局。
  *
- * 刻意不让九个功能长成一模一样的卡片（模板第 6.4 节）：
- * 前两个是主卖点，各占半行、字号更大、有详细描述；其余七个走三列小格。
- * 这样扫一眼就知道哪两件事最重要。
+ * 两个 `half`（占半行、字号更大）+ 六个 `third`（三列小格），两行都排满。
+ * 数量约束写在 data/features.ts 的注释里。
+ *
+ * 大脑聚合**不在这里** —— 它有独立的 BrainSpotlight 区块（紧跟 Benefits）。
  */
 export function Features() {
   const t = useT();
@@ -29,10 +29,13 @@ export function Features() {
                   <Icon size={23} aria-hidden="true" />
                 </span>
                 <h3 className="mt-5 text-xl font-semibold text-text-primary">{t(`${f.i18nPrefix}.name`)}</h3>
-                <p className="mt-2 text-[15px] font-medium leading-relaxed text-text-secondary">
+                {/* 引导句用 primary 色 + medium，说明段用 secondary。
+                    层级靠字号字重拉开 —— 别把说明段改成 text-muted，那一档
+                    对比度只有 2.56:1，见 styles.css 顶部说明 */}
+                <p className="mt-2 text-[15px] font-medium leading-relaxed text-text-primary">
                   {t(`${f.i18nPrefix}.short`)}
                 </p>
-                <p className="mt-4 text-sm leading-relaxed text-text-muted">{t(`${f.i18nPrefix}.desc`)}</p>
+                <p className="mt-4 text-sm leading-relaxed text-text-secondary">{t(`${f.i18nPrefix}.desc`)}</p>
               </article>
             </Reveal>
           );
@@ -44,21 +47,17 @@ export function Features() {
           const Icon = f.icon;
           return (
             <Reveal key={f.id} delay={i * 50} className="h-full">
-              <article
-                className={cn(
-                  "flex h-full flex-col rounded-card border border-border bg-surface p-6 shadow-card transition-shadow hover:shadow-card-hover"
-                )}
-              >
+              <article className="flex h-full flex-col rounded-card border border-border bg-surface p-6 shadow-card transition-shadow hover:shadow-card-hover">
                 <div className="flex items-center gap-3">
                   <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-control bg-surface-hover text-text-secondary">
                     <Icon size={18} aria-hidden="true" />
                   </span>
                   <h3 className="text-base font-semibold text-text-primary">{t(`${f.i18nPrefix}.name`)}</h3>
                 </div>
-                <p className="mt-3 text-sm font-medium leading-relaxed text-text-secondary">
+                <p className="mt-3 text-sm font-medium leading-relaxed text-text-primary">
                   {t(`${f.i18nPrefix}.short`)}
                 </p>
-                <p className="mt-2.5 text-xs leading-relaxed text-text-muted">{t(`${f.i18nPrefix}.desc`)}</p>
+                <p className="mt-2 text-[13px] leading-relaxed text-text-secondary">{t(`${f.i18nPrefix}.desc`)}</p>
               </article>
             </Reveal>
           );

@@ -15,7 +15,9 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        primary: "bg-primary text-primary-foreground shadow-card hover:opacity-90 active:scale-[0.99]",
+        // 底色用 primary-solid 而不是 primary：深色模式下 primary 被提亮过，
+        // 白字压上去只有 3.57:1。见 tailwind.config.js 里该 token 的说明。
+        primary: "bg-primary-solid text-primary-foreground shadow-card hover:opacity-90 active:scale-[0.99]",
         secondary: "bg-surface-hover text-text-primary border border-border hover:bg-border/40",
         outline: "border border-border bg-transparent text-text-primary hover:bg-surface-hover",
         ghost: "text-text-secondary hover:bg-surface-hover hover:text-text-primary",

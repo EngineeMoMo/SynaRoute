@@ -6,7 +6,6 @@ import {
   ArrowLeftRight,
   Split,
   Replace,
-  Brain,
   KeyRound,
   PlugZap,
   ScrollText,
@@ -41,17 +40,20 @@ export interface Feature {
   i18nPrefix: string;
   /**
    * 在 Bento 网格里占据的宽度。
-   * 头两个功能是最核心的卖点，给整行/半行的大格子；其余走三列小格子，
-   * 避免「八个一模一样的卡片」那种没有信息层级的排布。
+   *
+   * **两个 `half` + 六个 `third` 是刻意凑的整数**：half 走两列一行、third 走三列两行，
+   * 每一行都排满。加功能时要么成对加 half、要么按三个一组加 third，否则最后一行会
+   * 剩一个孤零零的卡片（视觉上像是没做完）。
+   *
+   * 大脑聚合不在这个列表里 —— 它有独立的 `BrainSpotlight` 区块，别再往这儿加一份。
    */
-  span: "wide" | "half" | "third";
+  span: "half" | "third";
 }
 
 export const features: Feature[] = [
   { id: "failover", icon: Split, i18nPrefix: "features.failover", span: "half" },
-  { id: "brain", icon: Brain, i18nPrefix: "features.brain", span: "half" },
+  { id: "protocol", icon: ArrowLeftRight, i18nPrefix: "features.protocol", span: "half" },
   { id: "mapping", icon: Replace, i18nPrefix: "features.mapping", span: "third" },
-  { id: "protocol", icon: ArrowLeftRight, i18nPrefix: "features.protocol", span: "third" },
   { id: "secret", icon: KeyRound, i18nPrefix: "features.secret", span: "third" },
   { id: "apply", icon: PlugZap, i18nPrefix: "features.apply", span: "third" },
   { id: "logs", icon: ScrollText, i18nPrefix: "features.logs", span: "third" },

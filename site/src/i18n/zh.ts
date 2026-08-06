@@ -31,7 +31,8 @@ export const zh: Dict = {
 
   // ---------- 导航 ----------
   "nav.home": "首页",
-  "nav.features": "核心功能",
+  "nav.brain": "大脑聚合",
+  "nav.features": "功能",
   "nav.screenshots": "产品截图",
   "nav.download": "下载",
   "nav.docs": "使用文档",
@@ -40,10 +41,13 @@ export const zh: Dict = {
 
   // ---------- Hero ----------
   "hero.badge": "Windows 桌面软件 · 全部本地运行",
-  "hero.title": "一个 Key 失效，下一个自动接上",
+  // 标题拆两段：后半段在 Hero 里套 whitespace-nowrap 锁成整体，
+  // 避免窄屏把「下一个自动接上」断成孤字。改文案时保持这个切分点。
+  "hero.titleLead": "一个 Key 失效，",
+  "hero.titleTail": "下一个自动接上",
   "hero.desc":
-    "SynaRoute 在你的电脑上架起一层本地 API 路由代理，为 Claude CLI、Claude 桌面端和 Codex 桌面端统一管理多个厂商的 API Key。主 Key 超时或报错时按优先级自动转移到下一个可用 Key，客户端无感知，不用改配置、不用重启。",
-  "hero.descSecond": "密钥全程留在本机加密存储，没有云端账号，也不会上传任何配置。",
+    "本机运行的 API 路由代理，为 Claude CLI、Claude 桌面端和 Codex 桌面端统一管理多家厂商的 Key。",
+  "hero.descSecond": "主 Key 报错就自动换下一个，客户端无感知——不改配置，不用重启。",
   "hero.ctaPrimary": "下载 Windows 版",
   "hero.ctaPrimaryMacHint": "macOS 版即将推出",
   "hero.ctaSecondary": "查看 GitHub",
@@ -74,7 +78,7 @@ export const zh: Dict = {
     "支持 Anthropic Messages、OpenAI Chat Completions、OpenAI Responses 三种协议互转，流式与非流式都覆盖。",
 
   // ---------- 核心功能 ----------
-  "features.title": "核心功能",
+  "features.title": "其他功能",
   "features.subtitle": "围绕「多 Key、多客户端、多协议」这三件事展开。",
 
   "features.failover.name": "故障转移路由",
@@ -121,6 +125,38 @@ export const zh: Dict = {
   "features.tray.short": "常驻托盘，可快速启停代理与切换主 Key。",
   "features.tray.desc":
     "托盘图标按代理运行状态变化。右键菜单可分别启停三个分类的代理、快速切换主 Key。可选开机自启动，随系统启动时最小化到托盘。",
+
+  // ---------- 大脑聚合专区 ----------
+  // 只写软件真的能做的事。「决策者必填」「工具调用默认关且更耗额度」这两条
+  // 是刻意写进来的：先说清代价，用户装了之后不会觉得被夸大宣传骗了。
+  "brain.badge": "特色能力",
+  "brain.title": "让多个模型一起想，再由一个模型拍板",
+  "brain.subtitle":
+    "同一个问题交给多个模型并行回答，再由你指定的决策模型综合出最终结论。适合代码审查、方案设计、疑难排查这类单个模型容易漏视角的任务。",
+
+  "brain.flow.members": "成员并行回答",
+  "brain.flow.membersHint": "2～4 个 Key + 模型的组合，同时开跑",
+  "brain.flow.merge": "汇总",
+  "brain.flow.mergeHint": "压缩汇总省额度，或全量上下文保信息",
+  "brain.flow.decider": "决策者产出结论",
+  "brain.flow.deciderHint": "必填，建议选能力最强的那个模型",
+
+  "brain.cap.strategy.title": "两种汇总策略",
+  "brain.cap.strategy.desc":
+    "压缩汇总先让汇总模型把各家答案精简，成员多时更省额度；全量上下文把原答案整份交给决策者，信息最全。并发上限与单成员超时都可调。",
+  "brain.cap.retrieval.title": "按需读你的代码",
+  "brain.cap.retrieval.desc":
+    "可开启一组只读工具，让成员自己决定读哪个文件、搜什么关键词、看哪个符号。工具永不写文件、不执行命令，且限制在工作目录内。默认关闭——每轮都要重发完整历史，额度消耗明显更高。",
+  "brain.cap.images.title": "支持传图",
+  "brain.cap.images.desc":
+    "报错截图、界面稿都可以作为输入。最多 4 张、单张不超过 5MB。任何一张不合规会整次报错说明原因，不会静默丢掉某张图让你拿到一个「其实没看图」的答案。",
+  "brain.cap.mcp.title": "也能当 MCP 工具用",
+  "brain.cap.mcp.desc":
+    "开启 MCP 服务器后，Codex CLI 与 Claude Code 可以直接调用它。这条通道只返回建议、绝不改你的文件，所有修改仍由你的客户端执行。",
+
+  "brain.ctaDocs": "看使用说明",
+  "brain.ctaMcp": "作为 MCP 工具接入",
+  "brain.screenshotAlt": "大脑聚合配置界面：参与成员列表、最终决策者、聚合策略与并发超时设置",
 
   // ---------- 截图 ----------
   "screenshots.title": "界面一览",
@@ -263,14 +299,17 @@ export const zh: Dict = {
   "footer.privacy": "隐私政策",
   "footer.terms": "用户协议",
   "footer.email": "邮箱",
-  "footer.authorSite": "作者主页",
+  "footer.authorSite": "作者 @{name}",
   "footer.copyright": "© {year} SynaRoute. 保留所有权利。",
   "footer.sourceNote": "源码公开在 GitHub（尚未附带开源许可证）。",
 
   // ---------- 平台 ----------
   "platform.windows.name": "Windows",
+  "platform.windows.format": "exe · NSIS 安装包",
   "platform.macos.name": "macOS",
+  "platform.macos.format": "dmg",
   "platform.linux.name": "Linux",
+  "platform.linux.format": "AppImage",
 
   // ---------- 文档 ----------
   "docs.title": "使用文档",

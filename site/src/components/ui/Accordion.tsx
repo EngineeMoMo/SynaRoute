@@ -12,12 +12,16 @@ export interface AccordionEntry {
  * FAQ 手风琴。
  *
  * 用原生 <button> + aria-expanded/aria-controls，而不是 <details>：
- * 需要控制「默认展开第一条」以及展开动画，<details> 两者都不好做。
+ * 需要控制展开动画与「同时展开多条」，<details> 两者都不好做。
  * 键盘可达性由 button 天然保证（Enter/Space 都能触发）。
+ *
+ * 排版上刻意每条独立成卡片（不是一整块里用分隔线切开）：十条问题堆在一个大框里时，
+ * 每行只有一条细线，扫视起来是一片密集的横线，看不出条目边界。独立卡片 + 间距后
+ * 每条是一个可点的对象，展开的那条还能靠边框高亮出来。
  */
 export function Accordion({ items, className }: { items: AccordionEntry[]; className?: string }) {
-  // 默认展开第一条：进来就有内容可读，比全收起更友好（模板第 6.9 节允许二选一）
-  const [openIds, setOpenIds] = useState<string[]>(() => (items[0] ? [items[0].id] : []));
+  // 默认全收起：十条问题若展开第一条，首屏会被一段长答案占掉，反而看不清有哪些问题
+  const [openIds, setOpenIds] = useState<string[]>([]);
   const baseId = useId();
 
   function toggle(id: string) {
@@ -25,13 +29,19 @@ export function Accordion({ items, className }: { items: AccordionEntry[]; class
   }
 
   return (
-    <div className={cn("divide-y divide-border overflow-hidden rounded-card border border-border bg-surface", className)}>
-      {items.map((item) => {
+    <div className={cn("space-y-3", className)}>
+      {items.map((item, i) => {
         const open = openIds.includes(item.id);
         const btnId = `${baseId}-${item.id}-btn`;
         const panelId = `${baseId}-${item.id}-panel`;
         return (
-          <div key={item.id}>
+          <div
+            key={item.id}
+            className={cn(
+              "overflow-hidden rounded-card border bg-surface transition-colors",
+              open ? "border-primary/40 shadow-card" : "border-border hover:border-text-muted/40"
+            )}
+          >
             <h3>
               <button
                 id={btnId}
@@ -39,21 +49,33 @@ export function Accordion({ items, className }: { items: AccordionEntry[]; class
                 aria-expanded={open}
                 aria-controls={panelId}
                 onClick={() => toggle(item.id)}
-                className="flex w-full items-center justify-between gap-4 px-5 py-4 text-left transition-colors hover:bg-surface-hover sm:px-6 sm:py-5"
+                className="flex w-full items-start gap-4 px-5 py-4 text-left transition-colors hover:bg-surface-hover sm:px-6 sm:py-5"
               >
-                <span className="text-[15px] font-medium text-text-primary">{item.question}</span>
+                {/* 编号：给十条问题一个可指认的序号，答复用户时能说「第 6 条」 */}
+                <span
+                  aria-hidden="true"
+                  className={cn(
+                    "mt-px inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full font-mono text-[11px] font-semibold transition-colors",
+                    open ? "bg-primary-solid text-primary-foreground" : "bg-surface-hover text-text-secondary"
+                  )}
+                >
+                  {i + 1}
+                </span>
+                <span className="flex-1 text-[15px] font-medium leading-6 text-text-primary">
+                  {item.question}
+                </span>
                 <ChevronDown
                   size={18}
                   aria-hidden="true"
                   className={cn(
-                    "shrink-0 text-text-muted transition-transform duration-250",
-                    open && "rotate-180"
+                    "mt-0.5 shrink-0 transition-transform duration-250",
+                    open ? "rotate-180 text-primary" : "text-text-secondary"
                   )}
                 />
               </button>
             </h3>
             {/* grid-rows 从 0fr 到 1fr 是唯一能对「未知高度」做纯 CSS 过渡的写法；
-                收起时 aria-hidden + 不可聚焦，避免读屏和 Tab 键进到看不见的内容里 */}
+                收起时 aria-hidden，避免读屏和 Tab 键进到看不见的内容里 */}
             <div
               id={panelId}
               role="region"
@@ -65,7 +87,10 @@ export function Accordion({ items, className }: { items: AccordionEntry[]; class
               )}
             >
               <div className="overflow-hidden">
-                <p className="px-5 pb-5 text-[15px] leading-7 text-text-secondary sm:px-6 sm:pb-6">
+                {/* 左内边距对齐问题文字，答案看起来是挂在问题下面的。
+                    64px = 按钮内边距 24（sm:px-6）+ 编号 24（w-6）+ 间距 16（gap-4）。
+                    改上面任何一个值，这里要跟着改，否则答案会和问题错开一点点。 */}
+                <p className="px-5 pb-5 text-[15px] leading-7 text-text-secondary sm:pb-6 sm:pl-16 sm:pr-6">
                   {item.answer}
                 </p>
               </div>

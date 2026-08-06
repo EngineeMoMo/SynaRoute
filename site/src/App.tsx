@@ -61,7 +61,7 @@ function LangLayout() {
       {/* 跳过导航直达正文：键盘用户第一个 Tab 就能拿到 */}
       <a
         href="#main"
-        className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[60] focus:rounded-control focus:bg-primary focus:px-4 focus:py-2 focus:text-primary-foreground"
+        className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[60] focus:rounded-control focus:bg-primary-solid focus:px-4 focus:py-2 focus:text-primary-foreground"
       >
         {t("common.skipToContent")}
       </a>

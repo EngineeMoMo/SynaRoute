@@ -37,7 +37,7 @@ export function FinalCTA() {
 
           <div className="mt-6 flex flex-col items-center gap-2">
             <PlatformBadges className="justify-center" />
-            <p className="text-xs text-text-muted">
+            <p className="text-xs text-text-secondary">
               {t("hero.versionPrefix")} <span className="font-mono">{release.version}</span>
             </p>
           </div>

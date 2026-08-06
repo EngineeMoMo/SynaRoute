@@ -15,6 +15,8 @@ export interface NavItem {
 }
 
 export const navItems: NavItem[] = [
+  // 大脑聚合排在功能之前：它是唯一「别处没有」的能力，顶栏得能直接跳过去
+  { id: "brain", labelKey: "nav.brain", hash: "brain" },
   { id: "features", labelKey: "nav.features", hash: "features" },
   { id: "screenshots", labelKey: "nav.screenshots", hash: "screenshots" },
   { id: "download", labelKey: "nav.download", path: "download" },
@@ -27,6 +29,7 @@ export const footerNav: { titleKey: string; items: NavItem[] }[] = [
   {
     titleKey: "footer.product",
     items: [
+      { id: "brain", labelKey: "nav.brain", hash: "brain" },
       { id: "features", labelKey: "nav.features", hash: "features" },
       { id: "screenshots", labelKey: "nav.screenshots", hash: "screenshots" },
       { id: "download", labelKey: "nav.download", path: "download" },

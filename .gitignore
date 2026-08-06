@@ -41,3 +41,6 @@ secrets.enc
 
 # ---- 官网截图采集用的临时 Chrome 配置目录（脚本已改用系统临时目录，此处为双保险）----
 .chrome-capture/
+
+# ---- 官网排版人工核对用的截图，只在本地生成、不入库 ----
+site/.shots-review/

@@ -21,7 +21,9 @@ export function Benefits() {
                 </span>
                 <h3 className="mt-4 text-base font-semibold text-text-primary">{t(`${b.i18nPrefix}.name`)}</h3>
                 <p className="mt-2 text-sm leading-relaxed text-text-secondary">{t(`${b.i18nPrefix}.desc`)}</p>
-                <p className="mt-3 border-t border-border pt-3 text-xs leading-relaxed text-text-muted">
+                {/* 补充说明比上面一句更次要，但仍要能读 —— 靠字号（13px）和分隔线
+                    区分层级，不用 text-muted（对比度 2.56:1 不达标） */}
+                <p className="mt-3 border-t border-border pt-3 text-[13px] leading-relaxed text-text-secondary">
                   {t(`${b.i18nPrefix}.more`)}
                 </p>
               </div>

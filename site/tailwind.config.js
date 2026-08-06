@@ -22,6 +22,19 @@ export default {
 
       // ---- 以下为官网独有，桌面应用不需要 ----
 
+      colors: {
+        ...appConfig.theme.extend.colors,
+        /**
+         * 实心按钮/徽标的底色，白字压在上面。
+         *
+         * 为什么不直接用 `primary`：深色模式把 `--primary` 提亮成 #8174FF 是为了
+         * 「主色当文字画在近黑底上」，而白字压在这个亮紫上只有 3.57:1，达不到 AA。
+         * 两种用法的诉求相反，只能分成两个 token。浅色模式两者同值，观感不变。
+         * 见 styles.css 里 --primary-solid 的注释。
+         */
+        "primary-solid": "rgb(var(--primary-solid) / <alpha-value>)",
+      },
+
       maxWidth: {
         // 正文主容器宽度：模板建议 1120~1280，取中间值兼顾大屏留白与信息密度
         content: "1200px",

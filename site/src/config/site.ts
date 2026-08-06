@@ -33,9 +33,9 @@ export const siteConfig = {
   fallbackVersion: "v0.1.9",
 
   author: {
-    name: "EngineeMoMo",
+    name: GITHUB_OWNER,
+    /** 作者主页统一用 GitHub 个人页 —— 这里能直接看到项目本身，比另开一个站更有用 */
     url: `https://github.com/${GITHUB_OWNER}`,
-    site: "https://www.mofamilys.com",
     email: "mhm292117@163.com",
   },
 

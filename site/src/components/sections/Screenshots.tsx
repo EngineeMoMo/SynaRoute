@@ -55,7 +55,7 @@ export function Screenshots() {
               </button>
               <figcaption className="mt-3">
                 <span className="text-sm font-medium text-text-primary">{t(`${s.i18nPrefix}.title`)}</span>
-                <span className="mt-1 block text-xs leading-relaxed text-text-muted">
+                <span className="mt-1 block text-[13px] leading-relaxed text-text-secondary">
                   {t(`${s.i18nPrefix}.desc`)}
                 </span>
               </figcaption>

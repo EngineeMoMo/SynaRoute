@@ -1,5 +1,5 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { Github, Mail, Globe } from "lucide-react";
+import { Github, Mail } from "lucide-react";
 import { Logo } from "@/components/ui/Logo";
 import { Container } from "@/components/ui/Section";
 import { footerNav } from "@/data/nav";
@@ -32,7 +32,7 @@ export function Footer() {
               <Logo size={30} />
             </Link>
             <p className="mt-4 max-w-sm text-sm leading-relaxed text-text-secondary">{t("footer.tagline")}</p>
-            <p className="mt-3 text-xs leading-relaxed text-text-muted">{t("footer.sourceNote")}</p>
+            <p className="mt-3 text-xs leading-relaxed text-text-secondary">{t("footer.sourceNote")}</p>
           </div>
 
           {footerNav.map((group) => (
@@ -65,7 +65,7 @@ export function Footer() {
         </div>
 
         <div className="mt-10 flex flex-col gap-4 border-t border-border pt-6 sm:flex-row sm:items-center sm:justify-between">
-          <p className="text-xs text-text-muted">
+          <p className="text-xs text-text-secondary">
             {t("footer.copyright", { year: new Date().getFullYear() })}
           </p>
 
@@ -86,12 +86,12 @@ export function Footer() {
               {siteConfig.author.email}
             </a>
             <a
-              href={siteConfig.author.site}
+              href={siteConfig.author.url}
               {...externalLinkProps}
               className="inline-flex items-center gap-1.5 text-xs text-text-secondary transition-colors hover:text-text-primary"
             >
-              <Globe size={14} aria-hidden="true" />
-              {t("footer.authorSite")}
+              <Github size={14} aria-hidden="true" />
+              {t("footer.authorSite", { name: siteConfig.author.name })}
             </a>
           </div>
         </div>

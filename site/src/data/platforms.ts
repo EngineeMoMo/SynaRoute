@@ -16,10 +16,12 @@ export interface Platform {
   id: PlatformId;
   /** i18n key 后缀，取词为 `platform.<id>.name` 等 */
   status: PlatformStatus;
-  /** 最低系统版本，直接展示 */
+  /**
+   * 最低系统版本，直接展示。
+   * 刻意不走 i18n：「Windows 10 (1809) / Windows 11」两种语言下写法完全一致，
+   * 进字典只会多一处要同步的地方。
+   */
   minOS: string;
-  /** 安装包格式，直接展示 */
-  format: string;
   /**
    * 从 GitHub Release 资产列表里挑出本平台安装包的匹配规则。
    * 拿不到（API 失败 / 该版本没有此资产）时回落到 releases/latest 页面。
@@ -35,7 +37,6 @@ export const platforms: Platform[] = [
     status: "available",
     // Tauri 2 的 WebView2 依赖决定了下限：Win10 1809 起系统自带 WebView2 Runtime
     minOS: "Windows 10 (1809) / Windows 11",
-    format: "exe · NSIS 安装包",
     assetPattern: /_x64-setup\.exe$/i,
     uaPattern: /windows/i,
   },
@@ -44,7 +45,6 @@ export const platforms: Platform[] = [
     // 尚未构建 macOS 版本。做出来之后改这一行即可，无需改任何组件。
     status: "coming-soon",
     minOS: "macOS 12+",
-    format: "dmg",
     assetPattern: /\.dmg$/i,
     uaPattern: /mac os x|macintosh/i,
   },

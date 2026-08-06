@@ -6,9 +6,10 @@
   "description": "SynaRoute 官网（独立于桌面应用的静态站点）",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build && node scripts/postbuild.mjs",
+    "build": "tsc && vite build && node scripts/check-opacity.mjs && node scripts/postbuild.mjs",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "icons": "node scripts/gen-favicon.mjs && node scripts/gen-og.mjs"
   },
   "dependencies": {
     "class-variance-authority": "^0.7.1",
