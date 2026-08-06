@@ -2036,42 +2036,39 @@ fn redact_json_string_field(s: &str, key: &str) -> String {
         out.push_str(&rest[..idx]);
         out.push_str(&needle);
         let after_key = &rest[idx + needle.len()..];
-        // skip whitespace + colon + whitespace + opening quote
-        let mut chars = after_key.char_indices().peekable();
-        let mut pos = 0;
-        // copy whitespace
-        while let Some(&(i, c)) = chars.peek() {
-            if c.is_whitespace() {
-                pos = i + c.len_utf8();
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        out.push_str(&after_key[..pos]);
-        let after_ws = &after_key[pos..];
+
+        // **不匹配就一个字符都不能提前推进 out**。
+        //
+        // 这里原先是「边扫边推」：先把冒号前的空白推进 out，再判断下一个字符是不是 `:`，
+        // 不是就 `rest = after_key` 回退 —— 而 after_key **包含刚推过的那段空白**，
+        // 下一轮又推一遍。于是每跑一次脱敏，非字符串字段的空白就翻倍。
+        //
+        // 这条对布尔/数值字段**必然**命中：`hasSecret`（含 secret）、
+        // `masterPasswordEnabled`（含 password）都在键名判据里，而它们的值是 `true`/`false`
+        // 不带引号，走的正是 bail-out 分支。症状是诊断报告与配置预览里的 JSON
+        // 出现莫名的长串空格（`"hasSecret":        true`），越脱敏越长。
+        //
+        // 故改为：先纯读地量出 `空白 → : → 空白 → "` 这个完整形状，全部对上才推 out；
+        // 任何一步不符就只推 needle、把 rest 落在 after_key，让那段原文由后续循环
+        // （或末尾的 push_str(rest)）**原样**带出去。
+        let ws1 = after_key.len() - after_key.trim_start().len();
+        let after_ws = &after_key[ws1..];
         if !after_ws.starts_with(':') {
             rest = after_key;
             continue;
         }
-        out.push(':');
         let after_colon = &after_ws[1..];
-        let mut p2 = 0;
-        let mut c2 = after_colon.char_indices().peekable();
-        while let Some(&(i, c)) = c2.peek() {
-            if c.is_whitespace() {
-                p2 = i + c.len_utf8();
-                c2.next();
-            } else {
-                break;
-            }
-        }
-        out.push_str(&after_colon[..p2]);
-        let after_ws2 = &after_colon[p2..];
+        let ws2 = after_colon.len() - after_colon.trim_start().len();
+        let after_ws2 = &after_colon[ws2..];
         if !after_ws2.starts_with('"') {
-            rest = after_colon;
+            rest = after_key;
             continue;
         }
+
+        // 形状已确认：把原文的空白与冒号照原样带上，值换成掩码。
+        out.push_str(&after_key[..ws1]);
+        out.push(':');
+        out.push_str(&after_colon[..ws2]);
         // find closing quote (no escape handling for simplicity — secrets rarely have \")
         if let Some(end) = after_ws2[1..].find('"') {
             out.push_str("\"***\"");
@@ -2427,6 +2424,46 @@ mod tests {
         assert!(!out.contains("sk-abc1234567890"));
         assert!(!out.contains("secret"));
         assert!(out.contains(r#""model":"x""#) || out.contains(r#""model": "x""#));
+    }
+
+    /// 键名命中判据、但**值不是字符串**的字段必须**逐字节原样保留**。
+    ///
+    /// 这曾是一条真缺陷：`redact_json_string_field` 原先边扫边推 —— 先把冒号前的空白
+    /// 推进结果，再判断下一个字符是不是 `:`；不是就把游标回退到**含那段空白的位置**，
+    /// 下一轮又推一遍。于是每跑一次脱敏，这类字段的空白就翻倍。
+    ///
+    /// 它对布尔字段**必然**命中：`hasSecret` 含 secret、`masterPasswordEnabled` 含 password，
+    /// 而两者的值都是不带引号的 `true`/`false`。用户看到的是配置预览与诊断报告里
+    /// 莫名出现长串空格（`"hasSecret":        true`），且越脱敏越长 —— 而没人会把
+    /// 「JSON 排版变怪」联想到脱敏函数。
+    ///
+    /// 判据取**幂等 + 原文相等**两条：只测幂等的话，一个「稳定地多插一个空格」的实现
+    /// 也能通过。
+    #[test]
+    fn redact_leaves_non_string_values_byte_identical() {
+        // 覆盖三种间距：紧贴、单空格、多空格（pretty-print 对齐后的样子）。
+        let raw = concat!(
+            "{\n",
+            "  \"hasSecret\":true,\n",
+            "  \"masterPasswordEnabled\": false,\n",
+            "  \"tokenBudget\":    4096,\n",
+            "  \"apiKey\": \"sk-should-be-masked\"\n",
+            "}"
+        );
+        let once = redact_config_secrets(raw);
+        let twice = redact_config_secrets(&once);
+
+        assert_eq!(once, twice, "脱敏必须幂等：预览/报告会对同一份内容跑不止一次");
+        // 非字符串值的三行必须与原文逐字节相同（间距一个都不能多）。
+        for line in ["  \"hasSecret\":true,", "  \"masterPasswordEnabled\": false,", "  \"tokenBudget\":    4096,"] {
+            assert!(
+                once.contains(line),
+                "非字符串字段被改动了间距。期望原样保留:\n  {line:?}\n实际输出:\n{once}"
+            );
+        }
+        // 而字符串值仍要被掩码（别为了修间距把脱敏本身弄丢）。
+        assert!(!once.contains("sk-should-be-masked"), "字符串密钥仍必须被掩码: {once}");
+        assert!(once.contains("\"apiKey\": \"***\""), "掩码形态应保持: {once}");
     }
 
     #[test]

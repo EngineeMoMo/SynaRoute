@@ -2153,6 +2153,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 出口的整份脱敏**必须幂等**，否则它会把配置段搅坏。
+    ///
+    /// 报告的配置段已经过了一次 `redacted_config_json`，整份再过一次
+    /// `redact_config_secrets` —— 这是刻意的双重覆盖（新增段落自动被保护）。
+    /// 但前提是第二遍对已脱敏文本无副作用：若它把第一遍留下的 `***` 或 `sk-***`
+    /// 再匹配一次、多截掉几个字符，症状会是「报告里的 JSON 少了个引号」这类
+    /// 没人会立刻联想到脱敏的怪现象。
+    ///
+    /// 判据取「再脱敏一次，结果逐字节相同」。这条同时守住了「脱敏顺序被调换」
+    /// （例如有人把出口那次挪到配置段之前）不会改变输出。
+    #[test]
+    fn redacting_an_already_redacted_report_changes_nothing() {
+        let (store, dir) = temp_store("diag_idem");
+        let mut k = key(CategoryType::ClaudeCli);
+        k.name = "sk-abcdefghijklmnop".into(); // 够长，会命中裸 token 扫描
+        k.headers_json = Some(r#"{"api_key":"plain-value","note":"keep me"}"#.into());
+        store.upsert_key(k).unwrap();
+        store.append_event(
+            CategoryType::ClaudeCli,
+            "error",
+            None,
+            r#"上游 401 {"error":{"apiKey":"leaked-abc","message":"invalid"}}"#,
+        );
+
+        let env = DiagnosticsEnv {
+            app_version: "9.9.9".into(),
+            exe_path: "C:\\test\\synaroute.exe".into(),
+            proxy: vec![(CategoryType::ClaudeCli, false, None)],
+        };
+        let once = build_diagnostics_report(&store, &env);
+        let twice = crate::tools::redact_config_secrets(&once);
+
+        assert_eq!(once, twice, "出口脱敏不幂等 —— 二次运行改动了报告内容");
+        // 顺带确认这份样本真的触发了脱敏（否则上面的相等是空断言）。
+        assert!(once.contains("***"), "样本应当命中脱敏，否则这条测试什么都没验");
+        assert!(!once.contains("sk-abcdefghijklmnop"), "裸 token 应被掩码");
+        assert!(!once.contains("leaked-abc"), "事件里的 apiKey 值应被掩码");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 落盘失败时**把系统改回原状**：否则留下「系统已注册、配置说关」，
     /// 下次启动的对账会按配置把它关掉 —— 用户点开了、重启后又没了，无从察觉。
     ///
