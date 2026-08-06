@@ -39,9 +39,17 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - uses: actions/checkout@v4
+      # v4 的**动作运行时**是 Node 20，已弃用（runner 强制拉到 Node 24 并每跑必告警）。
+      # v5 起官方切到 node24。v7 是当前最新，从 v4 跳过来的两处判据都已核过：
+      # - 最低 runner 版本 v2.327.1：GitHub 托管 runner 早已超过（告警本身就说明它在跑 Node 24）
+      # - v7 新增「阻止 fork PR 检出」只作用于 pull_request_target / workflow_run，本仓两个
+      #   workflow 都不用这两个事件
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      # setup-node v5 起：`package.json` 里有 `packageManager` 字段时会**自动**开缓存
+      # （v6 又把自动缓存收窄到只对 npm）。本仓根与 site 两个 package.json 都没有该字段，
+      # 故行为不变；下面 `cache: npm` 是显式指定，v7 仍支持。
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
           cache: npm
