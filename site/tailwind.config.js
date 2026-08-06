@@ -17,6 +17,19 @@ export default {
   darkMode: ["class"],
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
   theme: {
+    /**
+     * 补一个 360px 的 `xs` 断点（Tailwind 默认最小是 sm=640）。
+     * 用途只有一个：Hero 标题在 320~359px 这段要更小的字号，理由见下面 hero-xs。
+     * 其余断点沿用默认，不动。
+     */
+    screens: {
+      xs: "360px",
+      sm: "640px",
+      md: "768px",
+      lg: "1024px",
+      xl: "1280px",
+      "2xl": "1536px",
+    },
     extend: {
       ...appConfig.theme.extend,
 
@@ -45,6 +58,15 @@ export default {
         // Hero 主标题：桌面 56px / 移动 36px（由响应式类切换），行高压紧显紧凑
         hero: ["3.5rem", { lineHeight: "1.1", letterSpacing: "-0.02em" }],
         "hero-sm": ["2.25rem", { lineHeight: "1.15", letterSpacing: "-0.02em" }],
+        /**
+         * 320px 这类极窄屏专用。
+         *
+         * 中文标题的两段各自套了 whitespace-nowrap（中文无词边界，不锁会断出半个词），
+         * 于是最长那段是**不可压缩**的：36px 下它要 325px，而 320px 视口的容器只有
+         * 280px —— 会被 Hero section 的 overflow-hidden 直接裁掉右半句。
+         * 30px 下同一段是 271px，装得下。
+         */
+        "hero-xs": ["1.875rem", { lineHeight: "1.2", letterSpacing: "-0.02em" }],
         "section-title": ["2rem", { lineHeight: "1.25", letterSpacing: "-0.01em" }],
       },
       keyframes: {

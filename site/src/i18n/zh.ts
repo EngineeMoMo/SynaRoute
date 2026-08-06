@@ -41,13 +41,14 @@ export const zh: Dict = {
 
   // ---------- Hero ----------
   "hero.badge": "Windows 桌面软件 · 全部本地运行",
-  // 标题拆两段：后半段在 Hero 里套 whitespace-nowrap 锁成整体，
-  // 避免窄屏把「下一个自动接上」断成孤字。改文案时保持这个切分点。
-  "hero.titleLead": "一个 Key 失效，",
-  "hero.titleTail": "下一个自动接上",
+  // 标题拆两段：中文两段各自套 whitespace-nowrap 锁成整体，避免窄屏在
+  // 「Key 互为备份」中间断行。切分点就是那个逗号，改文案时保持这个结构。
+  "hero.titleLead": "多个 Key 互为备份，",
+  "hero.titleTail": "多个模型协同思考",
   "hero.desc":
-    "本机运行的 API 路由代理，为 Claude CLI、Claude 桌面端和 Codex 桌面端统一管理多家厂商的 Key。",
-  "hero.descSecond": "主 Key 报错就自动换下一个，客户端无感知——不改配置，不用重启。",
+    "本机运行的 API 路由代理，为 Claude CLI、Claude 桌面端和 Codex 桌面端统管多家厂商的 Key 与模型。",
+  "hero.descSecond":
+    "主 Key 报错自动换下一个；也能让多个模型并行回答同一个问题，再由决策者综合出结论。",
   "hero.ctaPrimary": "下载 Windows 版",
   "hero.ctaPrimaryMacHint": "macOS 版即将推出",
   "hero.ctaSecondary": "查看 GitHub",
@@ -287,11 +288,11 @@ export const zh: Dict = {
     "手动改配置一次只能指向一个厂商，出问题要人工发现并再改一次。SynaRoute 让请求先经过本地代理，由代理在多个 Key 之间自动接力，同时保留可视化管理、健康检查与运行日志。",
 
   // ---------- 底部 CTA ----------
-  "cta.title": "让多个 Key 自己接力",
+  "cta.title": "让多个 Key 互为备份，让多个模型一起想",
   "cta.desc": "免费使用，全部本地运行，不需要注册账号。",
 
   // ---------- 页脚 ----------
-  "footer.tagline": "面向 Claude CLI、Claude 桌面端与 Codex 桌面端的本地 API Key 路由代理。",
+  "footer.tagline": "面向 Claude CLI、Claude 桌面端与 Codex 桌面端的本地 API 路由代理：多 Key 互为备份，多模型协同作答。",
   "footer.product": "产品",
   "footer.resources": "资源",
   "footer.legal": "条款",

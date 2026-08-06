@@ -40,13 +40,14 @@ export const en: Dict = {
 
   // ---------- Hero ----------
   "hero.badge": "Windows desktop app · Runs entirely on your machine",
-  // Split in two so Hero can lock the tail with whitespace-nowrap — see zh.ts.
-  "hero.titleLead": "When one key fails, ",
-  "hero.titleTail": "the next takes over",
+  // Split in two so the zh build can lock each half with whitespace-nowrap — see zh.ts.
+  // English must NOT be locked (measured: one half alone needs 325px at a 320px viewport).
+  "hero.titleLead": "Many keys backing each other up, ",
+  "hero.titleTail": "many models thinking together",
   "hero.desc":
-    "A local API routing proxy that manages keys from multiple vendors for Claude CLI, the Claude desktop app and the Codex desktop app.",
+    "A local API routing proxy that manages keys and models from multiple vendors for Claude CLI, the Claude desktop app and the Codex desktop app.",
   "hero.descSecond":
-    "When the primary key errors out, the next one takes over — no config edits, no client restart.",
+    "When the primary key errors out, the next one takes over. It can also put several models on the same question in parallel and have a decider synthesise the answer.",
   "hero.ctaPrimary": "Download for Windows",
   "hero.ctaPrimaryMacHint": "macOS build coming soon",
   "hero.ctaSecondary": "View on GitHub",
@@ -301,12 +302,12 @@ export const en: Dict = {
     "Editing config by hand points you at one vendor at a time, and when it breaks you have to notice and edit again. SynaRoute puts a local proxy in front so requests hand off between keys automatically, while giving you visual management, health checks and request logs.",
 
   // ---------- Final CTA ----------
-  "cta.title": "Let your keys cover for each other",
+  "cta.title": "Let your keys cover for each other, and your models think together",
   "cta.desc": "Free, entirely local, no account needed.",
 
   // ---------- Footer ----------
   "footer.tagline":
-    "A local API key routing proxy for Claude CLI, the Claude desktop app and the Codex desktop app.",
+    "A local API routing proxy for Claude CLI, the Claude desktop app and the Codex desktop app: many keys backing each other up, many models answering together.",
   "footer.product": "Product",
   "footer.resources": "Resources",
   "footer.legal": "Legal",

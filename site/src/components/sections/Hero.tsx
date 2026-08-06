@@ -33,13 +33,16 @@ export function Hero() {
           </p>
 
           {/* 标题排版，中英各有各的坑：
-              · text-balance 让浏览器均分各行宽度 —— 没有它，桌面端会断成
-                「…下一个自动接」+ 孤零零一个「上」
+              · text-balance 让浏览器均分各行宽度 —— 没有它，桌面端会把最后
+                两三个字挤成孤零零的一行
               · 中文额外把两段各锁成整体：中文没有词边界，浏览器可在任意两字之间断行，
-                会断出「一个 Key 失 / 效，」这种半个词。英文**不能**锁 ——
+                会断出「多个 Key 互为备 / 份，」这种半个词。英文**不能**锁 ——
                 实测 320px 下单段就要 325px，锁死会被 section 的 overflow-hidden 裁掉
+              · 三档字号：320px 用 hero-xs(30px)、360px 起 hero-sm(36px)、
+                640px 起 hero(56px)。锁了 nowrap 的中文段在 36px 下要 325px，
+                而 320px 视口的容器只有 280px，不降档就会被裁掉右半句
               · max-w-4xl（不是 3xl）给 3.5rem 的字号留够横向空间 */}
-          <h1 className="animate-fade-up mt-6 text-balance text-hero-sm font-bold text-text-primary sm:text-hero">
+          <h1 className="animate-fade-up mt-6 text-balance text-hero-xs font-bold text-text-primary xs:text-hero-sm sm:text-hero">
             <span className={lockWrap}>{t("hero.titleLead")}</span>
             <span className={lockWrap}>{t("hero.titleTail")}</span>
           </h1>

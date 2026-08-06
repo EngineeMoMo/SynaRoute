@@ -4,10 +4,10 @@
 
 # SynaRoute
 
-**一个 Key 失效，下一个自动接上**
+**多个 Key 互为备份，多个模型协同思考**
 
-本机运行的 API 路由代理，为 Claude CLI、Claude 桌面端和 Codex 桌面端统一管理多家厂商的 Key。<br>
-主 Key 报错就自动换下一个，客户端无感知 —— 不改配置，不用重启。
+本机运行的 API 路由代理，为 Claude CLI、Claude 桌面端和 Codex 桌面端统管多家厂商的 Key 与模型。<br>
+主 Key 报错自动换下一个；也能让多个模型并行回答同一个问题，再由决策者综合出结论。
 
 [官网](https://synaroute.mofamilys.com) ·
 [下载](https://github.com/EngineeMoMo/SynaRoute/releases/latest) ·

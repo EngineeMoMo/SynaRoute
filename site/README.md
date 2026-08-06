@@ -118,9 +118,14 @@ Security → FAQ → FinalCTA。
 | `sections/Security.tsx` | `facts` 六条走三列两行；风险提示单独整行、不进网格 |
 | `data/faq.ts` | 十条，独立卡片纵向排列，无行数约束 |
 
-Hero 标题拆成 `hero.titleLead` + `hero.titleTail` 两个 key，后半段套
-`whitespace-nowrap`，配合 `text-balance` 防止窄屏断出孤字（原先 375px 下
-最后一行只剩一个「上」字）。改标题文案时保留这个切分点。
+Hero 标题拆成 `hero.titleLead` + `hero.titleTail` 两个 key。中文两段**各自**套
+`whitespace-nowrap`（中文无词边界，不锁会断出「多个 Key 互为备 / 份，」这种半个词），
+英文**不锁**。切分点就是那个逗号，改文案时保持这个结构。
+
+因为中文段锁了 nowrap 就不可压缩，字号需要三档：`hero-xs`(30px) / `hero-sm`(36px, ≥360px)
+/ `hero`(56px, ≥640px)。36px 下最长那段要 325px，而 320px 视口的容器只有 280px ——
+不降档会被 Hero section 的 `overflow-hidden` 直接裁掉右半句。为此在 tailwind.config.js
+补了一个 `xs: 360px` 断点（Tailwind 默认最小是 sm=640）。
 
 ## 加 macOS 版下载
 
