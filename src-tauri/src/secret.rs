@@ -83,7 +83,7 @@ pub struct SecretStore {
     /// `set` / `remove` / 三个整库迁移 / `lock` / `unlock`，共 7 处。
     /// **锁定态必须清空**——否则会破坏「锁定态 `get` 返 Err」这条刻意行为，
     /// 也让「立即锁定」名不副实（已解出的明文仍能从缓存里拿到）。
-    dpapi_cache: HashMap<String, Zeroizing<String>>,
+    os_cache: HashMap<String, Zeroizing<String>>,
 }
 
 impl SecretStore {
@@ -109,7 +109,7 @@ impl SecretStore {
         } else {
             (SecretVault::default(), false)
         };
-        Ok(Self { path, vault, load_failed, vault_key: None, dpapi_cache: HashMap::new() })
+        Ok(Self { path, vault, load_failed, vault_key: None, os_cache: HashMap::new() })
     }
 
     // ---- 主口令模式：状态与解锁 ----
@@ -186,7 +186,7 @@ impl SecretStore {
             self.vault.boxes.insert(key_id.to_string(), boxed);
             self.vault.entries.remove(key_id);
         } else {
-            let cipher = dpapi_encrypt(secret.as_bytes())?;
+            let cipher = os_encrypt(secret.as_bytes())?;
             self.vault.entries.insert(key_id.to_string(), STANDARD.encode(cipher));
             // 对称清理：DPAPI 模式下也要清掉 boxes 里的同 id（关闭主口令后新存的密钥，
             // 若 boxes 残留旧条目，将来再启用主口令时 all_key_ids 会读到那条过期密文）。
@@ -231,11 +231,11 @@ impl SecretStore {
         };
         // DPAPI 模式：先查进程内缓存，命中即免掉一次 CryptUnprotectData 系统调用（P2-6）。
         // 缓存的失效由 set / remove / 三个迁移 / lock / unlock 共 7 处负责（见字段文档）。
-        if let Some(hit) = self.dpapi_cache.get(key_id) {
+        if let Some(hit) = self.os_cache.get(key_id) {
             return Ok(Some(hit.clone()));
         }
         let cipher = STANDARD.decode(b64).map_err(|e| AppError::Crypto(e.to_string()))?;
-        let plain = dpapi_decrypt(&cipher)?;
+        let plain = os_decrypt(&cipher)?;
         Ok(Some(Zeroizing::new(String::from_utf8_lossy(&plain).to_string())))
     }
 
@@ -250,7 +250,7 @@ impl SecretStore {
             // 只在 DPAPI 模式缓存：主口令模式有长驻 vault_key，本就不慢，
             // 不为它引入额外的明文驻留。
             if !self.is_master_mode() {
-                self.dpapi_cache.insert(key_id.to_string(), v.clone());
+                self.os_cache.insert(key_id.to_string(), v.clone());
             }
         }
         Ok(got)
@@ -258,13 +258,13 @@ impl SecretStore {
 
     /// 该条是否已在解密缓存里（P2-6）。供 `Store::secret_for` 的「两段式」判断是否需要升级到写锁。
     pub fn is_cached(&self, key_id: &str) -> bool {
-        self.dpapi_cache.contains_key(key_id)
+        self.os_cache.contains_key(key_id)
     }
 
-    /// 清空解密缓存。**所有会让缓存过期的操作都必须调它**（见 `dpapi_cache` 字段文档）。
+    /// 清空解密缓存。**所有会让缓存过期的操作都必须调它**（见 `os_cache` 字段文档）。
     fn invalidate_cache(&mut self) {
         // Zeroizing 的值在这里被析构 → 自动清零，不留明文残迹。
-        self.dpapi_cache.clear();
+        self.os_cache.clear();
     }
 
     pub fn remove(&mut self, key_id: &str) -> AppResult<()> {
@@ -424,7 +424,7 @@ impl SecretStore {
 
         let mut entries = HashMap::with_capacity(plain.len());
         for (id, s) in &plain {
-            entries.insert(id.clone(), STANDARD.encode(dpapi_encrypt(s.as_bytes())?));
+            entries.insert(id.clone(), STANDARD.encode(os_encrypt(s.as_bytes())?));
         }
 
         let prev = std::mem::take(&mut self.vault);
@@ -542,10 +542,27 @@ impl SecretStore {
     }
 }
 
-// ---- DPAPI（仅 Windows）----
+// ---- 操作系统托管的密钥保护：`os_encrypt` / `os_decrypt` ----
+//
+// 三份实现，按平台择一（同一时刻只有一份被编译）：
+//
+// | 平台 | 密钥由谁持有 | 加解密在哪做 | 换机可用 |
+// |---|---|---|---|
+// | Windows | 系统（DPAPI，绑用户账户） | 系统内核态 | ❌ |
+// | macOS | 系统（Keychain，绑登录态） | 本进程 AES-256-GCM | ❌ |
+// | 其他 Unix | **编译期常量**（仅开发） | 本进程 AES-256-GCM | ⚠️ 等同明文 |
+//
+// **刻意不再叫 `dpapi_*`**：非 Windows 那份从来就不是 DPAPI，而名字说是。
+// 这类「名字与实现不符」正是密钥回退分支的缺陷能长期无人发现的原因之一
+// （详见 `fallback_key` 的发现史）。缓存字段也从 `dpapi_cache` 一并改成 `os_cache`。
+//
+// 测试名里保留的 `dpapi` 字样（如 `..._falling_back_to_dpapi`）指的是**默认模式**这个概念，
+// 不是特指 Win32 API —— 那些判据跨平台同样成立（mac 上默认模式是 Keychain），故不改名。
+
+// ---- Windows：DPAPI ----
 
 #[cfg(windows)]
-fn dpapi_encrypt(plain: &[u8]) -> AppResult<Vec<u8>> {
+fn os_encrypt(plain: &[u8]) -> AppResult<Vec<u8>> {
     use windows::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
     unsafe {
         let in_blob = CRYPT_INTEGER_BLOB {
@@ -565,7 +582,7 @@ fn dpapi_encrypt(plain: &[u8]) -> AppResult<Vec<u8>> {
 }
 
 #[cfg(windows)]
-fn dpapi_decrypt(cipher: &[u8]) -> AppResult<Vec<u8>> {
+fn os_decrypt(cipher: &[u8]) -> AppResult<Vec<u8>> {
     use windows::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
     unsafe {
         let in_blob = CRYPT_INTEGER_BLOB {
@@ -584,29 +601,180 @@ fn dpapi_decrypt(cipher: &[u8]) -> AppResult<Vec<u8>> {
     }
 }
 
-// 非 Windows 平台回退（开发期在其他平台也能编译；正式仅 Windows）
-#[cfg(not(windows))]
-fn dpapi_encrypt(plain: &[u8]) -> AppResult<Vec<u8>> {
+// ---- macOS：Keychain 托管一把库密钥 + AES-256-GCM ----
+//
+// 与 DPAPI 的信任模型对等：密钥由系统托管、绑当前登录用户、免口令、换机解不出。
+// 差别在于 DPAPI 是「系统替你做加解密」，Keychain 是「系统替你保管密钥、加解密仍在本进程」——
+// 故这里仍走 `aes_encrypt`/`aes_decrypt`，只是密钥来源换成 Keychain。
+//
+// **拒绝授权必须返 Err，绝不退到弱密钥**。这条纪律与主口令模式的锁定态同源
+// （见 `locked_vault_refuses_writes_instead_of_falling_back_to_dpapi`）：
+// 拿不到密钥时宁可让用户看到「取不到密钥」，也不能悄悄用一把更弱的把数据写下去
+// —— 那会让「加密存储」这个承诺在用户不知情的情况下失效。
+
+#[cfg(target_os = "macos")]
+fn os_encrypt(plain: &[u8]) -> AppResult<Vec<u8>> {
+    aes_encrypt(&keychain_vault_key()?, plain)
+}
+
+#[cfg(target_os = "macos")]
+fn os_decrypt(cipher: &[u8]) -> AppResult<Vec<u8>> {
+    aes_decrypt(&keychain_vault_key()?, cipher)
+}
+
+/// Keychain 里那条通用密码项的 service / account。
+///
+/// `service` 用 bundle identifier（与 `tauri.conf.json` 的 `identifier` 一致），
+/// `account` 固定串——同一用户下只需一把库密钥。
+#[cfg(target_os = "macos")]
+const KEYCHAIN_SERVICE: &str = "com.synaroute.app";
+#[cfg(target_os = "macos")]
+const KEYCHAIN_ACCOUNT: &str = "vault-key";
+
+/// 取（或首次生成）Keychain 里的库密钥。
+///
+/// ## 为什么缓存
+///
+/// 转发热路径每请求每候选都要取一次密钥。不缓存就是每次一趟 Keychain 系统调用
+/// （且 ad-hoc 签名下每次都可能触发授权检查）。缓存后每进程一次。
+///
+/// **只在成功时写缓存**：用户第一次点「拒绝」不能被永久记成失败，之后授权了要能用上。
+///
+/// 安全权衡与主口令模式的长驻 `vault_key` 同源：明文密钥本就要拼进 Authorization 头发出去，
+/// 且 `os_cache` 已经缓存了解密后的明文，缓存这把密钥不新增暴露面。
+///
+/// ## 双进程竞态
+///
+/// Keychain 只有 create-or-update 语义（`set_generic_password`），没有 create-if-absent，
+/// 故「两个进程同时发现无密钥、各自生成、各自写入」时后写者会覆盖前者，前者已加密的数据
+/// 就解不出来了。这里**写完立刻读回**：读回值与自己写的不一致说明输给了别人，
+/// 那就采用读回的那把（双方最终收敛到同一把）。
+///
+/// 主进程有 `tauri-plugin-single-instance` 兜着，正常不会有两个 GUI 实例；
+/// `--mcp-stdio` 子进程只做 JSON-RPC 转发、不开密钥库。所以这是窄窗口的兜底，不是主路径。
+#[cfg(target_os = "macos")]
+fn keychain_vault_key() -> AppResult<[u8; 32]> {
+    static CACHED: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    if let Some(k) = CACHED.get() {
+        return Ok(*k);
+    }
+    let key = keychain_fetch_or_create()?;
+    let _ = CACHED.set(key);
+    Ok(key)
+}
+
+/// 实际与 Keychain 打交道的那一半（供 [`keychain_vault_key`] 缓存调用）。
+#[cfg(target_os = "macos")]
+fn keychain_fetch_or_create() -> AppResult<[u8; 32]> {
+    use security_framework::passwords::{generic_password, set_generic_password, PasswordOptions};
+    use security_framework_sys::base::errSecItemNotFound;
+
+    let read = || -> Result<Option<Vec<u8>>, security_framework::base::Error> {
+        match generic_password(PasswordOptions::new_generic_password(
+            KEYCHAIN_SERVICE,
+            KEYCHAIN_ACCOUNT,
+        )) {
+            Ok(bytes) => Ok(Some(bytes)),
+            // 「没有这一条」不是错误——首次运行必然走这里。
+            Err(e) if e.code() == errSecItemNotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    };
+
+    // ① 已有则直接用。
+    match read() {
+        Ok(Some(bytes)) => return to_key32(&bytes),
+        Ok(None) => {}
+        // 拒绝授权 / 钥匙串锁定 / 其他失败：返 Err，**不生成新密钥**。
+        // 生成新的会把 secrets.enc 里现有密文全部变成解不出的垃圾。
+        Err(e) => {
+            return Err(AppError::Crypto(format!(
+                "读取 Keychain 库密钥失败（OSStatus {}）: {e}。\
+                 若是授权弹框被拒，请在钥匙串访问里允许 SynaRoute 读取该项后重试。",
+                e.code()
+            )))
+        }
+    }
+
+    // ② 首次运行：生成随机密钥并写入。
+    let mut fresh = [0u8; 32];
+    {
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut fresh);
+    }
+    set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, &fresh).map_err(|e| {
+        AppError::Crypto(format!("写入 Keychain 库密钥失败（OSStatus {}）: {e}", e.code()))
+    })?;
+
+    // ③ 读回确认，处理「同时写入」的竞态（见函数文档）。
+    match read() {
+        Ok(Some(bytes)) => {
+            let got = to_key32(&bytes)?;
+            if got != fresh {
+                tracing::warn!(
+                    "Keychain 库密钥被另一进程同时写入,已采用钥匙串里的那一把(避免两份密钥并存)"
+                );
+            }
+            Ok(got)
+        }
+        // 刚写成功却读不到:不能拿 `fresh` 继续——下次启动读到的可能是别的值,
+        // 那样这一轮加密的数据全部解不出。宁可这次报错。
+        Ok(None) => Err(AppError::Crypto(
+            "写入 Keychain 库密钥后读回为空,拒绝继续(避免用一把可能不会被持久化的密钥加密)".into(),
+        )),
+        Err(e) => Err(AppError::Crypto(format!(
+            "写入 Keychain 库密钥后读回失败（OSStatus {}）: {e}",
+            e.code()
+        ))),
+    }
+}
+
+/// 把 Keychain 里取出的字节转成 32 字节密钥。长度不符即报错——
+/// 静默截断/补零会让密钥变成一把**可预测**的东西，比报错危险得多。
+#[cfg(target_os = "macos")]
+fn to_key32(bytes: &[u8]) -> AppResult<[u8; 32]> {
+    if bytes.len() != 32 {
+        return Err(AppError::Crypto(format!(
+            "Keychain 里的库密钥长度异常（{} 字节,应为 32）。\
+             该项可能被外部程序改写,请在钥匙串访问里删除 {KEYCHAIN_SERVICE}/{KEYCHAIN_ACCOUNT} 后重启\
+             （注意:删除后现有密钥将无法解出,需重新录入）。",
+            bytes.len()
+        )));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(bytes);
+    Ok(key)
+}
+
+// ---- 其他 Unix（Linux 等）：仅开发用，不可分发 ----
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn os_encrypt(plain: &[u8]) -> AppResult<Vec<u8>> {
     aes_encrypt(&fallback_key(), plain)
 }
 
-#[cfg(not(windows))]
-fn dpapi_decrypt(cipher: &[u8]) -> AppResult<Vec<u8>> {
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn os_decrypt(cipher: &[u8]) -> AppResult<Vec<u8>> {
     aes_decrypt(&fallback_key(), cipher)
 }
 
-/// 非 Windows 的**开发期**回退密钥。
+/// **非 Windows 非 macOS**（Linux 等）的开发期回退密钥。
 ///
 /// ⚠️ **不是生产可用的方案**，且刻意在运行时喊出来。这把密钥是编译进二进制的常量 ——
-/// 谁拿到 `secrets.enc` 加一份程序就能全解出来。macOS 的正解是 Keychain（绑登录态，
-/// 与 Windows 的 DPAPI 信任模型对等），属 mac 移植阶段 1 的工作。
+/// 谁拿到 `secrets.enc` 加一份程序就能全解出来。Windows 走 DPAPI、macOS 走 Keychain，
+/// 两者都由系统托管密钥；只有这条分支没有系统级密钥保管可用，故仅供本地开发调试。
+/// 若将来要正式支持 Linux，正解是接 Secret Service（libsecret）或强制主口令模式。
 ///
 /// **发现史**（说明这条路径从未被走过）：原实现返回 `*b"synaroute-dev-fallback-key-32byte"`
 /// —— 那个字面量是 **33 字节**（名字里写着 32，数错了），于是整个
 /// `#[cfg(not(windows))]` 分支**根本编译不过**。注释声称「开发期在其他平台也能编译」，
 /// 而在 macOS runner 上首次编译即 E0308。这也解释了为什么这个缺陷能长期存在：
 /// Windows 上永远看不到它。
-#[cfg(not(windows))]
+///
+/// cfg 门刻意与调用方（`os_encrypt`/`os_decrypt` 的第三份实现）**完全一致**：
+/// 写成 `not(windows)` 会让它在 macOS 上变成死代码 → dead_code 警告 → 撞破
+/// 「clippy 零警告」基线。这不是洁癖，是让基线继续能当门禁用。
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn fallback_key() -> [u8; 32] {
     // 每进程只喊一次，避免转发热路径把日志刷爆；但一定要喊 ——
     // 本项目反复防的就是「看起来在加密、其实等于明文」这种静默降级。
@@ -625,7 +793,14 @@ fn fallback_key() -> [u8; 32] {
     key
 }
 
-/// AES-256-GCM（仅非 Windows 开发回退使用）
+/// AES-256-GCM，非 Windows 平台的实际加解密实现。
+///
+/// **macOS 上这是生产路径**（密钥来自 Keychain），其他 Unix 上是开发回退（密钥是常量）。
+/// 两者共用同一套密码学实现、只有密钥来源不同 —— 故这段代码的正确性对 macOS 是有效要求，
+/// 不是「反正只在开发时跑」。
+///
+/// 输出布局 `nonce(12) || ciphertext||tag`。nonce 每次随机（`OsRng`），
+/// 故同一明文两次加密的密文不同 —— 这是 GCM 的硬要求（nonce 重用会泄露密钥流）。
 #[cfg(not(windows))]
 fn aes_encrypt(key: &[u8; 32], plain: &[u8]) -> AppResult<Vec<u8>> {
     use aes_gcm::aead::{Aead, KeyInit, OsRng};
@@ -780,7 +955,7 @@ mod tests {
     /// 逐个覆盖：`set`（更新同一条）/ `remove` / `lock`（**必须清**，否则「立即锁定」名不副实）
     /// / 三个整库迁移 / `unlock`。
     #[test]
-    fn dpapi_cache_invalidates_on_every_mutation() {
+    fn os_cache_invalidates_on_every_mutation() {
         let dir = temp_dir("cache_invalidate");
         let mut s = SecretStore::load(dir.join("secrets.enc")).unwrap();
 
