@@ -21,6 +21,7 @@ use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -34,29 +35,58 @@ struct RunningMcp {
     handle: JoinHandle<()>,
 }
 
-/// stdio 子进程发现主应用 MCP 端口用的文件名（放在 exe 同级目录）。
-/// 关键：exe 同级目录（如 F:\SynaRoute\）不受 MSIX AppData 虚拟化影响，
-/// 无论主应用/子进程被谁以什么包身份拉起，读到的都是同一份真实端口。
+/// stdio 子进程发现主应用 MCP 端口用的文件名。
 const MCP_PORT_FILE: &str = "mcp-port";
 
-/// 主应用 MCP 端口写到 exe 同级文件，供 stdio 子进程发现（见 [`run_stdio`]）。
-/// 写失败不致命（子进程会退回端口扫描），仅记日志。
-fn write_mcp_port_file(port: u16) {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let path = dir.join(MCP_PORT_FILE);
-            if let Err(e) = std::fs::write(&path, port.to_string()) {
-                tracing::warn!("写 MCP 端口文件失败({}): {e}", path.display());
-            }
-        }
+/// 端口文件的完整路径。**读写两侧必须都走这里**。
+///
+/// 曾经是读、写各自 `current_exe().parent().join(...)` 算一遍 —— 两份等价代码，
+/// 改平台适配时极易只改一处，症状是「写在 A、读在 B」，而 `read_mcp_port_file`
+/// 读不到只会**静默退回端口扫描**（见 `run_stdio`），没有任何报错，最难查的那类。
+///
+/// ## 平台差异
+///
+/// **Windows：exe 同级**（如 `F:\SynaRoute\`）。理由是躲 MSIX AppData 虚拟化 ——
+/// Claude/Codex 等包应用拉起的子进程读 `%APPDATA%` 会被重定向到包容器私有副本，
+/// 与用户双击启动的主应用读到的是两份文件（本项目最大的历史惨案，见 CLAUDE.md）。
+/// exe 同级目录不被虚拟化，任何身份的进程读到的都是同一份真实端口。
+///
+/// **macOS：`~/Library/Application Support/SynaRoute/`**。上述前提在 macOS 完全不存在
+/// （无 AppData 虚拟化），而照搬 exe 同级会踩 bundle 的坑：`current_exe()` 位于
+/// `SynaRoute.app/Contents/MacOS/`，写进去会被 updater 的整包替换清掉、让 codesign
+/// 的 sealed resources 校验失败、在只读卷上直接写失败。且 Codex/Claude 拉起的 stdio
+/// 子进程与主应用同属一个用户，读同一个 home 下的路径没有任何歧义。
+fn mcp_port_file_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let dir = dirs::data_dir()?.join("SynaRoute");
+        // 主应用与 stdio 子进程都可能先到；建不出目录就当拿不到路径（调用方各有兜底）。
+        std::fs::create_dir_all(&dir).ok()?;
+        return Some(dir.join(MCP_PORT_FILE));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let exe = std::env::current_exe().ok()?;
+        Some(exe.parent()?.join(MCP_PORT_FILE))
     }
 }
 
-/// 读 exe 同级的 MCP 端口文件（stdio 子进程用）。读不到返回 None。
+/// 主应用把实际 MCP 端口写到端口文件，供 stdio 子进程发现（见 [`run_stdio`]）。
+/// 写失败不致命（子进程会退回端口扫描），仅记日志。
+fn write_mcp_port_file(port: u16) {
+    let Some(path) = mcp_port_file_path() else {
+        tracing::warn!("无法定位 MCP 端口文件路径，stdio 子进程将退回端口扫描");
+        return;
+    };
+    if let Err(e) = std::fs::write(&path, port.to_string()) {
+        tracing::warn!("写 MCP 端口文件失败({}): {e}", path.display());
+    }
+}
+
+/// 读端口文件（stdio 子进程用）。读不到返回 None。
 fn read_mcp_port_file() -> Option<u16> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    let content = std::fs::read_to_string(dir.join(MCP_PORT_FILE)).ok()?;
+    let path = mcp_port_file_path()?;
+    let content = std::fs::read_to_string(path).ok()?;
     content.trim().parse::<u16>().ok()
 }
 

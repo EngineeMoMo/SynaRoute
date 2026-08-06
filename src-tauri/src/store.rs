@@ -100,6 +100,29 @@ pub fn default_log_dir() -> PathBuf {
 
 /// 实际探测逻辑（仅由 [`default_log_dir`] 缓存调用一次）。
 fn resolve_default_log_dir() -> PathBuf {
+    // ---- macOS：不走 exe 同级，直接用系统标准日志目录 ----
+    //
+    // exe 同级那套是为 Windows 设计的（见上方文档：躲 MSIX AppData 虚拟化，让用户双击启动的
+    // 实例与被包应用拉起的实例读到同一份日志）。该前提在 macOS 完全不成立，而照搬会出事：
+    //
+    // macOS 上 `current_exe()` 是 `SynaRoute.app/Contents/MacOS/synaroute`，其 parent 在
+    // **bundle 内部**。而 `/Applications` 通常可写 —— 所以下面那套「探测可写性」会**成功**，
+    // 日志就写进 bundle 里，回退分支根本轮不到。后果：
+    //   1. Tauri updater 替换整个 .app → 历史日志静默消失（用户排障时正好需要它们）；
+    //   2. bundle 内容纳入代码签名的 sealed resources，写入会让 `codesign --verify` 失败；
+    //   3. 从只读 DMG 直接运行、或装在只读卷上时写入失败，退回 Application Support，
+    //      于是「日志在哪」取决于用户怎么装的 —— 正是本函数上方那段历史要消灭的分裂。
+    //
+    // `~/Library/Logs/<App>` 是 macOS 的标准位置（Console.app 会自动收录），且与更新、
+    // 签名、只读介质三者都无关。不做可写性探测：home 不可写的话整个应用都跑不起来。
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = dirs::home_dir() {
+            return home.join("Library").join("Logs").join("SynaRoute");
+        }
+        // home 都拿不到时落到下面的通用回退（data_dir）。
+    }
+
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let logs = dir.join("logs");
