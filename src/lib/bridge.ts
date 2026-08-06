@@ -91,6 +91,18 @@ export const api = {
   revealSecret: (keyId: string) =>
     call<string | null>("reveal_secret", { keyId }, async () => `sk-mock-${keyId}`),
 
+  // 孤儿密钥条数（密钥库里有、配置里已无对应 Key 的残留）。只读，不删。
+  //
+  // 刻意做成「先看数、再由用户点确认」两步：删密钥不可逆，而残留孤儿本身无害（只占空间），
+  // 不值得用「启动时自动清理」去换那点整洁 —— 一旦自动删错，用户没有任何补救机会。
+  countOrphanSecrets: () =>
+    call<number>("count_orphan_secrets", undefined, () => mockBridge.countOrphanSecrets()),
+
+  // 清理孤儿密钥。**破坏性操作**：后端会先备份整个密钥库，备份失败即放弃清理。
+  // 返回实际清理条数。主口令锁定态下后端直接返回 0（读不到内容时「没这条」的结论不可信）。
+  pruneOrphanSecrets: () =>
+    call<number>("prune_orphan_secrets", undefined, () => mockBridge.pruneOrphanSecrets()),
+
   // 切换启用状态
   toggleKey: (keyId: string, enabled: boolean) =>
     call<void>("toggle_key", { keyId, enabled }, () => mockBridge.toggleKey(keyId, enabled)),

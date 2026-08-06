@@ -24,6 +24,13 @@ const now = Date.now();
 let masterMock: MasterPasswordState = { enabled: false, locked: false };
 let masterPw = "";
 
+/**
+ * 孤儿密钥条数的浏览器预览态。**刻意给非零初值**：这一行 UI 只在 `> 0` 时出现，
+ * 若 mock 恒返回 0，浏览器模式下这块界面永远不可达 —— 那 mock 就失去了意义
+ * （改样式、验文案都得先装到真机上）。清理后归零，让「清理→提示→行消失」整条链可走通。
+ */
+let orphanMock = 2;
+
 /** 便捷构造模型列表 */
 const models = (names: string[], ctxWindow?: number): ModelInfo[] =>
   names.map((n) => ({ realName: n, source: "fetched" as const, fetchedAt: now - 3600_000, contextWindow: ctxWindow }));
@@ -407,6 +414,18 @@ export const mockBridge = {
   async saveSecret(_keyId: string, _secret: string) {
     await delay();
     // mock：不真正存储明文
+  },
+
+  // 孤儿密钥（UX#19）。非零初值与「清理后归零」的用意见 orphanMock 声明处。
+  async countOrphanSecrets() {
+    await delay();
+    return orphanMock;
+  },
+  async pruneOrphanSecrets() {
+    await delay();
+    const n = orphanMock;
+    orphanMock = 0;
+    return n;
   },
   async toggleKey(keyId: string, enabled: boolean) {
     await delay();

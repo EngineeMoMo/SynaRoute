@@ -56,6 +56,11 @@ export function SettingsPage() {
   // 头部），不是 settings.masterPasswordEnabled 那个镜像字段。
   const [master, setMaster] = useState<MasterPasswordState | null>(null);
   const [masterDialog, setMasterDialog] = useState<"enable" | "disable" | "unlock" | "change" | null>(null);
+  // 孤儿密钥（UX#19 / P2-3）：密钥库里有、配置里已无对应 Key 的残留。
+  // `null` = 还没查过（不显示这一行）；`0` = 查过且干净（也不显示，没必要占位置）。
+  const [orphanCount, setOrphanCount] = useState<number | null>(null);
+  const [pruning, setPruning] = useState(false);
+  const [pruneConfirm, setPruneConfirm] = useState(false);
 
   /** 重新拉主口令状态。任何切换/解锁后都要调，UI 才不会显示陈旧态。 */
   const reloadMaster = async () => {
@@ -63,6 +68,41 @@ export function SettingsPage() {
       setMaster(await api.getMasterPasswordState());
     } catch (e) {
       console.error("getMasterPasswordState failed", e);
+    }
+  };
+
+  /**
+   * 重查孤儿密钥条数。
+   *
+   * 锁定态下后端一律返回 0（`Store::count_orphan_secrets` 主动跳过）——那不是「确实没有」，
+   * 而是「读不到所以不敢下结论」。故 UI 这一行只在**已解锁**时才有意义，
+   * 否则会给出「已清理干净」的错误暗示。
+   */
+  const reloadOrphans = async () => {
+    try {
+      setOrphanCount(await api.countOrphanSecrets());
+    } catch (e) {
+      console.error("countOrphanSecrets failed", e);
+    }
+  };
+
+  /**
+   * 执行清理。**破坏性且不可逆**，故先要二次确认。
+   *
+   * 后端在删之前会整库备份（备份失败即放弃，见 `service::prune_orphan_secrets`），
+   * 这里把「已备份」写进成功提示——用户需要知道还有退路，否则不敢点这个按钮。
+   */
+  const handlePrune = async () => {
+    setPruning(true);
+    try {
+      const n = await api.pruneOrphanSecrets();
+      showToast("success", t("settings.orphanPruned", { n }));
+      setPruneConfirm(false);
+      await reloadOrphans();
+    } catch (e) {
+      showToast("error", String((e as Error)?.message ?? e));
+    } finally {
+      setPruning(false);
     }
   };
 
@@ -101,6 +141,9 @@ export function SettingsPage() {
       await loadCategory(activeCategory);
       await refreshCategory();
       await reloadMaster(); // 导入含密钥段时锁定态可能变
+      // Replace 导入会移除本机独有的 Key，其密钥由后端一并清理；Merge 不会。
+      // 无论哪种模式都重查一次：这是孤儿数最可能变化的时刻。
+      await reloadOrphans();
     } catch (e) {
       console.error("reload after import failed", e);
       showToast("error", String((e as Error)?.message ?? e));
@@ -112,8 +155,17 @@ export function SettingsPage() {
     void api.getAppVersion().then(setVersion);
     void api.getDefaultLogDir().then(setDefaultLogDir);
     void reloadMaster();
+    void reloadOrphans();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 解锁后重查孤儿数：锁定态下后端返回的 0 是「读不到」而非「没有」（见 reloadOrphans）。
+  // 不重查会让刚解锁的用户看不到本该提示的清理入口，直到他离开再回到本页。
+  const vaultLocked = master?.locked ?? false;
+  useEffect(() => {
+    if (!vaultLocked) void reloadOrphans();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [vaultLocked]);
 
   // MCP 运行状态轮询：开启时每 3s 刷新一次，展示运行中/端口/故障原因。
   const mcpEnabled = !!settings?.mcpEnabled;
@@ -496,6 +548,49 @@ export function SettingsPage() {
               onChange={(v) => update({ lanExposure: v })}
               danger
             />
+
+            {/* 孤儿密钥清理（UX#19 / P2-3）。
+                **只在有孤儿且已解锁时才出现**：没有残留就不该占位置；锁定态下后端返回的 0
+                是「读不到所以不敢下结论」，此时显示这一行会给出「已清理干净」的错误暗示。
+
+                刻意不做启动时自动清理：删密钥不可逆，而残留孤儿本身是无害的（只占空间），
+                不值得用「自动删」去换那点整洁——一旦删错，用户没有任何补救机会。 */}
+            {!vaultLocked && orphanCount !== null && orphanCount > 0 && (
+              <div className="rounded-control border border-warning/40 bg-warning/8 p-2.5">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle size={14} className="mt-0.5 shrink-0 text-warning" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium text-text-primary">
+                      {t("settings.orphanTitle", { n: orphanCount })}
+                    </div>
+                    <div className="mt-0.5 text-xs leading-relaxed text-text-muted">
+                      {t("settings.orphanDesc")}
+                    </div>
+                    {pruneConfirm ? (
+                      <div className="mt-2 space-y-1.5">
+                        {/* 确认文案必须说清「不可逆」与「已备份」两件事：
+                            只说不可逆用户不敢点，只说已备份用户会以为随手可撤。 */}
+                        <div className="text-xs font-medium text-danger">
+                          {t("settings.orphanConfirm", { n: orphanCount })}
+                        </div>
+                        <div className="flex gap-2">
+                          <Button size="sm" variant="danger" disabled={pruning} onClick={() => void handlePrune()}>
+                            {pruning ? t("settings.orphanPruning") : t("settings.orphanConfirmYes")}
+                          </Button>
+                          <Button size="sm" variant="outline" disabled={pruning} onClick={() => setPruneConfirm(false)}>
+                            {t("common.cancel")}
+                          </Button>
+                        </div>
+                      </div>
+                    ) : (
+                      <Button size="sm" variant="outline" className="mt-2" onClick={() => setPruneConfirm(true)}>
+                        {t("settings.orphanPrune")}
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
           </CardContent>
         </Card>
 
