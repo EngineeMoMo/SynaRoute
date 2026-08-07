@@ -172,8 +172,32 @@ jobs:
       # `app` 必须显式列出：bundler 在 `!package_types.contains(&MacOsBundle)` 时
       # 会把 .app 当中间产物删掉（源码 tb.rs 的 "Clean up .app if only building dmg"），
       # 而下面四条判据全靠读 .app 里的文件。
+      # ---- 一次性签名密钥（仅供 CI 验证 updater 打包路径）----
+      #
+      # `createUpdaterArtifacts: true` 让 bundler 去打 `.app.tar.gz` 并**签名**，
+      # 而签名要 `TAURI_SIGNING_PRIVATE_KEY`。缺了它 tauri build 会报
+      # "A public key has been found, but no private key" 并以非零码退出。
+      #
+      # 这里刻意用**当场生成的临时密钥**，不是生产发布密钥：
+      #   - CI 只验证「updater 打包路径能否跑通」，不发布任何东西；
+      #   - 生产密钥不该进 CI secrets（本仓库的发布是本地手动签名）。
+      # 代价是产出的 `.sig` 与 tauri.conf.json 里的 pubkey **不匹配** —— 故
+      # **CI 产物不能用于真实更新**，只能用于安装测试。签名时 bundler 不校验
+      # 私钥是否对应配置里的 pubkey，所以这不影响验证目的。
+      - name: Generate throwaway signing key
+        run: |
+          set -o pipefail
+          npx tauri signer generate --ci -w "$RUNNER_TEMP/ci-updater.key" -p "" 2>&1 | tail -5
+          echo "TAURI_SIGNING_PRIVATE_KEY=$(cat "$RUNNER_TEMP/ci-updater.key")" >> "$GITHUB_ENV"
+          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
+
       - name: Build .app and verify bundle
         run: |
+          # pipefail：没有它，`| tail` 的退出码会盖掉 tauri build 的非零码 ——
+          # 本 workflow 曾因此把「缺签名私钥」这条 Error 判成 success（日志里明写
+          # Error、workflow 却是绿的）。同一形态在 cargo test 那步已加过 pipefail，
+          # 此处当初漏了。
+          set -o pipefail
           npm run tauri build -- --bundles app,dmg 2>&1 | tail -30
 
           APP="src-tauri/target/release/bundle/macos/SynaRoute.app"
@@ -234,6 +258,24 @@ jobs:
           dmg_size=$(du -h "$DMG" | cut -f1)
           echo "dmg 产出: $DMG ($dmg_size)"
 
+          # 判据 6：updater 产物（`.app.tar.gz` + `.sig`）
+          #
+          # 这条判据的由来就是一个真实缺口：`createUpdaterArtifacts` 此前未设（默认 false），
+          # bundler 整块跳过，mac 用户永远收不到更新 —— 而 Windows 因为 NSIS installer
+          # 本身即 self-contained 更新包，一直是好的，所以这个缺口在 Windows 上不可见。
+          UPD="src-tauri/target/release/bundle/macos/SynaRoute.app.tar.gz"
+          if [ ! -f "$UPD" ]; then
+            echo "::error::updater 产物未生成 —— 检查 bundle.createUpdaterArtifacts 是否为 true"
+            ls -la src-tauri/target/release/bundle/macos/ || true
+            exit 1
+          fi
+          if [ ! -f "$UPD.sig" ]; then
+            echo "::error::updater 签名缺失 —— TAURI_SIGNING_PRIVATE_KEY 未生效"
+            exit 1
+          fi
+          upd_size=$(du -h "$UPD" | cut -f1)
+          echo "updater 产物: $UPD ($upd_size) + .sig ✓"
+
           {
             echo "### macOS 产物判据"
             echo "- LSMinimumSystemVersion: \`$got\`"
@@ -241,6 +283,10 @@ jobs:
             echo "- 架构: \`$arch\`"
             echo "- 前端嵌入: 命中 $n 次"
             echo "- dmg: \`$(basename "$DMG")\` ($dmg_size)"
+            echo "- updater: \`$(basename "$UPD")\` ($upd_size) + \`.sig\`"
+            echo ""
+            echo "> ⚠️ CI 的 \`.sig\` 用一次性临时密钥签，与配置里的 pubkey 不匹配 ——"
+            echo "> 产物可用于安装测试，**不能**用于真实更新验证。"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # ---- 打包产物供下载（真机验证用）----
@@ -279,6 +325,10 @@ jobs:
           tar -xzf "$RUNNER_TEMP/artifacts/SynaRoute-macos-arm64-app.tar.gz" -C "$probe"
 
           # 顺带把 tar 列表的头几行打出来，供下次排查时知道真实格式（含 stderr）。
+          #
+          # 本块**刻意不加 `set -o pipefail`**（与 build 那步相反）：这里的管道是
+          # `| head -3`，head 读够就关管道 → tar 收到 SIGPIPE 而非零退出 → 开了
+          # pipefail 会把这行纯诊断输出变成红。判据是下面的 `test -x`，不是这行。
           echo "--- tar -tvf 前 3 行（诊断用）---"
           tar -tvf "$RUNNER_TEMP/artifacts/SynaRoute-macos-arm64-app.tar.gz" 2>&1 | head -3
           echo "---"
