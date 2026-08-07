@@ -69,6 +69,13 @@ windows = { version = "0.58", features = [
   "Win32_Storage_FileSystem",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+# 只为 `EXDEV`（跨设备 rename）这一个 errno 常量，见 `secret.rs::atomic_write`。
+# 与其硬编码 18 不如取自权威定义 —— 这是「按错误码分流」的地方，记错数值会让
+# 判定张冠李戴（详见该处注释）。libc 本就在依赖树里（tokio/rusqlite 等间接引入），
+# 加显式依赖只多一条依赖边、零新增 crate。
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS Keychain 免口令加密（与 Windows DPAPI 对等的信任模型：绑登录态、跨机解不出）。
 #

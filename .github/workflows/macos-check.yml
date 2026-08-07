@@ -153,6 +153,81 @@ jobs:
           git checkout -- src/proc.rs
           echo "故障注入已被 cargo check 抓到，且原因正确 ✓"
 
+      # ---- .app 产出与 Info.plist 判据 ----
+      #
+      # 为什么必须真出包：`bundle.macOS.minimumSystemVersion` 加在配置里是「看起来配了」，
+      # 而它到底有没有落进 Info.plist 的 LSMinimumSystemVersion，只有产物能证明。
+      # 本项目历史上栽在同一形态两次（FR-025 自启动开关字段存在、UI 能点、值落盘，
+      # 后端却从无注册代码；Tailwind 的 bg-warning/8 不在标度内→一条 CSS 都不生成）。
+      #
+      # 刻意只出 `app` 不出 `dmg`：dmg 要挂载磁盘映像，在 CI 上慢且偶发失败，
+      # 而本步要验的判据（Info.plist、icns、可执行文件架构）全在 .app 里。
+      # dmg 的正确性属阶段 3 真机验证。
+      #
+      # `--bundles app` 而不是把 app/dmg 写进 tauri.conf.json 的 targets：
+      # bundler 的 `PackageType::Nsis` 那条 match 臂**没有 cfg 门控**
+      # （源码注释：don't restrict to windows as NSIS installers can be built in
+      # linux+macOS using cargo-xwin），配置里混列会让 mac 构建真去跑 NSIS。
+      - name: Build .app and verify bundle
+        run: |
+          npm run tauri build -- --bundles app 2>&1 | tail -30
+
+          APP="src-tauri/target/release/bundle/macos/SynaRoute.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::.app 未产出，预期路径 $APP"
+            ls -R src-tauri/target/release/bundle 2>/dev/null || true
+            exit 1
+          fi
+          echo "产物: $APP"
+
+          PLIST="$APP/Contents/Info.plist"
+
+          # 判据 1：minimumSystemVersion 真的落进了 Info.plist
+          got=$(/usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$PLIST" 2>/dev/null || echo "<缺失>")
+          echo "LSMinimumSystemVersion = $got"
+          if [ "$got" != "11.0" ]; then
+            echo "::error::tauri.conf.json 配了 minimumSystemVersion=11.0，产物里却是 '$got' —— 配置未生效"
+            exit 1
+          fi
+
+          # 判据 2：icns 由 PNG 自动生成（icon 数组里没有 .icns，靠 bundler 现场打包）
+          if ! ls "$APP/Contents/Resources/"*.icns >/dev/null 2>&1; then
+            echo "::error::Resources 下无 .icns —— 图标未被打包，Dock/Finder 会显示默认图标"
+            ls -la "$APP/Contents/Resources/" || true
+            exit 1
+          fi
+          echo "icns 已生成 ✓"
+
+          # 判据 3：可执行文件是 arm64（macos-latest 是 Apple Silicon）
+          arch=$(lipo -archs "$APP/Contents/MacOS/SynaRoute" 2>/dev/null || echo "?")
+          echo "可执行架构 = $arch"
+          case "$arch" in
+            *arm64*) ;;
+            *) echo "::error::预期 arm64，实际 '$arch'"; exit 1;;
+          esac
+
+          # 判据 4：前端资源真被嵌入（对齐 CLAUDE.md 的硬规则 —— 裸 cargo build 该值为 0）
+          n="(未检)"
+          chunk=$(ls dist/assets/*.js 2>/dev/null | head -1 | xargs -r basename)
+          if [ -n "$chunk" ]; then
+            n=$(grep -c "$chunk" "$APP/Contents/MacOS/SynaRoute" 2>/dev/null || echo 0)
+            echo "chunk '$chunk' 在二进制里出现 $n 次"
+            if [ "$n" -eq 0 ]; then
+              echo "::error::前端资源未嵌入产物 —— 运行时会去连 devUrl 打不开界面"
+              exit 1
+            fi
+          else
+            echo "::warning::dist/assets 下没找到 js chunk，跳过嵌入判据"
+          fi
+
+          {
+            echo "### macOS .app 产物判据"
+            echo "- LSMinimumSystemVersion: \`$got\`"
+            echo "- icns: 已生成"
+            echo "- 架构: \`$arch\`"
+            echo "- 前端嵌入: 命中 $n 次"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # 判据刻意用 `git diff`（只看**已跟踪**文件）而不是 `git status --porcelain`：
       # 前面的 npm ci / npm run build 会产出 node_modules 与 dist（均已 gitignore），
       # 用 status 会把它们当成「未复原」误红。cargo 那边加了 `--locked`，Cargo.lock 不会被改写。

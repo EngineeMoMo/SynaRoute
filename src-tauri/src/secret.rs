@@ -829,6 +829,23 @@ fn aes_decrypt(key: &[u8; 32], data: &[u8]) -> AppResult<Vec<u8>> {
     cipher.decrypt(nonce, ct).map_err(|e| AppError::Crypto(e.to_string()))
 }
 
+/// 「跨设备移动」的 errno / Win32 错误码。
+///
+/// 抽成函数只为一件事：让这个平台差异有个可测的落点。它原先是 `atomic_write` 里一个
+/// 无条件写死的 `17`，而 17 只在 Windows 上是 `ERROR_NOT_SAME_DEVICE`；Unix 上 17 是
+/// `EEXIST`，跨设备是 `EXDEV`(18)。见调用点的注释。
+#[inline]
+fn cross_device_errno() -> i32 {
+    #[cfg(windows)]
+    {
+        17 // ERROR_NOT_SAME_DEVICE
+    }
+    #[cfg(not(windows))]
+    {
+        libc::EXDEV
+    }
+}
+
 /// 原子写：写临时文件再重命名替换，避免半写损坏（NFR-011 / dev-hard-rules）。
 ///
 /// 关键健壮性处理（企业管控机实战问题，真实 app 内 CDP 抓到的根因）：
@@ -887,15 +904,24 @@ pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> AppResult<()> {
         return Err(ctx("写临时文件", &e));
     }
 
-    // ERROR_NOT_SAME_DEVICE：跨设备移动，重试无意义，直接回退原地写。
-    const ERROR_NOT_SAME_DEVICE: i32 = 17;
+    // 跨设备移动：确定性失败，重试无意义，直接回退原地写。
+    //
+    // **错误码必须按平台取**。原先无条件用 17 —— 那是 Windows 的 ERROR_NOT_SAME_DEVICE，
+    // 而 Unix 上 17 是 `EEXIST`、跨设备是 `EXDEV`(18)。照搬同时踩两个坑：
+    //   1. 真正的 EXDEV 不被识别 → 白白重试 6 次（约 375ms）才落到回退，纯浪费；
+    //   2. 万一 rename 真返回 EEXIST，会被误判成「跨设备」而跳过重试 —— 判定张冠李戴。
+    //
+    // Unix 侧用 `libc::EXDEV` 而不是硬编码 18：本项目对「按错误码分流」一贯要求取自
+    // 权威定义而非记忆中的数值（同 Cargo.toml 里 security-framework-sys 那条的理由）。
+    // libc 本就在依赖树里（0.2.x，经 tokio/rusqlite 等间接引入），加显式依赖零新增 crate。
+    let cross_device = cross_device_errno();
     // ERROR_ACCESS_DENIED(5) / ERROR_SHARING_VIOLATION(32)：杀软/并发瞬时锁，值得短暂重试。
     let mut delay_ms = 5u64;
     for attempt in 0..6 {
         match std::fs::rename(&tmp, path) {
             Ok(()) => return Ok(()),
             Err(e) => {
-                if e.raw_os_error() == Some(ERROR_NOT_SAME_DEVICE) {
+                if e.raw_os_error() == Some(cross_device) {
                     break; // 跨设备：立即回退
                 }
                 if attempt < 5 {
@@ -945,6 +971,33 @@ mod tests {
             .join(format!("synaroute_secret_test_{}_{}_{}", tag, std::process::id(), seq));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 「跨设备」错误码必须按平台取，不能是一个写死的数值。
+    ///
+    /// 这条护栏防的是**回退式简化**：`cross_device_errno()` 看起来只是包了一个常量，
+    /// 很容易被后来者「顺手」改回 `let cross_device = 17;`。而那个 17 在 Unix 上是
+    /// `EEXIST`，不是跨设备 —— 两个平台的值本就不同，此处钉住这个不等式。
+    ///
+    /// 为什么值得单独一条测试：错的后果不报错、不 panic，只表现为落盘偶尔慢 375ms
+    /// （真 EXDEV 被白白重试 6 次），或把 EEXIST 误判成跨设备而跳过本该做的重试。
+    /// 这类「静默退化」正是本项目反复防的形态。
+    #[test]
+    fn cross_device_errno_is_platform_specific() {
+        let got = cross_device_errno();
+
+        #[cfg(windows)]
+        assert_eq!(got, 17, "Windows 上应为 ERROR_NOT_SAME_DEVICE");
+
+        #[cfg(not(windows))]
+        {
+            assert_eq!(got, libc::EXDEV, "Unix 上应为 EXDEV");
+            assert_eq!(got, 18, "EXDEV 在 Linux/macOS 上均为 18（值变了说明平台假设需重核）");
+            assert_ne!(
+                got, 17,
+                "17 是 Unix 的 EEXIST —— 若这里等于 17，说明有人把平台门控改回了硬编码"
+            );
+        }
     }
 
     /// P2-6：DPAPI 解密缓存的**全部失效点**。
