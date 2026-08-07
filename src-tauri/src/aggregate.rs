@@ -1557,6 +1557,48 @@ fn format_file_context(files: &[retrieval::RetrievedFile]) -> String {
 /// 走同一道字符串级校验（两处各写一份必然漂移）。
 pub(crate) fn is_safe_relative_path(path: &str) -> bool {
     use std::path::Component;
+
+    if path.trim().is_empty() {
+        return false;
+    }
+
+    // ---- 与平台无关的字符串级判定（必须在 `Path` 语义之前）----
+    //
+    // 为什么不能只靠 `Path::is_absolute()` / `Component::Prefix`：**它们是平台相关的**。
+    // 同一个字符串在两个平台上被判成两回事（macOS CI 首跑实测）：
+    //
+    // | 输入 | Windows | Unix |
+    // |---|---|---|
+    // | `C:\Windows\win.ini` | 绝对路径 + Prefix → 拒 | 一个普通组件 → **放行** |
+    // | `C:/Windows/x` | 绝对路径 + Prefix → 拒 | 组件 `C:`/`Windows`/`x` → **放行** |
+    // | `\\server\share\x` | UNC Prefix → 拒 | 一个普通组件 → **放行** |
+    //
+    // 在 Unix 上这三种不构成逃逸（反斜杠是合法文件名字符，落点仍在工作目录内，
+    // 且第 2 道 canonicalize 判定照样成立）。但本函数的**承诺**是「拒 `..`、绝对路径、
+    // 盘符、UNC」（见 `agent_tools` 模块注释），承诺在某个平台上不成立就是缺陷——
+    // 下一个人会按注释信任它。且同一份模型输出在两平台行为分叉，无谓地增加排障面。
+    //
+    // 故这三类一律按**字符串形状**拒掉，与运行平台无关。
+
+    // 盘符前缀：`X:` 开头（`C:\x`、`c:/x`、甚至裸 `C:`）
+    let b = path.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return false;
+    }
+    // 反斜杠开头：UNC（`\\server\share`）与盘内根（`\Windows`）
+    if path.starts_with('\\') {
+        return false;
+    }
+    // 反斜杠也当分隔符做 `..` 判定 —— Unix 的 `Path` 不这么看，
+    // 于是 `a\..\..\b` 在 Unix 上是一个组件、逃不掉但也拒不掉。
+    if path
+        .split(['/', '\\'])
+        .any(|seg| seg == "..")
+    {
+        return false;
+    }
+
+    // ---- 平台原生判定（Windows 上仍是主力，Unix 上负责 `/` 开头与 `..` 组件）----
     let p = std::path::Path::new(path);
     if p.is_absolute() {
         return false;
@@ -1567,8 +1609,7 @@ pub(crate) fn is_safe_relative_path(path: &str) -> bool {
             _ => {}
         }
     }
-    // 组件里不能有空片段/纯 .（正常相对路径不含），且非空
-    !path.trim().is_empty()
+    true
 }
 
 /// 规范化后判断 `candidate` 是否仍在 `work_root` 之下（解析符号链接后的真实落点）。

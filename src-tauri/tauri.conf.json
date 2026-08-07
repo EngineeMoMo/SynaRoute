@@ -37,6 +37,9 @@
       "icons/128x128@2x.png",
       "icons/icon.ico"
     ],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    },
     "windows": {
       "nsis": {
         "installMode": "currentUser",

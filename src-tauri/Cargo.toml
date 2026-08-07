@@ -69,5 +69,26 @@ windows = { version = "0.58", features = [
   "Win32_Storage_FileSystem",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+# 只为 `EXDEV`（跨设备 rename）这一个 errno 常量，见 `secret.rs::atomic_write`。
+# 与其硬编码 18 不如取自权威定义 —— 这是「按错误码分流」的地方，记错数值会让
+# 判定张冠李戴（详见该处注释）。libc 本就在依赖树里（tokio/rusqlite 等间接引入），
+# 加显式依赖只多一条依赖边、零新增 crate。
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS Keychain 免口令加密（与 Windows DPAPI 对等的信任模型：绑登录态、跨机解不出）。
+#
+# 为什么用 security-framework 而不是跨平台的 `keyring`：前者**本就在 mac 依赖树里**
+# （tauri-plugin-updater → reqwest → rustls-platform-verifier → security-framework），
+# 加直接依赖只多一条依赖边、零新增 crate；`keyring` 会新增约 5 个。
+security-framework = "3"
+# 只为 `errSecItemNotFound` 等 OSStatus 常量。刻意引 sys crate 而不硬编码数值
+# （与 `proc.rs` 里 CREATE_NO_WINDOW 用字面量的取舍相反）：那个常量三十年没变过且含义唯一，
+# 而这里要**按错误码分流**（不存在 → 生成新密钥；拒绝访问 → 报错），记错一个数值的后果是
+# 「把拒绝访问误判成不存在 → 生成新密钥覆盖旧的 → 用户全部密钥永久解不出」。
+# 该 crate 同样已在树里，零新增成本。
+security-framework-sys = "2"
+
 [features]
 custom-protocol = ["tauri/custom-protocol"]
