@@ -1359,9 +1359,27 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<ta
 fn tray_tooltip(app: &tauri::AppHandle) -> String {
     let state = app.state::<AppState>();
     let settings = state.store.get_settings();
+
+    // 运行状态必须在 tooltip 里：macOS 的菜单栏图标是 template（单色、由系统按深浅色填色），
+    // 拿不到颜色也拿不到透明度，`stopped_tray_icon` 那套「彩色=运行 / 灰度=停止」在 mac 上
+    // 完全失效（见 `apply_tray_icon`）。若状态只由图标表达，mac 用户将无处可看。
+    //
+    // Windows 上图标仍然分两态，这里的文本是冗余的 —— 但冗余无害，且两平台同一份文本
+    // 省掉一处平台分叉。
+    let running: Vec<&str> = CategoryType::ALL
+        .iter()
+        .filter(|c| state.proxy.is_running(**c))
+        .map(|c| c.display_name())
+        .collect();
+    let status = if running.is_empty() {
+        "已停止".to_string()
+    } else {
+        format!("运行中: {}", running.join(" / "))
+    };
+
     match settings.active_models.get(&CategoryType::Codex) {
-        Some(m) if !m.trim().is_empty() => format!("SynaRoute · Codex: {m}"),
-        _ => "SynaRoute".to_string(),
+        Some(m) if !m.trim().is_empty() => format!("SynaRoute · {status} · Codex: {m}"),
+        _ => format!("SynaRoute · {status}"),
     }
 }
 
@@ -1374,6 +1392,9 @@ fn tray_tooltip(app: &tauri::AppHandle) -> String {
 /// 灰度用感知亮度权重（0.299/0.587/0.114）而非三通道均值——均值会让偏蓝的图标看起来
 /// 比实际更亮。alpha 乘 0.55 让它明显「淡下去」，即使用户系统主题下灰度对比不明显，
 /// 也能靠透明度分辨。
+///
+/// 仅非 macOS 使用（mac 上托盘图标是 template，见 `apply_tray_icon`）。
+#[cfg(not(target_os = "macos"))]
 fn desaturate_rgba_in_place(rgba: &mut [u8]) -> bool {
     if rgba.is_empty() || rgba.len() % 4 != 0 {
         return false;
@@ -1397,6 +1418,9 @@ fn desaturate_rgba_in_place(rgba: &mut [u8]) -> bool {
 /// 「运行时是新图标、停止时是旧图标」的割裂。从运行时拿到的 RGBA 现场派生，永远自动对齐。
 ///
 /// 结果缓存（`OnceLock`）：托盘每次重建都会取一次，而源图标在进程内恒定。
+///
+/// macOS 不用它：那边图标走 template（系统按深浅色填色），派生灰度版渲染结果与原图无异。
+#[cfg(not(target_os = "macos"))]
 fn stopped_tray_icon(app: &tauri::AppHandle) -> Option<tauri::image::Image<'static>> {
     static CACHED: std::sync::OnceLock<Option<(Vec<u8>, u32, u32)>> = std::sync::OnceLock::new();
     let cached = CACHED.get_or_init(|| {
@@ -1418,15 +1442,38 @@ fn stopped_tray_icon(app: &tauri::AppHandle) -> Option<tauri::image::Image<'stat
 /// 判据是**任一**在跑而非全部：托盘只有一个图标，而三个分类各自独立启停。用户关心的是
 /// 「SynaRoute 现在有没有在转发」，细分状态由菜单里各分类的勾选表达。
 fn apply_tray_icon(app: &tauri::AppHandle, tray: &tauri::tray::TrayIcon) {
-    let state = app.state::<AppState>();
-    let any_running = CategoryType::ALL.iter().any(|c| state.proxy.is_running(*c));
-    let icon = if any_running {
-        app.default_window_icon().cloned()
-    } else {
-        stopped_tray_icon(app).or_else(|| app.default_window_icon().cloned())
-    };
-    if let Some(icon) = icon {
-        let _ = tray.set_icon(Some(icon));
+    // ---- macOS：图标恒定，状态交给 tooltip ----
+    //
+    // 菜单栏图标应当是 template（单色）：系统只读 alpha 通道、自己按深浅色模式填色
+    // （浅色填黑、深色填白）。彩色图标在深色模式下会显得突兀，且与系统其它图标格调不一。
+    //
+    // 但 template 化与「彩色=运行 / 灰度=停止」这套状态表达**互斥** —— 颜色和透明度
+    // 都被系统接管，`desaturate_rgba_in_place` 派生出的灰度版在 mac 上和原图渲染结果
+    // 完全一致，两态无从分辨。故 mac 上状态改由 tooltip 承载（见 `tray_tooltip`），
+    // 图标不随状态变。
+    //
+    // Windows 保持原有两态图标：任务栏通知区没有 template 概念，彩色/灰度是那边的惯例。
+    #[cfg(target_os = "macos")]
+    {
+        let _ = tray.set_icon_as_template(true);
+        if let Some(icon) = app.default_window_icon().cloned() {
+            let _ = tray.set_icon(Some(icon));
+        }
+        return;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let state = app.state::<AppState>();
+        let any_running = CategoryType::ALL.iter().any(|c| state.proxy.is_running(*c));
+        let icon = if any_running {
+            app.default_window_icon().cloned()
+        } else {
+            stopped_tray_icon(app).or_else(|| app.default_window_icon().cloned())
+        };
+        if let Some(icon) = icon {
+            let _ = tray.set_icon(Some(icon));
+        }
     }
 }
 
@@ -1711,7 +1758,10 @@ mod tests {
 
     /// 「已停止」图标的派生：必须真的变灰、真的变淡，且不改尺寸。
     /// 直接测像素变换本身（不依赖 AppHandle，单测里拿不到真实图标）。
+    ///
+    /// 随被测函数一起门控：mac 上托盘图标走 template，不存在灰度派生这条路。
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn stopped_icon_derivation_greys_out_and_fades() {
         // 一个 2×1 的图：纯红不透明 + 纯蓝半透明。
         let mut rgba = vec![255u8, 0, 0, 255, 0, 0, 255, 128];
@@ -1727,6 +1777,7 @@ mod tests {
 
     /// 像素数据长度非法时必须原样返回、不做部分修改——宁可两态同图标，也不要画出花屏。
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn stopped_icon_derivation_rejects_malformed_pixel_data() {
         let mut odd = vec![1u8, 2, 3]; // 不是 4 的整数倍
         assert!(!desaturate_rgba_in_place(&mut odd));
