@@ -44,7 +44,7 @@ export const platforms: Platform[] = [
     id: "macos",
     // 尚未构建 macOS 版本。做出来之后改这一行即可，无需改任何组件。
     status: "coming-soon",
-    minOS: "macOS 12+",
+    minOS: "macOS 11+",
     assetPattern: /\.dmg$/i,
     uaPattern: /mac os x|macintosh/i,
   },
