@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/bridge";
 import { useStore } from "@/store";
 import { useT } from "@/lib/useT";
@@ -91,6 +91,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     }
   };
   const [saving, setSaving] = useState(false);
+  const [invalidContextModels, setInvalidContextModels] = useState<Set<string>>(() => new Set());
   // 手动加模型输入框（不用原生 prompt()：WebView2 里行为不可靠）
   const [manualModel, setManualModel] = useState("");
 
@@ -367,6 +368,10 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const save = async () => {
     if (!name.trim()) return setError(t("editor.errNeedName"));
     if (!baseUrl.trim()) return setError(t("editor.errNeedBaseUrl2"));
+    const currentModelNames = new Set(models.map((m) => m.realName));
+    if ([...invalidContextModels].some((model) => currentModelNames.has(model))) {
+      return setError(t("editor.errInvalidContextWindow"));
+    }
 
     const key = buildDraftKey();
 
@@ -624,19 +629,32 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                         1M
                       </span>
                     )}
-                    <input
-                      type="number"
-                      className="h-7 w-24 rounded-control border border-border bg-bg px-2 text-xs text-text-primary placeholder:text-text-muted"
-                      placeholder={t("editor.contextWindowPlaceholder")}
-                      value={m.contextWindow ?? ""}
-                      onChange={(e) => {
-                        const val = e.target.value ? Number(e.target.value) : undefined;
-                        setModels(models.map((x) => x.realName === m.realName ? { ...x, contextWindow: val } : x));
-                      }}
+                    <ContextWindowInput
+                      value={m.contextWindow}
+                      onChange={(val) =>
+                        setModels(models.map((x) => x.realName === m.realName ? { ...x, contextWindow: val } : x))
+                      }
+                      onValidityChange={(valid) =>
+                        setInvalidContextModels((prev) => {
+                          const next = new Set(prev);
+                          if (valid) next.delete(m.realName);
+                          else next.add(m.realName);
+                          return next;
+                        })
+                      }
                       title={t("editor.contextWindow")}
+                      unitTitle={t("editor.contextWindowUnit")}
+                      placeholder={t("editor.contextWindowPlaceholder")}
                     />
                     <button
-                      onClick={() => setModels(models.filter((x) => x.realName !== m.realName))}
+                      onClick={() => {
+                        setModels(models.filter((x) => x.realName !== m.realName));
+                        setInvalidContextModels((prev) => {
+                          const next = new Set(prev);
+                          next.delete(m.realName);
+                          return next;
+                        });
+                      }}
                       className="shrink-0 rounded p-1 text-text-muted hover:text-danger"
                       title={t("common.remove")}
                     >
@@ -833,6 +851,208 @@ function Field({
     <div className={className}>
       <div className="mb-1 text-xs font-medium text-text-secondary">{label}</div>
       {children}
+    </div>
+  );
+}
+
+/** 单位下拉的三档：token 原始数值 / 千（×1000）/ 百万（×1000000）。 */
+type TokenUnit = "token" | "K" | "M";
+
+const UNIT_MULTIPLIER: Record<TokenUnit, number> = { token: 1, K: 1_000, M: 1_000_000 };
+const UNIT_DECIMALS: Record<TokenUnit, number> = { token: 0, K: 3, M: 6 };
+/** 后端 `ModelInfo.context_window` 是 `Option<u32>`，前端必须同上限，不能等 IPC 反序列化才失败。 */
+const MAX_CONTEXT_TOKENS = 0xffff_ffff;
+
+/**
+ * 精确地把十进制数值 + 单位换成整数 token，避免二进制浮点误差。
+ *
+ * 例如 JS 的 `1.000001 * 1_000_000` 实际是 `1000000.9999999999`；用 Number 乘完再
+ * `isInteger` 会把合法的 1,000,001 token 判错。这里直接按十进制位数补零，绝不猜值。
+ */
+function tokensFromAmount(raw: string, unit: TokenUnit): number | null {
+  const matched = /^(\d+)(?:\.(\d+))?$/.exec(raw.trim());
+  if (!matched) return null;
+
+  const whole = matched[1];
+  const fraction = (matched[2] ?? "").replace(/0+$/, "");
+  const decimals = UNIT_DECIMALS[unit];
+  if (fraction.length > decimals) return null; // 该精度会产生半个 token，拒绝而非四舍五入
+
+  const tokens = BigInt(whole) * BigInt(UNIT_MULTIPLIER[unit])
+    + BigInt((fraction + "0".repeat(decimals - fraction.length)) || "0");
+  if (tokens <= 0n || tokens > BigInt(MAX_CONTEXT_TOKENS)) return null;
+  return Number(tokens);
+}
+
+/** 为已有 token 数选择初始单位：按数量级选最大单位，允许精确小数回显。 */
+function preferredUnit(tokens: number | undefined): TokenUnit {
+  if (tokens === undefined) return "K"; // 上下文窗口通常是数十万，空值默认 K，直接填 200 即 200K
+  if (tokens >= 1_000_000) return "M";
+  if (tokens >= 1_000) return "K";
+  return "token";
+}
+
+/**
+ * 按当前单位**无损**反算显示值。
+ *
+ * 不能用 `String(tokens / multiplier)`：接近 `Number.MAX_SAFE_INTEGER` 时二进制浮点
+ * 会把 `9007199254740991 / 1000` 显示成 `9007199254740.99`，再解析就少 1 token。
+ * 这里用 BigInt 做商余数、手工插十进制点，确保 `tokensFromAmount(amountForUnit(...))`
+ * 对整个安全整数范围都严格往返。
+ */
+function amountForUnit(tokens: number | undefined, unit: TokenUnit): string {
+  if (tokens === undefined) return "";
+  const divisor = BigInt(UNIT_MULTIPLIER[unit]);
+  const raw = BigInt(tokens);
+  const whole = raw / divisor;
+  const remainder = raw % divisor;
+  if (remainder === 0n) return String(whole);
+
+  const decimals = UNIT_DECIMALS[unit];
+  const fraction = remainder.toString().padStart(decimals, "0").replace(/0+$/, "");
+  return `${whole}.${fraction}`;
+}
+
+/**
+ * 上下文窗口输入：数值框 + 单位下拉，替代早期「一个框里既能填纯数字又能填 200k/1M」的设计
+ * ——那种写法要求用户记住语法，改成显式选单位后，数值框永远只接受数字，心智负担更低。
+ *
+ * 两个草稿状态（数值、单位）分离而不合并成一个字符串再解析：单位切换不该触发数值校验，
+ * 数值输入也不该受单位状态影响，各自独立才不会出现「切单位时把已输入的数值吃掉」之类耦合。
+ */
+function ContextWindowInput({
+  value,
+  onChange,
+  onValidityChange,
+  title,
+  unitTitle,
+  placeholder,
+}: {
+  value: number | undefined;
+  onChange: (v: number | undefined) => void;
+  onValidityChange: (valid: boolean) => void;
+  title: string;
+  unitTitle: string;
+  placeholder: string;
+}) {
+  const [amountDraft, setAmountDraft] = useState<string | null>(null);
+  const [unit, setUnit] = useState<TokenUnit>(() => preferredUnit(value));
+  const [bad, setBad] = useState(false);
+  const nativeBadInput = useRef(false);
+
+  // 单位是用户的显式选择，父组件回写 value 时不能擅自改档：
+  // 用户填 `1.5` 选 M 后，value=1_500_000；若重新按「能整除的最大单位」拆分，
+  // 会跳成 `1500 k`，数值虽相同但用户刚选的 M 被吃掉。按当前 unit 反算即可保持 `1.5 M`。
+  const externalAmount = amountForUnit(value, unit);
+  const shownAmount = amountDraft ?? externalAmount;
+
+  const commitAmount = (rawAmount: string, rawUnit: TokenUnit) => {
+    const trimmed = rawAmount.trim();
+    if (trimmed === "") {
+      setBad(false);
+      setAmountDraft(null);
+      onValidityChange(true);
+      onChange(undefined);
+      return;
+    }
+    // 只接受正数；十进制精确换算后必须是整数 token，不做静默四舍五入。
+    const tokens = tokensFromAmount(trimmed, rawUnit);
+    if (tokens === null) {
+      setBad(true);
+      onValidityChange(false);
+      return;
+    }
+    setBad(false);
+    setAmountDraft(null);
+    onValidityChange(true);
+    onChange(tokens);
+  };
+
+  return (
+    <div
+      className="flex shrink-0 items-center gap-1"
+      onBlur={(e) => {
+        // 焦点仍在「数值 + 单位」组合内部时不提交：点击单位下拉会先触发 input blur，
+        // 若此时按旧单位提交，再处理 select change，就会短暂写入错误值。
+        if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+        if (nativeBadInput.current) {
+          setBad(true);
+          onValidityChange(false);
+          return;
+        }
+        commitAmount(amountDraft ?? externalAmount, unit);
+      }}
+    >
+      <input
+        type="number"
+        inputMode="decimal"
+        min="0"
+        step="any"
+        className={`h-7 w-16 rounded-control border bg-bg px-2 text-xs text-text-primary placeholder:text-text-muted ${
+          bad ? "border-danger" : "border-border"
+        }`}
+        placeholder={placeholder}
+        value={shownAmount}
+        onChange={(e) => {
+          // Chromium 对 `type=number` 的某些中间态（如单独一个 `-`）会给 value=""
+          // 同时 validity.badInput=true。若只看 value，会把「输入未完成」误判成用户主动清空，
+          // blur 后静默删掉原有 contextWindow。badInput 时保留上一个草稿并阻止 Save。
+          if (e.currentTarget.validity.badInput) {
+            nativeBadInput.current = true;
+            setBad(true);
+            onValidityChange(false);
+            return;
+          }
+          nativeBadInput.current = false;
+          const nextDraft = e.target.value;
+          setAmountDraft(nextDraft);
+
+          // 合法草稿立即同步父状态，Save 永远拿到最新值，不依赖 blur 与 click 的事件顺序。
+          // 非法草稿保留在输入框中但不上报，且 validity=false 会阻止 Save。
+          const trimmed = nextDraft.trim();
+          const parsed = trimmed === "" ? undefined : tokensFromAmount(trimmed, unit);
+          const valid = parsed !== null;
+          onValidityChange(valid);
+          if (valid) onChange(parsed);
+          if (bad) setBad(false);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commitAmount(amountDraft ?? externalAmount, unit);
+          } else if (e.key === "Escape") {
+            nativeBadInput.current = false;
+            setAmountDraft(null); // 放弃本次编辑，回到外部值
+            setBad(false);
+            onValidityChange(true);
+          }
+        }}
+        title={title}
+      />
+      <select
+        className="h-7 rounded-control border border-border bg-bg px-1 text-xs text-text-primary"
+        value={unit}
+        onChange={(e) => {
+          if (nativeBadInput.current) {
+            setBad(true);
+            onValidityChange(false);
+            return;
+          }
+          const nextUnit = e.target.value as TokenUnit;
+          // 数值 + 单位共同构成真实 token 数：输入 1 后选 M，就是 1,000,000；
+          // 输入 200 后选 K，就是 200,000。单位选择不是纯显示格式切换。
+          const amountNow = amountDraft ?? externalAmount;
+          setUnit(nextUnit);
+          if (amountNow.trim() !== "") {
+            commitAmount(amountNow, nextUnit);
+          }
+        }}
+        title={unitTitle}
+      >
+        <option value="token">tok</option>
+        <option value="K">K</option>
+        <option value="M">M</option>
+      </select>
     </div>
   );
 }
