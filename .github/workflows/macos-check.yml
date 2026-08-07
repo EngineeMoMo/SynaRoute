@@ -263,16 +263,47 @@ jobs:
 
           cp src-tauri/target/release/bundle/dmg/*.dmg "$RUNNER_TEMP/artifacts/"
 
-          # 自检：tar 里必须真的带着可执行位（否则解开也跑不了，等于白传）。
-          # `tar -tv` 的权限列形如 `-rwxr-xr-x`，抓主可执行文件那一行来看。
-          mode=$(tar -tvf "$RUNNER_TEMP/artifacts/SynaRoute-macos-arm64-app.tar.gz" \
-            | grep 'SynaRoute.app/Contents/MacOS/SynaRoute$' | awk '{print $1}')
-          echo "主可执行文件在 tar 里的权限位: $mode"
-          case "$mode" in
-            *x*) ;;
-            *) echo "::error::tar 里主可执行文件没有可执行位 —— 解开后无法启动"; exit 1;;
-          esac
+          # 自检：把 tar **真解一次**，对解出来的文件判可执行位。
+          #
+          # 上一版这里是 `tar -tvf | grep ... | awk '{print $1}'`，即解析 tar 的文本列表。
+          # 它在 macOS runner 上取到**空字符串** → 自检误红，而 tar 本身是好的
+          # （bsdtar 的 -tv 列表格式或输出流与我预期不符，根因未查）。
+          #
+          # 不去查那个根因，而是换判据：要证的命题是「解开后能不能跑」，
+          # 正确判法就是解开再 `test -x`，不是对一行文本做模式匹配。
+          # 文本解析这类间接判据一旦不匹配，失败方向是「静默取空」而非报错 ——
+          # 恰好是本项目反复防的形态，这次栽在我自己写的判据上。
+          probe="$RUNNER_TEMP/extract-probe"
+          rm -rf "$probe"
+          mkdir -p "$probe"
+          tar -xzf "$RUNNER_TEMP/artifacts/SynaRoute-macos-arm64-app.tar.gz" -C "$probe"
 
+          # 顺带把 tar 列表的头几行打出来，供下次排查时知道真实格式（含 stderr）。
+          echo "--- tar -tvf 前 3 行（诊断用）---"
+          tar -tvf "$RUNNER_TEMP/artifacts/SynaRoute-macos-arm64-app.tar.gz" 2>&1 | head -3
+          echo "---"
+
+          exe="$probe/SynaRoute.app/Contents/MacOS/SynaRoute"
+          if [ ! -f "$exe" ]; then
+            echo "::error::解开后找不到主可执行文件，预期 $exe"
+            find "$probe" -maxdepth 4 | head -30
+            exit 1
+          fi
+          if [ ! -x "$exe" ]; then
+            echo "::error::解开后主可执行文件没有可执行位 —— 双击不会有任何反应"
+            ls -l "$exe"
+            exit 1
+          fi
+          echo "解开后可执行位保留 ✓"
+          ls -l "$exe"
+
+          # 符号链接数只报不判：Tauri 的 .app 未必含 Frameworks，为零不代表错。
+          # 记它是为了将来若加了框架依赖，能看出 tar 是否把链接原样带过来了。
+          links=$(find "$probe/SynaRoute.app" -type l | wc -l | tr -d ' ')
+          echo "符号链接数: $links"
+
+          rm -rf "$probe"
+          echo "--- 待上传产物 ---"
           ls -lh "$RUNNER_TEMP/artifacts/"
 
       # v7 而非 v4：v4 的运行时是 Node 20（已弃用），会把本 workflow 前面刚清掉的
