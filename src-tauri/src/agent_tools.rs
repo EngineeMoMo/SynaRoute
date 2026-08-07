@@ -230,12 +230,14 @@ fn resolve_readable(work_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     }
     // ③″ 硬链接别名：canonicalize **不还原硬链接**（硬链接是同一文件内容的另一目录项，
     //     没有「目标」可解析），故良性命名的硬链接（`notes.md` 与 `.env` 同 inode）能骗过
-    //     上面按名字、按落点两次判定。枚举该文件在同卷上的**全部**硬链接名，任一叶子名敏感即拒。
-    //     仅 Windows 实现（本项目 Windows-only；Unix 为 no-op）。多链接文件极罕见，枚举只在
-    //     `number_of_links > 1` 时才发生，正常单链接文件零开销。
+    //     上面按名字、按落点两次判定。
+    //
+    //     Windows 能枚举同卷全部链接名，只在其中存在敏感名时拒；macOS/Unix 的标准库
+    //     只能可靠拿到 nlink、无法从 inode 反查所有路径，故 nlink>1 时 fail-closed。
+    //     多链接源文件极罕见，宁可让用户复制一份再读，也不能把凭据经别名送进上游请求。
     if let Some(alias) = sensitive_hardlink_alias(&real) {
         return Err(format!(
-            "路径 `{rel}` 被拒：它与一个可能含凭据的文件（{alias}）是同一份内容的硬链接。"
+            "路径 `{rel}` 被拒：该文件存在无法安全验证的硬链接（{alias}），可能与凭据文件共享内容。"
         ));
     }
     Ok(real)
@@ -341,9 +343,22 @@ fn sensitive_hardlink_alias(real: &Path) -> Option<String> {
     found
 }
 
-/// 非 Windows：no-op。本项目为 Windows-only；Unix 上文件符号链接已由 canonicalize 处理，
-/// 硬链接攻击面不在本项目目标范围内。
-#[cfg(not(windows))]
+/// macOS/Unix：标准库能可靠拿到 inode 的链接数，但不能从 inode 反查同文件系统上的
+/// 全部路径名。`nlink > 1` 时无法证明其它名字里没有 `.env`/密钥文件，故 fail-closed。
+///
+/// 这不是理论攻击面：`ln .env notes.md` 无需任何特权，canonicalize(notes.md) 仍是
+/// notes.md，按「输入名 + 真实落点」两次敏感判定都会放行。复制文件会得到独立 inode，
+/// 用户确有读取需求时可复制一份；安全工具不该拿无法验证的别名碰运气。
+#[cfg(unix)]
+fn sensitive_hardlink_alias(real: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let nlink = std::fs::metadata(real).ok()?.nlink();
+    (nlink > 1).then(|| format!("nlink={nlink}"))
+}
+
+/// 其它非 Windows/非 Unix 平台（当前 Tauri 桌面目标不会走到）：保守拒绝无法获取元数据的情况
+/// 会误伤所有文件，故维持 no-op；新增平台时必须显式实现并补测试。
+#[cfg(not(any(windows, unix)))]
 fn sensitive_hardlink_alias(_real: &Path) -> Option<String> {
     None
 }
@@ -1216,9 +1231,8 @@ mod tests {
             target.display()
         ))
     }
-    // 非 Windows 版本只被 Windows 专属测试调用，macOS 上 clippy 报 unused。
+    /// 非 Windows 用标准库建硬链接，供 Unix fail-closed 测试使用。
     #[cfg(not(windows))]
-    #[allow(dead_code)]
     fn try_hard_link(link: &Path, target: &Path) -> bool {
         std::fs::hard_link(target, link).is_ok()
     }
@@ -1251,6 +1265,44 @@ mod tests {
             e.contains("凭据") && e.contains("硬链接"),
             "拒绝原因应点明硬链接与凭据风险，实际：{e}"
         );
+        std::fs::remove_dir_all(&w).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_hardlink_policy_fails_closed_for_any_alias() {
+        // Unix 标准库能看见 nlink，但不能反查同 inode 的全部路径名，故无法像 Windows 那样
+        // 证明另一个名字是否敏感。策略是 nlink>1 一律拒绝 —— 包括两个都无害的名字。
+        // 这是有意的平台差异：安全工具宁可让用户复制一份（新 inode）再读，也不能把可能
+        // 与 `.env` 共享内容的别名发给上游。
+        let w = work("d3_hardlink_unix");
+        std::fs::write(w.join("main.rs"), "fn main() {}\n").unwrap();
+        assert!(resolve_readable(&w, "main.rs").is_ok(), "单链接普通文件必须能读");
+        assert!(try_hard_link(&w.join("copy.rs"), &w.join("main.rs")), "无法创建硬链接");
+
+        let e = resolve_readable(&w, "copy.rs")
+            .expect_err("Unix 上 nlink>1 无法验证其它名字，必须 fail-closed");
+        assert!(
+            e.contains("硬链接") && e.contains("nlink=2"),
+            "拒绝原因应明确硬链接及 nlink，实际：{e}"
+        );
+        // 原路径也共享同一 inode，同样必须拒绝；只拦别名会留下对称的绕法。
+        assert!(resolve_readable(&w, "main.rs").is_err(), "原路径在 nlink>1 时也必须拒绝");
+        std::fs::remove_dir_all(&w).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_hardlink_policy_also_guards_image_loader() {
+        // 图片入口必须复用同一条 resolve_readable 防线。若未来有人为「正常图片打不开」
+        // 绕开它，这条立即变红，防止凭据内容被 base64 塞进多模态请求。
+        let w = work("d3_hardlink_unix_img");
+        std::fs::write(w.join(".env"), "TOKEN=abc\n").unwrap();
+        assert!(try_hard_link(&w.join("shot.png"), &w.join(".env")), "无法创建硬链接");
+        let dir = w.to_string_lossy().to_string();
+        let e = load_images(Some(&dir), &["shot.png".into()])
+            .expect_err("Unix 上硬链接图片必须 fail-closed");
+        assert!(e.contains("硬链接") && e.contains("nlink=2"), "{e}");
         std::fs::remove_dir_all(&w).ok();
     }
 

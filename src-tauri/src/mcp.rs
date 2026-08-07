@@ -190,10 +190,9 @@ impl McpManager {
         if bound != port {
             tracing::warn!("MCP 请求端口 {port} 被占用，已改用 {bound}");
         }
-        // 把实际端口写到 exe 同级的 mcp-port 文件：stdio 子进程（--mcp-stdio）据此找到运行中的
-        // 主应用并转发 tools/call。写 exe 同级（如 F:\SynaRoute\）而非 %APPDATA%——后者会被
-        // MSIX 虚拟化（Claude/Codex 等包应用读到的是包容器私有副本，与真实文件是平行宇宙），
-        // exe 同级目录不虚拟化，任何身份的进程读到的都是同一份真实端口。
+        // 把实际端口写到平台对应的共享文件（见 mcp_port_file_path）：
+        // Windows 放 exe 同级以躲 MSIX AppData 虚拟化；macOS 放 Application Support，
+        // 避免写进 .app bundle。stdio 子进程据此找到主应用并转发 tools/call。
         write_mcp_port_file(bound);
         tracing::info!("MCP 服务器已启动: http://127.0.0.1:{bound}/mcp");
         Ok(bound)
@@ -283,7 +282,7 @@ pub async fn run_stdio() {
 }
 
 /// 把 stdio 收到的 `tools/call` 转发到运行中主应用的 HTTP MCP。
-/// 端口发现：先读 exe 同级端口文件（主应用启动时写，不受 MSIX 虚拟化影响），
+/// 端口发现：先读平台共享端口文件（Windows=exe 同级；macOS=Application Support），
 /// 读不到再扫描默认端口范围。主应用未运行时返回可读错误，提示用户启动应用。
 async fn forward_tool_call_to_main(params: &Value) -> Result<Value, String> {
     let port = discover_main_mcp_port()
@@ -325,7 +324,7 @@ async fn forward_tool_call_to_main(params: &Value) -> Result<Value, String> {
     }
 }
 
-/// 发现运行中主应用的 MCP 端口：先读 exe 同级端口文件，再扫描默认端口范围探活。
+/// 发现运行中主应用的 MCP 端口：先读平台共享端口文件，再扫描默认端口范围探活。
 async fn discover_main_mcp_port() -> Option<u16> {
     // 1. 端口文件（主应用启动时写，最可靠）。读到后探活确认真的是 SynaRoute MCP。
     if let Some(p) = read_mcp_port_file() {

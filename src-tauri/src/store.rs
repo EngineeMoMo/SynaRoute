@@ -84,9 +84,9 @@ pub fn new_key_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// 默认日志目录：安装目录（exe 同级）下的 `logs/`。
-/// 路径动态解析（current_exe），禁止硬编码（dev-hard-rules 规则2）。
-/// 若安装目录不可写（如装在 Program Files 需管理员权限），回退到 %APPDATA%\SynaRoute\logs。
+/// 默认日志目录：Windows 优先安装目录（exe 同级）下的 `logs/`，macOS 直接使用
+/// `~/Library/Logs/SynaRoute/`。路径动态解析，禁止硬编码（dev-hard-rules 规则2）。
+/// Windows 安装目录不可写时回退到 `%APPDATA%\SynaRoute\logs`。
 ///
 /// **结果进程内缓存一次**（`OnceLock`）：本函数原先每写一行日志都被调一次，每次都做
 /// 「建 `.write-probe` → 写 → 删」的探测；而日志写入是并发的（代理转发、健康检查各自的 tokio
