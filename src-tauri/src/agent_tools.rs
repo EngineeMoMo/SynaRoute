@@ -1216,7 +1216,9 @@ mod tests {
             target.display()
         ))
     }
+    // 非 Windows 版本只被 Windows 专属测试调用，macOS 上 clippy 报 unused。
     #[cfg(not(windows))]
+    #[allow(dead_code)]
     fn try_hard_link(link: &Path, target: &Path) -> bool {
         std::fs::hard_link(target, link).is_ok()
     }

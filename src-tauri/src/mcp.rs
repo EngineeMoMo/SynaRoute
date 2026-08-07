@@ -62,7 +62,7 @@ fn mcp_port_file_path() -> Option<PathBuf> {
         let dir = dirs::data_dir()?.join("SynaRoute");
         // 主应用与 stdio 子进程都可能先到；建不出目录就当拿不到路径（调用方各有兜底）。
         std::fs::create_dir_all(&dir).ok()?;
-        return Some(dir.join(MCP_PORT_FILE));
+        Some(dir.join(MCP_PORT_FILE))
     }
     #[cfg(not(target_os = "macos"))]
     {
