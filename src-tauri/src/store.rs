@@ -573,6 +573,34 @@ impl Store {
         self.events.read().iter().map(Self::strip_trace).collect()
     }
 
+    /// 按「分类 × Key」聚合 token 用量（用量统计面板用）。
+    ///
+    /// 数据源是内存事件环形缓冲（最多 500 条）：用量随事件逐条采集（见
+    /// [`crate::upstream::usage`]），聚合时把带 `usage` 的事件按 category+key_id 累加。
+    ///
+    /// **刻意不含跨天历史**：每日 `.jsonl` 文件是逐条完整的事实来源，但解析它需要
+    /// 读盘 + 反序列化，且用量面板定位是「最近消耗」，不是「账单」。跨天累计留给后续
+    /// 版本（若要，按 `effective_log_dir` 的日期文件补一个按日聚合即可）。
+    ///
+    /// 折叠事件（repeat>1）的用量已在折叠时累加，这里直接读即可。
+    pub fn token_usage_by_key(&self) -> Vec<TokenUsageByKey> {
+        use std::collections::BTreeMap;
+        let mut map: BTreeMap<(CategoryType, String), TokenUsage> = BTreeMap::new();
+        for e in self.events.read().iter() {
+            let Some(u) = &e.usage else { continue };
+            // key_id 为空的事件（系统级）归到该分类的「(空)」行。
+            let k = (e.category_id, e.key_id.clone().unwrap_or_default());
+            map.entry(k).or_default().add(u);
+        }
+        map.into_iter()
+            .map(|((category_id, key_id), usage)| TokenUsageByKey {
+                category_id,
+                key_id,
+                usage,
+            })
+            .collect()
+    }
+
     /// 某分类**最近一条**失败事件（error / failover），且必须够新。
     ///
     /// 为什么单开一个窄查询、而不让前端拿 `list_all_events` 自己找（UX#11）：
@@ -2313,6 +2341,46 @@ mod tests {
         let last = ev.last().unwrap();
         assert_eq!(last.repeat, 2);
         assert_eq!(last.usage.map(|x| (x.input, x.output)), Some((70, 8)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 用量统计聚合：按「分类 × Key」分组，折叠累加的量也要计入。
+    #[test]
+    fn token_usage_by_key_groups_and_accumulates() {
+        use crate::upstream::TokenUsage;
+        let dir = temp_dir("usage_agg");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        let u = |i: u64, o: u64, c: u64| {
+            Some(TokenUsage { input: i, output: o, cache_read: c })
+        };
+
+        // 同分类同 Key 多条（不折叠，各自独立，应累加）
+        store.append_event_full(CategoryType::ClaudeCli, "route", Some("k1"), "a", None, None, u(100, 10, 0));
+        store.append_event_full(CategoryType::ClaudeCli, "route", Some("k1"), "b", None, None, u(50, 5, 30));
+        // 不同 Key
+        store.append_event_full(CategoryType::ClaudeCli, "route", Some("k2"), "c", None, None, u(20, 2, 0));
+        // 不同分类同 Key id（两个分类是不同命名空间，应分开）
+        store.append_event_full(CategoryType::Codex, "route", Some("k1"), "d", None, None, u(7, 1, 0));
+        // 无 Key 的系统级事件
+        store.append_event_full(CategoryType::ClaudeCli, "config", None, "e", None, None, u(3, 0, 0));
+
+        let agg = store.token_usage_by_key();
+        assert_eq!(agg.len(), 4, "4 个 (分类,key) 分组: {agg:?}");
+
+        let cli_k1 = agg.iter().find(|r| r.category_id == CategoryType::ClaudeCli && r.key_id == "k1").unwrap();
+        assert_eq!(
+            (cli_k1.usage.input, cli_k1.usage.output, cli_k1.usage.cache_read),
+            (150, 15, 30),
+            "同 Key 多次应累加（含缓存）"
+        );
+        let codex_k1 = agg.iter().find(|r| r.category_id == CategoryType::Codex && r.key_id == "k1").unwrap();
+        assert_eq!((codex_k1.usage.input, codex_k1.usage.output), (7, 1), "不同分类的 k1 要分开");
+        let no_key = agg.iter().find(|r| r.category_id == CategoryType::ClaudeCli && r.key_id.is_empty()).unwrap();
+        assert_eq!(no_key.usage.input, 3, "无 Key 事件归到空串组");
+        // 空 usage 事件不参与
+        store.append_event(CategoryType::ClaudeCli, "route", Some("k9"), "无用量");
+        assert_eq!(store.token_usage_by_key().len(), 4, "无用量事件不得产生分组");
 
         std::fs::remove_dir_all(&dir).ok();
     }

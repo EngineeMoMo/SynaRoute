@@ -27,6 +27,7 @@ import type {
   RequestTrace,
   RetrievedFile,
   ToolConfigPreview,
+  TokenUsageByKey,
   UpdateCheckResult,
   Vendor,
 } from "@/types";
@@ -187,6 +188,10 @@ export const api = {
   /** 合并全部分类的事件日志（不按分类过滤），供运行日志页连续展示；每条自带 categoryId 标签。 */
   listAllEvents: () =>
     call<EventLogEntry[]>("list_all_events", undefined, () => mockBridge.listAllEvents()),
+
+  /** 按「分类 × Key」聚合的 token 用量（用量统计面板）。 */
+  getTokenUsage: () =>
+    call<TokenUsageByKey[]>("get_token_usage", undefined, () => mockBridge.tokenUsage()),
 
   /**
    * 最近一次「够新」的转发失败（UX#11 的分类页常驻提示用）。

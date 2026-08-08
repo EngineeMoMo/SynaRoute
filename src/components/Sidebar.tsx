@@ -12,12 +12,13 @@ import {
   Settings,
   Building2,
   UserRound,
+  Gauge,
   Waypoints,
   Search,
   type LucideIcon,
 } from "lucide-react";
 
-export type NavKey = CategoryType | "brain" | "logs" | "vendors" | "settings" | "about";
+export type NavKey = CategoryType | "brain" | "logs" | "usage" | "vendors" | "settings" | "about";
 
 interface NavItem {
   key: NavKey;
@@ -32,6 +33,7 @@ const NAV: NavItem[] = [
   { key: "codex", tKey: "nav.codex", icon: Code2, group: "category" },
   { key: "brain", tKey: "nav.brain", icon: Brain, group: "feature" },
   { key: "logs", tKey: "nav.logs", icon: ScrollText, group: "feature" },
+  { key: "usage", tKey: "nav.usage", icon: Gauge, group: "feature" },
   { key: "vendors", tKey: "nav.vendors", icon: Building2, group: "system" },
   { key: "settings", tKey: "nav.settings", icon: Settings, group: "system" },
   { key: "about", tKey: "nav.about", icon: UserRound, group: "system" },

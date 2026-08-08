@@ -14,6 +14,7 @@ import type {
   ModelInfo,
   ProviderKey,
   ProxyState,
+  TokenUsageByKey,
   Vendor,
 } from "@/types";
 import type { UserPrefs } from "@/lib/prefs";
@@ -681,6 +682,26 @@ export const mockBridge = {
     await delay();
     // 与真实后端同口径：列表剥掉 trace 正文，只留 hasTrace 布尔位。
     return clone(events).map((e) => ({ ...e, hasTrace: !!e.trace, trace: undefined }));
+  },
+  async tokenUsage() {
+    await delay();
+    // 与真实后端同口径：按分类×Key 聚合。mock 里各 Key 的 usage 取自 events 里的用量；
+    // 无用量事件不产生分组。
+    const map = new Map<string, TokenUsageByKey>();
+    for (const e of events) {
+      if (!e.usage) continue;
+      const key = `${e.categoryId}/${e.keyId ?? ""}`;
+      const cur = map.get(key) ?? {
+        categoryId: e.categoryId,
+        keyId: e.keyId ?? "",
+        usage: { input: 0, output: 0, cacheRead: 0 },
+      };
+      cur.usage.input += e.usage.input;
+      cur.usage.output += e.usage.output;
+      cur.usage.cacheRead = (cur.usage.cacheRead ?? 0) + (e.usage.cacheRead ?? 0);
+      map.set(key, cur);
+    }
+    return clone([...map.values()]);
   },
   async getEventTrace(eventId: string) {
     await delay();

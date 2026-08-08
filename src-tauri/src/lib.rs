@@ -364,6 +364,12 @@ fn list_all_events(state: tauri::State<AppState>) -> Vec<EventLogEntry> {
     state.store.list_all_events()
 }
 
+/// 按「分类 × Key」聚合的 token 用量（用量统计面板）。
+#[tauri::command]
+fn get_token_usage(state: tauri::State<AppState>) -> Vec<crate::model::TokenUsageByKey> {
+    state.store.token_usage_by_key()
+}
+
 /// 某分类「最近一次失败」（error/failover），供分类页顶部常驻提示条用（UX#11）。
 ///
 /// 为什么单开一个命令而不让前端复用 `list_all_events` 自己筛：那个接口返回全部 500 条，
@@ -1118,6 +1124,7 @@ pub fn run() {
             restore_tool_config,
             list_events,
             list_all_events,
+            get_token_usage,
             recent_failure,
             get_event_trace,
             get_settings,

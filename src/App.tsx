@@ -3,6 +3,7 @@ import { Sidebar, type NavKey } from "@/components/Sidebar";
 import { CategoryPage } from "@/pages/CategoryPage";
 import { BrainPage } from "@/pages/BrainPage";
 import { LogsPage } from "@/pages/LogsPage";
+import { UsagePage } from "@/pages/UsagePage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { AboutPage } from "@/pages/AboutPage";
 import { VendorPage } from "@/pages/VendorPage";
@@ -132,6 +133,7 @@ export default function App() {
   const renderMain = () => {
     if (nav === "brain") return <BrainPage />;
     if (nav === "logs") return <LogsPage />;
+    if (nav === "usage") return <UsagePage />;
     if (nav === "vendors") return <VendorPage />;
     if (nav === "settings") return <SettingsPage />;
     if (nav === "about") return <AboutPage />;

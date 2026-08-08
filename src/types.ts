@@ -259,6 +259,14 @@ export interface TokenUsage {
   cacheRead?: number;
 }
 
+/** 用量统计：按「分类 × Key」聚合的一行（后端 get_token_usage 返回）。 */
+export interface TokenUsageByKey {
+  categoryId: CategoryType;
+  /** 空串 = 该分类的系统级事件（无具体 Key） */
+  keyId: string;
+  usage: TokenUsage;
+}
+
 export interface EventLogEntry {
   id: string;
   ts: number;

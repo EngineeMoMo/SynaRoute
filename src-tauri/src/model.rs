@@ -1161,6 +1161,16 @@ fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
+/// 用量统计：按「分类 × Key」聚合的一行。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageByKey {
+    pub category_id: CategoryType,
+    /// 空串 = 该分类的系统级事件（无具体 Key）。
+    pub key_id: String,
+    pub usage: TokenUsage,
+}
+
 impl TokenUsage {
     pub fn total(&self) -> u64 {
         self.input + self.output
