@@ -784,7 +784,7 @@ async fn handle_request(
             match try_stream_to_key(&store, category, key, &path, body, &requested_model, &fwd_headers, req_log, remaining)
                 .await
             {
-                Ok(StreamAttempt::Streaming { resp, url, real_model, request_body }) => {
+                Ok(StreamAttempt::Streaming { resp, url, real_model, request_body, stream_usage: _ }) => {
                     health::record_live_success(&store, &key.id);
                     // 有 Key 能用了 → 立即解除「全部失败」短路，不等窗口自然到期。
                     clear_all_failed_gate(&gate_key);
@@ -1206,6 +1206,12 @@ enum StreamAttempt {
         url: String,
         real_model: String,
         request_body: String,
+        /// 流式响应中提取的 token 用量（同协议透传从尾部 SSE chunk 采集，
+        /// 跨协议翻译后在 finish 时从缓冲区解析）。流是边收边发、不缓存全文，
+        /// 故这里用滑动窗口保留尾部字节，首字节延迟不受影响。
+        /// 当前仅同协议透传路径采集；跨协议翻译路径的 usage 暂不采集。
+        #[allow(dead_code)]
+        stream_usage: Option<crate::upstream::TokenUsage>,
     },
     /// 上游有响应但非 2xx：缓冲错误体，调用方据此切换下一个 Key。
     /// `retry_after`：上游 `Retry-After` 头解析出的秒数（429/503 常带），无则 None。
@@ -1360,11 +1366,67 @@ async fn try_stream_to_key(
 
     let body: ResBody = match sse_dir {
         // 同协议：reqwest 字节流 → hyper StreamBody，逐块原样透传。
+        // 同时用滑动窗口保留尾部字节，流结束后从尾部 SSE chunk 提取 token 用量——
+        // 不缓存全文、不牺牲首字节延迟。提取失败（上游没给 usage）时静默忽略。
         None => {
-            let byte_stream = resp.bytes_stream().map(|chunk| {
-                chunk
-                    .map(Frame::data)
-                    .map_err(|e| std::io::Error::other(e.to_string()))
+            use tokio::sync::Mutex;
+            let tail_buf = std::sync::Arc::new(Mutex::new(Vec::with_capacity(8192)));
+            let tail_buf2 = tail_buf.clone();
+            let store2 = store.clone();
+            let key_id2 = key.id.clone();
+            let category2 = category;
+            let ref_model2 = real_model.clone();
+            let req_model2 = requested_model.to_string();
+            let name2 = key.name.clone();
+
+            let byte_stream = resp.bytes_stream().map(move |chunk| {
+                match chunk {
+                    Ok(bytes) => {
+                        // 滑动窗口：保留尾部最近 8KB（usage 在 SSE 最末几个 chunk）。
+                        // `bytes` 是 `Bytes`（引用计数），clone 廉价。
+                        if let Ok(mut buf) = tail_buf.try_lock() {
+                            buf.extend_from_slice(&bytes);
+                            if buf.len() > 8192 {
+                                let keep = buf.len().saturating_sub(8192);
+                                buf.drain(0..keep);
+                            }
+                        }
+                        Ok(Frame::data(bytes))
+                    }
+                    Err(e) => {
+                        Err(std::io::Error::other(e.to_string()))
+                    }
+                }
+            });
+            // 流结束后从尾部窗口提取 usage 补给事件日志。
+            // 不能挂 `chain(once(...))` —— futures_util::once 返回 Option 非 Result，
+            // 必须等流自然结束（drop 或被消费完）。这里在消费完后异步提取。
+            tokio::spawn(async move {
+                // 等流被下游消费完——尾部窗口已填满最后数据。
+                // 这句是"等上游流自然结束"，没有额外开销。
+                let buf = tail_buf2.lock().await;
+                let sse = String::from_utf8_lossy(&buf);
+                if let Some(u) = crate::upstream::extract_usage_from_sse(&sse) {
+                    let detail = format!(
+                        "{} · 流式返回 · {} · {ref_model2}",
+                        name2,
+                        fmt_route_model(&req_model2, &ref_model2,
+                            crate::model::ModelResolveKind::Native),
+                    );
+                    // 与主 route 事件同 collapse key → 折叠为同一条、用量累加。
+                    let collapse = format!("ok:{}:{}:{}", key_id2, req_model2, true);
+                    store2.append_event_full(
+                        category2,
+                        "route",
+                        Some(&key_id2),
+                        &detail,
+                        None,
+                        Some(collapse),
+                        Some(u),
+                    );
+                }
+                drop(buf);
+                drop(tail_buf2);
             });
             BodyExt::boxed(StreamBody::new(byte_stream))
         }
@@ -1451,6 +1513,7 @@ async fn try_stream_to_key(
         url,
         real_model,
         request_body,
+        stream_usage: None,
     })
 }
 

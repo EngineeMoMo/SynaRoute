@@ -40,7 +40,7 @@ pub use session::{
     TurnParams,
 };
 pub use endpoint::join_endpoint;
-pub use usage::{extract_usage, with_usage, TokenUsage};
+pub use usage::{extract_usage, extract_usage_from_sse, with_usage, TokenUsage};
 
 // 子模块里被本文件使用的项。`pub(super)` 的项对父模块可见需要显式 use ——
 // Rust 的私有项可见性只向**下**流（父的私有项对子可见），反向必须显式提升并引入。
