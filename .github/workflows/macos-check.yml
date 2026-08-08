@@ -62,6 +62,42 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # 版本号三处一致 + Cargo.lock 已同步。
+      #
+      # 为什么单独一步：`Cargo.lock` 里记着**本包自己**的 `version`，所以改 Cargo.toml 的
+      # 版本号就让 lock 过期。本机 `cargo build` 会静默重写 lock，Windows 上永远看不见；
+      # CI 传了 `--locked` 禁止重写 → 第一条 cargo 命令硬失败、后面十步全 skipped。
+      # 这个坑已经连踩两次（0.1.12→0.1.13 的 run 31240396211、0.1.13→0.1.14 的 31242466356），
+      # 两次都靠一个「同步 Cargo.lock」的补丁提交才转绿。
+      #
+      # 报错必须**说出真正的原因**：cargo 原生那句 "cannot update the lock file ...
+      # because --locked was passed" 不会告诉你「你刚改了版本号但忘了跑 cargo check」，
+      # 得自己联想。这一步把它变成一句可照做的指令。
+      #
+      # 注意判据是「lock 与 Cargo.toml 是否一致」，不是「版本号是多少」——
+      # 后者每次发版都要改这个文件，必然腐坏。
+      - name: 版本号一致性 + Cargo.lock 同步（bump 版本必踩的坑）
+        run: |
+          set -euo pipefail
+          pkg=$(node -p "require('./package.json').version")
+          conf=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          toml=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "package.json=$pkg  tauri.conf.json=$conf  Cargo.toml=$toml"
+          if [ "$pkg" != "$conf" ] || [ "$pkg" != "$toml" ]; then
+            echo "::error::三处版本号不一致（package.json=$pkg / tauri.conf.json=$conf / Cargo.toml=$toml）"
+            exit 1
+          fi
+          # Cargo.lock 里本包的版本必须已经跟上。用 -A2 限定在 [[package]] 块内，
+          # 避免撞上依赖里同名字段。
+          locked=$(grep -A2 '^name = "synaroute"$' src-tauri/Cargo.lock \
+                   | grep -m1 '^version' | sed 's/.*"\(.*\)".*/\1/')
+          echo "Cargo.lock=$locked"
+          if [ "$locked" != "$toml" ]; then
+            echo "::error::Cargo.lock 记的版本是 $locked，Cargo.toml 是 $toml —— 改版本号后忘了同步 lock。"
+            echo "::error::修法：在 src-tauri 下跑一次 cargo check（会自动更新 lock），然后把 src-tauri/Cargo.lock 一起提交。"
+            exit 1
+          fi
+
       # 用 ci 而不是 install：锁文件对不上直接失败，不悄悄装成另一套版本
       - name: Install frontend deps
         run: npm ci
