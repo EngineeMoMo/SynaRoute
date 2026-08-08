@@ -9,6 +9,7 @@
     "core:window:allow-set-theme",
     "shell:allow-open",
     "dialog:default",
-    "updater:default"
+    "updater:default",
+    "notification:default"
   ]
 }

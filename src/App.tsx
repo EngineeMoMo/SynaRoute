@@ -16,6 +16,7 @@ import { ConfigAppliedDialog } from "@/components/ConfigAppliedDialog";
 import { useStore, applyTheme } from "@/store";
 import { useBackendEvents } from "@/lib/useBackendEvents";
 import { isTauri } from "@/lib/bridge";
+import { requestNotificationPermission } from "@/lib/notifications";
 import { useT } from "@/lib/useT";
 import type { CategoryType, ProviderKey } from "@/types";
 
@@ -53,6 +54,10 @@ export default function App() {
     // 不加 isTauri 守卫：浏览器预览下 bridge 会走 mock，正好能验证横幅布局；
     // 真实环境走 Tauri 命令。两边都不弹窗，失败仅落进 updateCheck.error。
     void useStore.getState().checkForUpdates({ silent: true });
+    // 系统通知权限（FR-028 代理健康告警）：应用内警告条不需要权限，但系统级弹窗需要。
+    // 只在 Tauri 环境请求（浏览器 mock 没有通知插件）。启动时请求一次：
+    // 已授权则静默通过；未决定则弹系统授权框；拒绝则应用内警告条仍工作、仅系统弹窗不弹。
+    void requestNotificationPermission();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

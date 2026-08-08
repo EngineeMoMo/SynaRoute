@@ -46,6 +46,18 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
   // 模型映射兜底检查（FR-006a）：统计启用 Key 中，各期望模型的覆盖缺口
   const gaps = useMemo(() => detectMappingGaps(keys.filter((k) => k.enabled)), [keys]);
 
+  // 当前处于熔断中的 Key（FR-028）：breakerUntil 存在且未过期。常驻警告条的数据源。
+  // 熔断是「连续失败自动暂停」的状态，必须常驻可见——否则用户看到某 Key 没被路由，
+  // 却不知道它正被暂停、还以为是配置错。
+  const trippedKeys = useMemo(
+    () =>
+      keys.filter((k) => {
+        if (!k.health.breakerUntil) return false;
+        return Date.now() < k.health.breakerUntil;
+      }),
+    [keys]
+  );
+
   /**
    * 分类切换时作废「所有在途异步结果」的代际号。
    *
@@ -215,6 +227,21 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
           >
             {t("category.recentFailureView")}
           </button>
+        </div>
+      )}
+
+      {/* 熔断中的 Key（FR-028 常驻告警）：连续失败已自动暂停使用，其他 Key 接管。
+          常驻而非一次性提示——熔断窗口最长 60s，用户切回来时若已恢复不该看到假警告，
+          但若还在熔断中，必须一眼看见「这条为什么没被用」。 */}
+      {trippedKeys.length > 0 && (
+        <div className="mx-6 mb-2 flex items-start gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-xs text-warning">
+          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+          <div className="flex-1 leading-relaxed">
+            <span className="font-medium">{t("category.trippedKeys")}</span>
+            <span className="ml-1 break-all">
+              {trippedKeys.map((k) => k.name).join("、")}
+            </span>
+          </div>
         </div>
       )}
 

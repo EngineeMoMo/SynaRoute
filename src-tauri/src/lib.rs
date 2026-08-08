@@ -11,6 +11,7 @@ mod events;
 mod health;
 mod mcp;
 mod model;
+mod notification;
 mod portable;
 mod proc;
 mod proxy;
@@ -1039,6 +1040,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         // 开机自启动（FR-025）。`--autostart` 参数让被系统拉起的实例可自我识别，
         // 据此最小化到托盘（见 setup 与 [`launched_by_autostart`]）。
         .plugin(tauri_plugin_autostart::init(

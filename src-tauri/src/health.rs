@@ -7,6 +7,15 @@ use crate::upstream;
 use chrono::Utc;
 use std::sync::Arc;
 
+/// 发系统通知（熔断/恢复告警）。非 test 走 `notification::notify`；test 下是 no-op
+/// （notification 模块整体 `#[cfg(not(test))]`，测试进程不链接通知插件的 WinRT 依赖）。
+#[cfg(not(test))]
+fn notify(title: &str, body: &str) {
+    crate::notification::notify(title, body);
+}
+#[cfg(test)]
+fn notify(_title: &str, _body: &str) {}
+
 /// 熔断阈值：连续失败达到即熔断
 const BREAKER_THRESHOLD: u32 = 3;
 /// 熔断冷却时长（毫秒）
@@ -95,6 +104,13 @@ pub async fn check_one(store: &Arc<Store>, key_id: &str) {
 /// 避免设 Down 后 is_candidate 永久拒绝、而实时流量又进不来无法恢复的死锁）。
 pub fn record_live_failure(store: &Arc<Store>, key_id: &str) {
     let now = Utc::now().timestamp_millis();
+    // 先读「是否已熔断」：熔断是状态跃迁，只在「未熔断 → 刚熔断」时发一次系统通知
+    // （不是每次失败都发，否则刷屏）。这条读与下面的 mutate_health 之间有个极窄窗口，
+    // 并发下可能漏报一次 —— 通知本就是尽力而为（events::notify 失败不致命），可接受。
+    let was_tripped = store
+        .get_key(key_id)
+        .map(|k| k.health.breaker_until.is_some())
+        .unwrap_or(false);
     // 走 `mutate_health` 而非「get_key → 算 → update_health」：后者跨两个临界区，
     // 两个并发失败会都读到同一个 prev.fail_count 各自 +1 写回，导致熔断迟钝
     // （详见 Store::mutate_health 的文档）。这里 read-modify-write 在同一个写锁内完成。
@@ -111,12 +127,31 @@ pub fn record_live_failure(store: &Arc<Store>, key_id: &str) {
         // 必变，故这里恒为 true —— 与旧行为等价（旧代码 fail_count 变化即触发 persist）。
         true
     });
+    // 熔断武装跃迁：发系统通知 + 记一条告警事件。
+    let now_tripped = store
+        .get_key(key_id)
+        .map(|k| k.health.breaker_until.is_some())
+        .unwrap_or(false);
+    if now_tripped && !was_tripped {
+        let name = store
+            .get_key(key_id)
+            .map(|k| k.name.clone())
+            .unwrap_or_else(|| key_id.to_string());
+        notify(
+            "Key 已熔断",
+            &format!("「{name}」连续失败，已暂停使用 60 秒。其他 Key 将自动接管。"),
+        );
+    }
 }
 
 /// 把一次「实时转发成功」计入熔断器：清零 fail_count、解除熔断，标记 Up。
 /// 让恢复的 Key 立即回到候选池（无需等下一次后台探测）。
 pub fn record_live_success(store: &Arc<Store>, key_id: &str) {
     let now = Utc::now().timestamp_millis();
+    let was_tripped = store
+        .get_key(key_id)
+        .map(|k| k.health.breaker_until.is_some())
+        .unwrap_or(false);
     let _ = store.mutate_health(key_id, |h| {
         // 已健康、无熔断残留、且 last_live_success 仍新鲜：内存与磁盘都无需动
         // （避免高频请求每次都写盘——这是热路径上最值钱的一处抑制，见 Store::update_health）。
@@ -137,6 +172,17 @@ pub fn record_live_success(store: &Arc<Store>, key_id: &str) {
         // last_checked / latency_ms 保持不动（那是探测的观测量，不是转发的）。
         true
     });
+    // 熔断解除跃迁：发系统通知。was_tripped 来自 mutate 之前，此刻已解除。
+    if was_tripped {
+        let name = store
+            .get_key(key_id)
+            .map(|k| k.name.clone())
+            .unwrap_or_else(|| key_id.to_string());
+        notify(
+            "Key 已恢复",
+            &format!("「{name}」恢复可用，已回到候选池。"),
+        );
+    }
 }
 
 /// 判断某 Key 当前是否可作为路由候选。

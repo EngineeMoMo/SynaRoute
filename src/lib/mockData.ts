@@ -126,6 +126,22 @@ const store: Record<CategoryType, ProviderKey[]> = {
       mappings: [],
       health: { status: "down", lastChecked: now - 30_000, latencyMs: 1251, failCount: 1 },
     },
+    {
+      id: "k6",
+      categoryId: "claude-cli",
+      name: "厂商6（熔断中）",
+      vendor: "custom",
+      baseUrl: "https://tripped.example.com",
+      protocol: "anthropic",
+      hasSecret: true,
+      enabled: true,
+      priority: 5,
+      params: { temperature: 1.0, maxTokens: 8192 },
+      models: models(["claude-opus-4-8"]),
+      mappings: [],
+      // 熔断中：breakerUntil 在 40 秒后到期 → 常驻警告条应显示这条 Key
+      health: { status: "up", lastChecked: now - 5_000, latencyMs: 90, failCount: 3, breakerUntil: now + 40_000 },
+    },
   ],
   "claude-desktop": [],
   codex: [

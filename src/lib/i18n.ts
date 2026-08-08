@@ -186,6 +186,7 @@ const zh: Dict = {
   // 最近失败原因常驻条（UX#11）：转发失败时客户端只显示 502/529，真因藏在日志页里。
   "category.recentFailure": "最近一次转发失败：",
   "category.recentFailureView": "查看日志",
+  "category.trippedKeys": "以下 Key 连续失败已熔断（暂停使用 60 秒，其他 Key 自动接管）：",
   "category.empty": "还没有配置任何 Key",
   "category.addFirst": "添加第一个 Key",
   "category.activeModel": "当前模型",
@@ -829,6 +830,7 @@ const en: Dict = {
   "category.mappingGapItem": "Model {expected} has no mapping on {keys}, so it’s not in the picker",
   "category.recentFailure": "Last forwarding failure:",
   "category.recentFailureView": "View logs",
+  "category.trippedKeys": "These keys tripped the circuit breaker (paused for 60s; other keys take over):",
   "category.empty": "No keys configured yet",
   "category.addFirst": "Add your first key",
   "category.activeModel": "Active model",

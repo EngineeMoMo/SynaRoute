@@ -21,6 +21,12 @@ tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 # 开机自启动（FR-025）：注册系统级自启动项。Windows 走注册表 Run 键，跨平台由插件适配。
 tauri-plugin-autostart = "2"
+# 系统通知（FR-028 代理健康告警）：Key 熔断/恢复时弹系统级通知。
+# 注意：不要用 `[target.'cfg(not(test))']` 包它 —— Cargo 的 target cfg 不认 cfg(test)
+# （test 是 profile 不是编译目标），写了会静默解析成无条件依赖。测试二进制的
+# `STATUS_ENTRYPOINT_NOT_FOUND` 问题由 notification.rs 模块的 `#[cfg(not(test))]` 隔离
+# 逻辑路径，但依赖本身仍会被链接 —— 见该模块注释的完整说明。
+tauri-plugin-notification = "2"
 
 # 异步运行时 + HTTP
 tokio = { version = "1", features = ["full"] }
