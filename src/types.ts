@@ -273,6 +273,9 @@ export interface EventLogEntry {
   categoryId: CategoryType;
   type: "route" | "failover" | "health" | "aggregate" | "error" | "request" | "mcp" | "config";
   keyId?: string;
+  /** Key 的可读名（keyId 是 uuid，用户认不出；列表接口按 id 回填）。路径可视化据此
+   *  在折叠态直接显示「走了哪个 Key」，不必从 detail 字符串里解析。 */
+  keyName?: string;
   detail: string;
   /**
    * 连续同类事件被折叠的条数（1 = 未折叠，UI 不显示计数）。

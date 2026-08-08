@@ -1242,6 +1242,14 @@ pub struct EventLogEntry {
     pub kind: String, // route | failover | health | aggregate | error | request
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
+    /// Key 的**可读名**（key_id 是 uuid，用户认不出；列表接口按 id 回填）。
+    ///
+    /// 为什么要在列表带上而让前端从 detail 字符串里挖：detail 是拼好的展示文本
+    /// （「Key名 · 模型段 · 动词」），折叠态被 truncate 截断时 Key 名可能看不见；
+    /// 而请求路径可视化（FR-028 之三）要「不展开就知道走了哪个 Key」，靠稳定的
+    /// 结构化字段而不是解析字符串。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_name: Option<String>,
     pub detail: String,
     /// 连续同类事件被折叠的条数（1 = 未折叠）。
     ///

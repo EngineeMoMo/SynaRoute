@@ -334,6 +334,9 @@ impl Store {
             category_id: category,
             kind: kind.to_string(),
             key_id: key_id.map(|s| s.to_string()),
+            // 事件构造时就回填 key_name（key_id → 可读名）：日志文件与列表都带可读名，
+            // 排障/路径可视化不必拿 uuid 反查。查表一次、无则 None（Key 可能已被删）。
+            key_name: key_id.and_then(|kid| self.get_key(kid).map(|k| k.name)),
             detail: detail.to_string(),
             repeat: 1,
             collapse_key: collapse_key.clone(),
@@ -546,6 +549,7 @@ impl Store {
             category_id: e.category_id,
             kind: e.kind.clone(),
             key_id: e.key_id.clone(),
+            key_name: e.key_name.clone(),
             detail: e.detail.clone(),
             repeat: e.repeat,
             // has_trace 必须留下：前端靠它决定「这行能不能展开」。剥的是正文，不是存在性。

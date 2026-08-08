@@ -218,6 +218,7 @@ const events: EventLogEntry[] = [
     categoryId: "claude-cli",
     type: "failover",
     keyId: "k1",
+    keyName: "厂商1（官方直连）",
     detail: "厂商1 超时（>30s），切换到厂商2",
   },
   {
@@ -226,6 +227,7 @@ const events: EventLogEntry[] = [
     categoryId: "claude-cli",
     type: "route",
     keyId: "k2",
+    keyName: "厂商2（备用中转）",
     detail: "厂商2 成功返回 opus-4-7",
     // 折叠计数：验证「×N」徽标的渲染（真实后端对连续同类成功记录会这样合并）
     repeat: 7,

@@ -19,6 +19,7 @@ import {
   Check,
   Settings2,
   Search,
+  KeyRound,
   type LucideIcon,
 } from "lucide-react";
 
@@ -320,6 +321,15 @@ function LogRow({ entry, lang }: { entry: EventLogEntry; lang: string }) {
           <Icon size={10} />
           {t(meta.tKey)}
         </Badge>
+        {/* 路径可视化（FR-028 之三）：结构化展示「走了哪个 Key」，不靠 detail 字符串解析。
+            detail 在折叠态被 truncate 截断时 Key 名可能看不见，而 keyName 是后端按 id 回填
+            的可读名，独立于展示文本。request/failover/route 是「真的走了上游」的事件。 */}
+        {entry.keyName && (
+          <Badge variant="info">
+            <KeyRound size={10} />
+            {entry.keyName}
+          </Badge>
+        )}
         <span className={`flex-1 text-sm text-text-primary ${open ? "whitespace-pre-wrap break-words" : "truncate"}`}>
           {entry.detail}
         </span>
