@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"SynaRoute 默认权限集","local":true,"windows":["main"],"permissions":["core:default","core:window:allow-start-dragging","core:window:allow-set-theme","shell:allow-open","dialog:default","updater:default"]}}
+{"default":{"identifier":"default","description":"SynaRoute 默认权限集","local":true,"windows":["main"],"permissions":["core:default","core:window:allow-start-dragging","core:window:allow-set-theme","shell:allow-open","dialog:default","updater:default","notification:default"]}}
