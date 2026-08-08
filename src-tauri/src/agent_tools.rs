@@ -344,7 +344,12 @@ fn sensitive_hardlink_alias(real: &Path) -> Option<String> {
 }
 
 /// macOS/Unix：标准库能可靠拿到 inode 的链接数，但不能从 inode 反查同文件系统上的
-/// 全部路径名。`nlink > 1` 时无法证明其它名字里没有 `.env`/密钥文件，故 fail-closed。
+/// 全部路径名。对**常规文件** `nlink > 1` 时无法证明其它名字里没有 `.env`/密钥文件，故 fail-closed。
+///
+/// **目录必须豁免**：Unix 目录的 nlink 天然大于 1（= 子目录数 + 2），macOS 上
+/// `.`/`src`/`sub` 这类普通目录实测 nlink=2~6。若对目录也判 nlink>1，只读工具连
+/// 普通目录都拒 —— 这正是本次 mac CI 抓到的 3 条回归（list_dir / grep / read_file
+/// 全因「路径 `.` 被拒 nlink=6」失败）。
 ///
 /// 这不是理论攻击面：`ln .env notes.md` 无需任何特权，canonicalize(notes.md) 仍是
 /// notes.md，按「输入名 + 真实落点」两次敏感判定都会放行。复制文件会得到独立 inode，
@@ -352,7 +357,13 @@ fn sensitive_hardlink_alias(real: &Path) -> Option<String> {
 #[cfg(unix)]
 fn sensitive_hardlink_alias(real: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    let nlink = std::fs::metadata(real).ok()?.nlink();
+    let md = std::fs::metadata(real).ok()?;
+    // 只防「常规文件被硬链接别名」。目录、符号链接（前面 canonicalize 已处理）、
+    // 特殊文件（socket/FIFO/设备）不在凭据别名攻击面内。
+    if !md.is_file() {
+        return None;
+    }
+    let nlink = md.nlink();
     (nlink > 1).then(|| format!("nlink={nlink}"))
 }
 
