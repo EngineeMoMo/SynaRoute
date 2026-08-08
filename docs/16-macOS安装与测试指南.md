@@ -4,6 +4,8 @@
 > **不是**已完成 Developer ID 签名与公证的正式发布版。它用于验证 SynaRoute 在 macOS 上
 > 能否编译、安装、启动、转发 —— 但首次启动会撞上 Gatekeeper，需要手动放行（见第 3 节）。
 
+**当前版本：v0.1.13**
+
 ---
 
 ## 1. 产物清单
@@ -12,8 +14,8 @@
 
 | 文件 | 大小 | 用途 |
 |---|---|---|
-| `SynaRoute_0.1.12_aarch64.dmg` | 8.6 MB | 拖拽安装包（推荐） |
-| `SynaRoute-macos-arm64-app.tar.gz` | 8.6 MB | 直接解压运行的 .app（免挂载） |
+| `SynaRoute_0.1.13_aarch64.dmg` | 8.7 MB | 拖拽安装包（推荐） |
+| `SynaRoute-macos-arm64-app.tar.gz` | 8.7 MB | 直接解压运行的 .app（免挂载） |
 
 获取方式（在你的 Mac 上）：
 ```bash
@@ -136,7 +138,7 @@ find /Applications/SynaRoute.app -name "config.json" 2>/dev/null   # 应无输�
 
 ## 5. 功能测试（与 Windows 一致的部分）
 
-mac 与 Windows 共用同一套 Rust 代理引擎和前端，以下能力已由 571 条测试验证，
+mac 与 Windows 共用同一套 Rust 代理引擎和前端，以下能力已由 572 条测试验证，
 mac 上应行为一致：
 
 1. **配置 Key**：厂商管理 → 新增 Key → 填 base_url/协议/密钥
@@ -145,6 +147,9 @@ mac 上应行为一致：
 3. **故障转移**：多个 Key 时，主 Key 失败自动切备用
 4. **大脑聚合**：Claude Code 里通过 `synaroute_ai` 调聚合
 5. **MCP**：启用后，Codex/Claude 里能调用 synaroute 的 MCP 工具
+6. **用量统计**：左侧「用量统计」面板，按分类×Key 展示 token 消耗（流式/非流式均采集）
+7. **健康告警**：Key 连续失败熔断时 CategoryPage 顶部显示黄色告警条；熔断/恢复时系统通知
+8. **路径可视化**：运行日志折叠态显示蓝色 Key 名徽标，不展开就能看到走了哪个 Key
 
 ---
 
