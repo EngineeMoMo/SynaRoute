@@ -1171,6 +1171,38 @@ pub struct TokenUsageByKey {
     pub usage: TokenUsage,
 }
 
+/// 用量累计的**落盘快照**（`usage.json`）。
+///
+/// 刻意与 `config.json` 分开成独立文件，不塞进 `AppConfig`：
+/// - 用量是**运行期遥测**，不是用户配置。混进去会让「每分钟落一次用量」变成
+///   「每分钟重写一次用户的全部 Key 与设置」——把一份只该增长计数器的写入，
+///   放大成对用户最宝贵数据的反复覆写，任何一次坏写都可能带走 Key 配置。
+/// - 体积与节奏都不同：config 是事件驱动、~20KB；usage 是定时、通常几百字节。
+///
+/// `entries` 用 Vec 而非 map：键是 `(分类, key_id)` 二元组，JSON 的对象键只能是字符串，
+/// 序列化成拼接字符串就得自己解析、还要处理 key_id 里出现分隔符的情况。展开成数组
+/// 既无歧义也便于人工查看。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSnapshot {
+    /// 格式版本。将来改结构时用它决定「能否直接反序列化 / 需不需要迁移」。
+    #[serde(default = "usage_snapshot_version")]
+    pub version: u32,
+    /// 统计起始时刻（毫秒时间戳）。首次创建时写入，之后原样保留 ——
+    /// 面板据此显示「统计自 X 起」，否则一个只增不减的数字用户无从判断它覆盖多长时间。
+    #[serde(default)]
+    pub since_ms: i64,
+    /// 最后一次落盘时刻，仅供人工排查「这份文件是不是卡住不更新了」。
+    #[serde(default)]
+    pub updated_ms: i64,
+    #[serde(default)]
+    pub entries: Vec<TokenUsageByKey>,
+}
+
+fn usage_snapshot_version() -> u32 {
+    1
+}
+
 impl TokenUsage {
     pub fn total(&self) -> u64 {
         self.input + self.output

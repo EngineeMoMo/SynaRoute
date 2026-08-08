@@ -371,6 +371,15 @@ fn get_token_usage(state: tauri::State<AppState>) -> Vec<crate::model::TokenUsag
     state.store.token_usage_by_key()
 }
 
+/// 用量累计的**起算时刻**（毫秒）。面板拿它显示「自 X 起累计」。
+///
+/// 它是首次开始累计的时间、跨重启保留，不是本次启动时间 —— 面板若写「自本次启动」
+/// 而数据其实是跨重启累计的，用户会以为统计漏了。
+#[tauri::command]
+fn get_usage_since(state: tauri::State<AppState>) -> i64 {
+    state.store.usage_since_ms()
+}
+
 /// 某分类「最近一次失败」（error/failover），供分类页顶部常驻提示条用（UX#11）。
 ///
 /// 为什么单开一个命令而不让前端复用 `list_all_events` 自己筛：那个接口返回全部 500 条，
@@ -1032,6 +1041,28 @@ pub fn run() {
         });
     }
 
+    // 用量累计定时落盘。**刻意不搭健康探测那趟车**：那趟车的周期跟着用户配的
+    // `health_check_interval_secs` 走，用户设 3600s 就一小时才落一次盘；设 0（关闭探测）
+    // 更是只剩 30s 轮询空转。用量的丢失窗口不该被探测设置牵着走，故用固定节奏独立一趟。
+    //
+    // 只在**有变更**时才真的写盘（`flush_usage_if_dirty` 先查脏标记），空闲期零 I/O
+    // —— 用户明确担心过持续写盘伤 SSD，这里不能变成每 30s 一次的无条件写。
+    {
+        let store_bg = store.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+            rt.block_on(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        store::USAGE_FLUSH_INTERVAL_SECS,
+                    ))
+                    .await;
+                    store_bg.flush_usage_if_dirty();
+                }
+            });
+        });
+    }
+
     tauri::Builder::default()
         // 单实例：再次启动时聚焦已有窗口，避免开多个进程（必须最先注册）
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -1127,6 +1158,7 @@ pub fn run() {
             list_events,
             list_all_events,
             get_token_usage,
+            get_usage_since,
             recent_failure,
             get_event_trace,
             get_settings,
@@ -1186,6 +1218,9 @@ pub fn run() {
                 // 健康态若还是脏的（后台合并轮次未到就退出了），在这里补一次落盘。
                 // 不做的话，本次运行攒下的熔断计数会丢，下次启动会立刻重打已知坏掉的 Key。
                 state.store.flush_health_if_dirty();
+                // 用量累计同理：定时轮次没到就退出的话，这一段的消耗会丢。
+                // 用量是纯累加的历史值，丢了不会自愈（不像健康态能靠下次探测重建）。
+                state.store.flush_usage_if_dirty();
                 state.store.flush_logs();
                 let dropped = state.store.log_dropped_count();
                 if dropped > 0 {

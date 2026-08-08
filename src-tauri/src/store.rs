@@ -6,7 +6,7 @@ use crate::error::{AppError, AppResult};
 use crate::model::*;
 use crate::secret::{atomic_write, SecretStore};
 use parking_lot::RwLock;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 pub struct Store {
@@ -49,12 +49,35 @@ pub struct Store {
     /// 增长、甚至回退** —— 一个「累计用量」面板越用数字越小，比不显示更糟：用户据此
     /// 估额度会严重低估。累加器只增不减，与保留多少条日志正交。
     ///
-    /// 仍是**内存态、不落盘**：落盘等于每次请求都写 config.json，正是 P1-3 极力避开的
-    /// 热路径开销。重启归零这一点在面板副标题里明说，不让用户误以为是历史总账。
+    /// **周期性落盘**（不是每请求落盘）：热路径只翻 `usage_dirty` 标记，真正的序列化
+    /// 与写盘由后台任务按固定节奏合并成一次，与 `health_dirty` 同一套取舍。
+    /// 这样既不丢跨重启的累计，也不把每请求写盘引回热路径（P1-3 的初衷）。
     usage_totals: RwLock<std::collections::BTreeMap<(CategoryType, String), TokenUsage>>,
+    /// 用量累计有未落盘变更。由 `flush_usage_if_dirty` 合并落盘并清标记。
+    ///
+    /// 有这个标记，**空闲的应用一个字节都不写盘** —— 用户明确关心过 SSD 写入寿命，
+    /// 无脑定时写会让一个开着不用的窗口每分钟制造一次无意义写入。
+    usage_dirty: std::sync::atomic::AtomicBool,
+    /// `usage.json` 的路径（与 `config.json` 同目录）。
+    ///
+    /// 单独存字段而不是每次从 `config_path` 现推：读写两处各推一次就是漂移的温床
+    /// （`mcp.rs` 的端口文件正因此踩过——读写各算一次路径，改了一处就静默失配）。
+    usage_path: PathBuf,
+    /// 用量统计的起始时刻（毫秒）。随 `usage.json` 一起持久化，供面板显示「统计自 X 起」。
+    usage_since_ms: RwLock<i64>,
 }
 
-/// 发给日志写线程的命令。
+/// 用量累计的定时落盘间隔（秒）。
+///
+/// 60s 是「最多丢 1 分钟用量」与「写盘频率」之间的取舍：
+/// - 往下调（如 10s）收益很小 —— 崩溃丢 10s 还是 60s 的统计，对一个用量面板都无所谓；
+///   代价却是空闲期外的写盘次数翻 6 倍。
+/// - 往上调（如 10min）则一次意外退出就丢掉一大段，而用量是纯累加值、丢了不会自愈。
+///
+/// 关键在于它**只在有变更时才写**（见 `flush_usage_if_dirty`），所以这个间隔决定的是
+/// 「有流量时最密写多快」，不是「无论如何每 60s 写一次」。空闲的应用零写入。
+pub const USAGE_FLUSH_INTERVAL_SECS: u64 = 60;
+
 enum LogCmd {
     /// 写一条日志（已序列化好的一行，不含换行符）。
     ///
@@ -241,6 +264,10 @@ impl Store {
         // 记录初始 (mtime,len),后续读操作前用于「磁盘被外部改过就重载」的自愈判断
         let initial_stamp = Self::read_disk_stamp(&config_path);
 
+        // 用量累计：启动即恢复上次的累计值（周期性落盘保存下来的），失败则从零开始。
+        let usage_path = Self::usage_file_path(&config_path);
+        let (usage_totals, usage_since) = Self::load_usage(&usage_path);
+
         let store = Self {
             config_path,
             config: RwLock::new(config),
@@ -250,7 +277,10 @@ impl Store {
             log_tx: Self::spawn_log_writer(),
             log_dropped: std::sync::atomic::AtomicU64::new(0),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
-            usage_totals: RwLock::new(std::collections::BTreeMap::new()),
+            usage_totals: RwLock::new(usage_totals),
+            usage_dirty: std::sync::atomic::AtomicBool::new(false),
+            usage_path,
+            usage_since_ms: RwLock::new(usage_since),
         };
         // P1 防数据销毁：仅在「全新安装(文件不存在)首次 seed」或「成功加载后的迁移」时落盘。
         // load_failed(文件存在但解析失败)时绝不 persist——否则空配置会覆盖磁盘上的原有数据。
@@ -364,6 +394,8 @@ impl Store {
         if let Some(u) = &entry.usage {
             let k = (category, entry.key_id.clone().unwrap_or_default());
             self.usage_totals.write().entry(k).or_default().add(u);
+            // 只翻标记，不在此处落盘：写盘留给后台的合并 flush。
+            self.mark_usage_dirty();
         }
 
         // 内存态的写入抽成独立方法，让 events 写锁**随该方法返回即释放** ——
@@ -640,6 +672,7 @@ impl Store {
             let k = (category, key_id.unwrap_or_default().to_string());
             self.usage_totals.write().entry(k).or_default().add(&usage);
         }
+        self.mark_usage_dirty();
 
         // 再修补日志行：从后往前找同 collapse_key 的最近一条。
         {
@@ -1380,6 +1413,107 @@ impl Store {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// `usage.json` 的路径：与 `config.json` 同目录。
+    ///
+    /// 跟着 config 走而不是另找一个「数据目录」，是为了继承 config 已经确立的落点语义 ——
+    /// Windows 上 `%APPDATA%\SynaRoute\` 受 MSIX 虚拟化影响、mac 上是
+    /// `~/Library/Application Support/SynaRoute/`。两个文件同目录，用户备份/迁移时
+    /// 不会只带走一个。
+    /// `usage.json` 的落点：**跟着 `config.json` 走**，不是跟着日志走。
+    ///
+    /// 这是刻意的分野，别「顺手统一」：日志与 `mcp-port` 放 exe 同级是为了绕开 MSIX 的 AppData
+    /// 虚拟化（要让「用户双击启动的实例」和「包内进程启动的实例」看到同一份文件）；用量属**用户数据**，
+    /// 就该跟 `config.json`/`secrets.enc` 同域、同一套备份与导入导出边界。
+    /// 代价是它同样会被虚拟化 —— 与 config 一致，符合预期，不是缺陷。
+    fn usage_file_path(config_path: &Path) -> PathBuf {
+        config_path
+            .parent()
+            .map(|d| d.join("usage.json"))
+            .unwrap_or_else(|| PathBuf::from("usage.json"))
+    }
+
+    /// 启动时读取用量累计。
+    ///
+    /// **一律不上抛错误**：文件缺失（全新安装）、内容损坏（断电写坏）都只是「没有历史累计」，
+    /// 绝不能因为一个统计文件读不出来就让应用起不来。损坏时落 warn 并从空开始，
+    /// 下一次 flush 会用好的内容覆盖它。
+    fn load_usage(path: &Path) -> (std::collections::BTreeMap<(CategoryType, String), TokenUsage>, i64) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let raw = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return (std::collections::BTreeMap::new(), now)
+            }
+            Err(e) => {
+                tracing::warn!("读取用量统计失败（本次从零开始累计）: {e}");
+                return (std::collections::BTreeMap::new(), now);
+            }
+        };
+        let snap: UsageSnapshot = match serde_json::from_slice(&raw) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("用量统计文件解析失败（本次从零开始累计）: {e}");
+                return (std::collections::BTreeMap::new(), now);
+            }
+        };
+        let mut map = std::collections::BTreeMap::new();
+        for row in snap.entries {
+            // 同键重复行合并而非后者覆盖前者：手工编辑过的文件不该静默丢掉一半数据。
+            map.entry((row.category_id, row.key_id))
+                .or_insert_with(TokenUsage::default)
+                .add(&row.usage);
+        }
+        // since_ms 为 0 = 旧版本文件或被手工清空过，退回「现在」而不是 1970，
+        // 否则面板会显示「统计自 1970-01-01 起」这种明显错误的起始时间。
+        let since = if snap.since_ms > 0 { snap.since_ms } else { now };
+        (map, since)
+    }
+
+    /// 标记「用量累计有未落盘的变更」。
+    fn mark_usage_dirty(&self) {
+        self.usage_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 若用量累计被标脏则落盘一次并清标记（后台任务定期调用 + 退出前调用）。
+    ///
+    /// 返回是否真的写了盘。与 `flush_health_if_dirty` 同样**先清标记再写**：
+    /// 写盘期间若又有新消耗，宁可下一轮多写一次，也不要形成「标记已清、这次变更没落盘」
+    /// 的丢失窗口。
+    pub fn flush_usage_if_dirty(&self) -> bool {
+        if !self
+            .usage_dirty
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        let snap = UsageSnapshot {
+            version: 1,
+            since_ms: *self.usage_since_ms.read(),
+            updated_ms: chrono::Utc::now().timestamp_millis(),
+            entries: self.token_usage_by_key(),
+        };
+        let bytes = match serde_json::to_vec_pretty(&snap) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("用量统计序列化失败: {e}");
+                return false;
+            }
+        };
+        // 走与 config/secrets 同一个 atomic_write：临时文件 + 重命名，断电不会留下半截 JSON。
+        if let Err(e) = crate::secret::atomic_write(&self.usage_path, &bytes) {
+            self.mark_usage_dirty();
+            tracing::warn!("用量统计落盘失败（下一轮重试）: {e}");
+            return false;
+        }
+        true
+    }
+
+    /// 用量统计的起始时刻（毫秒）。面板显示「统计自 X 起」用。
+    pub fn usage_since_ms(&self) -> i64 {
+        *self.usage_since_ms.read()
+    }
+
     /// 若健康态被标脏则落盘一次并清标记（由后台任务定期调用，以及退出前调用）。
     ///
     /// 返回是否真的写了盘。**先清标记再写**：若写盘期间又有新变更，宁可多写一次（下一轮），
@@ -2051,6 +2185,9 @@ impl Store {
         };
         let secrets = SecretStore::load(secrets_path)?;
         let initial_stamp = Self::read_disk_stamp(&config_path);
+        // 与生产构造器同样恢复用量累计：测试才能覆盖「重启后累计不归零」这条判据。
+        let usage_path = Self::usage_file_path(&config_path);
+        let (usage_totals, usage_since) = Self::load_usage(&usage_path);
         Ok(Self {
             config_path,
             config: RwLock::new(config),
@@ -2060,7 +2197,10 @@ impl Store {
             log_tx: Self::spawn_log_writer(),
             log_dropped: std::sync::atomic::AtomicU64::new(0),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
-            usage_totals: RwLock::new(std::collections::BTreeMap::new()),
+            usage_totals: RwLock::new(usage_totals),
+            usage_dirty: std::sync::atomic::AtomicBool::new(false),
+            usage_path,
+            usage_since_ms: RwLock::new(usage_since),
         })
     }
 }
@@ -2478,6 +2618,132 @@ mod tests {
             after,
             (MAX_EVENTS as u64 + 100) * 10,
             "累计用量必须涵盖已滚出事件环的请求（before={before} after={after}）"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 用量累计必须**跨重启保留**。
+    ///
+    /// 这条钉住的是「周期性落盘」这个功能本身：累加器是内存态，进程一退就没了。
+    /// 若忘了在退出/定时点落盘，或落盘后启动时忘了读回来，用户看到的就是
+    /// 「每次重开软件用量归零」—— 一个号称累计的面板永远只显示本次运行的零头。
+    #[test]
+    fn usage_totals_survive_restart() {
+        use crate::upstream::TokenUsage;
+        let dir = temp_dir("usage_restart");
+        let cfg = dir.join("config.json");
+        let sec = dir.join("secrets.enc");
+
+        {
+            let store = Store::new_at(cfg.clone(), sec.clone()).unwrap();
+            store.append_event_full(
+                CategoryType::ClaudeCli,
+                "route",
+                Some("k1"),
+                "req",
+                None,
+                None,
+                Some(TokenUsage { input: 700, output: 30, cache_read: 5 }),
+            );
+            assert!(store.flush_usage_if_dirty(), "有变更时必须真的落盘");
+        } // store 析构 = 模拟进程退出
+
+        // 重新构造 = 模拟重启
+        let store2 = Store::new_at(cfg, sec).unwrap();
+        let rows = store2.token_usage_by_key();
+        assert_eq!(rows.len(), 1, "重启后应恢复出那一行用量");
+        assert_eq!(rows[0].usage.input, 700, "input 必须跨重启保留");
+        assert_eq!(rows[0].usage.output, 30);
+        assert_eq!(rows[0].usage.cache_read, 5);
+
+        // 重启后继续累加，应当叠在历史值之上而不是从零开始。
+        store2.append_event_full(
+            CategoryType::ClaudeCli,
+            "route",
+            Some("k1"),
+            "req2",
+            None,
+            None,
+            Some(TokenUsage { input: 300, output: 20, cache_read: 0 }),
+        );
+        assert_eq!(
+            store2.token_usage_by_key()[0].usage.input,
+            1000,
+            "新消耗必须叠加在恢复出来的历史值上"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 脏标记语义：无变更不写盘（空闲期零 I/O），有变更才写。
+    ///
+    /// 用户明确担心过持续写盘伤 SSD。若去掉脏标记改成无条件定时写，一个开着不用的
+    /// 窗口会每分钟制造一次无意义写入 —— 这条测试就是那个担忧的回归护栏。
+    #[test]
+    fn usage_flush_is_noop_without_changes() {
+        use crate::upstream::TokenUsage;
+        let dir = temp_dir("usage_dirty_flag");
+        let store =
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        assert!(
+            !store.flush_usage_if_dirty(),
+            "刚构造、无任何用量变更时不应写盘"
+        );
+
+        store.append_event_full(
+            CategoryType::ClaudeCli,
+            "route",
+            Some("k1"),
+            "req",
+            None,
+            None,
+            Some(TokenUsage { input: 1, output: 1, cache_read: 0 }),
+        );
+        assert!(store.flush_usage_if_dirty(), "有变更后应写盘一次");
+        assert!(
+            !store.flush_usage_if_dirty(),
+            "同一批变更不应重复写盘（标记已清）"
+        );
+
+        // 不带 usage 的事件不该弄脏用量（否则纯错误日志也会触发写盘）。
+        store.append_event_full(
+            CategoryType::ClaudeCli,
+            "error",
+            Some("k1"),
+            "boom",
+            None,
+            None,
+            None,
+        );
+        assert!(
+            !store.flush_usage_if_dirty(),
+            "无 usage 的事件不应弄脏用量累计"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 用量文件损坏（断电写坏 / 被手工编辑坏）绝不能让应用起不来。
+    ///
+    /// 统计文件是最不重要的那类数据，却和 config 同目录 —— 若解析失败直接上抛，
+    /// 一个统计文件就能把整个应用挡在启动之外。必须降级为「本次从零累计」。
+    #[test]
+    fn corrupt_usage_file_does_not_block_startup() {
+        let dir = temp_dir("usage_corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("usage.json"), b"{ this is not json").unwrap();
+
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc"))
+            .expect("用量文件损坏不得导致 Store 构造失败");
+        assert!(
+            store.token_usage_by_key().is_empty(),
+            "损坏文件应降级为空累计，而不是半截数据"
+        );
+        assert!(
+            store.usage_since_ms() > 0,
+            "起算时刻应回退为「现在」，不能是 0（面板会显示 1970）"
         );
 
         std::fs::remove_dir_all(&dir).ok();

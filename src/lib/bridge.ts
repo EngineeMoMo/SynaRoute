@@ -194,6 +194,15 @@ export const api = {
     call<TokenUsageByKey[]>("get_token_usage", undefined, () => mockBridge.tokenUsage()),
 
   /**
+   * 上面那份累计量的**起算时刻**（epoch ms）。
+   *
+   * 累加器跨重启保留，所以「从什么时候开始算」必须由后端给出：前端拿不到（既不是本次挂载时间，
+   * 也不是本次启动时间）。首次落盘前后端也会给出本次进程的起点，不会返回 null。
+   */
+  getUsageSince: () =>
+    call<number>("get_usage_since", undefined, () => mockBridge.usageSince()),
+
+  /**
    * 最近一次「够新」的转发失败（UX#11 的分类页常驻提示用）。
    *
    * **为什么必须走后端而不在前端从 `events` 里挑**：分类页的 5s 轮询走

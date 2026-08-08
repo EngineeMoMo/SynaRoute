@@ -7,10 +7,15 @@ import { Badge } from "@/components/ui/Badge";
 /**
  * 用量统计面板：按「分类 × Key」展示 token 消耗。
  *
- * 数据来自后端 `get_token_usage`，读的是 Store 里一份**独立累加器**，口径是「本次运行累计」。
+ * 数据来自后端 `get_token_usage`，读的是 Store 里一份**独立累加器**，口径是「跨重启累计」。
  * 刻意不从事件环（最多 500 条）算总量：那样在环滚动后总量会停止增长（见
  * `token_usage_totals_never_shrink_when_event_ring_rotates`）。
- * **刻意不落盘、不含跨天历史**：定位是「本次运行消耗」不是「账单」，重启归零；历史累计属后续版本。
+ *
+ * 累加器每分钟落盘一次（`usage.json`，仅在有新消耗时写），启动时读回 —— 所以标题下写的是
+ * `usage.since` 的**起算时刻**而不是「本次启动」。这个区别不是措辞问题：若面板说「本次启动」
+ * 而数字其实是跨重启累计的，用户会以为统计翻倍了。
+ *
+ * 仍**不含跨天/按日历史**：定位是「累计消耗」不是「账单」，逐日曲线属后续版本。
  *
  * 只统计 token、不换算钱：各中转商单价差异巨大，SynaRoute 无从得知；想算钱的用户按
  * token×单价自乘即可。
@@ -18,11 +23,15 @@ import { Badge } from "@/components/ui/Badge";
 export function UsagePage() {
   const t = useT();
   const [rows, setRows] = useState<TokenUsageByKey[] | null>(null);
+  const [sinceMs, setSinceMs] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = async () => {
     try {
-      setRows(await api.getTokenUsage());
+      // 两个请求并发发，避免起算时刻慢一拍导致标题闪一下旧值。
+      const [next, since] = await Promise.all([api.getTokenUsage(), api.getUsageSince()]);
+      setRows(next);
+      setSinceMs(since);
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -54,6 +63,11 @@ export function UsagePage() {
           <div>
             <h1 className="text-lg font-semibold text-text-primary">{t("usage.title")}</h1>
             <p className="mt-1 text-xs text-text-muted">{t("usage.subtitle")}</p>
+            {sinceMs !== null && (
+              <p className="mt-0.5 text-xs text-text-muted" title={t("usage.sinceHint")}>
+                {t("usage.since")}: {new Date(sinceMs).toLocaleString()}
+              </p>
+            )}
           </div>
           <button
             onClick={() => void load()}

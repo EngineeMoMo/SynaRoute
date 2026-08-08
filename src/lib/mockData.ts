@@ -721,6 +721,12 @@ export const mockBridge = {
     }
     return clone([...map.values()]);
   },
+  async usageSince() {
+    await delay();
+    // mock 没有真实的落盘文件，用「7 天前」代表一份已经攒了一阵的累计，
+    // 好让浏览器预览也能看出这行不是「本次启动时间」。
+    return Date.now() - 7 * 24 * 60 * 60 * 1000;
+  },
   async getEventTrace(eventId: string) {
     await delay();
     return clone(events.find((e) => e.id === eventId)?.trace ?? null);
