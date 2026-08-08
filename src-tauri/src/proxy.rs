@@ -784,7 +784,7 @@ async fn handle_request(
             match try_stream_to_key(&store, category, key, &path, body, &requested_model, &fwd_headers, req_log, remaining)
                 .await
             {
-                Ok(StreamAttempt::Streaming { resp, url, real_model, request_body, stream_usage: _ }) => {
+                Ok(StreamAttempt::Streaming { resp, url, real_model, request_body }) => {
                     health::record_live_success(&store, &key.id);
                     // 有 Key 能用了 → 立即解除「全部失败」短路，不等窗口自然到期。
                     clear_all_failed_gate(&gate_key);
@@ -1180,6 +1180,10 @@ fn handle_list_models(store: &Arc<Store>, category: CategoryType) -> Response<Re
 /// 请求/响应体在日志里的最大字符数（防止超大 body 撑爆内存日志）
 const REQ_LOG_CAP: usize = 20_000;
 
+/// 流式响应尾部滑动窗口大小。SSE 的 usage 统计在最末几个事件里，只需留住尾巴，
+/// 不缓存全文 —— 既不牺牲首字节延迟，也不让长会话的响应体常驻内存。
+const TAIL_WINDOW_BYTES: usize = 8192;
+
 /// 截断超长文本，附省略提示。
 fn cap(s: &str) -> String {
     cap_to(s, REQ_LOG_CAP)
@@ -1201,17 +1205,15 @@ enum StreamAttempt {
     /// 附带诊断快照供调用模型日志：实际请求的上游 URL、映射后模型名、
     /// **转换后发往上游的请求体**（含 reasoning→thinking 等映射结果，供排障核对）。
     /// 响应体因是真流式（边收边发）无法完整留存，日志侧标注说明。
+    ///
+    /// 这里**不带** token 用量：流是边收边发的，`log_success` 同步执行时流才刚开始，
+    /// 那一刻上游还没吐出末尾的 usage 事件。用量由流内的尾部窗口在流结束后
+    /// 异步补记（同 collapse key 合并进同一条日志），不走这个返回值。
     Streaming {
         resp: Response<ResBody>,
         url: String,
         real_model: String,
         request_body: String,
-        /// 流式响应中提取的 token 用量（同协议透传从尾部 SSE chunk 采集，
-        /// 跨协议翻译后在 finish 时从缓冲区解析）。流是边收边发、不缓存全文，
-        /// 故这里用滑动窗口保留尾部字节，首字节延迟不受影响。
-        /// 当前仅同协议透传路径采集；跨协议翻译路径的 usage 暂不采集。
-        #[allow(dead_code)]
-        stream_usage: Option<crate::upstream::TokenUsage>,
     },
     /// 上游有响应但非 2xx：缓冲错误体，调用方据此切换下一个 Key。
     /// `retry_after`：上游 `Retry-After` 头解析出的秒数（429/503 常带），无则 None。
@@ -1369,64 +1371,78 @@ async fn try_stream_to_key(
         // 同时用滑动窗口保留尾部字节，流结束后从尾部 SSE chunk 提取 token 用量——
         // 不缓存全文、不牺牲首字节延迟。提取失败（上游没给 usage）时静默忽略。
         None => {
-            use tokio::sync::Mutex;
-            let tail_buf = std::sync::Arc::new(Mutex::new(Vec::with_capacity(8192)));
+            // 尾部滑动窗口 + 「流已结束」信号。
+            //
+            // buffer 用 `std::sync::Mutex`：写入发生在 `map` 这个**同步**闭包里，
+            // 用异步锁只能 `try_lock`，一旦竞争就静默丢块。这里写者只有流本身、
+            // 读者只在流结束后才动，用同步锁反而既简单又不丢数据。
+            //
+            // 结束信号用 `Notify` + Drop 守卫：`map` 闭包被 drop 的时刻，就是
+            // 上游流被消费完（或下游提前断开）的时刻，hyper 送完 body 就会 drop 它。
+            // 这是唯一能在 `.map()` 上拿到「流结束」的可靠点位 —— 用 `notify_one`
+            // 而非 `notify_waiters`，因为它会留下 permit，补记任务晚到也不会漏掉。
+            struct StreamEnd(std::sync::Arc<tokio::sync::Notify>);
+            impl Drop for StreamEnd {
+                fn drop(&mut self) {
+                    self.0.notify_one();
+                }
+            }
+
+            let tail_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::with_capacity(
+                TAIL_WINDOW_BYTES,
+            )));
+            let stream_done = std::sync::Arc::new(tokio::sync::Notify::new());
+            let end_guard = StreamEnd(stream_done.clone());
+
             let tail_buf2 = tail_buf.clone();
             let store2 = store.clone();
             let key_id2 = key.id.clone();
             let category2 = category;
-            let ref_model2 = real_model.clone();
+            // 补记只需要「定位到哪一行」的三要素（分类 + key + collapse_key），
+            // 不再自己拼 detail —— detail 由流开始时那条同步日志负责，补记只往里补用量。
             let req_model2 = requested_model.to_string();
-            let name2 = key.name.clone();
 
             let byte_stream = resp.bytes_stream().map(move |chunk| {
+                // 闭包持有守卫；闭包被 drop → 守卫 Drop → 通知补记任务。
+                let _ = &end_guard;
                 match chunk {
                     Ok(bytes) => {
-                        // 滑动窗口：保留尾部最近 8KB（usage 在 SSE 最末几个 chunk）。
-                        // `bytes` 是 `Bytes`（引用计数），clone 廉价。
-                        if let Ok(mut buf) = tail_buf.try_lock() {
+                        // 滑动窗口：只留尾部 8KB（usage 在 SSE 最末几个事件里）。
+                        if let Ok(mut buf) = tail_buf.lock() {
                             buf.extend_from_slice(&bytes);
-                            if buf.len() > 8192 {
-                                let keep = buf.len().saturating_sub(8192);
-                                buf.drain(0..keep);
+                            if buf.len() > TAIL_WINDOW_BYTES {
+                                let drop_n = buf.len() - TAIL_WINDOW_BYTES;
+                                buf.drain(0..drop_n);
                             }
                         }
                         Ok(Frame::data(bytes))
                     }
-                    Err(e) => {
-                        Err(std::io::Error::other(e.to_string()))
-                    }
+                    Err(e) => Err(std::io::Error::other(e.to_string())),
                 }
             });
-            // 流结束后从尾部窗口提取 usage 补给事件日志。
-            // 不能挂 `chain(once(...))` —— futures_util::once 返回 Option 非 Result，
-            // 必须等流自然结束（drop 或被消费完）。这里在消费完后异步提取。
+
+            // 补记任务：**必须**先等流结束再读窗口。
+            // 曾经这里直接 `lock().await` 就读 —— 而 body 是惰性的，spawn 那一刻流还没被
+            // poll 过一个字节，锁空闲、buffer 为空，于是永远提取不到 usage 且不报错。
             tokio::spawn(async move {
-                // 等流被下游消费完——尾部窗口已填满最后数据。
-                // 这句是"等上游流自然结束"，没有额外开销。
-                let buf = tail_buf2.lock().await;
-                let sse = String::from_utf8_lossy(&buf);
+                stream_done.notified().await;
+                let snapshot = match tail_buf2.lock() {
+                    Ok(buf) => buf.clone(),
+                    Err(_) => return,
+                };
+                let sse = String::from_utf8_lossy(&snapshot);
                 if let Some(u) = crate::upstream::extract_usage_from_sse(&sse) {
-                    let detail = format!(
-                        "{} · 流式返回 · {} · {ref_model2}",
-                        name2,
-                        fmt_route_model(&req_model2, &ref_model2,
-                            crate::model::ModelResolveKind::Native),
-                    );
-                    // 与主 route 事件同 collapse key → 折叠为同一条、用量累加。
+                    // 补记进**流开始时已写下的那一行**，不新追加一条。
+                    // 再 append 一条同 collapse key 的事件会被折叠逻辑当成「又发生了一次」：
+                    // repeat 变 2（一次请求显示成 ×2）、detail 被覆盖（延迟数字丢失）。
                     let collapse = format!("ok:{}:{}:{}", key_id2, req_model2, true);
-                    store2.append_event_full(
+                    store2.backfill_usage_for_collapsed_event(
                         category2,
-                        "route",
                         Some(&key_id2),
-                        &detail,
-                        None,
-                        Some(collapse),
-                        Some(u),
+                        &collapse,
+                        u,
                     );
                 }
-                drop(buf);
-                drop(tail_buf2);
             });
             BodyExt::boxed(StreamBody::new(byte_stream))
         }
@@ -1513,7 +1529,6 @@ async fn try_stream_to_key(
         url,
         real_model,
         request_body,
-        stream_usage: None,
     })
 }
 
@@ -3838,5 +3853,50 @@ mod tests {
         );
         pm.stop(CategoryType::ClaudeCli);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 钉住流式用量采集的**同步前提**：补记任务必须等到上游流真正结束才能读尾部窗口。
+    ///
+    /// 这条测试存在的原因是一次真实回归：补记任务写成 `tokio::spawn` 里直接
+    /// `buf.lock().await`，而 hyper 的 body 是**惰性**的 —— spawn 那一刻流一个字节都还没
+    /// 被 poll，锁是空闲的，补记任务瞬间拿到锁、读到空 buffer、提取不到 usage 就退出了。
+    /// 于是「流式采集用量」这个功能永远静默采不到任何东西，且不报任何错。
+    ///
+    /// 这里用 `Notify` 复现正确的同步语义：只有流走完并 notify 之后，补记侧读到的
+    /// 才是完整尾部。若把 `notified().await` 删掉（回到旧写法），断言必须变红。
+    #[tokio::test]
+    async fn stream_tail_window_is_read_only_after_stream_completes() {
+        use std::sync::Arc;
+        use tokio::sync::{Mutex, Notify};
+
+        let tail: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(Notify::new());
+
+        let tail_w = tail.clone();
+        let done_w = done.clone();
+        // 模拟惰性流：spawn 之后才开始产出数据。
+        let producer = tokio::spawn(async move {
+            for part in ["event: a\n", "event: b\n", "data: {\"usage\":1}\n"] {
+                tokio::task::yield_now().await;
+                tail_w.lock().await.extend_from_slice(part.as_bytes());
+            }
+            done_w.notify_one();
+        });
+
+        let tail_r = tail.clone();
+        let done_r = done.clone();
+        let collector = tokio::spawn(async move {
+            // 关键：等流结束。删掉这一行就是旧的错误写法。
+            done_r.notified().await;
+            let buf = tail_r.lock().await;
+            String::from_utf8_lossy(&buf).to_string()
+        });
+
+        producer.await.unwrap();
+        let seen = collector.await.unwrap();
+        assert!(
+            seen.contains("usage"),
+            "补记任务必须读到流末尾的 usage 数据，实际读到: {seen:?}"
+        );
     }
 }

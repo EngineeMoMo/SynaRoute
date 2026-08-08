@@ -7,8 +7,10 @@ import { Badge } from "@/components/ui/Badge";
 /**
  * 用量统计面板：按「分类 × Key」展示 token 消耗。
  *
- * 数据来自后端 `get_token_usage`，聚合自事件日志里带 usage 的事件（最多 500 条内存环形缓冲）。
- * **刻意不含跨天历史**：定位是「最近消耗」不是「账单」，历史累计属后续版本。
+ * 数据来自后端 `get_token_usage`，读的是 Store 里一份**独立累加器**，口径是「本次运行累计」。
+ * 刻意不从事件环（最多 500 条）算总量：那样在环滚动后总量会停止增长（见
+ * `token_usage_totals_never_shrink_when_event_ring_rotates`）。
+ * **刻意不落盘、不含跨天历史**：定位是「本次运行消耗」不是「账单」，重启归零；历史累计属后续版本。
  *
  * 只统计 token、不换算钱：各中转商单价差异巨大，SynaRoute 无从得知；想算钱的用户按
  * token×单价自乘即可。

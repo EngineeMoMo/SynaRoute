@@ -42,6 +42,16 @@ pub struct Store {
     /// 锁且内部含最坏 ~1.2s 的 `thread::sleep` 退避——在 tokio worker 上同步执行会让同线程
     /// 的其它并发转发（含 SSE 流）一并停顿。健康态是可重建的瞬态，合并落盘是正确的取舍。
     health_dirty: std::sync::atomic::AtomicBool,
+    /// 「本次运行以来」的 token 用量累计，按 (分类, key_id) 分组。
+    ///
+    /// **刻意与事件环 `events` 分开存**：`events` 是个 MAX_EVENTS 条的滑动环，超出即
+    /// drain 掉最老的。若把用量总计算在环上，累计值会在第 MAX_EVENTS 次请求之后**不再
+    /// 增长、甚至回退** —— 一个「累计用量」面板越用数字越小，比不显示更糟：用户据此
+    /// 估额度会严重低估。累加器只增不减，与保留多少条日志正交。
+    ///
+    /// 仍是**内存态、不落盘**：落盘等于每次请求都写 config.json，正是 P1-3 极力避开的
+    /// 热路径开销。重启归零这一点在面板副标题里明说，不让用户误以为是历史总账。
+    usage_totals: RwLock<std::collections::BTreeMap<(CategoryType, String), TokenUsage>>,
 }
 
 /// 发给日志写线程的命令。
@@ -240,6 +250,7 @@ impl Store {
             log_tx: Self::spawn_log_writer(),
             log_dropped: std::sync::atomic::AtomicU64::new(0),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
+            usage_totals: RwLock::new(std::collections::BTreeMap::new()),
         };
         // P1 防数据销毁：仅在「全新安装(文件不存在)首次 seed」或「成功加载后的迁移」时落盘。
         // load_failed(文件存在但解析失败)时绝不 persist——否则空配置会覆盖磁盘上的原有数据。
@@ -346,6 +357,14 @@ impl Store {
         };
         // 先写文件：文件是逐条完整的事实来源，不受下面的界面折叠影响。
         self.write_log_to_file(&entry);
+
+        // 用量累计：**在事件环之外**独立累加。每次带 usage 的调用都代表一次真实消耗，
+        // 折叠与否只影响界面展示几行，不影响真实烧掉的额度，故这里无条件累加一次。
+        // （放在 push_event_in_memory 之前，且用独立的锁——不与 events 写锁嵌套。）
+        if let Some(u) = &entry.usage {
+            let k = (category, entry.key_id.clone().unwrap_or_default());
+            self.usage_totals.write().entry(k).or_default().add(u);
+        }
 
         // 内存态的写入抽成独立方法，让 events 写锁**随该方法返回即释放** ——
         // 原先这把锁活到函数末尾（且折叠分支还会中途 return），emit 无处可放。
@@ -579,30 +598,70 @@ impl Store {
 
     /// 按「分类 × Key」聚合 token 用量（用量统计面板用）。
     ///
-    /// 数据源是内存事件环形缓冲（最多 500 条）：用量随事件逐条采集（见
-    /// [`crate::upstream::usage`]），聚合时把带 `usage` 的事件按 category+key_id 累加。
+    /// 数据源是 `usage_totals` 累加器，口径为「本次运行累计」，**与事件环解耦**：
+    /// 事件环只保留最近 MAX_EVENTS 条，若按环算总量，第 MAX_EVENTS 次请求之后
+    /// 累计值就不再增长（老事件被 drain 掉多少、新事件就补回多少）——一个「累计用量」
+    /// 面板越用数字越小，用户据此估额度会严重低估。
     ///
-    /// **刻意不含跨天历史**：每日 `.jsonl` 文件是逐条完整的事实来源，但解析它需要
-    /// 读盘 + 反序列化，且用量面板定位是「最近消耗」，不是「账单」。跨天累计留给后续
-    /// 版本（若要，按 `effective_log_dir` 的日期文件补一个按日聚合即可）。
-    ///
-    /// 折叠事件（repeat>1）的用量已在折叠时累加，这里直接读即可。
+    /// **刻意不含跨天历史、不落盘**：每日 `.jsonl` 是逐条完整的事实来源，但解析它要
+    /// 读盘 + 反序列化；而每请求写盘正是 P1-3 要避开的热路径开销。面板定位是
+    /// 「本次运行消耗」不是「账单」，重启归零已在副标题里明说。跨天累计留给后续版本
+    /// （若要，按 `effective_log_dir` 的日期文件补一个按日聚合即可）。
     pub fn token_usage_by_key(&self) -> Vec<TokenUsageByKey> {
-        use std::collections::BTreeMap;
-        let mut map: BTreeMap<(CategoryType, String), TokenUsage> = BTreeMap::new();
-        for e in self.events.read().iter() {
-            let Some(u) = &e.usage else { continue };
-            // key_id 为空的事件（系统级）归到该分类的「(空)」行。
-            let k = (e.category_id, e.key_id.clone().unwrap_or_default());
-            map.entry(k).or_default().add(u);
-        }
-        map.into_iter()
+        self.usage_totals
+            .read()
+            .iter()
             .map(|((category_id, key_id), usage)| TokenUsageByKey {
-                category_id,
-                key_id,
-                usage,
+                category_id: *category_id,
+                key_id: key_id.clone(),
+                usage: *usage,
             })
             .collect()
+    }
+
+    /// 流式请求的用量**补记**：把流走完才拿到的 token 用量并进**已存在的那一行**。
+    ///
+    /// 为什么不能直接再 `append_event_full` 一条同 collapse_key 的事件：折叠逻辑的语义是
+    /// 「同一件事又发生了一次」——它会把 `repeat` 加一（一次请求在界面上显示成 ×2），
+    /// 并用新 detail 覆盖旧 detail（把流开始时记下的延迟数字冲掉）。
+    /// 补记要的是「修补同一行」，不是「再记一次」。
+    ///
+    /// 找不到目标行（已被 MAX_EVENTS 挤出）时**不新建行**：这笔用量在累加器里已经记到，
+    /// 界面上少一段用量文本，远好过多出一条看起来像重复请求的假记录。
+    pub fn backfill_usage_for_collapsed_event(
+        &self,
+        category: CategoryType,
+        key_id: Option<&str>,
+        collapse_key: &str,
+        usage: crate::upstream::TokenUsage,
+    ) {
+        // 累加器**无条件**先记：面板的总量口径与「那条日志行还在不在」无关。
+        {
+            let k = (category, key_id.unwrap_or_default().to_string());
+            self.usage_totals.write().entry(k).or_default().add(&usage);
+        }
+
+        // 再修补日志行：从后往前找同 collapse_key 的最近一条。
+        {
+            let mut ev = self.events.write();
+            let Some(target) = ev
+                .iter_mut()
+                .rev()
+                .find(|e| e.collapse_key.as_deref() == Some(collapse_key))
+            else {
+                return;
+            };
+            match target.usage.as_mut() {
+                Some(acc) => acc.add(&usage),
+                None => target.usage = Some(usage),
+            }
+            // detail 追加用量文本，与非流式路径（`log_success` 的 usage_part）同一观感。
+            // 只在还没有用量段时追加，避免重复补记把同一段贴两次。
+            if !target.detail.contains('↑') {
+                target.detail.push_str(&format!(" · {}", usage.fmt_compact()));
+            }
+        } // 写锁在此释放 —— emit 前必须放光锁（见 events::emit 文档）。
+        crate::events::emit(crate::events::Topic::Logs, Some(category));
     }
 
     /// 某分类**最近一条**失败事件（error / failover），且必须够新。
@@ -1549,18 +1608,24 @@ impl Store {
             .map(|k| k.name.clone())
     }
 
-    /// 某 Key 当前是否处于熔断中（窄读取器，只取一个 bool）。
+    /// 某 Key 的熔断窗口截止时刻（窄读取器，只取一个 `Option<i64>`）。
     ///
     /// `record_live_failure` / `record_live_success` 做熔断状态跃迁检测用——每失败/成功
     /// 调用一次，用 `get_key` 整份克隆只为看 `breaker_until` 太浪费。
-    pub fn key_breaker_tripped(&self, key_id: &str) -> bool {
+    ///
+    /// 刻意返回**原始值**而非 bool：调用方对「熔断中」有两种不同口径，压成 bool 必然
+    /// 有一方被迫用错的那种 ——
+    /// - 「窗口是否还活着」（`until > now`）：与 `is_candidate` 同口径，用于判断
+    ///   熔断**武装**跃迁（窗口自然到期后再次失败，属于一次新的熔断，应当告警）。
+    /// - 「是否还有熔断残留」（`is_some()`）：用于判断**解除**跃迁（残留只有真实成功
+    ///   才会被清成 None，清掉即代表这个 Key 真的恢复了）。
+    pub fn key_breaker_until(&self, key_id: &str) -> Option<i64> {
         self.config
             .read()
             .keys
             .iter()
             .find(|k| k.id == key_id)
-            .map(|k| k.health.breaker_until.is_some())
-            .unwrap_or(false)
+            .and_then(|k| k.health.breaker_until)
     }
 
     /// 脱敏后的完整配置 JSON（用于诊断报告）。
@@ -1995,6 +2060,7 @@ impl Store {
             log_tx: Self::spawn_log_writer(),
             log_dropped: std::sync::atomic::AtomicU64::new(0),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
+            usage_totals: RwLock::new(std::collections::BTreeMap::new()),
         })
     }
 }
@@ -2373,6 +2439,101 @@ mod tests {
         let last = ev.last().unwrap();
         assert_eq!(last.repeat, 2);
         assert_eq!(last.usage.map(|x| (x.input, x.output)), Some((70, 8)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 用量总计**只增不减**：事件环滚动（MAX_EVENTS 上限）不得让已统计的用量凭空消失。
+    ///
+    /// 这条是「用量统计」这个功能的核心正确性判据。原实现把总量算在 `self.events` 上，
+    /// 而 events 是个 500 条的环 —— 超过 500 次请求后，最老的事件被 drain 掉，
+    /// 面板上的累计 token **会往回退**。一个「累计用量」面板显示的数字越用越小，
+    /// 比不显示更糟：用户据此判断额度消耗，会严重低估。
+    #[test]
+    fn token_usage_totals_never_shrink_when_event_ring_rotates() {
+        use crate::upstream::TokenUsage;
+        let dir = temp_dir("usage_no_shrink");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        let one = || Some(TokenUsage { input: 10, output: 1, cache_read: 0 });
+
+        // 先把事件环填满（每条都不折叠：detail 不同且不给 collapse_key）。
+        for i in 0..MAX_EVENTS {
+            store.append_event_full(
+                CategoryType::ClaudeCli, "route", Some("k1"),
+                &format!("req-{i}"), None, None, one(),
+            );
+        }
+        let before = store.token_usage_by_key()[0].usage.input;
+        assert_eq!(before, (MAX_EVENTS as u64) * 10, "填满环时应统计到全部用量");
+
+        // 再发 100 条 —— 最老的 100 条会被挤出事件环。
+        for i in 0..100 {
+            store.append_event_full(
+                CategoryType::ClaudeCli, "route", Some("k1"),
+                &format!("more-{i}"), None, None, one(),
+            );
+        }
+        let after = store.token_usage_by_key()[0].usage.input;
+        assert_eq!(
+            after,
+            (MAX_EVENTS as u64 + 100) * 10,
+            "累计用量必须涵盖已滚出事件环的请求（before={before} after={after}）"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 一次流式请求只应在界面上留**一行**：把流结束后才拿到的 token 用量**并进已有的那行**，
+    /// 而不是新追加一条。
+    ///
+    /// 背景（真实缺陷）：流式转发的日志行是在**流刚开始**（收到响应头）时同步写的，那一刻
+    /// 上游还没吐出末尾的 usage 事件；用量只能等流走完再补。补记若走
+    /// `append_event_full` + 相同 collapse_key，折叠逻辑会把它当成「同一件事又发生了一次」：
+    ///   - `repeat` 加到 2 → 一次请求显示成「×2」
+    ///   - `detail` 被替换成补记那条（没有延迟数字、没有用量文本）
+    ///
+    /// 于是既虚报了次数，又把延迟显示弄丢了。
+    #[test]
+    fn stream_usage_backfill_updates_one_row_instead_of_adding_another() {
+        use crate::upstream::TokenUsage;
+        let dir = temp_dir("usage_backfill");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        let collapse = "ok:k1:claude-sonnet-4:true".to_string();
+
+        // 1) 流开始：同步写下这条（此刻还没有 usage，但有延迟数字）。
+        store.append_event_full(
+            CategoryType::ClaudeCli,
+            "route",
+            Some("k1"),
+            "主Key · 流式返回 · claude-sonnet-4 · 138ms",
+            None,
+            Some(collapse.clone()),
+            None,
+        );
+        // 2) 流结束：补记用量。
+        let u = TokenUsage { input: 12_345, output: 400, cache_read: 0 };
+        store.backfill_usage_for_collapsed_event(CategoryType::ClaudeCli, Some("k1"), &collapse, u);
+
+        let ev = store.list_all_events();
+        assert_eq!(ev.len(), 1, "一次流式请求只能留一行，实际: {ev:?}");
+        assert_eq!(ev[0].repeat, 1, "补记不是「又发生了一次」，repeat 必须仍为 1");
+        assert!(
+            ev[0].detail.contains("138ms"),
+            "补记不得把延迟数字冲掉: {}",
+            ev[0].detail
+        );
+        assert!(
+            ev[0].detail.contains("↑12.3k"),
+            "补记后这一行应带上用量文本: {}",
+            ev[0].detail
+        );
+        let got = ev[0].usage.expect("这一行应带上结构化用量");
+        assert_eq!((got.input, got.output), (12_345, 400));
+
+        // 用量累计同样要记到（面板的数据源是累加器，与事件环无关）。
+        let agg = store.token_usage_by_key();
+        assert_eq!(agg.len(), 1);
+        assert_eq!(agg[0].usage.input, 12_345, "累加器必须也收到这笔用量");
 
         std::fs::remove_dir_all(&dir).ok();
     }

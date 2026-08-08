@@ -8,13 +8,26 @@ use chrono::Utc;
 use std::sync::Arc;
 
 /// 发系统通知（熔断/恢复告警）。非 test 走 `notification::notify`；test 下是 no-op
-/// （notification 模块整体 `#[cfg(not(test))]`，测试进程不链接通知插件的 WinRT 依赖）。
+/// （测试进程不该弹系统框。注意插件 crate 在 test 下**照常链接**，见 notification.rs 模块注释）。
 #[cfg(not(test))]
 fn notify(title: &str, body: &str) {
     crate::notification::notify(title, body);
 }
 #[cfg(test)]
 fn notify(_title: &str, _body: &str) {}
+
+/// 熔断窗口此刻是否还活着（与 `is_candidate` 同口径：`until > now` 才算熔断中）。
+///
+/// 单独抽出来是因为**不能**用 `breaker_until.is_some()` 代替：`breaker_until` 只有在一次
+/// 真实成功后才被清成 `None`，窗口自然到期时字段仍是 `Some(过去时刻)`，此时路由侧
+/// （`is_candidate`）已判可用。用 `is_some()` 判「熔断中」会让重新武装时的
+/// `now && !was` 恒为 false，第二次及以后的熔断永远不发通知。
+///
+/// 收成一个函数而不是在两处各写一遍同样的 `map(...).unwrap_or(false)`：这个判据刚因为
+/// 两套口径分叉出过缺陷，再复制一份就是给下一次分叉留位置。
+fn breaker_window_active(breaker_until: Option<i64>, now: i64) -> bool {
+    breaker_until.map(|until| until > now).unwrap_or(false)
+}
 
 /// 熔断阈值：连续失败达到即熔断
 const BREAKER_THRESHOLD: u32 = 3;
@@ -107,8 +120,12 @@ pub fn record_live_failure(store: &Arc<Store>, key_id: &str) {
     // 先读「是否已熔断」：熔断是状态跃迁，只在「未熔断 → 刚熔断」时发一次系统通知
     // （不是每次失败都发，否则刷屏）。这条读与下面的 mutate_health 之间有个极窄窗口，
     // 并发下可能漏报一次 —— 通知本就是尽力而为（events::notify 失败不致命），可接受。
-    // 用窄读取器（只取 bool），不用 get_key 整份克隆——每失败都走这里，热路径。
-    let was_tripped = store.key_breaker_tripped(key_id);
+    // 用窄读取器（只取 Option<i64>），不用 get_key 整份克隆——每失败都走这里，热路径。
+    //
+    // 口径是「窗口此刻是否还活着」，不是「字段有没有残留」：窗口自然到期后 breaker_until
+    // 仍是 Some(过去时刻)（只有真实成功才清），若按 is_some() 算，重新武装时
+    // was_tripped 恒为 true，第二次及以后的熔断就永远静默了。
+    let was_tripped = breaker_window_active(store.key_breaker_until(key_id), now);
     // 走 `mutate_health` 而非「get_key → 算 → update_health」：后者跨两个临界区，
     // 两个并发失败会都读到同一个 prev.fail_count 各自 +1 写回，导致熔断迟钝
     // （详见 Store::mutate_health 的文档）。这里 read-modify-write 在同一个写锁内完成。
@@ -126,7 +143,8 @@ pub fn record_live_failure(store: &Arc<Store>, key_id: &str) {
         true
     });
     // 熔断武装跃迁：发系统通知 + 记一条告警事件。
-    let now_tripped = store.key_breaker_tripped(key_id);
+    // 同口径复算（mutate 里刚写的 breaker_until 一定在未来，故这里等价于「是否刚被武装」）。
+    let now_tripped = breaker_window_active(store.key_breaker_until(key_id), now);
     if now_tripped && !was_tripped {
         let name = store.key_name(key_id).unwrap_or_else(|| key_id.to_string());
         notify(
@@ -140,10 +158,13 @@ pub fn record_live_failure(store: &Arc<Store>, key_id: &str) {
 /// 让恢复的 Key 立即回到候选池（无需等下一次后台探测）。
 pub fn record_live_success(store: &Arc<Store>, key_id: &str) {
     let now = Utc::now().timestamp_millis();
-    // mutate 前读「是否已熔断」：与 mutate 后的状态对比，判断「本次是否真的发生了
-    // 熔断解除」。若在 mutate 后才读，无法区分「本来就没熔断」与「刚解除」——会误发
-    // 「已恢复」通知给一个一直健康的 Key。窄读取器只取 bool，热路径零整份克隆。
-    let was_tripped = store.key_breaker_tripped(key_id);
+    // mutate 前读熔断残留：与 mutate 后对比，判断「本次是否真的清掉了熔断」。
+    // 这里口径是 `is_some()`（有无残留）而非「窗口是否还活着」，且**刻意**与
+    // `record_live_failure` 不同：残留只有真实成功才会被清成 None，所以
+    // 「Some → None」精确对应「这个 Key 真的恢复了」。若这里也按窗口活着算，
+    // 「熔断窗口自然到期后第一次成功」就发不出恢复通知——而用户上一条收到的正是熔断告警，
+    // 不给恢复回执会让告警永远悬着。窄读取器只取 Option<i64>，热路径零整份克隆。
+    let had_breaker_residue = store.key_breaker_until(key_id).is_some();
     let _ = store.mutate_health(key_id, |h| {
         // 已健康、无熔断残留、且 last_live_success 仍新鲜：内存与磁盘都无需动
         // （避免高频请求每次都写盘——这是热路径上最值钱的一处抑制，见 Store::update_health）。
@@ -164,12 +185,12 @@ pub fn record_live_success(store: &Arc<Store>, key_id: &str) {
         // last_checked / latency_ms 保持不动（那是探测的观测量，不是转发的）。
         true
     });
-    // 熔断解除跃迁：mutate 后再读一次，对比确认「已熔断 → 已解除」。
+    // 熔断解除跃迁：mutate 后再读一次，对比确认「有残留 → 已清空」。
     // 并发窗口：另一线程可能在两次读之间解除熔断，导致本线程误发一条「已恢复」。
     // 恢复通知是低频事件，且重复一次「已恢复」无害（用户看到的是 Key 确实恢复了），
     // 不引入额外锁来消除这个窄窗口。
-    let now_tripped = store.key_breaker_tripped(key_id);
-    if was_tripped && !now_tripped {
+    let still_has_residue = store.key_breaker_until(key_id).is_some();
+    if had_breaker_residue && !still_has_residue {
         let name = store.key_name(key_id).unwrap_or_else(|| key_id.to_string());
         notify(
             "Key 已恢复",
@@ -279,6 +300,43 @@ mod tests {
 
     fn hs(status: HealthStatus, fail_count: u32, breaker_until: Option<i64>) -> HealthState {
         HealthState { status, fail_count, breaker_until, ..Default::default() }
+    }
+
+    /// 熔断「跃迁」判据必须按**窗口是否还活着**算，不能按 `breaker_until.is_some()` 算。
+    ///
+    /// 背景：`breaker_until` 只有在一次真实成功后才会被清成 `None`。窗口自然到期
+    /// （`until <= now`）时字段仍是 `Some(过去时刻)`，而 `is_candidate` 此时已判它可路由。
+    /// 于是「熔断中」这个概念有两套口径：
+    ///   - 路由用的（`is_candidate`）：`until > now` 才算熔断
+    ///   - 通知曾用的（`is_some()`）：只要还有残留就算熔断
+    ///
+    /// 两套口径不一致会吃掉告警：Key 第一次熔断 → 窗口到期 → 再次连续失败被**重新武装**，
+    /// 此时按 `is_some()` 算 `was_tripped` 恒为 true，`now && !was` 恒为 false，
+    /// **第二次及以后的熔断永远不发通知**。用户只会在 Key 第一次出问题时收到一次告警，
+    /// 之后无论故障多少轮都静默——而这恰恰是健康告警这个功能要解决的问题。
+    #[test]
+    fn breaker_arm_transition_uses_live_window_not_residual_field() {
+        let now = Utc::now().timestamp_millis();
+        // 窗口已自然到期，但字段仍有残留（真实成功前不会被清）。
+        let expired = hs(HealthStatus::Up, 3, Some(now - 1_000));
+        assert!(
+            is_candidate(&expired),
+            "前提：窗口到期后路由侧已认为可用（这正是两套口径分叉的地方）"
+        );
+        assert!(
+            !breaker_window_active(expired.breaker_until, now),
+            "通知侧必须与路由侧同口径：窗口到期即视为未熔断，否则重新武装时发不出告警"
+        );
+
+        // 窗口仍活着 → 两侧都应认为在熔断中。
+        let active = hs(HealthStatus::Up, 3, Some(now + 30_000));
+        assert!(!is_candidate(&active));
+        assert!(breaker_window_active(active.breaker_until, now));
+
+        // 从未熔断。
+        let clean = hs(HealthStatus::Up, 0, None);
+        assert!(is_candidate(&clean));
+        assert!(!breaker_window_active(clean.breaker_until, now));
     }
 
     /// 密钥库锁着时健康探测必须**一个字节都不改**。
