@@ -1,4 +1,4 @@
-# macOS 安装与测试指南（SynaRoute 0.1.12）
+# macOS 安装与测试指南（SynaRoute 0.1.14）
 
 > 适用：Apple Silicon Mac（arm64）。本版本产出的 mac 包是 **CI 构建 + ad-hoc 签名**的测试包，
 > **不是**已完成 Developer ID 签名与公证的正式发布版。它用于验证 SynaRoute 在 macOS 上
