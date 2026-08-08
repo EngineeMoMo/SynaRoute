@@ -335,8 +335,8 @@ impl Store {
             kind: kind.to_string(),
             key_id: key_id.map(|s| s.to_string()),
             // 事件构造时就回填 key_name（key_id → 可读名）：日志文件与列表都带可读名，
-            // 排障/路径可视化不必拿 uuid 反查。查表一次、无则 None（Key 可能已被删）。
-            key_name: key_id.and_then(|kid| self.get_key(kid).map(|k| k.name)),
+            // 排障/路径可视化不必拿 uuid 反查。走窄读取器（只克隆 name），不用 get_key 整份克隆。
+            key_name: key_id.and_then(|kid| self.key_name(kid)),
             detail: detail.to_string(),
             repeat: 1,
             collapse_key: collapse_key.clone(),
@@ -1533,6 +1533,34 @@ impl Store {
     /// config.json（包内私有副本 vs 真实文件）。把实际路径打进报告，才能一眼分辨是哪一份。
     pub fn config_path_display(&self) -> String {
         self.config_path.display().to_string()
+    }
+
+    /// Key 的可读名（窄读取器，**只克隆 name 这一个 String**）。
+    ///
+    /// 为什么必须有：`append_event_full` 每请求调用一次、`health.rs` 的熔断通知每失败/恢复
+    /// 调用 —— 若用 `get_key`（整份克隆 ProviderKey，含 models/mappings/health），转发热路径
+    /// 上每写一条日志就白克隆一整份配置对象。与 `request_log_enabled` 等窄读取器同一原则。
+    pub fn key_name(&self, key_id: &str) -> Option<String> {
+        self.config
+            .read()
+            .keys
+            .iter()
+            .find(|k| k.id == key_id)
+            .map(|k| k.name.clone())
+    }
+
+    /// 某 Key 当前是否处于熔断中（窄读取器，只取一个 bool）。
+    ///
+    /// `record_live_failure` / `record_live_success` 做熔断状态跃迁检测用——每失败/成功
+    /// 调用一次，用 `get_key` 整份克隆只为看 `breaker_until` 太浪费。
+    pub fn key_breaker_tripped(&self, key_id: &str) -> bool {
+        self.config
+            .read()
+            .keys
+            .iter()
+            .find(|k| k.id == key_id)
+            .map(|k| k.health.breaker_until.is_some())
+            .unwrap_or(false)
     }
 
     /// 脱敏后的完整配置 JSON（用于诊断报告）。
