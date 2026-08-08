@@ -124,8 +124,7 @@ static TX: OnceLock<SyncSender<Sig>> = OnceLock::new();
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// 取已安装的 AppHandle（`notification.rs` 用；未初始化时返回 None）。
-/// 仅非 test 编译：test 构建不链接通知模块，此处是死代码。
-#[cfg(not(test))]
+#[allow(dead_code)]
 pub fn app_handle() -> Option<tauri::AppHandle> {
     APP.get().cloned()
 }
