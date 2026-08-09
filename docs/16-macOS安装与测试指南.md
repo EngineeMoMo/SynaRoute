@@ -1,20 +1,20 @@
-# macOS 安装与测试指南（SynaRoute 0.1.14）
+# macOS 安装与测试指南（SynaRoute 0.1.15）
 
 > 适用：Apple Silicon Mac（arm64）。本版本产出的 mac 包是 **CI 构建 + ad-hoc 签名**的测试包，
 > **不是**已完成 Developer ID 签名与公证的正式发布版。它用于验证 SynaRoute 在 macOS 上
 > 能否编译、安装、启动、转发 —— 但首次启动会撞上 Gatekeeper，需要手动放行（见第 3 节）。
 
-**当前版本：v0.1.13**
+**当前版本：v0.1.15**
 
 ---
 
 ## 1. 产物清单
 
-从 GitHub Actions 下载（run `31233219672`，artifact 名 `macos-arm64-build`）：
+从 GitHub Actions 下载（run `31287262683`，artifact 名 `macos-arm64-build`）：
 
 | 文件 | 大小 | 用途 |
 |---|---|---|
-| `SynaRoute_0.1.13_aarch64.dmg` | 8.7 MB | 拖拽安装包（推荐） |
+| `SynaRoute_0.1.15_aarch64.dmg` | 8.7 MB | 拖拽安装包（推荐） |
 | `SynaRoute-macos-arm64-app.tar.gz` | 8.7 MB | 直接解压运行的 .app（免挂载） |
 
 获取方式（在你的 Mac 上）：
@@ -23,7 +23,7 @@
 # Actions → macOS check → 最新成功 run → Artifacts → macos-arm64-build
 
 # 方式 B：命令行（需已登录 gh）
-gh run download 31233219672 -n macos-arm64-build
+gh run download 31287262683 -n macos-arm64-build
 ```
 
 产物已验证（CI 六条判据）：最低系统版本 11.0、icns 图标、arm64 架构、
@@ -43,7 +43,7 @@ gh run download 31233219672 -n macos-arm64-build
 
 ### 3.1 用 dmg 安装（推荐）
 
-1. 双击 `SynaRoute_0.1.12_aarch64.dmg`
+1. 双击 `SynaRoute_0.1.15_aarch64.dmg`
 2. 磁盘映像挂载后，把 **SynaRoute.app** 拖进 **Applications** 文件夹
 3. 打开 Finder → 应用程序 → 双击 **SynaRoute**
 
