@@ -1049,6 +1049,7 @@ pub fn run() {
     // —— 用户明确担心过持续写盘伤 SSD，这里不能变成每 30s 一次的无条件写。
     {
         let store_bg = store.clone();
+        let proxy_bg = proxy.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio rt");
             rt.block_on(async move {
@@ -1058,6 +1059,10 @@ pub fn run() {
                     ))
                     .await;
                     store_bg.flush_usage_if_dirty();
+                    // 代理运行态快照（恢复上次启用状态用）。搭这条现成线程而不另起一条：
+                    // 本循环已经是「周期性、可容忍延迟、不在请求路径上」的载体。
+                    // 内部比对不同才落盘，无变化零 I/O —— 空闲的应用不会因此每分钟写一次盘。
+                    service::snapshot_running_proxies(&store_bg, &proxy_bg);
                 }
             });
         });
@@ -1121,6 +1126,25 @@ pub fn run() {
                 let store_bg = state.store.clone();
                 tauri::async_runtime::spawn(async move {
                     service::start_mcp_on_launch(&store_bg, &mcp_bg).await;
+                });
+            }
+
+            // 恢复上次在跑的代理分类：用户上次启用过，下次开应用（含开机自启动）就该继续，
+            // 不必每次手点。与 `--autostart` 无关 —— 手动双击同样要恢复。
+            //
+            // 放在 MCP 之后、同样 spawn 到 Tauri 托管运行时：恢复要逐个 await
+            // （每个分类都要绑端口 + 写客户端配置），不能阻塞 setup 让窗口迟迟不出来。
+            {
+                let store_bg = state.store.clone();
+                let proxy_bg = state.proxy.clone();
+                let app_bg = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let restored = service::restore_proxies_on_launch(&store_bg, &proxy_bg).await;
+                    // 托盘图标按「是否有代理在跑」灰度化（FR-022），恢复完必须刷一次，
+                    // 否则托盘显示「全停」而实际在跑。
+                    if restored > 0 {
+                        let _ = rebuild_tray(&app_bg);
+                    }
                 });
             }
             Ok(())
@@ -1221,6 +1245,10 @@ pub fn run() {
                 // 用量累计同理：定时轮次没到就退出的话，这一段的消耗会丢。
                 // 用量是纯累加的历史值，丢了不会自愈（不像健康态能靠下次探测重建）。
                 state.store.flush_usage_if_dirty();
+                // 代理运行态快照：这是「下次启动恢复上次启用状态」的主要写入点 ——
+                // 周期性快照最多滞后 USAGE_FLUSH_INTERVAL_SECS，而用户「启动代理后立刻退出」
+                // 是很常见的操作，只靠周期性会漏掉。放在这里，正常退出必定记准。
+                service::snapshot_running_proxies(&state.store, &state.proxy);
                 state.store.flush_logs();
                 let dropped = state.store.log_dropped_count();
                 if dropped > 0 {

@@ -1450,6 +1450,25 @@ pub struct AppSettings {
     /// 作为下次首选（与 mcp_port 同一粘滞策略）。缺省时用 CategoryType::meta().default_port。
     #[serde(default, deserialize_with = "de_category_map")]
     pub proxy_ports: std::collections::BTreeMap<CategoryType, u16>,
+    /// 上次运行结束时**处于启用状态**的代理分类。启动时据此自动恢复（FR-029）。
+    ///
+    /// 缘由：代理的运行态原先只活在 `ProxyManager.running`（内存 HashMap），进程一退就没了，
+    /// 用户每次开应用都得手点一次「启动」——而绝大多数人的用法是「一直开着」。
+    ///
+    /// **记的是快照而非用户意图**：启停的意图点有 4 处以上（`start_proxy` 命令、
+    /// `apply_tool_config`、托盘 handler、首启向导、`set_proxy_port`），在每处写标记
+    /// 漏一处就是静默失效。改为周期性 + 退出时采样 `ProxyManager` 的活真相，
+    /// 任何路径都无法漏记。附带好处：`set_proxy_port` 内部 `stop()→start()` 的瞬态
+    /// 天然不影响结果，因为只在稳定态采样。
+    ///
+    /// 恢复时必须走 `service::apply_tool_config`（= `proxy.start()` + 写客户端配置），
+    /// 不能裸 `proxy.start()` —— 后者会重演「界面/托盘说已启动、客户端根本没走代理」
+    /// 那个已修过的无头案（见 `service::apply_tool_config` 的文档）。
+    ///
+    /// 后端自管字段：由 `set_proxy_running_categories` 更新。它不在 `UserPrefs` 白名单里，
+    /// 故通用 `save_settings` 的陈旧前端快照天然覆盖不到（与 `mcp_*` / `active_models` 同策略）。
+    #[serde(default, deserialize_with = "de_category_vec")]
+    pub proxy_running_categories: Vec<CategoryType>,
     /// 首启向导是否已完成（UX#1）。**三态**：
     /// - `None` = 从未判定。旧版本升级上来的配置里没这个字段，全新安装第一次启动也是这个值。
     /// - `Some(true)` = 已完成或用户主动跳过 → 不再显示。
@@ -1665,6 +1684,7 @@ impl Default for AppSettings {
             active_efforts: std::collections::BTreeMap::new(),
             tray_model_switch_enabled: true,
             proxy_ports: std::collections::BTreeMap::new(),
+            proxy_running_categories: Vec::new(),
             // None = 从未判定。启动时 reconcile_onboarding_flag 会据当前 Key 数定下来，
             // 老用户因此不会突然被首启向导拦住。
             onboarding_done: None,

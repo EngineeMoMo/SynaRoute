@@ -35,6 +35,17 @@ use crate::proxy::ProxyManager;
 use crate::store::Store;
 use std::sync::Arc;
 
+/// 发系统通知。非 test 走 `notification::notify`；test 下是 no-op。
+///
+/// 与 `health.rs` 同一套 cfg 分派：`notification` 模块整体 `#[cfg(not(test))]`
+/// （测试进程不该弹系统通知框），直接引用它会让 `cargo test` 编译不过。
+#[cfg(not(test))]
+fn notify(title: &str, body: &str) {
+    crate::notification::notify(title, body);
+}
+#[cfg(test)]
+fn notify(_title: &str, _body: &str) {}
+
 // ==== 代理与工具接入 ====
 
 /// 写进客户端配置的**对外模型名**列表。
@@ -795,6 +806,89 @@ pub(crate) async fn start_mcp_on_launch(store: &Store, mcp: &McpManager) {
         }
         Err(e) => tracing::warn!("MCP 服务器启动失败: {e}"),
     }
+}
+
+// ==== 代理运行态的记忆与恢复（FR-029）====
+
+/// 把「当前哪些分类的代理在跑」快照进配置，供下次启动恢复。
+///
+/// **为什么快照真实运行态、而不在每个启停点写标记**：启停的意图点有四处以上
+/// （`start_proxy` 命令、[`apply_tool_config`]、托盘 handler、首启向导、[`set_proxy_port`]），
+/// 逐点写标记漏一处就是静默失效 —— 用户会遇到「有时记得住有时记不住」，
+/// 而这类间歇性行为最难归因。这里读 [`ProxyManager`] 的活真相，任何路径都无法漏记。
+///
+/// 附带好处：`set_proxy_port` 内部的 `stop() → start()` 瞬态天然不影响结果 ——
+/// 只在稳定态采样，采不到那个中间的空集。
+///
+/// 落盘由 `set_proxy_running_categories` 做幂等判断（与上次相同则一个字节都不写），
+/// 故本函数可以被高频调用：空闲的应用不会因为它产生任何磁盘写入。
+pub(crate) fn snapshot_running_proxies(store: &Store, proxy: &ProxyManager) {
+    let running: Vec<CategoryType> = CategoryType::ALL
+        .iter()
+        .copied()
+        .filter(|c| proxy.is_running(*c))
+        .collect();
+    if let Err(e) = store.set_proxy_running_categories(&running) {
+        // 记不住不影响本次运行，下一轮还会再试；只在真的写失败时留痕。
+        tracing::warn!("代理运行态快照落盘失败（下一轮重试）: {e}");
+    }
+}
+
+/// 启动时恢复上次在跑的代理（FR-029）。
+///
+/// **必须走 [`apply_tool_config`] 而不是裸 `proxy.start()`**：起代理的完整语义是
+/// 「监听端口 + 写客户端工具配置」两件事。只做前半截，客户端读到的仍是官方端点，
+/// 用户会看到「界面显示已启动、Claude/Codex 根本没走代理」—— 托盘曾经就是这么错的
+/// （见 [`apply_tool_config`] 的文档），不能在恢复路径上重演一遍。
+///
+/// `tools::apply` 是幂等的（内部比对内容、没变不写盘），所以端口没漂移时这一步
+/// 不产生任何文件写入；端口漂移时正需要它重写，否则客户端指着一个死端口。
+///
+/// **逐个独立**：一个分类失败（端口被占、配置文件被占用）绝不能阻断其余分类。
+/// 失败必须**可见** —— 记 error 事件 + 发系统通知。静默失效是这里最坏的结果：
+/// 用户以为代理在跑，实际没跑，客户端报错却找不到原因。
+/// 返回**成功恢复的分类数**：调用方据此决定要不要刷托盘图标（0 就不必刷）。
+pub(crate) async fn restore_proxies_on_launch(
+    store: &Arc<Store>,
+    proxy: &Arc<ProxyManager>,
+) -> usize {
+    // 窄读取器而非 `get_settings()`：后者克隆整份 AppSettings（3 个 map + 2 个 Vec），
+    // 这里只要那一个小 Vec。与 `request_log_enabled` 等同一原则。
+    let wanted = store.proxy_running_categories();
+    if wanted.is_empty() {
+        return 0;
+    }
+    let mut ok_count = 0usize;
+    for category in wanted {
+        match apply_tool_config(store, proxy, category).await {
+            Ok(_) => {
+                ok_count += 1;
+                let port = proxy.port_of(category);
+                store.append_event(
+                    category,
+                    "config",
+                    None,
+                    &format!(
+                        "已恢复上次启用的代理（端口 {}）",
+                        port.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+                    ),
+                );
+            }
+            Err(e) => {
+                store.append_event(
+                    category,
+                    "error",
+                    None,
+                    &format!("恢复上次启用的代理失败：{e}。请在界面手动启动。"),
+                );
+                notify(
+                    "代理未能自动恢复",
+                    &format!("「{}」启动失败：{e}", category.meta().display_name),
+                );
+            }
+        }
+    }
+    ok_count
 }
 
 // ==== 开机自启动（FR-025）====

@@ -1954,6 +1954,42 @@ impl Store {
         })
     }
 
+    /// 「上次运行时哪些分类的代理在跑」的快照（后端自管字段）。
+    ///
+    /// 由 `service::snapshot_running_proxies` 周期性 + 退出时写入，
+    /// 供下次启动 `service::restore_proxies_on_launch` 恢复。
+    ///
+    /// **幂等**：与现值相同（顺序无关）则一个字节都不写。这一步不是优化而是必需 ——
+    /// 快照每 60s 采样一次，若不比对就变成「开着不用也每分钟写一次 config.json」，
+    /// 而用户明确担心过持续写盘伤 SSD。
+    ///
+    /// 入参顺序不敏感：内部排序去重后再比对与存储，避免「同一集合不同顺序」被误判为变更。
+    pub fn set_proxy_running_categories(&self, cats: &[CategoryType]) -> AppResult<()> {
+        let mut next: Vec<CategoryType> = cats.to_vec();
+        next.sort_by_key(|c| c.as_str());
+        next.dedup();
+        self.mutate_and_persist_if(|cfg| {
+            if cfg.settings.proxy_running_categories == next {
+                false
+            } else {
+                cfg.settings.proxy_running_categories = next.clone();
+                true
+            }
+        })
+    }
+
+    /// 读回上次运行的代理分类快照（窄读取器，只克隆这一个小 Vec）。
+    ///
+    /// **读侧也归一（排序去重）**，与写侧保持同一形态。写侧已经归一了，所以正常写出的
+    /// 文件本就有序；但手工编辑过的配置可能是乱序或有重复，那样启动后第一次快照比对
+    /// 会误判为「有变更」而白写一次盘。让两侧形态一致，这个多余写入就不存在。
+    pub fn proxy_running_categories(&self) -> Vec<CategoryType> {
+        let mut v = self.config.read().settings.proxy_running_categories.clone();
+        v.sort_by_key(|c| c.as_str());
+        v.dedup();
+        v
+    }
+
     /// 首启向导标记的专用写入（后端自管字段，绕过 save_settings 的旧快照覆盖）。
     /// 已是目标值则幂等跳过写盘。
     pub fn set_onboarding_done(&self, done: bool) -> AppResult<()> {
@@ -3646,6 +3682,140 @@ mod tests {
             "已注册分类不应被前端空 vec 清空"
         );
         assert_eq!(now.theme, "dark", "非控制面字段应正常更新");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 代理运行态快照必须**跨重启保留**（FR-029 的核心判据）。
+    ///
+    /// 这条钉住的是「上次启用了代理，下次开应用自动继续」这个功能本身：快照只活在
+    /// 内存里的话，进程一退就没了，用户每次都得手点一次启动 —— 正是要解决的问题。
+    #[test]
+    fn proxy_running_categories_survive_restart() {
+        let dir = temp_dir("proxy_running_restart");
+        let cfg = dir.join("config.json");
+        let sec = dir.join("secrets.enc");
+
+        {
+            let store = Store::new_at(cfg.clone(), sec.clone()).unwrap();
+            assert!(
+                store.proxy_running_categories().is_empty(),
+                "全新配置应当没有任何记忆（不能凭空自启动代理）"
+            );
+            store
+                .set_proxy_running_categories(&[CategoryType::ClaudeCli, CategoryType::Codex])
+                .unwrap();
+        } // 析构 = 模拟进程退出
+
+        let store2 = Store::new_at(cfg, sec).unwrap();
+        assert_eq!(
+            store2.proxy_running_categories(),
+            vec![CategoryType::ClaudeCli, CategoryType::Codex],
+            "重启后必须读回上次在跑的分类"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 快照落盘必须**幂等**：同一集合（含顺序不同）不得重复写盘。
+    ///
+    /// 用户明确担心过持续写盘伤 SSD。快照每 60s 采样一次，若不比对就变成
+    /// 「开着不用也每分钟重写一次 config.json」—— 而 config.json 里是用户的 Key 与全部设置，
+    /// 把一份只读的采样变成对最宝贵数据的反复覆写，是拿真正要紧的东西去冒无谓的风险。
+    #[test]
+    fn proxy_running_snapshot_is_idempotent_and_order_insensitive() {
+        let dir = temp_dir("proxy_running_idempotent");
+        let cfg = dir.join("config.json");
+        let store = Store::new_at(cfg.clone(), dir.join("secrets.enc")).unwrap();
+
+        store
+            .set_proxy_running_categories(&[CategoryType::ClaudeCli, CategoryType::Codex])
+            .unwrap();
+        let stamp1 = std::fs::metadata(&cfg).unwrap().modified().unwrap();
+        let len1 = std::fs::metadata(&cfg).unwrap().len();
+
+        // 同一集合、顺序颠倒 → 不应写盘（否则每轮采样都会因排序抖动白写一次）。
+        store
+            .set_proxy_running_categories(&[CategoryType::Codex, CategoryType::ClaudeCli])
+            .unwrap();
+        let stamp2 = std::fs::metadata(&cfg).unwrap().modified().unwrap();
+        let len2 = std::fs::metadata(&cfg).unwrap().len();
+        assert_eq!(stamp1, stamp2, "同一集合（顺序不同）不应重复写盘");
+        assert_eq!(len1, len2);
+        assert_eq!(
+            store.proxy_running_categories(),
+            vec![CategoryType::ClaudeCli, CategoryType::Codex],
+            "存储形态应已排序归一，与入参顺序无关"
+        );
+
+        // 真的变了才写。
+        store
+            .set_proxy_running_categories(&[CategoryType::ClaudeCli])
+            .unwrap();
+        assert_eq!(
+            store.proxy_running_categories(),
+            vec![CategoryType::ClaudeCli],
+            "集合真的变化时必须落盘生效"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 前端切主题时提交的陈旧 settings 快照**不得清空**代理运行态记忆。
+    ///
+    /// 这是本项目出过 P0 的形状（切主题把刚关掉的开机自启动重新装回系统）。
+    /// `proxy_running_categories` 是后端自管字段，靠的是它不在 `UserPrefs` 白名单里；
+    /// 哪天有人「顺手」把它加进 `UserPrefs`，这条测试必须立刻变红 ——
+    /// 否则表现是「切一次主题，代理就不记得上次启用过了」，几乎无法归因。
+    #[test]
+    fn save_settings_preserves_proxy_running_categories() {
+        let dir = temp_dir("save_settings_preserves_proxy_running");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        store
+            .set_proxy_running_categories(&[CategoryType::Codex])
+            .unwrap();
+
+        // 前端持有的旧快照里这个字段通常是空的，切主题时整份提交。
+        let mut stale = store.get_settings();
+        stale.proxy_running_categories = vec![];
+        stale.theme = "dark".into();
+        store.save_settings(UserPrefs::from(&stale)).unwrap();
+
+        assert_eq!(
+            store.get_settings().proxy_running_categories,
+            vec![CategoryType::Codex],
+            "代理运行态记忆不应被前端空 vec 清空"
+        );
+        assert_eq!(store.get_settings().theme, "dark", "真正想改的字段应正常落");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 配置里出现未知分类名时：忽略那一个，其余照常读出。
+    ///
+    /// 走的是 `de_category_vec` 的容错。为什么要钉：将来若新增/重命名分类，
+    /// 降级回旧版本时配置里就会有旧版本不认识的名字。若整个字段解析失败退成空，
+    /// 用户会遇到「装回旧版本后代理不记得启用过了」；若整份 config 解析失败，
+    /// 那就是连 Key 都读不出来的灾难。
+    #[test]
+    fn unknown_category_in_proxy_running_is_skipped_not_fatal() {
+        let dir = temp_dir("proxy_running_unknown_cat");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        std::fs::write(
+            &cfg,
+            br#"{"settings":{"theme":"dark","proxyRunningCategories":["codex","gemini-cli","claude-cli"]}}"#,
+        )
+        .unwrap();
+
+        let store = Store::new_at(cfg, dir.join("secrets.enc")).unwrap();
+        assert_eq!(
+            store.proxy_running_categories(),
+            vec![CategoryType::ClaudeCli, CategoryType::Codex],
+            "未知分类应被跳过，已知的两个照常读出"
+        );
+        assert_eq!(store.get_settings().theme, "dark", "同份配置的其它字段不受影响");
 
         std::fs::remove_dir_all(&dir).ok();
     }
