@@ -1333,6 +1333,16 @@ fn with_rollback<T>(
     }
 }
 
+/// 还原前保留现场用的后缀：`<原名>.synaroute-prerestore`。
+///
+/// 存在的理由：`.bak` 是**首写即锁**的「接入前快照」，可能已是几个月前的内容，而用户在
+/// 那之后往同一文件里写了大量自有配置（Claude Code 每点一次「don't ask again」就往
+/// `permissions.allow` 追加一条，还有 hooks / statusLine / 自定义 env；Codex 那边是
+/// `[mcp_servers.*]` / `[profiles.*]` / 项目信任项）。还原是**整文件覆盖**，这些改动会
+/// 一次性消失，而原先连一份副本都不留 —— 卸载场景尤其致命：能重建它的应用同时也被删了。
+/// 留这一份就把「不可逆」变成「可回滚」，与项目「改配置前必先备份」的硬规则一致。
+const PRERESTORE_SUFFIX: &str = "synaroute-prerestore";
+
 /// 某文件对应的 `.synaroute.bak` 备份路径。
 fn backup_path_for(path: &Path) -> PathBuf {
     path.with_extension(match path.extension().and_then(|e| e.to_str()) {
@@ -1341,7 +1351,21 @@ fn backup_path_for(path: &Path) -> PathBuf {
     })
 }
 
+/// 某文件「还原前现场」的保留路径。
+fn prerestore_path_for(path: &Path) -> PathBuf {
+    path.with_extension(match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.{PRERESTORE_SUFFIX}"),
+        None => PRERESTORE_SUFFIX.to_string(),
+    })
+}
+
 /// 从 `.synaroute.bak` 还原单个文件；备份不存在则返回 false（跳过，不报错）。
+///
+/// **覆盖前先把当前内容另存一份** `.synaroute-prerestore`（见 [`PRERESTORE_SUFFIX`]）：
+/// `.bak` 是首写即锁的旧快照，整文件写回会抹掉用户此后所有自有配置，而卸载路径上
+/// 这一步之后应用就没了，没有任何界面能帮用户找回。留一份即可回滚。
+/// 保留失败**不阻断还原**（还原本身是用户要的），只告警——但会跳过删 `.bak`，
+/// 保证任意时刻盘上至少有一份副本。
 ///
 /// 还原成功后**删除 `.bak`**：与 `backup_and_write_bytes` 的「首写即锁」配套。
 /// 备份既已交还给目标文件，就该让下一轮接入重新抓一份新鲜的「接入前快照」——否则被锁死的旧
@@ -1354,9 +1378,27 @@ fn restore_one(path: &Path) -> AppResult<bool> {
         return Ok(false);
     }
     let data = std::fs::read(&backup)?;
+
+    // 保留现场：目标文件存在才需要留（不存在意味着没什么会被覆盖）。
+    let mut kept_scene = true;
+    if path.exists() {
+        if let Err(e) = std::fs::copy(path, prerestore_path_for(path)) {
+            kept_scene = false;
+            tracing::warn!(
+                "还原前保留现场失败 {}: {e}（将保留 .bak 不删，确保仍有副本可回滚）",
+                path.display()
+            );
+        }
+    }
+
     crate::secret::atomic_write(path, &data)?;
-    if let Err(e) = std::fs::remove_file(&backup) {
-        tracing::warn!("还原后清理备份 {} 失败: {e}", backup.display());
+
+    // 现场没留住就不删 `.bak`：宁可下次还原报「无备份」，也不能出现
+    // 「旧快照已删、当前内容已被覆盖」这种两头皆空的状态。
+    if kept_scene {
+        if let Err(e) = std::fs::remove_file(&backup) {
+            tracing::warn!("还原后清理备份 {} 失败: {e}", backup.display());
+        }
     }
     Ok(true)
 }
@@ -2735,6 +2777,42 @@ mod tests {
             std::fs::read(&path).unwrap(),
             b"ORIGINAL_OAUTH",
             "restore_one 应还原到接入前的原始内容"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// 还原是**整文件回滚到首写即锁的旧快照**，会抹掉用户在那之后的全部自有改动。
+    /// 覆盖前必须留一份现场，否则卸载路径上这一步之后应用就没了，用户无从找回。
+    ///
+    /// 具体场景：用户 1 月接入，`.bak` 锁死为 1 月内容；此后数月 Claude Code 往
+    /// `settings.json` 追加 permissions/hooks/statusLine。8 月卸载 → 整文件覆盖回 1 月，
+    /// 且旧实现随即删掉 `.bak` —— 磁盘上一份副本都不剩。
+    #[test]
+    fn restore_one_keeps_prerestore_copy_before_overwriting() {
+        let path = temp_file("restore_prerestore", "settings.json");
+        std::fs::write(&path, b"ORIGINAL").unwrap();
+
+        // 接入：备份原文件并写入代理配置。
+        backup_and_write_bytes(&path, b"PROXY_CONFIG").unwrap();
+        // 用户此后自己改了这个文件（Claude Code 追加 permissions 等）。
+        std::fs::write(&path, b"PROXY_CONFIG + USER_EDITS_MONTHS_LATER").unwrap();
+
+        assert!(restore_one(&path).unwrap());
+
+        // 还原本身照旧：回到接入前的内容。
+        assert_eq!(std::fs::read(&path).unwrap(), b"ORIGINAL");
+
+        // 关键：被覆盖掉的那份用户内容必须还在盘上，可回滚。
+        let scene = prerestore_path_for(&path);
+        assert!(
+            scene.exists(),
+            "还原前必须保留现场副本，否则用户数月的自有配置不可恢复"
+        );
+        assert_eq!(
+            std::fs::read(&scene).unwrap(),
+            b"PROXY_CONFIG + USER_EDITS_MONTHS_LATER",
+            "现场副本应是被覆盖前的实际内容"
         );
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();

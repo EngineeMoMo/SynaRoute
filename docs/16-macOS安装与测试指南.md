@@ -187,13 +187,33 @@ macOS 上目录 nlink>1 已被豁免，但文件硬链接仍 fail-closed。
 
 ## 7. 卸载
 
+> ⚠️ **第 1 步不能跳过**。macOS 没有卸载器，拖废纸篓不会触发任何清理逻辑；
+> 直接删 `.app` 会把三端客户端**留在指向 SynaRoute 代理的状态**：
+> `~/.claude/settings.json` 仍指着 `127.0.0.1:47100`（已无人监听）、
+> `~/.codex/auth.json` 仍是占位 key（**官方 OAuth 登录不会自己回来**）、
+> 桌面端 gateway 档仍在。而此时能帮你还原的应用已经被你删了。
+
 ```bash
-# 退出应用后
+# 1) 先还原三端客户端配置 + 摘除 MCP 注册（Windows 卸载器自动做的那一步）
+#    删 .app 之前跑，跑完再删。
+/Applications/SynaRoute.app/Contents/MacOS/SynaRoute --uninstall-cleanup
+
+# 2) 再删应用与数据
 rm -rf /Applications/SynaRoute.app
-rm -rf ~/Library/Application\ Support/SynaRoute
-rm -rf ~/Library/Logs/SynaRoute
-# 可选：清掉 Keychain 里 SynaRoute 的条目（钥匙串访问 → 找到 SynaRoute → 删除）
+rm -rf ~/Library/Application\ Support/SynaRoute   # config.json + secrets.enc（密钥库）
+rm -rf ~/Library/Logs/SynaRoute                   # 开过请求日志的话含明文对话正文
+
+# 3) 开机自启动项（在设置里开过才有）
+rm -f ~/Library/LaunchAgents/*SynaRoute*.plist
+
+# 4) 可选：Keychain 里的库密钥（钥匙串访问 → 搜 SynaRoute → 删除）
 ```
+
+第 1 步会打印每个分类的还原结果。若某分类显示还原失败，对应客户端的配置需手工改回官方端点。
+
+> 还原会把客户端配置**整份回滚**到「首次接入 SynaRoute 之前」的快照。若你在那之后自己改过
+> `settings.json` / `config.toml`（加过 hooks、permissions、自己的 MCP server 等），
+> 那些改动会被覆盖 —— 覆盖前的内容留在同目录的 `<原名>.synaroute-prerestore`，需要就从那里捞回来。
 
 ---
 

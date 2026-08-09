@@ -1000,6 +1000,20 @@ pub fn run() {
                     category.as_str()
                 ),
             }
+            // MCP 注册写的是**另一组文件**，restore 管不到它：
+            //   - CLI：`~/.claude.json` 的 `mcpServers.synaroute`（restore 只动 settings.json）
+            //   - 桌面端：`Claude-3p/claude_desktop_config.json` 的 `mcpServers`
+            //     （restore_desktop_steps 只改同文件的 deploymentMode 键）
+            // 不摘的话，卸载后 CLI 每开一次会话都去连已无人监听的端口（`/mcp` 里恒为
+            // failed），桌面端每次启动都去拉起一个**已被删除的 exe** —— 而此时应用已经
+            // 不在了，用户没有任何界面入口能摘掉它，只能手工编辑 JSON。
+            match tools::unregister_mcp_client(category) {
+                Ok((msg, _)) => eprintln!("[{}] {msg}", category.as_str()),
+                Err(e) => eprintln!(
+                    "[{}] 摘除 MCP 注册失败（可手动删除该客户端配置里的 synaroute 项）: {e}",
+                    category.as_str()
+                ),
+            }
         }
         // 用 eprintln! 而非 tracing：此时 subscriber 尚未初始化。
         // 永远正常返回 —— 还原失败不该把卸载器卡住或让它报错退出。
