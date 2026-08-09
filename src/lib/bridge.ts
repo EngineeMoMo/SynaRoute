@@ -173,6 +173,17 @@ export const api = {
   restoreToolConfig: (categoryId: CategoryType) =>
     call<string>("restore_tool_config", { categoryId }, async () => ""),
 
+  /**
+   * 切回官方：停止该分类代理并还原客户端配置，**同时保留 MCP 注册**。
+   *
+   * 与 stopProxy + restoreToolConfig 两步走的区别：
+   * Codex 的代理设置和 MCP 在同一份 config.toml 里，整文件还原会把 mcp_servers 一起抹掉。
+   * 这里后端在还原后会自动把 MCP 重注册一次（幂等：CLI/桌面端内容未变则跳过写盘）。
+   * 用于「想用官方 API 聊天，但还想用大脑聚合 MCP 工具」的场景。
+   */
+  switchToOfficial: (categoryId: CategoryType) =>
+    call<void>("switch_to_official", { categoryId }, async () => {}),
+
   /** 只读预览：三端路径/内容不同（CLI settings / Codex toml+auth / 桌面 config），token 已脱敏 */
   getToolConfigPreview: (categoryId: CategoryType) =>
     call<ToolConfigPreview>(

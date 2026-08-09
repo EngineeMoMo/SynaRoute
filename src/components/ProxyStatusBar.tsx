@@ -4,7 +4,7 @@ import type { ProxyState } from "@/types";
 import { useStore } from "@/store";
 import { useT } from "@/lib/useT";
 import { discoverableModels, routingPrimaryKey } from "@/lib/modelSets";
-import { Play, Square, Copy, Waypoints, ArrowRight, AlertTriangle } from "lucide-react";
+import { Play, Square, Copy, Waypoints, ArrowRight, AlertTriangle, LogOut } from "lucide-react";
 import { ToolConfigPreviewButton } from "@/components/ToolConfigPreview";
 
 /** 顶部代理状态条：显示端点、运行状态，提供启停（FR-008/FR-019）+ 主 Key / Codex 模型快切（UX#6/#8） */
@@ -14,6 +14,7 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
   // 哪怕用户根本不在日志页。actions 是稳定引用，单独取不会引入额外渲染。
   const startProxy = useStore((s) => s.startProxy);
   const stopProxy = useStore((s) => s.stopProxy);
+  const switchToOfficial = useStore((s) => s.switchToOfficial);
   const keys = useStore((s) => s.keys);
   const activeCategory = useStore((s) => s.activeCategory);
   const setPrimaryKey = useStore((s) => s.setPrimaryKey);
@@ -201,9 +202,22 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
       <div className="ml-auto flex items-center gap-2">
         <ToolConfigPreviewButton />
         {running ? (
-          <Button size="sm" variant="outline" onClick={() => void stopProxy()}>
-            <Square size={14} /> {t("proxy.stop")}
-          </Button>
+          <>
+            {/* 切官方：停止代理并还原配置，但保留 MCP 注册（大脑聚合继续可用）。
+                放在「停止」左侧，因为它比完全停止更温和（只断代理，不断工具）。 */}
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => void switchToOfficial()}
+              title={t("proxy.switchToOfficialHint")}
+              className="text-text-muted hover:text-text-primary"
+            >
+              <LogOut size={14} /> {t("proxy.switchToOfficial")}
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => void stopProxy()}>
+              <Square size={14} /> {t("proxy.stop")}
+            </Button>
+          </>
         ) : (
           <Button size="sm" onClick={() => void startProxy()}>
             <Play size={14} /> {t("proxy.start")}

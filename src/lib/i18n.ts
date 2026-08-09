@@ -144,6 +144,8 @@ const zh: Dict = {
   "proxy.configAppliedDesc": "已自动将代理端点写入 {tool} 的配置文件。请退出并重启 {tool} 客户端，以使新配置生效。",
   "proxy.stop": "停止",
   "proxy.start": "启动",
+  "proxy.switchToOfficial": "切官方",
+  "proxy.switchToOfficialHint": "停止代理并还原配置（保留 MCP 大脑聚合），切回官方原生连接",
   "proxy.viewConfig": "查看工具配置",
 
   "toolConfig.title": "目标工具配置（只读）",
@@ -793,6 +795,8 @@ const en: Dict = {
   "proxy.configAppliedDesc": "The proxy endpoint has been written to {tool}'s configuration. Please quit and restart {tool} to apply the new settings.",
   "proxy.stop": "Stop",
   "proxy.start": "Start",
+  "proxy.switchToOfficial": "Use Official",
+  "proxy.switchToOfficialHint": "Stop proxy and restore config (MCP brain tool preserved), switch back to direct official API",
   "proxy.viewConfig": "View tool config",
 
   "toolConfig.title": "Target tool config (read-only)",

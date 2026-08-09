@@ -353,6 +353,23 @@ fn restore_tool_config(category_id: CategoryType) -> AppResult<String> {
     tools::restore(category_id)
 }
 
+/// 「切回官方」：停止该分类代理 + 还原客户端配置，但**保留 MCP 注册**。
+///
+/// 与 stop_proxy + restore_tool_config 的区别：Codex 的代理设置和 MCP 在同一份
+/// config.toml 里，整文件还原会把 mcp_servers 一起抹掉。本命令还原后会把 MCP 重注册
+/// 一次（幂等：CLI/桌面端内容没变就跳过写盘，Codex 则把被抹掉的项补回来）。
+/// 见 [`service::switch_to_official`] 的完整说明。
+#[tauri::command]
+async fn switch_to_official(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    category_id: CategoryType,
+) -> AppResult<()> {
+    service::switch_to_official(&state.store, &state.proxy, &state.mcp, category_id).await?;
+    let _ = rebuild_tray(&app);
+    Ok(())
+}
+
 // ============ 日志 & 设置命令 ============
 
 #[tauri::command]
@@ -1179,6 +1196,7 @@ pub fn run() {
             apply_tool_config,
             get_tool_config_preview,
             restore_tool_config,
+            switch_to_official,
             list_events,
             list_all_events,
             get_token_usage,

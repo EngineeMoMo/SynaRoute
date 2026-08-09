@@ -675,6 +675,75 @@ pub(crate) fn unregister_mcp_for_category(
     Ok(mcp_status(mcp))
 }
 
+/// 「切回官方」：停止该分类的代理并还原客户端配置，**但保留 MCP 注册**。
+///
+/// 典型用法：用户平时靠 SynaRoute 多 Key 故障转移，偶尔要用官方原生功能（个人订阅、
+/// Claude.ai Projects 等）；同时又想继续用「大脑聚合」MCP 工具 —— 两者本不冲突，
+/// 官方 API 能用 SynaRoute 的 MCP，但代理端点不在了。
+///
+/// **为什么不直接复用 stop + restore**：
+/// - Codex 把代理设置和 MCP 都写在同一份 `config.toml`，`restore_one` 是整文件回滚，
+///   会顺手把 `mcp_servers.synaroute` 一起抹掉。
+/// - CLI 和桌面端虽然文件分离（CLI: settings.json vs .claude.json；桌面端: restore 只
+///   改 deploymentMode 字段），这里统一走「还原后重注册」，对所有分类都幂等正确：
+///   CLI/桌面端重注册时内容相同会跳过写盘，Codex 则补回被抹掉的 mcp_servers 项。
+///
+/// 失败返回 Err；日志记在各步骤内部；调用方负责刷新托盘。
+pub(crate) async fn switch_to_official(
+    store: &Arc<Store>,
+    proxy: &Arc<ProxyManager>,
+    mcp: &McpManager,
+    category: CategoryType,
+) -> AppResult<()> {
+    // 1. 停止代理（端口释放，短路窗口清空）。
+    proxy.stop(category);
+    store.append_event(category, "config", None, "切回官方：停止代理");
+
+    // 2. 还原客户端配置（把端点改回官方、Codex 还原 auth.json 恢复 OAuth 登录）。
+    match crate::tools::restore(category) {
+        Ok(msg) => store.append_event(category, "config", None, &msg),
+        Err(e) => {
+            store.append_event(
+                category,
+                "error",
+                None,
+                &format!("切回官方：还原客户端配置失败（{e}），请手动检查配置文件"),
+            );
+            return Err(e);
+        }
+    }
+
+    // 3. 若该分类已注册 MCP 且服务在跑，重新注册（幂等）以弥补 Codex 的整文件覆盖。
+    //    CLI / 桌面端：内容未变，`register_mcp_client` 内部比对后跳过写盘。
+    //    Codex：`restore` 刚抹掉了 mcp_servers，重注册把它补回来。
+    let mcp_was_registered = store
+        .get_settings()
+        .mcp_registered_categories
+        .contains(&category);
+    if mcp_was_registered {
+        if let Some(port) = mcp.running_port() {
+            register_and_record(store, category, port);
+            store.append_event(
+                category,
+                "config",
+                None,
+                "切回官方：已保留 MCP 注册（大脑聚合继续可用）",
+            );
+        } else {
+            // MCP 服务本身没跑（用户没开启），注册也没意义；只告知。
+            store.append_event(
+                category,
+                "config",
+                None,
+                "切回官方：MCP 服务未启动，注册保留在设置中，下次启用 MCP 时自动恢复",
+            );
+        }
+    }
+
+    Ok(())
+}
+
+
 /// 启用/停用 MCP 全局开关，并自动注册到「当前活跃分类」对应的工具。
 ///
 /// **`enabled` 的落盘时序按启动结果决定**，不能先写 true 再启动：那样会造出

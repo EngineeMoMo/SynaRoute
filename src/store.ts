@@ -110,6 +110,8 @@ interface AppState {
   checkHealth: (keyId: string) => Promise<void>;
   startProxy: (opts?: { announce?: boolean }) => Promise<boolean>;
   stopProxy: () => Promise<void>;
+  /** 切回官方：停止代理 + 还原配置，但保留 MCP 注册（大脑聚合继续可用）。 */
+  switchToOfficial: () => Promise<void>;
   // 应用内「对外模型名」选择（借鉴 EchoBird）：客户端菜单拉不到中转模型时在应用内选，
   // 代理转发时覆盖客户端发来的模型名。走后端专用命令直写，即时生效、免重启客户端。
   setActiveModel: (category: CategoryType, model: string) => Promise<boolean>;
@@ -450,6 +452,27 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (e) {
       console.error("restoreToolConfig after stop failed", e);
       get().showToast("error", String((e as Error)?.message ?? e));
+    }
+  },
+
+  async switchToOfficial() {
+    const cat = get().activeCategory;
+    try {
+      await api.switchToOfficial(cat);
+    } catch (e) {
+      console.error("switchToOfficial failed", e);
+      get().showToast("error", String((e as Error)?.message ?? e));
+      return;
+    }
+    // 后端已原子地处理了 stop + restore + 重注册 MCP
+    // 只需刷新本地状态
+    try {
+      const proxy = await api.getProxyState(cat);
+      set({ proxy });
+      if (get().configAppliedCategory === cat) set({ configAppliedCategory: null });
+      await get().loadCategory(cat);
+    } catch {
+      // 状态刷新失败不阻断，下一次轮询会自愈
     }
   },
 
