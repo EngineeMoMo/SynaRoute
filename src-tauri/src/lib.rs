@@ -527,6 +527,10 @@ impl service::AutostartToggle for PluginAutostart<'_> {
 /// 会让人以为程序没启动。
 const AUTOSTART_FLAG: &str = "--autostart";
 
+/// 卸载前清理模式：由 NSIS 的 PREUNINSTALL 钩子拉起，还原三端客户端配置后退出
+/// （见 `run()` 里 `--uninstall-cleanup` 分支的完整说明）。
+const UNINSTALL_CLEANUP_FLAG: &str = "--uninstall-cleanup";
+
 /// 本次进程是否由「开机自启动」拉起（据启动参数判定）。
 fn launched_by_autostart<I, S>(args: I) -> bool
 where
@@ -969,6 +973,36 @@ pub fn run() {
         // HTTP MCP 端口，由持有真实配置的主应用执行聚合。TCP 端口不受 MSIX 虚拟化影响。
         let rt = tokio::runtime::Runtime::new().expect("tokio rt");
         rt.block_on(mcp::run_stdio());
+        return;
+    }
+
+    // 卸载前清理：NSIS 的 PREUNINSTALL 钩子拉起 `synaroute.exe --uninstall-cleanup`。
+    // 不启动 UI、不监听端口，把三端客户端配置还原成接入前的样子后立即退出。
+    //
+    // **为什么必须有**：接入会改写用户的 `~/.claude/settings.json`、
+    // `~/.codex/{config.toml,auth.json}` 与桌面端 gateway 档，而还原只在
+    // 「停止代理 / 切官方」时发生。直接卸载不经过那条路径 —— 卸载器只删自己的文件，
+    // 不会拉起应用执行还原。于是配置留在指向 `127.0.0.1:47100` 的状态，端口已无人监听，
+    // 客户端直接连不上；而用户几乎不可能把「Claude Code 用不了」联想到
+    // 「我昨天卸载了 SynaRoute」。Codex 更糟：`auth.json` 仍是占位 key，
+    // 官方 OAuth 登录不会自动回来。
+    //
+    // 与 `--mcp-stdio` 同样**不初始化 Store**：`tools::restore` 只依赖 CategoryType，
+    // 不需要配置；且避免读到 MSIX 虚拟化的错误配置宇宙。
+    if std::env::args().any(|a| a == UNINSTALL_CLEANUP_FLAG) {
+        for category in CategoryType::ALL {
+            // 逐个独立：一个分类失败绝不能挡住其余两个，更不能让卸载流程失败。
+            // 未接入过的分类走到这里会返回「无备份，无需还原」，本就是幂等的。
+            match tools::restore(category) {
+                Ok(msg) => eprintln!("[{}] {msg}", category.as_str()),
+                Err(e) => eprintln!(
+                    "[{}] 还原失败（可手动检查该客户端的配置文件）: {e}",
+                    category.as_str()
+                ),
+            }
+        }
+        // 用 eprintln! 而非 tracing：此时 subscriber 尚未初始化。
+        // 永远正常返回 —— 还原失败不该把卸载器卡住或让它报错退出。
         return;
     }
 
@@ -1788,6 +1822,44 @@ mod tests {
         assert!(!launched_by_autostart(["synaroute.exe", "autostart"]));
         // 与 MCP stdio 模式的参数互不干扰（那条路径根本不进 Tauri setup）。
         assert!(!launched_by_autostart(["synaroute.exe", "--mcp-stdio"]));
+        // 卸载清理模式同样不得被误判成自启动（它连 Tauri 都不启动）。
+        assert!(!launched_by_autostart([
+            "synaroute.exe",
+            UNINSTALL_CLEANUP_FLAG
+        ]));
+    }
+
+    /// 三个 headless 参数必须互不重叠。
+    ///
+    /// 钉这条的原因：`run()` 里三个早退分支都用 `args().any(|a| a == FLAG)` 顺序判定，
+    /// 一旦某个参数是另一个的前缀/子串并被改成 `starts_with` 之类的宽松匹配，就会串台 ——
+    /// 最坏情况是卸载清理误命中普通启动，把用户**正在使用**的客户端配置还原掉
+    /// （客户端立刻断连），且不报任何错。
+    #[test]
+    fn headless_flags_are_mutually_exclusive() {
+        let flags = [AUTOSTART_FLAG, UNINSTALL_CLEANUP_FLAG, "--mcp-stdio"];
+        for (i, a) in flags.iter().enumerate() {
+            for (j, b) in flags.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "参数重名");
+                    assert!(
+                        !a.starts_with(b) && !b.starts_with(a),
+                        "{a} 与 {b} 存在前缀关系，宽松匹配下会串台"
+                    );
+                }
+            }
+        }
+        // 卸载清理的判据与自启动一样必须是「完全相等」，不接受变体。
+        // `contains` 与生产侧 `args().any(|a| a == FLAG)` 同为**完全相等**判定；
+        // 本测试断言的正是这个「不接受前缀/变体」的语义。
+        let is_cleanup = |args: &[&str]| args.contains(&UNINSTALL_CLEANUP_FLAG);
+        assert!(is_cleanup(&["synaroute.exe", UNINSTALL_CLEANUP_FLAG]));
+        assert!(is_cleanup(&["synaroute.exe", "--other", UNINSTALL_CLEANUP_FLAG]));
+        // 普通双击启动绝不能触发还原 —— 这是本测试最重要的一条。
+        assert!(!is_cleanup(&["synaroute.exe"]));
+        assert!(!is_cleanup(&["synaroute.exe", "--uninstall"]));
+        assert!(!is_cleanup(&["synaroute.exe", "--uninstall-cleanup=1"]));
+        assert!(!is_cleanup(&["synaroute.exe", AUTOSTART_FLAG]));
     }
 
     /// 托盘菜单 id 的往返：生成端与解析端必须完全对称，否则点了没反应（走 `_ => {}` 静默丢弃）。
