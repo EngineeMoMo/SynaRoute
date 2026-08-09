@@ -1199,8 +1199,16 @@ pub struct UsageSnapshot {
     pub entries: Vec<TokenUsageByKey>,
 }
 
+/// `usage.json` 的当前格式版本。**读写共用这一个常量**，别两边各写字面量 ——
+/// 那样改了写侧忘了改读侧，版本门就会把自己刚写出去的文件判为"来自未来"。
+///
+/// 改动规则：只有当**旧程序按旧结构解析新文件会得到错误结果**时才递增
+/// （例如 `entries` 改成按日分桶）。纯新增可选字段不必加 —— serde 的
+/// `#[serde(default)]` 已能让旧文件在新程序里正确读出。
+pub const USAGE_SNAPSHOT_VERSION: u32 = 1;
+
 fn usage_snapshot_version() -> u32 {
-    1
+    USAGE_SNAPSHOT_VERSION
 }
 
 impl TokenUsage {

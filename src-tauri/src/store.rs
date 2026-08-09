@@ -65,6 +65,32 @@ pub struct Store {
     usage_path: PathBuf,
     /// 用量统计的起始时刻（毫秒）。随 `usage.json` 一起持久化，供面板显示「统计自 X 起」。
     usage_since_ms: RwLock<i64>,
+    /// 磁盘上的 `usage.json` 版本高于本程序 → 本次运行**只读不写**。
+    ///
+    /// 没有这个开关，版本门就是自欺：它返回空累加器保护了「读」，但第一个请求
+    /// 就会标脏，随后的 flush 拿空数据 + 旧 version 覆写那个新格式文件，
+    /// 用户攒的历史当场清零 —— 正是这道门要防的破坏。
+    /// 启动时定一次，运行期不变（用户中途换文件属于自找麻烦，不为它加复杂度）。
+    usage_read_only: bool,
+}
+
+/// `load_usage` 的结果。
+///
+/// 用具名结构体而不是元组：三个字段里有两个是 `i64`/`bool` 这种「位置一错就静默出错」
+/// 的类型，元组解构写反了编译器不会拦。`read_only` 尤其不能错 —— 它反了就等于
+/// 把版本门变成破坏源。
+struct UsageLoad {
+    totals: std::collections::BTreeMap<(CategoryType, String), TokenUsage>,
+    since: i64,
+    /// 磁盘上那份文件**比本程序认识的格式更新**，本次运行只读不写。
+    read_only: bool,
+}
+
+impl UsageLoad {
+    /// 「没有历史可继承，但可以正常写回」—— 全新安装 / 文件损坏 / 读失败都走这个。
+    fn fresh(now: i64) -> Self {
+        Self { totals: std::collections::BTreeMap::new(), since: now, read_only: false }
+    }
 }
 
 /// 用量累计的定时落盘间隔（秒）。
@@ -266,7 +292,7 @@ impl Store {
 
         // 用量累计：启动即恢复上次的累计值（周期性落盘保存下来的），失败则从零开始。
         let usage_path = Self::usage_file_path(&config_path);
-        let (usage_totals, usage_since) = Self::load_usage(&usage_path);
+        let usage_loaded = Self::load_usage(&usage_path);
 
         let store = Self {
             config_path,
@@ -277,10 +303,11 @@ impl Store {
             log_tx: Self::spawn_log_writer(),
             log_dropped: std::sync::atomic::AtomicU64::new(0),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
-            usage_totals: RwLock::new(usage_totals),
+            usage_totals: RwLock::new(usage_loaded.totals),
             usage_dirty: std::sync::atomic::AtomicBool::new(false),
             usage_path,
-            usage_since_ms: RwLock::new(usage_since),
+            usage_since_ms: RwLock::new(usage_loaded.since),
+            usage_read_only: usage_loaded.read_only,
         };
         // P1 防数据销毁：仅在「全新安装(文件不存在)首次 seed」或「成功加载后的迁移」时落盘。
         // load_failed(文件存在但解析失败)时绝不 persist——否则空配置会覆盖磁盘上的原有数据。
@@ -1437,25 +1464,46 @@ impl Store {
     /// **一律不上抛错误**：文件缺失（全新安装）、内容损坏（断电写坏）都只是「没有历史累计」，
     /// 绝不能因为一个统计文件读不出来就让应用起不来。损坏时落 warn 并从空开始，
     /// 下一次 flush 会用好的内容覆盖它。
-    fn load_usage(path: &Path) -> (std::collections::BTreeMap<(CategoryType, String), TokenUsage>, i64) {
+    fn load_usage(path: &Path) -> UsageLoad {
         let now = chrono::Utc::now().timestamp_millis();
+        // 文件缺失 / 读不出 / 解析失败：一律降级为「从零累计」且**允许写回**。
+        // 这三种都不是「文件比我新」，让下一次 flush 用好内容覆盖它才是对的。
         let raw = match std::fs::read(path) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return (std::collections::BTreeMap::new(), now)
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return UsageLoad::fresh(now),
             Err(e) => {
                 tracing::warn!("读取用量统计失败（本次从零开始累计）: {e}");
-                return (std::collections::BTreeMap::new(), now);
+                return UsageLoad::fresh(now);
             }
         };
         let snap: UsageSnapshot = match serde_json::from_slice(&raw) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("用量统计文件解析失败（本次从零开始累计）: {e}");
-                return (std::collections::BTreeMap::new(), now);
+                return UsageLoad::fresh(now);
             }
         };
+        // 版本门：只认自己认识的格式。
+        //
+        // `version` 若只写不读，就是个**假的**兼容位 —— 将来把 entries 改成按日分桶后，
+        // 旧版本程序（比如用户降级、或两台机器同步了这个文件）会用旧结构去解析新文件：
+        // serde 对未知字段默认忽略、缺失字段取 default，于是**解析"成功"但内容是空的**，
+        // 紧接着下一次 flush 就用空数据把用户攒了几个月的累计覆盖掉。
+        // 宁可这一次不显示统计（返回空、且**不动原文件**），也不能销毁数据。
+        if snap.version > USAGE_SNAPSHOT_VERSION {
+            tracing::warn!(
+                "用量统计文件版本为 {}，本程序只认到 {} —— 跳过本次累计并保留原文件，\
+                 不做解析也不覆盖（避免用旧结构解析新格式后把历史清零）",
+                snap.version,
+                USAGE_SNAPSHOT_VERSION
+            );
+            // 起算时刻仍沿用文件里的：面板显示的起点是对的，只是这次没读到明细。
+            let since = if snap.since_ms > 0 { snap.since_ms } else { now };
+            // read_only = true：**必须**同时禁掉写回，否则这道门自己就是破坏源 ——
+            // 返回空 map 后第一个请求就会 mark_usage_dirty，60s 后的 flush 会拿
+            // 「空累加器 + version=1」覆写这个更高版本的文件，正好干成它要防的事。
+            return UsageLoad { totals: std::collections::BTreeMap::new(), since, read_only: true };
+        }
         let mut map = std::collections::BTreeMap::new();
         for row in snap.entries {
             // 同键重复行合并而非后者覆盖前者：手工编辑过的文件不该静默丢掉一半数据。
@@ -1466,7 +1514,7 @@ impl Store {
         // since_ms 为 0 = 旧版本文件或被手工清空过，退回「现在」而不是 1970，
         // 否则面板会显示「统计自 1970-01-01 起」这种明显错误的起始时间。
         let since = if snap.since_ms > 0 { snap.since_ms } else { now };
-        (map, since)
+        UsageLoad { totals: map, since, read_only: false }
     }
 
     /// 标记「用量累计有未落盘的变更」。
@@ -1481,6 +1529,12 @@ impl Store {
     /// 写盘期间若又有新消耗，宁可下一轮多写一次，也不要形成「标记已清、这次变更没落盘」
     /// 的丢失窗口。
     pub fn flush_usage_if_dirty(&self) -> bool {
+        // 只读模式：磁盘上那份是更新的格式，本次运行一个字节都不许写。
+        // **必须在清脏标记之前判**：否则标记被清掉、这段消耗既没写盘也不再重试，
+        // 等于一边"保护"文件一边丢数据。
+        if self.usage_read_only {
+            return false;
+        }
         if !self
             .usage_dirty
             .swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -1488,7 +1542,7 @@ impl Store {
             return false;
         }
         let snap = UsageSnapshot {
-            version: 1,
+            version: USAGE_SNAPSHOT_VERSION,
             since_ms: *self.usage_since_ms.read(),
             updated_ms: chrono::Utc::now().timestamp_millis(),
             entries: self.token_usage_by_key(),
@@ -2187,7 +2241,7 @@ impl Store {
         let initial_stamp = Self::read_disk_stamp(&config_path);
         // 与生产构造器同样恢复用量累计：测试才能覆盖「重启后累计不归零」这条判据。
         let usage_path = Self::usage_file_path(&config_path);
-        let (usage_totals, usage_since) = Self::load_usage(&usage_path);
+        let usage_loaded = Self::load_usage(&usage_path);
         Ok(Self {
             config_path,
             config: RwLock::new(config),
@@ -2197,10 +2251,11 @@ impl Store {
             log_tx: Self::spawn_log_writer(),
             log_dropped: std::sync::atomic::AtomicU64::new(0),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
-            usage_totals: RwLock::new(usage_totals),
+            usage_totals: RwLock::new(usage_loaded.totals),
             usage_dirty: std::sync::atomic::AtomicBool::new(false),
             usage_path,
-            usage_since_ms: RwLock::new(usage_since),
+            usage_since_ms: RwLock::new(usage_loaded.since),
+            usage_read_only: usage_loaded.read_only,
         })
     }
 }
@@ -2720,6 +2775,72 @@ mod tests {
         assert!(
             !store.flush_usage_if_dirty(),
             "无 usage 的事件不应弄脏用量累计"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 磁盘上的 `usage.json` 版本高于本程序时，**原文件必须一个字节都不变**。
+    ///
+    /// 这条防的是一个具体的数据销毁链：将来把 `entries` 改成按日分桶后，
+    /// 旧程序（用户降级 / 两台机器同步了这份文件）用旧结构解析新文件 —— serde 忽略
+    /// 未知字段、缺失字段取 default，于是**解析"成功"但读出空内容**。若此时还允许写回，
+    /// 第一个请求就标脏，随后的 flush 拿「空累加器 + 旧 version」覆写，
+    /// 用户攒了几个月的累计当场清零，且毫无报错。
+    ///
+    /// 所以判据不是「读出来是空的」（那只是现象），而是**原文件字节不变**。
+    #[test]
+    fn newer_usage_file_is_never_overwritten_by_older_program() {
+        use crate::upstream::TokenUsage;
+        let dir = temp_dir("usage_version_gate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let upath = dir.join("usage.json");
+
+        // 造一份「来自未来」的文件：版本号比本程序认识的高，且带上本程序不认识的字段。
+        let future = format!(
+            r#"{{
+  "version": {},
+  "sinceMs": 1700000000000,
+  "updatedMs": 1700000009999,
+  "dailyBuckets": {{ "2026-08-09": {{ "input": 123 }} }},
+  "entries": []
+}}"#,
+            USAGE_SNAPSHOT_VERSION + 1
+        );
+        std::fs::write(&upath, future.as_bytes()).unwrap();
+        let before = std::fs::read(&upath).unwrap();
+
+        let store =
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        // 读侧：不继承明细（旧结构读不懂），但起算时刻要沿用文件里的，
+        // 否则面板会把统计起点显示成"刚刚"，看起来像历史被清了。
+        assert!(store.token_usage_by_key().is_empty(), "更高版本的明细不应被旧结构解析");
+        assert_eq!(
+            store.usage_since_ms(),
+            1700000000000,
+            "起算时刻应沿用文件里的值"
+        );
+
+        // 写侧：产生新消耗 → 标脏 → flush 必须**拒绝写盘**。
+        store.append_event_full(
+            CategoryType::ClaudeCli,
+            "route",
+            Some("k1"),
+            "req",
+            None,
+            None,
+            Some(TokenUsage { input: 42, output: 7, cache_read: 0 }),
+        );
+        assert!(
+            !store.flush_usage_if_dirty(),
+            "只读模式下必须拒绝写盘（返回 false）"
+        );
+
+        let after = std::fs::read(&upath).unwrap();
+        assert_eq!(
+            before, after,
+            "更高版本的 usage.json 必须原样保留，一个字节都不能改"
         );
 
         std::fs::remove_dir_all(&dir).ok();
