@@ -927,7 +927,29 @@ pub(crate) async fn start_mcp_on_launch(store: &Store, mcp: &McpManager) {
 ///
 /// 落盘由 `set_proxy_running_categories` 做幂等判断（与上次相同则一个字节都不写），
 /// 故本函数可以被高频调用：空闲的应用不会因为它产生任何磁盘写入。
+/// 「正在退出」标志。退出处理块在 `stop_all` **之前**置位，
+/// 之后 [`snapshot_running_proxies`] 一律 no-op。
+///
+/// **为什么需要**：有一条常驻后台线程每 60s 也调 `snapshot_running_proxies`，退出时它
+/// 没有被停止/join。若它的定时恰好落在退出块「已 `stop_all` 清空运行集、进程尚未真正退出」
+/// 这个窗口（`flush_logs` 最多阻塞 3s），它会读到空的运行集、把 `proxy_running_categories`
+/// 覆盖成空，且其写入晚于退出块写的正确值 —— 于是用户明明开着代理退出，下次启动
+/// `restore_proxies_on_launch` 读到空集、什么都不恢复。这是「有时记得住有时记不住」的
+/// 最难归因间歇失效。置位后让后台快照闭嘴，退出块写入的那份运行态就是最终值。
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 标记进程进入退出流程。**必须在退出块 `stop_all` 之前调**。
+pub(crate) fn begin_shutdown() {
+    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub(crate) fn snapshot_running_proxies(store: &Store, proxy: &ProxyManager) {
+    // 退出流程已开始：后台线程的周期性快照一律不写，避免它读到 stop_all 后的空集、
+    // 把退出块刚写好的正确运行态覆盖掉（见 SHUTTING_DOWN 文档）。
+    // 退出块自己调用本函数时尚未置位（它先 snapshot 再 begin_shutdown → stop_all），故不受影响。
+    if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     let running: Vec<CategoryType> = CategoryType::ALL
         .iter()
         .copied()
@@ -2171,6 +2193,37 @@ mod tests {
             "停代理的还原不得凭空造出 MCP 注册记录"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 退出置位后，后台线程的周期性快照必须 no-op —— 否则它会用 stop_all 后的空集
+    /// 覆盖退出块刚写好的运行态，下次启动 FR-029 什么都不恢复（间歇失效）。
+    #[test]
+    fn snapshot_is_noop_after_shutdown_begun() {
+        let (store, dir) = temp_store("snapshot_shutdown");
+        let proxy = std::sync::Arc::new(crate::proxy::ProxyManager::new(store.clone()));
+
+        // 先造一个「上次开着 Codex」的运行态记录（模拟退出块已写好的正确值）。
+        store.set_proxy_running_categories(&[CategoryType::Codex]).unwrap();
+        assert_eq!(
+            store.proxy_running_categories(),
+            vec![CategoryType::Codex],
+            "前置：已记录 Codex 在跑"
+        );
+
+        // 置位「正在退出」——此后 proxy 实际没在跑（proxy 是全新实例，is_running 全 false），
+        // 但快照必须拒绝把记录覆盖成空。
+        begin_shutdown();
+        snapshot_running_proxies(&store, &proxy);
+
+        assert_eq!(
+            store.proxy_running_categories(),
+            vec![CategoryType::Codex],
+            "退出置位后快照应 no-op，不得把已写好的运行态覆盖成空集"
+        );
+
+        // 复位，避免污染同进程内其它测试（静态标志跨测试共享）。
+        SHUTTING_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

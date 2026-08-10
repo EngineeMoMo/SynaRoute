@@ -375,7 +375,18 @@ export function SettingsPage() {
         const bound = st.port ?? port;
         setSettings((s) => (s ? { ...s, proxyPorts: { ...(s.proxyPorts ?? {}), [cat]: bound } } : s));
         setPortDrafts((d) => ({ ...d, [cat]: String(bound) }));
-        showToast("success", t("settings.proxyPortSaved", { port: String(bound) }));
+        // 文案按**实际运行态**分流：后端对未运行的分类只落盘、不启动、不碰客户端配置
+        // （service::set_proxy_port 的 was_running=false 分支），此时回报 status="stopped"。
+        // 若不分流、一律说「已重写客户端配置，客户端需重启生效」，用户会去重启 claude/codex
+        // 期待生效——而配置一个字节没动、代理也没跑，重启毫无效果，且他不知道还得回来点「启动」。
+        // 这正是后端注释极力避免的「界面说 A、实际 B」，不能被这句 toast 重新引入。
+        const running = st.status === "running";
+        showToast(
+          "success",
+          running
+            ? t("settings.proxyPortSaved", { port: String(bound) })
+            : t("settings.proxyPortSavedStopped", { port: String(bound) }),
+        );
       })
       .catch((e) => {
         console.error("setProxyPort failed", e);

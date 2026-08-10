@@ -1329,7 +1329,10 @@ async fn try_stream_to_key(
     }
     inject_default_effort(store, category, &mut payload, downstream, key.protocol);
     // Key 上配的采样参数（下游没显式给才注入）。必须在协议转换**之前**，见该函数文档。
-    apply_key_params(&mut payload, &key.params, downstream);
+    // count_tokens 等非补全子路径不注入（那些端点的 schema 不含采样字段，注了会被上游 400）。
+    if path_takes_sampling_params(path) {
+        apply_key_params(&mut payload, &key.params, downstream);
+    }
     let payload = crate::upstream::convert_request_owned(payload, downstream, key.protocol);
 
     // 同协议：原样保留下游路径 + query（count_tokens 等子路径正确透传）。
@@ -1732,9 +1735,31 @@ fn inject_default_effort(
 /// **必须在协议转换之前调用**：字段名按**下游**协议写，转换层会负责改写成上游形态
 /// （如 Responses 的 `max_output_tokens` → Anthropic 的 `max_tokens`，见 convert.rs:921）。
 /// 若放在转换之后，就得自己再判一次上游协议，那正是「两套真相」的开端。
+/// Key 上配的采样参数（temperature / max_tokens / top_p）是否该注入本次请求。
+///
+/// **只有「补全端点」该注入**。Claude CLI / 桌面端做 token 计数会发
+/// `POST /v1/messages/count_tokens`，body 只含 model/messages、无采样字段，
+/// 同协议直通会原样发到上游的 count_tokens 端点 —— 而该端点的 schema **不含**
+/// max_tokens/temperature/top_p，严格上游（Anthropic 官方）会以 400「extra inputs
+/// not permitted」拒绝，客户端 token 计数功能失效。而 KeyEditor 默认就带
+/// temperature=1.0 + max_tokens=8192，几乎每个 Key 都会触发，不是边角场景。
+///
+/// 判据用「路径**不含** count_tokens」而非「等于补全路径」：各端补全路径形态不同
+/// （/v1/messages、/chat/completions、/responses，还可能带 ?beta= 等 query），
+/// 用黑名单挡掉已知的非补全子路径最稳，将来新增补全端点也不会被误挡。
+fn path_takes_sampling_params(path: &str) -> bool {
+    !path.contains("count_tokens")
+}
+
 fn apply_key_params(payload: &mut Value, params: &crate::model::KeyParams, downstream: Protocol) {
     let Some(obj) = payload.as_object_mut() else { return };
 
+    // Anthropic 扩展思考（下游 body 已带 `thinking`）与采样参数互斥：开 thinking 时
+    // Anthropic 要求 temperature 固定为 1、且不可有 top_p，否则 400（判据见 convert.rs:410/421，
+    // 跨协议路径已按此归一）。此处是**同协议 Anthropic 直通**，没有那道归一化 ——
+    // 若把 Key 上配的非 1 temperature / top_p 注进带 thinking 的请求，上游直接 400。
+    // 故 thinking 在场时不碰采样字段（max_tokens 与 thinking 不冲突，仍照注）。
+    let has_thinking = obj.get("thinking").is_some_and(|t| !t.is_null());
     // max_tokens 的字段名随**下游**协议不同：Responses 用 max_output_tokens，
     // Anthropic 与 Chat 用 max_tokens。Chat 另接受 max_completion_tokens 作为别名，
     // 故判「已有」时两个名字都要看，否则会在客户端已用新名时重复注入旧名。
@@ -1751,9 +1776,12 @@ fn apply_key_params(payload: &mut Value, params: &crate::model::KeyParams, downs
         }
     }
 
-    // temperature / top_p 三协议同名。
+    // temperature / top_p 三协议同名。thinking 在场时**跳过**（见上，避免同协议直通 400）。
     for (name, val) in [("temperature", params.temperature), ("top_p", params.top_p)] {
         let Some(v) = val else { continue };
+        if has_thinking {
+            continue; // 扩展思考与采样参数互斥
+        }
         if obj.get(name).is_some_and(|x| !x.is_null()) {
             continue; // 下游显式给了 → 尊重下游
         }
@@ -1840,7 +1868,10 @@ async fn forward_to_key(
     inject_default_effort(store, category, &mut payload, downstream, key.protocol);
     // 与 try_stream_to_key 同进同退：Key 参数注入必须两条路径都做，
     // 否则「非流式生效、流式不生效」这种按客户端而异的分叉极难归因。
-    apply_key_params(&mut payload, &key.params, downstream);
+    // 同样跳过 count_tokens 等非补全子路径（见 path_takes_sampling_params）。
+    if path_takes_sampling_params(path) {
+        apply_key_params(&mut payload, &key.params, downstream);
+    }
 
     // 跨协议转换（下游协议 → 上游 Key 协议；同协议时 convert_request 内部直接返回克隆）
     let payload = crate::upstream::convert_request_owned(payload, downstream, key.protocol);
@@ -2367,6 +2398,60 @@ mod tests {
         assert!(
             payload.get("max_tokens").is_none(),
             "Responses 下游不该写 max_tokens 这个名字"
+        );
+    }
+
+    /// count_tokens 等非补全子路径**不得**注入采样参数。
+    ///
+    /// 钉住一条 P2：Claude CLI/桌面端做 token 计数发 /v1/messages/count_tokens，
+    /// 该端点 schema 不含 max_tokens/temperature/top_p，而 KeyEditor 默认就带这两个值 ——
+    /// 若无条件注入，同协议直通会把它们原样发到 count_tokens 端点，严格上游 400。
+    /// 判据函数是 `path_takes_sampling_params`；转发路径据它决定调不调 apply_key_params。
+    #[test]
+    fn count_tokens_path_excluded_from_sampling_params() {
+        assert!(
+            !path_takes_sampling_params("/v1/messages/count_tokens"),
+            "count_tokens 子路径不应注入采样参数（上游会 400）"
+        );
+        assert!(
+            !path_takes_sampling_params("/v1/messages/count_tokens?beta=true"),
+            "带 query 的 count_tokens 同样要挡"
+        );
+        // 补全端点仍应注入（否则 Key 参数又变回从不生效）。
+        assert!(path_takes_sampling_params("/v1/messages"));
+        assert!(path_takes_sampling_params("/v1/chat/completions"));
+        assert!(path_takes_sampling_params("/v1/responses"));
+    }
+
+    /// 扩展思考（thinking）在场时不注入 temperature / top_p —— 同协议 Anthropic 直通
+    /// 没有跨协议那道「开 thinking 归一 temperature=1、去 top_p」，注了非 1 值上游会 400。
+    /// max_tokens 与 thinking 不冲突，仍应注入。
+    #[test]
+    fn key_params_skip_sampling_when_thinking_present() {
+        let params = crate::model::KeyParams {
+            temperature: Some(0.2),
+            max_tokens: Some(8192),
+            top_p: Some(0.9),
+            timeout_ms: None,
+        };
+        // 客户端发了 thinking 但没带 temperature/top_p —— 正是会被 Key 默认值注入的空档。
+        let mut payload = json!({
+            "model": "m",
+            "messages": [],
+            "thinking": { "type": "enabled", "budget_tokens": 2048 }
+        });
+        apply_key_params(&mut payload, &params, Protocol::Anthropic);
+        assert!(
+            payload.get("temperature").is_none(),
+            "thinking 在场时不得注入 temperature（Anthropic 会 400）"
+        );
+        assert!(
+            payload.get("top_p").is_none(),
+            "thinking 在场时不得注入 top_p"
+        );
+        assert_eq!(
+            payload["max_tokens"], 8192,
+            "max_tokens 与 thinking 不冲突，仍应注入"
         );
     }
 

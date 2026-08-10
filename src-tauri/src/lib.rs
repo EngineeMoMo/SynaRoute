@@ -1330,6 +1330,12 @@ pub fn run() {
                 // 「记住上次状态」这个功能弄坏了。
                 service::snapshot_running_proxies(&state.store, &state.proxy);
 
+                // 置「正在退出」标志：此后后台线程每 60s 的周期性快照一律 no-op，
+                // 免得它在下面 stop_all 清空运行集之后、进程真正退出之前触发一次、
+                // 把刚写好的运行态覆盖成空（详见 service::SHUTTING_DOWN）。
+                // 必须在 stop_all 之前、snapshot 之后。
+                service::begin_shutdown();
+
                 // 优雅停机：广播关闭信号让在途连接干净收尾，而非等进程被杀时 socket 直接 RST
                 // （客户端会看到「连接被重置」）。proxy 与 MCP 都是本进程的 tokio 任务，
                 // 进程结束时 OS 也会回收，但那是「硬拔」；这里主动停是为了：
