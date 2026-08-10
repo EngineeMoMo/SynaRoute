@@ -353,8 +353,14 @@ fn get_tool_config_preview(category_id: CategoryType) -> AppResult<tools::ToolCo
 }
 
 #[tauri::command]
-fn restore_tool_config(category_id: CategoryType) -> AppResult<String> {
-    tools::restore(category_id)
+fn restore_tool_config(
+    state: tauri::State<AppState>,
+    category_id: CategoryType,
+) -> AppResult<String> {
+    // 走「保留 MCP」的还原：这是前端「停止代理」按钮触发的命令，而停代理与关 MCP 是两条路
+    // —— 用户停代理只想断路由，没要求关掉大脑聚合。对 Codex 尤其重要（代理设置与 mcp_servers
+    // 同在 config.toml，裸 restore 会顺手抹掉 MCP）。见 service::restore_client_config_keeping_mcp。
+    service::restore_client_config_keeping_mcp(&state.store, &state.mcp, category_id)
 }
 
 /// 「切回官方」：停止该分类代理 + 还原客户端配置，但**保留 MCP 注册**。
@@ -1761,14 +1767,17 @@ fn handle_tray_proxy_toggle(app: &tauri::AppHandle, id: &str) {
     let running = state.proxy.is_running(category);
     let store = state.store.clone();
     let proxy = state.proxy.clone();
+    let mcp = state.mcp.clone();
     let app = app.clone();
 
     if running {
         proxy.stop(category);
         store.append_event(category, "config", None, "托盘停止代理");
-        // 停止即退出接入态（与前端 stopProxy 一致）：还原客户端配置，
-        // Codex 连同 auth.json 一起复原，用户官方登录立即恢复。
-        match tools::restore(category) {
+        // 停止即退出接入态（与前端 stopProxy 一致）：还原客户端配置，**但保留 MCP**。
+        // 停代理与关 MCP 是两条独立的路——见 service::restore_client_config_keeping_mcp。
+        // Codex 连同 auth.json 一起复原，用户官方登录立即恢复；其 mcp_servers 因整文件
+        // 回滚被抹掉后，这里幂等补回。
+        match service::restore_client_config_keeping_mcp(&store, &mcp, category) {
             Ok(msg) => store.append_event(category, "config", None, &msg),
             Err(e) => store.append_event(
                 category,

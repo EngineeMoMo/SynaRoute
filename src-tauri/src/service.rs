@@ -562,6 +562,47 @@ impl RewriteReason {
     }
 }
 
+/// 还原某分类的客户端配置，**但保留 MCP 注册**（大脑聚合是独立于代理的另一条路）。
+///
+/// 「停止代理」和「MCP 大脑聚合」是两件独立的事：用户点「停止代理」只想断开路由转发，
+/// 从没表达过要关掉 MCP。但对 **Codex** 而言，代理设置与 `mcp_servers.synaroute` 写在
+/// 同一份 `config.toml` 里，而 `tools::restore` 是整文件回滚 —— 它会把 MCP 注册**顺带抹掉**。
+/// 于是产生一个只有 Codex 才有、且**间歇**的错乱：停一次代理 → `mcp_servers` 没了、
+/// 但 `settings.mcp_registered_categories` 仍记着它 → 下次启动 `start_mcp_on_launch` 又
+/// 把它写回来。用户视角是「停一次代理，聚合工具就没了；重开应用又有了」，最难归因。
+///
+/// 修法与 [`switch_to_official`] 同源：还原之后，若该分类**本就注册过 MCP** 且 MCP 服务在跑，
+/// 就幂等重注册一次 —— 只对 Codex 有实际写盘（补回被抹掉的项），CLI/桌面端因 MCP 配置与
+/// 代理配置本就是不同文件、内容未变，`register_mcp_client` 内部比对后跳过。
+///
+/// **三条「停代理即退出接入态」的路径**（界面「停止」、托盘停止、切官方）必须都走这里，
+/// 否则又会分叉成「有的路保留 MCP、有的不保留」。
+pub(crate) fn restore_client_config_keeping_mcp(
+    store: &Store,
+    mcp: &McpManager,
+    category: CategoryType,
+) -> AppResult<String> {
+    let msg = crate::tools::restore(category)?;
+
+    // 该分类本就没注册过 MCP → 无需补，直接返回还原结果。
+    if !store
+        .get_settings()
+        .mcp_registered_categories
+        .contains(&category)
+    {
+        return Ok(msg);
+    }
+    // 注册过，但 MCP 服务当前没跑（用户没开启 MCP）→ 现在补也没处补；
+    // 保留在 mcp_registered_categories 里，下次启用 MCP 时由 start 流程恢复。
+    // 不在此清空该记录：清了反而会让「下次启用 MCP」漏掉这个分类。
+    let Some(port) = mcp.running_port() else {
+        return Ok(msg);
+    };
+    // 幂等重注册：Codex 补回 restore 抹掉的 mcp_servers；CLI/桌面端内容没变会跳过写盘。
+    register_and_record(store, category, port);
+    Ok(msg)
+}
+
 /// 把 synaroute MCP 注册进某分类对应工具的客户端配置，并把该分类记入
 /// `settings.mcp_registered_categories`（去重）。
 ///
@@ -712,9 +753,18 @@ pub(crate) async fn switch_to_official(
     proxy.stop(category);
     store.append_event(category, "config", None, "切回官方：停止代理");
 
-    // 2. 还原客户端配置（把端点改回官方、Codex 还原 auth.json 恢复 OAuth 登录）。
-    match crate::tools::restore(category) {
-        Ok(msg) => store.append_event(category, "config", None, &msg),
+    // 2. 还原客户端配置但保留 MCP —— 与界面/托盘「停止」共用同一入口
+    //    （`restore_client_config_keeping_mcp`），三条路径语义一致：断代理、留聚合。
+    match restore_client_config_keeping_mcp(store, mcp, category) {
+        Ok(msg) => {
+            store.append_event(category, "config", None, &msg);
+            store.append_event(
+                category,
+                "config",
+                None,
+                "切回官方：已保留 MCP 注册（大脑聚合继续可用）",
+            );
+        }
         Err(e) => {
             store.append_event(
                 category,
@@ -723,33 +773,6 @@ pub(crate) async fn switch_to_official(
                 &format!("切回官方：还原客户端配置失败（{e}），请手动检查配置文件"),
             );
             return Err(e);
-        }
-    }
-
-    // 3. 若该分类已注册 MCP 且服务在跑，重新注册（幂等）以弥补 Codex 的整文件覆盖。
-    //    CLI / 桌面端：内容未变，`register_mcp_client` 内部比对后跳过写盘。
-    //    Codex：`restore` 刚抹掉了 mcp_servers，重注册把它补回来。
-    let mcp_was_registered = store
-        .get_settings()
-        .mcp_registered_categories
-        .contains(&category);
-    if mcp_was_registered {
-        if let Some(port) = mcp.running_port() {
-            register_and_record(store, category, port);
-            store.append_event(
-                category,
-                "config",
-                None,
-                "切回官方：已保留 MCP 注册（大脑聚合继续可用）",
-            );
-        } else {
-            // MCP 服务本身没跑（用户没开启），注册也没意义；只告知。
-            store.append_event(
-                category,
-                "config",
-                None,
-                "切回官方：MCP 服务未启动，注册保留在设置中，下次启用 MCP 时自动恢复",
-            );
         }
     }
 
@@ -2115,6 +2138,37 @@ mod tests {
         assert!(
             !s.mcp_enabled,
             "开关必须落成 false，否则前端下次冷启以为服务在跑"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 停代理还原客户端配置时**不得动 `mcp_registered_categories`**（停代理 ≠ 关 MCP）。
+    ///
+    /// 这是「停止代理 / 托盘停止 / 切官方」三条路共用的 `restore_client_config_keeping_mcp`
+    /// 的核心不变量。真实的 Codex 缺陷（`config.toml` 整文件回滚抹掉 `mcp_servers`、
+    /// 而设置仍记着已注册 → 下次启动又写回 → 间歇错乱）要真机验（改开发机的
+    /// `~/.codex/config.toml`）；这里只钉住能在内存里验的那半：还原动作本身不改「已注册」记录。
+    ///
+    /// 前置把注册集合保持为空，避免 `register_and_record` 去写真实客户端文件。
+    /// 空集合下 `restore_client_config_keeping_mcp` 在「本就没注册过」处提前返回，
+    /// 正好覆盖「CLI 停代理不应凭空冒出注册记录」这一面。
+    #[test]
+    fn stopping_proxy_restore_does_not_touch_mcp_registration() {
+        let (store, dir) = temp_store("stop_keeps_mcp");
+        let mcp = McpManager::new(store.clone());
+
+        assert!(
+            store.get_settings().mcp_registered_categories.is_empty(),
+            "前置：无已注册分类（否则会去写真实客户端文件）"
+        );
+
+        // CLI 从未接入过：还原是幂等的「无备份，无需还原」，且绝不该新增注册记录。
+        let msg = restore_client_config_keeping_mcp(&store, &mcp, CategoryType::ClaudeCli).unwrap();
+        assert!(msg.contains("无需还原") || msg.contains("还原"), "应返回还原结果: {msg}");
+        assert!(
+            store.get_settings().mcp_registered_categories.is_empty(),
+            "停代理的还原不得凭空造出 MCP 注册记录"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
