@@ -324,10 +324,14 @@ async fn set_proxy_port(
 ) -> AppResult<ProxyState> {
     let bound = service::set_proxy_port(&state.store, &state.proxy, category_id, port).await?;
     let _ = rebuild_tray(&app);
+    // 状态**按实际运行态回报**，不硬编码 "running"：改端口对未运行的分类只落盘、不启动
+    // （见 service::set_proxy_port），若这里恒报 running，前端状态条会显示「运行中」
+    // 而代理其实没起来 —— 那正是本项目最忌讳的「界面说 A、实际 B」。
+    let running = state.proxy.is_running(category_id);
     Ok(ProxyState {
         category_id,
         port: Some(bound),
-        status: "running".into(),
+        status: if running { "running".into() } else { "stopped".into() },
         message: None,
     })
 }

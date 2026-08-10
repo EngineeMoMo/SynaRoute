@@ -199,6 +199,29 @@ impl SseTranslator {
         out
     }
 
+    /// 本次流累积到的 token 用量；两者皆 0 时返回 `None`（视作上游没给）。
+    ///
+    /// 给**跨协议流式的用量采集**用。同协议直通那条路走的是「尾窗缓存 + 事后
+    /// `extract_usage_from_sse`」，跨协议这条路不能照搬：翻译器边收边转，尾窗里躺的是
+    /// 已经**转换过**的下游格式，字段名与上游未必一致。而翻译器本来就得读懂上游 usage
+    /// 才能翻译（见 `input_tokens` / `output_tokens` 的写入点），所以直接问它最准，
+    /// 也省一份缓冲。
+    ///
+    /// 判 0 而非判「有没有见过 usage 事件」：token 数为 0 的成功请求实际不存在，
+    /// 而多记一个字段去区分「没给」和「给了 0」不值当。
+    pub fn accumulated_usage(&self) -> Option<crate::model::TokenUsage> {
+        if self.input_tokens == 0 && self.output_tokens == 0 {
+            return None;
+        }
+        Some(crate::model::TokenUsage {
+            input: self.input_tokens,
+            output: self.output_tokens,
+            // 翻译器不累积 cache_read：它只在能翻译的字段上做搬运，缓存命中数各协议表述不一，
+            // 硬凑会记出个假数。同协议直通那条路能拿到（原样解析上游 JSON），此处留 0。
+            cache_read: 0,
+        })
+    }
+
     /// 流结束时冲刷收尾事件（Responses 需要 response.completed；Chat 需 [DONE]）。
     pub fn finish(&mut self) -> String {
         match self.dir {
@@ -1796,6 +1819,56 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
         out.push_str(&tr.finish());
         assert_eq!(anthropic_tool_blocks(&out).len(), 1, "断流也应交付工具:\n{out}");
         assert!(out.contains("\"stop_reason\":\"tool_use\""));
+    }
+
+    /// 跨协议流式的用量必须能取出来。
+    ///
+    /// 钉住的是一条**静默失效**：跨协议流式（Codex 接 Claude 上游，本项目的主场景）
+    /// 此前从不采集用量 —— 用量面板对这类 Key 恒为 0、日志行没有 `↑↓` 段，而同一台机器上
+    /// 同协议直通的 Key 显示得好好的，用户只会以为「这个 Key 的统计坏了」。
+    /// 翻译器本就累积了两个计数器，缺的只是取出来的入口。
+    #[test]
+    fn accumulated_usage_exposes_translator_counters() {
+        // Anthropic 上游：input_tokens 在 message_start，output_tokens 在 message_delta。
+        let mut tr = SseTranslator::new(SseDirection::AnthropicToResponses);
+        assert!(
+            tr.accumulated_usage().is_none(),
+            "还没喂任何数据 → 不该凭空报用量"
+        );
+
+        tr.push(
+            br#"event: message_start
+data: {"type":"message_start","message":{"id":"m1","model":"claude-sonnet-4","usage":{"input_tokens":1234}}}
+
+"#,
+        );
+        tr.push(
+            br#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":567}}
+
+"#,
+        );
+        tr.finish();
+
+        let u = tr
+            .accumulated_usage()
+            .expect("翻译器已见过两处 usage，必须能取出");
+        assert_eq!(u.input, 1234);
+        assert_eq!(u.output, 567);
+    }
+
+    /// 上游一个 usage 字段都没给 → 返回 None，不要记一行 0/0 的假数。
+    #[test]
+    fn accumulated_usage_is_none_when_upstream_gave_nothing() {
+        let mut tr = SseTranslator::new(SseDirection::AnthropicToResponses);
+        tr.push(
+            br#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}
+
+"#,
+        );
+        tr.finish();
+        assert!(tr.accumulated_usage().is_none());
     }
 
     #[test]

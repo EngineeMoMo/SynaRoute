@@ -1300,6 +1300,8 @@ async fn try_stream_to_key(
         obj.insert("model".into(), Value::String(real_model.clone()));
     }
     inject_default_effort(store, category, &mut payload, downstream, key.protocol);
+    // Key 上配的采样参数（下游没显式给才注入）。必须在协议转换**之前**，见该函数文档。
+    apply_key_params(&mut payload, &key.params, downstream);
     let payload = crate::upstream::convert_request_owned(payload, downstream, key.protocol);
 
     // 同协议：原样保留下游路径 + query（count_tokens 等子路径正确透传）。
@@ -1461,12 +1463,72 @@ async fn try_stream_to_key(
                 search_tools,
             );
             let upstream = resp.bytes_stream();
+
+            // 用量补记三要素（与同协议分支同一套定位口径：分类 + key + collapse_key）。
+            // 跨协议这条路**不用**尾窗 + `extract_usage_from_sse`：翻译器边收边转，尾窗里
+            // 躺的是已转换成下游格式的字节，字段名与上游不一定对得上。翻译器本来就要读懂
+            // 上游 usage 才能翻译，直接问它最准，也省一份 8KB 缓冲。
+            let usage_store = store.clone();
+            let usage_key_id = key.id.clone();
+            let usage_category = category;
+            let usage_req_model = requested_model.to_string();
+
             struct StreamState<S> {
                 translator: crate::upstream::SseTranslator,
                 upstream: S,
                 finished: bool,
+                /// 只补记一次。上游结束会走两遍 `None` 分支（第一遍冲刷收尾事件、
+                /// 第二遍才真终止），不设这个闩会补记两次 —— 第二次把同一行的用量
+                /// 又写一遍，虽然值相同，但下次改成累加式补记时就是静默翻倍。
+                usage_recorded: bool,
+                store: std::sync::Arc<Store>,
+                category: CategoryType,
+                key_id: String,
+                req_model: String,
             }
-            let init = StreamState { translator, upstream, finished: false };
+
+            // 挂在 Drop 上而不是在几个 `return None` 分支里各调一次：unfold 的累加器在
+            // **任何**终止路径上都会被 drop —— 正常收完、上游报错、以及下游中途断开
+            // （客户端 Ctrl+C，此时一个分支都不会执行）。前两种手写能覆盖，第三种漏不掉才是关键：
+            // 那正是长回答被打断的场合，用户更想知道这次花了多少 token。
+            impl<S> Drop for StreamState<S> {
+                fn drop(&mut self) {
+                    self.record_usage();
+                }
+            }
+
+            impl<S> StreamState<S> {
+                /// 流终止时把翻译器累积的用量补进「流开始时已写下的那一行」。
+                fn record_usage(&mut self) {
+                    if self.usage_recorded {
+                        return;
+                    }
+                    self.usage_recorded = true;
+                    let Some(u) = self.translator.accumulated_usage() else {
+                        return; // 上游没给用量 —— 不造假数
+                    };
+                    // 不新追加事件：同 collapse key 再 append 会被折叠成「又发生了一次」
+                    // （repeat 变 2、detail 被覆盖）。理由同同协议分支。
+                    let collapse = format!("ok:{}:{}:{}", self.key_id, self.req_model, true);
+                    self.store.backfill_usage_for_collapsed_event(
+                        self.category,
+                        Some(&self.key_id),
+                        &collapse,
+                        u,
+                    );
+                }
+            }
+
+            let init = StreamState {
+                translator,
+                upstream,
+                finished: false,
+                usage_recorded: false,
+                store: usage_store,
+                category: usage_category,
+                key_id: usage_key_id,
+                req_model: usage_req_model,
+            };
             let translated = futures_util::stream::unfold(init, |mut st| async move {
                 loop {
                     match st.upstream.next().await {
@@ -1624,6 +1686,77 @@ fn inject_default_effort(
     }
 }
 
+/// 把 Key 上配置的采样参数（temperature / top_p / max_tokens）注入请求体。
+///
+/// **为什么需要**：`KeyParams` 的四个字段里，此前只有 `timeout_ms` 被转发路径读过
+/// （`key.params.timeout_ms` 是全 proxy.rs 唯一一处 `key.params.` 引用），
+/// 另外三个在**整个后端零使用**——`max_tokens` 仅被 `aggregate.rs` 的大脑聚合读，
+/// `temperature` / `top_p` 连那里都没有。而 KeyEditor 让用户填这三个值、保存进 config.json、
+/// 「批量应用 Max Tokens 到本分类全部 Key」还会回一条「已应用到 N 条」的成功提示。
+/// 于是形成本项目最忌讳的失效形态：**能配、能存、有回执、对转发零作用**，
+/// 用户把「设了没用」归因成「这个中转商不听参数」，排查方向完全错。
+/// （FR-005 验收判据 2 要求「转发请求携带该 Key 配置的参数，可通过代理日志验证」。）
+///
+/// **口径：只在下游未显式给出时注入**，与 [`inject_default_effort`] 的「已有则不覆盖」一致。
+/// 客户端显式发的值代表用户当下的意图（如 Claude Code 针对某次对话调的 temperature），
+/// 优先级高于 Key 上配的默认值；Key 参数的定位是「这个 Key 的缺省」，不是「强制覆盖」。
+///
+/// **必须在协议转换之前调用**：字段名按**下游**协议写，转换层会负责改写成上游形态
+/// （如 Responses 的 `max_output_tokens` → Anthropic 的 `max_tokens`，见 convert.rs:921）。
+/// 若放在转换之后，就得自己再判一次上游协议，那正是「两套真相」的开端。
+fn apply_key_params(payload: &mut Value, params: &crate::model::KeyParams, downstream: Protocol) {
+    let Some(obj) = payload.as_object_mut() else { return };
+
+    // max_tokens 的字段名随**下游**协议不同：Responses 用 max_output_tokens，
+    // Anthropic 与 Chat 用 max_tokens。Chat 另接受 max_completion_tokens 作为别名，
+    // 故判「已有」时两个名字都要看，否则会在客户端已用新名时重复注入旧名。
+    let max_tokens_key = match downstream {
+        Protocol::OpenaiResponses => "max_output_tokens",
+        Protocol::Anthropic | Protocol::OpenaiChat => "max_tokens",
+    };
+    if let Some(v) = params.max_tokens {
+        let already = obj.get(max_tokens_key).is_some_and(|x| !x.is_null())
+            || (downstream == Protocol::OpenaiChat
+                && obj.get("max_completion_tokens").is_some_and(|x| !x.is_null()));
+        if !already {
+            obj.insert(max_tokens_key.into(), Value::from(v));
+        }
+    }
+
+    // temperature / top_p 三协议同名。
+    for (name, val) in [("temperature", params.temperature), ("top_p", params.top_p)] {
+        let Some(v) = val else { continue };
+        if obj.get(name).is_some_and(|x| !x.is_null()) {
+            continue; // 下游显式给了 → 尊重下游
+        }
+        // NaN / Inf 会得到 Null；插 null 上游多半 400，宁可当没配过。
+        let encoded = f32_to_json(v);
+        if !encoded.is_null() {
+            obj.insert(name.into(), encoded);
+        }
+    }
+}
+
+/// `f32` → JSON number，**不带 f32→f64 拓宽噪声**。
+///
+/// `Value::from(0.2f32)` 会得到 `0.20000000298023224` —— 因为 0.2 在 f32 里本就是个近似值，
+/// 直接拓宽成 f64 会把那串二进制误差如实展开。于是发给上游的 JSON 里躺着
+/// `"temperature": 0.20000000298023224`，虽然数值上等价，但它会**原样出现在日志页的请求体快照里**，
+/// 用户看到自己填的 0.2 变成一串小数会怀疑参数被篡改（本项目最不该制造的那类误导）。
+///
+/// 借 Rust 的 `f32` Display 给出「能往返的最短十进制表示」（0.2f32 → "0.2"），再按 f64 解析。
+/// 与 KeyEditor 里 token 单位换算刻意走十进制字符串 + BigInt 是同一条纪律：
+/// **人填进去的十进制，出去时还得是那个十进制**。
+fn f32_to_json(v: f32) -> Value {
+    v.to_string()
+        .parse::<f64>()
+        .ok()
+        .and_then(serde_json::Number::from_f64)
+        .map(Value::Number)
+        // NaN / Inf 落这里：这两个 JSON 表示不了，宁可不注入也不发个 null 让上游 400。
+        .unwrap_or(Value::Null)
+}
+
 /// 转发到单个 Key：套用模型映射 + 协议适配。
 /// 返回完整 outcome（含发往上游的请求体、响应体、状态），供路由与调用模型日志共用。
 /// 注意：非 2xx 不再直接返回 Err，而是照常返回 outcome（ok=false），
@@ -1677,6 +1810,9 @@ async fn forward_to_key(
         obj.insert("model".into(), Value::String(real_model.clone()));
     }
     inject_default_effort(store, category, &mut payload, downstream, key.protocol);
+    // 与 try_stream_to_key 同进同退：Key 参数注入必须两条路径都做，
+    // 否则「非流式生效、流式不生效」这种按客户端而异的分叉极难归因。
+    apply_key_params(&mut payload, &key.params, downstream);
 
     // 跨协议转换（下游协议 → 上游 Key 协议；同协议时 convert_request 内部直接返回克隆）
     let payload = crate::upstream::convert_request_owned(payload, downstream, key.protocol);
@@ -2173,6 +2309,116 @@ mod tests {
 
     /// 推理强度必须取**本请求所属分类**的设置，不能硬编码 Codex。
     /// 硬编码时把任一 Responses 客户端接到别的分类端口，就会读到 Codex 的强度（口径串台）。
+    /// Key 上配的采样参数必须真的进请求体。
+    ///
+    /// 钉住的是一条**静默失效**：`temperature` / `top_p` / `max_tokens` 曾在整个后端零使用
+    /// （只有 `timeout_ms` 被读），而 UI 能填、能存、批量应用还回「已应用到 N 条」。
+    /// 删掉 `apply_key_params` 的调用，本测试必须变红。
+    #[test]
+    fn key_params_are_injected_into_payload() {
+        let params = crate::model::KeyParams {
+            temperature: Some(0.2),
+            max_tokens: Some(8192),
+            top_p: Some(0.9),
+            timeout_ms: Some(30_000),
+        };
+
+        // Anthropic / Chat 下游：max_tokens 原名
+        for downstream in [Protocol::Anthropic, Protocol::OpenaiChat] {
+            let mut payload = json!({ "model": "m", "messages": [] });
+            apply_key_params(&mut payload, &params, downstream);
+            assert_eq!(payload["max_tokens"], 8192, "{downstream:?} 应注入 max_tokens");
+            assert_eq!(payload["temperature"], 0.2, "{downstream:?} 应注入 temperature");
+            assert_eq!(payload["top_p"], 0.9, "{downstream:?} 应注入 top_p");
+        }
+
+        // Responses 下游：字段名是 max_output_tokens（写错名字上游会忽略 → 又一次静默失效）
+        let mut payload = json!({ "model": "m", "input": [] });
+        apply_key_params(&mut payload, &params, Protocol::OpenaiResponses);
+        assert_eq!(payload["max_output_tokens"], 8192);
+        assert!(
+            payload.get("max_tokens").is_none(),
+            "Responses 下游不该写 max_tokens 这个名字"
+        );
+    }
+
+    /// 下游显式给了值 → 尊重下游，不覆盖（与 inject_default_effort 同口径）。
+    #[test]
+    fn key_params_do_not_override_explicit_downstream_values() {
+        let params = crate::model::KeyParams {
+            temperature: Some(0.2),
+            max_tokens: Some(8192),
+            top_p: Some(0.9),
+            timeout_ms: None,
+        };
+        let mut payload = json!({
+            "model": "m", "messages": [],
+            "max_tokens": 512, "temperature": 1.5, "top_p": 0.1
+        });
+        apply_key_params(&mut payload, &params, Protocol::Anthropic);
+        assert_eq!(payload["max_tokens"], 512, "客户端显式值优先");
+        assert_eq!(payload["temperature"], 1.5);
+        assert_eq!(payload["top_p"], 0.1);
+
+        // Chat 的别名 max_completion_tokens 也算「已有」，否则会两个名字都出现。
+        let mut payload = json!({ "model": "m", "messages": [], "max_completion_tokens": 256 });
+        apply_key_params(&mut payload, &params, Protocol::OpenaiChat);
+        assert!(
+            payload.get("max_tokens").is_none(),
+            "已有 max_completion_tokens 时不应再注入 max_tokens"
+        );
+
+        // 未配置的字段不该凭空造出来。
+        let none = crate::model::KeyParams {
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            timeout_ms: None,
+        };
+        let mut payload = json!({ "model": "m", "messages": [] });
+        apply_key_params(&mut payload, &none, Protocol::Anthropic);
+        assert!(payload.get("max_tokens").is_none());
+        assert!(payload.get("temperature").is_none());
+        assert!(payload.get("top_p").is_none());
+    }
+
+    /// 用户填的十进制，发出去还得是那个十进制。
+    ///
+    /// 回归护栏：`Value::from(0.2f32)` 会得到 `0.20000000298023224`（f32→f64 拓宽把
+    /// 二进制近似误差展开了）。数值上无害，但它会**原样出现在日志页的请求体快照里** ——
+    /// 用户看到自己填的 0.2 变成一长串小数，会以为参数被程序改过。
+    #[test]
+    fn key_params_keep_decimal_fidelity() {
+        let params = crate::model::KeyParams {
+            temperature: Some(0.2),
+            max_tokens: None,
+            top_p: Some(0.95),
+            timeout_ms: None,
+        };
+        let mut payload = json!({ "model": "m", "messages": [] });
+        apply_key_params(&mut payload, &params, Protocol::Anthropic);
+
+        // 比字符串而非比数值：0.20000000298023224 == 0.2 在 f64 比较下是 false，
+        // 但真正要钉的是「序列化出去长什么样」。
+        assert_eq!(payload["temperature"].to_string(), "0.2");
+        assert_eq!(payload["top_p"].to_string(), "0.95");
+    }
+
+    /// NaN / Inf 不可序列化成 JSON，宁可当没配过，也不要插个 null 让上游 400。
+    #[test]
+    fn key_params_skip_non_finite_values() {
+        let params = crate::model::KeyParams {
+            temperature: Some(f32::NAN),
+            max_tokens: None,
+            top_p: Some(f32::INFINITY),
+            timeout_ms: None,
+        };
+        let mut payload = json!({ "model": "m", "messages": [] });
+        apply_key_params(&mut payload, &params, Protocol::Anthropic);
+        assert!(payload.get("temperature").is_none(), "NaN 不应注入");
+        assert!(payload.get("top_p").is_none(), "Inf 不应注入");
+    }
+
     #[test]
     fn effort_injection_reads_requesting_category_not_hardcoded_codex() {
         let dir = temp_dir("effort_cat");

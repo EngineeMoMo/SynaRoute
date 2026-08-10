@@ -191,17 +191,27 @@ export function SettingsPage() {
   const update = (patch: Partial<AppSettings>) => {
     if (!settings) return;
     const prev = settings;
-    const next = { ...settings, ...patch };
-    setSettings(next);
-    // 落盘失败必须可见（项目硬规则：禁止静默吞错）。乐观更新 UI，写盘失败时弹提示
-    // **并回滚开关状态**——否则 UI 显示已开、系统实际没开（自启动这类「后端要动系统」的
-    // 设置尤其致命：用户以为开成了，重启后什么也没发生）。
+    // 乐观更新：先用本页当前快照 + patch 立刻反映到 UI，不等 IPC 往返。
+    setSettings({ ...settings, ...patch });
+    // 落盘前**重新拉一次磁盘最新值**再合并 patch —— 不能用本页挂载时的旧 `settings` 当基线。
+    //
+    // 本页的 `settings` 只在挂载时 `getSettings()` 拉过一次。若用户先切了主题/语言
+    // （store.ts 的 setTheme/setLang 走 persistOneSetting，各自都会重拉磁盘最新值再落盘，
+    // 绕过本页状态），本页这份快照就带着**旧的 theme/language**。此时再点本页任意一个开关，
+    // 若直接拿本页旧快照 `{...settings, ...patch}` 提交，就会把刚落盘的新主题/语言顶回旧值——
+    // 用户会看到「明明选了深色，点了个不相关的开关后又变回浅色」，且没有任何报错。
+    // 与 persistOneSetting 同一套写法：先拉最新、再合并、再落盘，避免用旧快照覆盖新值。
     void api
-      .saveSettings(pickPrefs(next))
-      .then(() => {
-        // 成功后同步 store 副本：store.settings 是切主题/语言时的落盘基线之一，
-        // 留着旧值会让那条路径把刚改的字段顶回去（见 store.ts persistOneSetting）。
-        useStore.setState({ settings: next });
+      .getSettings()
+      .then((latest) => {
+        const merged = { ...latest, ...patch };
+        return api.saveSettings(pickPrefs(merged)).then(() => merged);
+      })
+      .then((merged) => {
+        // 用合并后的值同步两份状态：本页快照（继续给用户看）与全局 store
+        // （store.settings 是切主题/语言时的落盘基线之一，留着旧值会反过来把这次的改动顶回去）。
+        setSettings(merged);
+        useStore.setState({ settings: merged });
       })
       .catch((e) => {
         console.error("saveSettings failed", e);

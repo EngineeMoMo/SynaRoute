@@ -46,6 +46,35 @@
   ${If} ${Errors}                                   ; 无 _?= → 用户真的在卸载
   ${AndIf} $UpdateMode <> 1                         ; 纵深防御，见文件头
   ${AndIf} ${FileExists} "$INSTDIR\synaroute.exe"
+
+    ; ---- 先确认「应用已不在运行」，之后才允许动任何文件 ----
+    ;
+    ; 为什么必须在这里自己判一次：内置的 `CheckIfAppIsRunning`（那个「正在运行，要关掉吗」
+    ; 的 OK/CANCEL 框）在 installer.nsi 里排在**本钩子之后**。而 SynaRoute 是常驻托盘应用，
+    ; 卸载时几乎总在运行 —— 于是顺序是「先还原了用户的客户端配置，再问他要不要继续」。
+    ; 用户点「取消」→ 内置宏 `Abort` 掉整个卸载节，应用继续跑、界面与托盘仍显示「已接入」，
+    ; 但三端配置已经被回滚成官方端点、`.bak` 也已被消费掉。此后所有请求都不再经过 SynaRoute，
+    ; 多 Key 故障转移 / 模型映射 / 用量统计全部静默失效，而 UI 一切正常、本会话内无任何自愈路径
+    ; （重写客户端配置只发生在启动恢复、接入、改端口时）。
+    ;
+    ; 故这里把「取消」提前到**任何文件改动之前**：取消后的磁盘状态与卸载前完全一致。
+    ;
+    ; 用 FindProcessCurrentUser 而非 FindProcess：与内置宏保持一致
+    ; （installer.nsi 的 INSTALLMODE = currentUser，见 utils.nsh 里同一条 !if 分支）。
+    ; 静默/被动卸载（/S、/P）不弹框，直接放行：那两种模式下用户已表达「别问我」。
+    nsis_tauri_utils::FindProcessCurrentUser "synaroute.exe"
+    Pop $R6
+    ${If} $R6 = 0                                   ; 0 = 找到进程，应用仍在运行
+      IfSilent +3 0
+      ${IfThen} $PassiveMode != 1 ${|} MessageBox MB_OKCANCEL "$(appRunningOkKill)" IDOK +2 IDCANCEL 0 ${|}
+      Abort "$(appRunning)"
+      ; 用户点了「确定」：先结束进程再还原，避免它在还原之后又把配置写回去
+      ; （启动恢复 / 快照落盘都可能重写），否则还原等于白做。
+      nsis_tauri_utils::KillProcessCurrentUser "synaroute.exe"
+      Pop $R6
+      Sleep 500
+    ${EndIf}
+
     ; /TIMEOUT 是硬要求：还原是纯文件操作、正常远小于 1s，但本项目历史上被静默安装
     ; 卡死过两次，绝不能让卸载器挂在一个子进程上。超时就放弃还原、继续卸载 ——
     ; 残留配置可以手动改，卸载卡死用户只能去任务管理器。

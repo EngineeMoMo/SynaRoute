@@ -1281,10 +1281,27 @@ fn backup_and_write_bytes(path: &Path, data: &[u8]) -> AppResult<()> {
     // 首写即锁后，`.bak` 恒为「SynaRoute 第一次动这个文件之前」的内容，重复接入多少次都不变质。
     // 配套：`restore_one` 还原成功后删掉 `.bak`（见该函数），让下一轮接入重新抓一份新鲜快照，
     // 否则锁死的旧快照会在「接入→还原→改配置→再接入→再还原」时把用户改动覆盖回很久以前。
-    if path.exists() {
-        let backup = backup_path_for(path);
-        if !backup.exists() {
+    // 「锁」只在两者都还没锁过时才可能上锁，且**互斥**——上了哪一把就不会再上另一把。
+    //
+    // 这一点必须严格保证：若已经锁了 marker（首次接入时文件不存在），此后 SynaRoute 自己
+    // 把文件从无写到有，`path.exists()` 就会变真。若这时只看 `path.exists()` 决定走
+    // 「备份」分支，会把 SynaRoute 自己写的内容当成「原始快照」拷进 `.bak`——
+    // 于是磁盘上 marker 与 `.bak` 同时存在，`restore_one` 只看 `.bak`（判断顺序在它之前），
+    // 就会把文件「还原」成 SynaRoute 自己写的版本，而不是删除它。凭空新建的文件从此永远
+    // 「还原」不回「不存在」这个真实的原始状态。
+    let backup = backup_path_for(path);
+    let marker = created_marker_path_for(path);
+    if !backup.exists() && !marker.exists() {
+        if path.exists() {
             std::fs::copy(path, &backup)?;
+        } else {
+            // 文件接入前**根本不存在**（如未装 settings.json 的 Claude CLI 用户、只走
+            // ChatGPT 登录从未生成过 config.toml 的 Codex 用户）：没有「原内容」可备份，
+            // 落一个空标记代替 `.bak`，供 `restore_one` 判定「这份文件是我凭空造出来的，
+            // 该整份删掉」而非「无备份、之前就没接入过」。少这一步的后果：`restore_one`
+            // 因 `.bak` 不存在直接判定「无需还原」，文件却原样留在盘上、指着一个已经
+            // 无人监听的本地端口——客户端从此永久连不上，卸载之后连能改它的界面都没有了。
+            std::fs::write(&marker, b"")?;
         }
     }
     // 规则2：原子写
@@ -1359,7 +1376,20 @@ fn prerestore_path_for(path: &Path) -> PathBuf {
     })
 }
 
-/// 从 `.synaroute.bak` 还原单个文件；备份不存在则返回 false（跳过，不报错）。
+/// 「接入前该文件根本不存在」的标记后缀：`<原名>.synaroute-created`。
+///
+/// 与 `.bak`（有原内容可还原）互斥、二选一——见 [`backup_and_write_bytes`] 的写入侧。
+const CREATED_MARKER_SUFFIX: &str = "synaroute-created";
+
+/// 某文件对应的「凭空新建」标记路径。
+fn created_marker_path_for(path: &Path) -> PathBuf {
+    path.with_extension(match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.{CREATED_MARKER_SUFFIX}"),
+        None => CREATED_MARKER_SUFFIX.to_string(),
+    })
+}
+
+/// 从 `.synaroute.bak` 还原单个文件；无 `.bak` 也无「凭空新建」标记则返回 false（跳过，不报错）。
 ///
 /// **覆盖前先把当前内容另存一份** `.synaroute-prerestore`（见 [`PRERESTORE_SUFFIX`]）：
 /// `.bak` 是首写即锁的旧快照，整文件写回会抹掉用户此后所有自有配置，而卸载路径上
@@ -1372,10 +1402,30 @@ fn prerestore_path_for(path: &Path) -> PathBuf {
 /// 快照会在「接入 → 还原 → 用户改配置 → 再接入 → 再还原」时把用户改动覆盖回很久以前的状态。
 /// 副作用（可接受且语义准确）：连点两次还原，第二次会返回「无备份，无需还原」。
 /// 删除失败只告警不上抛：还原本身已成功，不该因清理失败把成功报成失败。
+///
+/// **无 `.bak` 但有「凭空新建」标记**：说明这份文件是 SynaRoute 首次接入时从零建出来的，
+/// 接入前的「原状」就是「不存在」。直接删掉整个文件即是精确还原——不是「整文件回滚到某个
+/// 旧版本」，而是「回到那个版本原本没有这份文件」的状态。这一支必须存在：没有它，
+/// 未装过 `~/.claude/settings.json` 的 Claude CLI 用户、只走 ChatGPT 登录从未生成过
+/// `~/.codex/config.toml` 的 Codex 用户，停止/还原/卸载三条路径都会因为「无 .bak」直接
+/// 判定「无需还原」而放过这份文件——它会原样留在盘上、永久指向一个已经没人监听的本地端口，
+/// 客户端从此连不上，且卸载之后连能改它的界面都没有了。
 fn restore_one(path: &Path) -> AppResult<bool> {
     let backup = backup_path_for(path);
     if !backup.exists() {
-        return Ok(false);
+        let marker = created_marker_path_for(path);
+        if !marker.exists() {
+            return Ok(false);
+        }
+        // 凭空新建的文件：删除即是还原。删除失败保留标记（下次还能再试），
+        // 成功才清标记——与 `.bak` 分支「还原成功才清理凭据」同一条纪律。
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        if let Err(e) = std::fs::remove_file(&marker) {
+            tracing::warn!("还原后清理新建标记 {} 失败: {e}", marker.display());
+        }
+        return Ok(true);
     }
     let data = std::fs::read(&backup)?;
 
@@ -1552,10 +1602,20 @@ fn restore_desktop_steps(
     }
 
     // 仅在「本档确为当前生效档」且「已无其它档接手」时才复位 1p。
+    //
+    // 两个 config 各自可能是**接入时凭空新建的**（用户从未装过/从未打开过桌面端时该文件不存在）。
+    // 那种情况下「还原」的正解是**删掉整个文件**，而不是往里写 `deploymentMode: "1p"` ——
+    // 后者会留下一个 SynaRoute 自己造出来的文件冒充「用户的官方配置」。
+    // `restore_created_or_write_mode` 按 `.synaroute-created` 标记区分这两种情形。
     if applied_is_ours && !others_remain {
-        write_deployment_mode(normal_config, "1p")?;
-        write_deployment_mode(threep_config, "1p")?;
-        done.push("deploymentMode→1p".to_string());
+        let n = restore_created_or_write_mode(normal_config, "1p")?;
+        let t = restore_created_or_write_mode(threep_config, "1p")?;
+        done.push(match (n, t) {
+            // 两个都是我们建的 → 都已删除
+            (true, true) => "删除接入时新建的两个 claude_desktop_config.json".to_string(),
+            // 混合/都存在 → 如实描述
+            _ => "deploymentMode→1p".to_string(),
+        });
     }
 
     if done.is_empty() {
@@ -1563,6 +1623,30 @@ fn restore_desktop_steps(
     } else {
         Ok(format!("已断开 Claude 桌面端接入：{}。请重启桌面端生效。", done.join("、")))
     }
+}
+
+/// 桌面端 config 的还原：**接入时凭空新建的就删掉，原本存在的才写回 `mode`**。
+///
+/// 返回 `true` 表示「该文件是我们新建的，已整份删除」。
+///
+/// 为什么不能一律 `write_deployment_mode(path, "1p")`：那会在用户**从未装过桌面端**
+/// （或从未打开过、配置文件尚不存在）的机器上，留下一个 SynaRoute 自己造出来的
+/// `claude_desktop_config.json`，内容是 `{"deploymentMode":"1p"}`。它冒充「用户的官方配置」，
+/// 而用户从来没有过这个文件——与 CLI/Codex 那条「凭空新建须整份删除」是同一条语义
+/// （见 [`restore_one`] 的 created 标记分支）。
+fn restore_created_or_write_mode(path: &Path, mode: &str) -> AppResult<bool> {
+    let marker = created_marker_path_for(path);
+    if marker.exists() {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        if let Err(e) = std::fs::remove_file(&marker) {
+            tracing::warn!("还原后清理新建标记 {} 失败: {e}", marker.display());
+        }
+        return Ok(true);
+    }
+    write_deployment_mode(path, mode)?;
+    Ok(false)
 }
 
 /// 读 `_meta.json` 的 `appliedId`（不存在/解析失败均返回 None）。
@@ -2818,6 +2902,77 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
+    /// 接入前文件根本不存在（如未装 settings.json 的 Claude CLI 用户）：还原必须把它
+    /// 整份删掉，而不是留在盘上指着一个已经没人监听的端口。
+    ///
+    /// 钉住的是一条 P1：旧实现只在 `path.exists()` 时才拍 `.bak`，凭空新建的文件从不
+    /// 产生备份，`restore_one` 因 `!backup.exists()` 直接判定「无需还原」，文件永久残留。
+    #[test]
+    fn restore_one_deletes_file_that_was_created_from_nothing() {
+        let path = temp_file("restore_created", "settings.json");
+        assert!(!path.exists(), "前提：接入前该文件不存在");
+
+        // 接入：凭空新建（无原内容可备份，应落 created 标记而非 .bak）。
+        backup_and_write_bytes(&path, b"PROXY_CONFIG").unwrap();
+        assert!(path.exists());
+        assert!(
+            !backup_path_for(&path).exists(),
+            "凭空新建不应产生 .bak（没有原内容）"
+        );
+        assert!(
+            created_marker_path_for(&path).exists(),
+            "凭空新建应落 created 标记，供还原时判定「该整份删除」"
+        );
+
+        // 还原：应删除整个文件（不是覆盖成某个内容），且清掉标记。
+        let ok = restore_one(&path).unwrap();
+        assert!(ok, "有 created 标记应视为「有还原动作」返回 true");
+        assert!(!path.exists(), "凭空新建的文件还原后应被整份删除");
+        assert!(
+            !created_marker_path_for(&path).exists(),
+            "还原成功后应清掉标记，供下一轮接入重新判定"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// 二次接入（如改端口重新 apply）不得把「凭空新建」误判成「原本存在」。
+    ///
+    /// 钉住的是修复过程中我自己引入过的一个后续漏洞：若判断顺序错了，第二次
+    /// `backup_and_write_bytes` 会看到 `path.exists() == true`（因为第一次接入已经把
+    /// 文件写出来了），把 SynaRoute 自己写的内容当成「原始快照」拷进 `.bak`，导致
+    /// marker 与 `.bak` 同时存在——还原时只看 `.bak`，会把文件「还原」成 SynaRoute
+    /// 自己写的版本，而不是删除它，凭空新建的文件从此永远回不到「不存在」这个真实原状。
+    #[test]
+    fn repeated_apply_after_created_from_nothing_does_not_fabricate_a_backup() {
+        let path = temp_file("restore_created_twice", "config.toml");
+        assert!(!path.exists());
+
+        // 第一次接入：凭空新建，落 created 标记。
+        backup_and_write_bytes(&path, b"PROXY_CONFIG_V1").unwrap();
+        // 第二次接入（如改端口）：文件此刻已存在，不能因此改判成「备份」分支。
+        backup_and_write_bytes(&path, b"PROXY_CONFIG_V2").unwrap();
+
+        assert!(
+            !backup_path_for(&path).exists(),
+            "不应凭空产生 .bak —— 那会让 restore_one 走错分支，把「删除」误判成「还原成 V2」"
+        );
+        assert!(
+            created_marker_path_for(&path).exists(),
+            "created 标记必须原样保留，直到真正还原时才清"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"PROXY_CONFIG_V2");
+
+        let ok = restore_one(&path).unwrap();
+        assert!(ok);
+        assert!(
+            !path.exists(),
+            "无论中间接入过几次，凭空新建的文件最终还原都应是删除，不是回退到某个中间版本"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
     #[test]
     fn restore_one_skips_when_no_backup() {
         // 备份不存在（如用户接入前无 auth.json）：应返回 false 且不报错、不动目标文件。
@@ -3884,6 +4039,11 @@ tool_timeout_sec = 600
         // 接入后还原（**调真实 restore_desktop_at**，不在测试里重抄步骤）：
         // 唯一档场景 → deploymentMode 复位 1p、本档 profile 删除、_meta 清本档且删 appliedId。
         let (dir, normal, threep, profile, meta) = desktop_layout("desktop_restore");
+        // 前置：两个 config 接入前**已存在**（用户已装过桌面端）。本用例测的是
+        // 「原本存在 → 还原写回 1p」这一支；「原本不存在 → 还原删文件」另有专门用例
+        // （desktop_restore_deletes_configs_it_created）。
+        std::fs::write(&normal, b"{}").unwrap();
+        std::fs::write(&threep, b"{}").unwrap();
         apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
         assert!(profile.exists());
         assert_eq!(
@@ -3912,6 +4072,34 @@ tool_timeout_sec = 600
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 桌面端 config 原本**不存在**（用户从未装过/从未打开过桌面端）时，还原必须
+    /// 把接入时凭空建出来的那两个 `claude_desktop_config.json` **整份删掉**，
+    /// 而不是往里写 `{"deploymentMode":"1p"}` 冒充「用户的官方配置」。
+    ///
+    /// 与 CLI/Codex 的 created 标记分支同一条语义（见 restore_one 的文档）。
+    #[test]
+    fn desktop_restore_deletes_configs_it_created() {
+        let (dir, normal, threep, profile, meta) = desktop_layout("desktop_restore_created");
+        // 前提：两个 config 都不存在。
+        assert!(!normal.exists(), "前提：normal config 接入前不存在");
+        assert!(!threep.exists(), "前提：threep config 接入前不存在");
+
+        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
+        assert!(normal.exists(), "接入应凭空建出 normal config");
+        assert!(threep.exists(), "接入应凭空建出 threep config");
+
+        restore_desktop_at(&normal, &threep, &profile, &meta, None).unwrap();
+
+        assert!(
+            !normal.exists(),
+            "接入时凭空新建的 config 还原后应整份删除，不该留下 deploymentMode=1p 的假配置"
+        );
+        assert!(!threep.exists(), "同上（3p 目录那份）");
+        assert!(!profile.exists(), "本档 profile 应删除");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn desktop_restore_is_atomic_on_midway_failure() {
         // P1 回归：桌面端还原要动 4 个文件（两个 config 的 deploymentMode + 本档 profile + _meta），
@@ -3922,6 +4110,11 @@ tool_timeout_sec = 600
         // read_json_or_empty 会返回解析错误。此时前两步（删 profile、清 _meta）已经生效，
         // 正是「半还原」的窗口。回滚后这两步都必须被撤销。
         let (dir, normal, threep, profile, meta) = desktop_layout("desktop_restore_atomic");
+        // 前置：两个 config 在接入前**已存在**（用户已装过桌面端）。
+        // 这一步决定接入走 `.bak` 分支而非「凭空新建」标记分支 —— 后者还原时直接删文件、
+        // 不再解析 JSON，本用例赖以制造失败的注入点（写非法 JSON）就失去着力点。
+        std::fs::write(&normal, b"{}").unwrap();
+        std::fs::write(&threep, b"{}").unwrap();
         apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
         assert!(profile.exists(), "前置条件：接入后 profile 存在");
         assert_eq!(

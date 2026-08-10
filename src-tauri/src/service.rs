@@ -149,13 +149,26 @@ fn warn_desktop_unacceptable_models(store: &Store, category: CategoryType, model
 ///
 /// 写 config 失败**不让整个改端口失败**：端口已经落盘、代理已按新端口跑起来了，
 /// 此时返回 Err 会让前端以为改端口没成功，而实际状态已变——只记一条 error 事件。
+///
+/// **该分类代理没在跑时只落盘、不启动**（返回配置里的首选端口）。
+/// 端口是启动时才绑定的，没在跑就没有「重启使其生效」这回事；而无条件 `start()` + `apply()`
+/// 会把「我只是想换个端口号」变成一次**静默接入**：
+/// Codex 那边 `auth.json` 会被整份换成占位 key（原 ChatGPT OAuth 登录态被挪进 `.bak`），
+/// 用户却只看到一句「端口已改」。更糟的是退出时 `snapshot_running_proxies` 会把它记进
+/// `proxy_running_categories`，此后每次开应用都自动拉起并重写配置 —— 用户从未点过启动。
 pub(crate) async fn set_proxy_port(
     store: &Arc<Store>,
     proxy: &Arc<ProxyManager>,
     category: CategoryType,
     port: u16,
 ) -> AppResult<u16> {
+    // 先取运行态：`set_proxy_port` 落盘后再判会被后续的 stop/start 干扰。
+    let was_running = proxy.is_running(category);
     store.set_proxy_port(category, port)?;
+    if !was_running {
+        // 未运行：新端口已粘滞落盘，下次启动自然生效。不动代理、不碰客户端配置。
+        return Ok(port);
+    }
     proxy.stop(category);
     let bound = proxy.start(category).await?;
     // 用**真实绑定端口**而非请求端口：首选端口被占用时会回退，写错客户端就连不上。
@@ -2462,5 +2475,38 @@ mod tests {
             !import_summary(&report).contains("清理"),
             "没清理时不该凭空写一句"
         );
+    }
+
+    /// 改端口对**未运行**的分类只落盘，绝不顺手把代理启动、更不重写客户端配置。
+    ///
+    /// 钉住的是一条静默接入：旧实现无条件 `stop()` + `start()` + `tools::apply()`。
+    /// 用户从没启动过 Codex 代理（仍走官方 ChatGPT 登录），只是在设置里把端口号从
+    /// 47101 改成 47105，就会被静默接入 —— Codex 的 `auth.json` 被整份换成占位 key、
+    /// 原 OAuth 登录态被挪进 `.bak`，而界面只说了一句「端口已改」。
+    /// 更持久的后果：退出时 `snapshot_running_proxies` 把它记进 `proxy_running_categories`，
+    /// 此后每次开应用都自动拉起并重写配置，而用户从未点过「启动」。
+    #[tokio::test]
+    async fn changing_port_while_stopped_does_not_start_proxy() {
+        let (store, dir) = temp_store("port_while_stopped");
+        let proxy = std::sync::Arc::new(crate::proxy::ProxyManager::new(store.clone()));
+        let cat = CategoryType::Codex;
+
+        assert!(!proxy.is_running(cat), "前提：该分类代理未运行");
+
+        // 选一个不太可能被占的端口，避免与真实环境冲突。
+        let bound = set_proxy_port(&store, &proxy, cat, 47187).await.unwrap();
+
+        assert_eq!(bound, 47187, "未运行时应回报配置里的首选端口");
+        assert!(
+            !proxy.is_running(cat),
+            "改端口不得把未运行的代理静默启动（否则等于一次用户没同意的接入）"
+        );
+        assert_eq!(
+            store.get_settings().proxy_ports.get(&cat).copied(),
+            Some(47187),
+            "新端口仍必须粘滞落盘，下次启动生效"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
