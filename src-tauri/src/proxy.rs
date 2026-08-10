@@ -364,6 +364,34 @@ impl ProxyManager {
             crate::events::emit(crate::events::Topic::Proxy, Some(category));
         }
     }
+
+    /// 停掉**所有**分类的代理，返回实际停掉的分类数。退出应用时用。
+    ///
+    /// 与逐个 `stop()` 的区别，是刻意为「进程退出」这个场景设计的：
+    /// - **广播 shutdown 信号**再 abort —— 这一步是「优雅」的实质：已建立的连接会收到
+    ///   watch 变更、走 `select` 的关闭臂，让 hyper 正常收尾（客户端看到的是干净的连接结束，
+    ///   而非进程被杀时 socket 直接 RST 的「连接被重置」）。accept 循环随后 abort、端口释放。
+    /// - **不 emit 事件**：退出时前端窗口正在拆除，事件泵的接收端可能已经没了，emit 无意义；
+    ///   而逐个 `stop()` 会 emit（那是运行期用户操作，UI 还在）。
+    /// - **不还原客户端配置**：那是 FR-029 的取舍 —— 退出时快照「哪些在跑」，下次启动自动恢复；
+    ///   退出即还原会让下次启动多绕一圈重写，且中间有窗口期客户端指向死端口。
+    ///   调用方（退出处理块）必须**先做运行态快照、再调本函数**，否则快照读到的是空集。
+    pub fn stop_all(&self) -> usize {
+        // 一次性取走全部句柄，锁内只做 remove、不做 I/O。
+        let handles: Vec<RunningProxy> = {
+            let mut running = self.running.lock();
+            running.drain().map(|(_, p)| p).collect()
+        };
+        let n = handles.len();
+        for p in &handles {
+            // 先广播「关闭」，让在途连接走干净的收尾路径。
+            let _ = p.shutdown.send(true);
+        }
+        for p in handles {
+            p.handle.abort();
+        }
+        n
+    }
 }
 
 /// 处理一次下游工具请求：故障转移路由。
@@ -2637,6 +2665,37 @@ mod tests {
             all_failed_gate_remaining(&gate_key).is_none(),
             "停止代理也应清掉短路窗口"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `stop_all` 停净所有分类并如实计数；且它读的是**当前**运行集合，不受调用顺序影响。
+    ///
+    /// 这是退出优雅停机的实质。配套的**顺序不变量**（先快照 `is_running` 再 `stop_all`）
+    /// 在退出处理块里，靠本测试保证 `stop_all` 后 `is_running` 全为 false ——
+    /// 若谁把退出块的两步调换，快照就会读到空集、FR-029 下次啥都不恢复。
+    #[tokio::test]
+    async fn stop_all_stops_every_running_category_and_counts() {
+        let dir = temp_dir("stop_all");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let pm = ProxyManager::new(store.clone());
+
+        // 起两个分类（各自绑不同默认端口，互不冲突）。
+        pm.start(CategoryType::ClaudeCli).await.unwrap();
+        pm.start(CategoryType::Codex).await.unwrap();
+        assert!(pm.is_running(CategoryType::ClaudeCli));
+        assert!(pm.is_running(CategoryType::Codex));
+
+        let stopped = pm.stop_all();
+        assert_eq!(stopped, 2, "两个在跑的分类都应被停掉并计入");
+        assert!(!pm.is_running(CategoryType::ClaudeCli), "stop_all 后不得有残留");
+        assert!(!pm.is_running(CategoryType::Codex));
+        assert!(!pm.is_running(CategoryType::ClaudeDesktop));
+
+        // 幂等：全停之后再调返回 0，不 panic。
+        assert_eq!(pm.stop_all(), 0, "无在跑分类时应返回 0");
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -1324,7 +1324,25 @@ pub fn run() {
                 // 代理运行态快照：这是「下次启动恢复上次启用状态」的主要写入点 ——
                 // 周期性快照最多滞后 USAGE_FLUSH_INTERVAL_SECS，而用户「启动代理后立刻退出」
                 // 是很常见的操作，只靠周期性会漏掉。放在这里，正常退出必定记准。
+                //
+                // ⚠️ 顺序铁律：**先快照、再 stop_all**。快照读的是 `proxy.is_running(..)`，
+                // 一旦先停，读到的就是空集，FR-029 下次启动啥都不恢复 —— 优雅关闭反而把
+                // 「记住上次状态」这个功能弄坏了。
                 service::snapshot_running_proxies(&state.store, &state.proxy);
+
+                // 优雅停机：广播关闭信号让在途连接干净收尾，而非等进程被杀时 socket 直接 RST
+                // （客户端会看到「连接被重置」）。proxy 与 MCP 都是本进程的 tokio 任务，
+                // 进程结束时 OS 也会回收，但那是「硬拔」；这里主动停是为了：
+                //   1. 在途请求/SSE 流走正常收尾路径，客户端拿到干净的连接结束；
+                //   2. MCP stop() 顺带删掉 mcp-port 文件，不给下次启动留一个指向死端口的陈旧文件。
+                // **不还原客户端配置**：那是 FR-029 的取舍，退出即还原会让下次启动多绕一圈重写，
+                // 且中间有窗口期客户端指向死端口。下次启动会按上面的快照自动恢复。
+                let stopped = state.proxy.stop_all();
+                state.mcp.stop();
+                if stopped > 0 {
+                    tracing::info!("退出前已优雅停止 {stopped} 个分类的代理");
+                }
+
                 state.store.flush_logs();
                 let dropped = state.store.log_dropped_count();
                 if dropped > 0 {

@@ -90,6 +90,23 @@ fn read_mcp_port_file() -> Option<u16> {
     content.trim().parse::<u16>().ok()
 }
 
+/// 删掉端口文件。MCP 一停，这个文件就是**陈旧**的：stdio 子进程只有在主应用运行、
+/// HTTP MCP 在监听时才连得上，主应用一停/一退，文件里的端口就指向一个没人监听的地址。
+///
+/// 留着它的坏处是**误导**：下次主应用还没起、而 Codex 又拉起 stdio 子进程时，子进程会
+/// 读到这个旧端口、去连、失败 —— 本可以直接走「端口扫描兜底」少绕一圈。删掉它让
+/// 「文件存在」== 「主应用此刻确实在监听那个端口」这个不变量成立。
+/// 删除失败只告警：文件陈旧不致命，下次 `write_mcp_port_file` 会覆盖它。
+fn clear_mcp_port_file() {
+    let Some(path) = mcp_port_file_path() else { return };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        // 本来就不存在 = 已是期望状态，不算错。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("清理 MCP 端口文件失败({}): {e}", path.display()),
+    }
+}
+
 /// 端口占用时，向上探测的最大候选数（configured .. configured+FALLBACK_RANGE）。
 /// 9527 等常用端口在部分 Windows 机器上被系统进程（WUDFHost / GoodixSessionService 等）占用，
 /// 单端口硬绑定会静默失败，故自动向上找一个可用端口，并把真实端口暴露给 UI。
@@ -201,6 +218,8 @@ impl McpManager {
     pub fn stop(&self) {
         if let Some(r) = self.running.lock().take() {
             r.handle.abort();
+            // 端口文件与「服务在监听」绑定：停了就删，别留个指向死端口的文件误导 stdio 子进程。
+            clear_mcp_port_file();
             tracing::info!("MCP 服务器已停止");
         }
     }
@@ -867,6 +886,43 @@ fn tool_error_content(text: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 端口文件的写 → 读 → 清 往返，并钉住「清掉后再清不报错」（幂等）。
+    ///
+    /// `clear_mcp_port_file` 是优雅停机的一环：MCP 一停就删文件，让「文件存在」
+    /// == 「此刻真有 HTTP MCP 在监听那个端口」这个不变量成立，不给下次启动留个
+    /// 指向死端口的陈旧文件误导 stdio 子进程。
+    #[test]
+    fn mcp_port_file_write_read_clear_roundtrip() {
+        // 用真实路径解析（Windows=exe 同级、mac=Application Support）；测试二进制自己的
+        // 目录里写一个 mcp-port，不碰用户数据。若环境拿不到路径（极少见），跳过而非误判。
+        let Some(path) = mcp_port_file_path() else {
+            return;
+        };
+        // 先清干净，避免上一次遗留影响断言。
+        clear_mcp_port_file();
+
+        write_mcp_port_file(48123);
+        assert_eq!(
+            read_mcp_port_file(),
+            Some(48123),
+            "写入后应能读回同一端口"
+        );
+
+        clear_mcp_port_file();
+        assert_eq!(
+            read_mcp_port_file(),
+            None,
+            "清理后端口文件应消失（下次 stdio 子进程会退回端口扫描，而非连一个死端口）"
+        );
+
+        // 幂等：文件已不存在时再清一次不得报错/ panic。
+        clear_mcp_port_file();
+        assert_eq!(read_mcp_port_file(), None);
+
+        // 顺带确认文件真在盘上没了。
+        assert!(!path.exists(), "clear 之后文件不应还在: {}", path.display());
+    }
 
     // initialize 必须回显客户端请求的 protocolVersion（而非硬编码旧版）。
     // rmcp/Codex 协商更新版本时，服务器回显旧版会致握手不完整、tools/list 拿不到工具。
