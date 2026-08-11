@@ -24,6 +24,8 @@ mod upstream;
 /// 详见该文件的模块注释。
 #[cfg(test)]
 mod upstream_api_surface;
+/// 性能与内存实测探针（全 `#[ignore]`，不进常规测试；跑法见模块文档）。
+mod perf_probe;
 mod service;
 mod workdirs;
 
