@@ -6,6 +6,12 @@ import { Button } from "@/components/ui/Button";
 import { Combobox } from "@/components/ui/Combobox";
 import { BrandIcon } from "@/components/BrandIcon";
 import type { DesktopModelNameIssue, ModelInfo, ModelMapping, ProviderKey, Protocol } from "@/types";
+import {
+  type TokenUnit,
+  tokensFromAmount,
+  preferredUnit,
+  amountForUnit,
+} from "@/lib/tokenUnit";
 import { X, RefreshCw, Plus, Trash2, ArrowRight, Eye, EyeOff, Zap, Gauge, Brain, Download, AlertTriangle } from "lucide-react";
 
 interface KeyEditorProps {
@@ -855,63 +861,7 @@ function Field({
   );
 }
 
-/** 单位下拉的三档：token 原始数值 / 千（×1000）/ 百万（×1000000）。 */
-type TokenUnit = "token" | "K" | "M";
-
-const UNIT_MULTIPLIER: Record<TokenUnit, number> = { token: 1, K: 1_000, M: 1_000_000 };
-const UNIT_DECIMALS: Record<TokenUnit, number> = { token: 0, K: 3, M: 6 };
-/** 后端 `ModelInfo.context_window` 是 `Option<u32>`，前端必须同上限，不能等 IPC 反序列化才失败。 */
-const MAX_CONTEXT_TOKENS = 0xffff_ffff;
-
-/**
- * 精确地把十进制数值 + 单位换成整数 token，避免二进制浮点误差。
- *
- * 例如 JS 的 `1.000001 * 1_000_000` 实际是 `1000000.9999999999`；用 Number 乘完再
- * `isInteger` 会把合法的 1,000,001 token 判错。这里直接按十进制位数补零，绝不猜值。
- */
-function tokensFromAmount(raw: string, unit: TokenUnit): number | null {
-  const matched = /^(\d+)(?:\.(\d+))?$/.exec(raw.trim());
-  if (!matched) return null;
-
-  const whole = matched[1];
-  const fraction = (matched[2] ?? "").replace(/0+$/, "");
-  const decimals = UNIT_DECIMALS[unit];
-  if (fraction.length > decimals) return null; // 该精度会产生半个 token，拒绝而非四舍五入
-
-  const tokens = BigInt(whole) * BigInt(UNIT_MULTIPLIER[unit])
-    + BigInt((fraction + "0".repeat(decimals - fraction.length)) || "0");
-  if (tokens <= 0n || tokens > BigInt(MAX_CONTEXT_TOKENS)) return null;
-  return Number(tokens);
-}
-
-/** 为已有 token 数选择初始单位：按数量级选最大单位，允许精确小数回显。 */
-function preferredUnit(tokens: number | undefined): TokenUnit {
-  if (tokens === undefined) return "K"; // 上下文窗口通常是数十万，空值默认 K，直接填 200 即 200K
-  if (tokens >= 1_000_000) return "M";
-  if (tokens >= 1_000) return "K";
-  return "token";
-}
-
-/**
- * 按当前单位**无损**反算显示值。
- *
- * 不能用 `String(tokens / multiplier)`：接近 `Number.MAX_SAFE_INTEGER` 时二进制浮点
- * 会把 `9007199254740991 / 1000` 显示成 `9007199254740.99`，再解析就少 1 token。
- * 这里用 BigInt 做商余数、手工插十进制点，确保 `tokensFromAmount(amountForUnit(...))`
- * 对整个安全整数范围都严格往返。
- */
-function amountForUnit(tokens: number | undefined, unit: TokenUnit): string {
-  if (tokens === undefined) return "";
-  const divisor = BigInt(UNIT_MULTIPLIER[unit]);
-  const raw = BigInt(tokens);
-  const whole = raw / divisor;
-  const remainder = raw % divisor;
-  if (remainder === 0n) return String(whole);
-
-  const decimals = UNIT_DECIMALS[unit];
-  const fraction = remainder.toString().padStart(decimals, "0").replace(/0+$/, "");
-  return `${whole}.${fraction}`;
-}
+/** 单位换算与精确往返（`token`/`K`/`M`）抽到 [`@/lib/tokenUnit`] 便于单测（审计 A2-04）。 */
 
 /**
  * 上下文窗口输入：数值框 + 单位下拉，替代早期「一个框里既能填纯数字又能填 200k/1M」的设计
