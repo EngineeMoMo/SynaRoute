@@ -1348,29 +1348,36 @@ async fn try_stream_to_key(
     let client = crate::upstream::shared_client();
 
     // 请求头统一由 apply_upstream_headers 装齐（与非流式路径共用同一实现，防两条路径分叉）。
-    // 流式**不设总超时**，避免长回答被掐断——故这里不调 .timeout()。
+    // **不在 RequestBuilder 上调 `.timeout()`**：reqwest 的那个超时覆盖「整个请求含读完 body」，
+    // 对 SSE 流等于给长回答设了硬上限，会把回答截断。流式的超时只能套在**探头阶段**，
+    // 见下面的 `probe_to`。
     let rb = apply_upstream_headers(client.post(&url).json(&payload), key, &secret, fwd_headers, &real_model);
 
-    // 故障转移预算**只约束这个探头阶段**（等上游返回响应头/状态码）。
+    // 探头阶段超时 = min(Key 自身超时, 故障转移剩余预算)，与非流式的 `effective_to` 同口径。
     //
-    // 为什么不能把预算套在整个流上：一旦 2xx 开始转发 SSE，掐断就等于把长回答截断——
-    // 那是本项目刻意避免的行为（同函数上方 `:1188` 注释：流式不设总超时）。而探头阶段
-    // 本身不产出内容、卡住只是白等，用预算约束它既能让故障转移及时进入下一个候选，
-    // 又不影响已建立的流。预算关闭（None）时行为与改动前完全一致。
+    // **只约束探头阶段**（等上游返回响应头/状态码），拿到 2xx 之后一律不再设超时：
+    // 一旦开始转发 SSE，掐断就等于把长回答截断——那是本项目刻意避免的行为。
+    // 而探头阶段不产出任何内容、卡住只是白等，超时让故障转移及时进入下一个候选。
+    //
+    // 为什么必须把 `key_timeout` 也算进来（本轮修的缺口）：此前这里**只用 budget_left**，
+    // 于是 ① 用户为该 Key 设的超时（如 10s）对流式完全无效，仍要等满 90s 总预算；
+    // ② 更糟的是把总预算设成 0（关闭）时 `budget_left` 为 None，流式探头**没有任何超时**
+    // ——上游连上却不回响应头就永久挂着，直到 TCP 自己断。而 Claude Code / Codex 默认都发
+    // `stream:true`，这是主路径。用户为了「别掐断长回答」去关总预算，恰恰会踩中这个组合。
+    let key_to = crate::upstream::key_timeout(key);
+    let probe_to = match budget_left {
+        Some(b) => key_to.min(b),
+        None => key_to,
+    };
     let send_fut = rb.send();
-    let resp = match budget_left {
-        Some(b) => match tokio::time::timeout(b, send_fut).await {
-            Ok(r) => r.map_err(|e| AppError::upstream_msg(format!("连接 {url} 失败: {e}")))?,
-            Err(_) => {
-                return Err(AppError::upstream_msg(format!(
-                    "连接 {url} 超时（故障转移剩余预算 {}ms 内未拿到响应头）",
-                    b.as_millis()
-                )))
-            }
-        },
-        None => send_fut
-            .await
-            .map_err(|e| AppError::upstream_msg(format!("连接 {url} 失败: {e}")))?,
+    let resp = match tokio::time::timeout(probe_to, send_fut).await {
+        Ok(r) => r.map_err(|e| AppError::upstream_msg(format!("连接 {url} 失败: {e}")))?,
+        Err(_) => {
+            return Err(AppError::upstream_msg(format!(
+                "连接 {url} 超时（{}ms 内未拿到响应头）",
+                probe_to.as_millis()
+            )))
+        }
     };
     let status = resp.status();
 
@@ -1911,7 +1918,10 @@ async fn forward_to_key(
     // 本次请求的超时 = min(Key 自身超时, 故障转移剩余预算)。
     // 取小值：既不让一个慢 Key 吃光整池预算（那会让后续候选无机会尝试），
     // 也不放宽用户为该 Key 设的上限。预算关闭时退化为纯 Key 超时（旧行为）。
-    let key_to = std::time::Duration::from_millis(key.params.timeout_ms.unwrap_or(30_000));
+    // 与流式探头阶段共用同一口径：`key_timeout` 是 per-Key 超时的**唯一事实来源**。
+    // 别在这里重新写一遍 `unwrap_or(30_000)` —— 两处各写一遍就是「改了默认值只生效一半」
+    // 的经典分叉（流式改了、非流式没改，或反之）。
+    let key_to = crate::upstream::key_timeout(key);
     let effective_to = match budget_left {
         Some(b) => key_to.min(b),
         None => key_to,
@@ -3182,6 +3192,71 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(3),
             "预算应阻止继续遍历剩余候选，实测耗时 {elapsed:?}（无预算时约 4.5s）"
+        );
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **流式**探头阶段必须受 per-Key 超时约束 —— 即便故障转移总预算被关闭。
+    ///
+    /// 钉住的缺口：`try_stream_to_key` 此前只用 `budget_left` 兜探头阶段、完全不读
+    /// `key.params.timeout_ms`。于是：
+    /// - 用户为该 Key 设的超时（这里 800ms）对流式**完全无效**；
+    /// - 把总预算设成 0（关闭）时 `budget_left` 为 None，流式探头**没有任何响应超时**，
+    ///   上游连上却不回响应头就永久挂着，直到 TCP 自己断。
+    ///
+    /// 而 Claude Code / Codex 默认都发 `stream:true`，这是主路径；用户为了「别掐断长回答」
+    /// 去关总预算，恰恰会踩中这个组合。
+    ///
+    /// 判据：预算关闭 + 上游卡 10s 不回响应头 + Key 超时 800ms →
+    /// 必须在秒级内以失败收场（两个候选各 800ms），而不是挂满 10s。
+    #[tokio::test]
+    async fn streaming_probe_honors_key_timeout_even_without_budget() {
+        // 上游收到请求后卡 10s 才回（模拟「连上了但不回响应头」）
+        let stuck = spawn_slow_mock(10_000, 200, r#"{"ok":true}"#).await;
+
+        let dir = temp_dir("stream_probe_to");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        for i in 0..2 {
+            let mut k = key(&format!("k{i}"), i, &stuck);
+            k.params.timeout_ms = Some(800); // 每个候选自身超时 800ms
+            store.upsert_key(k).unwrap();
+            store.secrets.write().set(&format!("k{i}"), "x").unwrap();
+        }
+        // **关闭**总预算：这正是缺口最致命的配置（旧实现此时流式无任何超时）
+        let mut s = store.get_settings();
+        s.failover_total_budget_ms = 0;
+        store.save_settings(UserPrefs::from(&s)).unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+
+        let t0 = std::time::Instant::now();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            // stream:true → 走 try_stream_to_key（本用例要测的那条路径）
+            .json(&json!({
+                "model":"m","max_tokens":10,"stream":true,
+                "messages":[{"role":"user","content":"hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        let elapsed = t0.elapsed();
+
+        assert_eq!(
+            resp.status().as_u16(),
+            529,
+            "两个候选都探头超时 → 应如实返回 529，不能假装成功"
+        );
+        // 2 个候选各 800ms ≈ 1.6s。旧实现（预算关闭时无超时）会挂到上游 10s 才回。
+        // 取 5s 上限：既能证明「per-Key 超时真的生效了」，又给 CI 抖动留足余量。
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "流式探头必须受 per-Key 超时约束，实测 {elapsed:?}（旧实现约 10s）"
         );
 
         pm.stop(CategoryType::ClaudeCli);
