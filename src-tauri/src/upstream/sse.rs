@@ -219,6 +219,7 @@ impl SseTranslator {
             // 翻译器不累积 cache_read：它只在能翻译的字段上做搬运，缓存命中数各协议表述不一，
             // 硬凑会记出个假数。同协议直通那条路能拿到（原样解析上游 JSON），此处留 0。
             cache_read: 0,
+            cache_creation: 0,
         })
     }
 

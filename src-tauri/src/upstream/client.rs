@@ -154,14 +154,20 @@ pub(super) fn apply_auth(
     req
 }
 
-/// 为聚合成员/决策者的**自建请求**注入客户端身份头（User-Agent 等）。
+/// 为**自建请求**注入客户端身份头（User-Agent 等）。
 ///
 /// 为什么需要：透传路径会转发下游客户端（Claude Code / Codex）的原始 UA/x-app 等头，
-/// 部分中转渠道靠这些做客户端准入校验。但聚合调用是本应用自建请求，若不带任何客户端标识，
+/// 部分中转渠道靠这些做客户端准入校验。但自建请求若不带任何客户端标识，
 /// 会被这类渠道判为 `detected: unknown` 而 403（channel:client_restricted）。这里按协议
-/// 补一个与官方客户端一致的 UA（及 Anthropic 的 anthropic-beta / x-app），使聚合请求也能
+/// 补一个与官方客户端一致的 UA（及 Anthropic 的 anthropic-beta / x-app），使自建请求也能
 /// 通过客户端准入。仅注入身份头，不动鉴权与业务字段。
-pub(super) fn apply_client_identity(
+///
+/// **凡是本应用自建的上游请求都要过这一道**，目前三类调用方：
+/// 聚合成员/决策者（`completion.rs`）、工具会话（`session.rs`）、
+/// 余额查询（`balance.rs`）。余额查询就是漏了它才被中转站 403 —— 同一个坑踩了第二次，
+/// 故把可见性从 `pub(super)` 提到 `pub`（`balance` 在 upstream 外面），
+/// 并登记进 `upstream_api_surface` 守卫，让它成为有名有姓的对外契约。
+pub fn apply_client_identity(
     req: reqwest::RequestBuilder,
     protocol: Protocol,
 ) -> reqwest::RequestBuilder {

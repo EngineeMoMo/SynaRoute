@@ -44,6 +44,7 @@ fn public_functions_stay_reachable() {
     let _ = crate::upstream::extract_usage;
     let _ = crate::upstream::join_endpoint;
     let _ = crate::upstream::shared_client;
+    let _ = crate::upstream::apply_client_identity;
     let _ = crate::upstream::sse_direction;
     let _ = crate::upstream::collect_tool_namespaces;
     let _ = crate::upstream::collect_custom_tools;

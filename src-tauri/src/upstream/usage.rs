@@ -19,7 +19,7 @@ pub use crate::model::TokenUsage;
 
 /// 从上游响应体里提取 token 用量，**同时兼容两家协议**的字段名。
 ///
-/// Anthropic: `usage.{input_tokens, output_tokens, cache_read_input_tokens}`
+/// Anthropic: `usage.{input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens}`
 /// OpenAI:    `usage.{prompt_tokens, completion_tokens}`（缓存在
 ///            `prompt_tokens_details.cached_tokens`）
 ///
@@ -32,7 +32,7 @@ pub fn extract_usage(body: &Value) -> Option<TokenUsage> {
             .find_map(|k| u.get(*k).and_then(|v| v.as_u64()))
             .unwrap_or(0)
     };
-    let cache = u
+    let cache_read = u
         .get("cache_read_input_tokens")
         .and_then(|v| v.as_u64())
         .or_else(|| {
@@ -41,10 +41,15 @@ pub fn extract_usage(body: &Value) -> Option<TokenUsage> {
                 .and_then(|v| v.as_u64())
         })
         .unwrap_or(0);
+    let cache_creation = u
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let usage = TokenUsage {
         input: num(&["input_tokens", "prompt_tokens"]),
         output: num(&["output_tokens", "completion_tokens"]),
-        cache_read: cache,
+        cache_read,
+        cache_creation,
     };
     (!usage.is_empty()).then_some(usage)
 }
@@ -74,6 +79,7 @@ pub fn extract_usage_from_sse(sse: &str) -> Option<TokenUsage> {
                 acc.input = acc.input.max(u.input);
                 acc.output = acc.output.max(u.output);
                 acc.cache_read = acc.cache_read.max(u.cache_read);
+                acc.cache_creation = acc.cache_creation.max(u.cache_creation);
             }
         }
     }
@@ -135,15 +141,20 @@ mod tests {
     /// 两家协议的 usage 字段名不同，必须都能取到 —— 取不到就等于用户看不到额度消耗。
     #[test]
     fn extract_usage_handles_both_protocol_field_names() {
-        // Anthropic
+        // Anthropic（含缓存创建字段）
         let a = serde_json::json!({
-            "usage": { "input_tokens": 1200, "output_tokens": 340, "cache_read_input_tokens": 900 }
+            "usage": {
+                "input_tokens": 1200,
+                "output_tokens": 340,
+                "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": 150
+            }
         });
         let u = extract_usage(&a).expect("Anthropic usage 应能取到");
-        assert_eq!((u.input, u.output, u.cache_read), (1200, 340, 900));
+        assert_eq!((u.input, u.output, u.cache_read, u.cache_creation), (1200, 340, 900, 150));
         assert_eq!(u.total(), 1540);
 
-        // OpenAI（缓存在 prompt_tokens_details.cached_tokens 里）
+        // OpenAI（缓存在 prompt_tokens_details.cached_tokens 里，无 cache_creation 等价字段）
         let o = serde_json::json!({
             "usage": {
                 "prompt_tokens": 800,
@@ -153,7 +164,7 @@ mod tests {
             }
         });
         let u = extract_usage(&o).expect("OpenAI usage 应能取到");
-        assert_eq!((u.input, u.output, u.cache_read), (800, 120, 512));
+        assert_eq!((u.input, u.output, u.cache_read, u.cache_creation), (800, 120, 512, 0));
 
         // 上游没给 usage → None（不是 0）。写 0 会让日志显示「本次 0 token」，看着像 bug。
         assert!(extract_usage(&serde_json::json!({ "content": [] })).is_none());
@@ -195,17 +206,20 @@ data: [DONE]\n";
 
     #[test]
     fn token_usage_add_and_format() {
-        let mut a = TokenUsage { input: 1200, output: 340, cache_read: 0 };
-        a.add(&TokenUsage { input: 800, output: 60, cache_read: 500 });
-        assert_eq!((a.input, a.output, a.cache_read), (2000, 400, 500));
+        let mut a = TokenUsage { input: 1200, output: 340, cache_read: 0, cache_creation: 0 };
+        a.add(&TokenUsage { input: 800, output: 60, cache_read: 500, cache_creation: 150 });
+        assert_eq!((a.input, a.output, a.cache_read, a.cache_creation), (2000, 400, 500, 150));
         // 展示：≥10k 用 k 缩写，缓存不为 0 才附加
         assert_eq!(
-            TokenUsage { input: 12_345, output: 400, cache_read: 0 }.fmt_compact(),
+            TokenUsage { input: 12_345, output: 400, cache_read: 0, cache_creation: 0 }.fmt_compact(),
             "↑12.3k ↓400"
         );
-        assert!(TokenUsage { input: 10, output: 2, cache_read: 900 }
+        assert!(TokenUsage { input: 10, output: 2, cache_read: 900, cache_creation: 0 }
             .fmt_compact()
             .contains("缓存900"));
+        assert!(TokenUsage { input: 10, output: 2, cache_read: 0, cache_creation: 300 }
+            .fmt_compact()
+            .contains("写缓存300"));
         assert!(TokenUsage::default().is_empty());
     }
 }

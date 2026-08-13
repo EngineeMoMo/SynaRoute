@@ -31,6 +31,8 @@ mod util;
 pub use client::shared_client;
 /// 转发用的 per-Key 响应超时。流式探头阶段与非流式共用同一口径（见 proxy.rs 两处调用）。
 pub use client::key_timeout;
+/// 自建请求的客户端身份头（UA 等）。缺它会被部分中转渠道判 `detected: unknown` 而 403。
+pub use client::apply_client_identity;
 pub use completion::text_completion;
 pub use discovery::fetch_models;
 pub use probe::{health_probe, health_probe_real};
