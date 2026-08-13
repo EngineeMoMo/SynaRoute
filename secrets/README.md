@@ -28,6 +28,12 @@ updater 会把它当作正品安装。签名是用户与伪造更新之间唯一
 gpg -d secrets/synaroute.key.gpg > ~/.tauri/synaroute.key
 ```
 
+> ⚠️ **必须在 Git Bash 里跑。** `gpg` 是 Git for Windows 自带的，装在
+> `<Git 安装目录>\usr\bin\gpg.exe`，而 Git 只把 `cmd\` 加进 PATH、**不加 `usr\bin`** ——
+> 所以 CMD / PowerShell 里会报「gpg 不是内部或外部命令」。
+> 非要在 CMD 里跑就写全路径（旧机器是 `F:\Git\usr\bin\gpg.exe`，新机器按实际安装位置）。
+> 也就是说：**只要装了 Git，就已经有 gpg 了**，不需要单独装 GnuPG。
+
 还原后验证公钥指纹与 `src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey` 配对，
 再按 [docs/18](../docs/18-重装系统开发环境清单.md) §3.4 设 `TAURI_SIGNING_PRIVATE_KEY`。
 
