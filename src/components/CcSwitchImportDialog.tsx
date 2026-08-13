@@ -3,14 +3,22 @@ import { api } from "@/lib/bridge";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 import { AlertTriangle, Database, Loader2, X } from "lucide-react";
+import { useT } from "@/lib/useT";
+import type { TFunc } from "@/lib/i18n";
 import type { CcSwitchCandidate, CcSwitchImportReport, CcSwitchScanResult } from "@/types";
 
-/** 分类 → 中文名（与侧栏口径一致） */
-const CATEGORY_LABEL: Record<string, string> = {
-  "claude-cli": "Claude CLI",
-  "claude-desktop": "Claude 桌面端",
-  codex: "Codex",
-};
+/**
+ * 分类 → 显示名。**走 `nav.*` 词条，不在本文件里写字面量**。
+ *
+ * 原先这里硬编码着「Claude 桌面端」之类的中文，于是英文界面下候选行的分类徽标是中文、
+ * 而侧栏同一个东西是英文。复用 `nav.*` 也顺带保证两处永远一致（日后改名不会漏掉这里）。
+ *
+ * 认不出的分类 id 原样回显，而不是显示空白 —— 那样用户至少知道是哪个 id 没被识别。
+ */
+function categoryLabel(t: TFunc, id: string): string {
+  const label = t(`nav.${id}`);
+  return label === `nav.${id}` ? id : label;
+}
 
 /**
  * 从 cc-switch 导入历史 Key。
@@ -30,6 +38,7 @@ export function CcSwitchImportDialog({ onClose, onImported }: {
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [importing, setImporting] = useState(false);
   const [report, setReport] = useState<CcSwitchImportReport | null>(null);
+  const t = useT();
 
   useEffect(() => {
     let alive = true;
@@ -81,12 +90,12 @@ export function CcSwitchImportDialog({ onClose, onImported }: {
         <header className="flex items-center justify-between border-b border-border px-5 py-4">
           <div className="flex items-center gap-2">
             <Database size={18} className="text-text-secondary" />
-            <h2 className="text-base font-semibold text-text-primary">从 cc-switch 导入 Key</h2>
+            <h2 className="text-base font-semibold text-text-primary">{t("ccswitch.title")}</h2>
           </div>
           <button
             onClick={onClose}
             className="rounded p-1 text-text-secondary hover:bg-surface-hover"
-            aria-label="关闭"
+            aria-label={t("common.close")}
           >
             <X size={18} />
           </button>
@@ -95,7 +104,7 @@ export function CcSwitchImportDialog({ onClose, onImported }: {
         <div className="flex-1 overflow-y-auto px-5 py-4">
           {loading && (
             <div className="flex items-center gap-2 py-8 text-sm text-text-secondary">
-              <Loader2 size={16} className="animate-spin" /> 正在读取 cc-switch 配置库…
+              <Loader2 size={16} className="animate-spin" /> {t("ccswitch.scanning")}
             </div>
           )}
 
@@ -109,7 +118,11 @@ export function CcSwitchImportDialog({ onClose, onImported }: {
           {report && (
             <div className="mb-4 rounded border border-border bg-surface-hover p-3 text-sm">
               <div className="font-medium text-text-primary">
-                导入完成：成功 {report.imported} · 跳过 {report.skipped} · 失败 {report.failed}
+                {t("ccswitch.reportSummary", {
+                  ok: report.imported,
+                  skipped: report.skipped,
+                  failed: report.failed,
+                })}
               </div>
               <ul className="mt-2 space-y-1 text-xs text-text-secondary">
                 {report.outcomes.map((o) => (
@@ -118,26 +131,28 @@ export function CcSwitchImportDialog({ onClose, onImported }: {
                   </li>
                 ))}
               </ul>
-              <p className="mt-2 text-xs text-text-secondary">
-                已导入的 Key 尚<strong>未接入</strong>任何客户端配置。需要接入时在对应分类里点「接入」。
-              </p>
+              {/* 原文用 <strong> 强调「未接入」。改走词条后不能再夹 JSX 标签，
+                  故把强调交给整句语气（词条里写明「不会自动生效」），
+                  否则两种语言各要一套 JSX 拼装，日后必然漂移。 */}
+              <p className="mt-2 text-xs text-text-secondary">{t("ccswitch.notAppliedNote")}</p>
             </div>
           )}
 
           {scan && !report && (
             <>
               <p className="mb-3 break-all text-xs text-text-secondary">
-                数据来源：{scan.dbPath}（只读，不会修改 cc-switch 的任何数据）
+                {t("ccswitch.source", { path: scan.dbPath })}
               </p>
 
               {importable.length === 0 && (
-                <p className="py-4 text-sm text-text-secondary">没有可导入的档。</p>
+                <p className="py-4 text-sm text-text-secondary">{t("ccswitch.nothingToImport")}</p>
               )}
 
               {importable.map((c) => (
                 <CandidateRow
                   key={c.sourceId}
                   c={c}
+                  t={t}
                   checked={picked.has(c.sourceId)}
                   onToggle={() => toggle(c.sourceId)}
                 />
@@ -146,7 +161,7 @@ export function CcSwitchImportDialog({ onClose, onImported }: {
               {blocked.length > 0 && (
                 <details className="mt-4">
                   <summary className="cursor-pointer text-sm text-text-secondary">
-                    不可导入 {blocked.length} 条（官方登录档 / 已存在 / 暂不支持的端）
+                    {t("ccswitch.blockedSummary", { n: blocked.length })}
                   </summary>
                   <div className="mt-2 space-y-2">
                     {blocked.map((c) => (
@@ -168,15 +183,17 @@ export function CcSwitchImportDialog({ onClose, onImported }: {
 
         <footer className="flex items-center justify-between border-t border-border px-5 py-3">
           <span className="text-xs text-text-secondary">
-            {report ? "可关闭本窗口" : `已选 ${picked.size} / 可导入 ${importable.length}`}
+            {report
+              ? t("ccswitch.canClose")
+              : t("ccswitch.pickedCount", { n: picked.size, total: importable.length })}
           </span>
           <div className="flex gap-2">
             <Button variant="secondary" onClick={onClose}>
-              {report ? "关闭" : "取消"}
+              {report ? t("common.close") : t("common.cancel")}
             </Button>
             {!report && (
               <Button onClick={doImport} disabled={picked.size === 0 || importing}>
-                {importing ? "导入中…" : `导入选中 ${picked.size} 条`}
+                {importing ? t("ccswitch.importing") : t("ccswitch.importN", { n: picked.size })}
               </Button>
             )}
           </div>
@@ -186,8 +203,10 @@ export function CcSwitchImportDialog({ onClose, onImported }: {
   );
 }
 
-function CandidateRow({ c, checked, onToggle }: {
+function CandidateRow({ c, t, checked, onToggle }: {
   c: CcSwitchCandidate;
+  /** 从父组件传入而非各自 `useT()`：本组件按候选条数渲染 N 份，没必要每份都建一次 */
+  t: TFunc;
   checked: boolean;
   onToggle: () => void;
 }) {
@@ -197,13 +216,16 @@ function CandidateRow({ c, checked, onToggle }: {
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-2">
           <span className="font-medium text-text-primary">{c.name}</span>
-          <Badge variant="neutral">{CATEGORY_LABEL[c.categoryId ?? ""] ?? c.appType}</Badge>
+          {/* 认不出分类时退回 appType（后端原样给的串），不显示空徽标 */}
+          <Badge variant="neutral">
+            {c.categoryId ? categoryLabel(t, c.categoryId) : c.appType}
+          </Badge>
           {c.protocol && <Badge variant="neutral">{c.protocol}</Badge>}
-          {c.isCurrent && <Badge variant="success">cc-switch 当前生效</Badge>}
+          {c.isCurrent && <Badge variant="success">{t("ccswitch.isCurrent")}</Badge>}
         </div>
         <div className="mt-1 break-all text-xs text-text-secondary">
           {c.baseUrl}
-          {c.defaultModel && <> · 默认模型 {c.defaultModel}</>}
+          {c.defaultModel && <> · {t("ccswitch.defaultModel", { name: c.defaultModel })}</>}
         </div>
         <div className="mt-0.5 font-mono text-xs text-text-secondary">{c.secretMasked}</div>
       </div>
