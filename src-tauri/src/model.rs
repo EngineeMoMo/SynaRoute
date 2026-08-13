@@ -1830,10 +1830,18 @@ pub struct UserPrefs {
     pub aggregate_trace_enabled: bool,
     #[serde(default = "default_true")]
     pub tray_model_switch_enabled: bool,
-    #[serde(default)]
-    pub floating_widget_enabled: bool,
-    #[serde(default)]
-    pub floating_widget_always_on_top: bool,
+    // ⚠️ **悬浮球那两个字段刻意不在这里**（`floating_widget_enabled` /
+    // `floating_widget_always_on_top`）。它们带窗口副作用，由专用命令
+    // `set_floating_widget` / `set_floating_pinned` 管。
+    //
+    // 曾经在这里，是个**静默关掉用户开关**的缺陷：前端 `prefs.ts` 的白名单里
+    // 从来没有这两个键（那侧的注释也写着「不在白名单里」），于是每次 `saveSettings`
+    // 提交的 JSON 都缺键 → `#[serde(default)]` 补成 false → `apply_to` 把它们
+    // 写成 false。表现为「切一下主题/语言，开着的悬浮球就没了」，而用户完全不知道
+    // 是那个动作干的。与自启动那条 P0 同类，方向相反。
+    //
+    // 判据：本结构体的字段集必须与 `src/lib/prefs.ts` 的 `pickPrefs` 逐字段对齐。
+    // 加字段时先问「前端白名单里有吗」——没有就不该加到这里。
 }
 
 impl UserPrefs {
@@ -1855,8 +1863,8 @@ impl UserPrefs {
         s.health_probe_test_messages = self.health_probe_test_messages;
         s.aggregate_trace_enabled = self.aggregate_trace_enabled;
         s.tray_model_switch_enabled = self.tray_model_switch_enabled;
-        s.floating_widget_enabled = self.floating_widget_enabled;
-        s.floating_widget_always_on_top = self.floating_widget_always_on_top;
+        // 悬浮球两个开关**刻意不赋值**：它们不在 UserPrefs 里（理由见该结构体的注释）。
+        // 别"顺手补上"——补上就等于把那个静默关开关的缺陷再装回来。
     }
 }
 
@@ -1876,8 +1884,6 @@ impl From<&AppSettings> for UserPrefs {
             health_probe_test_messages: s.health_probe_test_messages.clone(),
             aggregate_trace_enabled: s.aggregate_trace_enabled,
             tray_model_switch_enabled: s.tray_model_switch_enabled,
-            floating_widget_enabled: s.floating_widget_enabled,
-            floating_widget_always_on_top: s.floating_widget_always_on_top,
         }
     }
 }
@@ -1947,6 +1953,47 @@ pub struct AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 带窗口/系统副作用的开关**不能**被批量 `save_settings` 改动。
+    ///
+    /// 钉的是一个真实发生过的缺陷：`floating_widget_enabled` 与
+    /// `floating_widget_always_on_top` 曾在 `UserPrefs` 里，而前端 `prefs.ts` 的白名单
+    /// 从来没有这两个键 —— 于是每次 saveSettings 提交的 JSON 都缺键，serde 补成 false，
+    /// `apply_to` 把用户开着的悬浮球静默关掉。表现为「切一下主题，悬浮球就没了」。
+    ///
+    /// 判据刻意用**前端会真实发出的那种 JSON**（缺这些键）走一遍完整往返，
+    /// 而不是直接断言结构体没有该字段 —— 后者在字段被加回来时才失败，
+    /// 而这个在「加回来 且 前端没同步补键」时就失败，正是缺陷的真实形状。
+    #[test]
+    fn batch_save_settings_never_touches_side_effect_toggles() {
+        // 用户已通过专用命令开启的状态。用结构体更新语法而非「先 default 再逐个赋值」：
+        // 后者会触发 clippy 的 field_reassign_with_default，而本仓基线是零警告。
+        let mut s = AppSettings {
+            floating_widget_enabled: true,
+            floating_widget_always_on_top: true,
+            auto_start: true,
+            ..Default::default()
+        };
+
+        // 前端真实提交的形态：只有白名单里的键。这里刻意只给一个键，
+        // 其余全靠 serde 默认 —— 这正是「缺键」的最坏情况。
+        let wire = serde_json::json!({ "theme": "dark" });
+        let prefs: UserPrefs = serde_json::from_value(wire).expect("UserPrefs 应能容忍缺键");
+        prefs.apply_to(&mut s);
+
+        assert!(
+            s.floating_widget_enabled,
+            "批量保存把悬浮球开关关掉了 —— 它必须只由 set_floating_widget 改"
+        );
+        assert!(
+            s.floating_widget_always_on_top,
+            "批量保存把悬浮球置顶关掉了 —— 它必须只由 set_floating_pinned 改"
+        );
+        assert!(
+            s.auto_start,
+            "批量保存把开机自启动关掉了 —— 那是已修过的 P0，不能回归"
+        );
+    }
 
     /// 表里的 wire_id 必须与 serde 的 rename 完全一致（P2-8）。
     ///
