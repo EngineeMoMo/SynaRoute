@@ -4,8 +4,15 @@
 use serde::{Deserialize, Serialize};
 
 /// 三个目标工具分类
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+///
+/// `Default` = `ClaudeCli`，**仅为 `ProviderKey::default()` 的测试便利**而存在
+/// （见该结构的文档）。业务逻辑里绝不要依赖这个默认值 —— 分类必须来自用户选择，
+/// 猜错会把 Key 写进错误的客户端配置。
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub enum CategoryType {
+    #[default]
     #[serde(rename = "claude-cli")]
     ClaudeCli,
     #[serde(rename = "claude-desktop")]
@@ -110,8 +117,11 @@ impl CategoryType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// `Default` = `Anthropic`，理由同 [`CategoryType`]：只为测试构造便利，
+/// 业务侧的协议必须来自用户配置或厂商预设（猜错会用错端点与鉴权头）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Protocol {
+    #[default]
     #[serde(rename = "anthropic")]
     Anthropic,
     /// OpenAI Chat Completions（messages[]/choices，端点 /chat/completions）。
@@ -368,7 +378,12 @@ impl Default for HealthState {
 
 /// 单条厂商 Key。注意：密钥本身不在此结构里（存于加密库，见 secret 模块），
 /// 仅用 has_secret 标记是否已配置，避免密钥经 IPC 下发到前端（NFR-006）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` 是为测试便利加的（`ProviderKey { id: ..., ..Default::default() }`）：
+/// 这个结构已有 20 个字段，每加一个就要改动散落各处的测试构造点。
+/// **生产代码不要用 `Default`** —— `category_id` / `protocol` 的默认值没有业务含义，
+/// 真实 Key 一律经 `KeyEditor` 或导入路径构造。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderKey {
     pub id: String,
@@ -406,6 +421,165 @@ pub struct ProviderKey {
     pub tier_opus: Option<String>,
     #[serde(default)]
     pub health: HealthState,
+    /// 余额查询配置（可选）。`None` = 该 Key 未配置余额查询。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_query: Option<BalanceQuery>,
+    /// 计费倍率（如 `"0.3"` = 官方价三折）。中转站普遍按官方价打折计费。
+    ///
+    /// 存字符串而非 f64：它会参与金额计算，而 JSON 里的 `0.3` 反序列化成 f64 后
+    /// 再序列化可能变 `0.30000000000000004`，用户在界面上看到这种数字会以为程序坏了。
+    /// 真正参与运算时才 parse 一次（见 `pricing::calculate_cost_nano`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_multiplier: Option<String>,
+}
+
+/// 余额查询配置（对齐 cc-switch 的 `usage_script`，但不执行用户代码）。
+///
+/// cc-switch 让用户写 JavaScript 并内置引擎执行；SynaRoute 改为**声明式**：
+/// 由 Rust 发请求 + 按候选字段名递归提取。理由见
+/// `docs/17-用量查询与悬浮窗方案.md` §2.1 —— 内置 JS 引擎等于开一个任意代码
+/// 执行入口，而实测 cc-switch 自己的「通用模板」提取逻辑就是几个 `??` 回退，
+/// 声明式完全覆盖。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceQuery {
+    /// 总开关。关闭时不发任何请求（用户可保留配置但暂停查询）。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 预设模板 id：`generic` / `newapi` / `deepseek` / `official` / `custom`。
+    /// 仅用于界面回显「用户当初选了哪个模板」，实际请求只看下面的字段。
+    #[serde(default)]
+    pub template: String,
+    /// 请求路径，支持 `{{baseUrl}}` / `{{apiKey}}` 占位符。
+    pub url: String,
+    /// HTTP 方法（默认 GET）。
+    #[serde(default)]
+    pub method: String,
+    /// 认证头形态：`bearer` / `x-api-key` / `none`。
+    #[serde(default)]
+    pub auth: String,
+    /// 覆盖 baseUrl（留空 = 用本 Key 的 `base_url`）。
+    ///
+    /// 存在的必要性：部分中转站的计费面板与转发端点**不同域**
+    /// （转发在 `api.foo.com`，余额在 `panel.foo.com`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url_override: Option<String>,
+    /// 覆盖密钥的**密钥库键名**（留空 = 用本 Key 自己的密钥）。
+    ///
+    /// 只存键名不存明文：明文一律进 `secrets.enc`，配置文件里不落密钥
+    /// （cc-switch 的 `usage_script.apiKey` 是明文落库的，这里刻意不照搬）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_ref: Option<String>,
+    /// 超时（秒）。0 或缺省 → `DEFAULT_BALANCE_TIMEOUT_SECS`。
+    #[serde(default)]
+    pub timeout_secs: u32,
+    /// 自动查询间隔（分钟）。`0` = 不自动查，只在用户点刷新时查。
+    #[serde(default)]
+    pub auto_interval_min: u32,
+    /// 自定义取值路径（点分，支持数组下标如 `"balance_infos.0.total_balance"`）。
+    /// 留空 = 走内置候选链自动探测。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_path: Option<String>,
+    /// NewAPI 类面板的 access token（对应 `{{accessToken}}` 占位符）。
+    ///
+    /// 与 API Key 分开：NewAPI 的用量接口认的是**面板登录态**，不是转发用的 API Key。
+    /// 明文存在配置里 —— 它不是转发凭据、权限仅限查自己的用量面板，
+    /// 与 API Key 不同级；真要藏可留空并改用自定义模板。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+    /// NewAPI 类面板的用户 id（对应 `{{userId}}` 占位符，也用于 `New-Api-User` 头）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+}
+
+impl Default for BalanceQuery {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            template: "generic".into(),
+            // 与 cc-switch 通用模板**逐字一致**（其文档 §2.5：`url: "{{baseUrl}}/user/balance"`）。
+            //
+            // 此前这里写的是 `/v1/usage` —— 那是我从某个站的**自定义脚本**里读到的路径，
+            // 误当成了通用默认值，导致新用户一开开关就 404。对齐官方模板才是正确起点。
+            url: "{{baseUrl}}/user/balance".into(),
+            method: "GET".into(),
+            auth: "bearer".into(),
+            base_url_override: None,
+            api_key_ref: None,
+            timeout_secs: DEFAULT_BALANCE_TIMEOUT_SECS,
+            auto_interval_min: 0,
+            remaining_path: None,
+            access_token: None,
+            user_id: None,
+        }
+    }
+}
+
+/// 余额查询默认超时（秒）。与 cc-switch 界面上的默认值一致。
+pub const DEFAULT_BALANCE_TIMEOUT_SECS: u32 = 10;
+
+/// 一次余额查询的结果。
+///
+/// 字段对齐 cc-switch 的 extractor 返回契约（其用户手册 §2.5 列了 8 个可选字段：
+/// `isValid` / `invalidMessage` / `remaining` / `unit` / `planName` / `total` /
+/// `used` / `extra`），这样同一套站点配置在两边的表达力一致。
+///
+/// **失败必须可见**：查不到就带上 `error` 如实呈现，绝不返回
+/// `remaining: 0` —— 显示 0 会让用户以为余额真的用光了，
+/// 这类误导比不显示更糟。故 `remaining` 是 `Option`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceResult {
+    /// 查询是否成功拿到了数值。
+    pub ok: bool,
+    /// 剩余额度。`None` = 没取到（此时 `error` 必有内容）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<f64>,
+    /// 货币单位（`USD` / `CNY` / 上游自报的其它）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// 上游是否声明该 Key 仍有效（部分站点会给 `is_active` / `is_available`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_valid: Option<bool>,
+    /// 账号无效时上游给的原因（cc-switch 的 `invalidMessage`）。
+    ///
+    /// 与 `error` 分开：`error` 是**我们这侧**的失败（超时、404、字段找不到），
+    /// 这个是**上游明确说**「这个号不能用了」。两者混在一起，用户就分不清
+    /// 「查询坏了」和「账号欠费了」——而这两件事的处理方式完全不同。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid_message: Option<String>,
+    /// 套餐名（多套餐站点会给，cc-switch 的 `planName`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_name: Option<String>,
+    /// 总额度。有它才能算出「已用百分比」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<f64>,
+    /// 已消耗额度。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used: Option<f64>,
+    /// 查询时刻（epoch ms）。面板显示「刷新于 X 分钟前」。
+    pub queried_at: i64,
+    /// 失败原因（超时 / HTTP 状态 / 字段找不到）。成功时为 `None`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl BalanceResult {
+    /// 构造一个失败结果（带原因）。
+    pub fn failed(reason: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            remaining: None,
+            unit: None,
+            is_valid: None,
+            invalid_message: None,
+            plan_name: None,
+            total: None,
+            used: None,
+            queried_at: chrono::Utc::now().timestamp_millis(),
+            error: Some(reason.into()),
+        }
+    }
 }
 
 /// Claude Code 网关模型发现：CLI 静默丢弃 id 不以 `claude`/`anthropic` 开头的条目
@@ -1155,6 +1329,10 @@ pub struct TokenUsage {
     /// 命中缓存的输入 token（Anthropic 有，OpenAI 部分中转商也给）
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub cache_read: u64,
+    /// 写入缓存的 token（首次发送缓存前缀时产生）。
+    /// 成本通常是输入价的 1.25 倍，漏它会让计费偏低。
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub cache_creation: u64,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -1179,13 +1357,14 @@ pub struct TokenUsageByKey {
 ///   放大成对用户最宝贵数据的反复覆写，任何一次坏写都可能带走 Key 配置。
 /// - 体积与节奏都不同：config 是事件驱动、~20KB；usage 是定时、通常几百字节。
 ///
-/// `entries` 用 Vec 而非 map：键是 `(分类, key_id)` 二元组，JSON 的对象键只能是字符串，
-/// 序列化成拼接字符串就得自己解析、还要处理 key_id 里出现分隔符的情况。展开成数组
-/// 既无歧义也便于人工查看。
+/// **v2 改动（2026-08-11）**：按日分桶 + 90 天滚动。v1 只有单个全局 `entries`，
+/// 运行几个月后会攒到几千行；v2 把它们按 UTC 日期分桶，flush 时自动删 91 天前的桶。
+/// v1→v2 迁移：首次 flush 时把 v1 的 `entries` 全搬进一个桶（日期按 `since_ms` 推算），
+/// 之后 `entries` 字段留空（保留它是为了让 v2 能读 v1 文件）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageSnapshot {
-    /// 格式版本。将来改结构时用它决定「能否直接反序列化 / 需不需要迁移」。
+    /// 格式版本。v1 = 全局 `entries`；v2 = 按日分桶 `daily_buckets`。
     #[serde(default = "usage_snapshot_version")]
     pub version: u32,
     /// 统计起始时刻（毫秒时间戳）。首次创建时写入，之后原样保留 ——
@@ -1195,17 +1374,34 @@ pub struct UsageSnapshot {
     /// 最后一次落盘时刻，仅供人工排查「这份文件是不是卡住不更新了」。
     #[serde(default)]
     pub updated_ms: i64,
-    #[serde(default)]
+    /// **v2 数据**：按 UTC 日期分桶的用量，最多保留 90 天。
+    /// 每个桶 = 一天内所有分类 × Key 的累计。降序排列（最新的在前）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub daily_buckets: Vec<DailyUsageBucket>,
+    /// **v1 兼容字段**：v2 写出时留空，只在读 v1 文件时有值。
+    /// v2 程序首次 flush 会把这里的内容迁移进 `daily_buckets` 的一个桶。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<TokenUsageByKey>,
+}
+
+/// 一天的用量分桶（v2 格式）。`entries` 含义与 v1 相同：该天内所有 Key 的累计。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyUsageBucket {
+    /// UTC 日期字符串，格式 `"YYYY-MM-DD"`（如 `"2026-08-11"`）。
+    pub date: String,
+    /// 该天内按 `(分类, key_id)` 聚合的用量。Vec 而非 map 的理由同 v1。
     pub entries: Vec<TokenUsageByKey>,
 }
 
 /// `usage.json` 的当前格式版本。**读写共用这一个常量**，别两边各写字面量 ——
 /// 那样改了写侧忘了改读侧，版本门就会把自己刚写出去的文件判为"来自未来"。
 ///
-/// 改动规则：只有当**旧程序按旧结构解析新文件会得到错误结果**时才递增
-/// （例如 `entries` 改成按日分桶）。纯新增可选字段不必加 —— serde 的
-/// `#[serde(default)]` 已能让旧文件在新程序里正确读出。
-pub const USAGE_SNAPSHOT_VERSION: u32 = 1;
+/// 改动规则：只有当**旧程序按旧结构解析新文件会得到错误结果**时才递增。
+/// v1→v2（按日分桶）正是这种情形：v1 程序解析 v2 文件时 `daily_buckets` 会被
+/// 忽略（未知字段），读出的 `entries` 是空的，紧接着 flush 就会用空数据覆盖
+/// 用户攒了几个月的累计 —— **版本门必须拦住**。
+pub const USAGE_SNAPSHOT_VERSION: u32 = 2;
 
 fn usage_snapshot_version() -> u32 {
     USAGE_SNAPSHOT_VERSION
@@ -1216,13 +1412,14 @@ impl TokenUsage {
         self.input + self.output
     }
     pub fn is_empty(&self) -> bool {
-        self.input == 0 && self.output == 0 && self.cache_read == 0
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_creation == 0
     }
     /// 累加（聚合各环节汇总用）。
     pub fn add(&mut self, o: &TokenUsage) {
         self.input += o.input;
         self.output += o.output;
         self.cache_read += o.cache_read;
+        self.cache_creation += o.cache_creation;
     }
     /// 紧凑展示：`↑1.2k ↓340`（缓存命中不为 0 时附 `缓存 900`）。
     pub fn fmt_compact(&self) -> String {
@@ -1236,6 +1433,9 @@ impl TokenUsage {
         let mut s = format!("↑{} ↓{}", k(self.input), k(self.output));
         if self.cache_read > 0 {
             s.push_str(&format!(" 缓存{}", k(self.cache_read)));
+        }
+        if self.cache_creation > 0 {
+            s.push_str(&format!(" 写缓存{}", k(self.cache_creation)));
         }
         s
     }
@@ -1433,6 +1633,12 @@ pub struct AppSettings {
     /// 免打开主窗口（借鉴 cc-switch 托盘切换范式）。默认开。关闭则托盘只留显示/退出。
     #[serde(default = "default_true")]
     pub tray_model_switch_enabled: bool,
+    /// 桌面悬浮窗开关（第⑥批）。**默认关**。
+    ///
+    /// 开启后并不立即显示 —— 只在主窗口**最小化到托盘**时才出现（见 `lib.rs` 的
+    /// `CloseRequested` 处理）。这是用户明确要求的语义：主窗口在前台时悬浮窗只会挡事。
+    #[serde(default)]
+    pub floating_widget_enabled: bool,
     /// 各分类的「默认推理强度」（key=分类字符串，value=effort 档位 low/medium/high/xhigh）。
     /// 缘由：Codex Desktop 对自定义 provider 不下发 reasoning.effort（只发 reasoning.summary），
     /// 客户端 UI 设的强度传不到上游。故在此配一个默认值，转发时若下游 body 无 effort 就注入，
@@ -1616,6 +1822,8 @@ pub struct UserPrefs {
     pub aggregate_trace_enabled: bool,
     #[serde(default = "default_true")]
     pub tray_model_switch_enabled: bool,
+    #[serde(default)]
+    pub floating_widget_enabled: bool,
 }
 
 impl UserPrefs {
@@ -1637,6 +1845,7 @@ impl UserPrefs {
         s.health_probe_test_messages = self.health_probe_test_messages;
         s.aggregate_trace_enabled = self.aggregate_trace_enabled;
         s.tray_model_switch_enabled = self.tray_model_switch_enabled;
+        s.floating_widget_enabled = self.floating_widget_enabled;
     }
 }
 
@@ -1656,6 +1865,7 @@ impl From<&AppSettings> for UserPrefs {
             health_probe_test_messages: s.health_probe_test_messages.clone(),
             aggregate_trace_enabled: s.aggregate_trace_enabled,
             tray_model_switch_enabled: s.tray_model_switch_enabled,
+            floating_widget_enabled: s.floating_widget_enabled,
         }
     }
 }
@@ -1688,6 +1898,9 @@ impl Default for AppSettings {
             // None = 从未判定。启动时 reconcile_onboarding_flag 会据当前 Key 数定下来，
             // 老用户因此不会突然被首启向导拦住。
             onboarding_done: None,
+            // 悬浮窗默认**关闭**（用户明确要求）：它是个额外的常驻窗口，
+            // 不该在用户没开口的情况下自己冒出来。
+            floating_widget_enabled: false,
         }
     }
 }
@@ -1785,6 +1998,8 @@ mod tests {
             tier_haiku: None,
             tier_sonnet: None,
             tier_opus: None,
+            balance_query: None,
+            cost_multiplier: None,
             health: HealthState::default(),
         }
     }

@@ -374,6 +374,8 @@ mod tests {
             tier_haiku: None,
             tier_sonnet: None,
             tier_opus: None,
+            balance_query: None,
+            cost_multiplier: None,
             health: HealthState::default(),
         };
         store.upsert_key(key).unwrap();
@@ -485,6 +487,8 @@ mod tests {
                     tier_haiku: None,
                     tier_sonnet: None,
                     tier_opus: None,
+                    balance_query: None,
+                    cost_multiplier: None,
                     health: HealthState::default(),
                 })
                 .unwrap();
@@ -552,6 +556,8 @@ mod tests {
                 tier_haiku: None,
                 tier_sonnet: None,
                 tier_opus: None,
+                balance_query: None,
+                cost_multiplier: None,
                 health,
             }
         };
@@ -635,6 +641,8 @@ mod tests {
                 tier_haiku: None,
                 tier_sonnet: None,
                 tier_opus: None,
+                balance_query: None,
+                cost_multiplier: None,
                 health: HealthState::default(),
             })
             .unwrap();
@@ -761,6 +769,8 @@ mod tests {
             tier_haiku: None,
             tier_sonnet: None,
             tier_opus: None,
+            balance_query: None,
+            cost_multiplier: None,
             health: HealthState::default(),
         }
     }

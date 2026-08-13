@@ -87,6 +87,8 @@ fn bench_key(id: &str, base_url: &str) -> ProviderKey {
         tier_haiku: None,
         tier_sonnet: None,
         tier_opus: None,
+        balance_query: None,
+        cost_multiplier: None,
         health: HealthState::default(),
     }
 }

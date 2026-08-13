@@ -3,16 +3,19 @@
 
 mod agent_tools;
 mod aggregate;
+mod balance;
 mod ccswitch;
 mod codegraph;
 mod crypto;
 mod error;
 mod events;
+mod floating;
 mod health;
 mod mcp;
 mod model;
 mod notification;
 mod portable;
+mod pricing;
 mod proc;
 mod proxy;
 mod retrieval;
@@ -254,6 +257,43 @@ async fn check_health(state: tauri::State<'_, AppState>, key_id: String) -> AppR
     Ok(())
 }
 
+/// 查询某个 Key 的上游余额。
+///
+/// **不返回 Err 而是把失败装进 `BalanceResult.error`**：余额查不到是常态
+/// （站点没这接口、路径填错、网络抖动），而 IPC 层的 Err 在前端会变成一个
+/// 抛出的异常、需要 try/catch 才不炸掉整个面板。用值表达失败让前端能在
+/// 卡片上就地显示原因（方案 §2.1「失败必须可见」）。
+///
+/// 真正的 `Err` 只留给「Key 不存在」这种调用方用错了的情况。
+#[tauri::command]
+async fn query_key_balance(
+    state: tauri::State<'_, AppState>,
+    key_id: String,
+) -> AppResult<crate::model::BalanceResult> {
+    let Some(key) = state.store.get_key(&key_id) else {
+        return Err(crate::error::AppError::NotFound(key_id));
+    };
+    let Some(cfg) = key.balance_query.clone() else {
+        return Ok(crate::model::BalanceResult::failed("该 Key 未配置余额查询"));
+    };
+
+    // 主口令锁定时取不到密钥：如实说明是「锁着」，不是「余额接口坏了」。
+    if state.store.secrets.read().is_locked() {
+        return Ok(crate::model::BalanceResult::failed(
+            "密钥库已锁定，请先用主口令解锁",
+        ));
+    }
+
+    // 允许用另一条密钥查余额（部分站点的计费面板与转发端点不同域、各用各的凭证）。
+    let secret_key = cfg.api_key_ref.as_deref().unwrap_or(&key_id);
+    let secret = state.store.secrets.read().get(secret_key).ok().flatten();
+    let Some(secret) = secret else {
+        return Ok(crate::model::BalanceResult::failed("未配置密钥"));
+    };
+
+    Ok(crate::balance::query_balance(&key, &cfg, &secret).await)
+}
+
 // ============ 大脑聚合命令 ============
 
 #[tauri::command]
@@ -409,6 +449,71 @@ fn get_usage_since(state: tauri::State<AppState>) -> i64 {
     state.store.usage_since_ms()
 }
 
+/// 按日分桶的用量（最近 90 天），供「今日 / 本周 / 近 7 日趋势」。
+///
+/// 不含尚未 flush 的增量（最多落后 60s）：面板把这份历史与 `get_token_usage`
+/// 的实时总量配合使用，故这点延迟不会让「今日」看起来停滞。
+#[tauri::command]
+fn get_daily_usage(state: tauri::State<AppState>) -> Vec<crate::model::DailyUsageBucket> {
+    state.store.daily_usage_buckets()
+}
+
+/// 带成本估算的用量行（用量页表格用）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageCostRow {
+    category_id: CategoryType,
+    key_id: String,
+    /// Key 的可读名（keyId 是 uuid，用户认不出）。Key 已删除时为 None。
+    key_name: Option<String>,
+    usage: crate::model::TokenUsage,
+    /// 估算成本（纳美元）。`None` = 没有可用单价，界面显示「—」而不是 0。
+    cost_nano: Option<u64>,
+    /// 单价来源，界面据此标注精度（exact / family / unknown）。
+    pricing_source: crate::pricing::PricingSource,
+    /// 实际生效的倍率（回显用户填的值，空则为 "1.0"）。
+    multiplier: String,
+}
+
+/// 按「分类 × Key」聚合的用量 **+ 成本估算**。
+///
+/// 成本按 Key 而非按模型估算：用量累加器的键不含模型名（见
+/// `pricing::estimate_cost` 的文档）。代表模型取该 Key 的
+/// `default_model`，没配则取模型列表首个。
+#[tauri::command]
+fn get_usage_with_cost(state: tauri::State<AppState>) -> Vec<UsageCostRow> {
+    let rows = state.store.token_usage_by_key();
+    rows.into_iter()
+        .map(|r| {
+            let key = state.store.get_key(&r.key_id);
+            // 代表模型：优先用户配的兜底模型，否则模型列表首个。
+            let hint = key.as_ref().and_then(|k| {
+                k.default_model
+                    .clone()
+                    .or_else(|| k.models.first().map(|m| m.real_name.clone()))
+            });
+            let mult = key
+                .as_ref()
+                .and_then(|k| k.cost_multiplier.clone())
+                .unwrap_or_else(|| "1.0".into());
+            let (cost_nano, pricing_source) = crate::pricing::estimate_cost(
+                &r.usage,
+                hint.as_deref(),
+                Some(&mult),
+            );
+            UsageCostRow {
+                category_id: r.category_id,
+                key_id: r.key_id,
+                key_name: key.as_ref().map(|k| k.name.clone()),
+                usage: r.usage,
+                cost_nano,
+                pricing_source,
+                multiplier: mult,
+            }
+        })
+        .collect()
+}
+
 /// 某分类「最近一次失败」（error/failover），供分类页顶部常驻提示条用（UX#11）。
 ///
 /// 为什么单开一个命令而不让前端复用 `list_all_events` 自己筛：那个接口返回全部 500 条，
@@ -510,6 +615,51 @@ async fn set_auto_start(
     enabled: bool,
 ) -> AppResult<()> {
     service::toggle_auto_start(&state.store, &PluginAutostart(&app), enabled)
+}
+
+/// 悬浮窗开关。
+///
+/// **专用命令，不走 saveSettings**：它带窗口副作用（建/销毁一个 WebView），
+/// 而通用保存路径提交的是前端挂载时的整份快照 —— 那正是 `auto_start` 出过 P0 的地方
+/// （切主题会把用户刚关掉的开关重新打开）。
+///
+/// 开启后**不立即显示**：显示条件还要求主窗口已隐藏到托盘。所以这里只是
+/// 落盘 + 同步一次可见性，用户此刻通常在设置页（主窗口可见），悬浮窗不会冒出来。
+/// 这不是 bug，是用户明确要的语义 —— 提示文案里已写明。
+#[tauri::command]
+fn set_floating_widget(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+    enabled: bool,
+) -> AppResult<()> {
+    // 走 mutate_and_persist_if：落盘失败时按磁盘对账回滚。
+    // 直接改内存再 persist 的话，落盘失败即「内存领先磁盘」，而该方向永不自愈 ——
+    // 表现为开关看着生效了、重启后悄悄回退（store.rs 的 set_active_model 有同样注释）。
+    state.store.set_floating_widget_flag(enabled)?;
+    // 把开关动作与随后的窗口真实状态一起记进日志。
+    //
+    // 这里是**命令线程**，查询窗口属性是安全的（事件回调里不行，会等自己）——
+    // 所以这是唯一能拿到「窗口到底存在没、可见没、URL 对不对」的位置。
+    state.store.append_event(
+        CategoryType::ClaudeCli,
+        "config",
+        None,
+        &format!(
+            "悬浮窗开关 → {} · {}",
+            if enabled { "开" } else { "关" },
+            floating::diagnose(&app)
+        ),
+    );
+    if enabled {
+        // 这里在 IPC 命令线程上，不是事件循环回调 —— 建窗是安全的。
+        // `destroy` 之后重新打开开关时窗口已不存在，需要在此重建；
+        // `sync_visibility` 内部的 `ensure_window` 会处理。
+        floating::sync_visibility(&app, true);
+    } else {
+        // 关掉就销毁，不留着占一个 WebView 进程。
+        floating::destroy(&app);
+    }
+    Ok(())
 }
 
 /// 用 `tauri-plugin-autostart` 实现 [`service::AutostartToggle`]。
@@ -1182,6 +1332,14 @@ pub fn run() {
             }
             service::reconcile_auto_start(&state.store, &PluginAutostart(app.handle()));
 
+            // 预建悬浮窗（隐藏态）。**必须在 setup 里做**，不能等到用户藏窗口时才建 ——
+            // 那时的代码跑在事件循环回调里，同步建窗会死等自己（详见 floating::preload）。
+            //
+            // 无条件预建、不看开关：开关是运行期可改的，而 setup 只跑一次。若只在
+            // 「开关已开」时预建，用户启动后才打开开关就又落回「回调里建窗」那条坏路径。
+            // 代价是一个隐藏的 WebView；关掉开关时 `destroy` 会销毁它。
+            crate::floating::preload(app.handle());
+
             // 随系统启动时最小化到托盘（FR-025 需求原文要求）。判据是启动参数里有
             // `--autostart`（注册自启动项时带上的），而非「auto_start 为真」——
             // 后者在用户手动双击时也成立，那时把窗口藏起来会让人以为程序没启动。
@@ -1190,6 +1348,16 @@ pub fn run() {
                     let _ = w.hide();
                 }
                 tracing::info!("随系统启动，已最小化到托盘（{AUTOSTART_FLAG}）");
+                // 这一刻主窗口已隐藏 → 若用户开了悬浮窗开关，它现在就该出现。
+                //
+                // **少了这一句就是一个静默失效**：自启动路径不经过 `CloseRequested`
+                // （那是用户点关闭按钮才走的），于是「开机自启 + 开了悬浮窗」的用户
+                // 开机后什么也看不到，要先把主窗口叫出来再关一次才行 —— 而他并不知道
+                // 需要这么做，只会认为悬浮窗坏了。
+                crate::floating::sync_visibility(
+                    app.handle(),
+                    state.store.get_settings().floating_widget_enabled,
+                );
             }
 
             // 内置 MCP 服务器：用户已启用则随应用启动（Q8），端口取自设置（默认 9527，Q7）。
@@ -1230,8 +1398,20 @@ pub fn run() {
         // 真正退出走托盘菜单「退出」→ app.exit(0)（不触发本事件）。
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // 悬浮窗自己被关（无边框窗虽无关闭按钮，但 Alt+F4 仍可触发）：
+                // 直接放行销毁，不要按主窗口那套「藏起来」处理 —— 否则用户关不掉它。
+                if window.label() == crate::floating::FLOATING_LABEL {
+                    return;
+                }
                 api.prevent_close();
                 let _ = window.hide();
+                // 主窗口刚藏进托盘 → 这正是悬浮窗该出现的时刻（若用户开了开关）。
+                // 读磁盘最新值而不是启动时的快照：用户可能刚在设置页改过。
+                let app = window.app_handle();
+                if let Some(state) = app.try_state::<AppState>() {
+                    let enabled = state.store.get_settings().floating_widget_enabled;
+                    crate::floating::sync_visibility(app, enabled);
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1261,6 +1441,10 @@ pub fn run() {
             list_all_events,
             get_token_usage,
             get_usage_since,
+            get_daily_usage,
+            get_usage_with_cost,
+            query_key_balance,
+            set_floating_widget,
             recent_failure,
             get_event_trace,
             get_settings,
@@ -1768,6 +1952,13 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
+    }
+    // 主窗口回到前台 → 悬浮窗该收起来（显示条件之一是「主窗口已隐藏」）。
+    // 这里传 enabled 无所谓真假：`sync_visibility` 会发现主窗口已可见而一律隐藏，
+    // 但仍按真实开关传值，避免日后有人把这个函数挪去别处时行为悄悄变了。
+    if let Some(state) = app.try_state::<AppState>() {
+        let enabled = state.store.get_settings().floating_widget_enabled;
+        crate::floating::sync_visibility(app, enabled);
     }
 }
 

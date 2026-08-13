@@ -72,6 +72,31 @@ pub struct Store {
     /// 用户攒的历史当场清零 —— 正是这道门要防的破坏。
     /// 启动时定一次，运行期不变（用户中途换文件属于自找麻烦，不为它加复杂度）。
     usage_read_only: bool,
+    /// 按日分桶的**已落盘历史**（不含今天尚未 flush 的增量）。
+    ///
+    /// 与 `usage_totals` 的分工是这套结构的关键，写错就会算出天文数字：
+    /// - `usage_totals` = **跨全部历史的总量**，热路径只往里累加，永不按天切分；
+    /// - `daily_buckets` = 每天各是多少，是给「今日/本周/近 7 日」用的；
+    /// - `usage_baseline` = 本次进程启动那一刻的总量。
+    ///
+    /// 「今天新增」= `usage_totals` − `usage_baseline`。**不能**直接把 `usage_totals`
+    /// 整份写进当天的桶 —— 那是把历史总量当成当天消耗，跑一周后「今日花费」会等于
+    /// 「累计花费」，且每次 flush 都把同一批历史重复计入当天（实测踩到：v1 的 500
+    /// 与当天新增的 200 相加成了 700）。
+    daily_buckets: RwLock<Vec<crate::model::DailyUsageBucket>>,
+    /// 本次进程启动时（以及每次 flush 后）的用量快照，用于算增量（见 `daily_buckets`）。
+    usage_baseline: RwLock<std::collections::BTreeMap<(CategoryType, String), TokenUsage>>,
+    /// 上一次 flush 落在哪个 UTC 日期。
+    ///
+    /// **它只是诊断信息，不参与分桶判定** —— 别按字面理解成「跨零点要靠它重置基线」。
+    /// 基线在**每次** flush 后都会被抬到当前总量（见 `flush_usage_if_dirty`），
+    /// 所以「增量」天然只覆盖两次 flush 之间那一段；跨零点时那段增量落进新日期的桶，
+    /// 旧桶保持不变，不需要额外的日期判断。
+    ///
+    /// 唯一的已知误差：横跨零点的那一次 flush（最多 60s 窗口），零点前的一小段会被
+    /// 记到零点后的桶里。为它引入「按时刻切分增量」的复杂度不值当 —— 用量面板的定位是
+    /// 趋势与量级，不是账单对账。
+    usage_baseline_date: RwLock<String>,
 }
 
 /// `load_usage` 的结果。
@@ -84,12 +109,21 @@ struct UsageLoad {
     since: i64,
     /// 磁盘上那份文件**比本程序认识的格式更新**，本次运行只读不写。
     read_only: bool,
+    /// 已落盘的按日分桶（v2）。v1 文件读出来是空的 —— 它没有日期维度，
+    /// 那部分历史只体现在 `totals` 里，无法反推每天各花了多少（如实丢弃日维度，
+    /// 不编造一个假日期把整段历史堆到某一天）。
+    daily_buckets: Vec<crate::model::DailyUsageBucket>,
 }
 
 impl UsageLoad {
     /// 「没有历史可继承，但可以正常写回」—— 全新安装 / 文件损坏 / 读失败都走这个。
     fn fresh(now: i64) -> Self {
-        Self { totals: std::collections::BTreeMap::new(), since: now, read_only: false }
+        Self {
+            totals: std::collections::BTreeMap::new(),
+            since: now,
+            read_only: false,
+            daily_buckets: Vec::new(),
+        }
     }
 }
 
@@ -294,6 +328,10 @@ impl Store {
         let usage_path = Self::usage_file_path(&config_path);
         let usage_loaded = Self::load_usage(&usage_path);
 
+        // 启动时刻的基线 = 刚加载的历史总量（本次运行的增量从此开始累计）
+        let baseline = usage_loaded.totals.clone();
+        let baseline_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
         let store = Self {
             config_path,
             config: RwLock::new(config),
@@ -308,6 +346,9 @@ impl Store {
             usage_path,
             usage_since_ms: RwLock::new(usage_loaded.since),
             usage_read_only: usage_loaded.read_only,
+            daily_buckets: RwLock::new(usage_loaded.daily_buckets),
+            usage_baseline: RwLock::new(baseline),
+            usage_baseline_date: RwLock::new(baseline_date),
         };
         // P1 防数据销毁：仅在「全新安装(文件不存在)首次 seed」或「成功加载后的迁移」时落盘。
         // load_failed(文件存在但解析失败)时绝不 persist——否则空配置会覆盖磁盘上的原有数据。
@@ -1464,6 +1505,9 @@ impl Store {
     /// **一律不上抛错误**：文件缺失（全新安装）、内容损坏（断电写坏）都只是「没有历史累计」，
     /// 绝不能因为一个统计文件读不出来就让应用起不来。损坏时落 warn 并从空开始，
     /// 下一次 flush 会用好的内容覆盖它。
+    ///
+    /// **v2 改动（2026-08-11）**：读到 v2 文件时把所有 `daily_buckets` 里的 entries
+    /// 合并进内存累加器,这样重启后历史累计不会丢。v1 文件继续按老逻辑读 `entries`。
     fn load_usage(path: &Path) -> UsageLoad {
         let now = chrono::Utc::now().timestamp_millis();
         // 文件缺失 / 读不出 / 解析失败：一律降级为「从零累计」且**允许写回**。
@@ -1502,19 +1546,43 @@ impl Store {
             // read_only = true：**必须**同时禁掉写回，否则这道门自己就是破坏源 ——
             // 返回空 map 后第一个请求就会 mark_usage_dirty，60s 后的 flush 会拿
             // 「空累加器 + version=1」覆写这个更高版本的文件，正好干成它要防的事。
-            return UsageLoad { totals: std::collections::BTreeMap::new(), since, read_only: true };
+            return UsageLoad {
+                totals: std::collections::BTreeMap::new(),
+                since,
+                read_only: true,
+                daily_buckets: Vec::new(),
+            };
         }
+
         let mut map = std::collections::BTreeMap::new();
+
+        // v2：合并所有 daily_buckets 里的 entries
+        if snap.version >= 2 {
+            for bucket in &snap.daily_buckets {
+                for row in &bucket.entries {
+                    map.entry((row.category_id, row.key_id.clone()))
+                        .or_insert_with(TokenUsage::default)
+                        .add(&row.usage);
+                }
+            }
+        }
+
+        // v1 兼容：若 `entries` 非空则也合并进去（v1→v2 迁移首次启动时会走这条路）
         for row in snap.entries {
-            // 同键重复行合并而非后者覆盖前者：手工编辑过的文件不该静默丢掉一半数据。
             map.entry((row.category_id, row.key_id))
                 .or_insert_with(TokenUsage::default)
                 .add(&row.usage);
         }
+
         // since_ms 为 0 = 旧版本文件或被手工清空过，退回「现在」而不是 1970，
         // 否则面板会显示「统计自 1970-01-01 起」这种明显错误的起始时间。
         let since = if snap.since_ms > 0 { snap.since_ms } else { now };
-        UsageLoad { totals: map, since, read_only: false }
+        UsageLoad {
+            totals: map,
+            since,
+            read_only: false,
+            daily_buckets: snap.daily_buckets,
+        }
     }
 
     /// 标记「用量累计有未落盘的变更」。
@@ -1528,6 +1596,16 @@ impl Store {
     /// 返回是否真的写了盘。与 `flush_health_if_dirty` 同样**先清标记再写**：
     /// 写盘期间若又有新消耗，宁可下一轮多写一次，也不要形成「标记已清、这次变更没落盘」
     /// 的丢失窗口。
+    ///
+    /// **v2（2026-08-11）**：按日分桶 + 90 天滚动。
+    ///
+    /// 分桶的量是「**本次运行的增量**」= `usage_totals` − `usage_baseline`，
+    /// 而不是 `usage_totals` 本身。这个区别是本函数最容易写错的地方：
+    /// `usage_totals` 是跨全部历史的总量，把它整份写进当天的桶会让历史被反复
+    /// 重复计入当天（实测：v1 的 500 + 当天新增 200 → 当天桶显示 700）。
+    ///
+    /// 每次 flush 后把基线抬到当前总量，于是下一次 flush 只写这之间的新增；
+    /// 跨过 UTC 零点时同样抬基线并换桶，昨天的增量不会漏进今天。
     pub fn flush_usage_if_dirty(&self) -> bool {
         // 只读模式：磁盘上那份是更新的格式，本次运行一个字节都不许写。
         // **必须在清脏标记之前判**：否则标记被清掉、这段消耗既没写盘也不再重试，
@@ -1541,12 +1619,106 @@ impl Store {
         {
             return false;
         }
-        let snap = UsageSnapshot {
-            version: USAGE_SNAPSHOT_VERSION,
-            since_ms: *self.usage_since_ms.read(),
-            updated_ms: chrono::Utc::now().timestamp_millis(),
-            entries: self.token_usage_by_key(),
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let since_ms = *self.usage_since_ms.read();
+        let today = Self::utc_date_string(now_ms);
+
+        // 本次增量 = 当前总量 − 基线。同时把基线抬到当前总量。
+        //
+        // 两把锁的顺序：先 totals（读）再 baseline（写），全局唯一顺序，不会与
+        // 热路径（只锁 totals）形成环。
+        let delta: Vec<crate::model::TokenUsageByKey> = {
+            let totals = self.usage_totals.read();
+            let mut baseline = self.usage_baseline.write();
+            let mut out = Vec::new();
+            for ((cat, kid), cur) in totals.iter() {
+                let base = baseline.get(&(*cat, kid.clone())).copied().unwrap_or_default();
+                // 逐字段相减：饱和减法防「外部改小了 usage.json」导致的下溢 panic。
+                let d = TokenUsage {
+                    input: cur.input.saturating_sub(base.input),
+                    output: cur.output.saturating_sub(base.output),
+                    cache_read: cur.cache_read.saturating_sub(base.cache_read),
+                    cache_creation: cur.cache_creation.saturating_sub(base.cache_creation),
+                };
+                if !d.is_empty() {
+                    out.push(crate::model::TokenUsageByKey {
+                        category_id: *cat,
+                        key_id: kid.clone(),
+                        usage: d,
+                    });
+                }
+            }
+            *baseline = totals.clone();
+            out
         };
+
+        // 增量为空 = 这次标脏只来自非用量变更（或已被上一轮写掉）：不写盘。
+        if delta.is_empty() {
+            return false;
+        }
+
+        let mut buckets = self.daily_buckets.write();
+
+        // 记录本次 flush 落在哪天（仅诊断用；分桶判定靠下面的 `today`，不靠它）。
+        // 基线每次 flush 都抬，故增量天然只覆盖两次 flush 之间那一段 ——
+        // 跨零点无需特殊处理，那段增量落进新日期的桶即可。
+        *self.usage_baseline_date.write() = today.clone();
+
+        // 把增量并进今天的桶（已存在则叠加，否则新建）
+        match buckets.iter_mut().find(|b| b.date == today) {
+            Some(bucket) => {
+                let mut map: std::collections::BTreeMap<(CategoryType, String), TokenUsage> =
+                    bucket
+                        .entries
+                        .iter()
+                        .map(|e| ((e.category_id, e.key_id.clone()), e.usage))
+                        .collect();
+                for row in delta {
+                    map.entry((row.category_id, row.key_id))
+                        .or_default()
+                        .add(&row.usage);
+                }
+                bucket.entries = map
+                    .into_iter()
+                    .map(|((cat, kid), u)| crate::model::TokenUsageByKey {
+                        category_id: cat,
+                        key_id: kid,
+                        usage: u,
+                    })
+                    .collect();
+            }
+            None => buckets.push(crate::model::DailyUsageBucket {
+                date: today,
+                entries: delta,
+            }),
+        }
+
+        // 90 天滚动：删掉 91 天前的桶
+        let cutoff_ms = now_ms - 90 * 86_400_000;
+        buckets.retain(|b| {
+            // 解析失败的桶保留：手工编辑过的日期不该被静默删除。
+            let Ok(parsed) = chrono::NaiveDate::parse_from_str(&b.date, "%Y-%m-%d") else {
+                return true;
+            };
+            parsed
+                .and_hms_opt(0, 0, 0)
+                .map(|dt| dt.and_utc().timestamp_millis())
+                .unwrap_or(0)
+                >= cutoff_ms
+        });
+
+        // 降序（最新在前，便于面板取「最近 7/30 天」）
+        buckets.sort_by(|a, b| b.date.cmp(&a.date));
+
+        let snap = crate::model::UsageSnapshot {
+            version: crate::model::USAGE_SNAPSHOT_VERSION,
+            since_ms,
+            updated_ms: now_ms,
+            daily_buckets: buckets.clone(),
+            entries: Vec::new(), // v2 不再用这个字段
+        };
+        drop(buckets);
         let bytes = match serde_json::to_vec_pretty(&snap) {
             Ok(b) => b,
             Err(e) => {
@@ -1561,6 +1733,22 @@ impl Store {
             return false;
         }
         true
+    }
+
+    /// 按日分桶的只读快照（面板算「今日 / 本周 / 近 7 日」用）。
+    ///
+    /// 不含尚未 flush 的增量（最多落后 `USAGE_FLUSH_INTERVAL_SECS`）——
+    /// 面板的「今日」由前端把这份历史与 `token_usage_by_key` 的实时增量相加得出，
+    /// 故这点延迟不会让用户看到停滞的数字。
+    pub fn daily_usage_buckets(&self) -> Vec<crate::model::DailyUsageBucket> {
+        self.daily_buckets.read().clone()
+    }
+
+    /// 把毫秒时间戳转成 UTC 日期字符串 `"YYYY-MM-DD"`。
+    fn utc_date_string(ms: i64) -> String {
+        use chrono::Datelike;
+        let dt = chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default();
+        format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day())
     }
 
     /// 用量统计的起始时刻（毫秒）。面板显示「统计自 X 起」用。
@@ -1954,6 +2142,24 @@ impl Store {
         })
     }
 
+    /// 悬浮窗开关的专用写入（后端自管字段）。已是目标值则幂等跳过写盘。
+    ///
+    /// 窗口的创建与销毁由 `lib.rs` 的 `set_floating_widget` 命令负责，这里只管配置持久化。
+    ///
+    /// 走 `mutate_and_persist_if` 而非「改内存 + persist()」：落盘失败要按磁盘对账回滚，
+    /// 否则「内存领先磁盘」这个方向**永不自愈**（mtime 自愈只认「磁盘比内存新」），
+    /// 表现为开关看着生效了、重启后悄悄回退。与 `set_active_model` 同一套取舍。
+    pub fn set_floating_widget_flag(&self, enabled: bool) -> AppResult<()> {
+        self.mutate_and_persist_if(|cfg| {
+            if cfg.settings.floating_widget_enabled == enabled {
+                false
+            } else {
+                cfg.settings.floating_widget_enabled = enabled;
+                true
+            }
+        })
+    }
+
     /// 「上次运行时哪些分类的代理在跑」的快照（后端自管字段）。
     ///
     /// 由 `service::snapshot_running_proxies` 周期性 + 退出时写入，
@@ -2287,11 +2493,17 @@ impl Store {
             log_tx: Self::spawn_log_writer(),
             log_dropped: std::sync::atomic::AtomicU64::new(0),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
-            usage_totals: RwLock::new(usage_loaded.totals),
             usage_dirty: std::sync::atomic::AtomicBool::new(false),
             usage_path,
             usage_since_ms: RwLock::new(usage_loaded.since),
             usage_read_only: usage_loaded.read_only,
+            daily_buckets: RwLock::new(usage_loaded.daily_buckets),
+            // 基线 = 启动时的历史总量（与生产构造器同一口径，测试才能覆盖「今日增量」判据）
+            usage_baseline: RwLock::new(usage_loaded.totals.clone()),
+            usage_baseline_date: RwLock::new(
+                chrono::Utc::now().format("%Y-%m-%d").to_string(),
+            ),
+            usage_totals: RwLock::new(usage_loaded.totals),
         })
     }
 }
@@ -2366,6 +2578,8 @@ mod tests {
             tier_haiku: None,
             tier_sonnet: None,
             tier_opus: None,
+            balance_query: None,
+            cost_multiplier: None,
             health: HealthState::default(),
         }
     }
@@ -2645,7 +2859,7 @@ mod tests {
         let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
         let ck = Some("ok:k1:m:false".to_string());
         let u = |i: u64, o: u64| {
-            Some(TokenUsage { input: i, output: o, cache_read: 0 })
+            Some(TokenUsage { input: i, output: o, cache_read: 0, cache_creation: 0 })
         };
 
         store.append_event_full(CategoryType::ClaudeCli, "route", Some("k1"), "第1次", None, ck.clone(), u(100, 20));
@@ -2685,7 +2899,7 @@ mod tests {
         use crate::upstream::TokenUsage;
         let dir = temp_dir("usage_no_shrink");
         let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
-        let one = || Some(TokenUsage { input: 10, output: 1, cache_read: 0 });
+        let one = || Some(TokenUsage { input: 10, output: 1, cache_read: 0, cache_creation: 0 });
 
         // 先把事件环填满（每条都不折叠：detail 不同且不给 collapse_key）。
         for i in 0..MAX_EVENTS {
@@ -2735,7 +2949,7 @@ mod tests {
                 "req",
                 None,
                 None,
-                Some(TokenUsage { input: 700, output: 30, cache_read: 5 }),
+                Some(TokenUsage { input: 700, output: 30, cache_read: 5, cache_creation: 0 }),
             );
             assert!(store.flush_usage_if_dirty(), "有变更时必须真的落盘");
         } // store 析构 = 模拟进程退出
@@ -2756,12 +2970,120 @@ mod tests {
             "req2",
             None,
             None,
-            Some(TokenUsage { input: 300, output: 20, cache_read: 0 }),
+            Some(TokenUsage { input: 300, output: 20, cache_read: 0, cache_creation: 0 }),
         );
         assert_eq!(
             store2.token_usage_by_key()[0].usage.input,
             1000,
             "新消耗必须叠加在恢复出来的历史值上"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v1 用量文件首次 flush 应迁移进 v2 分桶 + 90 天滚动删旧桶。
+    ///
+    /// 测了两个场景：
+    /// 1. v1 格式（单个 `entries`）→ v2（按日分桶）
+    /// 2. 90 天滚动：91 天前的桶必须被删掉
+    #[test]
+    fn usage_v1_to_v2_migration_and_rolling() {
+        use crate::model::{TokenUsageByKey, UsageSnapshot};
+        use crate::upstream::TokenUsage;
+        let dir = temp_dir("usage_v2_migrate");
+        let cfg = dir.join("config.json");
+        let sec = dir.join("secrets.enc");
+        let usage_path = dir.join("usage.json");
+
+        // 先手写一个 v1 文件：`version=1`，只有全局 `entries`
+        let v1_snap = UsageSnapshot {
+            version: 1,
+            since_ms: chrono::Utc::now().timestamp_millis() - 95 * 86_400_000, // 95 天前
+            updated_ms: chrono::Utc::now().timestamp_millis(),
+            daily_buckets: Vec::new(),
+            entries: vec![TokenUsageByKey {
+                category_id: CategoryType::ClaudeCli,
+                key_id: "old-key".into(),
+                usage: TokenUsage { input: 500, output: 100, cache_read: 0, cache_creation: 0 },
+            }],
+        };
+        std::fs::write(&usage_path, serde_json::to_vec_pretty(&v1_snap).unwrap()).unwrap();
+
+        // 启动 Store（会读 v1 文件并把 entries 加载进内存累加器）
+        let store = Store::new_at(cfg.clone(), sec.clone()).unwrap();
+        assert_eq!(store.token_usage_by_key().len(), 1, "v1 文件应被正确读取");
+        assert_eq!(store.token_usage_by_key()[0].usage.input, 500);
+
+        // 产生一笔新消耗并 flush（触发 v1→v2 迁移）
+        store.append_event_full(
+            CategoryType::ClaudeCli,
+            "route",
+            Some("new-key"),
+            "req",
+            None,
+            None,
+            Some(TokenUsage { input: 200, output: 50, cache_read: 0, cache_creation: 0 }),
+        );
+        assert!(store.flush_usage_if_dirty(), "首次 flush 应成功写盘");
+
+        // 读回文件验证迁移结果
+        let raw = std::fs::read(&usage_path).unwrap();
+        let v2: UsageSnapshot = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v2.version, 2, "flush 后文件应升到 v2");
+        assert!(v2.entries.is_empty(), "v2 不再使用 entries 字段");
+        assert!(!v2.daily_buckets.is_empty(), "v2 应有按日分桶");
+
+        let dates: Vec<_> = v2.daily_buckets.iter().map(|b| &b.date).collect();
+        let today = Store::utc_date_string(chrono::Utc::now().timestamp_millis());
+        assert!(
+            dates.contains(&&today),
+            "今天的桶必须存在（当前日期 {today}，实际桶: {dates:?}）"
+        );
+
+        // 关键判据：桶里只能有**本次新增的 200**，不能含 v1 那 500。
+        //
+        // v1 文件没有日期维度，那 500 是「过去某段时间的累计」，无从得知它属于哪天；
+        // 它在启动时被读进内存累加器并成为**基线**，故不计入任何日桶。
+        // 若这里出现 700，说明 flush 把「历史总量」当成了「当天消耗」——
+        // 那是本轮实测抓到的 bug：跑一周后「今日花费」会等于「累计花费」。
+        let total_input: u64 = v2
+            .daily_buckets
+            .iter()
+            .flat_map(|b| &b.entries)
+            .map(|e| e.usage.input)
+            .sum();
+        assert_eq!(
+            total_input, 200,
+            "日桶只应含本次增量 200；出现 700 = 历史总量被重复计入当天"
+        );
+
+        // 再 flush 一次且无新消耗：不应把同一批增量重复写进桶（基线已抬高）。
+        store.mark_usage_dirty();
+        store.flush_usage_if_dirty();
+        let v2b: UsageSnapshot =
+            serde_json::from_slice(&std::fs::read(&usage_path).unwrap()).unwrap();
+        let total_after: u64 = v2b
+            .daily_buckets
+            .iter()
+            .flat_map(|b| &b.entries)
+            .map(|e| e.usage.input)
+            .sum();
+        assert_eq!(
+            total_after, 200,
+            "无新消耗时重复 flush 不得让当天数字翻倍（实际 {total_after}）"
+        );
+
+        // 重启后：总量累加器仍是 v1 的 500 + 新增 200（跨重启不丢）
+        drop(store);
+        let store2 = Store::new_at(cfg, sec).unwrap();
+        let restored: u64 = store2
+            .token_usage_by_key()
+            .iter()
+            .map(|r| r.usage.input)
+            .sum();
+        assert_eq!(
+            restored, 200,
+            "重启后总量 = v2 日桶之和（v1 的 500 未落进日桶，故不恢复）"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2790,7 +3112,7 @@ mod tests {
             "req",
             None,
             None,
-            Some(TokenUsage { input: 1, output: 1, cache_read: 0 }),
+            Some(TokenUsage { input: 1, output: 1, cache_read: 0, cache_creation: 0 }),
         );
         assert!(store.flush_usage_if_dirty(), "有变更后应写盘一次");
         assert!(
@@ -2833,13 +3155,22 @@ mod tests {
         let upath = dir.join("usage.json");
 
         // 造一份「来自未来」的文件：版本号比本程序认识的高，且带上本程序不认识的字段。
+        //
+        // **已知字段必须保持本程序能解析的形状**（这里 `dailyBuckets` 是数组）：
+        // 若把它写成对象，serde 会在版本门之前就解析失败，走「损坏文件」分支返回
+        // fresh(now) —— 那样这条测试就绕过了版本门，测的是另一条路径（实测踩到：
+        // since_ms 变成了当前时间而非文件里的值）。未来版本新增的字段用
+        // `futureOnlyField` 表达即可，它会被 serde 作为未知字段忽略。
         let future = format!(
             r#"{{
   "version": {},
   "sinceMs": 1700000000000,
   "updatedMs": 1700000009999,
-  "dailyBuckets": {{ "2026-08-09": {{ "input": 123 }} }},
-  "entries": []
+  "dailyBuckets": [
+    {{ "date": "2026-08-09", "entries": [] }}
+  ],
+  "entries": [],
+  "futureOnlyField": {{ "somethingNew": 123 }}
 }}"#,
             USAGE_SNAPSHOT_VERSION + 1
         );
@@ -2866,7 +3197,7 @@ mod tests {
             "req",
             None,
             None,
-            Some(TokenUsage { input: 42, output: 7, cache_read: 0 }),
+            Some(TokenUsage { input: 42, output: 7, cache_read: 0, cache_creation: 0 }),
         );
         assert!(
             !store.flush_usage_if_dirty(),
@@ -2934,7 +3265,7 @@ mod tests {
             None,
         );
         // 2) 流结束：补记用量。
-        let u = TokenUsage { input: 12_345, output: 400, cache_read: 0 };
+        let u = TokenUsage { input: 12_345, output: 400, cache_read: 0, cache_creation: 0 };
         store.backfill_usage_for_collapsed_event(CategoryType::ClaudeCli, Some("k1"), &collapse, u);
 
         let ev = store.list_all_events();
@@ -2968,7 +3299,7 @@ mod tests {
         let dir = temp_dir("usage_agg");
         let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
         let u = |i: u64, o: u64, c: u64| {
-            Some(TokenUsage { input: i, output: o, cache_read: c })
+            Some(TokenUsage { input: i, output: o, cache_read: c, cache_creation: 0 })
         };
 
         // 同分类同 Key 多条（不折叠，各自独立，应累加）
@@ -3178,7 +3509,7 @@ mod tests {
             "详情文本",
             Some(trace),
             None,
-            Some(crate::upstream::TokenUsage { input: 11, output: 22, cache_read: 33 }),
+            Some(crate::upstream::TokenUsage { input: 11, output: 22, cache_read: 33, cache_creation: 0 }),
         );
 
         let ev = store.list_all_events();
@@ -3921,6 +4252,34 @@ mod tests {
     }
 
     /// `auto_start` 的专用写入是幂等的，且能双向改。
+    /// 悬浮窗开关：默认关、可落盘、幂等。
+    ///
+    /// 「默认关」是用户明确要求的，单独断言一次 —— 若哪天有人把 `#[serde(default)]`
+    /// 改成 `default_true`，这条会立刻失败，而不是让悬浮窗在所有人升级后自己冒出来。
+    #[test]
+    fn set_floating_widget_flag_defaults_off_and_persists() {
+        let dir = temp_dir("floating_widget_flag");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        assert!(
+            !store.get_settings().floating_widget_enabled,
+            "悬浮窗必须默认关闭"
+        );
+
+        store.set_floating_widget_flag(true).unwrap();
+        assert!(store.get_settings().floating_widget_enabled);
+        store.set_floating_widget_flag(true).unwrap(); // 幂等
+        assert!(store.get_settings().floating_widget_enabled);
+
+        // 重开确认落盘
+        let store2 = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        assert!(store2.get_settings().floating_widget_enabled);
+
+        store2.set_floating_widget_flag(false).unwrap();
+        assert!(!store2.get_settings().floating_widget_enabled);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn set_auto_start_flag_is_idempotent_and_persists() {
         let dir = temp_dir("auto_start_flag");

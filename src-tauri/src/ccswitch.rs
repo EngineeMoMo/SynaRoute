@@ -475,6 +475,8 @@ fn import_rows(
             tier_haiku: None,
             tier_sonnet: None,
             tier_opus: None,
+            balance_query: None,
+            cost_multiplier: None,
             health: Default::default(),
         };
 
