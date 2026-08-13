@@ -42,6 +42,58 @@ const zh: Dict = {
   "nav.settings": "设置",
   "nav.about": "关于作者",
 
+  // 余额查询与计费（第④批）
+  "balance.sectionTitle": "余额查询与计费",
+  "balance.on": "已启用",
+  "balance.enable": "启用余额查询",
+  // 文案只承诺**已实现**的能力：当前余额只能在本编辑器里点「测试查询」看到，
+  // Key 卡片与快捷面板上还没有常驻展示（那需要一套定时查询 + 缓存，见 docs/17）。
+  // 早前这句写的是「显示在 Key 卡片与快捷面板上」—— 那是句空头承诺，
+  // 用户开了开关后到处找不到余额，只会认为功能坏了。
+  "balance.enableHint":
+    "从中转站的计费接口读取剩余额度。各站接口不统一，先用预设模板试，不行再手填取值路径；配好后用下面的「测试查询」验证。",
+  "balance.template": "预设模板",
+  "balance.tpl.custom": "自定义",
+  "balance.tpl.generic": "通用模板",
+  "balance.tpl.newapi": "NewAPI",
+  "balance.tpl.deepseek": "DeepSeek",
+  "balance.tpl.official": "官方",
+  "balance.url": "请求地址",
+  "balance.urlHint":
+    "占位符：{{baseUrl}} 本 Key 的接口地址（含路径）、{{origin}} 只取域名（剥掉路径）、{{apiKey}} 密钥。余额端点在域名根下、而接口地址带路径后缀时（如 DeepSeek 的 /anthropic），要用 {{origin}}。",
+  "balance.accessToken": "Access Token",
+  "balance.userId": "用户 ID",
+  "balance.accessTokenHint":
+    "NewAPI 类面板的用量接口认的是**面板登录态**，不是转发用的 API 密钥。在面板的「个人设置」里生成 Access Token，用户 ID 也在那里。",
+  "balance.ofTotal": "共 {total} {unit}",
+  "balance.auth": "认证方式",
+  "balance.authNone": "不认证",
+  "balance.timeout": "超时（秒）",
+  // "balance.interval" / "balance.intervalHint" 已移除：那个输入框填了不生效
+  // （后端无定时查询任务），摆着就是个静默失效开关。定时查询落地后再连同 UI 一起加回。
+  "balance.remainingPath": "取值路径（选填）",
+  "balance.remainingPathPlaceholder": "如 data.balance",
+  "balance.remainingPathHint":
+    "留空则自动在返回里找 remaining / balance / quota.remaining / data.balance 等常见字段。支持数组下标，如 balance_infos.0.total_balance。自动找不到时才需手填。",
+  "balance.overrideTitle": "凭证覆盖（多数站点无需填）",
+  "balance.baseUrlOverride": "余额接口地址",
+  "balance.baseUrlOverridePlaceholder": "留空则用本 Key 的接口地址",
+  "balance.overrideHint": "部分站点的计费面板与转发端点不同域，此时在此单独填面板域名。",
+  "balance.probe": "测试查询",
+  "balance.probing": "查询中…",
+  "balance.probeOk": "查询成功：剩余 {amount} {unit}",
+  "balance.probeNeedSave": "请先保存这条 Key，再测试查询（查询要用已落盘的密钥与配置）。",
+  "balance.keyInactive": "注意：上游报告该密钥当前不可用（is_active=false）。",
+  "balance.multiplier": "计费倍率（选填）",
+  "balance.multiplierHint":
+    "中转站常按官方价打折，如 0.3 表示三折。用量页据此估算花费；留空按 1.0（原价）。只是估算，与实际账单可能有差。",
+
+  // 桌面悬浮窗（第⑥批）
+  "floating.runningCount": "{n}/3 运行",
+  "floating.todayTokens": "今日 token",
+  "floating.estCost": "花费（估算）",
+
+
   // 命令面板（Ctrl/Cmd+K）
   "palette.title": "命令面板",
   "palette.placeholder": "搜索 Key、模型、页面，或执行操作…",
@@ -398,7 +450,7 @@ const zh: Dict = {
   "logs.title": "运行日志",
   "logs.subtitle": "按系统 / 大脑聚合 / 路由与故障转移 / 错误分组，可按类型筛选（密钥已脱敏）",
   "usage.title": "用量统计",
-  "usage.subtitle": "按分类与 Key 聚合的 token 消耗（跨重启累计；仅统计 token，不换算金额）",
+  "usage.subtitle": "按分类与 Key 聚合的 token 消耗与花费估算（跨重启累计）",
   "usage.refresh": "刷新",
   "usage.loading": "加载中…",
   "usage.empty": "暂无用量记录（有转发流量后这里会出现数据）",
@@ -411,6 +463,24 @@ const zh: Dict = {
   "usage.systemLevel": "（系统级）",
   "usage.since": "统计起点",
   "usage.sinceHint": "每分钟自动保存一次（仅在有新消耗时写盘），意外退出最多丢 1 分钟",
+  // 第⑤批：金额与趋势
+  //
+  // 前三格显示的是 **token 数**（不是钱），故标签带单位后缀 —— 四格并排且第四格是金额，
+  // 不写单位的话「今日 1.2M」很容易被读成 120 万美元。
+  "usage.today": "今日 token",
+  "usage.thisWeek": "近 7 日 token",
+  "usage.thisMonth": "近 30 日 token",
+  "usage.estCost": "累计花费（估算）",
+  "usage.trend7d": "近 7 日 token 消耗",
+  "usage.colCost": "花费",
+  "usage.estimateHint":
+    "按内置官方单价 × 你填的计费倍率估算，不是账单。中转站实际计价可能不同；可在 Key 编辑器里调整「计费倍率」校准。",
+  "usage.costExactHint": "按官方单价表计算，倍率 {multiplier}",
+  "usage.costFamilyHint":
+    "该模型不在内置单价表里，按模型家族名（opus / sonnet / glm 等）估算，倍率 {multiplier}。偏差可能较大。",
+  "usage.costUnknownHint":
+    "无法估算：这条 Key 没有可识别的模型名。在 Key 里设置「默认兜底模型」或拉取模型列表后即可估算。",
+  "usage.unpricedHint": "有 {n} 条 Key 无法估算花费（模型名不在单价表中，金额列显示「—」）。",
   "logs.empty": "暂无事件",
   "logs.searchPlaceholder": "搜索日志（Key 名、模型、错误…）",
   "logs.noMatch": "没有匹配「{q}」的日志",
@@ -550,6 +620,9 @@ const zh: Dict = {
   "settings.startup": "启动",
   "settings.autoStartTitle": "开机自启动并最小化到托盘",
   "settings.autoStartDesc": "随 Windows 启动，后台驻留系统托盘",
+  "settings.floatingTitle": "桌面悬浮窗",
+  "settings.floatingDesc":
+    "在桌面角落常驻一个小窗，显示代理状态、今日用量与花费估算。开启后**关闭主窗口（最小化到托盘）时才出现**，主窗口在前台时自动隐藏。",
   "settings.backup": "配置备份",
   "settings.export": "导出配置…",
   "settings.import": "导入配置…",
@@ -687,6 +760,55 @@ const en: Dict = {
   "nav.vendors": "Vendors",
   "nav.settings": "Settings",
   "nav.about": "About",
+
+  // Balance query & cost (batch ④)
+  "balance.sectionTitle": "Balance & cost",
+  "balance.on": "Enabled",
+  "balance.enable": "Enable balance query",
+  "balance.enableHint":
+    "Reads remaining credit from the provider's billing endpoint. Endpoints vary by provider — try a preset first, then set a value path if needed; verify with \"Test query\" below.",
+  "balance.template": "Preset",
+  "balance.tpl.custom": "Custom",
+  "balance.tpl.generic": "Generic",
+  "balance.tpl.newapi": "NewAPI",
+  "balance.tpl.deepseek": "DeepSeek",
+  "balance.tpl.official": "Official",
+  "balance.url": "Request URL",
+  "balance.urlHint":
+    "Placeholders: {{baseUrl}} this key's base URL (path included), {{origin}} scheme+host only (path stripped), {{apiKey}} the secret. Use {{origin}} when the balance endpoint sits at the domain root but the base URL carries a path suffix (e.g. DeepSeek's /anthropic).",
+  "balance.accessToken": "Access Token",
+  "balance.userId": "User ID",
+  "balance.accessTokenHint":
+    "NewAPI-style panels authenticate the usage endpoint with the **panel session**, not the forwarding API key. Generate an Access Token in the panel's personal settings; the User ID is there too.",
+  "balance.ofTotal": "of {total} {unit}",
+  "balance.auth": "Auth",
+  "balance.authNone": "None",
+  "balance.timeout": "Timeout (s)",
+  // "balance.interval" / "balance.intervalHint" removed — see the zh section.
+  "balance.remainingPath": "Value path (optional)",
+  "balance.remainingPathPlaceholder": "e.g. data.balance",
+  "balance.remainingPathHint":
+    "Leave empty to auto-detect common fields (remaining / balance / quota.remaining / data.balance …). Array indices work too, e.g. balance_infos.0.total_balance. Only needed when auto-detection fails.",
+  "balance.overrideTitle": "Credential override (rarely needed)",
+  "balance.baseUrlOverride": "Balance endpoint",
+  "balance.baseUrlOverridePlaceholder": "Empty = use this key's base URL",
+  "balance.overrideHint":
+    "Some providers host the billing panel on a different domain than the forwarding endpoint. Set that domain here.",
+  "balance.probe": "Test query",
+  "balance.probing": "Querying…",
+  "balance.probeOk": "Success: {amount} {unit} remaining",
+  "balance.probeNeedSave":
+    "Save this key first, then test — the query uses the persisted secret and config.",
+  "balance.keyInactive": "Note: the provider reports this key as inactive (is_active=false).",
+  "balance.multiplier": "Cost multiplier (optional)",
+  "balance.multiplierHint":
+    "Providers often discount official pricing — 0.3 means 30% of list price. The usage page estimates spend from this; empty means 1.0. Estimates only; may differ from your actual bill.",
+
+  // Desktop widget (batch ⑥)
+  "floating.runningCount": "{n}/3 running",
+  "floating.todayTokens": "Today's tokens",
+  "floating.estCost": "Spend (est.)",
+
 
   // Command palette (Ctrl/Cmd+K)
   "palette.title": "Command palette",
@@ -1044,7 +1166,7 @@ const en: Dict = {
   "logs.title": "Logs",
   "logs.subtitle": "Grouped by system / brain / routing / error (keys redacted)",
   "usage.title": "Usage",
-  "usage.subtitle": "Token consumption by category and key (cumulative across restarts; token counts only, not cost)",
+  "usage.subtitle": "Token consumption and estimated spend by category and key (cumulative across restarts)",
   "usage.refresh": "Refresh",
   "usage.loading": "Loading…",
   "usage.empty": "No usage yet (data appears after forwarding traffic)",
@@ -1057,6 +1179,23 @@ const en: Dict = {
   "usage.systemLevel": "(system)",
   "usage.since": "Counting since",
   "usage.sinceHint": "Saved every minute (only when there is new usage); an unexpected exit loses at most 1 minute",
+  // Batch ⑤: cost & trend
+  // First three cards show **token counts**, not money — the unit suffix matters
+  // because the fourth card in the same row is a dollar amount.
+  "usage.today": "Today (tokens)",
+  "usage.thisWeek": "Last 7d (tokens)",
+  "usage.thisMonth": "Last 30d (tokens)",
+  "usage.estCost": "Est. spend",
+  "usage.trend7d": "Token usage, last 7 days",
+  "usage.colCost": "Cost",
+  "usage.estimateHint":
+    "Estimated from built-in list prices × your cost multiplier — not a bill. Providers may price differently; adjust the multiplier in the key editor to calibrate.",
+  "usage.costExactHint": "From the built-in price table, multiplier {multiplier}",
+  "usage.costFamilyHint":
+    "This model isn't in the built-in price table; estimated from its family name (opus / sonnet / glm …), multiplier {multiplier}. May deviate significantly.",
+  "usage.costUnknownHint":
+    "Can't estimate: no recognizable model name for this key. Set a default fallback model or fetch the model list to enable estimation.",
+  "usage.unpricedHint": "{n} key(s) can't be priced (model not in the price table); their cost shows as \"—\".",
   "logs.empty": "No events yet",
   "logs.searchPlaceholder": "Search logs (key, model, error…)",
   "logs.noMatch": "No logs match “{q}”",
@@ -1190,6 +1329,9 @@ const en: Dict = {
   "settings.startup": "Startup",
   "settings.autoStartTitle": "Auto-start and minimize to tray",
   "settings.autoStartDesc": "Launch with Windows and stay in the system tray",
+  "settings.floatingTitle": "Desktop widget",
+  "settings.floatingDesc":
+    "Keeps a small always-on-top window in a screen corner showing proxy status, today's usage and estimated spend. Once enabled it appears **only when the main window is closed (minimized to tray)**, and hides while the main window is in front.",
   "settings.backup": "Config backup",
   "settings.export": "Export config…",
   "settings.import": "Import config…",

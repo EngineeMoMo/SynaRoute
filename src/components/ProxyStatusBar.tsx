@@ -219,7 +219,13 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
             </Button>
           </>
         ) : (
-          <Button size="sm" onClick={() => void startProxy()}>
+          // 启动是本页的主操作（UI-1）：给它渐变以拉开与「停止 / 切官方」的层级差。
+          // 停止按钮维持 outline 中性样式——破坏性/退出类操作不该比启动更抢眼。
+          <Button
+            size="sm"
+            onClick={() => void startProxy()}
+            className="bg-gradient-to-r from-primary to-primary-deep"
+          >
             <Play size={14} /> {t("proxy.start")}
           </Button>
         )}

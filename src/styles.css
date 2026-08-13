@@ -20,6 +20,17 @@
 
     /* 品牌与功能色 */
     --primary: 109 94 247; /* #6D5EF7 靛紫 */
+    /**
+     * 渐变的**深**色端（UI-1）。
+     *
+     * 方案原本写的是 `to-primary-light`（往亮处渐变），实测后否决了：`--primary`
+     * (#6D5EF7) 上白字的对比度只有 **4.57:1**，刚过 AA 的 4.5 门槛、余量几乎为零。
+     * 任何提亮都会跌破——试过 #8B80FA 只有 3.2:1，实测不合格。
+     *
+     * 所以渐变改成往深处走：白字对比度只会更好（#5848E4 上是 6.07:1），
+     * 层次感一样在。往亮处做渐变时务必先算对比度，别照抄方案。
+     */
+    --primary-deep: 88 72 228; /* #5848E4，白字 6.07:1 */
     --primary-foreground: 255 255 255; /* #FFFFFF */
     --success: 34 197 94; /* #22C55E */
     --warning: 245 158 11; /* #F59E0B */
@@ -42,6 +53,9 @@
 
     /* 品牌与功能色（深色下略微提亮） */
     --primary: 129 116 255; /* 略亮的靛紫 */
+    /* 深色模式的 --primary 是 #8174FF（更亮），白字对比度本就更低，
+       故这里的渐变深端也相应下压，保证白字仍在 AA 以上。 */
+    --primary-deep: 104 92 240; /* #685CF0 */
     --primary-foreground: 255 255 255;
     --success: 34 197 94;
     --warning: 245 158 11;
@@ -89,5 +103,133 @@
   }
   ::-webkit-scrollbar-thumb:hover {
     background-color: rgb(var(--text-muted));
+  }
+}
+
+/*
+ * 入场动效（Tooltip / 快捷面板用）。
+ *
+ * **自建而非引 tailwindcss-animate**：本仓 `plugins: []`，全仓动效原本只用
+ * `transition-*` 工具类。而 `animate-in` / `fade-in-0` / `zoom-in-95` /
+ * `slide-in-from-bottom-4` 这套类名是那个插件提供的——没装插件时它们
+ * **不报错、也不生成任何 CSS**，元素照常渲染、只是动效悄悄没有，
+ * 与 `bg-warning/8` 那类透明度修饰符是同一种静默失效（见 tailwind.config.js 注释）。
+ * 故这里把用到的四个类各自落成真实 keyframes，判据：
+ * `npm run build` 后 `dist/assets/*.css` 里能搜到 `.animate-in`。
+ */
+@layer utilities {
+  .animate-in {
+    animation-duration: 150ms;
+    animation-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+    animation-fill-mode: both;
+  }
+  .fade-in-0 {
+    animation-name: synaroute-fade-in;
+  }
+  /* 同时出现两个入场类时，两组关键帧要合成一个动画，否则后者会覆盖前者 */
+  .fade-in-0.zoom-in-95 {
+    animation-name: synaroute-fade-zoom-in;
+  }
+  .fade-in-0.slide-in-from-bottom-4 {
+    animation-name: synaroute-fade-slide-up;
+  }
+  .duration-150 {
+    animation-duration: 150ms;
+  }
+  .duration-200 {
+    animation-duration: 200ms;
+  }
+
+  /* ── 状态动效（UI-1 第 3 条）────────────────────────────────────────────
+   * 只给「进行中 / 刚出事」两种瞬时状态用，稳定态一律不动 —— 一直在动的界面
+   * 会把注意力从真正要看的地方拽走。
+   *
+   * 不用 Tailwind 自带的 `animate-pulse`：它是整体 opacity 呼吸（0.5↔1），
+   * 文字会跟着变灰、可读性下降。这里只让**光晕**呼吸，文字始终保持满对比度。
+   */
+  .status-pulse {
+    animation: synaroute-status-pulse 1.6s ease-in-out infinite;
+  }
+  /* 故障抖动：只播一次（不 infinite）。持续抖动会变成噪音，而且用户滚动到它
+     时动画早就播完了 —— 抖一次的意义是「刚刚变成这个状态」的即时反馈。 */
+  .status-shake {
+    animation: synaroute-status-shake 0.4s ease-in-out 1;
+  }
+}
+
+/**
+ * 尊重系统「减少动态效果」。
+ *
+ * 无限循环的脉冲对前庭敏感 / 注意力障碍用户是实际的可访问性障碍，属 WCAG 2.2
+ * 动画相关准则关切的范畴，不是可选装饰。这里整段关掉循环动画（脉冲），
+ * 一次性入场动效也压到极短而非留着。
+ *
+ * 放在 @layer utilities **之外**：utilities 层内的媒体查询在某些 Tailwind
+ * 版本下会被 layer 顺序影响优先级，放外面确保它一定能盖住上面的声明。
+ */
+@media (prefers-reduced-motion: reduce) {
+  .status-pulse,
+  .status-shake {
+    animation: none;
+  }
+  .animate-in {
+    animation-duration: 1ms;
+  }
+}
+
+@keyframes synaroute-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes synaroute-fade-zoom-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes synaroute-fade-slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(1rem);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* 检测中：光晕呼吸。用 box-shadow 而非 opacity，文字对比度不受影响。
+   currentColor 让它自动跟随徽标的语义色（info 蓝），不必为每种色写一遍。 */
+@keyframes synaroute-status-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 currentColor;
+  }
+  50% {
+    box-shadow: 0 0 0 3px currentColor;
+  }
+}
+
+/* 故障抖动：位移克制在 2px 内。幅度再大就从「提示」变成「干扰」了。 */
+@keyframes synaroute-status-shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  25% {
+    transform: translateX(-2px);
+  }
+  75% {
+    transform: translateX(2px);
   }
 }

@@ -8,13 +8,16 @@ import type {
   AppSettings,
   BrainConfig,
   CategoryType,
+  DailyUsageBucket,
   EventLogEntry,
   HealthStatus,
   MasterPasswordState,
   ModelInfo,
+  PricingSource,
   ProviderKey,
   ProxyState,
   TokenUsageByKey,
+  UsageCostRow,
   Vendor,
 } from "@/types";
 import type { UserPrefs } from "@/lib/prefs";
@@ -727,6 +730,134 @@ export const mockBridge = {
     // 好让浏览器预览也能看出这行不是「本次启动时间」。
     return Date.now() - 7 * 24 * 60 * 60 * 1000;
   },
+
+  /**
+   * 按日分桶用量的 mock：造近 7 天、逐日递增的曲线。
+   *
+   * 刻意让数字有起伏而不是一条直线：趋势图的排序、峰值高亮、空日留白
+   * 这些在等值数据上都看不出错。第 3 天故意留空，用来验证「那天没用量」
+   * 的显示（真实数据里周末常常就是空的）。
+   */
+  async dailyUsage() {
+    await delay();
+    const buckets: DailyUsageBucket[] = [];
+    const perDay = [1_200_000, 340_000, 0, 890_000, 1_750_000, 620_000, 2_100_000];
+    for (let i = 0; i < perDay.length; i++) {
+      const d = new Date(Date.now() - i * 86_400_000);
+      const date = d.toISOString().slice(0, 10);
+      if (perDay[i] === 0) {
+        buckets.push({ date, entries: [] });
+        continue;
+      }
+      buckets.push({
+        date,
+        entries: [
+          {
+            categoryId: "claude-cli",
+            keyId: store["claude-cli"][0]?.id ?? "k1",
+            usage: {
+              input: perDay[i],
+              output: Math.round(perDay[i] * 0.28),
+              cacheRead: Math.round(perDay[i] * 1.4),
+              cacheCreation: Math.round(perDay[i] * 0.11),
+            },
+          },
+        ],
+      });
+    }
+    // 与后端同口径：最新在前
+    return buckets;
+  },
+
+  /**
+   * 带成本估算的用量 mock。
+   *
+   * 刻意让 exact / family / unknown 三种定价来源都出现：
+   * `unknown` 那条（金额显示「—」）最容易做漏，而它在真实数据里很常见
+   * （用户用了内置表和家族兜底都不认识的模型名）。
+   */
+  async usageWithCost(): Promise<UsageCostRow[]> {
+    await delay();
+    const rows = await this.tokenUsage();
+    const sources: PricingSource[] = ["exact", "family", "unknown"];
+    const out: UsageCostRow[] = rows.map((r, i) => {
+      const src = sources[i % sources.length];
+      const total = r.usage.input + r.usage.output;
+      return {
+        categoryId: r.categoryId,
+        keyId: r.keyId,
+        keyName:
+          store[r.categoryId]?.find((k) => k.id === r.keyId)?.name ?? r.keyId ?? null,
+        usage: r.usage,
+        // unknown 必须是 null，不是 0 —— 界面要显示「—」
+        costNano: src === "unknown" ? null : total * (src === "exact" ? 3000 : 15000),
+        pricingSource: src,
+        multiplier: src === "family" ? "0.3" : "1.0",
+      };
+    });
+
+    // mock 的事件里只有一条 Key 有用量，故上面只产出 1 行 —— 那样 family 与
+    // unknown 两条分支在浏览器预览里**永远渲染不到**，而「—」与「≈」的样式
+    // 恰恰最容易做漏。这里各补一行，让三种定价来源都能被看到。
+    // **必须挑没出现过的 keyId**：直接取 cli[1] 会与上面 rows 里已有的那条撞号，
+    // React 的 key 重复会让表格行错乱（实测报了 "two children with the same key"）。
+    const used = new Set(out.map((r) => `${r.categoryId}/${r.keyId}`));
+    const cli = (store["claude-cli"] ?? []).filter(
+      (k) => !used.has(`claude-cli/${k.id}`),
+    );
+    if (cli[0]) {
+      out.push({
+        categoryId: "claude-cli",
+        keyId: cli[0].id,
+        keyName: cli[0].name,
+        usage: { input: 42_000, output: 8_800, cacheRead: 12_000, cacheCreation: 3_100 },
+        costNano: 760_000_000,
+        pricingSource: "family",
+        multiplier: "0.3",
+      });
+    }
+    if (cli[1]) {
+      out.push({
+        categoryId: "claude-cli",
+        keyId: cli[1].id,
+        keyName: cli[1].name,
+        usage: { input: 9_100, output: 2_200, cacheRead: 0, cacheCreation: 0 },
+        costNano: null, // 无单价 → 界面必须显示「—」
+        pricingSource: "unknown",
+        multiplier: "1.0",
+      });
+    }
+    return out;
+  },
+
+  /**
+   * 余额查询的 mock。
+   *
+   * 按 keyId 的哈希分出三种形态：**成功、未配置、查询失败**。
+   * 三种都要能在浏览器预览里看到 —— 失败态的文案与布局最容易做漏，
+   * 而它恰恰是真实使用中最常出现的（站点没这接口、路径填错）。
+   */
+  async queryBalance(keyId: string) {
+    await delay();
+    const bucket = keyId.split("").reduce((a, c) => a + c.charCodeAt(0), 0) % 3;
+    if (bucket === 1) {
+      return {
+        ok: false,
+        queriedAt: Date.now(),
+        error: "上游返回里找不到余额字段（可在「取值路径」手填，如 data.balance）",
+      };
+    }
+    if (bucket === 2) {
+      return { ok: false, queriedAt: Date.now(), error: "查询超时（10s）" };
+    }
+    return {
+      ok: true,
+      remaining: 84.2,
+      unit: "CNY",
+      isValid: true,
+      queriedAt: Date.now(),
+    };
+  },
   async getEventTrace(eventId: string) {
     await delay();
     return clone(events.find((e) => e.id === eventId)?.trace ?? null);
@@ -748,6 +879,11 @@ export const mockBridge = {
   async setAutoStart(enabled: boolean) {
     await delay();
     settings.autoStart = enabled;
+  },
+  async setFloatingWidget(enabled: boolean) {
+    await delay();
+    // 浏览器预览里没有 Tauri 窗口，只落状态；真实环境由后端建/销毁悬浮窗。
+    settings.floatingWidgetEnabled = enabled;
   },
   async listVendors(): Promise<Vendor[]> {
     await delay();

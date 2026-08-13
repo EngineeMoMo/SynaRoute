@@ -1,3 +1,4 @@
+import * as React from "react";
 import { useMemo, useState } from "react";
 import { useStore } from "@/store";
 import { Badge } from "@/components/ui/Badge";
@@ -137,7 +138,12 @@ export function LogsPage() {
       <div className="border-b border-border px-6 py-4">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <h1 className="text-lg font-semibold text-text-primary">{t("logs.title")}</h1>
+            {/* 标题配图标（UI-1）：与 BrainPage 的 `<Brain size={20} className="text-primary"/>`
+                同一形制，让各页顶部有一致的识别锚点。 */}
+            <div className="flex items-center gap-2">
+              <ScrollText size={20} className="text-primary" />
+              <h1 className="text-lg font-semibold text-text-primary">{t("logs.title")}</h1>
+            </div>
             <p className="mt-1 text-xs text-text-muted">{t("logs.subtitle")}</p>
           </div>
           {/* 搜索（UX#10）：与下方两维筛选正交叠加，徽标计数会跟着搜索结果走 */}
@@ -270,7 +276,22 @@ function fmtTokens(n: number): string {
   return n >= 10_000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
 
-function LogRow({ entry, lang }: { entry: EventLogEntry; lang: string }) {
+/**
+ * 单条日志行。
+ *
+ * **用 memo 包住（PERF-1）**：本页 2s 轮询一次 `listAllEvents`，而后端事件环上限 500 条。
+ * 无 memo 时每次轮询都要重渲染全部 500 行（每行含展开态 useState、若干 Badge、图标），
+ * 而轮询的常态是「只在末尾追加一两条、前面几百条一字未改」。
+ *
+ * 同样**依赖 store 侧的 `reuseUnchanged`**：IPC 每次返回全新对象，不复用未变对象的话
+ * `prevProps.entry === nextProps.entry` 恒为 false、这个 memo 就是白加的。
+ *
+ * 没有上虚拟滚动是**权衡后的决定**，不是遗漏：500 条封顶实测插入+布局 27ms、滚动重排 1ms，
+ * 而本行支持展开（展开后高度从 ~40px 变到数百 px，且高度取决于异步拉回的 trace 正文长度），
+ * 变高虚拟滚动要接测量回调、易出现跳动与滚动位置漂移。为 27ms 的一次性开销引入这份复杂度
+ * 与一个新依赖不划算 —— memo 消掉的是每 2s 复发的那份成本，收益更大且零依赖。
+ */
+const LogRow = React.memo(function LogRow({ entry, lang }: { entry: EventLogEntry; lang: string }) {
   const t = useT();
   const [open, setOpen] = useState(false);
   // 链路快照按需拉取：列表接口不带 trace 正文（每 2s 轮询 × 单条最坏 40000 字符会拖卡界面），
@@ -370,7 +391,7 @@ function LogRow({ entry, lang }: { entry: EventLogEntry; lang: string }) {
       )}
     </div>
   );
-}
+});
 
 function TraceDetail({ trace }: { trace: RequestTrace }) {
   const t = useT();

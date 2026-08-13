@@ -15,6 +15,7 @@ import type {
 import type { Lang } from "@/lib/i18n";
 import { api, isTauri } from "@/lib/bridge";
 import { pickPrefs } from "@/lib/prefs";
+import { reuseUnchanged } from "@/lib/reuseUnchanged";
 
 /**
  * 只改 settings 里的一两个字段并落盘，**基线取磁盘最新值而非内存快照**。
@@ -206,10 +207,10 @@ export const useStore = create<AppState>((set, get) => ({
     if (brainR.status === "rejected") console.error("getBrainConfig failed", brainR.reason);
     if (eventsR.status === "rejected") console.error("listAllEvents failed", eventsR.reason);
     set((s) => ({
-      keys: keysR.status === "fulfilled" ? keysR.value : s.keys,
+      keys: keysR.status === "fulfilled" ? reuseUnchanged(s.keys, keysR.value) : s.keys,
       proxy: proxyR.status === "fulfilled" ? proxyR.value : s.proxy,
       brain: brainR.status === "fulfilled" ? brainR.value : s.brain,
-      events: eventsR.status === "fulfilled" ? eventsR.value : s.events,
+      events: eventsR.status === "fulfilled" ? reuseUnchanged(s.events, eventsR.value) : s.events,
       loading: false,
     }));
   },
@@ -222,7 +223,8 @@ export const useStore = create<AppState>((set, get) => ({
         api.getProxyState(c),
       ]);
       set((s) => ({
-        keys: keysR.status === "fulfilled" ? keysR.value : s.keys,
+        // 逐条复用内容未变的旧对象：这是 5s 轮询，不做的话 KeyCard 的 memo 恒失效。
+        keys: keysR.status === "fulfilled" ? reuseUnchanged(s.keys, keysR.value) : s.keys,
         proxy: proxyR.status === "fulfilled" ? proxyR.value : s.proxy,
       }));
     } catch (e) {
@@ -235,7 +237,9 @@ export const useStore = create<AppState>((set, get) => ({
   async refreshEvents() {
     try {
       const events = await api.listAllEvents();
-      set({ events });
+      // 2s 轮询：日志页最密的刷新源。逐条复用未变的旧事件对象，让 LogRow 的 memo 生效——
+      // 事件是追加型的，新增一条时前面几百条内容都没动，不该跟着重渲染。
+      set((s) => ({ events: reuseUnchanged(s.events, events) }));
     } catch (e) {
       console.error("refreshEvents failed", e);
     }

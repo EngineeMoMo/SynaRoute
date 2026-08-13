@@ -5,14 +5,22 @@ import { useT } from "@/lib/useT";
 import { Button } from "@/components/ui/Button";
 import { Combobox } from "@/components/ui/Combobox";
 import { BrandIcon } from "@/components/BrandIcon";
-import type { DesktopModelNameIssue, ModelInfo, ModelMapping, ProviderKey, Protocol } from "@/types";
+import type {
+  BalanceQuery,
+  BalanceResult,
+  DesktopModelNameIssue,
+  ModelInfo,
+  ModelMapping,
+  ProviderKey,
+  Protocol,
+} from "@/types";
 import {
   type TokenUnit,
   tokensFromAmount,
   preferredUnit,
   amountForUnit,
 } from "@/lib/tokenUnit";
-import { X, RefreshCw, Plus, Trash2, ArrowRight, Eye, EyeOff, Zap, Gauge, Brain, Download, AlertTriangle } from "lucide-react";
+import { X, RefreshCw, Plus, Trash2, ArrowRight, Eye, EyeOff, Zap, Gauge, Brain, Download, AlertTriangle, Wallet, ChevronRight } from "lucide-react";
 
 interface KeyEditorProps {
   initial: ProviderKey | null; // null = 新增
@@ -31,6 +39,43 @@ const PROTOCOL_LABEL: Record<Protocol, string> = {
   openai_chat: "OpenAI Chat",
   openai_responses: "OpenAI Responses",
 };
+
+/**
+ * 余额查询的预设模板（对齐 cc-switch 界面上那排按钮）。
+ *
+ * 只预设 `url` / `method` / `auth` 三项 —— 取值路径刻意留空，走后端的候选字段链
+ * 自动探测（`remaining` / `quota.remaining` / `balance` / `data.balance` …）。
+ * 这样一个模板能覆盖同一类面板的多种字段命名，而不必为每家各写一条。
+ *
+ * `custom` 不在此表里：它表示「用户自己改过」，切到它时保留当前填的值不动。
+ */
+const BALANCE_TEMPLATES: Record<string, { url: string; method: string; auth: string }> = {
+  // cc-switch 内置「通用模板」的**原文路径**（其用户手册 §2.5：`{{baseUrl}}/user/balance`）。
+  // 此前这里写的是 `/v1/usage` —— 那是某个站的自定义脚本路径，被我误当成通用默认值，
+  // 结果新用户一开开关就 404。
+  generic: { url: "{{baseUrl}}/user/balance", method: "GET", auth: "bearer" },
+  // NewAPI 系面板：认的是**面板登录态**（access token + 用户 id），不是转发用的 API Key
+  newapi: { url: "{{baseUrl}}/api/user/self", method: "GET", auth: "access-token" },
+  // DeepSeek：余额端点在**域名根**下，而它的 baseUrl 常带 `/anthropic` 后缀，
+  // 故必须用 `{{origin}}`（剥掉路径）而非 `{{baseUrl}}` —— 实测后者 404、前者 200。
+  deepseek: { url: "{{origin}}/user/balance", method: "GET", auth: "bearer" },
+  // 官方 Anthropic
+  official: { url: "{{baseUrl}}/v1/organizations/me", method: "GET", auth: "x-api-key" },
+};
+
+/** 模板按钮的顺序与文案 key（与 cc-switch 的排列一致：自定义在最前）。 */
+const BALANCE_TEMPLATE_ORDER = ["custom", "generic", "newapi", "deepseek", "official"] as const;
+
+/** 新建 Key 时的余额查询初值：默认**关闭**，但把通用模板填好，用户开开关即可用。 */
+function defaultBalanceQuery(): BalanceQuery {
+  return {
+    enabled: false,
+    template: "generic",
+    ...BALANCE_TEMPLATES.generic,
+    timeoutSecs: 10,
+    autoIntervalMin: 0,
+  };
+}
 
 /** 新增/编辑 Key 抽屉面板（FR-002/004/005/006） */
 export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
@@ -58,6 +103,18 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const [tierHaiku, setTierHaiku] = useState(initial?.tierHaiku ?? "");
   const [tierSonnet, setTierSonnet] = useState(initial?.tierSonnet ?? "");
   const [tierOpus, setTierOpus] = useState(initial?.tierOpus ?? "");
+  // ---- 余额查询（第④批）----
+  // 整份配置放一个 state：字段间有联动（换模板要一次改 url/method/auth 三项），
+  // 拆成 8 个 useState 会让「换模板」变成 8 次 setState、且容易漏改其中一项。
+  const [balance, setBalance] = useState<BalanceQuery>(
+    () => initial?.balanceQuery ?? defaultBalanceQuery(),
+  );
+  const [balanceOpen, setBalanceOpen] = useState(!!initial?.balanceQuery?.enabled);
+  // 「测试查询」的结果。null = 还没测过；测过就把成功值或失败原因如实显示出来。
+  const [balanceProbe, setBalanceProbe] = useState<BalanceResult | null>(null);
+  const [probing, setProbing] = useState(false);
+  // 计费倍率（如 "0.3" = 官方价三折）。存字符串，避免 0.1+0.2 那类浮点显示。
+  const [costMultiplier, setCostMultiplier] = useState(initial?.costMultiplier ?? "");
   const [fetching, setFetching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // 批量应用 Max Tokens 的状态与结果提示。成功走独立提示，不复用 error（那是红色告警样式）。
@@ -244,6 +301,59 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const addMapping = () =>
     setMappings([...mappings, { id: `m_${Date.now()}`, expectedName: "", realName: "" }]);
 
+  /**
+   * 切余额查询模板：套用该模板的 url/method/auth，其余字段（超时、间隔、覆盖项）保留。
+   *
+   * 切到 `custom` 时**什么都不改**，只改 template 标记 —— 用户选「自定义」的意图是
+   * 「我要自己填」，此时清空或重置他刚填的内容是最招人烦的行为。
+   */
+  const applyBalanceTemplate = (tpl: string) => {
+    setBalanceProbe(null); // 换了目标地址，上次的探测结果不再代表现在
+    if (tpl === "custom") {
+      setBalance((b) => ({ ...b, template: "custom" }));
+      return;
+    }
+    const preset = BALANCE_TEMPLATES[tpl];
+    if (!preset) return;
+    setBalance((b) => ({ ...b, template: tpl, ...preset }));
+  };
+
+  /**
+   * 测试查询：先保存再查。
+   *
+   * **为什么必须先保存**：后端 `query_key_balance` 按 keyId 从密钥库取密钥、
+   * 从配置读 balanceQuery —— 都是已落盘的数据。若不保存就查，用户在表单里刚改的
+   * URL 根本不会生效，测出来的是旧配置的结果，「改完一测还是错」会让人以为改动无效。
+   *
+   * 新建且尚未保存过的 Key 直接拒绝并说明原因，而不是静默失败。
+   */
+  const probeBalance = async () => {
+    if (!initial?.id) {
+      setBalanceProbe({
+        ok: false,
+        queriedAt: Date.now(),
+        error: t("balance.probeNeedSave"),
+      });
+      return;
+    }
+    setProbing(true);
+    setBalanceProbe(null);
+    try {
+      // 先把当前表单落盘，否则测的是旧配置（见上方注释）
+      await api.upsertKey(buildDraftKey());
+      if (secret) await api.saveSecret(initial.id, secret);
+      setBalanceProbe(await api.queryKeyBalance(initial.id));
+    } catch (e) {
+      setBalanceProbe({
+        ok: false,
+        queriedAt: Date.now(),
+        error: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setProbing(false);
+    }
+  };
+
   // 当前厂商的内置预设模型（用于「一键导入」补全空列表）
   const presetModels = vendors.find((v) => v.id === vendor)?.presetModels ?? [];
   const importPresetModels = () => {
@@ -294,6 +404,20 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     tierSonnet: activeCategory === "codex" ? undefined : tierSonnet.trim() || undefined,
     tierOpus: activeCategory === "codex" ? undefined : tierOpus.trim() || undefined,
     health: initial?.health ?? { status: "unknown", failCount: 0 },
+    // 余额查询：从未配置过且仍是关闭态时不落这个字段，避免给每条 Key 的
+    // config.json 都塞一段没用的默认配置（老 Key 保持原样、导出文件也更干净）。
+    balanceQuery:
+      balance.enabled || initial?.balanceQuery
+        ? {
+            ...balance,
+            // 空白的覆盖项一律落 undefined 而非空串：后端把「空串」与「未设置」
+            // 都当未设置处理，但空串会被序列化进文件，成为无意义的噪音。
+            baseUrlOverride: balance.baseUrlOverride?.trim() || undefined,
+            apiKeyRef: balance.apiKeyRef?.trim() || undefined,
+            remainingPath: balance.remainingPath?.trim() || undefined,
+          }
+        : undefined,
+    costMultiplier: costMultiplier.trim() || undefined,
   });
 
   /**
@@ -821,6 +945,262 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
             />
             <p className="mt-1 text-[11px] leading-relaxed text-text-muted">{t("editor.defaultModelHint")}</p>
           </Field>
+
+          {/* ---- 余额查询与计费（第④批）----
+              默认折叠：绝大多数用户不会配它，展开着会让本已很长的抽屉更难扫读。
+              标题行常驻显示「已启用 / 未启用」，折叠状态下也能看出配没配。 */}
+          <div className="rounded-control border border-border">
+            <button
+              type="button"
+              onClick={() => setBalanceOpen((v) => !v)}
+              className="flex w-full items-center gap-2 px-3 py-2 text-left"
+            >
+              <Wallet size={14} className="shrink-0 text-text-secondary" />
+              <span className="flex-1 text-xs font-medium text-text-secondary">
+                {t("balance.sectionTitle")}
+              </span>
+              {balance.enabled && (
+                <span className="shrink-0 rounded-full bg-success/12 px-1.5 py-0.5 text-[10px] text-success">
+                  {t("balance.on")}
+                </span>
+              )}
+              <ChevronRight
+                size={14}
+                className={`shrink-0 text-text-muted transition-transform ${balanceOpen ? "rotate-90" : ""}`}
+              />
+            </button>
+
+            {balanceOpen && (
+              <div className="space-y-3 border-t border-border px-3 py-3">
+                {/* 总开关 */}
+                <label className="flex cursor-pointer items-start gap-2">
+                  <input
+                    type="checkbox"
+                    checked={balance.enabled}
+                    onChange={(e) => {
+                      setBalance((b) => ({ ...b, enabled: e.target.checked }));
+                      setBalanceProbe(null);
+                    }}
+                    className="mt-0.5"
+                  />
+                  <span className="text-xs text-text-primary">
+                    {t("balance.enable")}
+                    <span className="mt-0.5 block text-[11px] leading-relaxed text-text-muted">
+                      {t("balance.enableHint")}
+                    </span>
+                  </span>
+                </label>
+
+                {balance.enabled && (
+                  <>
+                    {/* 预设模板 */}
+                    <Field label={t("balance.template")}>
+                      <div className="flex flex-wrap gap-1.5">
+                        {BALANCE_TEMPLATE_ORDER.map((tpl) => (
+                          <button
+                            key={tpl}
+                            type="button"
+                            onClick={() => applyBalanceTemplate(tpl)}
+                            className={`rounded-control border px-2 py-1 text-[11px] transition-colors ${
+                              balance.template === tpl
+                                ? "border-primary bg-primary/10 text-primary"
+                                : "border-border text-text-secondary hover:bg-surface-hover"
+                            }`}
+                          >
+                            {t(`balance.tpl.${tpl}`)}
+                          </button>
+                        ))}
+                      </div>
+                    </Field>
+
+                    {/* 请求地址 */}
+                    <Field label={t("balance.url")}>
+                      <input
+                        className={`${inputCls} font-mono`}
+                        value={balance.url}
+                        placeholder="{{baseUrl}}/v1/usage"
+                        onChange={(e) => {
+                          // 用户手改地址即视为自定义：模板高亮跟着走，
+                          // 否则会出现「高亮在通用模板、地址却不是它」的错配。
+                          setBalance((b) => ({ ...b, url: e.target.value, template: "custom" }));
+                          setBalanceProbe(null);
+                        }}
+                      />
+                      <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
+                        {t("balance.urlHint")}
+                      </p>
+                    </Field>
+
+                    {/* 认证方式 + 超时。
+                        「自动查询间隔」那一格已移除：字段本身留在数据结构里（后端
+                        `BalanceQuery.auto_interval_min` 已定义），但**没有任何定时任务读它**
+                        —— 摆一个填了不生效的输入框，正是本项目反复防的「静默失效开关」。
+                        等定时查询真正落地再把它加回来。 */}
+                    <div className="grid grid-cols-2 gap-2">
+                      <Field label={t("balance.auth")}>
+                        <select
+                          className={inputCls}
+                          value={balance.auth}
+                          onChange={(e) => setBalance((b) => ({ ...b, auth: e.target.value }))}
+                        >
+                          <option value="bearer">Bearer</option>
+                          <option value="x-api-key">x-api-key</option>
+                          <option value="access-token">Access Token</option>
+                          <option value="none">{t("balance.authNone")}</option>
+                        </select>
+                      </Field>
+                      <Field label={t("balance.timeout")}>
+                        <input
+                          type="number"
+                          min={1}
+                          className={inputCls}
+                          value={balance.timeoutSecs}
+                          onChange={(e) =>
+                            setBalance((b) => ({ ...b, timeoutSecs: Number(e.target.value) || 10 }))
+                          }
+                        />
+                      </Field>
+                    </div>
+
+                    {/* Access Token / 用户 id：只在选了 access-token 认证时才出现。
+                        NewAPI 类面板认的是面板登录态而非 API Key，两个都得填；
+                        其它认证方式下这两格无意义，显示出来只会让人以为漏填了东西。 */}
+                    {balance.auth === "access-token" && (
+                      <div className="grid grid-cols-2 gap-2">
+                        <Field label={t("balance.accessToken")}>
+                          <input
+                            className={`${inputCls} font-mono`}
+                            value={balance.accessToken ?? ""}
+                            onChange={(e) =>
+                              setBalance((b) => ({ ...b, accessToken: e.target.value }))
+                            }
+                          />
+                        </Field>
+                        <Field label={t("balance.userId")}>
+                          <input
+                            className={`${inputCls} font-mono`}
+                            value={balance.userId ?? ""}
+                            onChange={(e) => setBalance((b) => ({ ...b, userId: e.target.value }))}
+                          />
+                        </Field>
+                      </div>
+                    )}
+                    {balance.auth === "access-token" && (
+                      <p className="text-[11px] leading-relaxed text-text-muted">
+                        {t("balance.accessTokenHint")}
+                      </p>
+                    )}
+
+                    {/* 取值路径（留空 = 自动探测） */}
+                    <Field label={t("balance.remainingPath")}>
+                      <input
+                        className={`${inputCls} font-mono`}
+                        value={balance.remainingPath ?? ""}
+                        placeholder={t("balance.remainingPathPlaceholder")}
+                        onChange={(e) =>
+                          setBalance((b) => ({ ...b, remainingPath: e.target.value }))
+                        }
+                      />
+                      <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
+                        {t("balance.remainingPathHint")}
+                      </p>
+                    </Field>
+
+                    {/* 凭证覆盖：默认折叠在一行提示后，多数站点用不到 */}
+                    <details className="rounded-control bg-surface-hover/40 px-2.5 py-2">
+                      <summary className="cursor-pointer text-[11px] text-text-secondary">
+                        {t("balance.overrideTitle")}
+                      </summary>
+                      <div className="mt-2 space-y-2">
+                        <Field label={t("balance.baseUrlOverride")}>
+                          <input
+                            className={`${inputCls} font-mono`}
+                            value={balance.baseUrlOverride ?? ""}
+                            placeholder={t("balance.baseUrlOverridePlaceholder")}
+                            onChange={(e) =>
+                              setBalance((b) => ({ ...b, baseUrlOverride: e.target.value }))
+                            }
+                          />
+                        </Field>
+                        <p className="text-[11px] leading-relaxed text-text-muted">
+                          {t("balance.overrideHint")}
+                        </p>
+                      </div>
+                    </details>
+
+                    {/* 测试查询 */}
+                    <div className="flex items-center gap-2">
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => void probeBalance()}
+                        disabled={probing}
+                      >
+                        <RefreshCw size={13} className={probing ? "animate-spin" : ""} />
+                        {probing ? t("balance.probing") : t("balance.probe")}
+                      </Button>
+                    </div>
+
+                    {/* 探测结果：成功显示数值，失败**如实显示原因**。
+                        绝不把失败显示成「余额 0」——那会让用户以为额度真用光了。 */}
+                    {balanceProbe && (
+                      <div
+                        className={`rounded-control px-3 py-2 text-xs leading-relaxed ${
+                          balanceProbe.ok
+                            ? "bg-success/10 text-success"
+                            : "bg-danger/10 text-danger"
+                        }`}
+                      >
+                        {balanceProbe.ok ? (
+                          <>
+                            {t("balance.probeOk", {
+                              amount: String(balanceProbe.remaining ?? "?"),
+                              unit: balanceProbe.unit ?? "USD",
+                            })}
+                            {/* 套餐名与总额/已用：上游给了才显示，不硬凑 */}
+                            {balanceProbe.planName && (
+                              <span className="ml-1 opacity-80">
+                                · {balanceProbe.planName}
+                              </span>
+                            )}
+                            {balanceProbe.total != null && (
+                              <span className="ml-1 opacity-80">
+                                · {t("balance.ofTotal", {
+                                  total: String(balanceProbe.total),
+                                  unit: balanceProbe.unit ?? "USD",
+                                })}
+                              </span>
+                            )}
+                            {balanceProbe.isValid === false && (
+                              <span className="mt-1 block text-warning">
+                                {balanceProbe.invalidMessage ?? t("balance.keyInactive")}
+                              </span>
+                            )}
+                          </>
+                        ) : (
+                          balanceProbe.error
+                        )}
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {/* 计费倍率：与余额查询无关，但同属「钱」这一类，放一起用户好找。
+                    即使不开余额查询也能配（用量页靠它算金额）。 */}
+                <Field label={t("balance.multiplier")}>
+                  <input
+                    className={`${inputCls} font-mono`}
+                    value={costMultiplier}
+                    placeholder="1.0"
+                    onChange={(e) => setCostMultiplier(e.target.value)}
+                  />
+                  <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
+                    {t("balance.multiplierHint")}
+                  </p>
+                </Field>
+              </div>
+            )}
+          </div>
 
           {/* 保存错误：后端的校验消息是多行的（如桌面端模型名不合规会附后果与修法），
               必须 whitespace-pre-line 保留换行，否则挤成一坨没人读得下去。 */}

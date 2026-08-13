@@ -95,6 +95,15 @@ export interface DesktopModelNameReport {
   tierSonnet?: string;
   tierOpus?: string;
   health: HealthState;
+  /** 余额查询配置。未配置时为 undefined */
+  balanceQuery?: BalanceQuery;
+  /**
+   * 计费倍率（如 "0.3" = 官方价三折）。中转站普遍按官方价打折计费。
+   *
+   * 是字符串而非 number：JSON 里的 0.3 经过 f64 往返可能变成
+   * 0.30000000000000004，用户在界面上看到这种数字会以为程序坏了。
+   */
+  costMultiplier?: string;
 }
 
 /** Key 请求参数（FR-005） */
@@ -257,6 +266,11 @@ export interface TokenUsage {
   output: number;
   /** 命中缓存的输入 token（为 0 时后端不下发该字段） */
   cacheRead?: number;
+  /**
+   * 写入缓存的 token（首次发送缓存前缀时产生，为 0 时后端不下发）。
+   * 单价约为输入价的 1.25 倍，算钱时不能漏。
+   */
+  cacheCreation?: number;
 }
 
 /** 用量统计：按「分类 × Key」聚合的一行（后端 get_token_usage 返回）。 */
@@ -265,6 +279,105 @@ export interface TokenUsageByKey {
   /** 空串 = 该分类的系统级事件（无具体 Key） */
   keyId: string;
   usage: TokenUsage;
+}
+
+/** 一天的用量分桶（后端 get_daily_usage 返回，最近 90 天，最新在前）。 */
+export interface DailyUsageBucket {
+  /** UTC 日期，格式 `YYYY-MM-DD` */
+  date: string;
+  entries: TokenUsageByKey[];
+}
+
+/**
+ * 单价来源，界面据此如实标注估算精度。
+ *
+ * - `exact`：命中内置官方单价表
+ * - `family`：按家族关键词兜底（如 claude-opus-4-8 → opus 档）
+ * - `unknown`：没有可用单价，金额显示「—」而非 0
+ */
+export type PricingSource = "exact" | "family" | "unknown";
+
+/** 带成本估算的用量行（后端 get_usage_with_cost 返回）。 */
+export interface UsageCostRow {
+  categoryId: CategoryType;
+  keyId: string;
+  /** Key 可读名；Key 已删除时为 null */
+  keyName: string | null;
+  usage: TokenUsage;
+  /** 估算成本（纳美元 = 1e-9 USD）。null = 无可用单价 */
+  costNano: number | null;
+  pricingSource: PricingSource;
+  /** 实际生效的倍率（回显，空则 "1.0"） */
+  multiplier: string;
+}
+
+/**
+ * 余额查询配置（挂在 ProviderKey 上）。
+ *
+ * 对齐 cc-switch 的 `usage_script` 数据契约（占位符、候选字段回退、超时、自动间隔），
+ * 但**不执行用户 JS**：取值由后端按候选链声明式提取。理由见
+ * `docs/17-用量查询与悬浮窗方案.md` §2.1。
+ */
+export interface BalanceQuery {
+  /** 总开关。关闭时不发请求（可保留配置但暂停查询） */
+  enabled: boolean;
+  /** 预设模板 id：generic / newapi / deepseek / official / custom（仅用于界面回显） */
+  template: string;
+  /** 请求路径，支持 {{baseUrl}} / {{apiKey}} 占位符 */
+  url: string;
+  /** HTTP 方法，留空按 GET */
+  method: string;
+  /** 认证头形态：bearer / x-api-key / none */
+  auth: string;
+  /** 覆盖 baseUrl（留空 = 用该 Key 的 baseUrl）。计费面板与转发端点不同域时用 */
+  baseUrlOverride?: string;
+  /** 覆盖密钥的**密钥库键名**（只存键名不存明文） */
+  apiKeyRef?: string;
+  /** 超时（秒），0 = 用默认 10s */
+  timeoutSecs: number;
+  /** 自动查询间隔（分钟），0 = 只在手动刷新时查 */
+  autoIntervalMin: number;
+  /** 自定义取值路径（点分，支持数组下标如 balance_infos.0.total_balance）。留空 = 自动探测 */
+  remainingPath?: string;
+  /** NewAPI 类面板的 access token（对应 {{accessToken}} 占位符） */
+  accessToken?: string;
+  /** NewAPI 类面板的用户 id（对应 {{userId}}，也用于 New-Api-User 头） */
+  userId?: string;
+}
+
+/**
+ * 一次余额查询的结果。
+ *
+ * `remaining` 刻意是可选：取不到时为 `undefined` 而非 0 ——
+ * 显示「余额 0」会让用户以为额度真用光了，比不显示更糟。
+ * 失败时 `error` 必有内容，界面应就地显示它。
+ */
+export interface BalanceResult {
+  ok: boolean;
+  /** 剩余额度。undefined = 没取到（此时看 error） */
+  remaining?: number;
+  /** 货币单位（取不到时后端按 USD 兜底） */
+  unit?: string;
+  /** 上游声明的 Key 有效性（部分站点提供） */
+  isValid?: boolean;
+  /**
+   * 上游明确说「账号无效」时给的原因。
+   *
+   * 与 `error` 分开：`error` 是**我们这侧**的失败（超时、404、字段找不到），
+   * 这个是上游说「这个号不能用了」。两者混在一起用户就分不清
+   * 「查询坏了」和「账号欠费了」，而处理方式完全不同。
+   */
+  invalidMessage?: string;
+  /** 套餐名（多套餐站点会给） */
+  planName?: string;
+  /** 总额度（有它才能算已用百分比） */
+  total?: number;
+  /** 已消耗额度 */
+  used?: number;
+  /** 查询时刻（epoch ms），用于显示「刷新于 X 分钟前」 */
+  queriedAt: number;
+  /** 失败原因（超时 / HTTP 状态 / 字段找不到）。成功时无此字段 */
+  error?: string;
 }
 
 export interface EventLogEntry {
@@ -338,6 +451,15 @@ export interface AppSettings {
   activeModels?: Record<string, string>; // 各分类当前选定的对外模型名（key=分类）。借鉴 EchoBird：客户端菜单拉不到中转模型时，在应用内选、代理转发时覆盖。后端自管，走 setActiveModel 专用命令
   activeEfforts?: Record<string, string>; // 各分类默认推理强度（key=分类，值 minimal/low/medium/high/xhigh）。Codex 对自定义 provider 不发 reasoning.effort，故在此配置、转发时注入。后端自管，走 setActiveEffort 专用命令
   trayModelSwitchEnabled?: boolean; // 托盘快切 Codex 模型子菜单开关（默认开）。开启后右键托盘可直接切 Codex 当前对外模型，免打开主窗口
+  /**
+   * 桌面悬浮窗开关（默认关）。
+   *
+   * **不在 UserPrefs 白名单里**：它带窗口副作用，由专用命令 `setFloatingWidget`
+   * 修改（理由同 autoStart —— 批量保存会用旧快照把它覆盖回去）。
+   *
+   * 开启后不会立刻显示，还要求主窗口已最小化到托盘。
+   */
+  floatingWidgetEnabled?: boolean;
   proxyPorts?: Record<string, number>; // 各分类代理首选监听端口（key=分类）。粘滞固定端口：默认 CLI=47100/Codex=47101/Desktop=47102，改端口走 setProxyPort（重启代理+重写客户端 config）
   /**
    * 首启向导是否已完成（UX#1）。**三态**：null/undefined = 从未判定（旧配置或全新安装），

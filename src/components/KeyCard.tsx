@@ -3,6 +3,7 @@ import { Card } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { Switch } from "@/components/ui/Switch";
 import { Button } from "@/components/ui/Button";
+import { Tooltip } from "@/components/ui/Tooltip";
 import { HealthBadge } from "@/components/HealthBadge";
 import { BrandIcon } from "@/components/BrandIcon";
 import { type ProviderKey, protocolLabel } from "@/types";
@@ -11,8 +12,18 @@ import { formatRelativeTime } from "@/lib/utils";
 import { useT } from "@/lib/useT";
 import { ChevronUp, ChevronDown, RefreshCw, Pencil, Trash2, ArrowRight } from "lucide-react";
 
-/** 单个厂商 Key 卡片（FR-001/003/006/010/011） */
-export function KeyCard({ k, onEdit, isFirst, isLast }: {
+/**
+ * 单个厂商 Key 卡片（FR-001/003/006/010/011）。
+ *
+ * **用 memo 包住（PERF-2）**：CategoryPage 每 5s 轮询一次 `listKeys`，日志页每 2s 刷 events。
+ * 一份分类下有 N 张卡片，无 memo 时每次轮询都要把 N 张全部重渲染一遍（含 Tooltip、
+ * 徽标、Switch 全套子树），而绝大多数轮询的返回内容与上次完全一致。
+ *
+ * 这个 memo **依赖 store 侧的 `reuseUnchanged`**：IPC 每次都返回全新对象，
+ * 若不在 store 里复用未变对象，`prevProps.k === nextProps.k` 恒为 false、memo 恒失效
+ * （实测确认过：轮询后 k 引用必变而内容全等）。两者必须成对存在，改一处要想到另一处。
+ */
+export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast }: {
   k: ProviderKey;
   onEdit: (k: ProviderKey) => void;
   isFirst: boolean;
@@ -30,6 +41,12 @@ export function KeyCard({ k, onEdit, isFirst, isLast }: {
   const vendorIcon = vendors.find((v) => v.id === k.vendor)?.icon;
   // 就地二次确认：不用原生 confirm()（在 Tauri WebView2 里行为不可靠，会导致删除不触发）
   const [confirmingDelete, setConfirmingDelete] = React.useState(false);
+  // 模型徽标折叠态（UX-3）：超过 3 个时默认折叠，点击「+N」展开
+  const [modelsExpanded, setModelsExpanded] = React.useState(false);
+
+  // 显示的模型列表：映射优先，否则显示前几个原生模型
+  const displayModels = k.mappings.length > 0 ? k.mappings : k.models.slice(0, modelsExpanded ? k.models.length : 3);
+  const hasMore = k.mappings.length === 0 && k.models.length > 3;
 
   return (
     <Card className="p-0">
@@ -37,24 +54,26 @@ export function KeyCard({ k, onEdit, isFirst, isLast }: {
         {/* 优先级上移/下移（FR-010）：越靠上越优先，故障转移先用它。
             拖拽在 Tauri WebView 里不稳，改用明确的上/下按钮，点一下与相邻 Key 交换。 */}
         <div className="mt-0.5 flex flex-col">
-          <button
-            className="text-text-muted hover:text-text-secondary disabled:cursor-not-allowed disabled:opacity-30"
-            title={t("key.moveUp")}
-            aria-label={t("key.moveUp")}
-            disabled={isFirst}
-            onClick={() => void moveKey(k.id, "up")}
-          >
-            <ChevronUp size={15} />
-          </button>
-          <button
-            className="text-text-muted hover:text-text-secondary disabled:cursor-not-allowed disabled:opacity-30"
-            title={t("key.moveDown")}
-            aria-label={t("key.moveDown")}
-            disabled={isLast}
-            onClick={() => void moveKey(k.id, "down")}
-          >
-            <ChevronDown size={15} />
-          </button>
+          <Tooltip content={t("key.moveUp")} side="left">
+            <button
+              className="text-text-muted hover:text-text-secondary disabled:cursor-not-allowed disabled:opacity-30"
+              aria-label={t("key.moveUp")}
+              disabled={isFirst}
+              onClick={() => void moveKey(k.id, "up")}
+            >
+              <ChevronUp size={15} />
+            </button>
+          </Tooltip>
+          <Tooltip content={t("key.moveDown")} side="left">
+            <button
+              className="text-text-muted hover:text-text-secondary disabled:cursor-not-allowed disabled:opacity-30"
+              aria-label={t("key.moveDown")}
+              disabled={isLast}
+              onClick={() => void moveKey(k.id, "down")}
+            >
+              <ChevronDown size={15} />
+            </button>
+          </Tooltip>
         </div>
 
         <BrandIcon hint={k.vendor} fallbackLabel={k.name} iconUrl={vendorIcon} size={28} className="mt-0.5" />
@@ -66,29 +85,36 @@ export function KeyCard({ k, onEdit, isFirst, isLast }: {
               {k.name}
             </span>
             {k.priority === 0 ? (
-              <Badge variant="primary">{t("key.primary")}</Badge>
-            ) : (
-              <button
-                type="button"
-                onClick={() => void setPrimaryKey(k.id)}
-                className="shrink-0 rounded-control border border-border px-1.5 py-0.5 text-[11px] text-text-muted hover:border-primary hover:text-primary"
-                title={t("key.setPrimaryHint")}
+              /* 主 Key 徽标用实心渐变（UI-1）：这是卡片列表里唯一需要「一眼找到」的标识，
+                 故给它全卡片最强的视觉权重。其余徽标一律保持低饱和的 /12 底色，
+                 渐变只用在这一处——铺开用就等于没有重点。 */
+              <Badge
+                variant="primary"
+                className="border-0 bg-gradient-to-r from-primary to-primary-deep text-primary-foreground"
               >
-                {t("key.setPrimary")}
-              </button>
+                {t("key.primary")}
+              </Badge>
+            ) : (
+              <Tooltip content={t("key.setPrimaryHint")} side="top">
+                <button
+                  type="button"
+                  onClick={() => void setPrimaryKey(k.id)}
+                  className="shrink-0 rounded-control border border-border px-1.5 py-0.5 text-[11px] text-text-muted hover:border-primary hover:text-primary"
+                >
+                  {t("key.setPrimary")}
+                </button>
+              </Tooltip>
             )}
             <HealthBadge health={k.health} />
           </div>
 
-          {/* 端点 */}
-          <div className="mt-1 truncate font-mono text-xs text-text-secondary">
-            {k.baseUrl}
-            <span className="ml-2 text-text-muted">
-              · {protocolLabel(k.protocol)} {t("key.protocolSuffix")}
-            </span>
+          {/* 端点与协议（UX-3：合并一行以减少卡片高度） */}
+          <div className="mt-1 flex items-center gap-2 text-xs">
+            <span className="truncate font-mono text-text-secondary">{k.baseUrl}</span>
+            <span className="shrink-0 text-text-muted">· {protocolLabel(k.protocol)} {t("key.protocolSuffix")}</span>
           </div>
 
-          {/* 模型 / 映射摘要（FR-006） */}
+          {/* 模型 / 映射摘要（FR-006），UX-3：超过 3 个时折叠 */}
           <div className="mt-2 flex flex-wrap items-center gap-1.5">
             {k.mappings.length > 0 ? (
               k.mappings.map((m) => (
@@ -97,27 +123,39 @@ export function KeyCard({ k, onEdit, isFirst, isLast }: {
                 </Badge>
               ))
             ) : (
-              k.models.slice(0, 4).map((m) => (
-                <Badge key={m.realName} variant="neutral">
-                  {m.realName}
-                </Badge>
-              ))
-            )}
-            {k.mappings.length === 0 && k.models.length > 4 && (
-              <span className="text-xs text-text-muted">+{k.models.length - 4}</span>
+              <>
+                {displayModels.map((m) => (
+                  <Badge key={m.realName} variant="neutral">
+                    {m.realName}
+                  </Badge>
+                ))}
+                {hasMore && (
+                  <button
+                    onClick={() => setModelsExpanded(!modelsExpanded)}
+                    className="text-xs text-text-muted hover:text-text-secondary"
+                  >
+                    {modelsExpanded ? "收起" : `+${k.models.length - 3}`}
+                  </button>
+                )}
+              </>
             )}
           </div>
 
-          <div className="mt-2 text-[11px] text-text-muted">
-            {t("key.healthCheckLabel", { time: formatRelativeTime(k.health.lastChecked) })}
-            {k.health.latencyMs != null &&
-              (k.health.status === "down" ? (
-                // 探测失败时这个延迟只是「失败前的往返耗时」，标红并注明，避免被读成探测成功。
-                <span className="text-danger">{` · ${k.health.latencyMs}ms · ${t("key.healthProbeFailed")}`}</span>
-              ) : (
-                ` · ${k.health.latencyMs}ms`
-              ))}
-          </div>
+          <Tooltip
+            content={k.health.lastChecked ? new Date(k.health.lastChecked).toLocaleString() : t("health.unknown")}
+            side="top"
+          >
+            <div className="mt-2 text-[11px] text-text-muted">
+              {t("key.healthCheckLabel", { time: formatRelativeTime(k.health.lastChecked) })}
+              {k.health.latencyMs != null &&
+                (k.health.status === "down" ? (
+                  // 探测失败时这个延迟只是「失败前的往返耗时」，标红并注明，避免被读成探测成功。
+                  <span className="text-danger">{` · ${k.health.latencyMs}ms · ${t("key.healthProbeFailed")}`}</span>
+                ) : (
+                  ` · ${k.health.latencyMs}ms`
+                ))}
+            </div>
+          </Tooltip>
         </div>
 
         {/* 右侧操作区 */}
@@ -151,29 +189,43 @@ export function KeyCard({ k, onEdit, isFirst, isLast }: {
             </div>
           ) : (
             <div className="flex items-center gap-0.5">
-              <Button
-                size="icon"
-                variant="ghost"
-                title={t("key.checkHealth")}
-                onClick={() => void checkHealth(k.id)}
-              >
-                <RefreshCw size={14} />
-              </Button>
-              <Button size="icon" variant="ghost" title={t("common.edit")} onClick={() => onEdit(k)}>
-                <Pencil size={14} />
-              </Button>
-              <Button
-                size="icon"
-                variant="ghost"
-                title={t("common.delete")}
-                onClick={() => setConfirmingDelete(true)}
-              >
-                <Trash2 size={14} />
-              </Button>
+              {/* 三个图标按钮都要 aria-label：Tooltip 只是 hover/focus 时出现的视觉层，
+                  不构成无障碍名称——没有 aria-label 时屏幕阅读器只会读到一个空按钮。
+                  文案与 Tooltip 内容同源，避免两处各说一套。 */}
+              <Tooltip content={t("key.checkHealth")} side="top">
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  aria-label={t("key.checkHealth")}
+                  onClick={() => void checkHealth(k.id)}
+                >
+                  <RefreshCw size={14} />
+                </Button>
+              </Tooltip>
+              <Tooltip content={t("common.edit")} side="top">
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  aria-label={t("common.edit")}
+                  onClick={() => onEdit(k)}
+                >
+                  <Pencil size={14} />
+                </Button>
+              </Tooltip>
+              <Tooltip content={t("common.delete")} side="top">
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  aria-label={t("common.delete")}
+                  onClick={() => setConfirmingDelete(true)}
+                >
+                  <Trash2 size={14} />
+                </Button>
+              </Tooltip>
             </div>
           )}
         </div>
       </div>
     </Card>
   );
-}
+});

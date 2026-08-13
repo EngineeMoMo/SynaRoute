@@ -17,6 +17,11 @@ export default {
         "text-muted": "rgb(var(--text-muted) / <alpha-value>)",
         primary: {
           DEFAULT: "rgb(var(--primary) / <alpha-value>)",
+          // 渐变深端（UI-1）。注册成 primary.deep 后 `to-primary-deep` 才会生成 CSS——
+          // 不注册就写这个类名，属于本仓踩过两次的「静默失效」：不报错、只是零 CSS。
+          // 为什么是「深」而不是方案里写的「浅」：见 styles.css 里 --primary-deep 的注释
+          //（往亮处渐变会让白字对比度跌破 WCAG AA）。
+          deep: "rgb(var(--primary-deep) / <alpha-value>)",
           foreground: "rgb(var(--primary-foreground) / <alpha-value>)",
         },
         success: "rgb(var(--success) / <alpha-value>)",

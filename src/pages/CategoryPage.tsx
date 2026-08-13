@@ -262,7 +262,10 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
         <MappingGapDialog gaps={gaps} onClose={() => setGapDialogOpen(false)} />
       )}
 
-      <div className="flex-1 space-y-2 overflow-y-auto px-6 pb-6">
+      {/* pb-24 而非 pb-6：右下角有常驻的快捷面板悬浮按钮（48px + 24px 边距），
+          底部留白不足时它会压住最后一张卡片的「启用」开关，用户滚到底也点不到
+          （实测过：FAB 矩形与最后一个 Switch 重叠）。 */}
+      <div className="flex-1 space-y-2 overflow-y-auto px-6 pb-24">
         {loading && <div className="py-10 text-center text-sm text-text-muted">{t("common.loading")}</div>}
 
         {!loading && sorted.length === 0 && (

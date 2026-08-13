@@ -1,3 +1,4 @@
+import * as React from "react";
 import { Badge } from "@/components/ui/Badge";
 import type { HealthState } from "@/types";
 import { useT } from "@/lib/useT";
@@ -31,6 +32,23 @@ export function HealthBadge({ health }: { health: HealthState }) {
   const remainMs = health.breakerUntil ? health.breakerUntil - Date.now() : 0;
   const breaking = remainMs > 0;
 
+  /**
+   * 抖动只在**刚进入**熔断时播一次（UI-1）。
+   *
+   * 为什么需要这个 ref：本组件挂在 KeyCard 上、跟着 5s 轮询重渲染。若直接把
+   * `status-shake` 常挂在熔断徽标上，每次重渲染 React 复用同一个 DOM 节点、
+   * 动画不会自动重播 —— 但只要该节点因任何原因重建（切分类、列表重排），
+   * 抖动就会再播一次，表现为「隔一会儿自己抖一下」的鬼畜效果。
+   *
+   * 记住上一次的熔断态，只在 false→true 那一瞬给类名，之后即使还在熔断也不再抖。
+   * 熔断是持续状态（最长 60s），持续抖动只会变成噪音。
+   */
+  const prevBreaking = React.useRef(breaking);
+  const justStarted = breaking && !prevBreaking.current;
+  React.useEffect(() => {
+    prevBreaking.current = breaking;
+  }, [breaking]);
+
   if (breaking) {
     const remainSec = Math.ceil(remainMs / 1000);
     // 探测/熔断分离后：熔断只由「实时请求连续失败」驱动，健康探测绝不触发熔断。
@@ -38,7 +56,11 @@ export function HealthBadge({ health }: { health: HealthState }) {
     // breakerUntil 是未来时刻：用绝对钟点表示「熔断至几点几分」，别再套「N 秒前」的相对格式（会显示成负数）。
     const time = new Date(health.breakerUntil!).toLocaleTimeString();
     return (
-      <Badge variant="warning" title={t("health.breakerFromLive", { time })}>
+      <Badge
+        variant="warning"
+        title={t("health.breakerFromLive", { time })}
+        className={justStarted ? "status-shake" : undefined}
+      >
         {t("health.breakingRemain", { sec: remainSec })}
       </Badge>
     );
@@ -82,7 +104,15 @@ export function HealthBadge({ health }: { health: HealthState }) {
       );
     }
     case "checking":
-      return <Badge variant="info">{t("health.checking")}</Badge>;
+      // 脉冲光晕（UI-1）：检测是异步的，静态徽标看不出「还在跑」还是「卡住了」。
+      // 只有这个进行中状态配动效，其余稳定态一律静止。
+      // `status-pulse` 用 currentColor 画光晕，自动跟随 info 变体的蓝色。
+      // 系统开了「减少动态效果」时该动画整体关掉（见 styles.css 的媒体查询）。
+      return (
+        <Badge variant="info" className="status-pulse">
+          {t("health.checking")}
+        </Badge>
+      );
     default:
       return <Badge variant="neutral">{t("health.unknown")}</Badge>;
   }

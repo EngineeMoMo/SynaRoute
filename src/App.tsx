@@ -1,3 +1,4 @@
+import * as React from "react";
 import { useEffect, useState } from "react";
 import { Sidebar, type NavKey } from "@/components/Sidebar";
 import { CategoryPage } from "@/pages/CategoryPage";
@@ -126,14 +127,19 @@ export default function App() {
     }
   };
 
-  const openAdd = () => {
+  // useCallback 包住（PERF-2）：这两个回调会一路传到 KeyCard 的 props 上，
+  // 而 KeyCard 是 memo 组件 —— 每次 App 重渲染都造新函数的话，memo 的浅比较在
+  // onEdit 这一项上就失败，N 张卡片照样全量重渲染。App 订阅了多个 store 字段
+  // （theme/onboarding/activeCategory…），它的重渲染并不罕见，所以这里必须稳。
+  // setState 函数本身是稳定的，故依赖数组为空。
+  const openAdd = React.useCallback(() => {
     setEditingKey(null);
     setEditorOpen(true);
-  };
-  const openEdit = (k: ProviderKey) => {
+  }, []);
+  const openEdit = React.useCallback((k: ProviderKey) => {
     setEditingKey(k);
     setEditorOpen(true);
-  };
+  }, []);
 
   const renderMain = () => {
     if (nav === "brain") return <BrainPage />;
@@ -188,6 +194,17 @@ export default function App() {
 
       <Toast />
       <ConfigAppliedDialog />
+      {/*
+        这里原先挂着 `QuickPanel` —— 一个**应用内**的右下角悬浮球（紫色闪电）。已移除：
+
+        1. 它与桌面悬浮窗（`FloatingWidget`，独立 Tauri 窗口）职责完全重合，
+           两者并存时软件里一个球、桌面上一个窗，用户分不清哪个是哪个；
+        2. 用户明确要的是「最小化到托盘后显示在**桌面**上的可拖动悬浮窗」，
+           而应用内悬浮球恰好是被点名要去掉的形态。
+
+        软件内需要快捷入口时走命令面板（Ctrl/Cmd+K），不再做成悬浮球。
+        组件文件 `components/QuickPanel.tsx` 已删除。
+      */}
 
       {/* 首启向导（UX#1）：仅在「标记未完成 且 一条 Key 都没有」时显示，可跳过。
           必须传 handleNav 本体——它同时做 setNav 与 setActiveCategory，

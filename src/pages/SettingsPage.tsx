@@ -21,6 +21,8 @@ import type {
   MasterPasswordState,
 } from "@/types";
 import {
+  // 别名 SettingsIcon：与本页组件名 SettingsPage 不冲突，但直接叫 Settings 容易看混
+  Settings as SettingsIcon,
   Sun, Moon, Monitor, ShieldCheck, KeyRound, Languages, ScrollText,
   Activity, RefreshCw, FolderOpen, Info, Plug, BookOpen, Copy, Check, X, Brain, MousePointerClick, MessageSquareDot, Timer,
   Download, Upload, AlertTriangle, type LucideIcon,
@@ -246,6 +248,32 @@ export function SettingsPage() {
       });
   };
 
+  /**
+   * 悬浮窗开关。与自启动同样走**专用命令**，不走 update()。
+   *
+   * 理由完全相同：它带窗口副作用（建/销毁一个 WebView），而 update() 提交的是本页
+   * 局部 state 的整份快照 —— 那正是出过 P0 的地方（切主题/语言会把用户刚关掉的
+   * 开关重新打开）。`floatingWidgetEnabled` 也不在 `saveSettings` 的入参类型里，
+   * 物理上走不到那条路。
+   *
+   * 失败必须回滚开关：UI 显示已开、实际没开是这类设置最坑的形态。
+   */
+  const handleToggleFloating = (v: boolean) => {
+    if (!settings) return;
+    const prev = settings;
+    setSettings({ ...settings, floatingWidgetEnabled: v });
+    void api
+      .setFloatingWidget(v)
+      .then(() => {
+        useStore.setState({ settings: { ...prev, floatingWidgetEnabled: v } });
+      })
+      .catch((e) => {
+        console.error("setFloatingWidget failed", e);
+        setSettings(prev);
+        showToast("error", String((e as Error)?.message ?? e));
+      });
+  };
+
   // MCP 开关/端口走专用命令：携带当前活跃分类，后端据此自动注册 synaroute 到对应工具客户端
   // （~/.claude.json 或 ~/.codex/config.toml），并在端口漂移时重写。不走通用 saveSettings，
   // 因为那拿不到 activeCategory。
@@ -404,7 +432,11 @@ export function SettingsPage() {
   return (
     <div className="h-full overflow-y-auto">
       <div className="border-b border-border px-6 py-4">
-        <h1 className="text-lg font-semibold text-text-primary">{t("settings.title")}</h1>
+        {/* 标题配图标（UI-1）：与 BrainPage / LogsPage 同一形制。 */}
+        <div className="flex items-center gap-2">
+          <SettingsIcon size={20} className="text-primary" />
+          <h1 className="text-lg font-semibold text-text-primary">{t("settings.title")}</h1>
+        </div>
       </div>
 
       <div className="space-y-4 p-6">
@@ -852,12 +884,20 @@ export function SettingsPage() {
           <CardHeader>
             <CardTitle>{t("settings.startup")}</CardTitle>
           </CardHeader>
-          <CardContent>
+          <CardContent className="space-y-3">
             <ToggleRow
               title={t("settings.autoStartTitle")}
               desc={t("settings.autoStartDesc")}
               checked={settings?.autoStart ?? false}
               onChange={handleToggleAutoStart}
+            />
+            {/* 悬浮窗（第⑥批）。desc 里必须写明「最小化到托盘后才出现」——
+                否则用户开了开关却什么都没发生，会当成 bug 反复点。 */}
+            <ToggleRow
+              title={t("settings.floatingTitle")}
+              desc={t("settings.floatingDesc")}
+              checked={settings?.floatingWidgetEnabled ?? false}
+              onChange={handleToggleFloating}
             />
           </CardContent>
         </Card>

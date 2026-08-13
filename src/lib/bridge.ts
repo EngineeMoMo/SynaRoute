@@ -7,11 +7,13 @@ import type {
   AppSettings,
   OnboardingState,
   FirstRequestProbe,
+  BalanceResult,
   BrainConfig,
   CategoryType,
   CcSwitchImportReport,
   CcSwitchScanResult,
   CodegraphState,
+  DailyUsageBucket,
   DesktopModelNameReport,
   EventLogEntry,
   ExportOutcome,
@@ -28,6 +30,7 @@ import type {
   RetrievedFile,
   ToolConfigPreview,
   TokenUsageByKey,
+  UsageCostRow,
   UpdateCheckResult,
   Vendor,
 } from "@/types";
@@ -205,6 +208,35 @@ export const api = {
     call<TokenUsageByKey[]>("get_token_usage", undefined, () => mockBridge.tokenUsage()),
 
   /**
+   * 按日分桶的用量（最近 90 天，最新在前），供「今日 / 本周 / 近 7 日趋势」。
+   *
+   * 不含尚未落盘的增量（最多落后 60s）——「今日」应把本接口的历史与
+   * `getTokenUsage` 的实时总量配合使用，否则刚发的请求要等一分钟才出现。
+   */
+  getDailyUsage: () =>
+    call<DailyUsageBucket[]>("get_daily_usage", undefined, () => mockBridge.dailyUsage()),
+
+  /**
+   * 按「分类 × Key」聚合的用量 + 成本估算。
+   *
+   * 成本按 Key 估算（累加器不含模型维度），代表模型取该 Key 的兜底模型或首个模型。
+   * `costNano` 为 null 表示没有可用单价 —— 界面应显示「—」而非 0，
+   * 否则用户会以为这条 Key 没花钱。
+   */
+  getUsageWithCost: () =>
+    call<UsageCostRow[]>("get_usage_with_cost", undefined, () => mockBridge.usageWithCost()),
+
+  /**
+   * 查询某个 Key 的上游余额。
+   *
+   * **失败不抛异常**：查不到时返回 `{ok: false, error: "原因"}`，
+   * 调用方直接把 `error` 显示在卡片上。余额查不到是常态（站点没这接口、
+   * 路径填错、网络抖动），用异常表达会让一次抖动炸掉整个面板。
+   */
+  queryKeyBalance: (keyId: string) =>
+    call<BalanceResult>("query_key_balance", { keyId }, () => mockBridge.queryBalance(keyId)),
+
+  /**
    * 上面那份累计量的**起算时刻**（epoch ms）。
    *
    * 累加器跨重启保留，所以「从什么时候开始算」必须由后端给出：前端拿不到（既不是本次挂载时间，
@@ -257,6 +289,16 @@ export const api = {
    */
   setAutoStart: (enabled: boolean) =>
     call<void>("set_auto_start", { enabled }, () => mockBridge.setAutoStart(enabled)),
+
+  /**
+   * 悬浮窗开关。**专用命令，不走 saveSettings**：它带窗口副作用（建/销毁 WebView），
+   * 而批量保存路径提交的是前端挂载时的旧快照 —— `autoStart` 正因此出过 P0
+   * （切主题把用户刚关掉的开关又打开）。
+   *
+   * 注意：开启后**不会立刻出现**，还要求主窗口已最小化到托盘。
+   */
+  setFloatingWidget: (enabled: boolean) =>
+    call<void>("set_floating_widget", { enabled }, () => mockBridge.setFloatingWidget(enabled)),
 
   // ---- 首启向导（UX#1）----
   // 浏览器预览刻意返回 shouldShow=true，好让预览模式能验证向导布局
