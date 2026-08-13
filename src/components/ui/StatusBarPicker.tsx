@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ChevronDown } from "lucide-react";
+import { Tooltip } from "@/components/ui/Tooltip";
 
 export interface StatusBarPickerOption {
   /** 提交给回调的值 */
@@ -40,7 +41,13 @@ export function StatusBarPicker({
   onChange: (v: string) => void;
   /** 选项为空时显示的话 */
   emptyHint: string;
-  /** 悬停提示，用来承载「切换即时生效」这类说明——状态条上没空间常驻显示 */
+  /**
+   * 悬停提示，用来承载「切换即时生效」这类说明——状态条上没空间常驻显示。
+   *
+   * 走自研 `Tooltip` 而非原生 `title`：这里承载的是**长说明**（如推理强度那段两行文字），
+   * 原生 title 有约 1s 延迟、无换行控制、字号由系统定，长文本会渲染成一坨看不下去，
+   * 且 WebView2 里表现不一致。Tooltip 组件当初就是为替掉这些位置才建的。
+   */
   title?: string;
   disabled?: boolean;
   /** value 为空时显示的占位文本 */
@@ -68,17 +75,20 @@ export function StatusBarPicker({
 
   return (
     <div className="relative" ref={boxRef}>
-      <button
-        type="button"
-        disabled={disabled}
-        title={title}
-        onClick={() => setOpen((o) => !o)}
-        className="flex max-w-[220px] items-center gap-1 rounded-control px-1.5 py-1 text-xs text-text-secondary hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
-      >
-        <span className="shrink-0 text-text-muted">{label}</span>
-        <span className="truncate font-medium text-text-primary">{display}</span>
-        <ChevronDown size={12} className="shrink-0 text-text-muted" />
-      </button>
+      {/* 菜单展开时禁掉提示：否则提示框会浮在自己刚打开的选项列表上方挡住第一项。
+          `content` 为空时 Tooltip 自身也不显示（见其 show()），故无 title 的调用方无副作用。 */}
+      <Tooltip content={title} side="bottom" disabled={open}>
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => setOpen((o) => !o)}
+          className="flex max-w-[220px] items-center gap-1 rounded-control px-1.5 py-1 text-xs text-text-secondary hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <span className="shrink-0 text-text-muted">{label}</span>
+          <span className="truncate font-medium text-text-primary">{display}</span>
+          <ChevronDown size={12} className="shrink-0 text-text-muted" />
+        </button>
+      </Tooltip>
 
       {open && (
         <>

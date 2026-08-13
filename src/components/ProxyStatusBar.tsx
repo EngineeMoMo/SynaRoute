@@ -1,5 +1,6 @@
 import { Button } from "@/components/ui/Button";
 import { StatusBarPicker } from "@/components/ui/StatusBarPicker";
+import { Tooltip } from "@/components/ui/Tooltip";
 import type { ProxyState } from "@/types";
 import { useStore } from "@/store";
 import { useT } from "@/lib/useT";
@@ -97,47 +98,56 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
         </span>
       </div>
 
-      {/* 健康度告警：全部/部分 Key 明确不可用时，在状态条上直接可见，而不是只有点进列表才能发现 */}
+      {/* 健康度告警：全部/部分 Key 明确不可用时，在状态条上直接可见，而不是只有点进列表才能发现。
+          提示补的是**文字本身答不了的那个问题**：「不可用」是探测结论，而路由的裁判是真实流量，
+          所以它不等于「一定转发不了」——没有这句，用户会以为代理已经彻底废了。 */}
       {allDown && (
-        <span
-          className="flex items-center gap-1 rounded-control bg-danger/10 px-1.5 py-1 text-xs font-medium text-danger"
-          title={t("proxy.allKeysDown", { n: enabledCount })}
-        >
-          <AlertTriangle size={13} />
-          {t("proxy.allKeysDown", { n: enabledCount })}
-        </span>
+        <Tooltip content={t("proxy.allKeysDownTip")} side="bottom">
+          <span className="flex items-center gap-1 rounded-control bg-danger/10 px-1.5 py-1 text-xs font-medium text-danger">
+            <AlertTriangle size={13} />
+            {t("proxy.allKeysDown", { n: enabledCount })}
+          </span>
+        </Tooltip>
       )}
       {someDown && (
-        <span
-          className="flex items-center gap-1 rounded-control bg-warning/10 px-1.5 py-1 text-xs font-medium text-warning"
-          title={t("proxy.someKeysDown", { down: downCount, total: enabledCount })}
-        >
-          <AlertTriangle size={13} />
-          {t("proxy.someKeysDown", { down: downCount, total: enabledCount })}
-        </span>
+        <Tooltip content={t("proxy.someKeysDownTip")} side="bottom">
+          <span className="flex items-center gap-1 rounded-control bg-warning/10 px-1.5 py-1 text-xs font-medium text-warning">
+            <AlertTriangle size={13} />
+            {t("proxy.someKeysDown", { down: downCount, total: enabledCount })}
+          </span>
+        </Tooltip>
       )}
 
-      <span
-        className={`flex items-center gap-1 rounded-control px-1.5 py-1 ${
-          enabledCount > 1 ? "text-primary" : "text-text-muted"
-        }`}
-        title={routeModeLabel}
-        aria-label={routeModeLabel}
-      >
-        {enabledCount > 1 ? <Waypoints size={15} /> : <ArrowRight size={15} />}
-        <span className="text-xs font-medium tabular-nums">{enabledCount}</span>
-      </span>
+      {/* 路由模式徽标。这是整条状态条上最晦涩的元素——只有一个图标加一个光秃秃的数字，
+          此前全靠原生 title 解释（1s 延迟、无样式）。数字含义、以及「直连/故障转移」
+          两种模式的差别都得说清楚。 */}
+      <Tooltip content={t("proxy.routeModeTip")} side="bottom">
+        <span
+          className={`flex items-center gap-1 rounded-control px-1.5 py-1 ${
+            enabledCount > 1 ? "text-primary" : "text-text-muted"
+          }`}
+          aria-label={routeModeLabel}
+        >
+          {enabledCount > 1 ? <Waypoints size={15} /> : <ArrowRight size={15} />}
+          <span className="text-xs font-medium tabular-nums">{enabledCount}</span>
+        </span>
+      </Tooltip>
 
       <div className="flex items-center gap-1.5 font-mono text-xs text-text-secondary">
-        <span>{endpoint}</span>
+        {/* 端点自身也值得一条：用户常问「这个地址要填到哪」 */}
+        <Tooltip content={t("proxy.endpointTip")} side="bottom">
+          <span>{endpoint}</span>
+        </Tooltip>
         {proxy?.port && (
-          <button
-            onClick={copyEndpoint}
-            className="rounded p-1 hover:bg-surface-hover"
-            title={t("proxy.copyEndpoint")}
-          >
-            <Copy size={12} />
-          </button>
+          <Tooltip content={t("proxy.copyEndpoint")} side="bottom">
+            <button
+              onClick={copyEndpoint}
+              aria-label={t("proxy.copyEndpoint")}
+              className="rounded p-1 hover:bg-surface-hover"
+            >
+              <Copy size={12} />
+            </button>
+          </Tooltip>
         )}
       </div>
 
@@ -204,19 +214,24 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
         {running ? (
           <>
             {/* 切官方：停止代理并还原配置，但保留 MCP 注册（大脑聚合继续可用）。
-                放在「停止」左侧，因为它比完全停止更温和（只断代理，不断工具）。 */}
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => void switchToOfficial()}
-              title={t("proxy.switchToOfficialHint")}
-              className="text-text-muted hover:text-text-primary"
-            >
-              <LogOut size={14} /> {t("proxy.switchToOfficial")}
-            </Button>
-            <Button size="sm" variant="outline" onClick={() => void stopProxy()}>
-              <Square size={14} /> {t("proxy.stop")}
-            </Button>
+                放在「停止」左侧，因为它比完全停止更温和（只断代理，不断工具）。
+                「切官方」与「停止」的差别只有这条提示说得清，而选错的后果实打实
+                （以为只是断代理、结果把大脑聚合也停了）。 */}
+            <Tooltip content={t("proxy.switchToOfficialHint")} side="bottom">
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => void switchToOfficial()}
+                className="text-text-muted hover:text-text-primary"
+              >
+                <LogOut size={14} /> {t("proxy.switchToOfficial")}
+              </Button>
+            </Tooltip>
+            <Tooltip content={t("proxy.stopTip")} side="bottom">
+              <Button size="sm" variant="outline" onClick={() => void stopProxy()}>
+                <Square size={14} /> {t("proxy.stop")}
+              </Button>
+            </Tooltip>
           </>
         ) : (
           // 启动是本页的主操作（UI-1）：给它渐变以拉开与「停止 / 切官方」的层级差。

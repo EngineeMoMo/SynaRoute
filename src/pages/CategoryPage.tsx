@@ -6,6 +6,7 @@ import { KeyCard } from "@/components/KeyCard";
 import { ProxyStatusBar } from "@/components/ProxyStatusBar";
 import { CcSwitchImportDialog } from "@/components/CcSwitchImportDialog";
 import { Button } from "@/components/ui/Button";
+import { Tooltip } from "@/components/ui/Tooltip";
 import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
 // 与状态条共用：两份实现必然漂移，而漂移后果是「状态条列出的模型在某备用 Key 上其实路由不了」
@@ -173,13 +174,19 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
       <div className="flex items-center justify-between px-6 pb-3 pt-4">
         <div>
           <h1 className="text-lg font-semibold text-text-primary">{t(`nav.${activeCategory}`)}</h1>
-          <p className="text-xs text-text-muted">
-            {t("category.keyCount", { total: keys.length, enabled: keys.filter((k) => k.enabled).length })}
-          </p>
+          {/* 「共 N 个 · M 个已启用」只报数，没说清「停用」意味着什么 ——
+              用户很容易以为停用的 Key 仍会作为备用被自动启用。 */}
+          <Tooltip content={t("category.keyCountTip")} side="bottom">
+            <p className="inline-block cursor-default text-xs text-text-muted">
+              {t("category.keyCount", { total: keys.length, enabled: keys.filter((k) => k.enabled).length })}
+            </p>
+          </Tooltip>
         </div>
-        <Button size="icon" onClick={onAddKey} title={t("category.addKey")} aria-label={t("category.addKey")}>
-          <Plus size={18} />
-        </Button>
+        <Tooltip content={t("category.addKey")} side="left">
+          <Button size="icon" onClick={onAddKey} aria-label={t("category.addKey")}>
+            <Plus size={18} />
+          </Button>
+        </Tooltip>
       </div>
 
       {/* 从 cc-switch 导入历史 Key：只读对方库、导入后不接入（详见 CcSwitchImportDialog） */}
@@ -234,15 +241,19 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
           常驻而非一次性提示——熔断窗口最长 60s，用户切回来时若已恢复不该看到假警告，
           但若还在熔断中，必须一眼看见「这条为什么没被用」。 */}
       {trippedKeys.length > 0 && (
-        <div className="mx-6 mb-2 flex items-start gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-xs text-warning">
-          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
-          <div className="flex-1 leading-relaxed">
-            <span className="font-medium">{t("category.trippedKeys")}</span>
-            <span className="ml-1 break-all">
-              {trippedKeys.map((k) => k.name).join("、")}
-            </span>
+        /* 提示补的是横幅文字没答的那个问题：「我要做什么吗？」——答案是不用，
+           倒计时结束自动恢复。没有这句，用户会去手动停用/删除那条 Key。 */
+        <Tooltip content={t("category.trippedKeysTip")} side="bottom">
+          <div className="mx-6 mb-2 flex items-start gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-xs text-warning">
+            <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+            <div className="flex-1 leading-relaxed">
+              <span className="font-medium">{t("category.trippedKeys")}</span>
+              <span className="ml-1 break-all">
+                {trippedKeys.map((k) => k.name).join("、")}
+              </span>
+            </div>
           </div>
-        </div>
+        </Tooltip>
       )}
 
       {/* 映射缺口提示（FR-006a）：只保留一行精简条，明细收进弹窗，避免条目过多撑爆页面 */}
@@ -276,19 +287,27 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
               <Button variant="secondary" onClick={onAddKey}>
                 <Plus size={16} /> {t("category.addFirst")}
               </Button>
-              {/* 空列表是最需要「从 cc-switch 导入」的场景：老用户往往已在 cc-switch 里配好了 */}
-              <Button variant="outline" onClick={() => setImportOpen(true)}>
-                <Database size={16} /> 从 cc-switch 导入
-              </Button>
+              {/* 空列表是最需要「从 cc-switch 导入」的场景：老用户往往已在 cc-switch 里配好了。
+                  文案走 i18n —— 原先这里与下方那个按钮都是硬编码中文，英文界面下会露出中文。 */}
+              <Tooltip content={t("category.ccSwitchImportTip")} side="top">
+                <Button variant="outline" onClick={() => setImportOpen(true)}>
+                  <Database size={16} /> {t("category.ccSwitchImport")}
+                </Button>
+              </Tooltip>
             </div>
           </div>
         )}
 
         {!loading && sorted.length > 0 && (
           <div className="flex justify-end pb-1">
-            <Button variant="ghost" size="sm" onClick={() => setImportOpen(true)}>
-              <Database size={14} /> 从 cc-switch 导入
-            </Button>
+            {/* 这个按钮会让人先怕一下：「会覆盖我现有的 Key 吗？会把接入切过去吗？」
+                答案都是不会（只读对方库、导入后不接入），但那只写在点开后的弹窗里 ——
+                在点之前就说清楚，才不用赌一把。 */}
+            <Tooltip content={t("category.ccSwitchImportTip")} side="left">
+              <Button variant="ghost" size="sm" onClick={() => setImportOpen(true)}>
+                <Database size={14} /> {t("category.ccSwitchImport")}
+              </Button>
+            </Tooltip>
           </div>
         )}
 

@@ -7,6 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Switch } from "@/components/ui/Switch";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
+import { Tooltip } from "@/components/ui/Tooltip";
 import { HealthBadge } from "@/components/HealthBadge";
 import { BrandIcon } from "@/components/BrandIcon";
 import { useT } from "@/lib/useT";
@@ -227,10 +228,14 @@ export function BrainPage() {
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0">
             <CardTitle>{t("brain.membersTitle")}</CardTitle>
-            {/* 一键快速配置：新用户免去逐个手选，点一下自动填成员 + 决策者 */}
-            <Button size="sm" variant="secondary" onClick={quickFill} title={t("brain.quickFillHint")}>
-              <Wand2 size={14} /> {t("brain.quickFill")}
-            </Button>
+            {/* 一键快速配置：新用户免去逐个手选，点一下自动填成员 + 决策者。
+                说明较长（要交代它会动哪些字段、还得点保存），原生 title 承载不住：
+                无换行控制、字号由系统定，长句会挤成一坨。 */}
+            <Tooltip content={t("brain.quickFillHint")} side="left">
+              <Button size="sm" variant="secondary" onClick={quickFill}>
+                <Wand2 size={14} /> {t("brain.quickFill")}
+              </Button>
+            </Tooltip>
           </CardHeader>
           <CardContent className="space-y-3">
             {keys.length === 0 ? (
@@ -254,30 +259,44 @@ export function BrainPage() {
                             <div className="truncate text-xs font-medium text-text-primary">{k?.name ?? m.keyId}</div>
                             {k && k.models.length > 0 ? (
                               // 就地改模型：下拉选该 Key 的模型（含当前值，若是手动加的也保底可见）
-                              <select
-                                value={m.modelName}
-                                onChange={(e) => updateMemberModel(m.id, e.target.value)}
-                                className="mt-0.5 max-w-full rounded-control border border-border bg-surface px-1.5 py-0.5 font-mono text-[11px] text-text-secondary focus:outline-none focus:ring-1 focus:ring-ring"
-                              >
-                                {!k.models.some((mm) => mm.realName === m.modelName) && (
-                                  <option value={m.modelName}>{m.modelName}</option>
-                                )}
-                                {k.models.map((mm) => (
-                                  <option key={mm.realName} value={mm.realName}>{mm.realName}</option>
-                                ))}
-                              </select>
+                              // 提示要点明「改完要保存」——本页所有改动都只进内存，
+                              // 不说清会有人改完直接关页面，然后以为功能坏了。
+                              <Tooltip content={t("brain.memberModelTip")} side="right">
+                                <select
+                                  value={m.modelName}
+                                  onChange={(e) => updateMemberModel(m.id, e.target.value)}
+                                  className="mt-0.5 max-w-full rounded-control border border-border bg-surface px-1.5 py-0.5 font-mono text-[11px] text-text-secondary focus:outline-none focus:ring-1 focus:ring-ring"
+                                >
+                                  {!k.models.some((mm) => mm.realName === m.modelName) && (
+                                    <option value={m.modelName}>{m.modelName}</option>
+                                  )}
+                                  {k.models.map((mm) => (
+                                    <option key={mm.realName} value={mm.realName}>{mm.realName}</option>
+                                  ))}
+                                </select>
+                              </Tooltip>
                             ) : (
                               <div className="truncate font-mono text-[11px] text-text-muted">{m.modelName}</div>
                             )}
                           </div>
-                          {k && <HealthBadge health={k.health} />}
-                          <button
-                            onClick={() => removeMember(m.keyId, m.modelName)}
-                            className="shrink-0 rounded-control p-1 text-text-muted hover:text-danger"
-                            title={t("common.remove")}
-                          >
-                            <X size={14} />
-                          </button>
+                          {/* 成员上的健康徽标：本页最容易被误读的一处 ——
+                              「不可用」不会让整轮聚合失败，只是这个成员可能无结果。 */}
+                          {k && (
+                            <Tooltip content={t("brain.memberHealthTip")} side="top">
+                              <span className="shrink-0">
+                                <HealthBadge health={k.health} />
+                              </span>
+                            </Tooltip>
+                          )}
+                          <Tooltip content={t("brain.memberRemoveTip")} side="top">
+                            <button
+                              onClick={() => removeMember(m.keyId, m.modelName)}
+                              aria-label={t("common.remove")}
+                              className="shrink-0 rounded-control p-1 text-text-muted hover:text-danger"
+                            >
+                              <X size={14} />
+                            </button>
+                          </Tooltip>
                         </div>
                       );
                     })}
@@ -348,8 +367,11 @@ export function BrainPage() {
             </div>
 
             <div className="flex gap-4">
+              {/* 并发上限此前**完全没有说明**（下面那段 hint 只讲超时）：
+                  成员数超过上限时会怎样（排队分批，而不是被丢掉）是个真实疑问。 */}
               <NumberField
                 label={t("brain.concurrency")}
+                hint={t("brain.concurrencyHint")}
                 value={config.concurrencyLimit}
                 min={1}
                 max={10}
@@ -1235,6 +1257,7 @@ function RecentWorkdirsMenu({ onPick, t }: { onPick: (path: string) => void; t: 
 
 function NumberField({
   label,
+  hint,
   value,
   min,
   max,
@@ -1242,15 +1265,35 @@ function NumberField({
   onChange,
 }: {
   label: string;
+  /**
+   * 悬停说明，挂在标签上。
+   *
+   * 本页多数字段的说明都是常驻可见文字（`KeyModelSelect` 的 hint、模式卡片的 desc），
+   * 唯独这几个数字框只有一个标签。本页已经很长，再给每个数字框加一行常驻说明会把
+   * 「保存」按钮推得更远，故这类「知道了就不用再看」的说明走悬停。
+   */
+  hint?: string;
   value: number;
   min?: number;
   max?: number;
   step?: number;
   onChange: (v: number) => void;
 }) {
+  const labelEl = (
+    <div className="mb-1 inline-block text-xs font-medium text-text-secondary">{label}</div>
+  );
   return (
     <div className="flex-1">
-      <div className="mb-1 text-xs font-medium text-text-secondary">{label}</div>
+      {hint ? (
+        <Tooltip content={hint} side="top">
+          {/* cursor-help：数字框的标签看不出可悬停，给个明确的光标暗示 */}
+          <div className="mb-1 inline-block cursor-help text-xs font-medium text-text-secondary underline decoration-dotted decoration-from-font underline-offset-2">
+            {label}
+          </div>
+        </Tooltip>
+      ) : (
+        labelEl
+      )}
       <input
         type="number"
         value={value}

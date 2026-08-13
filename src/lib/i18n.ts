@@ -53,12 +53,12 @@ const zh: Dict = {
   "balance.sectionTitle": "余额查询与计费",
   "balance.on": "已启用",
   "balance.enable": "启用余额查询",
-  // 文案只承诺**已实现**的能力：当前余额只能在本编辑器里点「测试查询」看到，
-  // Key 卡片与快捷面板上还没有常驻展示（那需要一套定时查询 + 缓存，见 docs/17）。
-  // 早前这句写的是「显示在 Key 卡片与快捷面板上」—— 那是句空头承诺，
-  // 用户开了开关后到处找不到余额，只会认为功能坏了。
+  // 文案只承诺**已实现**的能力。这句历经两版：最早写「显示在 Key 卡片与快捷面板上」
+  // 是空头承诺（当时没有任何展示位，用户开了开关到处找不到余额）；随后改成只提
+  // 「测试查询」。现在卡片展示已落地，故补回卡片那半句 —— 但**仍不提快捷面板/悬浮窗**，
+  // 那里确实还没接。改这句前先确认对应展示位真的存在。
   "balance.enableHint":
-    "从中转站的计费接口读取剩余额度。各站接口不统一，先用预设模板试，不行再手填取值路径；配好后用下面的「测试查询」验证。",
+    "从中转站的计费接口读取剩余额度，配好后显示在这条 Key 的卡片上。各站接口不统一，先用预设模板试，不行再手填取值路径；配好后用下面的「测试查询」验证。",
   "balance.template": "预设模板",
   "balance.tpl.custom": "自定义",
   "balance.tpl.generic": "通用模板",
@@ -73,6 +73,10 @@ const zh: Dict = {
   "balance.accessTokenHint":
     "NewAPI 类面板的用量接口认的是**面板登录态**，不是转发用的 API 密钥。在面板的「个人设置」里生成 Access Token，用户 ID 也在那里。",
   "balance.ofTotal": "共 {total} {unit}",
+  // Key 卡片余额行（第④批）
+  "balance.cardLabel": "余额",
+  "balance.usedPct": "已用 {pct}%",
+  "balance.refresh": "刷新余额",
   "balance.auth": "认证方式",
   "balance.authNone": "不认证",
   "balance.timeout": "超时（秒）",
@@ -188,6 +192,18 @@ const zh: Dict = {
   "proxy.allKeysDown": "全部 {n} 个 Key 当前不可用",
   "proxy.someKeysDown": "{down}/{total} 个 Key 当前不可用",
   "proxy.someKeysDownHint": "当前探测为不可用",
+  // 这两条提示要说清「不可用」的口径：它是**健康探测**的结论，而真正裁判可用性的是真实流量
+  // （见后端 health::is_candidate）。不说清，用户看到红字会以为代理已经彻底不能用了。
+  "proxy.allKeysDownTip":
+    "这是健康探测的结论，不代表一定转发不了——真正决定可用性的是真实请求。常见原因是网络波动或上游临时故障。若客户端确实报错，去运行日志看具体原因。",
+  "proxy.someKeysDownTip":
+    "这些 Key 的健康探测失败了，转发会自动跳过它们、用其余 Key。不影响正常使用；想确认可在卡片上点刷新重新探测。",
+  "proxy.routeModeTip":
+    "数字是当前已启用的 Key 数。多于 1 个时按卡片顺序依次尝试，某条失败自动换下一条（客户端无感）；只有 1 个时没有备用可切。",
+  "proxy.endpointTip":
+    "代理监听的本机地址。点「启动」时会自动写进客户端配置，通常不用手动填。",
+  "proxy.stopTip":
+    "停止代理并还原客户端配置（连 MCP 大脑聚合一起停）。只想切回官方、但保留大脑聚合，用左边的「切官方」。",
   // 状态条快切（UX#6 / UX#8）。「即时生效、无需重启客户端」这句要反复出现——
   // 用户默认以为改了配置就得重启客户端，不说清就不敢在会话中途切。
   "proxy.primaryKey": "主 Key",
@@ -238,6 +254,32 @@ const zh: Dict = {
 
   // 分类页
   "category.keyCount": "共 {total} 个 Key · {enabled} 个已启用",
+  // 提示语只补「文字本身答不了的问题」，不复述已经写在界面上的话
+  "category.keyCountTip":
+    "只有已启用的 Key 参与转发与故障转移，按卡片从上到下的顺序依次尝试。停用的 Key 既不转发、也不参与定时健康探测——它不会在别的 Key 失败时被自动启用。",
+  "category.trippedKeysTip":
+    "熔断是自动的：某条 Key 连续失败后暂停使用一小段时间，期间流量走其他 Key。无需手动处理，倒计时结束会自动恢复；不必停用或删除这条 Key。",
+  "category.ccSwitchImport": "从 cc-switch 导入",
+  // cc-switch 导入弹窗。整个弹窗原先没接 i18n（全是中文字面量），英文界面下一片中文。
+  "ccswitch.title": "从 cc-switch 导入 Key",
+  "ccswitch.scanning": "正在读取 cc-switch 配置库…",
+  "ccswitch.source": "数据来源：{path}（只读，不会修改 cc-switch 的任何数据）",
+  "ccswitch.nothingToImport": "没有可导入的档。",
+  "ccswitch.blockedSummary": "不可导入 {n} 条（官方登录档 / 已存在 / 暂不支持的端）",
+  "ccswitch.pickedCount": "已选 {n} / 可导入 {total}",
+  "ccswitch.importN": "导入选中 {n} 条",
+  "ccswitch.importing": "导入中…",
+  "ccswitch.canClose": "可关闭本窗口",
+  "ccswitch.reportSummary": "导入完成：成功 {ok} · 跳过 {skipped} · 失败 {failed}",
+  // 原文用 <strong> 强调「未接入」；改走词条后不夹 JSX，靠措辞本身把话说重。
+  // ⚠️ 这里**不能写 `**粗体**`**：本条是纯文本渲染，星号会原样显示成 `**尚未接入**`。
+  // 本仓多处词条都是纯文本，写 markdown 记号一律会露出来。
+  "ccswitch.notAppliedNote":
+    "注意：导入的 Key 只是存进了 SynaRoute，尚未接入任何客户端配置，不会自动生效。需要用它时到对应分类里点「启动」。",
+  "ccswitch.isCurrent": "cc-switch 当前生效",
+  "ccswitch.defaultModel": "默认模型 {name}",
+  "category.ccSwitchImportTip":
+    "只读取 cc-switch 的配置库，把其中的 Key 复制过来，不会改动它、也不会覆盖你现有的 Key。导入后不会自动接入，仍需你点「启动」。",
   "category.addKey": "新增厂商 Key",
   "category.mappingGapTitle": "部分模型未进入 CLI 的 /model 选择器",
   "category.mappingGapSummary": "{count} 个模型未进入 /model 选择器（未被所有启用 Key 共有）",
@@ -377,6 +419,13 @@ const zh: Dict = {
   "brain.modeFullTitle": "B · 全量上下文",
   "brain.modeFullDesc": "将各成员完整答案交决策者（信息最全）",
   "brain.concurrency": "并发上限",
+  // 成员数超过上限时会怎样，是这个字段唯一的真实疑问（答案：排队分批，不会被丢掉）
+  "brain.concurrencyHint":
+    "同时最多向几个成员发起请求。成员数超过这个值不会被丢掉，而是排队分批跑——调小可减轻上游限流，代价是整轮更慢。",
+  "brain.memberModelTip": "该成员用这个模型作答。改完记得点页面底部的「保存配置」，否则不生效。",
+  "brain.memberHealthTip":
+    "这条 Key 的健康探测结果。探测为不可用**不会**让整轮聚合失败——只是这个成员可能拿不到结果，其余成员照常作答。",
+  "brain.memberRemoveTip": "从参与成员中移除（不会删除这条 Key）。",
   "brain.totalTimeout": "整轮总预算 (ms)",
   "brain.totalTimeoutHint":
     "整个聚合一轮的墙钟上限（成员 + 压缩 + 决策者共享，决策者留保底配额）。MCP 客户端超时会自动跟随此值（+余量），无需手动配。问题复杂、模型思考久，把此值调大即可。",
@@ -778,7 +827,7 @@ const en: Dict = {
   "balance.on": "Enabled",
   "balance.enable": "Enable balance query",
   "balance.enableHint":
-    "Reads remaining credit from the provider's billing endpoint. Endpoints vary by provider — try a preset first, then set a value path if needed; verify with \"Test query\" below.",
+    "Reads remaining credit from the provider's billing endpoint and shows it on this key's card. Endpoints vary by provider — try a preset first, then set a value path if needed; verify with \"Test query\" below.",
   "balance.template": "Preset",
   "balance.tpl.custom": "Custom",
   "balance.tpl.generic": "Generic",
@@ -793,6 +842,10 @@ const en: Dict = {
   "balance.accessTokenHint":
     "NewAPI-style panels authenticate the usage endpoint with the **panel session**, not the forwarding API key. Generate an Access Token in the panel's personal settings; the User ID is there too.",
   "balance.ofTotal": "of {total} {unit}",
+  // Key card balance row (batch ④)
+  "balance.cardLabel": "Balance",
+  "balance.usedPct": "{pct}% used",
+  "balance.refresh": "Refresh balance",
   "balance.auth": "Auth",
   "balance.authNone": "None",
   "balance.timeout": "Timeout (s)",
@@ -911,6 +964,16 @@ const en: Dict = {
   "proxy.allKeysDown": "All {n} keys currently unavailable",
   "proxy.someKeysDown": "{down}/{total} keys currently unavailable",
   "proxy.someKeysDownHint": "Currently probing as unavailable",
+  "proxy.allKeysDownTip":
+    "This is the health probe's verdict, not proof that forwarding will fail — real requests are what actually decide availability. Usually a network blip or a temporary upstream outage. If your client does error out, check the run log for the real reason.",
+  "proxy.someKeysDownTip":
+    "These keys failed their health probe, so forwarding skips them and uses the rest. Normal use is unaffected; hit refresh on a card to re-probe.",
+  "proxy.routeModeTip":
+    "The number of keys currently enabled. Above 1, they're tried in card order and a failure silently falls through to the next; at 1 there's no backup to fall back to.",
+  "proxy.endpointTip":
+    "The local address the proxy listens on. Pressing Start writes it into your client's config, so you normally don't type it anywhere.",
+  "proxy.stopTip":
+    "Stops the proxy and restores your client config, MCP brain aggregation included. To go back to official but keep brain aggregation, use \"Switch to official\" on the left.",
   "proxy.primaryKey": "Primary key",
   "proxy.primaryKeyHint":
     "Tried first on failover. Switching takes effect immediately — no client restart needed.",
@@ -963,6 +1026,28 @@ const en: Dict = {
   "health.agoDays": "{n} d",
 
   "category.keyCount": "{total} keys · {enabled} enabled",
+  "category.keyCountTip":
+    "Only enabled keys forward traffic and take part in failover, tried top-to-bottom in card order. A disabled key neither forwards nor gets health-probed — it will not be switched on automatically when another key fails.",
+  "category.trippedKeysTip":
+    "Tripping is automatic: after repeated failures a key is paused briefly and traffic goes to the others. Nothing to do — it recovers on its own when the countdown ends. No need to disable or delete the key.",
+  "category.ccSwitchImport": "Import from cc-switch",
+  "ccswitch.title": "Import keys from cc-switch",
+  "ccswitch.scanning": "Reading cc-switch's config store…",
+  "ccswitch.source": "Source: {path} (read-only — nothing in cc-switch is modified)",
+  "ccswitch.nothingToImport": "Nothing available to import.",
+  "ccswitch.blockedSummary":
+    "{n} not importable (official-login profiles / already present / unsupported client)",
+  "ccswitch.pickedCount": "{n} selected of {total} importable",
+  "ccswitch.importN": "Import {n} selected",
+  "ccswitch.importing": "Importing…",
+  "ccswitch.canClose": "You can close this window",
+  "ccswitch.reportSummary": "Done: {ok} imported · {skipped} skipped · {failed} failed",
+  "ccswitch.notAppliedNote":
+    "Note: imported keys are only stored in SynaRoute. They are not applied to any client config and won't take effect on their own. Press Start in the relevant category when you want to use one.",
+  "ccswitch.isCurrent": "Active in cc-switch",
+  "ccswitch.defaultModel": "default model {name}",
+  "category.ccSwitchImportTip":
+    "Reads cc-switch's config store and copies keys over. It doesn't modify cc-switch, and it won't overwrite your existing keys. Nothing is applied on import — you still press Start yourself.",
   "category.addKey": "Add provider key",
   "category.mappingGapTitle": "Some models aren’t in the CLI /model picker",
   "category.mappingGapSummary": "{count} model(s) missing from the /model picker (not shared by all enabled keys)",
@@ -1098,6 +1183,13 @@ const en: Dict = {
   "brain.modeFullTitle": "B · Full context",
   "brain.modeFullDesc": "Pass full member answers to the decider (most complete)",
   "brain.concurrency": "Concurrency limit",
+  "brain.concurrencyHint":
+    "How many members are queried at once. Members beyond this limit aren't dropped — they queue in batches. Lowering it eases upstream rate limits at the cost of a slower round.",
+  "brain.memberModelTip":
+    "The model this member answers with. Remember to press Save config at the bottom of the page, or the change won't take effect.",
+  "brain.memberHealthTip":
+    "Health-probe result for this key. A failed probe does **not** fail the round — that member may simply return nothing while the others answer normally.",
+  "brain.memberRemoveTip": "Remove from members (does not delete the key itself).",
   "brain.totalTimeout": "Whole-round budget (ms)",
   "brain.totalTimeoutHint":
     "Wall-clock cap for one full aggregation round (members + compression + decider share it; the decider keeps a reserved floor). The MCP client timeout auto-tracks this value (+ margin), no manual config needed. For complex problems that need longer thinking, just raise this value.",
