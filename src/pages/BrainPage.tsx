@@ -10,6 +10,7 @@ import { Badge } from "@/components/ui/Badge";
 import { HealthBadge } from "@/components/HealthBadge";
 import { BrandIcon } from "@/components/BrandIcon";
 import { useT } from "@/lib/useT";
+import { formatRelativeTime } from "@/lib/utils";
 import type { TFunc } from "@/lib/i18n";
 import type { AggregateMode, BrainConfig, CategoryType, CodegraphState, ProviderKey } from "@/types";
 import type { RecentWorkdir } from "@/types";
@@ -1178,15 +1179,13 @@ function RecentWorkdirsMenu({ onPick, t }: { onPick: (path: string) => void; t: 
     setOpen(!open);
   };
 
+  // 一周以内走共享的相对时间（走 i18n），更久则退回绝对日期 ——
+  // 「37 天前」对用户没有信息量，具体日期才有。
+  // 注意：这里原本自带一份硬编码中文的相对时间实现，与 utils 里那份是同一个缺陷的两处实例。
   const formatTime = (ts?: number) => {
     if (!ts) return "";
-    const d = new Date(ts);
-    const now = Date.now();
-    const diff = now - ts;
-    if (diff < 3600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
-    if (diff < 86400_000) return `${Math.floor(diff / 3600_000)} 小时前`;
-    if (diff < 7 * 86400_000) return `${Math.floor(diff / 86400_000)} 天前`;
-    return d.toLocaleDateString();
+    if (Date.now() - ts >= 7 * 86400_000) return new Date(ts).toLocaleDateString();
+    return formatRelativeTime(ts, t);
   };
 
   return (

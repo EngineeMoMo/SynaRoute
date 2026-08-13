@@ -146,7 +146,7 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast 
             side="top"
           >
             <div className="mt-2 text-[11px] text-text-muted">
-              {t("key.healthCheckLabel", { time: formatRelativeTime(k.health.lastChecked) })}
+              {t("key.healthCheckLabel", { time: formatRelativeTime(k.health.lastChecked, t) })}
               {k.health.latencyMs != null &&
                 (k.health.status === "down" ? (
                   // 探测失败时这个延迟只是「失败前的往返耗时」，标红并注明，避免被读成探测成功。

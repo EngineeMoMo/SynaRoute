@@ -15,6 +15,13 @@ const zh: Dict = {
   // 通用
   "common.cancel": "取消",
   "common.save": "保存",
+  // 相对时间（`formatRelativeTime` 专用）。这几条原先是硬编码在 utils.ts 里的中文串，
+  // 外层调用方却套着 t() —— 于是英文界面出现「healthCheckLabel 翻译了、时间还是中文」。
+  "time.never": "从未",
+  "time.secondsAgo": "{n} 秒前",
+  "time.minutesAgo": "{n} 分钟前",
+  "time.hoursAgo": "{n} 小时前",
+  "time.daysAgo": "{n} 天前",
   "common.saving": "保存中…",
   "common.saved": "已保存",
   "common.loading": "加载中…",
@@ -735,6 +742,11 @@ const zh: Dict = {
 const en: Dict = {
   "common.cancel": "Cancel",
   "common.save": "Save",
+  "time.never": "never",
+  "time.secondsAgo": "{n}s ago",
+  "time.minutesAgo": "{n} min ago",
+  "time.hoursAgo": "{n} h ago",
+  "time.daysAgo": "{n} d ago",
   "common.saving": "Saving…",
   "common.saved": "Saved",
   "common.loading": "Loading…",
