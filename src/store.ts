@@ -2,6 +2,7 @@
 import { create } from "zustand";
 import type {
   AppSettings,
+  BalanceResult,
   BrainConfig,
   CategoryType,
   EventLogEntry,
@@ -16,6 +17,26 @@ import type { Lang } from "@/lib/i18n";
 import { api, isTauri } from "@/lib/bridge";
 import { pickPrefs } from "@/lib/prefs";
 import { reuseUnchanged } from "@/lib/reuseUnchanged";
+
+/**
+ * 一条余额缓存：查询结果 + **产出它的那份配置的指纹**。
+ *
+ * 指纹必须跟着结果一起存。只存结果的话，用户把查询地址从错的改成对的、保存，
+ * 卡片上仍会显示上一次那条 404 —— 而那正是他刚修掉的东西，看着像「改了没生效」。
+ */
+export interface BalanceCacheEntry {
+  result: BalanceResult;
+  fingerprint: string;
+}
+
+/**
+ * 余额缓存的新鲜期。超过它，卡片重新挂载时（切分类回来、重开窗口）会自动重查一次。
+ *
+ * 取 10 分钟的理由：余额是「钱还剩多少」，看到几分钟前的值完全够用，
+ * 而每次切分类都去发一轮请求会把中转站的计费接口打得很勤（部分站点对此限流）。
+ * 想看当下值有手动刷新按钮，且卡片上永远标着「查询于 X 分钟前」，陈旧是可见的。
+ */
+export const BALANCE_TTL_MS = 10 * 60 * 1000;
 
 /**
  * 只改 settings 里的一两个字段并落盘，**基线取磁盘最新值而非内存快照**。
@@ -64,6 +85,30 @@ interface AppState {
   onboarding: OnboardingState | null;
   vendors: Vendor[];
   loading: boolean;
+
+  /**
+   * 余额查询结果缓存，按 keyId 索引（第④批）。
+   *
+   * **不并进 `keys` 里的 ProviderKey**：余额是「查询结果」而非 Key 的配置，
+   * 混进去会被 5s 轮询的 `listKeys` 整份覆盖掉（后端不返回余额），
+   * 表现为卡片上的余额每 5 秒闪一下就消失。
+   *
+   * 按 keyId 索引也顺带免疫了本项目栽过的那类「切分类串台」——
+   * 在途的查询结果只会落到它自己那条 Key 上，不会写进新分类的某个位置。
+   */
+  balances: Record<string, BalanceCacheEntry>;
+  /** 正在查询中的 keyId 集合（卡片据此转刷新图标，也用于去重并发请求） */
+  balanceLoading: Record<string, boolean>;
+  /**
+   * 查一条 Key 的余额。
+   *
+   * `fingerprint` 由调用方用 `balanceFingerprint(key)` 算好传入：缓存命中判据是
+   * 「指纹相同 且 未超 TTL」，指纹变了（用户改了查询地址等）就必须重查。
+   * `force` = 用户手点刷新，跳过 TTL 但仍受并发去重约束。
+   */
+  refreshBalance: (keyId: string, fingerprint: string, force?: boolean) => Promise<void>;
+  /** 编辑器「测试查询」的结果直接写回缓存，省掉卡片再发一次同样的请求 */
+  setBalanceResult: (keyId: string, fingerprint: string, result: BalanceResult) => void;
 
   // 在线更新（侧栏徽章 / 设置页共用）
   updateCheck: UpdateCheckResult | null;
@@ -134,6 +179,64 @@ export const useStore = create<AppState>((set, get) => ({
   onboarding: null,
   vendors: [],
   loading: false,
+
+  balances: {},
+  balanceLoading: {},
+
+  async refreshBalance(keyId, fingerprint, force = false) {
+    // 并发去重。**这一条不能省**：StrictMode 下 effect 会连跑两次，
+    // 卡片挂载即发两个一模一样的请求。这里同步读同步写，第二次调用必然看到 true。
+    if (get().balanceLoading[keyId]) return;
+
+    if (!force) {
+      const cached = get().balances[keyId];
+      // 指纹相同 = 同一份配置查出来的；未超 TTL = 还算新鲜。两条都满足才复用。
+      if (
+        cached &&
+        cached.fingerprint === fingerprint &&
+        Date.now() - cached.result.queriedAt < BALANCE_TTL_MS
+      ) {
+        return;
+      }
+    }
+
+    set((s) => ({ balanceLoading: { ...s.balanceLoading, [keyId]: true } }));
+    try {
+      const result = await api.queryKeyBalance(keyId);
+      // 失败结果**也要落缓存**：后端把失败装在 `BalanceResult.error` 里正常返回
+      // （不抛 Err），卡片要如实显示那句原因。丢掉它会让卡片停在「未查询」，
+      // 用户既看不到余额也看不到为什么。
+      set((s) => ({ balances: { ...s.balances, [keyId]: { result, fingerprint } } }));
+    } catch (e) {
+      // 走到这里是 IPC 本身炸了（后端 panic、命令不存在），不是查询失败。
+      // 同样如实写进缓存，绝不静默——静默会让卡片永远停在「未查询」。
+      console.error("queryKeyBalance failed", e);
+      set((s) => ({
+        balances: {
+          ...s.balances,
+          [keyId]: {
+            result: {
+              ok: false,
+              queriedAt: Date.now(),
+              error: String((e as Error)?.message ?? e),
+            },
+            fingerprint,
+          },
+        },
+      }));
+    } finally {
+      // 用 delete 而不是置 false：这个表按 keyId 增长，删过的 Key 不该留残项。
+      set((s) => {
+        const next = { ...s.balanceLoading };
+        delete next[keyId];
+        return { balanceLoading: next };
+      });
+    }
+  },
+
+  setBalanceResult(keyId, fingerprint, result) {
+    set((s) => ({ balances: { ...s.balances, [keyId]: { result, fingerprint } } }));
+  },
 
   updateCheck: null,
   updateChecking: false,
@@ -373,6 +476,14 @@ export const useStore = create<AppState>((set, get) => ({
       get().showToast("error", String((e as Error)?.message ?? e));
       return;
     }
+    // 顺带清掉这条 Key 的余额缓存：该表按 keyId 索引、只增不减，
+    // 留着既是内存泄漏，又会在极端情况下（id 复用）把旧余额显示到新 Key 上。
+    set((s) => {
+      if (!(keyId in s.balances)) return {};
+      const next = { ...s.balances };
+      delete next[keyId];
+      return { balances: next };
+    });
     await get().loadCategory(get().activeCategory);
   },
 

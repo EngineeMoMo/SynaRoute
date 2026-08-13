@@ -9,8 +9,9 @@ import { BrandIcon } from "@/components/BrandIcon";
 import { type ProviderKey, protocolLabel } from "@/types";
 import { useStore } from "@/store";
 import { formatRelativeTime } from "@/lib/utils";
+import { balanceFingerprint, formatBalanceAmount, usedPercent } from "@/lib/balance";
 import { useT } from "@/lib/useT";
-import { ChevronUp, ChevronDown, RefreshCw, Pencil, Trash2, ArrowRight } from "lucide-react";
+import { ChevronUp, ChevronDown, RefreshCw, Pencil, Trash2, ArrowRight, Wallet } from "lucide-react";
 
 /**
  * 单个厂商 Key 卡片（FR-001/003/006/010/011）。
@@ -43,6 +44,32 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast 
   const [confirmingDelete, setConfirmingDelete] = React.useState(false);
   // 模型徽标折叠态（UX-3）：超过 3 个时默认折叠，点击「+N」展开
   const [modelsExpanded, setModelsExpanded] = React.useState(false);
+
+  // ---- 余额（第④批）----
+  // 只订阅本 Key 那一条，不订阅整张 balances 表：后者一变（任意别的 Key 查完余额）
+  // 就会把这一列卡片全部重渲染，正是上面 memo 要避免的事。
+  const balanceEntry = useStore((s) => s.balances[k.id]);
+  const balanceBusy = useStore((s) => !!s.balanceLoading[k.id]);
+  const refreshBalance = useStore((s) => s.refreshBalance);
+  const balanceEnabled = !!k.balanceQuery?.enabled;
+  // 指纹进 deps：用户改了查询地址/认证方式后指纹变，这里会自动重查一次，
+  // 而不是继续显示旧配置查出来的那条错误（看着像「改了没生效」）。
+  const fingerprint = balanceFingerprint(k);
+
+  React.useEffect(() => {
+    if (!balanceEnabled) return;
+    // 是否真的发请求由 store 判定（指纹 + TTL + 并发去重），这里只管声明「该有值」。
+    // 判定逻辑放 store 而不是这里，是因为 StrictMode 下本 effect 会跑两次，
+    // 只有在 store 里同步读写那面旗才拦得住重复请求。
+    void refreshBalance(k.id, fingerprint);
+  }, [k.id, balanceEnabled, fingerprint, refreshBalance]);
+
+  const balance = balanceEntry?.result;
+  // `remaining` 必须显式判 null 才显示：后端刻意让它可缺失（查不到时不给 0），
+  // 这里若写 `balance.remaining ?? 0` 就会把「取不到」渲染成「余额 0」，
+  // 让用户以为额度真用光了 —— 后端为此付的代价不能在最后一步毁掉。
+  const hasAmount = balance?.ok && balance.remaining != null;
+  const pct = hasAmount ? usedPercent(balance.remaining!, balance.total) : null;
 
   // 显示的模型列表：映射优先，否则显示前几个原生模型
   const displayModels = k.mappings.length > 0 ? k.mappings : k.models.slice(0, modelsExpanded ? k.models.length : 3);
@@ -156,6 +183,81 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast 
                 ))}
             </div>
           </Tooltip>
+
+          {/* 余额行（第④批）。只在这条 Key 开了余额查询时出现 ——
+              没开的 Key 显示一行「未配置」纯属噪音，而卡片高度是稀缺资源。 */}
+          {balanceEnabled && (
+            <div className="mt-1.5 border-t border-border pt-1.5 text-[11px]">
+              <div className="flex items-center gap-1.5">
+                <Wallet size={11} className="shrink-0 text-text-muted" />
+                <span className="shrink-0 text-text-muted">{t("balance.cardLabel")}</span>
+                {hasAmount ? (
+                  <>
+                    <span className="font-medium text-text-primary">
+                      {formatBalanceAmount(balance.remaining!)} {balance.unit ?? "USD"}
+                    </span>
+                    {/* 总额与百分比：上游给了才显示，不硬凑分母 */}
+                    {balance.total != null && (
+                      <span className="truncate text-text-muted">
+                        · {t("balance.ofTotal", {
+                          total: formatBalanceAmount(balance.total),
+                          unit: balance.unit ?? "USD",
+                        })}
+                        {pct != null && ` · ${t("balance.usedPct", { pct: String(pct) })}`}
+                      </span>
+                    )}
+                    {balance.planName && (
+                      <span className="truncate text-text-muted">· {balance.planName}</span>
+                    )}
+                  </>
+                ) : (
+                  <span className="text-text-muted">
+                    {balanceBusy ? t("balance.probing") : "—"}
+                  </span>
+                )}
+
+                {/* 查询时刻 + 手动刷新。时刻要常驻显示，陈旧才是可见的 ——
+                    余额默认 10 分钟才自动重查一次，不标时间用户会把旧值当当下值。 */}
+                <div className="ml-auto flex shrink-0 items-center gap-1">
+                  {balance && (
+                    <Tooltip content={new Date(balance.queriedAt).toLocaleString()} side="top">
+                      <span className="text-text-muted">
+                        {formatRelativeTime(balance.queriedAt, t)}
+                      </span>
+                    </Tooltip>
+                  )}
+                  <Tooltip content={t("balance.refresh")} side="top">
+                    <button
+                      type="button"
+                      aria-label={t("balance.refresh")}
+                      disabled={balanceBusy}
+                      onClick={() => void refreshBalance(k.id, fingerprint, true)}
+                      className="text-text-muted hover:text-text-secondary disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      <RefreshCw size={11} className={balanceBusy ? "animate-spin" : ""} />
+                    </button>
+                  </Tooltip>
+                </div>
+              </div>
+
+              {/* 失败原因**就地如实显示**，不只放进 tooltip：查询失败时用户最需要的就是
+                  这句话（是 404 路径错、还是 401 密钥错、还是超时），藏起来等于没说。
+                  长文本截断，全文进 tooltip。 */}
+              {balance && !balance.ok && balance.error && (
+                <Tooltip content={balance.error} side="top">
+                  <div className="mt-1 truncate text-danger">{balance.error}</div>
+                </Tooltip>
+              )}
+
+              {/* 上游明确说「这个号不能用了」——与查询失败分开显示（用 warning 而非 danger）：
+                  两者处理方式完全不同（一个是改配置，一个是去充钱/换号）。 */}
+              {balance?.isValid === false && (
+                <div className="mt-1 truncate text-warning">
+                  {balance.invalidMessage ?? t("balance.keyInactive")}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* 右侧操作区 */}

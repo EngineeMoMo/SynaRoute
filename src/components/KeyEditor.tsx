@@ -20,6 +20,7 @@ import {
   preferredUnit,
   amountForUnit,
 } from "@/lib/tokenUnit";
+import { balanceFingerprint, formatBalanceAmount } from "@/lib/balance";
 import { X, RefreshCw, Plus, Trash2, ArrowRight, Eye, EyeOff, Zap, Gauge, Brain, Download, AlertTriangle, Wallet, ChevronRight } from "lucide-react";
 
 interface KeyEditorProps {
@@ -82,6 +83,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const activeCategory = useStore((s) => s.activeCategory);
   const loadCategory = useStore((s) => s.loadCategory);
   const vendors = useStore((s) => s.vendors);
+  const setBalanceResult = useStore((s) => s.setBalanceResult);
   const t = useT();
   const isNew = !initial;
 
@@ -340,9 +342,17 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     setBalanceProbe(null);
     try {
       // 先把当前表单落盘，否则测的是旧配置（见上方注释）
-      await api.upsertKey(buildDraftKey());
+      const draft = buildDraftKey();
+      await api.upsertKey(draft);
       if (secret) await api.saveSecret(initial.id, secret);
-      setBalanceProbe(await api.queryKeyBalance(initial.id));
+      const result = await api.queryKeyBalance(initial.id);
+      setBalanceProbe(result);
+      // 同一结果直接写进卡片的余额缓存。
+      //
+      // 指纹用**刚落盘的草稿**算（不是 `initial`）：那才是产出本结果的配置，
+      // 也正是卡片重新渲染后会算出的指纹 —— 两者一致，卡片才会判成缓存有效而不再发一次
+      // 一模一样的请求。用 initial 算就会差一个指纹，每点一次测试查询白发两个请求。
+      setBalanceResult(initial.id, balanceFingerprint(draft), result);
     } catch (e) {
       setBalanceProbe({
         ok: false,
@@ -1153,8 +1163,14 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                       >
                         {balanceProbe.ok ? (
                           <>
+                            {/* 与卡片同一个格式化函数：同一笔余额在两处显示成
+                                `84.2` 和 `84.20` 两种写法会让人怀疑哪个是真的。
+                                它也保证极小额不塌成 0（见 lib/balance.ts）。 */}
                             {t("balance.probeOk", {
-                              amount: String(balanceProbe.remaining ?? "?"),
+                              amount:
+                                balanceProbe.remaining != null
+                                  ? formatBalanceAmount(balanceProbe.remaining)
+                                  : "?",
                               unit: balanceProbe.unit ?? "USD",
                             })}
                             {/* 套餐名与总额/已用：上游给了才显示，不硬凑 */}
@@ -1166,7 +1182,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                             {balanceProbe.total != null && (
                               <span className="ml-1 opacity-80">
                                 · {t("balance.ofTotal", {
-                                  total: String(balanceProbe.total),
+                                  total: formatBalanceAmount(balanceProbe.total),
                                   unit: balanceProbe.unit ?? "USD",
                                 })}
                               </span>

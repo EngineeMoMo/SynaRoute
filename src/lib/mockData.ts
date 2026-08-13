@@ -39,6 +39,23 @@ let orphanMock = 2;
 const models = (names: string[], ctxWindow?: number): ModelInfo[] =>
   names.map((n) => ({ realName: n, source: "fetched" as const, fetchedAt: now - 3600_000, contextWindow: ctxWindow }));
 
+/**
+ * 开着余额查询的默认配置（浏览器预览用）。
+ *
+ * `enabled: true` 是刻意的：Key 卡片上的余额行只在开关打开时才渲染，
+ * 若 mock 里全是关闭态，那一行在浏览器模式下**永远不可达** —— 改样式、验文案
+ * 都得先打包装到真机上。与 `orphanMock` 给非零初值同一个道理。
+ */
+const mockBalanceQuery = () => ({
+  enabled: true,
+  template: "generic",
+  url: "{{baseUrl}}/user/balance",
+  method: "GET",
+  auth: "bearer",
+  timeoutSecs: 10,
+  autoIntervalMin: 0,
+});
+
 // 内存态，仅本次会话有效
 const store: Record<CategoryType, ProviderKey[]> = {
   "claude-cli": [
@@ -56,6 +73,10 @@ const store: Record<CategoryType, ProviderKey[]> = {
       models: models(["opus-4-6", "opus-4-7", "opus-4-8"], 200000),
       mappings: [],
       health: { status: "up", lastChecked: now - 20_000, latencyMs: 320, failCount: 0 },
+      // k1~k4 各开余额查询，配合 `queryBalance` 的 4 个分桶，在预览里一次铺开
+      // 全部展示状态：有额度/有总额 → 查询失败 → 超时 → 上游报账号不可用。
+      // 卡片上这四种长得完全不同（尤其「失败」绝不能显示成余额 0），并排才看得出差异。
+      balanceQuery: mockBalanceQuery(),
     },
     {
       id: "k2",
@@ -71,6 +92,7 @@ const store: Record<CategoryType, ProviderKey[]> = {
       models: models(["opus-4-6", "opus-4-7", "opus-4-8", "fable-5"], 200000),
       mappings: [],
       health: { status: "up", lastChecked: now - 22_000, latencyMs: 540, failCount: 0 },
+      balanceQuery: mockBalanceQuery(),
     },
     {
       id: "k3",
@@ -89,6 +111,7 @@ const store: Record<CategoryType, ProviderKey[]> = {
         { id: "m2", expectedName: "opus-4-8", realName: "GLM5.2" },
       ],
       health: { status: "unknown", failCount: 0 },
+      balanceQuery: mockBalanceQuery(),
     },
     // 以下两条专供验证「陈旧失败结论」与「新鲜失败结论」的徽标差异（2026-08-02 加）：
     // 真机上见过一条**禁用** Key 卡片显示「探测不可达 · 10 天前」，而那家上游早已恢复、
@@ -113,6 +136,7 @@ const store: Record<CategoryType, ProviderKey[]> = {
         latencyMs: 342,
         failCount: 0,
       },
+      balanceQuery: mockBalanceQuery(),
     },
     {
       id: "k5",
@@ -837,9 +861,17 @@ export const mockBridge = {
    * 三种都要能在浏览器预览里看到 —— 失败态的文案与布局最容易做漏，
    * 而它恰恰是真实使用中最常出现的（站点没这接口、路径填错）。
    */
+  /**
+   * 按 keyId 稳定分桶，铺开卡片余额行的**全部四种**展示状态。
+   *
+   * 分桶（而不是随机）是为了让同一条 Key 每次刷新都落在同一状态上，
+   * 改样式时不会因为随机跳变而误判「刚才那个样式没生效」。
+   * k1~k4 恰好落在 0~3 四个桶里（已实测），四张卡片并排即可一次看全。
+   */
   async queryBalance(keyId: string) {
     await delay();
-    const bucket = keyId.split("").reduce((a, c) => a + c.charCodeAt(0), 0) % 3;
+    const bucket = keyId.split("").reduce((a, c) => a + c.charCodeAt(0), 0) % 4;
+    // 桶 1：查询失败（字段找不到）。卡片必须显示这句原因，**且绝不显示成余额 0**。
     if (bucket === 1) {
       return {
         ok: false,
@@ -847,13 +879,29 @@ export const mockBridge = {
         error: "上游返回里找不到余额字段（可在「取值路径」手填，如 data.balance）",
       };
     }
+    // 桶 2：超时
     if (bucket === 2) {
       return { ok: false, queriedAt: Date.now(), error: "查询超时（10s）" };
     }
+    // 桶 3：**有余额、但上游说这个号不可用**。这两件事要分开显示（warning 而非 danger）：
+    // 「查询坏了」去改配置，「号不能用了」去充钱或换号，处理方式完全不同。
+    if (bucket === 3) {
+      return {
+        ok: true,
+        remaining: 12.5,
+        unit: "USD",
+        isValid: false,
+        invalidMessage: "该密钥已被上游限流（触发日额度上限）",
+        queriedAt: Date.now() - 3 * 60_000,
+      };
+    }
+    // 桶 0：正常，且带总额 + 套餐名 → 卡片上会多出「共 N」与「已用 X%」
     return {
       ok: true,
       remaining: 84.2,
+      total: 200,
       unit: "CNY",
+      planName: "月付套餐",
       isValid: true,
       queriedAt: Date.now(),
     };
