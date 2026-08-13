@@ -130,8 +130,22 @@ const segment = (x1, y1, x2, y2, w) => (x, y) => {
 const CX = 600;
 const CY = 300;
 const S = 224; // 品牌标记边长
-const k = S / 32; // 标记原始 viewBox 是 32，按此缩放
+const k = S / 32; // 标记输出 viewBox 是 32，按此缩放
 const toCanvas = (vx, vy) => [CX - S / 2 + vx * k, CY - S / 2 + vy * k];
+
+/**
+ * 品牌标记的内层几何：lucide `Waypoints`（24×24 坐标系），缩到 20 居中（偏移 6）。
+ *
+ * 与 `gen-favicon.mjs` 及 `src/components/ui/Logo.tsx` **同一套变换**。
+ * 三处必须一起改 —— 图形分叉不会报错，只能靠肉眼比对发现。
+ */
+const GLYPH = 20;
+const LUCIDE_VB = 24;
+const gs = GLYPH / LUCIDE_VB; // lucide → 输出 viewBox 的缩放
+const go = (32 - GLYPH) / 2; // 居中偏移
+/** lucide 坐标 → 画布坐标 */
+const toG = (lx, ly) => toCanvas(go + lx * gs, go + ly * gs);
+const G_STROKE = 2 * gs * k; // lucide 默认线宽 2，两级缩放
 
 // 外围分流节点先画（位于标记下层），低透明度做背景层次
 for (const [sx, sy, r] of [
@@ -147,16 +161,28 @@ for (const [sx, sy, r] of [
   paint(circle(sx, sy, r + 9), PRIMARY, 0.14);
 }
 
-// 品牌标记本体：与 src-tauri/icons 的应用图标同形
+// 品牌标记本体：与 src-tauri/icons 的应用图标同形（lucide Waypoints）
 paint(roundedRect(CX, CY, S, S, (S * 7.5) / 32), PRIMARY, 1);
-const [ax, ay] = toCanvas(9, 8.5);
-const [bx, by] = toCanvas(16, 16);
-const [cx2, cy2] = toCanvas(23, 23.5);
-paint(segment(ax, ay, bx, by, 2.4 * k), WHITE, 1);
-paint(segment(bx, by, cx2, cy2, 2.4 * k), WHITE, 1);
-paint(circle(ax, ay, 2.9 * k), WHITE, 1);
-paint(circle(bx, by, 4.4 * k), WHITE, 1);
-paint(circle(cx2, cy2, 2.9 * k), WHITE, 1);
+// 连线（端点刻意不落在圆心上，那段留白是原设计的一部分）
+for (const [x1, y1, x2, y2] of [
+  [10.2, 6.3, 6.3, 10.2],
+  [7, 12, 17, 12],
+  [13.8, 17.7, 17.7, 13.8],
+]) {
+  const [px1, py1] = toG(x1, y1);
+  const [px2, py2] = toG(x2, y2);
+  paint(segment(px1, py1, px2, py2, G_STROKE), WHITE, 1);
+}
+// 四个节点：上、左、右、下
+for (const [lcx, lcy, r] of [
+  [12, 4.5, 2.5],
+  [4.5, 12, 2.5],
+  [19.5, 12, 2.5],
+  [12, 19.5, 2.5],
+]) {
+  const [pcx, pcy] = toG(lcx, lcy);
+  paint(circle(pcx, pcy, r * gs * k), WHITE, 1);
+}
 
 const png = encodePNG(W, H, buf);
 writeFileSync(OUT, png);
