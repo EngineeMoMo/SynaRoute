@@ -274,6 +274,29 @@ export function SettingsPage() {
       });
   };
 
+  /**
+   * 悬浮球置顶开关。同上走专用命令、失败回滚。
+   *
+   * 单独开这个开关是因为原先置顶是**写死**的（`always_on_top(true)`），
+   * 于是用别的软件时悬浮球一直盖在最上面挡着。置顶对「瞥一眼状态」有用，
+   * 但该由用户自己选，默认关。
+   */
+  const handleToggleFloatingPinned = (v: boolean) => {
+    if (!settings) return;
+    const prev = settings;
+    setSettings({ ...settings, floatingWidgetAlwaysOnTop: v });
+    void api
+      .setFloatingPinned(v)
+      .then(() => {
+        useStore.setState({ settings: { ...prev, floatingWidgetAlwaysOnTop: v } });
+      })
+      .catch((e) => {
+        console.error("setFloatingPinned failed", e);
+        setSettings(prev);
+        showToast("error", String((e as Error)?.message ?? e));
+      });
+  };
+
   // MCP 开关/端口走专用命令：携带当前活跃分类，后端据此自动注册 synaroute 到对应工具客户端
   // （~/.claude.json 或 ~/.codex/config.toml），并在端口漂移时重写。不走通用 saveSettings，
   // 因为那拿不到 activeCategory。
@@ -899,6 +922,16 @@ export function SettingsPage() {
               checked={settings?.floatingWidgetEnabled ?? false}
               onChange={handleToggleFloating}
             />
+            {/* 置顶子开关：只在悬浮球开着时才有意义，故关着时不显示 ——
+                摆一个开了也看不到效果的开关，正是本项目反复防的那种困惑。 */}
+            {settings?.floatingWidgetEnabled && (
+              <ToggleRow
+                title={t("settings.floatingPinTitle")}
+                desc={t("settings.floatingPinDesc")}
+                checked={settings?.floatingWidgetAlwaysOnTop ?? false}
+                onChange={handleToggleFloatingPinned}
+              />
+            )}
           </CardContent>
         </Card>
 

@@ -300,6 +300,22 @@ export const api = {
   setFloatingWidget: (enabled: boolean) =>
     call<void>("set_floating_widget", { enabled }, () => mockBridge.setFloatingWidget(enabled)),
 
+  /** 悬浮球置顶开关。默认关 —— 写死置顶会在用别的软件时一直挡着。 */
+  setFloatingPinned: (pinned: boolean) =>
+    call<void>("set_floating_pinned", { pinned }, () => mockBridge.setFloatingPinned(pinned)),
+
+  /**
+   * 悬浮球悬停展开 / 移出收起。
+   *
+   * **为什么这是一次 IPC 而不是纯 CSS**：WebView 画不出窗口以外的东西。悬浮球窗口
+   * 只有 64×64，光在 CSS 里展开会被窗口边界裁掉 —— 表现为「悬停没反应」。
+   * 窗口尺寸只能由后端改，故每次悬停都要过来一趟。
+   *
+   * 浏览器预览里是个 no-op（没有窗口可改）。
+   */
+  setFloatingExpanded: (expanded: boolean) =>
+    call<void>("set_floating_expanded", { expanded }, async () => {}),
+
   // ---- 首启向导（UX#1）----
   // 浏览器预览刻意返回 shouldShow=true，好让预览模式能验证向导布局
   // （与 UpdateBanner 不加 isTauri 守卫同一惯例）。

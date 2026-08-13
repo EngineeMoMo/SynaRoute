@@ -676,9 +676,14 @@ const zh: Dict = {
   "settings.startup": "启动",
   "settings.autoStartTitle": "开机自启动并最小化到托盘",
   "settings.autoStartDesc": "随 Windows 启动，后台驻留系统托盘",
-  "settings.floatingTitle": "桌面悬浮窗",
+  "settings.floatingTitle": "桌面悬浮球",
+  // ⚠️ 本条是**纯文本渲染**（ToggleRow 的 desc 直接进 div），写 `**粗体**` 会露出星号。
+  // 原文写着「常驻一个小窗」「always-on-top」，改成球+可选置顶后那两句都成了假话。
   "settings.floatingDesc":
-    "在桌面角落常驻一个小窗，显示代理状态、今日用量与花费估算。开启后**关闭主窗口（最小化到托盘）时才出现**，主窗口在前台时自动隐藏。",
+    "在桌面角落放一颗小球，显示有几个代理在跑；鼠标移上去展开今日用量与花费估算。开启后只在关闭主窗口（最小化到托盘）时出现，主窗口在前台时自动隐藏。",
+  "settings.floatingPinTitle": "悬浮球置顶",
+  "settings.floatingPinDesc":
+    "让悬浮球始终显示在其它窗口之上。默认关闭 —— 开了它在你用别的软件时也会盖在最前面。",
   "settings.backup": "配置备份",
   "settings.export": "导出配置…",
   "settings.import": "导入配置…",
@@ -1433,9 +1438,12 @@ const en: Dict = {
   "settings.startup": "Startup",
   "settings.autoStartTitle": "Auto-start and minimize to tray",
   "settings.autoStartDesc": "Launch with Windows and stay in the system tray",
-  "settings.floatingTitle": "Desktop widget",
+  "settings.floatingTitle": "Desktop ball",
   "settings.floatingDesc":
-    "Keeps a small always-on-top window in a screen corner showing proxy status, today's usage and estimated spend. Once enabled it appears **only when the main window is closed (minimized to tray)**, and hides while the main window is in front.",
+    "Puts a small ball in a screen corner showing how many proxies are running; hover it to expand today's usage and estimated spend. Once enabled it only appears when the main window is closed (minimized to tray), and hides while the main window is in front.",
+  "settings.floatingPinTitle": "Keep ball on top",
+  "settings.floatingPinDesc":
+    "Keeps the ball above other windows. Off by default — with it on, the ball also sits in front while you're using other apps.",
   "settings.backup": "Config backup",
   "settings.export": "Export config…",
   "settings.import": "Import config…",

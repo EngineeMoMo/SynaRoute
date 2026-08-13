@@ -460,6 +460,14 @@ export interface AppSettings {
    * 开启后不会立刻显示，还要求主窗口已最小化到托盘。
    */
   floatingWidgetEnabled?: boolean;
+  /**
+   * 悬浮球是否置顶（默认关）。同样**不在 UserPrefs 白名单里**，走专用命令
+   * `setFloatingPinned`。
+   *
+   * 默认关的理由：悬浮球原先是写死置顶的，于是用别的软件时它一直盖在最上面挡着。
+   * 置顶对「瞥一眼状态」有用，但该由用户自己选。
+   */
+  floatingWidgetAlwaysOnTop?: boolean;
   proxyPorts?: Record<string, number>; // 各分类代理首选监听端口（key=分类）。粘滞固定端口：默认 CLI=47100/Codex=47101/Desktop=47102，改端口走 setProxyPort（重启代理+重写客户端 config）
   /**
    * 首启向导是否已完成（UX#1）。**三态**：null/undefined = 从未判定（旧配置或全新安装），

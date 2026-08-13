@@ -21,9 +21,20 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 /// 悬浮窗的窗口标签。前端靠 URL 上的 `floating=1` 判断该渲染哪个界面。
 pub const FLOATING_LABEL: &str = "floating";
 
-/// 悬浮窗尺寸。够放「三端状态 + 主 Key + 余额 + 今日花费」四行，再大就挡事了。
-const FLOATING_W: f64 = 300.0;
-const FLOATING_H: f64 = 208.0;
+/// 悬浮球尺寸。**正方形**：前端画的是个圆，宽高不等会画成椭圆。
+///
+/// 原先是 300×208 的矩形卡片，铺开四行明细 —— 那个形状在桌面上很挡事，
+/// 而它想说的话（三端状态 / 今日花费）只在用户主动看一眼时才需要。
+/// 现在收成一颗球：常态只显示图标 + 运行数，明细改为**悬停展开**。
+const FLOATING_BALL: f64 = 64.0;
+
+/// 悬停展开后的窗口尺寸。展开态要装下原来那几行明细，故宽高都放开。
+///
+/// **窗口必须先够大**：WebView 画不出窗口之外的东西，若窗口维持 64×64，
+/// 前端那块展开面板会被窗口边界直接裁掉（表现为「悬停没反应」）。
+/// 故展开/收起是前端与后端**一起**改的 —— 前端换布局、后端换窗口尺寸。
+const FLOATING_PANEL_W: f64 = 300.0;
+const FLOATING_PANEL_H: f64 = 208.0;
 
 /// 算「主屏右下角」的逻辑坐标。
 ///
@@ -53,10 +64,13 @@ fn bottom_right_position(app: &AppHandle) -> Option<tauri::LogicalPosition<f64>>
     // 物理像素 → 逻辑像素后再算，否则高 DPI 屏上会偏出屏幕
     let sw = size.width as f64 / scale;
     let sh = size.height as f64 / scale;
-    // 距右下各留 24 逻辑像素；再往上抬 48 躲开 Windows 任务栏的典型高度
+    // 距右下各留 24 逻辑像素；再往上抬 48 躲开 Windows 任务栏的典型高度。
+    //
+    // 按**展开态**的尺寸留位置，而不是按球的 64×64：展开是往右下角那侧长出来的，
+    // 若按球定位，贴边放的球一展开就有一半长到屏幕外去了。
     Some(tauri::LogicalPosition::new(
-        (sw - FLOATING_W - 24.0).max(0.0),
-        (sh - FLOATING_H - 24.0 - 48.0).max(0.0),
+        (sw - FLOATING_PANEL_W - 24.0).max(0.0),
+        (sh - FLOATING_PANEL_H - 24.0 - 48.0).max(0.0),
     ))
 }
 
@@ -74,7 +88,10 @@ fn bottom_right_position(app: &AppHandle) -> Option<tauri::LogicalPosition<f64>>
 /// 在里面同步建窗就是等自己，实测表现为 `show()` 返回 Ok、随后
 /// `outer_position()` / `outer_size()` 全部读取失败（日志里那条「位置/尺寸读取失败」）。
 /// 窗口对象存在但从未真正完成初始化，屏幕上什么也没有。
-fn ensure_window(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
+///
+/// `pinned` = 是否置顶（用户设置项）。**建窗时就定下来**，此后由
+/// `set_floating_pinned` 改。
+fn ensure_window(app: &AppHandle, pinned: bool) -> tauri::Result<tauri::WebviewWindow> {
     if let Some(w) = app.get_webview_window(FLOATING_LABEL) {
         return Ok(w);
     }
@@ -89,13 +106,20 @@ fn ensure_window(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
         WebviewUrl::App("index.html?floating=1".into()),
     )
     .title("SynaRoute")
-    .inner_size(FLOATING_W, FLOATING_H)
+    // 建出来就是球的尺寸；悬停展开时由 `set_floating_expanded` 改成面板尺寸。
+    .inner_size(FLOATING_BALL, FLOATING_BALL)
     .resizable(false)
-    // 无边框 + 置顶 + 不进任务栏：这是「悬浮小窗」而不是第二个主窗口。
+    // 无边框 + 不进任务栏：这是「悬浮小球」而不是第二个主窗口。
     .decorations(false)
-    .always_on_top(true)
     .skip_taskbar(true)
-    .shadow(true)
+    // 透明 + 关阴影：圆形的关键。窗口本身是方的，圆是前端用 border-radius 画的 ——
+    // 不透明的话四角会露出方形底色（一颗球外面套个方框），而系统阴影是按**窗口矩形**
+    // 投的，留着就会在球周围投出一个方形影子。两者必须成对，只改一个都还是方的。
+    .transparent(true)
+    .shadow(false)
+    // **不再无条件置顶**。置顶是「用别的软件时被它挡着」的直接原因，
+    // 现在由用户在设置里决定（`floating_widget_always_on_top`，默认关）。
+    .always_on_top(pinned)
     // 先建后显：建窗时就 visible 会让它在定位完成前先闪一下屏幕左上角。
     .visible(false);
 
@@ -122,8 +146,8 @@ fn ensure_window(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
 /// 结果写进**事件日志**而非只 `tracing::warn!` —— 打包后没有控制台可看，
 /// 而「预建成功没成功」正是排障时最需要的那一位信息（实测吃过这个亏：
 /// 屏幕上没窗口，而日志里只有 `sync_visibility` 的记录，无从判断窗口到底建起来没）。
-pub fn preload(app: &AppHandle) {
-    let outcome = match ensure_window(app) {
+pub fn preload(app: &AppHandle, pinned: bool) {
+    let outcome = match ensure_window(app, pinned) {
         Ok(_) => "预建悬浮窗成功（隐藏态待命）".to_string(),
         Err(e) => {
             tracing::warn!("预建悬浮窗失败（开关打开时会重试）: {e}");
@@ -190,7 +214,9 @@ pub fn diagnose(app: &AppHandle) -> String {
 /// 故这里把 `enabled` / `main_hidden` / `should_show` 三个判据 + 建窗结果都记进
 /// 运行日志，用户复现一次就能在「运行日志」页里看到到底卡在哪一步。
 /// 这不是调试残留，是这类「多条件与、任一不满足都表现为无反应」的功能必须有的可观测性。
-pub fn sync_visibility(app: &AppHandle, enabled: bool) {
+///
+/// `pinned` = 用户是否要它置顶（`floating_widget_always_on_top`）。
+pub fn sync_visibility(app: &AppHandle, enabled: bool, pinned: bool) {
     // 主窗口是否处于隐藏态。取不到主窗口（极早期/已退出）时按「未隐藏」处理，
     // 于是悬浮窗不显示 —— 宁可不显示，也不要在退出过程中弹个窗出来。
     let main_visible = app
@@ -235,7 +261,7 @@ pub fn sync_visibility(app: &AppHandle, enabled: bool) {
         return;
     }
 
-    match ensure_window(app) {
+    match ensure_window(app, pinned) {
         Ok(w) => {
             // 定位放在 show() **之前**：先摆好再显示，避免它先在旧位置闪一下。
             //
@@ -247,10 +273,16 @@ pub fn sync_visibility(app: &AppHandle, enabled: bool) {
             if let Some(pos) = placed {
                 let _ = w.set_position(pos);
             }
+            // 每次显示都收回球形：上次可能是在展开态被隐藏的（鼠标还悬着就切走了），
+            // 不收的话下次露面就是一个 300×208 的方块，而前端画的是球 —— 一个圆
+            // 缩在大窗口左上角、其余是透明区。
+            let _ = w.set_size(tauri::LogicalSize::new(FLOATING_BALL, FLOATING_BALL));
 
             let shown = w.show();
-            // 置顶属性在部分 Windows 版本上会被后续窗口抢走，显示时重申一次。
-            let _ = w.set_always_on_top(true);
+            // 置顶按用户设置重申。**不能无条件 true**：那正是「用别的软件时被它挡着」
+            // 的原因。部分 Windows 版本上该属性会被后续窗口抢走，故每次显示都重设一次
+            // —— 但重设的是用户选的值。
+            let _ = w.set_always_on_top(pinned);
 
             // 记**算出来的**坐标，而不是回查 `outer_position()`。
             //
@@ -263,8 +295,8 @@ pub fn sync_visibility(app: &AppHandle, enabled: bool) {
             // 且足以判断「坐标是否落在屏内」——那才是排障要的信息。
             let geom = match placed {
                 Some(p) => format!(
-                    "目标位置=({:.0},{:.0}) 尺寸={:.0}x{:.0}",
-                    p.x, p.y, FLOATING_W, FLOATING_H
+                    "目标位置=({:.0},{:.0}) 尺寸={:.0}x{:.0} 置顶={}",
+                    p.x, p.y, FLOATING_BALL, FLOATING_BALL, pinned
                 ),
                 None => "拿不到显示器信息，已用兜底坐标".to_string(),
             };
@@ -291,5 +323,66 @@ pub fn sync_visibility(app: &AppHandle, enabled: bool) {
 pub fn destroy(app: &AppHandle) {
     if let Some(w) = app.get_webview_window(FLOATING_LABEL) {
         let _ = w.close();
+    }
+}
+
+/// 悬停展开 / 移出收起：改窗口尺寸。
+///
+/// **为什么非要动窗口尺寸**：WebView 画不出窗口以外的东西。若窗口固定 64×64，
+/// 前端那块展开面板会被窗口边界直接裁掉，用户看到的是「悬停没反应」——
+/// 而 CSS 层面明明已经展开了。这是无边框小窗最容易踩的一条。
+///
+/// 展开方向是**左上**（`set_position` 往左上挪）而不是右下：悬浮球停在屏幕右下角，
+/// 往右下长会直接长到屏幕外面去。故展开时把窗口原点左移/上移相应的差值，
+/// 球本身在屏幕上的视觉位置保持不动。
+///
+/// 由前端的 `mouseenter` / `mouseleave` 调用。失败只记 tracing：
+/// 展开不了顶多是看不到明细，不值得打断用户。
+pub fn set_expanded(app: &AppHandle, expanded: bool) {
+    let Some(w) = app.get_webview_window(FLOATING_LABEL) else {
+        return;
+    };
+
+    // 先拿当前位置，再算新原点。拿不到就只改尺寸 —— 位置会显得跳一下，
+    // 但仍比「展开被裁掉」好。
+    let cur = w.outer_position().ok();
+    let scale = w.scale_factor().unwrap_or(1.0);
+
+    let (tw, th) = if expanded {
+        (FLOATING_PANEL_W, FLOATING_PANEL_H)
+    } else {
+        (FLOATING_BALL, FLOATING_BALL)
+    };
+
+    if let Err(e) = w.set_size(tauri::LogicalSize::new(tw, th)) {
+        tracing::warn!("悬浮窗改尺寸失败: {e}");
+        return;
+    }
+
+    // 让球的**右下角**保持不动：展开时原点往左上退 (panel - ball)，收起时反向。
+    if let Some(p) = cur {
+        let delta = FLOATING_PANEL_W - FLOATING_BALL;
+        let delta_h = FLOATING_PANEL_H - FLOATING_BALL;
+        let lx = p.x as f64 / scale;
+        let ly = p.y as f64 / scale;
+        let (nx, ny) = if expanded {
+            (lx - delta, ly - delta_h)
+        } else {
+            (lx + delta, ly + delta_h)
+        };
+        // 钳到 0：多屏负坐标下这个夹取会把窗口拉回主屏，但比长到屏外不可见更可控
+        let _ = w.set_position(tauri::LogicalPosition::new(nx.max(0.0), ny.max(0.0)));
+    }
+}
+
+/// 改置顶属性（用户在设置里切「悬浮球置顶」时调）。
+///
+/// 即时生效、不需要重建窗口 —— 重建会让球闪一下并跳回右下角，
+/// 而用户可能刚把它拖到别处。
+pub fn set_pinned(app: &AppHandle, pinned: bool) {
+    if let Some(w) = app.get_webview_window(FLOATING_LABEL) {
+        if let Err(e) = w.set_always_on_top(pinned) {
+            tracing::warn!("悬浮窗置顶设置失败: {e}");
+        }
     }
 }

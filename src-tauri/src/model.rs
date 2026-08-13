@@ -1639,6 +1639,14 @@ pub struct AppSettings {
     /// `CloseRequested` 处理）。这是用户明确要求的语义：主窗口在前台时悬浮窗只会挡事。
     #[serde(default)]
     pub floating_widget_enabled: bool,
+    /// 悬浮球是否**置顶**（始终在其它窗口之上）。**默认关**。
+    ///
+    /// 为什么单开一个开关、且默认关：悬浮球原先是无条件 `always_on_top(true)` 的，
+    /// 于是用别的软件时它一直盖在最上面挡着 —— 这是用户实测反馈的问题。
+    /// 置顶对「瞥一眼状态」确实有用（否则会被别的窗口埋掉），但那该由用户自己选，
+    /// 不该是写死的行为。
+    #[serde(default)]
+    pub floating_widget_always_on_top: bool,
     /// 各分类的「默认推理强度」（key=分类字符串，value=effort 档位 low/medium/high/xhigh）。
     /// 缘由：Codex Desktop 对自定义 provider 不下发 reasoning.effort（只发 reasoning.summary），
     /// 客户端 UI 设的强度传不到上游。故在此配一个默认值，转发时若下游 body 无 effort 就注入，
@@ -1824,6 +1832,8 @@ pub struct UserPrefs {
     pub tray_model_switch_enabled: bool,
     #[serde(default)]
     pub floating_widget_enabled: bool,
+    #[serde(default)]
+    pub floating_widget_always_on_top: bool,
 }
 
 impl UserPrefs {
@@ -1846,6 +1856,7 @@ impl UserPrefs {
         s.aggregate_trace_enabled = self.aggregate_trace_enabled;
         s.tray_model_switch_enabled = self.tray_model_switch_enabled;
         s.floating_widget_enabled = self.floating_widget_enabled;
+        s.floating_widget_always_on_top = self.floating_widget_always_on_top;
     }
 }
 
@@ -1866,6 +1877,7 @@ impl From<&AppSettings> for UserPrefs {
             aggregate_trace_enabled: s.aggregate_trace_enabled,
             tray_model_switch_enabled: s.tray_model_switch_enabled,
             floating_widget_enabled: s.floating_widget_enabled,
+            floating_widget_always_on_top: s.floating_widget_always_on_top,
         }
     }
 }
@@ -1901,6 +1913,7 @@ impl Default for AppSettings {
             // 悬浮窗默认**关闭**（用户明确要求）：它是个额外的常驻窗口，
             // 不该在用户没开口的情况下自己冒出来。
             floating_widget_enabled: false,
+            floating_widget_always_on_top: false,
         }
     }
 }

@@ -74,6 +74,21 @@
     margin: 0;
   }
 
+  /**
+   * 悬浮球模式：body 必须**透明**。
+   *
+   * 这条不加就是一个「圆等于白画」的静默失效：窗口那侧已经 `transparent(true)`、
+   * 组件那侧也画了 `rounded-full`，但 body 这层不透明底色会铺满整个方形窗口 ——
+   * 屏幕上看到的是一个白方块，球嵌在里面。三层里任意一层不透明，结果都是方的。
+   *
+   * 类名由 `main.tsx` 在判定 `?floating=1` 时打到 <html> 上（那时 React 还没挂载，
+   * 早于首帧，不会闪一下白底）。
+   */
+  html.floating-mode,
+  html.floating-mode body {
+    background-color: transparent !important;
+  }
+
   body {
     background-color: rgb(var(--background));
     color: rgb(var(--text-primary));

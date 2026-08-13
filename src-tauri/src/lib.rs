@@ -654,12 +654,41 @@ fn set_floating_widget(
         // 这里在 IPC 命令线程上，不是事件循环回调 —— 建窗是安全的。
         // `destroy` 之后重新打开开关时窗口已不存在，需要在此重建；
         // `sync_visibility` 内部的 `ensure_window` 会处理。
-        floating::sync_visibility(&app, true);
+        let pinned = state.store.get_settings().floating_widget_always_on_top;
+        floating::sync_visibility(&app, true, pinned);
     } else {
         // 关掉就销毁，不留着占一个 WebView 进程。
         floating::destroy(&app);
     }
     Ok(())
+}
+
+/// 悬浮球置顶开关。
+///
+/// 与 `set_floating_widget` 同一套「先落盘（带磁盘对账回滚）再改窗口」的顺序：
+/// 反过来的话落盘失败就成了「窗口已置顶、配置说没置顶」，重启后静默回退。
+#[tauri::command]
+fn set_floating_pinned(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+    pinned: bool,
+) -> AppResult<()> {
+    state.store.set_floating_pinned_flag(pinned)?;
+    // 即时改属性而不重建窗口：重建会让球闪一下并跳回右下角，
+    // 而用户可能刚把它拖到别处。
+    floating::set_pinned(&app, pinned);
+    Ok(())
+}
+
+/// 悬浮球悬停展开 / 移出收起（由悬浮窗前端的 mouseenter / mouseleave 调）。
+///
+/// **必须有这条 IPC**：WebView 画不出窗口以外的东西，光在 CSS 里展开会被窗口边界裁掉，
+/// 表现为「悬停没反应」。窗口尺寸只能由后端改，故前端每次悬停都要过来一趟。
+///
+/// 纯视觉状态，不落盘 —— 它不是用户偏好，重启后没有「上次是展开的」这种语义。
+#[tauri::command]
+fn set_floating_expanded(app: tauri::AppHandle, expanded: bool) {
+    floating::set_expanded(&app, expanded);
 }
 
 /// 用 `tauri-plugin-autostart` 实现 [`service::AutostartToggle`]。
@@ -1338,7 +1367,10 @@ pub fn run() {
             // 无条件预建、不看开关：开关是运行期可改的，而 setup 只跑一次。若只在
             // 「开关已开」时预建，用户启动后才打开开关就又落回「回调里建窗」那条坏路径。
             // 代价是一个隐藏的 WebView；关掉开关时 `destroy` 会销毁它。
-            crate::floating::preload(app.handle());
+            crate::floating::preload(
+                app.handle(),
+                state.store.get_settings().floating_widget_always_on_top,
+            );
 
             // 随系统启动时最小化到托盘（FR-025 需求原文要求）。判据是启动参数里有
             // `--autostart`（注册自启动项时带上的），而非「auto_start 为真」——
@@ -1354,9 +1386,11 @@ pub fn run() {
                 // （那是用户点关闭按钮才走的），于是「开机自启 + 开了悬浮窗」的用户
                 // 开机后什么也看不到，要先把主窗口叫出来再关一次才行 —— 而他并不知道
                 // 需要这么做，只会认为悬浮窗坏了。
+                let s = state.store.get_settings();
                 crate::floating::sync_visibility(
                     app.handle(),
-                    state.store.get_settings().floating_widget_enabled,
+                    s.floating_widget_enabled,
+                    s.floating_widget_always_on_top,
                 );
             }
 
@@ -1409,8 +1443,12 @@ pub fn run() {
                 // 读磁盘最新值而不是启动时的快照：用户可能刚在设置页改过。
                 let app = window.app_handle();
                 if let Some(state) = app.try_state::<AppState>() {
-                    let enabled = state.store.get_settings().floating_widget_enabled;
-                    crate::floating::sync_visibility(app, enabled);
+                    let s = state.store.get_settings();
+                    crate::floating::sync_visibility(
+                        app,
+                        s.floating_widget_enabled,
+                        s.floating_widget_always_on_top,
+                    );
                 }
             }
         })
@@ -1445,6 +1483,8 @@ pub fn run() {
             get_usage_with_cost,
             query_key_balance,
             set_floating_widget,
+            set_floating_pinned,
+            set_floating_expanded,
             recent_failure,
             get_event_trace,
             get_settings,
@@ -1957,8 +1997,12 @@ fn show_main_window(app: &tauri::AppHandle) {
     // 这里传 enabled 无所谓真假：`sync_visibility` 会发现主窗口已可见而一律隐藏，
     // 但仍按真实开关传值，避免日后有人把这个函数挪去别处时行为悄悄变了。
     if let Some(state) = app.try_state::<AppState>() {
-        let enabled = state.store.get_settings().floating_widget_enabled;
-        crate::floating::sync_visibility(app, enabled);
+        let s = state.store.get_settings();
+        crate::floating::sync_visibility(
+            app,
+            s.floating_widget_enabled,
+            s.floating_widget_always_on_top,
+        );
     }
 }
 

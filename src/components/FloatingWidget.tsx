@@ -1,19 +1,31 @@
 /**
- * 桌面悬浮窗（第⑥批）
+ * 桌面悬浮球（第⑥批，2026-08-13 由矩形卡片改为球）
  *
  * 纯前端实现的单页 WebView 组件。后端在 `set_floating_widget(true)` 时创建、
  * 用户关闭或 `false` 时销毁。
  *
- * ## 职责
- * - 显示三档代理状态（运行数 n/3）
- * - 可拖动；鼠标穿透以免挡住下层窗口的点击
+ * ## 形态：常态一颗球，悬停展开明细
+ *
+ * 原先是 300×208 的矩形卡片，四行明细常驻铺开 —— 在桌面上很挡事，而它想说的话
+ * 只在用户主动看一眼时才需要。现在收成 64×64 的圆球（图标 + 运行数），
+ * 鼠标移上去才展开成原来那张面板。
+ *
+ * **圆形靠三件事同时成立**，少一件都还是方的：
+ * 1. 窗口 `transparent(true)` —— 否则四角露出方形底色；
+ * 2. 窗口 `shadow(false)` —— 系统阴影按**窗口矩形**投，留着就投出一个方影子；
+ * 3. 窗口宽高相等 —— 不等的话 `rounded-full` 画出来是椭圆。
+ * 前两条在 `floating.rs` 的 builder 里，第三条是 `FLOATING_BALL` 常量。
+ *
+ * **展开必须同时改窗口尺寸**（`api.setFloatingExpanded`）：WebView 画不出窗口以外的
+ * 东西，光在 CSS 里展开会被窗口边界直接裁掉，表现为「悬停没反应」。
  *
  * ## 注意事项
- * - 窗口本身的位置保存由后端管理（下次打开恢复），前端只负责渲染。
+ * - 置顶不再写死，由设置项 `floatingWidgetAlwaysOnTop` 决定（默认关）——
+ *   写死置顶就是「用别的软件时一直被它挡着」的原因。
  * - 组件需极致轻量：不加载完整路由、不依赖大型状态树。
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
 import type { ProxyState, CategoryType, UsageCostRow } from "@/types";
@@ -36,6 +48,32 @@ export function FloatingWidget() {
   });
   const [rows, setRows] = useState<UsageCostRow[]>([]);
   const [todayTokens, setTodayTokens] = useState(0);
+  const [expanded, setExpanded] = useState(false);
+
+  /**
+   * 收起用防抖：鼠标从球移到展开面板的途中会短暂离开元素，
+   * 不防抖就会「刚展开立刻收起」来回抖。移入时立即取消待执行的收起。
+   */
+  const collapseTimer = useRef<ReturnType<typeof setTimeout>>();
+
+  const expand = () => {
+    clearTimeout(collapseTimer.current);
+    if (expanded) return;
+    setExpanded(true);
+    // 先改窗口再展开内容：窗口没变大就展开，内容会被窗口边界裁掉。
+    void api.setFloatingExpanded(true);
+  };
+
+  const collapse = () => {
+    clearTimeout(collapseTimer.current);
+    collapseTimer.current = setTimeout(() => {
+      setExpanded(false);
+      void api.setFloatingExpanded(false);
+    }, 260);
+  };
+
+  // 卸载时清掉待执行的收起，避免它在组件没了之后再打一次 IPC
+  useEffect(() => () => clearTimeout(collapseTimer.current), []);
 
   useEffect(() => {
     let mounted = true;
@@ -88,10 +126,54 @@ export function FloatingWidget() {
   // 有 Key 算不出金额时标星号，避免用户把这个数当成全部花费。
   const anyUnpriced = rows.some((r) => r.costNano == null);
 
+  // ---- 收起态：一颗球 ----
+  //
+  // 外层**必须透明且不占满**：窗口是方的（虽然设了 transparent），
+  // 若外层给背景色就会露出方形。故背景只画在那颗 `rounded-full` 的球上。
+  if (!expanded) {
+    return (
+      <div
+        className="flex h-screen w-full items-center justify-center bg-transparent"
+        onMouseEnter={expand}
+      >
+        {/* 球本体。`data-tauri-drag-region` 让整颗球都能拖 ——
+            无边框窗没有标题栏，少了它用户就没法挪动。 */}
+        <div
+          data-tauri-drag-region
+          className="relative flex h-14 w-14 cursor-move select-none items-center justify-center rounded-full border border-border bg-surface/95 shadow-lg backdrop-blur"
+        >
+          {/* 图标与角标都 pointer-events-none：让鼠标事件落到下面的拖动层，
+              否则拖到图标上就拖不动了。 */}
+          <img
+            src="/app-icon.png"
+            alt="SynaRoute"
+            className="pointer-events-none h-6 w-6 rounded"
+          />
+          {/* 运行数角标：这是收起态唯一的信息，故一定要能一眼看清。
+              0 个在跑时用灰色，不用绿色 —— 绿点会被读成「正常运行中」。 */}
+          <span
+            className={`pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold tabular-nums ${
+              runningCount > 0
+                ? "bg-success text-white"
+                : "bg-surface-hover text-text-muted ring-1 ring-border"
+            }`}
+          >
+            {runningCount}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- 展开态：原来那张明细面板 ----
   return (
     // 用主题语义色而非硬编码深色：主窗口支持浅/深色主题，
     // 悬浮窗写死深色会在浅色主题下显得像另一个程序的窗口。
-    <div className="relative h-screen w-full select-none overflow-hidden rounded-xl border border-border bg-surface/95 backdrop-blur">
+    <div
+      className="relative h-screen w-full select-none overflow-hidden rounded-xl border border-border bg-surface/95 backdrop-blur"
+      onMouseEnter={expand}
+      onMouseLeave={collapse}
+    >
       {/* 可拖动区域（铺满整窗）。无边框窗没有标题栏，
           少了 data-tauri-drag-region 用户就没法挪动它。 */}
       <div data-tauri-drag-region className="absolute inset-0 cursor-move" />

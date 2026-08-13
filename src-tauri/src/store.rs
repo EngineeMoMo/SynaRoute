@@ -2160,6 +2160,19 @@ impl Store {
         })
     }
 
+    /// 悬浮球置顶开关的专用写入（后端自管字段）。与 `set_floating_widget_flag` 同一套语义：
+    /// 幂等跳过、落盘失败按磁盘对账回滚。
+    pub fn set_floating_pinned_flag(&self, pinned: bool) -> AppResult<()> {
+        self.mutate_and_persist_if(|cfg| {
+            if cfg.settings.floating_widget_always_on_top == pinned {
+                false
+            } else {
+                cfg.settings.floating_widget_always_on_top = pinned;
+                true
+            }
+        })
+    }
+
     /// 「上次运行时哪些分类的代理在跑」的快照（后端自管字段）。
     ///
     /// 由 `service::snapshot_running_proxies` 周期性 + 退出时写入，
