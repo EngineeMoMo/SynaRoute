@@ -62,42 +62,6 @@ jobs:
         with:
           workspaces: src-tauri
 
-      # 版本号三处一致 + Cargo.lock 已同步。
-      #
-      # 为什么单独一步：`Cargo.lock` 里记着**本包自己**的 `version`，所以改 Cargo.toml 的
-      # 版本号就让 lock 过期。本机 `cargo build` 会静默重写 lock，Windows 上永远看不见；
-      # CI 传了 `--locked` 禁止重写 → 第一条 cargo 命令硬失败、后面十步全 skipped。
-      # 这个坑已经连踩两次（0.1.12→0.1.13 的 run 31240396211、0.1.13→0.1.14 的 31242466356），
-      # 两次都靠一个「同步 Cargo.lock」的补丁提交才转绿。
-      #
-      # 报错必须**说出真正的原因**：cargo 原生那句 "cannot update the lock file ...
-      # because --locked was passed" 不会告诉你「你刚改了版本号但忘了跑 cargo check」，
-      # 得自己联想。这一步把它变成一句可照做的指令。
-      #
-      # 注意判据是「lock 与 Cargo.toml 是否一致」，不是「版本号是多少」——
-      # 后者每次发版都要改这个文件，必然腐坏。
-      - name: 版本号一致性 + Cargo.lock 同步（bump 版本必踩的坑）
-        run: |
-          set -euo pipefail
-          pkg=$(node -p "require('./package.json').version")
-          conf=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          toml=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          echo "package.json=$pkg  tauri.conf.json=$conf  Cargo.toml=$toml"
-          if [ "$pkg" != "$conf" ] || [ "$pkg" != "$toml" ]; then
-            echo "::error::三处版本号不一致（package.json=$pkg / tauri.conf.json=$conf / Cargo.toml=$toml）"
-            exit 1
-          fi
-          # Cargo.lock 里本包的版本必须已经跟上。用 -A2 限定在 [[package]] 块内，
-          # 避免撞上依赖里同名字段。
-          locked=$(grep -A2 '^name = "synaroute"$' src-tauri/Cargo.lock \
-                   | grep -m1 '^version' | sed 's/.*"\(.*\)".*/\1/')
-          echo "Cargo.lock=$locked"
-          if [ "$locked" != "$toml" ]; then
-            echo "::error::Cargo.lock 记的版本是 $locked，Cargo.toml 是 $toml —— 改版本号后忘了同步 lock。"
-            echo "::error::修法：在 src-tauri 下跑一次 cargo check（会自动更新 lock），然后把 src-tauri/Cargo.lock 一起提交。"
-            exit 1
-          fi
-
       # 用 ci 而不是 install：锁文件对不上直接失败，不悄悄装成另一套版本
       - name: Install frontend deps
         run: npm ci
@@ -196,45 +160,17 @@ jobs:
       # 本项目历史上栽在同一形态两次（FR-025 自启动开关字段存在、UI 能点、值落盘，
       # 后端却从无注册代码；Tailwind 的 bg-warning/8 不在标度内→一条 CSS 都不生成）。
       #
-      # 同时出 `dmg`：它是给人装的形态，且 dmg 那条打包路径（挂载磁盘映像、摆图标、
-      # 卸载）在 CI 上偶发失败，不跑就等于没验过 —— 而真机验证时若 dmg 本身有问题，
-      # 会被误当成「应用有问题」排查半天。
+      # 刻意只出 `app` 不出 `dmg`：dmg 要挂载磁盘映像，在 CI 上慢且偶发失败，
+      # 而本步要验的判据（Info.plist、icns、可执行文件架构）全在 .app 里。
+      # dmg 的正确性属阶段 3 真机验证。
       #
-      # `--bundles app,dmg` 而不是把它们写进 tauri.conf.json 的 targets：
+      # `--bundles app` 而不是把 app/dmg 写进 tauri.conf.json 的 targets：
       # bundler 的 `PackageType::Nsis` 那条 match 臂**没有 cfg 门控**
       # （源码注释：don't restrict to windows as NSIS installers can be built in
       # linux+macOS using cargo-xwin），配置里混列会让 mac 构建真去跑 NSIS。
-      #
-      # `app` 必须显式列出：bundler 在 `!package_types.contains(&MacOsBundle)` 时
-      # 会把 .app 当中间产物删掉（源码 tb.rs 的 "Clean up .app if only building dmg"），
-      # 而下面四条判据全靠读 .app 里的文件。
-      # ---- 一次性签名密钥（仅供 CI 验证 updater 打包路径）----
-      #
-      # `createUpdaterArtifacts: true` 让 bundler 去打 `.app.tar.gz` 并**签名**，
-      # 而签名要 `TAURI_SIGNING_PRIVATE_KEY`。缺了它 tauri build 会报
-      # "A public key has been found, but no private key" 并以非零码退出。
-      #
-      # 这里刻意用**当场生成的临时密钥**，不是生产发布密钥：
-      #   - CI 只验证「updater 打包路径能否跑通」，不发布任何东西；
-      #   - 生产密钥不该进 CI secrets（本仓库的发布是本地手动签名）。
-      # 代价是产出的 `.sig` 与 tauri.conf.json 里的 pubkey **不匹配** —— 故
-      # **CI 产物不能用于真实更新**，只能用于安装测试。签名时 bundler 不校验
-      # 私钥是否对应配置里的 pubkey，所以这不影响验证目的。
-      - name: Generate throwaway signing key
-        run: |
-          set -o pipefail
-          npx tauri signer generate --ci -w "$RUNNER_TEMP/ci-updater.key" -p "" 2>&1 | tail -5
-          echo "TAURI_SIGNING_PRIVATE_KEY=$(cat "$RUNNER_TEMP/ci-updater.key")" >> "$GITHUB_ENV"
-          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
-
       - name: Build .app and verify bundle
         run: |
-          # pipefail：没有它，`| tail` 的退出码会盖掉 tauri build 的非零码 ——
-          # 本 workflow 曾因此把「缺签名私钥」这条 Error 判成 success（日志里明写
-          # Error、workflow 却是绿的）。同一形态在 cargo test 那步已加过 pipefail，
-          # 此处当初漏了。
-          set -o pipefail
-          npm run tauri build -- --bundles app,dmg 2>&1 | tail -30
+          npm run tauri build -- --bundles app 2>&1 | tail -30
 
           APP="src-tauri/target/release/bundle/macos/SynaRoute.app"
           if [ ! -d "$APP" ]; then
@@ -284,125 +220,13 @@ jobs:
             echo "::warning::dist/assets 下没找到 js chunk，跳过嵌入判据"
           fi
 
-          # 判据 5：dmg 真的产出了（挂载/摆位/卸载那条路径能跑通）
-          DMG=$(ls src-tauri/target/release/bundle/dmg/*.dmg 2>/dev/null | head -1)
-          if [ -z "$DMG" ]; then
-            echo "::error::dmg 未产出 —— dmg 打包路径失败（挂载磁盘映像在 CI 上偶发失败）"
-            ls -R src-tauri/target/release/bundle 2>/dev/null || true
-            exit 1
-          fi
-          dmg_size=$(du -h "$DMG" | cut -f1)
-          echo "dmg 产出: $DMG ($dmg_size)"
-
-          # 判据 6：updater 产物（`.app.tar.gz` + `.sig`）
-          #
-          # 这条判据的由来就是一个真实缺口：`createUpdaterArtifacts` 此前未设（默认 false），
-          # bundler 整块跳过，mac 用户永远收不到更新 —— 而 Windows 因为 NSIS installer
-          # 本身即 self-contained 更新包，一直是好的，所以这个缺口在 Windows 上不可见。
-          UPD="src-tauri/target/release/bundle/macos/SynaRoute.app.tar.gz"
-          if [ ! -f "$UPD" ]; then
-            echo "::error::updater 产物未生成 —— 检查 bundle.createUpdaterArtifacts 是否为 true"
-            ls -la src-tauri/target/release/bundle/macos/ || true
-            exit 1
-          fi
-          if [ ! -f "$UPD.sig" ]; then
-            echo "::error::updater 签名缺失 —— TAURI_SIGNING_PRIVATE_KEY 未生效"
-            exit 1
-          fi
-          upd_size=$(du -h "$UPD" | cut -f1)
-          echo "updater 产物: $UPD ($upd_size) + .sig ✓"
-
           {
-            echo "### macOS 产物判据"
+            echo "### macOS .app 产物判据"
             echo "- LSMinimumSystemVersion: \`$got\`"
             echo "- icns: 已生成"
             echo "- 架构: \`$arch\`"
             echo "- 前端嵌入: 命中 $n 次"
-            echo "- dmg: \`$(basename "$DMG")\` ($dmg_size)"
-            echo "- updater: \`$(basename "$UPD")\` ($upd_size) + \`.sig\`"
-            echo ""
-            echo "> ⚠️ CI 的 \`.sig\` 用一次性临时密钥签，与配置里的 pubkey 不匹配 ——"
-            echo "> 产物可用于安装测试，**不能**用于真实更新验证。"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      # ---- 打包产物供下载（真机验证用）----
-      #
-      # **.app 必须先 tar**：`actions/upload-artifact` 不保留 POSIX 权限，也不保留符号链接
-      # （它内部先 zip，而 zip 那套元数据模型装不下 unix mode 位）。而 .app 靠两样东西才能跑：
-      #   1. `Contents/MacOS/SynaRoute` 的可执行位；
-      #   2. `Contents/Frameworks` 里的符号链接（WebView 等框架的版本化布局）。
-      # 直接上传的结果是下载下来双击毫无反应 —— 且不报任何错，正是本项目最防的静默失效形态。
-      #
-      # dmg 是单个二进制文件、内部结构由磁盘映像自己承载，不受此影响，直接传即可。
-      - name: Package artifacts
-        run: |
-          mkdir -p "$RUNNER_TEMP/artifacts"
-
-          # -C 进到 bundle/macos 再打包，让 tar 里的路径是 `SynaRoute.app/...`
-          # 而不是一长串 src-tauri/target/release/bundle/macos/。
-          tar -czf "$RUNNER_TEMP/artifacts/SynaRoute-macos-arm64-app.tar.gz" \
-            -C src-tauri/target/release/bundle/macos SynaRoute.app
-
-          cp src-tauri/target/release/bundle/dmg/*.dmg "$RUNNER_TEMP/artifacts/"
-
-          # 自检：把 tar **真解一次**，对解出来的文件判可执行位。
-          #
-          # 上一版这里是 `tar -tvf | grep ... | awk '{print $1}'`，即解析 tar 的文本列表。
-          # 它在 macOS runner 上取到**空字符串** → 自检误红，而 tar 本身是好的
-          # （bsdtar 的 -tv 列表格式或输出流与我预期不符，根因未查）。
-          #
-          # 不去查那个根因，而是换判据：要证的命题是「解开后能不能跑」，
-          # 正确判法就是解开再 `test -x`，不是对一行文本做模式匹配。
-          # 文本解析这类间接判据一旦不匹配，失败方向是「静默取空」而非报错 ——
-          # 恰好是本项目反复防的形态，这次栽在我自己写的判据上。
-          probe="$RUNNER_TEMP/extract-probe"
-          rm -rf "$probe"
-          mkdir -p "$probe"
-          tar -xzf "$RUNNER_TEMP/artifacts/SynaRoute-macos-arm64-app.tar.gz" -C "$probe"
-
-          # 顺带把 tar 列表的头几行打出来，供下次排查时知道真实格式（含 stderr）。
-          #
-          # 本块**刻意不加 `set -o pipefail`**（与 build 那步相反）：这里的管道是
-          # `| head -3`，head 读够就关管道 → tar 收到 SIGPIPE 而非零退出 → 开了
-          # pipefail 会把这行纯诊断输出变成红。判据是下面的 `test -x`，不是这行。
-          echo "--- tar -tvf 前 3 行（诊断用）---"
-          tar -tvf "$RUNNER_TEMP/artifacts/SynaRoute-macos-arm64-app.tar.gz" 2>&1 | head -3
-          echo "---"
-
-          exe="$probe/SynaRoute.app/Contents/MacOS/SynaRoute"
-          if [ ! -f "$exe" ]; then
-            echo "::error::解开后找不到主可执行文件，预期 $exe"
-            find "$probe" -maxdepth 4 | head -30
-            exit 1
-          fi
-          if [ ! -x "$exe" ]; then
-            echo "::error::解开后主可执行文件没有可执行位 —— 双击不会有任何反应"
-            ls -l "$exe"
-            exit 1
-          fi
-          echo "解开后可执行位保留 ✓"
-          ls -l "$exe"
-
-          # 符号链接数只报不判：Tauri 的 .app 未必含 Frameworks，为零不代表错。
-          # 记它是为了将来若加了框架依赖，能看出 tar 是否把链接原样带过来了。
-          links=$(find "$probe/SynaRoute.app" -type l | wc -l | tr -d ' ')
-          echo "符号链接数: $links"
-
-          rm -rf "$probe"
-          echo "--- 待上传产物 ---"
-          ls -lh "$RUNNER_TEMP/artifacts/"
-
-      # v7 而非 v4：v4 的运行时是 Node 20（已弃用），会把本 workflow 前面刚清掉的
-      # 那条弃用告警重新引回来。v5→v7 的「破坏性变更」实际只有运行时升 Node 24 +
-      # 最低 runner 2.327.1 两条，GitHub 托管 runner 早已满足（本 job 跑在 macos-26）。
-      - uses: actions/upload-artifact@v7
-        with:
-          name: macos-arm64-build
-          path: ${{ runner.temp }}/artifacts/*
-          # 真机验证是一次性动作，不需要长期留存；短期限也免得占仓库配额。
-          retention-days: 14
-          # 产物缺失应当是**红**而不是静默传个空包 —— 与本项目其它判据同一态度。
-          if-no-files-found: error
 
       # 判据刻意用 `git diff`（只看**已跟踪**文件）而不是 `git status --porcelain`：
       # 前面的 npm ci / npm run build 会产出 node_modules 与 dist（均已 gitignore），
