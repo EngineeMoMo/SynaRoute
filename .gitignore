@@ -50,3 +50,5 @@ site/.shots-review/
 # 若把它提交进仓库，就会出现「仓库里的 latest.json 指向旧签名、Release 上的是新的」
 # 两份真相，而错的那份表现为用户更新时验签失败 —— v0.1.14 正是这么翻的车。
 /latest.json
+*.key
+*.key.pub
