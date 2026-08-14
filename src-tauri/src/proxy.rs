@@ -908,7 +908,9 @@ async fn handle_request(
                     last_status = Some(status);
                     log_request(&store, key, elapsed, url, real_model, downstream_body.clone(), body, Some(status), false);
                     // 429/5xx 临时错误只切、不罚（不熔断好 Key）；4xx 硬错误才计入熔断。
-                    if status_counts_against_breaker(status) {
+                    // **带路径判**：辅助端点（count_tokens）的 404 是「上游没实现该端点」，
+                    // 与 Key 无关，不得据此熔断（见 failure_counts_against_breaker）。
+                    if failure_counts_against_breaker(status, &path) {
                         health::record_live_failure(&store, &key.id);
                     }
                     log_failover(
@@ -1025,7 +1027,9 @@ async fn handle_request(
                     false,
                 );
                 // 429/5xx 临时错误只切、不罚（不熔断好 Key）；4xx 硬错误才计入熔断。
-                if status_counts_against_breaker(outcome.status) {
+                // **带路径判**：辅助端点（count_tokens）的 404 是「上游没实现该端点」，
+                // 与 Key 无关，不得据此熔断（见 failure_counts_against_breaker）。
+                if failure_counts_against_breaker(status, &path) {
                     health::record_live_failure(&store, &key.id);
                 }
                 log_failover(
@@ -2126,8 +2130,48 @@ fn is_stripped_header(name: &str) -> bool {
 /// 仍然计入熔断的是**确定属于这个 Key** 的故障：
 /// 401/403 鉴权失败（密钥错/被封）、404 端点或模型不存在——换 Key 才有意义，
 /// 重试同一个只是白试，连续几次后熔断掉它，避免每个请求都从它开始。
+///
+/// ⚠️ **404 要配合 [`path_is_auxiliary_endpoint`] 一起判**，别单看状态码。见
+/// [`failure_counts_against_breaker`]。
 fn status_counts_against_breaker(status: u16) -> bool {
     !matches!(status, 400 | 429 | 500 | 502 | 503 | 504 | 529)
+}
+
+/// **辅助端点**（非补全）：上游不实现它是常态，不该据此判定 Key 坏了。
+///
+/// 目前只有 token 计数一个。它是 Anthropic 官方 API 的辅助端点，
+/// 而**绝大多数中转站不实现**（实测返回 `404 Invalid URL (POST /v1/messages/count_tokens)`）。
+///
+/// 与 [`path_takes_sampling_params`] 的判据刻意一致（都是「路径含 count_tokens」），
+/// 但语义不同、故不复用同一个函数：那个回答「该注入采样参数吗」，
+/// 这个回答「失败了该罚 Key 吗」。将来若两者的名单分叉（例如新增一个
+/// 「要注参数但不算辅助」的端点），共用一个函数会让改动波及到不相干的那条判据。
+fn path_is_auxiliary_endpoint(path: &str) -> bool {
+    path.contains("count_tokens")
+}
+
+/// 本次失败是否该计入熔断（惩罚该 Key）。**状态码与请求路径一起判。**
+///
+/// 为什么必须带上路径（2026-08-14 真机复盘）：客户端除了发对话，还会发
+/// `POST /v1/messages/count_tokens` 做 token 计数，而中转站普遍不实现该端点 → 404。
+/// 旧实现只看状态码，于是每一次 token 计数都会：
+///
+/// 1. 打上游 → 404 → `record_live_failure` 给该 Key 累加 fail_count；
+/// 2. 切下一个候选 → 同样 404（**所有**中转站都不实现它）；
+/// 3. 遍历完全池 → 报「全部 Key 失败」并武装短路窗口；
+/// 4. 连续几次后**整池 Key 全部熔断** → 「所有 Key 均在熔断窗口内」。
+///
+/// 而这些 Key 转发真实对话完全正常 —— 真机日志里同一个 Key 在 404 前后各有一条
+/// 「成功返回」。用户视角就是「Key 明明能用，界面却说熔断、说无 Key 可用」。
+///
+/// 判据的本质：熔断要回答的是「**这个 Key** 还能不能服务」。辅助端点的 404 回答的是
+/// 「**这个端点**上游没实现」——与用哪个 Key 无关，换任何 Key 都同样 404，
+/// 与 400「请求不合法」属同一类，故同样只切不罚。
+fn failure_counts_against_breaker(status: u16, path: &str) -> bool {
+    if path_is_auxiliary_endpoint(path) {
+        return false;
+    }
+    status_counts_against_breaker(status)
 }
 
 /// 是否为「无内容探测请求」：消息载荷为空**且**未解析出任何模型名。
@@ -2360,6 +2404,55 @@ mod tests {
         // 确定属于该 Key 的故障：鉴权失败 / 端点或模型不存在 → 计入熔断。
         for s in [401u16, 403, 404, 422] {
             assert!(status_counts_against_breaker(s), "HTTP {s} 应计入熔断");
+        }
+    }
+
+    /// 辅助端点（token 计数）的失败**绝不能**计入熔断。
+    ///
+    /// 真机复盘（2026-08-14）：客户端每做一次 token 计数就发
+    /// `POST /v1/messages/count_tokens`，而中转站普遍不实现它 → 404。旧实现只看状态码，
+    /// 于是每次计数都把**整池 Key** 逐个刷上 fail_count、遍历完报「全部 Key 失败」，
+    /// 几次之后所有 Key 熔断 → 界面显示「无 Key 可用」，而同一批 Key 转发真实对话完全正常
+    /// （日志里 404 前后各有一条「成功返回」）。
+    ///
+    /// 判据的本质：熔断回答「这个 **Key** 还能不能服务」，而辅助端点的 404 回答的是
+    /// 「这个 **端点** 上游没实现」——换任何 Key 都同样 404。
+    #[test]
+    fn auxiliary_endpoint_404_never_penalizes_the_key() {
+        // 各端真实发出的 token 计数路径（含带 query 的形态）。
+        for p in ["/v1/messages/count_tokens", "/v1/messages/count_tokens?beta=true"] {
+            assert!(path_is_auxiliary_endpoint(p), "{p:?} 应被识别为辅助端点");
+            // 404 是这条路径的常态（上游没实现），绝不能罚 Key。
+            assert!(
+                !failure_counts_against_breaker(404, p),
+                "{p:?} 的 404 是「上游没实现该端点」，不得计入熔断"
+            );
+            // 连鉴权失败也不罚：辅助端点整体不作为 Key 健康度的判据，
+            // 否则「上游对该端点单独鉴权」之类的实现差异又会把好 Key 刷红。
+            assert!(
+                !failure_counts_against_breaker(401, p),
+                "辅助端点的任何失败都不该作为 Key 健康度判据"
+            );
+        }
+
+        // 反面：补全端点的 404（模型真的不存在）**仍要**计入熔断，
+        // 否则这个修复就把原本正确的那条判据也一起废掉了。
+        for p in ["/v1/messages", "/v1/chat/completions", "/v1/responses"] {
+            assert!(!path_is_auxiliary_endpoint(p), "{p:?} 是补全端点，不是辅助端点");
+            assert!(
+                failure_counts_against_breaker(404, p),
+                "{p:?} 的 404 表示模型/端点真的不存在，仍应计入熔断"
+            );
+        }
+
+        // 临时性状态码在两类路径上都不罚（原有语义不变）。
+        for p in ["/v1/messages", "/v1/messages/count_tokens"] {
+            for s in [429u16, 500, 502, 503, 504, 529, 400] {
+                assert!(
+                    !failure_counts_against_breaker(s, p),
+                    "HTTP {s} 在 {p:?} 上不应计入熔断"
+                );
+            }
         }
         // 日志动词按**真实状态码**分类：一个模糊的「限流」会把三种不同根因盖住。
         // 真机反例：一次会话 400×16 + 5xx×11、429 零次，旧写法全标成「限流/繁忙」，

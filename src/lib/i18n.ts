@@ -93,7 +93,7 @@ const zh: Dict = {
   "balance.probe": "测试查询",
   "balance.probing": "查询中…",
   "balance.probeOk": "查询成功：剩余 {amount} {unit}",
-  "balance.probeNeedSave": "请先保存这条 Key，再测试查询（查询要用已落盘的密钥与配置）。",
+  "balance.probeNeedSecret": "请先填写 API 密钥，再测试查询（余额查询要拿密钥去打上游）。",
   "balance.keyInactive": "注意：上游报告该密钥当前不可用（is_active=false）。",
   "balance.multiplier": "计费倍率（选填）",
   "balance.multiplierHint":
@@ -867,8 +867,8 @@ const en: Dict = {
   "balance.probe": "Test query",
   "balance.probing": "Querying…",
   "balance.probeOk": "Success: {amount} {unit} remaining",
-  "balance.probeNeedSave":
-    "Save this key first, then test — the query uses the persisted secret and config.",
+  "balance.probeNeedSecret":
+    "Enter the API key first — the balance query needs it to call the provider.",
   "balance.keyInactive": "Note: the provider reports this key as inactive (is_active=false).",
   "balance.multiplier": "Cost multiplier (optional)",
   "balance.multiplierHint":

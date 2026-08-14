@@ -327,33 +327,45 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
    * 从配置读 balanceQuery —— 都是已落盘的数据。若不保存就查，用户在表单里刚改的
    * URL 根本不会生效，测出来的是旧配置的结果，「改完一测还是错」会让人以为改动无效。
    *
-   * 新建且尚未保存过的 Key 直接拒绝并说明原因，而不是静默失败。
+   * **新建的 Key 也能直接测**（2026-08-14 修）：`upsert_key` 会回填后端生成的 uuid
+   * 并随返回值给回，拿到它就能接着查 —— 不必要求用户先点一次「保存」再回来点「测试查询」。
+   * 旧实现在 `initial?.id` 为空时直接拒绝，而那正是「新建 Key 时想验证余额配置」
+   * 这个最需要它的场景（真机反馈：用户以为功能坏了）。
+   *
+   * 唯一仍需拦的是「连密钥都还没填」：余额查询要拿密钥去打上游，没密钥必然失败，
+   * 与其让上游回一个 401 让用户猜，不如就地说清楚。
    */
   const probeBalance = async () => {
-    if (!initial?.id) {
+    // 没有可用密钥（既没有已落盘的、也没在表单里填）→ 就地说明，别去打一次注定 401 的上游。
+    if (!secret && !initial?.hasSecret) {
       setBalanceProbe({
         ok: false,
         queriedAt: Date.now(),
-        error: t("balance.probeNeedSave"),
+        error: t("balance.probeNeedSecret"),
       });
       return;
     }
     setProbing(true);
     setBalanceProbe(null);
     try {
-      // 先把当前表单落盘，否则测的是旧配置（见上方注释）
+      // 先把当前表单落盘，否则测的是旧配置（见上方注释）。
+      // **用返回值里的 id**：新建时 draft.id 是空串，真正的 uuid 由后端生成并回填。
       const draft = buildDraftKey();
-      await api.upsertKey(draft);
-      if (secret) await api.saveSecret(initial.id, secret);
+      const saved = await api.upsertKey(draft);
+      const keyId = saved.id;
+      if (secret) await api.saveSecret(keyId, secret);
       // force=true 跳过缓存，确保「测试查询」总是查询上游最新值
-      const result = await api.queryKeyBalance(initial.id, true);
+      const result = await api.queryKeyBalance(keyId, true);
       setBalanceProbe(result);
       // 同一结果直接写进卡片的余额缓存。
       //
-      // 指纹用**刚落盘的草稿**算（不是 `initial`）：那才是产出本结果的配置，
+      // 指纹用**刚落盘的那条**算（`saved` 而非 `draft`/`initial`）：那才是产出本结果的配置，
       // 也正是卡片重新渲染后会算出的指纹 —— 两者一致，卡片才会判成缓存有效而不再发一次
-      // 一模一样的请求。用 initial 算就会差一个指纹，每点一次测试查询白发两个请求。
-      setBalanceResult(initial.id, balanceFingerprint(draft), result);
+      // 一模一样的请求。用 draft 算会在新建时差一个 id、指纹对不上，白发两个请求。
+      setBalanceResult(keyId, balanceFingerprint(saved), result);
+      // 新建的 Key 已经落盘了，把编辑器的「初始态」对齐过去。否则用户接着点「保存」
+      // 会因为 draft.id 仍是空串而**再插一条**，表现为「测了一次余额就多出一条 Key」。
+      onSaved?.(saved);
     } catch (e) {
       setBalanceProbe({
         ok: false,

@@ -356,10 +356,39 @@ pub async fn query_balance(
     match serde_json::from_str::<Value>(&text) {
         Ok(v) => extract_balance(&v, cfg.remaining_path.as_deref()),
         Err(e) => {
+            // HTML 响应单独给一条**可照做**的提示，不要只丢一句「不是合法 JSON」。
+            //
+            // 拿到 HTML 意味着这个 URL 是个**网页**而不是 API —— 十有八九是路径填错、
+            // 打到了站点首页或登录页。而原来的文案把 `<!doctype html>` 直接糊在错误里，
+            // 用户看到的是一堆 `<meta charset=...>`，完全不知道该改哪里
+            // （真机反馈：用户以为是程序坏了）。
+            if looks_like_html(&text) {
+                return BalanceResult::failed(format!(
+                    "该地址返回的是网页而不是 API 数据（{url}）。\
+                     通常是查询地址填错了：\n\
+                     • 确认站点的余额接口路径（常见为 /user/balance、/api/user/self、/v1/dashboard/billing/subscription）\n\
+                     • baseUrl 带路径后缀时（如 …/anthropic）请把模板里的 {{{{baseUrl}}}} 换成 {{{{origin}}}}\n\
+                     • 站点若只有网页版账单、没有开放接口，则无法查询余额"
+                ));
+            }
             let snippet: String = text.chars().take(200).collect();
             BalanceResult::failed(format!("响应不是合法 JSON（{e}）: {snippet}"))
         }
     }
+}
+
+/// 响应体是否是 HTML 而非 JSON。
+///
+/// 判据刻意宽松（前 200 字符里出现任一 HTML 起始标记即算）：这里只用来**换一条更好的
+/// 错误文案**，判错的代价仅是提示措辞略偏，而判据严格反而会让「带 BOM / 前置空行 /
+/// 以注释开头」的真实 HTML 漏出去、退回那句没用的「不是合法 JSON」。
+fn looks_like_html(body: &str) -> bool {
+    let head = body.trim_start().chars().take(200).collect::<String>().to_ascii_lowercase();
+    head.starts_with("<!doctype")
+        || head.starts_with("<html")
+        || head.starts_with("<head")
+        || head.starts_with("<?xml")
+        || head.contains("<meta charset")
 }
 
 #[cfg(test)]
