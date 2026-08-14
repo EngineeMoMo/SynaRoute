@@ -345,7 +345,8 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
       const draft = buildDraftKey();
       await api.upsertKey(draft);
       if (secret) await api.saveSecret(initial.id, secret);
-      const result = await api.queryKeyBalance(initial.id);
+      // force=true 跳过缓存，确保「测试查询」总是查询上游最新值
+      const result = await api.queryKeyBalance(initial.id, true);
       setBalanceProbe(result);
       // 同一结果直接写进卡片的余额缓存。
       //

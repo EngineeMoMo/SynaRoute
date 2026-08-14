@@ -9,6 +9,36 @@ use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// 检查 baseUrl 是否含路径后缀（如 `https://api.deepseek.com/anthropic` 中的 `/anthropic`）。
+///
+/// DeepSeek 等部分厂商的 baseUrl 会带路径后缀，此时用 `{{baseUrl}}/user/balance` 会拼出
+/// `.../anthropic/user/balance` → 404。应改用 `{{origin}}/user/balance` 剥掉路径部分。
+pub fn base_url_has_path_suffix(base_url: &str) -> bool {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // 尝试解析为 URL
+    if let Ok(url) = url::Url::parse(trimmed) {
+        // 检查路径是否非空且不只是 "/"
+        let path = url.path();
+        return !path.is_empty() && path != "/";
+    }
+
+    // 不是有效 URL，则检查是否含 "://" 后跟域名再跟 "/"（如 "https://example.com/path"）
+    if let Some(after_scheme) = trimmed.split("://").nth(1) {
+        // 找到第一个 '/' 的位置（域名结束）
+        if let Some(first_slash) = after_scheme.find('/') {
+            // 如果 '/' 后还有内容（不只是结尾的 '/'），说明有路径后缀
+            let after_slash = &after_scheme[first_slash + 1..];
+            return !after_slash.is_empty();
+        }
+    }
+
+    false
+}
+
 pub struct Store {
     config_path: PathBuf,
     config: RwLock<AppConfig>,
@@ -313,11 +343,26 @@ impl Store {
 
         // 迁移：老配置的内置厂商没有 preset_models 字段（serde default 给空 vec），
         // 从种子按 id 回填，让老用户也能用「一键导入预设模型」。仅补空、不覆盖用户已有数据。
-        let migrated = if !seeded {
+        let migrated_presets = if !seeded {
             Self::backfill_builtin_presets(&mut config.vendors)
         } else {
             false
         };
+
+        // 迁移：根据配置版本号执行必要的数据迁移
+        let mut needs_persist = seeded || migrated_presets;
+
+        // 版本迁移：v1 → v2（余额查询 URL 修正）
+        if config.config_version < 2 {
+            let migrated = Self::migrate_balance_query_url(&mut config.keys);
+            if migrated {
+                tracing::info!("配置迁移：v1 → v2（余额查询 URL 从 /v1/usage 改为 /user/balance）");
+                config.config_version = 2;
+                needs_persist = true;
+            }
+        }
+
+        // 后续版本迁移在此追加（如 config.config_version < 3 时的逻辑）
 
         let secrets = SecretStore::load(secrets_path)?;
 
@@ -352,7 +397,7 @@ impl Store {
         };
         // P1 防数据销毁：仅在「全新安装(文件不存在)首次 seed」或「成功加载后的迁移」时落盘。
         // load_failed(文件存在但解析失败)时绝不 persist——否则空配置会覆盖磁盘上的原有数据。
-        if (seeded || migrated) && !load_failed {
+        if needs_persist && !load_failed {
             store.persist()?;
         }
         Ok(store)
@@ -371,6 +416,61 @@ impl Store {
                 if !s.preset_models.is_empty() {
                     v.preset_models = s.preset_models.clone();
                     changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+
+    /// 迁移余额查询 URL：将旧的错误默认值 `/v1/usage` 改为正确的 `/user/balance`。
+    ///
+    /// **安全条件（两条都必须满足才改，否则会冲掉用户手填的地址）**：
+    /// 1. `url` **恰好等于**已知错误的旧默认值 `{{baseUrl}}/v1/usage`
+    /// 2. `template` 仍是 `"generic"`（说明用户从没动过它）
+    ///
+    /// 迁移后额外检查：若 baseUrl 本身含路径后缀（如 DeepSeek 的 `.../anthropic`），
+    /// 则 `{{baseUrl}}/user/balance` 会拼出错误路径，发出告警提示用 `{{origin}}`。
+    ///
+    /// 返回是否有改动（用于决定是否落盘）。
+    fn migrate_balance_query_url(keys: &mut [ProviderKey]) -> bool {
+        const OLD_WRONG_URL: &str = "{{baseUrl}}/v1/usage";
+        const NEW_CORRECT_URL: &str = "{{baseUrl}}/user/balance";
+
+        let mut changed = false;
+        for key in keys.iter_mut() {
+            if let Some(ref mut bq) = key.balance_query {
+                // 两条安全判据：恰好是旧默认值 && 仍是 generic 模板
+                if bq.url == OLD_WRONG_URL && bq.template == "generic" {
+                    tracing::info!(
+                        "迁移余额查询 URL：Key={} 从 {} 改为 {}",
+                        key.id,
+                        OLD_WRONG_URL,
+                        NEW_CORRECT_URL
+                    );
+                    bq.url = NEW_CORRECT_URL.into();
+                    changed = true;
+
+                    // 检查 baseUrl 是否含路径后缀（如 DeepSeek 的 /anthropic）。
+                    // {{baseUrl}}/user/balance 会拼出 .../anthropic/user/balance → 404。
+                    // 此时应改用 {{origin}}/user/balance 剥掉路径部分。
+                    // 这里只告警，不自动改——用户可能有其他理由带路径，
+                    // 且 {{origin}} 的含义需要用户知晓才能正确填写后续路径。
+                    let effective_base = bq
+                        .base_url_override
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or(&key.base_url);
+
+                    if base_url_has_path_suffix(effective_base) {
+                        tracing::warn!(
+                            "Key={} 的 baseUrl 含路径后缀（{}），余额查询 URL \
+                             已迁移为 {{{{baseUrl}}}}/user/balance，但实际会拼出错误路径。\
+                             建议在 KeyEditor 中改为 {{{{origin}}}}/user/balance",
+                            key.id,
+                            effective_base
+                        );
+                    }
                 }
             }
         }
@@ -1815,6 +1915,54 @@ impl Store {
         Ok(())
     }
 
+    /// 更新某 Key 的余额查询缓存（查询成功或失败后调用）。
+    ///
+    /// 纯内存操作、不落盘（`cached_balance` 字段带 `#[serde(skip)]`）。
+    /// 重启后缓存自然清空，下次查询时重新拉取是合理的。
+    pub fn update_balance_cache(&self, key_id: &str, result: BalanceResult) -> AppResult<()> {
+        let mut cfg = self.config.write();
+        if let Some(k) = cfg.keys.iter_mut().find(|k| k.id == key_id) {
+            k.cached_balance = Some(result);
+            // cached_balance 标记为 #[serde(skip)]，不会序列化到磁盘。
+            // 重启后缓存自然清空是合理的（避免使用过期数据）。
+            // 删除 persist() 调用：它不会序列化 cached_balance，纯属无效 I/O。
+        }
+        Ok(())
+    }
+
+    /// 获取某 Key 的余额缓存（如果存在且未过期）。
+    ///
+    /// 返回 `Some(result)` 表示缓存命中且未过期，调用方可直接使用；
+    /// 返回 `None` 表示无缓存或已过期，需要重新查询上游。
+    ///
+    /// 缓存有效期：与 `auto_interval_min` 对齐（用户配置的自动查询间隔即为缓存时长）；
+    /// 若未配置自动查询（`auto_interval_min == 0`），则缓存 5 分钟（避免短时间内重复查询）。
+    pub fn get_balance_cache(&self, key_id: &str) -> Option<BalanceResult> {
+        let cfg = self.config.read();
+        let key = cfg.keys.iter().find(|k| k.id == key_id)?;
+        let cached = key.cached_balance.as_ref()?;
+
+        // 计算缓存有效期（秒）
+        let cache_duration_secs = if let Some(bq) = &key.balance_query {
+            if bq.auto_interval_min > 0 {
+                (bq.auto_interval_min as i64) * 60
+            } else {
+                5 * 60 // 默认 5 分钟
+            }
+        } else {
+            5 * 60
+        };
+
+        // 检查是否过期
+        let now = chrono::Utc::now().timestamp_millis();
+        let age_secs = (now - cached.queried_at) / 1000;
+        if age_secs < cache_duration_secs {
+            Some(cached.clone())
+        } else {
+            None // 已过期
+        }
+    }
+
     /// 更新某 Key 的模型列表（拉取模型后调用）
     pub fn set_models(&self, key_id: &str, models: Vec<ModelInfo>) -> AppResult<()> {
         // 失败回滚：落盘失败不让内存领先磁盘（见 mutate_and_persist）。
@@ -2592,6 +2740,7 @@ mod tests {
             tier_sonnet: None,
             tier_opus: None,
             balance_query: None,
+            cached_balance: None,
             cost_multiplier: None,
             health: HealthState::default(),
         }
@@ -4914,5 +5063,126 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 迁移：余额查询 URL 从旧的错误默认值改为正确值，仅当恰好是旧默认值 && 仍是 generic 模板时。
+    #[test]
+    fn migrate_balance_query_url_only_fixes_known_wrong_default() {
+        let mut keys = vec![
+            // 场景 1：恰好是旧默认值 + generic 模板 → 应被迁移
+            ProviderKey {
+                id: "k1".into(),
+                category_id: CategoryType::ClaudeCli,
+                name: "旧配置用户".into(),
+                balance_query: Some(BalanceQuery {
+                    enabled: true,
+                    template: "generic".into(),
+                    url: "{{baseUrl}}/v1/usage".into(), // 旧错误默认值
+                    ..Default::default()
+                }),
+                ..sample_key("k1", 0)
+            },
+            // 场景 2：URL 是旧默认值，但 template 已改 → 不动（用户可能在自定义模板里刻意用这个路径）
+            ProviderKey {
+                id: "k2".into(),
+                category_id: CategoryType::ClaudeCli,
+                name: "自定义模板".into(),
+                balance_query: Some(BalanceQuery {
+                    enabled: true,
+                    template: "my-custom".into(),
+                    url: "{{baseUrl}}/v1/usage".into(),
+                    ..Default::default()
+                }),
+                ..sample_key("k2", 1)
+            },
+            // 场景 3：generic 模板，但 URL 已手动改过 → 不动
+            ProviderKey {
+                id: "k3".into(),
+                category_id: CategoryType::ClaudeCli,
+                name: "手动改过URL".into(),
+                balance_query: Some(BalanceQuery {
+                    enabled: true,
+                    template: "generic".into(),
+                    url: "{{baseUrl}}/api/balance".into(), // 用户手填的
+                    ..Default::default()
+                }),
+                ..sample_key("k3", 2)
+            },
+            // 场景 4：已经是新默认值 → 不动（幂等）
+            ProviderKey {
+                id: "k4".into(),
+                category_id: CategoryType::ClaudeCli,
+                name: "新版本新建".into(),
+                balance_query: Some(BalanceQuery {
+                    enabled: true,
+                    template: "generic".into(),
+                    url: "{{baseUrl}}/user/balance".into(),
+                    ..Default::default()
+                }),
+                ..sample_key("k4", 3)
+            },
+            // 场景 5：没配余额查询 → 不动
+            ProviderKey {
+                id: "k5".into(),
+                category_id: CategoryType::ClaudeCli,
+                name: "未配余额".into(),
+                balance_query: None,
+                ..sample_key("k5", 4)
+            },
+        ];
+
+        let changed = Store::migrate_balance_query_url(&mut keys);
+        assert!(changed, "k1 应被迁移，返回 true");
+
+        // k1 应被改为新默认值
+        assert_eq!(
+            keys[0].balance_query.as_ref().unwrap().url,
+            "{{baseUrl}}/user/balance",
+            "k1（旧默认值+generic）应被迁移"
+        );
+
+        // k2~k5 都不应被改动
+        assert_eq!(
+            keys[1].balance_query.as_ref().unwrap().url,
+            "{{baseUrl}}/v1/usage",
+            "k2（自定义模板）不应被改"
+        );
+        assert_eq!(
+            keys[2].balance_query.as_ref().unwrap().url,
+            "{{baseUrl}}/api/balance",
+            "k3（手动改过的URL）不应被改"
+        );
+        assert_eq!(
+            keys[3].balance_query.as_ref().unwrap().url,
+            "{{baseUrl}}/user/balance",
+            "k4（已是新默认值）保持不变"
+        );
+        assert!(keys[4].balance_query.is_none(), "k5（无配置）保持 None");
+
+        // 幂等性：再跑一次不应有改动
+        let changed_again = Store::migrate_balance_query_url(&mut keys);
+        assert!(!changed_again, "第二次迁移应返回 false（幂等）");
+    }
+
+    #[test]
+    fn base_url_has_path_suffix_detects_trailing_paths() {
+        // 纯域名或带端口 → 无路径后缀
+        assert!(!base_url_has_path_suffix("https://api.anthropic.com"));
+        assert!(!base_url_has_path_suffix("https://api.deepseek.com"));
+        assert!(!base_url_has_path_suffix("http://localhost:8080"));
+        assert!(!base_url_has_path_suffix("https://example.com:443"));
+
+        // 带路径后缀 → 检测到
+        assert!(base_url_has_path_suffix("https://api.deepseek.com/anthropic"));
+        assert!(base_url_has_path_suffix("https://api.example.com/v1"));
+        assert!(base_url_has_path_suffix("http://localhost:8080/api"));
+
+        // 只有根路径 `/` → 视为无后缀（等同于没有路径）
+        assert!(!base_url_has_path_suffix("https://api.anthropic.com/"));
+
+        // 无效 URL → false（防御性返回）
+        assert!(!base_url_has_path_suffix("not-a-url"));
+        assert!(!base_url_has_path_suffix(""));
+        assert!(!base_url_has_path_suffix("ftp://unsupported.com"));
     }
 }

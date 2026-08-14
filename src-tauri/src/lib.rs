@@ -35,7 +35,9 @@ mod workdirs;
 use error::AppResult;
 use mcp::McpManager;
 use model::*;
+use parking_lot::Mutex;
 use proxy::ProxyManager;
+use std::collections::HashSet;
 use std::sync::Arc;
 use store::Store;
 use tauri::Manager;
@@ -45,6 +47,8 @@ pub struct AppState {
     store: Arc<Store>,
     proxy: Arc<ProxyManager>,
     mcp: Arc<McpManager>,
+    /// 正在查询余额的 Key ID 集合（并发控制，防止同一 Key 被重复查询）
+    balance_queries_in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
 // ============ 配置管理命令 ============
@@ -265,33 +269,142 @@ async fn check_health(state: tauri::State<'_, AppState>, key_id: String) -> AppR
 /// 卡片上就地显示原因（方案 §2.1「失败必须可见」）。
 ///
 /// 真正的 `Err` 只留给「Key 不存在」这种调用方用错了的情况。
+///
+/// # 参数
+/// - `force`: 为 `true` 时跳过缓存检查，强制查询上游（编辑器「测试查询」按钮使用）
 #[tauri::command]
 async fn query_key_balance(
     state: tauri::State<'_, AppState>,
     key_id: String,
+    force: Option<bool>,
 ) -> AppResult<crate::model::BalanceResult> {
+    let force = force.unwrap_or(false);
+
+    // 先检查缓存：未过期直接返回，避免短时间内重复查询上游
+    // force=true 时跳过缓存检查（编辑器「测试查询」需要立即看到新值）
+    if !force {
+        if let Some(cached) = state.store.get_balance_cache(&key_id) {
+            tracing::debug!(
+                "余额缓存命中: key={} remaining={:?} age={}s",
+                key_id,
+                cached.remaining,
+                (chrono::Utc::now().timestamp_millis() - cached.queried_at) / 1000
+            );
+            return Ok(cached);
+        }
+    }
+
+    // 并发控制：如果该 Key 正在被查询，直接拒绝
+    {
+        let mut in_flight = state.balance_queries_in_flight.lock();
+        if in_flight.contains(&key_id) {
+            tracing::debug!("余额查询已在进行中，拒绝重复请求: key={}", key_id);
+            return Ok(crate::model::BalanceResult::failed(
+                "该 Key 的余额查询正在进行中，请稍候",
+            ));
+        }
+        in_flight.insert(key_id.clone());
+    }
+
+    // 使用 scopeguard 确保无论成功或失败都移除标记
+    let key_id_for_guard = key_id.clone();
+    let in_flight_clone = state.balance_queries_in_flight.clone();
+    let _guard = scopeguard::guard((), move |_| {
+        in_flight_clone.lock().remove(&key_id_for_guard);
+    });
+
     let Some(key) = state.store.get_key(&key_id) else {
         return Err(crate::error::AppError::NotFound(key_id));
     };
     let Some(cfg) = key.balance_query.clone() else {
-        return Ok(crate::model::BalanceResult::failed("该 Key 未配置余额查询"));
+        let reason = "该 Key 未配置余额查询";
+        state.store.append_event(
+            key.category_id,
+            "余额",
+            Some(&key_id),
+            &format!("查询失败：{}", reason),
+        );
+        return Ok(crate::model::BalanceResult::failed(reason));
     };
 
     // 主口令锁定时取不到密钥：如实说明是「锁着」，不是「余额接口坏了」。
     if state.store.secrets.read().is_locked() {
-        return Ok(crate::model::BalanceResult::failed(
-            "密钥库已锁定，请先用主口令解锁",
-        ));
+        let reason = "密钥库已锁定，请先用主口令解锁";
+        state.store.append_event(
+            key.category_id,
+            "余额",
+            Some(&key_id),
+            &format!("查询失败：{}", reason),
+        );
+        return Ok(crate::model::BalanceResult::failed(reason));
     }
 
     // 允许用另一条密钥查余额（部分站点的计费面板与转发端点不同域、各用各的凭证）。
     let secret_key = cfg.api_key_ref.as_deref().unwrap_or(&key_id);
     let secret = state.store.secrets.read().get(secret_key).ok().flatten();
     let Some(secret) = secret else {
-        return Ok(crate::model::BalanceResult::failed("未配置密钥"));
+        let reason = "未配置密钥";
+        state.store.append_event(
+            key.category_id,
+            "余额",
+            Some(&key_id),
+            &format!("查询失败：{}", reason),
+        );
+        return Ok(crate::model::BalanceResult::failed(reason));
     };
 
-    Ok(crate::balance::query_balance(&key, &cfg, &secret).await)
+    // 记录请求开始时间，用于计算响应时长
+    let start = std::time::Instant::now();
+
+    // 执行查询并记录结果
+    let result = crate::balance::query_balance(&key, &cfg, &secret).await;
+
+    let elapsed_ms = start.elapsed().as_millis();
+
+    // 构造请求 URL（用于日志诊断）
+    let base = cfg
+        .base_url_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&key.base_url);
+    let access_token = cfg.access_token.as_deref().unwrap_or("");
+    let user_id = cfg.user_id.as_deref().unwrap_or("");
+    // 脱敏：只显示协议+域名+路径，隐藏 apiKey/accessToken 等敏感参数
+    let url_for_log = crate::balance::expand_placeholders(&cfg.url, base, "***", access_token, user_id);
+
+    // 记录查询结果到运行日志（成功与失败都记，满足「失败必须可见」原则）
+    // 格式：状态 | 耗时 | URL | 详情
+    let detail = if let Some(ref err) = result.error {
+        format!("❌ 查询失败 | {}ms | {} | {}", elapsed_ms, url_for_log, err)
+    } else if let Some(remaining) = result.remaining {
+        format!(
+            "✅ 查询成功 | {}ms | {} | 余额 {} {}{}{}",
+            elapsed_ms,
+            url_for_log,
+            remaining,
+            result.unit.as_deref().unwrap_or("USD"),
+            result.total.map(|t| format!(" / 总额 {}", t)).unwrap_or_default(),
+            if result.is_valid == Some(false) { " · 已失效" } else { "" }
+        )
+    } else {
+        format!("⚠️ 查询成功但未取到余额值 | {}ms | {}", elapsed_ms, url_for_log)
+    };
+
+    state.store.append_event(
+        key.category_id,
+        "余额",
+        Some(&key_id),
+        &detail,
+    );
+
+    // 更新缓存（成功和失败都缓存，避免对失败端点短时间内重复轰炸）
+    // 缓存写入失败只记日志，不阻止查询结果返回（缓存是优化手段，不是核心目标）
+    if let Err(e) = state.store.update_balance_cache(&key_id, result.clone()) {
+        tracing::warn!("余额缓存写入失败（key={}, 不影响本次查询）: {}", key_id, e);
+    }
+
+    Ok(result)
 }
 
 // ============ 大脑聚合命令 ============
@@ -1339,7 +1452,12 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![AUTOSTART_FLAG]),
         ))
-        .manage(AppState { store, proxy, mcp })
+        .manage(AppState {
+            store,
+            proxy,
+            mcp,
+            balance_queries_in_flight: Arc::new(Mutex::new(HashSet::new())),
+        })
         .setup(|app| {
             build_tray(app.handle())?;
             // 状态推送（UX#5）。必须在这里装 —— Store/ProxyManager/后台探测线程都在

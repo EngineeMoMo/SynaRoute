@@ -232,9 +232,12 @@ export const api = {
    * **失败不抛异常**：查不到时返回 `{ok: false, error: "原因"}`，
    * 调用方直接把 `error` 显示在卡片上。余额查不到是常态（站点没这接口、
    * 路径填错、网络抖动），用异常表达会让一次抖动炸掉整个面板。
+   *
+   * @param keyId - Key ID
+   * @param force - 为 true 时跳过缓存检查，强制查询上游（编辑器「测试查询」按钮使用）
    */
-  queryKeyBalance: (keyId: string) =>
-    call<BalanceResult>("query_key_balance", { keyId }, () => mockBridge.queryBalance(keyId)),
+  queryKeyBalance: (keyId: string, force?: boolean) =>
+    call<BalanceResult>("query_key_balance", { keyId, force }, () => mockBridge.queryBalance(keyId)),
 
   /**
    * 上面那份累计量的**起算时刻**（epoch ms）。
