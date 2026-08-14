@@ -25,7 +25,7 @@
  * - 组件需极致轻量：不加载完整路由、不依赖大型状态树。
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
 import type { ProxyState, CategoryType, UsageCostRow } from "@/types";
@@ -71,6 +71,32 @@ export function FloatingWidget() {
       void api.setFloatingExpanded(false);
     }, 260);
   };
+
+  // 点击球体打开主窗口（区分点击和拖动）
+  const [dragStartPos, setDragStartPos] = useState<{ x: number; y: number } | null>(null);
+
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    setDragStartPos({ x: e.clientX, y: e.clientY });
+  }, []);
+
+  const handleMouseUp = useCallback(
+    (e: React.MouseEvent) => {
+      if (!dragStartPos) return;
+
+      // 计算鼠标移动距离
+      const dx = e.clientX - dragStartPos.x;
+      const dy = e.clientY - dragStartPos.y;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+
+      // 移动距离小于 5px 视为点击（而非拖动）
+      if (distance < 5) {
+        void api.showMainWindow();
+      }
+
+      setDragStartPos(null);
+    },
+    [dragStartPos],
+  );
 
   // 卸载时清掉待执行的收起，避免它在组件没了之后再打一次 IPC
   useEffect(() => () => clearTimeout(collapseTimer.current), []);
@@ -137,10 +163,13 @@ export function FloatingWidget() {
         onMouseEnter={expand}
       >
         {/* 球本体。`data-tauri-drag-region` 让整颗球都能拖 ——
-            无边框窗没有标题栏，少了它用户就没法挪动。 */}
+            无边框窗没有标题栏，少了它用户就没法挪动。
+            onMouseDown/Up 用于区分点击和拖动：移动距离小于5px = 点击打开主窗口。 */}
         <div
           data-tauri-drag-region
-          className="relative flex h-14 w-14 cursor-move select-none items-center justify-center rounded-full border border-border bg-surface/95 shadow-lg backdrop-blur"
+          onMouseDown={handleMouseDown}
+          onMouseUp={handleMouseUp}
+          className="relative flex h-14 w-14 cursor-pointer select-none items-center justify-center rounded-full border border-border bg-surface/95 shadow-lg backdrop-blur"
         >
           {/* 图标与角标都 pointer-events-none：让鼠标事件落到下面的拖动层，
               否则拖到图标上就拖不动了。 */}

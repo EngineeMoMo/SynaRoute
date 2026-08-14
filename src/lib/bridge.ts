@@ -319,6 +319,12 @@ export const api = {
   setFloatingExpanded: (expanded: boolean) =>
     call<void>("set_floating_expanded", { expanded }, async () => {}),
 
+  /**
+   * 显示并聚焦主窗口（从悬浮球/托盘恢复）。
+   * 主窗口回到前台后，悬浮球会自动隐藏。
+   */
+  showMainWindow: () => call<void>("show_main_window_cmd", {}, async () => {}),
+
   // ---- 首启向导（UX#1）----
   // 浏览器预览刻意返回 shouldShow=true，好让预览模式能验证向导布局
   // （与 UpdateBanner 不加 isTauri 守卫同一惯例）。

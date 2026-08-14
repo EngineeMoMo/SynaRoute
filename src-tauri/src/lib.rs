@@ -1603,6 +1603,7 @@ pub fn run() {
             set_floating_widget,
             set_floating_pinned,
             set_floating_expanded,
+            show_main_window_cmd,
             recent_failure,
             get_event_trace,
             get_settings,
@@ -2104,7 +2105,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// 显示并聚焦主窗口（从托盘恢复）
+/// 显示并聚焦主窗口（从托盘/悬浮球恢复）
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -2122,6 +2123,12 @@ fn show_main_window(app: &tauri::AppHandle) {
             s.floating_widget_always_on_top,
         );
     }
+}
+
+/// Tauri 命令：显示主窗口（供悬浮球点击调用）
+#[tauri::command]
+fn show_main_window_cmd(app: tauri::AppHandle) {
+    show_main_window(&app);
 }
 
 /// 解析 `proxy::<分类>` / `primary::<分类>::<keyId>` 里的分类段。
