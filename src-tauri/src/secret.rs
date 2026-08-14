@@ -662,32 +662,15 @@ const KEYCHAIN_ACCOUNT: &str = "vault-key";
 /// 不能永久缓存）。这版用 Mutex 只串行化**首次成功初始化**，锁内二次检查避免等待者重复调用。
 /// 抽成平台无关函数，使 Windows CI 也能用并发测试钉住 macOS 的初始化算法。
 #[cfg(any(target_os = "macos", test))]
-fn cached_or_try_init_copy<T: Copy, E>(
-    cache: &std::sync::OnceLock<T>,
-    init_lock: &std::sync::Mutex<()>,
-    init: impl FnOnce() -> Result<T, E>,
-) -> Result<T, E> {
-    if let Some(v) = cache.get() {
-        return Ok(*v);
-    }
-    let _guard = init_lock.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(v) = cache.get() {
-        return Ok(*v);
-    }
-    let fresh = init()?;
-    match cache.set(fresh) {
-        Ok(()) => Ok(fresh),
-        // 持锁且二次检查后理论上不可达；若未来调用方式变化，仍只返回缓存权威值，
-        // 绝不把一份未缓存的分叉值交给调用方。
-        Err(_) => Ok(*cache.get().expect("缓存 set 失败时应已有权威值")),
-    }
-}
-
 #[cfg(target_os = "macos")]
 fn keychain_vault_key() -> AppResult<[u8; 32]> {
     static CACHED: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    static INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    cached_or_try_init_copy(&CACHED, &INIT_LOCK, keychain_fetch_or_create)
+    if let Some(k) = CACHED.get() {
+        return Ok(*k);
+    }
+    let key = keychain_fetch_or_create()?;
+    let _ = CACHED.set(key);
+    Ok(key)
 }
 
 /// 实际与 Keychain 打交道的那一半（供 [`keychain_vault_key`] 缓存调用）。
@@ -1025,59 +1008,6 @@ mod tests {
                 "17 是 Unix 的 EEXIST —— 若这里等于 17，说明有人把平台门控改回了硬编码"
             );
         }
-    }
-
-    /// macOS Keychain 缓存初始化的核心并发不变量：无论多少线程同时首访，
-    /// 初始化函数只能成功执行一次，所有调用方必须拿到**同一个**值。
-    ///
-    /// 去掉 `INIT_LOCK` 或锁内二次检查，这条会出现 calls > 1；旧实现进一步会让调用方
-    /// 拿到不同值，导致同一个 secrets.enc 被两把密钥混写、重启后部分条目永久解不开。
-    #[test]
-    fn cached_or_try_init_copy_converges_under_concurrency() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::{Arc, Barrier, Mutex, OnceLock};
-
-        let cache = Arc::new(OnceLock::<u64>::new());
-        let lock = Arc::new(Mutex::new(()));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let barrier = Arc::new(Barrier::new(32));
-
-        let threads: Vec<_> = (0..32)
-            .map(|_| {
-                let cache = Arc::clone(&cache);
-                let lock = Arc::clone(&lock);
-                let calls = Arc::clone(&calls);
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    cached_or_try_init_copy(&cache, &lock, || -> Result<u64, ()> {
-                        let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
-                        // 放大竞态窗口，确保其余 31 个线程都越过第一次 cache.get()。
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        Ok(n as u64)
-                    })
-                    .unwrap()
-                })
-            })
-            .collect();
-
-        let values: Vec<u64> = threads.into_iter().map(|t| t.join().unwrap()).collect();
-        assert!(values.iter().all(|v| *v == 1), "所有线程必须收敛到第一把密钥: {values:?}");
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "初始化函数只能执行一次");
-        assert_eq!(cache.get().copied(), Some(1));
-    }
-
-    /// 初始化失败不能缓存：用户第一次拒绝 Keychain 后，稍后授权并重试必须还能成功。
-    #[test]
-    fn cached_or_try_init_copy_does_not_cache_failure() {
-        use std::sync::{Mutex, OnceLock};
-        let cache = OnceLock::<u64>::new();
-        let lock = Mutex::new(());
-
-        assert_eq!(cached_or_try_init_copy(&cache, &lock, || Err::<u64, _>("拒绝")), Err("拒绝"));
-        assert!(cache.get().is_none(), "失败不得污染缓存");
-        assert_eq!(cached_or_try_init_copy(&cache, &lock, || Ok::<u64, &str>(42)), Ok(42));
-        assert_eq!(cache.get().copied(), Some(42));
     }
 
     /// P2-6：DPAPI 解密缓存的**全部失效点**。
