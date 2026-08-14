@@ -501,7 +501,7 @@ pub struct BalanceQuery {
 impl Default for BalanceQuery {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,  // 对齐 cc-switch：默认启用余额查询（用户添加 Key 后即可查询）
             template: "generic".into(),
             // 与 cc-switch 通用模板**逐字一致**（其文档 §2.5：`url: "{{baseUrl}}/user/balance"`）。
             //
