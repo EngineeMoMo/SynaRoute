@@ -375,6 +375,7 @@ mod tests {
             tier_sonnet: None,
             tier_opus: None,
             balance_query: None,
+            cached_balance: None,
             cost_multiplier: None,
             health: HealthState::default(),
         };
@@ -388,7 +389,7 @@ mod tests {
             )
             .unwrap();
 
-        store.secrets.write().enable_master_password("pw").unwrap();
+        store.secrets.write().enable_master_password("TestPass123").unwrap();
         store.secrets.write().lock();
 
         check_one(&store, "k1").await;
@@ -488,6 +489,7 @@ mod tests {
                     tier_sonnet: None,
                     tier_opus: None,
                     balance_query: None,
+                    cached_balance: None,
                     cost_multiplier: None,
                     health: HealthState::default(),
                 })
@@ -557,6 +559,7 @@ mod tests {
                 tier_sonnet: None,
                 tier_opus: None,
                 balance_query: None,
+                cached_balance: None,
                 cost_multiplier: None,
                 health,
             }
@@ -642,6 +645,7 @@ mod tests {
                 tier_sonnet: None,
                 tier_opus: None,
                 balance_query: None,
+                cached_balance: None,
                 cost_multiplier: None,
                 health: HealthState::default(),
             })
@@ -770,6 +774,7 @@ mod tests {
             tier_sonnet: None,
             tier_opus: None,
             balance_query: None,
+            cached_balance: None,
             cost_multiplier: None,
             health: HealthState::default(),
         }

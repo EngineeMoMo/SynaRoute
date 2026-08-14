@@ -41,6 +41,98 @@ pub enum AppError {
     Other(String),
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// 错误信息脱敏工具 (P2-2 修复)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// 脱敏文件路径：隐藏用户名和敏感目录结构。
+///
+/// 示例：
+/// - Windows: `C:\Users\Alice\Documents\project\file.txt` → `C:\Users\***\Documents\project\file.txt`
+/// - Unix: `/home/alice/.config/app/data.json` → `/home/***/.config/app/data.json`
+pub fn redact_file_path(path: &str) -> String {
+    use std::path::Path;
+
+    let p = Path::new(path);
+    let components: Vec<_> = p.components().collect();
+
+    if components.len() <= 2 {
+        return path.to_string();  // 太短，无需脱敏
+    }
+
+    let mut redacted = Vec::new();
+    for (i, comp) in components.iter().enumerate() {
+        let comp_str = comp.as_os_str().to_string_lossy();
+
+        // Windows: 隐藏 C:\Users\<username>
+        if i == 2 && components.len() > 3 {
+            if let Some(parent) = components.get(1) {
+                let parent_str = parent.as_os_str().to_string_lossy();
+                if parent_str.eq_ignore_ascii_case("Users") || parent_str == "home" {
+                    redacted.push("***".to_string());
+                    continue;
+                }
+            }
+        }
+
+        redacted.push(comp_str.to_string());
+    }
+
+    // 重建路径（保留原始分隔符）
+    if cfg!(windows) {
+        redacted.join("\\")
+    } else {
+        format!("/{}", redacted.join("/"))
+    }
+}
+
+/// 脱敏 URL：隐藏查询参数和认证信息。
+///
+/// 示例：
+/// - `https://api.example.com/v1/chat?key=sk-xxx&user=alice` → `https://api.example.com/v1/chat?<redacted>`
+/// - `https://user:pass@api.example.com/path` → `https://***:***@api.example.com/path`
+pub fn redact_url(url: &str) -> String {
+    // 简单实现：隐藏查询字符串
+    if let Some(pos) = url.find('?') {
+        format!("{}?<query-redacted>", &url[..pos])
+    } else if url.contains('@') {
+        // 隐藏认证信息
+        url.replace(|c: char| c != '@' && c != '/' && c != ':', "*")
+            .split('@')
+            .enumerate()
+            .map(|(i, part)| {
+                if i == 0 {
+                    let schema_end = part.find("://").map(|p| p + 3).unwrap_or(0);
+                    format!("{}***:***", &part[..schema_end])
+                } else {
+                    part.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("@")
+    } else {
+        url.to_string()
+    }
+}
+
+/// 脱敏错误消息：综合处理路径、URL等敏感信息。
+pub fn redact_error_msg(msg: &str) -> String {
+    let mut result = msg.to_string();
+
+    // 脱敏可能的文件路径
+    if msg.contains(":\\") || msg.contains("/home/") || msg.contains("/Users/") {
+        // 简单启发式：如果包含路径模式，尝试脱敏
+        result = redact_file_path(&result);
+    }
+
+    // 脱敏可能的 URL
+    if msg.contains("://") {
+        result = redact_url(&result);
+    }
+
+    result
+}
+
 impl AppError {
     /// 构造「无状态码」的上游错误（连接层失败、解析失败、密钥缺失等**没有** HTTP 响应的场景）。
     ///

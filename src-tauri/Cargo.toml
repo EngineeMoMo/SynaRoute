@@ -77,6 +77,10 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 parking_lot = "0.12"
+# URL 解析（用于检测 baseUrl 是否含路径后缀），已在依赖树（reqwest → url）
+url = "2"
+# 作用域守卫：确保即使提前返回也执行清理代码（用于余额查询并发控制的标记清理）
+scopeguard = "1"
 
 [target.'cfg(windows)'.dependencies]
 # Windows DPAPI 免口令加密

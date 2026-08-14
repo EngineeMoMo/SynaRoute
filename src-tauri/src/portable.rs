@@ -552,6 +552,7 @@ mod tests {
             tier_sonnet: None,
             tier_opus: None,
             balance_query: None,
+            cached_balance: None,
             cost_multiplier: None,
             health: HealthState::default(),
         }
@@ -693,7 +694,7 @@ mod tests {
 
         let dst = store_at(&dst_dir);
         dst.upsert_key(key("local", "本机原有")).unwrap();
-        dst.secrets.write().enable_master_password("master").unwrap();
+        dst.secrets.write().enable_master_password("TestPass123").unwrap();
         dst.secrets.write().lock();
         assert!(dst.secrets.read().is_locked(), "前置条件：锁定态");
 

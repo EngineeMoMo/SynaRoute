@@ -196,10 +196,12 @@ pub(crate) async fn set_proxy_port(
 
 /// 保存（新增/更新）一条 Key。
 ///
-/// 唯一的编排是**先校验再落盘**：桌面端不合规的对外模型名必须在源头拦下，
-/// 见 [`reject_desktop_key_with_unusable_model_names`]。
+/// 校验项：
+/// 1. 桌面端不合规的对外模型名必须在源头拦下（见 [`reject_desktop_key_with_unusable_model_names`]）
+/// 2. 检查 baseUrl 路径后缀 + 余额查询配置的组合问题（见 [`warn_base_url_path_suffix_if_needed`]）
 pub(crate) fn save_key(store: &Store, key: ProviderKey) -> AppResult<ProviderKey> {
     reject_desktop_key_with_unusable_model_names(&key)?;
+    warn_base_url_path_suffix_if_needed(store, &key);
     store.upsert_key(key)
 }
 
@@ -409,6 +411,49 @@ fn merge_context_windows(names: Vec<String>, previous: &[ModelInfo]) -> Vec<Mode
 }
 
 // ==== 桌面端模型名校验 ====
+
+/// 检查 baseUrl 路径后缀与余额查询配置的组合，必要时发出告警。
+///
+/// **为什么不拦截而只告警**：baseUrl 带路径（如 DeepSeek 的 `https://api.deepseek.com/anthropic`）
+/// 本身是合法配置，转发、模型探测都能正常工作。问题只出现在用户**同时**配置了余额查询
+/// 且使用 `{{baseUrl}}` 模板变量时——此时会拼出 `.../anthropic/user/balance` → 404。
+/// 这是个「配置组合问题」而非「单项错误」，且有简单修法（改用 `{{origin}}`），
+/// 故只告警、不强制拦截（拦截会让用户无法保存 DeepSeek 等正常工作的 Key）。
+///
+/// 告警条件（**两条都满足才告警**）：
+/// 1. baseUrl 含路径后缀（如 `/anthropic`）
+/// 2. 已配置余额查询且 `url` 字段含 `{{baseUrl}}`
+///
+/// 不告警的情况（即使 baseUrl 有后缀）：
+/// - 未配置余额查询（`balance_query` 为 None）
+/// - 余额查询 URL 用的是 `{{origin}}` 而非 `{{baseUrl}}`（用户已经避开了这个坑）
+fn warn_base_url_path_suffix_if_needed(store: &Store, key: &ProviderKey) {
+    // 取有效 baseUrl：优先用 balance_query.base_url_override，回退到 key.base_url
+    let effective_base = key
+        .balance_query
+        .as_ref()
+        .and_then(|bq| bq.base_url_override.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&key.base_url);
+
+    // 条件 1：baseUrl 含路径后缀
+    if !crate::store::base_url_has_path_suffix(effective_base) {
+        return;
+    }
+
+    // 条件 2：已配置余额查询且 url 含 {{baseUrl}}
+    if let Some(ref bq) = key.balance_query {
+        if bq.url.contains("{{baseUrl}}") {
+            let msg = format!(
+                "Key「{}」的 baseUrl 含路径后缀（{}），余额查询 URL 使用 {{{{baseUrl}}}} 会拼出错误路径。\
+                 建议在 KeyEditor 中将余额查询 URL 改为 {{{{origin}}}}/user/balance",
+                key.name, effective_base
+            );
+            tracing::warn!("{}", msg);
+            store.append_event(key.category_id, "warning", Some(&key.id), &msg);
+        }
+    }
+}
 
 /// 桌面端 Key 的**对外模型名**必须是 Claude 桌面端会接受的形态，否则拒绝落盘。
 ///
@@ -1532,6 +1577,7 @@ mod tests {
             tier_sonnet: None,
             tier_opus: None,
             balance_query: None,
+            cached_balance: None,
             cost_multiplier: None,
             health: HealthState::default(),
         }

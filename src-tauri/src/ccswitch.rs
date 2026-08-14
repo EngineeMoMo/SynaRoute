@@ -476,6 +476,7 @@ fn import_rows(
             tier_sonnet: None,
             tier_opus: None,
             balance_query: None,
+            cached_balance: None,
             cost_multiplier: None,
             health: Default::default(),
         };

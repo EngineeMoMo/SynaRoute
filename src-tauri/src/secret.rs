@@ -315,9 +315,39 @@ impl SecretStore {
         if self.is_master_mode() {
             return Err(AppError::Invalid("已处于主口令模式，无需重复启用".into()));
         }
+
+        // 主口令强度验证：防止弱口令如 "123456"、"password"
         if password.is_empty() {
             return Err(AppError::Invalid("主口令不能为空".into()));
         }
+        if password.len() < 8 {
+            return Err(AppError::Invalid(
+                "主口令长度至少 8 个字符。当前长度不足，无法提供足够的安全强度。".into()
+            ));
+        }
+
+        // 基本复杂度检查：至少包含字母和数字
+        let has_letter = password.chars().any(|c| c.is_alphabetic());
+        let has_digit = password.chars().any(|c| c.is_numeric());
+        if !has_letter || !has_digit {
+            return Err(AppError::Invalid(
+                "主口令强度不足：必须同时包含字母和数字。\n\
+                 建议使用大小写字母、数字和特殊符号的组合，长度 12 位以上。".into()
+            ));
+        }
+
+        // 常见弱口令黑名单
+        const WEAK_PASSWORDS: &[&str] = &[
+            "12345678", "password", "admin123", "qwerty123",
+            "abc12345", "password123", "123456789", "iloveyou",
+        ];
+        let password_lower = password.to_lowercase();
+        if WEAK_PASSWORDS.iter().any(|&weak| password_lower.contains(weak)) {
+            return Err(AppError::Invalid(
+                "检测到常见弱口令模式，已拒绝。请使用更复杂的口令组合。".into()
+            ));
+        }
+
         if self.load_failed {
             // 降级态下 entries 是空的（读盘失败），此时迁移等于「把用户的密钥全丢掉再
             // 声称已加密」。必须拒绝，让用户先解决读盘问题。
@@ -1057,10 +1087,10 @@ mod tests {
         s.enable_master_password("pw-123456").unwrap();
         assert!(!s.is_cached("k3"), "启用主口令（整库重写）必须清缓存");
 
-        s.change_master_password("pw-123456", "pw-abcdef").unwrap();
+        s.change_master_password("pw-123456", "TestAbc123").unwrap();
         assert!(!s.is_cached("k3"), "改主口令（整库重写）必须清缓存");
 
-        s.disable_master_password("pw-abcdef").unwrap();
+        s.disable_master_password("TestAbc123").unwrap();
         assert!(!s.is_cached("k3"), "关闭主口令（整库重写）必须清缓存");
         // 迁移往返后值必须完好
         assert_eq!(
@@ -1178,7 +1208,7 @@ mod tests {
         store.set("k2", "sk-two").unwrap();
         assert!(!store.is_master_mode(), "默认必须是 DPAPI 模式");
 
-        let migrated = store.enable_master_password("correct horse battery").unwrap();
+        let migrated = store.enable_master_password("CorrectHorse123").unwrap();
         assert_eq!(migrated, 2, "两条既有密钥都要迁移，漏一条就是永久丢失");
         assert!(store.is_master_mode());
         assert!(!store.is_locked(), "启用后应处于已解锁态（刚输过口令）");
@@ -1196,7 +1226,7 @@ mod tests {
         assert!(reopened.is_master_mode());
         assert!(reopened.is_locked(), "新进程必须重新解锁");
         assert!(reopened.get("k1").is_err(), "锁定态取密钥必须报错而非返回 None");
-        reopened.unlock("correct horse battery").unwrap();
+        reopened.unlock("CorrectHorse123").unwrap();
         assert_eq!(reopened.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-one"));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1213,7 +1243,7 @@ mod tests {
         let path = dir.join("secrets.enc");
         let mut store = SecretStore::load(path.clone()).unwrap();
         store.set("k1", "sk-x").unwrap();
-        store.enable_master_password("pw").unwrap();
+        store.enable_master_password("TestPass123").unwrap();
         drop(store);
 
         let store = SecretStore::load(path).unwrap();
@@ -1232,7 +1262,7 @@ mod tests {
         let dir = temp_dir("master_locked_write");
         let path = dir.join("secrets.enc");
         let mut store = SecretStore::load(path.clone()).unwrap();
-        store.enable_master_password("pw").unwrap();
+        store.enable_master_password("TestPass123").unwrap();
         drop(store);
 
         let mut store = SecretStore::load(path.clone()).unwrap();
@@ -1252,10 +1282,10 @@ mod tests {
         let path = dir.join("secrets.enc");
         let mut store = SecretStore::load(path).unwrap();
         store.set("k1", "sk-x").unwrap();
-        store.enable_master_password("right-pw").unwrap();
+        store.enable_master_password("RightPass123").unwrap();
         assert!(!store.is_locked());
 
-        let err = store.unlock("wrong-pw").unwrap_err().to_string();
+        let err = store.unlock("WrongPass999").unwrap_err().to_string();
         assert!(err.contains("主口令错误"), "{err}");
         assert!(!store.is_locked(), "输错口令不该把已解锁的库锁回去");
         assert_eq!(store.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-x"), "仍应可读");
@@ -1270,12 +1300,12 @@ mod tests {
         let dir = temp_dir("master_empty");
         let path = dir.join("secrets.enc");
         let mut store = SecretStore::load(path.clone()).unwrap();
-        assert_eq!(store.enable_master_password("pw-empty").unwrap(), 0, "空库迁移 0 条");
+        assert_eq!(store.enable_master_password("EmptyTest123").unwrap(), 0, "空库迁移 0 条");
         drop(store);
 
         let mut store = SecretStore::load(path).unwrap();
-        assert!(store.unlock("not-it").is_err(), "空库也必须能识别错口令");
-        assert!(store.unlock("pw-empty").is_ok());
+        assert!(store.unlock("NotItWrong99").is_err(), "空库也必须能识别错口令");
+        assert!(store.unlock("EmptyTest123").is_ok());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1287,13 +1317,13 @@ mod tests {
         let path = dir.join("secrets.enc");
         let mut store = SecretStore::load(path.clone()).unwrap();
         store.set("k1", "sk-one").unwrap();
-        store.enable_master_password("pw").unwrap();
+        store.enable_master_password("TestPass123").unwrap();
 
         // 错口令不得关闭（防止有人趁已解锁的机器直接撤掉保护）。
-        assert!(store.disable_master_password("wrong").is_err());
+        assert!(store.disable_master_password("WrongPass999").is_err());
         assert!(store.is_master_mode(), "关闭失败后模式不变");
 
-        assert_eq!(store.disable_master_password("pw").unwrap(), 1);
+        assert_eq!(store.disable_master_password("TestPass123").unwrap(), 1);
         assert!(!store.is_master_mode());
         assert!(!store.is_locked(), "DPAPI 模式恒非锁定");
         assert_eq!(store.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-one"), "密钥必须完好");
@@ -1312,14 +1342,14 @@ mod tests {
         let path = dir.join("secrets.enc");
         let mut store = SecretStore::load(path.clone()).unwrap();
         store.set("k1", "sk-one").unwrap();
-        store.enable_master_password("old-pw").unwrap();
+        store.enable_master_password("OldPass123").unwrap();
         let old_salt = {
             let v: SecretVault = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             v.master.unwrap().kdf.salt
         };
 
-        assert!(store.change_master_password("wrong", "new-pw").is_err(), "旧口令要验");
-        assert_eq!(store.change_master_password("old-pw", "new-pw").unwrap(), 1);
+        assert!(store.change_master_password("wrong", "NewPass456").is_err(), "旧口令要验");
+        assert_eq!(store.change_master_password("OldPass123", "NewPass456").unwrap(), 1);
 
         let new_salt = {
             let v: SecretVault = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -1328,8 +1358,8 @@ mod tests {
         assert_ne!(old_salt, new_salt, "换口令必须换盐，否则新旧密钥可比对");
 
         let mut reopened = SecretStore::load(path).unwrap();
-        assert!(reopened.unlock("old-pw").is_err(), "旧口令必须立即失效");
-        reopened.unlock("new-pw").unwrap();
+        assert!(reopened.unlock("OldPass123").is_err(), "旧口令必须立即失效");
+        reopened.unlock("NewPass456").unwrap();
         assert_eq!(reopened.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-one"));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1344,7 +1374,7 @@ mod tests {
         store.set("k1", "sk-one").unwrap();
         let before = std::fs::read(&path).unwrap();
 
-        store.enable_master_password("pw").unwrap();
+        store.enable_master_password("TestPass123").unwrap();
 
         let bak = std::fs::read_dir(&dir)
             .unwrap()
@@ -1366,7 +1396,7 @@ mod tests {
 
         let mut store = SecretStore::load(path).unwrap();
         assert!(store.load_failed, "前置条件：应处于降级态");
-        let err = store.enable_master_password("pw").unwrap_err().to_string();
+        let err = store.enable_master_password("TestPass123").unwrap_err().to_string();
         assert!(err.contains("降级"), "要说清原因并给出行动指引: {err}");
         assert!(!store.is_master_mode(), "拒绝后模式不变");
 
@@ -1378,8 +1408,8 @@ mod tests {
     fn enabling_twice_is_rejected() {
         let dir = temp_dir("master_twice");
         let mut store = SecretStore::load(dir.join("secrets.enc")).unwrap();
-        store.enable_master_password("pw").unwrap();
-        assert!(store.enable_master_password("pw2").is_err());
+        store.enable_master_password("TestPass123").unwrap();
+        assert!(store.enable_master_password("TestPass456").is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1388,9 +1418,9 @@ mod tests {
     fn master_operations_rejected_in_dpapi_mode() {
         let dir = temp_dir("master_dpapi_ops");
         let mut store = SecretStore::load(dir.join("secrets.enc")).unwrap();
-        assert!(store.unlock("pw").is_err());
-        assert!(store.disable_master_password("pw").is_err());
-        assert!(store.change_master_password("a", "b").is_err());
+        assert!(store.unlock("TestPass123").is_err());
+        assert!(store.disable_master_password("TestPass123").is_err());
+        assert!(store.change_master_password("TestA123", "TestB456").is_err());
         assert!(store.enable_master_password("").is_err(), "空口令等于没加密");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1401,14 +1431,14 @@ mod tests {
         let dir = temp_dir("master_manual_lock");
         let mut store = SecretStore::load(dir.join("secrets.enc")).unwrap();
         store.set("k1", "sk-x").unwrap();
-        store.enable_master_password("pw").unwrap();
+        store.enable_master_password("TestPass123").unwrap();
         assert!(store.get("k1").is_ok());
 
         store.lock();
         assert!(store.is_locked());
         assert!(store.get("k1").is_err());
 
-        store.unlock("pw").unwrap();
+        store.unlock("TestPass123").unwrap();
         assert_eq!(store.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-x"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1421,7 +1451,7 @@ mod tests {
         let path = dir.join("secrets.enc");
         let mut store = SecretStore::load(path.clone()).unwrap();
         store.set("k1", "sk-x").unwrap();
-        store.enable_master_password("pw").unwrap();
+        store.enable_master_password("TestPass123").unwrap();
         // 人为造出「两处都有」的中断态
         store.vault.entries.insert("k1".into(), "stale-dpapi".into());
         store.remove("k1").unwrap();
@@ -1443,7 +1473,7 @@ mod tests {
         let mut store = SecretStore::load(path.clone()).unwrap();
 
         // 方向一：主口令模式下写入，应清掉 entries 里的 DPAPI 残留。
-        store.enable_master_password("pw").unwrap();
+        store.enable_master_password("TestPass123").unwrap();
         store.vault.entries.insert("k1".into(), "stale-dpapi".into());
         store.set("k1", "sk-new").unwrap();
         assert!(
@@ -1453,7 +1483,7 @@ mod tests {
         assert_eq!(store.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-new"));
 
         // 方向二：关回 DPAPI 模式后写入，应清掉 boxes 里的口令密文残留。
-        store.disable_master_password("pw").unwrap();
+        store.disable_master_password("TestPass123").unwrap();
         // 造残留：直接塞一条 boxes（模拟上一次迁移中断留下的条目）
         store.vault.boxes.insert(
             "k1".into(),
@@ -1485,7 +1515,7 @@ mod tests {
         // 先在 DPAPI 模式存一条，再人为塞一条**上一把口令**加密的 boxes 条目（中断态）。
         store.set("dpapi-one", "sk-dpapi").unwrap();
         let old_hdr = crate::crypto::KdfHeader::new_random();
-        let old_key = crate::crypto::derive_vault_key("old-pw", &old_hdr).unwrap();
+        let old_key = crate::crypto::derive_vault_key("OldPass123", &old_hdr).unwrap();
         store.vault.boxes.insert(
             "orphan-boxed".into(),
             crate::crypto::seal_with_key(&old_key, b"sk-orphan").unwrap(),
@@ -1501,7 +1531,7 @@ mod tests {
 
         // 启用主口令：那条孤儿用旧口令加密、当前模式（DPAPI）解不出 → 必须**整体放弃**并保持
         // 密钥库原样，而不是「跳过它、迁移剩下的」（后者等于静默丢弃）。
-        let err = store.enable_master_password("new-pw").unwrap_err().to_string();
+        let err = store.enable_master_password("NewPass456").unwrap_err().to_string();
         assert!(
             err.contains("orphan-boxed") || err.contains("解密不出来"),
             "应明确指出是哪条解不出并放弃切换: {err}"

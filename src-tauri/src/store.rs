@@ -4099,7 +4099,7 @@ mod tests {
         assert!(store.get_key("k1").unwrap().has_secret, "前置条件：标记应为真");
 
         // 切到主口令模式后手动上锁（模拟「重启后还没解锁」）。
-        store.secrets.write().enable_master_password("pw").unwrap();
+        store.secrets.write().enable_master_password("TestPass123").unwrap();
         store.secrets.write().lock();
 
         let fixed = store.reconcile_has_secret_flags().unwrap();
@@ -4110,7 +4110,7 @@ mod tests {
         );
 
         // 解锁后对账照常工作，且结论正确（仍有密钥）。
-        store.secrets.write().unlock("pw").unwrap();
+        store.secrets.write().unlock("TestPass123").unwrap();
         assert_eq!(store.reconcile_has_secret_flags().unwrap(), 0);
         assert!(store.get_key("k1").unwrap().has_secret);
         std::fs::remove_dir_all(&dir).ok();

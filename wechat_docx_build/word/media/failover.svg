@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="560" viewBox="0 0 1100 560">
+  <rect width="1100" height="560" rx="30" fill="#F8FAFC"/>
+  <text x="50" y="70" fill="#0F172A" font-size="36" font-family="Arial, Microsoft YaHei" font-weight="800">Key 故障转移：多个 Key 组成稳定资源池</text>
+  <g font-family="Arial, Microsoft YaHei" font-size="24" font-weight="700">
+    <rect x="70" y="250" width="190" height="105" rx="28" fill="#E0F2FE" stroke="#38BDF8" stroke-width="3"/><text x="115" y="295" fill="#075985">AI 客户端</text><text x="113" y="330" fill="#075985" font-size="20">Claude Code / Codex</text>
+    <rect x="410" y="250" width="210" height="105" rx="28" fill="#ECFDF5" stroke="#10B981" stroke-width="4"/><text x="455" y="295" fill="#065F46">SynaRoute</text><text x="455" y="330" fill="#065F46" font-size="20">健康检查 / 路由</text>
+    <rect x="790" y="125" width="190" height="76" rx="20" fill="#FEE2E2" stroke="#EF4444" stroke-width="3"/><text x="840" y="174" fill="#991B1B">Key 1 失败</text>
+    <rect x="790" y="255" width="190" height="76" rx="20" fill="#DCFCE7" stroke="#22C55E" stroke-width="3"/><text x="840" y="304" fill="#166534">Key 2 可用</text>
+    <rect x="790" y="385" width="190" height="76" rx="20" fill="#DCFCE7" stroke="#22C55E" stroke-width="3"/><text x="840" y="434" fill="#166534">Key 3 可用</text>
+  </g>
+  <g stroke="#64748B" stroke-width="4" fill="none" marker-end="url(#arrow)">
+    <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#64748B"/></marker></defs>
+    <path d="M260 303 L402 303"/><path d="M620 303 C700 303 710 170 783 165"/><path d="M620 303 L783 293"/><path d="M620 303 C700 303 710 420 783 423"/>
+  </g>
+  <path d="M782 135 L985 205" stroke="#EF4444" stroke-width="8" opacity="0.7"/>
+  <text x="425" y="455" fill="#0F766E" font-size="24" font-family="Arial, Microsoft YaHei" font-weight="700">失败时自动尝试下一条可用资源，减少手动换 Key 和任务中断</text>
+</svg>

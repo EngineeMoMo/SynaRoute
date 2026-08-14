@@ -66,11 +66,12 @@ fn bottom_right_position(app: &AppHandle) -> Option<tauri::LogicalPosition<f64>>
     let sh = size.height as f64 / scale;
     // 距右下各留 24 逻辑像素；再往上抬 48 躲开 Windows 任务栏的典型高度。
     //
-    // 按**展开态**的尺寸留位置，而不是按球的 64×64：展开是往右下角那侧长出来的，
-    // 若按球定位，贴边放的球一展开就有一半长到屏幕外去了。
+    // 按**球的尺寸**定位：球建出来就在右下角，悬停展开时前端自己调整位置。
+    // 原先按展开态尺寸算导致球从右下角往左内缩 236px、往上内缩 144px，
+    // 看着像浮在屏幕中右侧而非角落（§15.5）。
     Some(tauri::LogicalPosition::new(
-        (sw - FLOATING_PANEL_W - 24.0).max(0.0),
-        (sh - FLOATING_PANEL_H - 24.0 - 48.0).max(0.0),
+        (sw - FLOATING_BALL - 24.0).max(0.0),
+        (sh - FLOATING_BALL - 24.0 - 48.0).max(0.0),
     ))
 }
 
@@ -112,11 +113,11 @@ fn ensure_window(app: &AppHandle, pinned: bool) -> tauri::Result<tauri::WebviewW
     // 无边框 + 不进任务栏：这是「悬浮小球」而不是第二个主窗口。
     .decorations(false)
     .skip_taskbar(true)
-    // 透明 + 关阴影：圆形的关键。窗口本身是方的，圆是前端用 border-radius 画的 ——
-    // 不透明的话四角会露出方形底色（一颗球外面套个方框），而系统阴影是按**窗口矩形**
-    // 投的，留着就会在球周围投出一个方形影子。两者必须成对，只改一个都还是方的。
-    .transparent(true)
-    .shadow(false)
+    // ⚠️ 临时调试：关闭透明 + 恢复阴影，排查「球完全看不见」问题（§15.5）
+    // 透明 + WebView2 有已知问题：合成路径不对时整窗画成全透明。
+    // TODO: 排查完毕后改回 .transparent(true) + .shadow(false)
+    .transparent(false)
+    .shadow(true)
     // **不再无条件置顶**。置顶是「用别的软件时被它挡着」的直接原因，
     // 现在由用户在设置里决定（`floating_widget_always_on_top`，默认关）。
     .always_on_top(pinned)

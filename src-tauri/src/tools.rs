@@ -3532,6 +3532,7 @@ tool_timeout_sec = 600
             tier_sonnet: None,
             tier_opus: None,
             balance_query: None,
+            cached_balance: None,
             cost_multiplier: None,
             health: HealthState::default(),
         }

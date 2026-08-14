@@ -424,6 +424,12 @@ pub struct ProviderKey {
     /// 余额查询配置（可选）。`None` = 该 Key 未配置余额查询。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balance_query: Option<BalanceQuery>,
+    /// 上次余额查询的缓存结果（成功或失败都缓存，避免短时间内重复查询）。
+    ///
+    /// 只在内存中维护、不落盘（重启后重新查一次是合理的）。
+    /// 前端轮询时先看缓存：未过期直接返回、过期才真查上游。
+    #[serde(skip)]
+    pub cached_balance: Option<BalanceResult>,
     /// 计费倍率（如 `"0.3"` = 官方价三折）。中转站普遍按官方价打折计费。
     ///
     /// 存字符串而非 f64：它会参与金额计算，而 JSON 里的 `0.3` 反序列化成 f64 后
@@ -1940,6 +1946,10 @@ pub struct McpStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
+    /// 配置文件版本号，用于跟踪迁移状态。
+    /// 每次需要迁移已存配置时递增此版本号。
+    #[serde(default)]
+    pub config_version: u32,
     #[serde(default)]
     pub keys: Vec<ProviderKey>,
     #[serde(default)]
@@ -1949,6 +1959,13 @@ pub struct AppConfig {
     #[serde(default)]
     pub settings: AppSettings,
 }
+
+/// 当前配置文件的最新版本号。
+///
+/// 版本历史：
+/// - v1: 初始版本（隐式，未存储版本号）
+/// - v2: 余额查询 URL 从 `/v1/usage` 迁移到 `/user/balance`
+pub const CURRENT_CONFIG_VERSION: u32 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -2059,6 +2076,7 @@ mod tests {
             tier_sonnet: None,
             tier_opus: None,
             balance_query: None,
+            cached_balance: None,
             cost_multiplier: None,
             health: HealthState::default(),
         }

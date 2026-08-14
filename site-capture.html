@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" type="image/png" href="/favicon-32.png" sizes="32x32" />
+    <link rel="apple-touch-icon" href="/logo-256.png" />
+    <meta name="theme-color" content="#6D5EF7" />
+
+    <!--
+      这里的 title / description / OG 是**兜底**：站点是客户端渲染，
+      按路由更新 meta 的逻辑在 useSeo 里。部分只读初始 HTML 的抓取器
+      （某些社交平台的分享卡片）拿不到 JS 执行后的结果，故预置一份默认值，
+      保证分享出去至少不是空白。
+    -->
+    <title>SynaRoute — 多 Key 备份、多模型协同的本地 AI 路由代理</title>
+    <meta
+      name="description"
+      content="SynaRoute 在本机运行一层 API 路由代理，为 Claude CLI、Claude 桌面端与 Codex 桌面端统管多厂商的 API Key 与模型。主 Key 失败时自动转移到下一个可用 Key；也能让多个模型并行回答同一个问题，再由决策者综合出结论。密钥本地加密存储，无云端账号。"
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="SynaRoute" />
+    <meta property="og:title" content="SynaRoute — 多 Key 备份、多模型协同的本地 AI 路由代理" />
+    <meta
+      property="og:description"
+      content="为 Claude CLI、Claude 桌面端与 Codex 桌面端统管多厂商的 Key 与模型：主 Key 失败自动转移，多个模型可并行作答并由决策者汇总。全部本地运行。"
+    />
+    <meta property="og:image" content="https://synaroute.mofamilys.com/og.png" />
+    <meta property="og:url" content="https://synaroute.mofamilys.com/" />
+    <meta name="twitter:card" content="summary_large_image" />
+
+    <script>
+      // 在 React 挂载前先把主题类加上，避免深色偏好的用户看到一帧白屏。
+      // 与 hooks/useTheme.ts 用同一个 storage key，改名要两处一起改。
+      (function () {
+        try {
+          var saved = localStorage.getItem("synaroute-site-theme");
+          var dark =
+            saved === "dark" ||
+            (!saved && window.matchMedia("(prefers-color-scheme: dark)").matches);
+          if (dark) {
+            document.documentElement.classList.add("dark");
+            document.documentElement.style.colorScheme = "dark";
+          }
+        } catch (e) {
+          /* 隐私模式下 localStorage 可能抛异常，忽略即可 —— 大不了用浅色 */
+        }
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-Co40r1Qu.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-Cyz_rmFY.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

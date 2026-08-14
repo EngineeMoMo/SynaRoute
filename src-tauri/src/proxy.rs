@@ -3440,7 +3440,7 @@ mod tests {
         store.upsert_key(key("k1", 0, &upstream)).unwrap();
         store.secrets.write().set("k1", "sk-x").unwrap();
         // 启用主口令 → 已解锁态；随后显式上锁，模拟「新进程启动但用户还没输口令」。
-        store.secrets.write().enable_master_password("master-pw").unwrap();
+        store.secrets.write().enable_master_password("TestPass123").unwrap();
         store.secrets.write().lock();
         assert!(store.secrets.read().is_locked(), "前置条件：处于锁定态");
 

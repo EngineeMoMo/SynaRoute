@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0F172A"/><stop offset="0.55" stop-color="#134E4A"/><stop offset="1" stop-color="#10B981"/></linearGradient>
+    <radialGradient id="r" cx="80%" cy="20%" r="70%"><stop offset="0" stop-color="#A7F3D0" stop-opacity="0.55"/><stop offset="1" stop-color="#A7F3D0" stop-opacity="0"/></radialGradient>
+  </defs>
+  <rect width="1200" height="520" rx="42" fill="url(#g)"/>
+  <rect width="1200" height="520" rx="42" fill="url(#r)"/>
+  <circle cx="965" cy="130" r="78" fill="#FFFFFF" opacity="0.12"/>
+  <circle cx="1048" cy="230" r="120" fill="#FFFFFF" opacity="0.08"/>
+  <text x="80" y="150" fill="#FFFFFF" font-size="70" font-family="Arial, Microsoft YaHei" font-weight="800">SynaRoute</text>
+  <text x="82" y="228" fill="#D1FAE5" font-size="34" font-family="Arial, Microsoft YaHei">AI 大脑聚合 + Key 故障转移</text>
+  <text x="82" y="302" fill="#FFFFFF" opacity="0.92" font-size="28" font-family="Arial, Microsoft YaHei">让多个模型并行思考，让多个 Key 组成稳定资源池</text>
+  <g transform="translate(790,330)">
+    <rect x="0" y="0" width="280" height="88" rx="22" fill="#FFFFFF" opacity="0.16"/>
+    <circle cx="55" cy="44" r="20" fill="#34D399"/><circle cx="122" cy="44" r="20" fill="#60A5FA"/><circle cx="189" cy="44" r="20" fill="#FBBF24"/>
+    <path d="M55 44 C88 10 155 10 189 44" fill="none" stroke="#FFFFFF" stroke-width="6" opacity="0.75"/>
+  </g>
+</svg>
