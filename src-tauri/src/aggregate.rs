@@ -262,10 +262,24 @@ pub async fn run_apply(
         .decider_ref
         .clone()
         .ok_or_else(|| AppError::Invalid("未配置最终决策者".into()))?;
+
     // 优先用 Phase1 定下的目录；缺失时才回退实时解析（兼容老前端/直接调用）。
-    let effective_work_dir = match pinned_work_dir {
-        Some(d) if !d.trim().is_empty() => Some(d),
-        _ => resolve_work_dir(&brain),
+    // **关键防护**：若 Phase1 传了空字符串（而非 None），仍视为"已定下"，不再重新解析。
+    // 否则前端传 `Some("")` 时会回退 resolve_work_dir，若用户在两个 phase 之间切换项目
+    // 会导致 apply 写到错误的目录（目录漂移）。空字符串说明 Phase1 确认了「无工作目录」。
+    let effective_work_dir = match &pinned_work_dir {
+        Some(d) => {
+            // Phase1 已定下（包括空字符串 = 确认无工作目录），不再重新解析
+            if d.trim().is_empty() {
+                None  // 明确无工作目录
+            } else {
+                Some(d.clone())
+            }
+        }
+        None => {
+            // Phase1 未传（老前端/直接调用）：回退实时解析
+            resolve_work_dir(&brain)
+        }
     };
 
     // 重新获取文件上下文
@@ -2485,6 +2499,7 @@ mod tests {
             tier_sonnet: None,
             tier_opus: None,
             balance_query: None,
+            cached_balance: None,
             cost_multiplier: None,
             health: crate::model::HealthState::default(),
         }

@@ -145,15 +145,45 @@ fn all_failed_gate() -> &'static Mutex<HashMap<String, GateEntry>> {
 }
 
 /// 记一次「全部失败」，武装短路窗口。`retry_after_secs` 为上游给出的退避秒数（若有）。
+///
+/// ## 并发安全（CAS 语义）
+///
+/// 只在以下情况更新窗口：
+/// 1. 窗口不存在（首次武装）
+/// 2. 窗口已过期（自然到期后重新武装）
+/// 3. 新的 `retry_at_ms` 更晚（取更保守的退避时间，避免早到的重试仍然失败）
+///
+/// **不**覆盖仍有效且更严格的窗口，防止并发场景下后完成的请求用更短的退避覆盖先完成的。
 fn arm_all_failed_gate(gate_key: &str, retry_after_secs: Option<i64>) {
     let now = chrono::Utc::now().timestamp_millis();
-    all_failed_gate().lock().insert(
-        gate_key.to_string(),
-        GateEntry {
-            until_ms: now + ALL_FAILED_SHORT_CIRCUIT_MS,
-            retry_at_ms: retry_after_secs.map(|s| now + s.saturating_mul(1000)),
-        },
-    );
+    let new_until = now + ALL_FAILED_SHORT_CIRCUIT_MS;
+    let new_retry_at = retry_after_secs.map(|s| now + s.saturating_mul(1000));
+
+    let mut gate = all_failed_gate().lock();
+
+    // CAS 语义：只在应该更新时才更新
+    let should_update = match gate.get(gate_key) {
+        None => true,  // 窗口不存在，首次武装
+        Some(existing) if existing.until_ms <= now => true,  // 窗口已过期
+        Some(existing) => {
+            // 窗口仍有效：只在新值更保守时更新（取更晚的 retry_at）
+            match (existing.retry_at_ms, new_retry_at) {
+                (Some(old_retry), Some(new_retry)) => new_retry > old_retry,
+                (None, Some(_)) => true,   // 旧值无 retry_at，新值有 → 更新
+                _ => false,  // 其他情况保留现有窗口
+            }
+        }
+    };
+
+    if should_update {
+        gate.insert(
+            gate_key.to_string(),
+            GateEntry {
+                until_ms: new_until,
+                retry_at_ms: new_retry_at,
+            },
+        );
+    }
 }
 
 /// 短路窗口是否仍有效。有效则返回 `(剩余毫秒>0, 应告知下游的 Retry-After 秒数)`，
@@ -727,9 +757,20 @@ async fn handle_request(
                 // 夹一个下限：剩余时间太短时开始新尝试几乎必然超时，白打一次上游还拖长总耗时。
                 if i > 0 && left < MIN_ATTEMPT_SLICE {
                     let skipped_by_budget = candidates.len() - i;
+                    // 预算耗尽时构造明确的错误信息：若已有失败记录则附加预算信息，
+                    // 若还没有失败（极端情况：配置极小预算 + 第一个候选耗时过长）则说明预算不足
                     if last_err.is_empty() {
                         last_err = format!(
-                            "故障转移总预算耗尽，剩余 {skipped_by_budget} 个候选未尝试"
+                            "故障转移总预算耗尽（剩余时间 {}ms < 最小尝试片 {}ms），剩余 {skipped_by_budget} 个候选未尝试。\
+                             建议增加故障转移预算（当前 {} ms）或减少单 Key 超时时间。",
+                            left.as_millis(),
+                            MIN_ATTEMPT_SLICE.as_millis(),
+                            store.failover_budget().map(|d| d.as_millis()).unwrap_or(0)
+                        );
+                    } else {
+                        last_err = format!(
+                            "{}；故障转移总预算耗尽，剩余 {skipped_by_budget} 个候选未尝试",
+                            last_err
                         );
                     }
                     store.append_event(
@@ -2862,6 +2903,7 @@ mod tests {
             tier_sonnet: None,
             tier_opus: None,
             balance_query: None,
+            cached_balance: None,
             cost_multiplier: None,
             health: HealthState::default(),
         }
