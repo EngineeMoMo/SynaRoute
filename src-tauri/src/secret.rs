@@ -656,12 +656,6 @@ const KEYCHAIN_ACCOUNT: &str = "vault-key";
 ///
 /// 跨进程仍靠「写完立刻读回」收敛；主进程有 `tauri-plugin-single-instance`，
 /// `--mcp-stdio` 子进程只做 JSON-RPC 转发、不开密钥库，所以那是窄窗口兜底，不是主路径。
-/// 线程安全的「成功才缓存」惰性初始化。
-///
-/// `OnceLock::get_or_init` 不能用：初始化函数会失败（Keychain 拒绝/锁定时要返 Err，且失败
-/// 不能永久缓存）。这版用 Mutex 只串行化**首次成功初始化**，锁内二次检查避免等待者重复调用。
-/// 抽成平台无关函数，使 Windows CI 也能用并发测试钉住 macOS 的初始化算法。
-#[cfg(any(target_os = "macos", test))]
 #[cfg(target_os = "macos")]
 fn keychain_vault_key() -> AppResult<[u8; 32]> {
     static CACHED: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
