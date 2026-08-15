@@ -52,6 +52,18 @@ const REMAINING_CANDIDATES: &[&str] = &[
     "data.limit_remaining",
     "total_available",
     "data.total_available",
+    // NewAPI / OpenAI 兼容计费层：`GET /v1/dashboard/billing/subscription` 返回
+    // `{"object":"billing_subscription","hard_limit_usd":10.5,"soft_limit_usd":…}`。
+    //
+    // **实测来源**（2026-08-16，sotamodel.net）：该站是 NewAPI 架构，`/user/balance`
+    // 返回网页、`/api/user/self` 要面板 access token，只有这条认转发用的 API Key
+    // （无效 Key 时返 `{"error":{…,"type":"new_api_error"}}`）。中转站普遍如此，
+    // 而此前候选链里没有 hard_limit_usd —— 用户即便填对了地址也取不到值。
+    //
+    // 排在末尾：`hard_limit_usd` 是「额度上限」而非严格意义的「剩余」，
+    // 前面任一更精确的字段命中时都不该被它抢先。
+        "hard_limit_usd",
+    "data.hard_limit_usd",
 ];
 
 /// 货币单位的候选字段链。取不到时默认 USD（与 cc-switch 通用模板一致）。
@@ -453,6 +465,53 @@ mod tests {
         assert_eq!(r.remaining, Some(4.28), "余额在 balance_infos[0].total_balance");
         assert_eq!(r.unit.as_deref(), Some("CNY"), "币种必须取实际值，不能默认成 USD");
         assert_eq!(r.is_valid, Some(true), "is_available 应被识别为有效性字段");
+    }
+
+    /// NewAPI / OpenAI 兼容计费层的真实返回结构（`/v1/dashboard/billing/subscription`）。
+    ///
+    /// **为什么这条必须有**（2026-08-16 实测 sotamodel.net 得出）：中转站普遍是 NewAPI 架构，
+    /// 而它三个候选端点的行为各不相同：
+    ///   - `/user/balance` → 200 但返回**网页**（generic 模板打到这里，用户一直失败）
+    ///   - `/api/user/self` → 要面板 access token，不是转发用的 API Key
+    ///   - `/v1/dashboard/billing/subscription` → **只有这条认 API Key**
+    ///
+    /// 而这条返回里的余额字段是 `hard_limit_usd`，此前**不在候选链里** —— 即用户就算
+    /// 填对了地址也取不到值，只会看到「上游返回里找不到余额字段」。
+    /// 删掉候选链末尾那两条 `hard_limit_usd` 后本测试必红。
+    #[test]
+    fn newapi_billing_subscription_shape() {
+        // NewAPI 的标准返回（对齐 OpenAI 的 billing_subscription 契约）
+        let body = serde_json::json!({
+            "object": "billing_subscription",
+            "has_payment_method": false,
+            "soft_limit_usd": 8.0,
+            "hard_limit_usd": 10.5,
+            "system_hard_limit_usd": 10.5,
+            "access_until": 0
+        });
+        let r = extract_balance(&body, None);
+        assert!(
+            r.ok,
+            "NewAPI billing_subscription 必须能解析（hard_limit_usd 在候选链里吗？）：{:?}",
+            r.error
+        );
+        assert_eq!(
+            r.remaining,
+            Some(10.5),
+            "余额取 hard_limit_usd；取不到说明候选链缺这个字段"
+        );
+
+        // 更精确的字段存在时不得被 hard_limit_usd 抢先（它排在候选链末尾正是为此）
+        let with_remaining = serde_json::json!({
+            "object": "billing_subscription",
+            "remaining": 3.25,
+            "hard_limit_usd": 10.5
+        });
+        assert_eq!(
+            extract_balance(&with_remaining, None).remaining,
+            Some(3.25),
+            "remaining 比 hard_limit_usd 精确，必须优先"
+        );
     }
 
     /// 上游明确说「账号无效」时，报的是**那个原因**而不是「找不到字段」。

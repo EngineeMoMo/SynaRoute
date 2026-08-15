@@ -55,7 +55,20 @@ const BALANCE_TEMPLATES: Record<string, { url: string; method: string; auth: str
   // 此前这里写的是 `/v1/usage` —— 那是某个站的自定义脚本路径，被我误当成通用默认值，
   // 结果新用户一开开关就 404。
   generic: { url: "{{baseUrl}}/user/balance", method: "GET", auth: "bearer" },
-  // NewAPI 系面板：认的是**面板登录态**（access token + 用户 id），不是转发用的 API Key
+  // 中转站（NewAPI 的 OpenAI 兼容计费层）：`GET /v1/dashboard/billing/subscription`，
+  // 认的是**转发用的 API Key**，不需要另去面板拿 access token —— 故它比下面的 newapi
+  // 模板好用得多，绝大多数中转站首选这条。
+  //
+  // **实测来源**（2026-08-16，sotamodel.net）：
+  //   /user/balance                        → 200 但 Content-Type: text/html（是网页，不是 API）
+  //   /api/user/self                       → 200 JSON，但报 "invalid access token"（要面板登录态）
+  //   /v1/dashboard/billing/subscription   → 401 JSON `{"error":{…,"type":"new_api_error"}}`
+  //                                          ← 只有这条认 API Key
+  // 用户此前选 generic 一直失败，正是因为缺这个模板。返回里的余额字段是
+  // `hard_limit_usd`，已补进后端候选链（见 balance.rs REMAINING_CANDIDATES 末尾）。
+  relay: { url: "{{origin}}/v1/dashboard/billing/subscription", method: "GET", auth: "bearer" },
+  // NewAPI 系面板：认的是**面板登录态**（access token + 用户 id），不是转发用的 API Key。
+  // 只在 relay 模板取不到值时才需要它（要用户去面板复制 access token 与用户 id）。
   newapi: { url: "{{baseUrl}}/api/user/self", method: "GET", auth: "access-token" },
   // DeepSeek：余额端点在**域名根**下，而它的 baseUrl 常带 `/anthropic` 后缀，
   // 故必须用 `{{origin}}`（剥掉路径）而非 `{{baseUrl}}` —— 实测后者 404、前者 200。
@@ -65,7 +78,7 @@ const BALANCE_TEMPLATES: Record<string, { url: string; method: string; auth: str
 };
 
 /** 模板按钮的顺序与文案 key（与 cc-switch 的排列一致：自定义在最前）。 */
-const BALANCE_TEMPLATE_ORDER = ["custom", "generic", "newapi", "deepseek", "official"] as const;
+const BALANCE_TEMPLATE_ORDER = ["custom", "relay", "generic", "newapi", "deepseek", "official"] as const;
 
 /** 新建 Key 时的余额查询初值：默认**关闭**，但把通用模板填好，用户开开关即可用。 */
 function defaultBalanceQuery(): BalanceQuery {
