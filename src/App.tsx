@@ -169,7 +169,16 @@ export default function App() {
         // React 18 会把 setEditorOpen(false) 与 openEdit(k) 批处理成 editorOpen 恒为 true，
         // 同类型同位置的元素不会重新挂载，而 KeyEditor 的字段全是 useState(initial?.x)
         // 只在挂载时取一次 —— 结果是抽屉标题换了、表单里还是上一条 Key 的 baseUrl 与密钥态。
-        <KeyEditor key={editingKey?.id ?? "new"} initial={editingKey} onClose={() => setEditorOpen(false)} />
+        <KeyEditor
+          key={editingKey?.id ?? "new"}
+          initial={editingKey}
+          onClose={() => setEditorOpen(false)}
+          onSaved={(saved) => {
+            // probeBalance 先保存时，把 editingKey 对齐到后端回填的真实 uuid。
+            // 如果不更新，后续点「保存」会因为 initial?.id 仍是 null/空串而再 insert 一条新 Key。
+            setEditingKey(saved);
+          }}
+        />
       )}
 
       {paletteOpen && (
