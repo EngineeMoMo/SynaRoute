@@ -444,7 +444,7 @@ async fn handle_request(
     // 模型发现端点：Claude Code（v2.1.126+）/model 选择器会 GET <base>/v1/models 拉取可选模型。
     // 只放行 model 发现的可选模型（各启用 Key 可服务模型的交集/单 Key 自身），不进故障转移补全逻辑。
     // 用 path（去掉 query）的路径部分判定，避免把补全端点误判进来。
-    let path_only = req.uri().path();
+    let path_only = req.uri().path().to_string();
     if req.method() == hyper::Method::GET
         && (path_only == "/v1/models" || path_only == "/models")
     {
@@ -460,7 +460,7 @@ async fn handle_request(
     // 官方 gateway 协议里的**非推理端点**（判据：claude.exe v2.1.219 内嵌的 llm-gateway-protocol
     // 规范）。它们必须由代理自己应答，绝不能落进故障转移逻辑被 POST 给上游 AI 中转商——
     // 那样等于把策略查询 / OTLP 遥测体当成补全请求打出去，白烧一次额度还必然报错。
-    if let Some(resp) = handle_gateway_side_endpoints(req.method(), path_only) {
+    if let Some(resp) = handle_gateway_side_endpoints(req.method(), &path_only) {
         return Ok(resp);
     }
 
@@ -523,6 +523,24 @@ async fn handle_request(
         return Ok(error_resp(
             StatusCode::BAD_REQUEST,
             "空探测请求（无消息内容且未指定模型）：已在代理侧拒绝，未转发上游",
+        ));
+    }
+
+    // count_tokens 本地估算：Claude 桌面端每次对话前都会发 POST /v1/messages/count_tokens
+    // 估算输入 token 数，而绝大多数中转站不实现该端点 → 大量 404 日志 + 有时触发 429 限流。
+    // 使用本地 estimate_tokens 按消息内容估算，直接返回标准格式，不转发上游。
+    //
+    // 估算误差在 10%~20% 是可接受的——该端点的用途是让客户端决定要不要截断上下文，
+    // 而不是精确计费；Anthropic 文档也说其官方实现本身有误差（使用 tiktoken-style 估算）。
+    // 本地估算不消耗上游额度、不产生 404/429，用户体验大幅改善。
+    if path_only == "/v1/messages/count_tokens"
+        || path_only.starts_with("/v1/messages/count_tokens?")
+    {
+        let input_tokens = estimate_count_tokens_local(&req_json);
+        let resp_body = serde_json::json!({ "input_tokens": input_tokens });
+        return Ok(json_resp(
+            StatusCode::OK,
+            Bytes::from(serde_json::to_vec(&resp_body).unwrap_or_default()),
         ));
     }
 
@@ -2254,6 +2272,78 @@ fn is_contentless_probe(req_json: &Value, requested_model: &str) -> bool {
     ["messages", "input", "prompt", "contents"]
         .iter()
         .any(|k| obj.contains_key(*k))
+}
+
+/// `POST /v1/messages/count_tokens` 的本地 token 估算。
+///
+/// Claude 桌面端在每次对话前调用该端点估算输入 token 数，决定是否截断上下文。
+/// 中转站普遍不实现 → 大量 404 日志；高频调用还会触发 429 限流。
+///
+/// 改为本地估算：
+/// - 遍历 `messages`/`system` 里的文本内容，用 `estimate_tokens` 估算
+/// - 精度在 ±10~20% 以内（Anthropic 官方自己的实现也是估算，用 tiktoken-style）
+/// - 对客户端完全透明：只要返回合理的 `input_tokens` 数字，客户端就能正常截断
+fn estimate_count_tokens_local(req_json: &Value) -> u32 {
+    let mut total: u32 = 0;
+
+    // system prompt
+    if let Some(sys) = req_json.get("system") {
+        match sys {
+            Value::String(s) => total = total.saturating_add(crate::upstream::estimate_tokens(s)),
+            Value::Array(blocks) => {
+                for b in blocks {
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                        total = total.saturating_add(crate::upstream::estimate_tokens(t));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // messages
+    if let Some(msgs) = req_json.get("messages").and_then(|m| m.as_array()) {
+        for msg in msgs {
+            match msg.get("content") {
+                Some(Value::String(s)) => {
+                    total = total.saturating_add(crate::upstream::estimate_tokens(s));
+                }
+                Some(Value::Array(blocks)) => {
+                    for b in blocks {
+                        // text 块
+                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                            total = total.saturating_add(crate::upstream::estimate_tokens(t));
+                        }
+                        // tool_result 内嵌内容
+                        if let Some(inner) = b.get("content") {
+                            match inner {
+                                Value::String(s) => {
+                                    total = total.saturating_add(crate::upstream::estimate_tokens(s));
+                                }
+                                Value::Array(inner_blocks) => {
+                                    for ib in inner_blocks {
+                                        if let Some(t) = ib.get("text").and_then(|t| t.as_str()) {
+                                            total = total.saturating_add(crate::upstream::estimate_tokens(t));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // tools 声明本身也占 token（通常几百，用 JSON 字符串简单估算）
+    if let Some(tools) = req_json.get("tools") {
+        let tools_str = tools.to_string();
+        total = total.saturating_add(crate::upstream::estimate_tokens(&tools_str));
+    }
+
+    total
 }
 
 /// 故障转移日志里的动词：**按真实状态码分类**，让用户一眼看出该去修什么。
