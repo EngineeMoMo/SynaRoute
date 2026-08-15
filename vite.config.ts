@@ -5,11 +5,19 @@ import path from "node:path";
 // Tauri 开发时前端固定跑在 1420 端口，供 Rust 侧 devUrl 引用
 const host = process.env.TAURI_DEV_HOST;
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
   plugins: [react()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      // 生产构建把 mockData 换成空桩：那套演示数据（假 Key / 假余额 / 假 cc-switch 路径）
+      // 只服务 `npm run dev` 的浏览器预览，不该发给用户。bridge.ts 顶层是静态 import，
+      // 无法 tree-shake，故在打包层替换。桩里每个方法都抛错（不返回假值）——
+      // 生产环境走到那里说明 isTauri() 判据失效，必须立刻炸而不是显示「零条 Key」。
+      // 详见 src/lib/mockData.prod.ts 的文件注释。
+      ...(command === "build"
+        ? { "./mockData": path.resolve(__dirname, "./src/lib/mockData.prod.ts") }
+        : {}),
     },
   },
   // 防止 vite 屏蔽 Rust 侧错误
@@ -43,4 +51,4 @@ export default defineConfig({
       ignored: ["**/src-tauri/**"],
     },
   },
-});
+}));

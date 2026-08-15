@@ -1,7 +1,3 @@
-// Tauri IPC 桥接层
-// 关键设计：检测运行环境。在 Tauri 中走真实 invoke；在纯浏览器（npm run dev 直接看页面）
-// 中降级到 mock 数据，使前端可独立展示，不阻塞于 Rust 编译。
-
 import type {
   AggregateResult,
   AppSettings,
@@ -50,6 +46,10 @@ async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
 
 /**
  * 统一调用入口：Tauri 环境走真实后端命令，浏览器环境走 mock。
+ *
+ * `mock` 参数是一个**惰性 thunk**（`() => mockBridge.x()`）：Tauri 环境下永不调用，
+ * 故那些演示数据在生产环境不会被执行。但 `mockData.ts` 仍会被打进 bundle
+ * （顶层 import 无法 tree-shake），这是刻意接受的代价 —— 见文件顶部注释。
  */
 async function call<T>(cmd: string, args: Record<string, unknown> | undefined, mock: () => Promise<T> | T): Promise<T> {
   if (isTauri()) {

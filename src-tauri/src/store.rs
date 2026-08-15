@@ -1360,7 +1360,53 @@ impl Store {
         Ok(key)
     }
 
+    /// 检查某 Key 是否被任一分类的大脑聚合引用（成员 / 汇总者 / 决策者）。
+    ///
+    /// 返回引用位置的可读描述列表（空 = 无引用）。用于 [`Self::delete_key`] 的前置校验：
+    /// 删掉一个正在被大脑聚合使用的 Key，会让聚合在下次调用时**静默少一个参与者**
+    /// （成员被跳过）或**整轮失败**（汇总者/决策者不可用），而用户完全不知道原因 ——
+    /// 这正是本项目最忌讳的静默失效形态。故删除前必须拦住并说清该去哪里解除引用。
+    ///
+    /// `keyId::modelName` 是 `summarizer_ref` / `decider_ref` 的格式，故用 `split("::")`
+    /// 取前半段比对，而不是整串相等 —— 后者永远匹配不上。
+    fn brain_references_of(&self, key_id: &str) -> Vec<String> {
+        let cfg = self.config.read();
+        let mut hits = Vec::new();
+        for brain in cfg.brain.iter() {
+            let cat = brain.category_id.meta().display_name;
+            if brain.members.iter().any(|m| m.key_id == key_id) {
+                hits.push(format!("{cat} · 参与成员"));
+            }
+            // 两个 ref 的格式是 `keyId::modelName`，取 `::` 前半段比对
+            let ref_hits_key = |r: &Option<String>| {
+                r.as_deref()
+                    .and_then(|s| s.split("::").next())
+                    .is_some_and(|k| k == key_id)
+            };
+            if ref_hits_key(&brain.summarizer_ref) {
+                hits.push(format!("{cat} · 汇总模型"));
+            }
+            if ref_hits_key(&brain.decider_ref) {
+                hits.push(format!("{cat} · 决策者"));
+            }
+        }
+        hits
+    }
+
     pub fn delete_key(&self, key_id: &str) -> AppResult<()> {
+        // 大脑聚合引用检查：被引用时拒绝删除，并告诉用户该去哪里解除。
+        //
+        // 为什么必须拦而不是「删了顺手清理引用」：清理引用意味着**替用户改大脑聚合配置**
+        // —— 他可能只是想换一条 Key 的密钥（先删后建），结果发现精心配好的成员列表
+        // 少了一项、或决策者变成了空。让用户自己去大脑聚合页面移除，他才知道发生了什么。
+        let refs = self.brain_references_of(key_id);
+        if !refs.is_empty() {
+            return Err(AppError::Invalid(format!(
+                "该 Key 正在被大脑聚合使用（{}），无法删除。\n\
+                 请先到「大脑聚合」页面把它从上述位置移除，再回来删除。",
+                refs.join("、")
+            )));
+        }
         // 时序修正：先删 config 并落盘成功,再移除密钥。旧写法先 remove 密钥再 persist config,
         // 若 config 落盘失败,重启后 init 读回旧 config 使 Key 复活、却已丢密钥(has_secret=true
         // 却取不到密钥的孤儿)。失败回滚见 mutate_and_persist。
@@ -2701,6 +2747,75 @@ mod tests {
         let reloaded = Store::new_at(cfg_path, dir.join("secrets.enc")).unwrap();
         assert!(reloaded.get_key("k1").is_none(), "重载后 k1 仍应不存在");
         assert!(reloaded.get_key("k2").is_some(), "k2 应保留");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 被大脑聚合引用的 Key **不得**被删除，且错误要点明具体位置。
+    ///
+    /// 为什么这条防线必须有：删掉一个正在被聚合使用的 Key 后，成员会在下次调用时被静默跳过
+    /// （用户以为「怎么少了一个视角」）、汇总者/决策者不可用则整轮失败（用户只看到超时或报错，
+    /// 完全联想不到是几天前删的那条 Key）。两种都是本项目最忌讳的静默失效。
+    ///
+    /// 三个引用位置分别验：members / summarizer_ref / decider_ref。
+    /// **`summarizer_ref` / `decider_ref` 的格式是 `keyId::modelName`**，
+    /// 判定必须取 `::` 前半段 —— 用整串相等比对永远匹配不上，那等于这条防线没接上。
+    #[test]
+    fn delete_key_is_blocked_while_referenced_by_brain() {
+        let dir = temp_dir("del_brain_ref");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        for id in ["km", "ks", "kd", "kfree"] {
+            let mut k = sample_key(id, 0);
+            k.id = id.into();
+            store.upsert_key(k).unwrap();
+        }
+
+        // 三处引用各配一条 Key，kfree 不被任何位置引用
+        let mut brain = store.get_brain(CategoryType::ClaudeCli);
+        brain.members = vec![crate::model::BrainMember {
+            id: "m1".into(),
+            key_id: "km".into(),
+            model_name: "claude-opus-4-8".into(),
+        }];
+        brain.summarizer_ref = Some("ks::claude-haiku-4-5".into());
+        brain.decider_ref = Some("kd::claude-opus-4-8".into());
+        store.save_brain(brain).unwrap();
+
+        // 成员引用 → 拒绝，且错误里点明「参与成员」
+        let err = store.delete_key("km").expect_err("被引用为成员时必须拒绝删除");
+        let msg = format!("{err}");
+        assert!(msg.contains("参与成员"), "错误应点明引用位置，实际：{msg}");
+        assert!(msg.contains("大脑聚合"), "错误应告诉用户去哪解除，实际：{msg}");
+        assert!(store.get_key("km").is_some(), "拒绝删除后 Key 必须仍在");
+
+        // 汇总者引用 → 拒绝（这条专门钉住「`keyId::modelName` 要取前半段比对」）
+        let err = store.delete_key("ks").expect_err("被引用为汇总者时必须拒绝删除");
+        assert!(
+            format!("{err}").contains("汇总模型"),
+            "汇总者引用未被识别 —— 检查是否用整串比对了 `keyId::modelName`：{err}"
+        );
+        assert!(store.get_key("ks").is_some());
+
+        // 决策者引用 → 拒绝
+        let err = store.delete_key("kd").expect_err("被引用为决策者时必须拒绝删除");
+        assert!(format!("{err}").contains("决策者"), "{err}");
+        assert!(store.get_key("kd").is_some());
+
+        // 未被引用的 Key 照常能删（防线不能把正常路径也拦死）
+        store.delete_key("kfree").expect("未被引用的 Key 必须能删");
+        assert!(store.get_key("kfree").is_none());
+
+        // 从大脑聚合移除引用后，原先被拦的 Key 就能删了（这是给用户的出路）
+        let mut brain = store.get_brain(CategoryType::ClaudeCli);
+        brain.members.clear();
+        brain.summarizer_ref = None;
+        brain.decider_ref = None;
+        store.save_brain(brain).unwrap();
+        for id in ["km", "ks", "kd"] {
+            store
+                .delete_key(id)
+                .unwrap_or_else(|e| panic!("解除引用后 {id} 应能删除，实际：{e}"));
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
