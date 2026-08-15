@@ -119,13 +119,6 @@ export const api = {
       mockBridge.setPrimaryKey(categoryId, keyId),
     ),
 
-  // 把 Max Tokens 一次应用到该分类下全部 Key（含已停用的：否则日后重新启用又带回旧值）。
-  // 返回实际改动条数 —— 全都已是该值时为 0，前端据此如实提示，不谎报「已保存」。
-  applyMaxTokensToCategory: (categoryId: CategoryType, maxTokens: number) =>
-    call<number>("apply_max_tokens_to_category", { categoryId, maxTokens }, () =>
-      mockBridge.applyMaxTokensToCategory(categoryId, maxTokens),
-    ),
-
   // ---- 从 cc-switch 导入历史 Key（只读对方库；导入后不接入）----
   scanCcswitch: () =>
     call<CcSwitchScanResult>("scan_ccswitch", undefined, () => mockBridge.scanCcswitch()),

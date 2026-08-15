@@ -341,9 +341,6 @@ const zh: Dict = {
   "editor.showSecret": "显示",
   "editor.hideSecret": "隐藏",
   "editor.temperature": "Temperature（采样温度）",
-  "editor.maxTokens": "Max Tokens（当前不生效，仅兼容旧配置）",
-  "editor.maxTokensHint":
-    "SynaRoute 已不再用这个值限制任何回答长度。代理转发完全透明：客户端（Claude Code / Codex）给多少就是多少，没给也不补。大脑聚合的输出预算按协议与模型能力自动决定：OpenAI 上游不发上限；Anthropic 上游因 API 要求必填，按「该模型上下文窗口 − 本轮输入」现算。该字段仅为兼容旧配置保留，改它不会影响请求。",
   "editor.modelList": "模型列表",
   "editor.fetch": "拉取",
   "editor.modelManualPlaceholder": "手动输入模型名后回车，如 gpt-4o",
@@ -375,12 +372,6 @@ const zh: Dict = {
   "editor.errNeedBaseUrl2": "请填写 base_url",
   "editor.errInvalidContextWindow": "上下文窗口格式无效：请输入正数，并确保换算后是整数 token",
   "editor.errSave": "保存失败：{err}",
-  "editor.applyMaxTokensAll": "应用 {n} 到本分类全部 Key",
-  "editor.applyMaxTokensAllHint":
-    "把上面的 Max Tokens 一次写入本分类所有 Key（含已停用的）。注意：该值当前不参与任何请求（代理转发与大脑聚合都不读它），仅为兼容旧配置保留。",
-  "editor.maxTokensApplied": "已应用到 {n} 条 Key",
-  "editor.maxTokensNoChange": "本分类全部 Key 已是该值，无需修改",
-  "editor.errMaxTokensZero": "Max Tokens 必须大于 0（仅为保持旧配置格式有效；该值当前不参与请求）",
   "editor.errApplyAll": "批量应用失败：{err}",
 
   // 大脑聚合
@@ -1103,9 +1094,6 @@ const en: Dict = {
   "editor.showSecret": "Show",
   "editor.hideSecret": "Hide",
   "editor.temperature": "Temperature",
-  "editor.maxTokens": "Max Tokens (inactive; kept for legacy configs)",
-  "editor.maxTokensHint":
-    "SynaRoute no longer uses this value to cap any reply. Proxy forwarding is fully transparent: client requests (Claude Code / Codex) keep whatever they sent, and nothing is added if they sent none. Brain aggregation derives its own budget from the protocol and model: no cap is sent to OpenAI upstreams; Anthropic requires the field, so it is computed per request as (model context window − this turn's input). This field is retained only for backward compatibility — changing it does not affect requests.",
   "editor.modelList": "Model list",
   "editor.fetch": "Fetch",
   "editor.modelManualPlaceholder": "Type a model name and press Enter, e.g. gpt-4o",
@@ -1137,12 +1125,6 @@ const en: Dict = {
   "editor.errNeedBaseUrl2": "Please enter base_url",
   "editor.errInvalidContextWindow": "Invalid context window: enter a positive number that converts to a whole token count",
   "editor.errSave": "Save failed: {err}",
-  "editor.applyMaxTokensAll": "Apply {n} to every key in this category",
-  "editor.applyMaxTokensAllHint":
-    "Write the Max Tokens above to every key in this category (including disabled ones). Note: this value no longer takes part in any request — neither proxy forwarding nor brain aggregation reads it. Kept for backward compatibility only.",
-  "editor.maxTokensApplied": "Applied to {n} key(s)",
-  "editor.maxTokensNoChange": "Every key in this category already uses this value",
-  "editor.errMaxTokensZero": "Max Tokens must be greater than 0 (only to keep legacy config valid; it is not used by requests)",
   "editor.errApplyAll": "Bulk apply failed: {err}",
 
   "brain.title": "Brain Aggregation",

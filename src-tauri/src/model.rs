@@ -325,18 +325,6 @@ pub struct ModelMapping {
 pub struct KeyParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
-    /// 输出上限。**当前没有任何请求路径读它**，仅为兼容旧配置保留。
-    ///
-    /// 两次定调把它的两个用途都撤掉了：
-    /// - 2026-08-14：代理转发不注入（客户端没给就是没给）——
-    ///   见 `proxy.rs::apply_key_params` + `key_max_tokens_is_never_injected_by_proxy`；
-    /// - 2026-08-15：大脑聚合也不用它（那个 `unwrap_or(4096)` 会把长回答截断在一半，
-    ///   而用户只会去查上游）——改为按协议与模型上下文窗口现算，见 `upstream/budget.rs`。
-    ///
-    /// 保留字段而非删除：老配置文件里存着值，删掉要做迁移，而它现在是惰性的、无害。
-    /// **想把它接回任何请求路径前，先读上面两处的理由。**
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]

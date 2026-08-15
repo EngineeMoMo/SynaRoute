@@ -109,7 +109,6 @@ export interface DesktopModelNameReport {
 /** Key 请求参数（FR-005） */
 export interface KeyParams {
   temperature?: number;
-  maxTokens?: number;
   topP?: number;
   timeoutMs?: number;
 }

@@ -95,7 +95,6 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const [showSecret, setShowSecret] = useState(false);
   const [revealing, setRevealing] = useState(false);
   const [temperature, setTemperature] = useState(initial?.params.temperature ?? 1.0);
-  const [maxTokens, setMaxTokens] = useState(initial?.params.maxTokens ?? 8192);
   // 请求超时(ms):空 = 未设(后端默认 30000)。服务非流式转发,慢厂商可调大;
   // 健康探测/拉模型后端固定封顶 30s,大脑聚合用大脑页「总超时」——均不受此值放大影响。
   const [timeoutMs, setTimeoutMs] = useState<number | "">(initial?.params.timeoutMs ?? "");
@@ -119,46 +118,6 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const [costMultiplier, setCostMultiplier] = useState(initial?.costMultiplier ?? "");
   const [fetching, setFetching] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // 批量应用 Max Tokens 的状态与结果提示。成功走独立提示，不复用 error（那是红色告警样式）。
-  const [applyingAll, setApplyingAll] = useState(false);
-  const [applyAllMsg, setApplyAllMsg] = useState<string | null>(null);
-
-  /**
-   * 把当前输入框里的 Max Tokens 一次应用到本分类**全部** Key。
-   *
-   * ⚠️ 该值**当前不参与任何请求**（2026-08-15 定调）：代理转发透明不补上限；大脑聚合的
-   * 输出预算按协议与模型上下文窗口自动算（见 upstream/budget.rs）。字段与本批量入口
-   * 仅为兼容旧配置保留 —— 老配置里存着值，删字段要做迁移，收益不抵风险。
-   *
-   * 文案已如实标注「不生效」。**不要**因为「看起来没用」就悄悄把它接回某条请求路径：
-   * 那正是本次要消除的东西（4096 默认值把长回答截断在一半，用户无从归因）。
-   *
-   * 用的是**当前输入框的值**（可能尚未保存到本 Key）：用户改完数字直接点批量是最自然的流程，
-   * 要求先保存再批量反而绕。本 Key 自身的值仍由「保存」按钮落盘。
-   */
-  const applyMaxTokensToAll = async () => {
-    if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
-      setError(t("editor.errMaxTokensZero"));
-      return;
-    }
-    setApplyingAll(true);
-    setApplyAllMsg(null);
-    setError(null);
-    try {
-      const changed = await api.applyMaxTokensToCategory(activeCategory, maxTokens);
-      // 如实区分「改了 N 条」与「本就都是这个值」——后者报成功会让人以为刚生效。
-      setApplyAllMsg(
-        changed > 0
-          ? t("editor.maxTokensApplied", { n: String(changed) })
-          : t("editor.maxTokensNoChange"),
-      );
-      await loadCategory(activeCategory);
-    } catch (e) {
-      setError(t("editor.errApplyAll", { err: String(e) }));
-    } finally {
-      setApplyingAll(false);
-    }
-  };
   const [saving, setSaving] = useState(false);
   const [invalidContextModels, setInvalidContextModels] = useState<Set<string>>(() => new Set());
   // 手动加模型输入框（不用原生 prompt()：WebView2 里行为不可靠）
@@ -257,7 +216,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
         hasSecret: initial?.hasSecret || secret.length > 0,
         enabled: initial?.enabled ?? false,
         priority: initial?.priority ?? 999,
-        params: { ...initial?.params, temperature, maxTokens, timeoutMs: typeof timeoutMs === "number" && timeoutMs >= 1000 ? timeoutMs : undefined },
+        params: { ...initial?.params, temperature, timeoutMs: typeof timeoutMs === "number" && timeoutMs >= 1000 ? timeoutMs : undefined },
         models,
         mappings,
         defaultModel: defaultModel.trim() || undefined,
@@ -421,7 +380,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     hasSecret: initial?.hasSecret || secret.length > 0,
     enabled: initial?.enabled ?? false,
     priority: initial?.priority ?? 999,
-    params: { ...initial?.params, temperature, maxTokens, timeoutMs: typeof timeoutMs === "number" && timeoutMs >= 1000 ? timeoutMs : undefined },
+    params: { ...initial?.params, temperature, timeoutMs: typeof timeoutMs === "number" && timeoutMs >= 1000 ? timeoutMs : undefined },
     models,
     mappings: mappings.filter((m) => m.expectedName && m.realName),
     defaultModel: defaultModel.trim() || undefined,
@@ -695,15 +654,6 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
             <Field label="Temperature" className="flex-1">
               <input type="number" step={0.1} min={0} max={2} className={inputCls} value={temperature} onChange={(e) => setTemperature(Number(e.target.value))} />
             </Field>
-            <Field label={t("editor.maxTokens")} className="flex-1">
-              <input
-                type="number"
-                title={t("editor.maxTokensHint")}
-                className={inputCls}
-                value={maxTokens}
-                onChange={(e) => setMaxTokens(Number(e.target.value))}
-              />
-            </Field>
             <Field label="请求超时 (ms)" className="flex-1">
               <input
                 type="number"
@@ -716,26 +666,6 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                 onChange={(e) => setTimeoutMs(e.target.value === "" ? "" : Number(e.target.value))}
               />
             </Field>
-          </div>
-
-          {/* Max Tokens 批量应用：该值当前不参与任何请求，仅兼容旧配置（见
-              applyMaxTokensToAll 的说明）。保留入口是为了让老配置能被统一清理/对齐。 */}
-          <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={applyMaxTokensToAll}
-              disabled={applyingAll || !Number.isFinite(maxTokens) || maxTokens <= 0}
-              title={t("editor.applyMaxTokensAllHint")}
-            >
-              {applyingAll ? (
-                <RefreshCw size={13} className="animate-spin" />
-              ) : (
-                <Gauge size={13} />
-              )}
-              {t("editor.applyMaxTokensAll", { n: String(maxTokens) })}
-            </Button>
-            {applyAllMsg && <span className="text-xs text-success">{applyAllMsg}</span>}
           </div>
 
           {/* 模型拉取 */}

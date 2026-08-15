@@ -242,7 +242,7 @@ mod tests {
             headers_json: None,
             // 刻意配一个旧的 max_tokens：本模块**绝不能**读它（那是被撤下的截断源头）。
             params: KeyParams {
-                max_tokens: Some(4096),
+
                 ..Default::default()
             },
             models: models

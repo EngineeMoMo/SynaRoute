@@ -290,30 +290,6 @@ pub(crate) fn set_primary_key(
     Ok(changed)
 }
 
-/// 把 Max Tokens 一次应用到该分类下全部 Key（FR-005 批量设置）。
-///
-/// ⚠️ 该值**当前不参与任何请求**（代理转发与大脑聚合都不读它），仅兼容旧配置 ——
-/// 理由见 [`Store::apply_max_tokens_to_category`] 与 `upstream/budget.rs`。
-/// 规则在 [`Store::apply_max_tokens_to_category`] 里（含已停用的 Key：否则日后重新启用
-/// 又带回旧值）。返回**实际改动条数**，让前端如实提示「已应用到 N 条」——
-/// 全都已是该值时返回 0，不谎报「已保存」。
-pub(crate) fn apply_max_tokens_to_category(
-    store: &Store,
-    category: CategoryType,
-    max_tokens: u32,
-) -> AppResult<usize> {
-    let changed = store.apply_max_tokens_to_category(category, max_tokens)?;
-    if changed > 0 {
-        store.append_event(
-            category,
-            "config",
-            None,
-            &format!("批量设置 Max Tokens = {max_tokens}（本分类 {changed} 条 Key 已更新）"),
-        );
-    }
-    Ok(changed)
-}
-
 /// 清理孤儿密钥（P2-3）。**破坏性操作**：先备份密钥库，再删。返回被清理条数。
 ///
 /// 备份失败即放弃清理（`?` 直接返回）：孤儿残留是无害的（只占空间），
@@ -1875,43 +1851,6 @@ mod tests {
         assert!(
             detail.starts_with("设为主 Key"),
             "界面来源不带前缀（与历史文案一致）: {detail}"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 批量 Max Tokens：**返回实际改动条数**，全都已是该值时为 0 且不记日志。
-    ///
-    /// 这条数字会直接显示给用户（「已应用到 N 条」）。若无条件返回总条数，
-    /// 就变成了在没有任何改动时也谎报「已保存」。
-    #[test]
-    fn apply_max_tokens_reports_real_change_count_and_is_idempotent() {
-        let (store, dir) = temp_store("max_tokens");
-        for (i, id) in ["ka", "kb"].iter().enumerate() {
-            let mut k = key(CategoryType::ClaudeCli);
-            k.id = (*id).into();
-            k.priority = i as i32;
-            store.upsert_key(k).unwrap();
-        }
-
-        assert_eq!(
-            apply_max_tokens_to_category(&store, CategoryType::ClaudeCli, 16_384).unwrap(),
-            2,
-            "两条都该被改"
-        );
-        assert_eq!(
-            apply_max_tokens_to_category(&store, CategoryType::ClaudeCli, 16_384).unwrap(),
-            0,
-            "已是该值 → 0，不谎报「已保存」"
-        );
-        assert_eq!(
-            store
-                .list_events(CategoryType::ClaudeCli)
-                .iter()
-                .filter(|e| e.detail.contains("批量设置 Max Tokens"))
-                .count(),
-            1,
-            "第二次无改动，不该再记日志"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

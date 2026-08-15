@@ -2806,7 +2806,7 @@ mod tests {
         let mut key = test_key(&upstream);
         key.protocol = Protocol::OpenaiChat;
         // 刻意配一个旧的 max_tokens：它绝不能重新出现在请求里。
-        key.params.max_tokens = Some(4096);
+
         let mut session =
             ToolSession::new(Protocol::OpenaiChat, &MultimodalPrompt::from_text("问题"));
 
@@ -2853,8 +2853,8 @@ mod tests {
         .await;
         let (work, env) = tool_env_with_file("ant_dyncap").await;
         let (sdir, store) = test_store("ant_dyncap_store");
-        let mut key = test_key(&upstream); // test_key 已带 context_window = 200_000
-        key.params.max_tokens = Some(4096); // 旧值必须被忽略
+        let key = test_key(&upstream); // test_key 已带 context_window = 200_000
+
         let mut session =
             ToolSession::new(Protocol::Anthropic, &MultimodalPrompt::from_text("问题"));
 
@@ -2911,7 +2911,7 @@ mod tests {
         let (sdir, store) = test_store("ant_nowin_store");
         let mut key = test_key(&upstream);
         key.models.clear(); // 抹掉窗口数据（等于用户手填模型名 / 只拉取过列表）
-        key.params.max_tokens = Some(4096); // 有旧值也不许拿来兜底
+
         let mut session =
             ToolSession::new(Protocol::Anthropic, &MultimodalPrompt::from_text("问题"));
 

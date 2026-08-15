@@ -2658,7 +2658,7 @@ mod tests {
     fn key_params_are_injected_into_payload() {
         let params = crate::model::KeyParams {
             temperature: Some(0.2),
-            max_tokens: Some(8192),
+
             top_p: Some(0.9),
             timeout_ms: Some(30_000),
         };
@@ -2686,7 +2686,7 @@ mod tests {
     fn key_max_tokens_is_never_injected_by_proxy() {
         let params = crate::model::KeyParams {
             temperature: Some(0.2),
-            max_tokens: Some(8192),
+
             top_p: Some(0.9),
             timeout_ms: Some(30_000),
         };
@@ -2741,7 +2741,7 @@ mod tests {
     fn key_params_skip_sampling_when_thinking_present() {
         let params = crate::model::KeyParams {
             temperature: Some(0.2),
-            max_tokens: Some(8192),
+
             top_p: Some(0.9),
             timeout_ms: None,
         };
@@ -2775,7 +2775,7 @@ mod tests {
     fn key_params_do_not_override_explicit_downstream_values() {
         let params = crate::model::KeyParams {
             temperature: Some(0.2),
-            max_tokens: Some(8192),
+
             top_p: Some(0.9),
             timeout_ms: None,
         };
@@ -2808,7 +2808,7 @@ mod tests {
         // 未配置的字段不该凭空造出来。
         let none = crate::model::KeyParams {
             temperature: None,
-            max_tokens: None,
+
             top_p: None,
             timeout_ms: None,
         };
@@ -2828,7 +2828,7 @@ mod tests {
     fn key_params_keep_decimal_fidelity() {
         let params = crate::model::KeyParams {
             temperature: Some(0.2),
-            max_tokens: None,
+
             top_p: Some(0.95),
             timeout_ms: None,
         };
@@ -2846,7 +2846,7 @@ mod tests {
     fn key_params_skip_non_finite_values() {
         let params = crate::model::KeyParams {
             temperature: Some(f32::NAN),
-            max_tokens: None,
+
             top_p: Some(f32::INFINITY),
             timeout_ms: None,
         };

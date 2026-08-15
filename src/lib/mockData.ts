@@ -69,7 +69,7 @@ const store: Record<CategoryType, ProviderKey[]> = {
       hasSecret: true,
       enabled: true,
       priority: 0,
-      params: { temperature: 1.0, maxTokens: 8192 },
+      params: { temperature: 1.0 },
       models: models(["opus-4-6", "opus-4-7", "opus-4-8"], 200000),
       mappings: [],
       health: { status: "up", lastChecked: now - 20_000, latencyMs: 320, failCount: 0 },
@@ -88,7 +88,7 @@ const store: Record<CategoryType, ProviderKey[]> = {
       hasSecret: true,
       enabled: true,
       priority: 1,
-      params: { temperature: 1.0, maxTokens: 8192 },
+      params: { temperature: 1.0 },
       models: models(["opus-4-6", "opus-4-7", "opus-4-8", "fable-5"], 200000),
       mappings: [],
       health: { status: "up", lastChecked: now - 22_000, latencyMs: 540, failCount: 0 },
@@ -104,7 +104,7 @@ const store: Record<CategoryType, ProviderKey[]> = {
       hasSecret: true,
       enabled: true,
       priority: 2,
-      params: { temperature: 1.0, maxTokens: 8192 },
+      params: { temperature: 1.0 },
       models: models(["GLM5.1", "GLM5.2"]),
       mappings: [
         { id: "m1", expectedName: "opus-4-7", realName: "GLM5.1" },
@@ -127,7 +127,7 @@ const store: Record<CategoryType, ProviderKey[]> = {
       hasSecret: true,
       enabled: false, // 禁用 → 不参与定时探测 → 状态永久冻结
       priority: 3,
-      params: { temperature: 1.0, maxTokens: 8192 },
+      params: { temperature: 1.0 },
       models: models(["claude-opus-4-8"]),
       mappings: [],
       health: {
@@ -148,7 +148,7 @@ const store: Record<CategoryType, ProviderKey[]> = {
       hasSecret: true,
       enabled: true,
       priority: 4,
-      params: { temperature: 1.0, maxTokens: 8192 },
+      params: { temperature: 1.0 },
       models: models(["claude-opus-4-8"]),
       mappings: [],
       health: { status: "down", lastChecked: now - 30_000, latencyMs: 1251, failCount: 1 },
@@ -163,7 +163,7 @@ const store: Record<CategoryType, ProviderKey[]> = {
       hasSecret: true,
       enabled: true,
       priority: 5,
-      params: { temperature: 1.0, maxTokens: 8192 },
+      params: { temperature: 1.0 },
       models: models(["claude-opus-4-8"]),
       mappings: [],
       // 熔断中：breakerUntil 在 40 秒后到期 → 常驻警告条应显示这条 Key
@@ -182,7 +182,7 @@ const store: Record<CategoryType, ProviderKey[]> = {
       hasSecret: true,
       enabled: true,
       priority: 0,
-      params: { temperature: 1.0, maxTokens: 8192 },
+      params: { temperature: 1.0 },
       models: models(["gpt-5.6", "gpt-5.4"]),
       mappings: [],
       health: { status: "up", lastChecked: now - 15_000, latencyMs: 280, failCount: 0 },
@@ -499,21 +499,6 @@ export const mockBridge = {
         changed = true;
       }
     });
-    return changed;
-  },
-
-  // 批量设置 Max Tokens：与后端同语义 —— 含已停用的 Key、幂等（无改动返 0）。
-  async applyMaxTokensToCategory(categoryId: CategoryType, maxTokens: number) {
-    await delay();
-    if (maxTokens <= 0) throw new Error("Max Tokens 不能为 0（上游会直接拒绝请求）");
-    const list = store[categoryId] ?? [];
-    let changed = 0;
-    for (const k of list) {
-      if (k.params.maxTokens !== maxTokens) {
-        k.params = { ...k.params, maxTokens };
-        changed++;
-      }
-    }
     return changed;
   },
 
