@@ -99,7 +99,10 @@ pub async fn health_probe_real(
     // 探测超时封顶 8s（fast_timeout）：1 token 秒回，不跟随用户为慢厂商设的长超时，
     // 否则一个挂掉的慢 Key 会把它所在的那条探测并发槽占满（见 health::sweep_all_enabled，
     // PROBE_CONCURRENCY = 4），拖慢整轮扫描。
-    let result = text_completion(key, secret, &model, message, 1, false, fast_timeout(key)).await;
+    // `Some(1)`：探测**刻意**要这个上限——只验证「打得通」，不要真让上游生成内容。
+    // 与大脑聚合的「不设上限」不矛盾：那边是要完整答案，这边是要秒回。
+    let result =
+        text_completion(key, secret, &model, message, Some(1), false, fast_timeout(key)).await;
     let latency = start.elapsed().as_millis() as u64;
     match result {
         Ok(_) => (true, latency, None),

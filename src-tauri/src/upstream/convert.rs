@@ -195,10 +195,12 @@ fn openai_tools_to_anthropic(tools: &Value) -> Option<Value> {
 pub fn anthropic_to_openai(body: &Value) -> Value {
     let mut out = serde_json::Map::new();
     out.insert("model".into(), body.get("model").cloned().unwrap_or(Value::Null));
-    out.insert(
-        "max_tokens".into(),
-        body.get("max_tokens").cloned().unwrap_or(json!(4096)),
-    );
+    // 输出上限**只在源请求真有时才带**：OpenAI Chat 的 max_tokens 是可选项，
+    // 源没给就该省略。此前这里 `unwrap_or(4096)` 会凭空造一个上限 —— 那与
+    // 「代理不替客户端决定输出长度」直接冲突（见 proxy::apply_key_params 的定调）。
+    if let Some(mt) = body.get("max_tokens") {
+        out.insert("max_tokens".into(), mt.clone());
+    }
 
     let mut messages: Vec<Value> = vec![];
     // system（string 或 block 数组）→ system 消息
@@ -305,13 +307,19 @@ pub fn anthropic_to_openai(body: &Value) -> Value {
 pub fn openai_to_anthropic(body: &Value) -> Value {
     let mut out = serde_json::Map::new();
     out.insert("model".into(), body.get("model").cloned().unwrap_or(Value::Null));
-    // Anthropic max_tokens 必填：优先 max_tokens，回退 max_completion_tokens，最后兜底
-    let max_tokens = body
+    // Anthropic 的 `max_tokens` 必填，但**这里不负责凭空造一个**。
+    //
+    // 源请求给了就带上（含 Chat 的别名 `max_completion_tokens`）；源没给就先留空，
+    // 由**知道目标 Key 与真实模型**的调用方按「窗口剩余 ∩ 模型最大输出」补齐
+    // （见 `proxy::ensure_anthropic_max_tokens`）。此前这里 `unwrap_or(4096)`：
+    // OpenAI 客户端本来没设上限，跨协议转到 Anthropic Key 后却被本地按 4096 截断，
+    // 而用户只会以为是上游中转商的问题 —— 与本项目「不替客户端决定输出长度」的定调冲突。
+    if let Some(mt) = body
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
-        .cloned()
-        .unwrap_or(json!(4096));
-    out.insert("max_tokens".into(), max_tokens);
+    {
+        out.insert("max_tokens".into(), mt.clone());
+    }
 
     let mut system = String::new();
     let mut messages: Vec<Value> = vec![];
@@ -408,11 +416,14 @@ pub fn openai_to_anthropic(body: &Value) -> Value {
     // 推理强度：OpenAI reasoning.effort → Anthropic thinking.budget_tokens（两套机制的语义映射）。
     // Codex 改推理强度经此落到 Claude 上游的扩展思考预算；minimal/未知档不开思考。
     // 注意 Anthropic 开 thinking 时要求 temperature=1（否则 400），故一并归一。
-    if let Some(effort) = read_reasoning_effort(body) {
-        let max_tokens = out
-            .get("max_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(4096);
+    //
+    // 只有已经有**真实输出上限**时才在这里打开 thinking：源请求没给 max_tokens 的跨协议
+    // 情况，要等 proxy 层按目标模型窗口补齐后再判断（convert.rs 不知道 Key/真实模型，不能
+    // 为了算 thinking 偷偷回退 4096）。
+    if let (Some(effort), Some(max_tokens)) = (
+        read_reasoning_effort(body),
+        out.get("max_tokens").and_then(|v| v.as_u64()),
+    ) {
         if let Some(budget) = effort_to_thinking_budget(&effort, max_tokens) {
             out.insert(
                 "thinking".into(),
@@ -1601,6 +1612,32 @@ mod tests {
         assert_eq!(msgs[1]["role"], "tool");
         assert_eq!(msgs[1]["tool_call_id"], "t1");
         assert_eq!(msgs[1]["content"], "结果");
+    }
+
+    #[test]
+    fn o2a_omitted_cap_stays_omitted_for_key_aware_proxy_to_fill() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let a = openai_to_anthropic(&body);
+        assert!(
+            a.get("max_tokens").is_none(),
+            "转换器没有 Key/真实模型能力数据，绝不得凭空造 4096；proxy 层会补 Anthropic 必填值"
+        );
+    }
+
+    #[test]
+    fn a2o_omitted_cap_stays_omitted_for_optional_openai_target() {
+        let body = json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let o = anthropic_to_openai(&body);
+        assert!(
+            o.get("max_tokens").is_none(),
+            "OpenAI 输出上限是可选项，源没给就保持省略，不能凭空造 4096"
+        );
     }
 
     #[test]

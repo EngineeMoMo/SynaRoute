@@ -1373,14 +1373,22 @@ async fn try_stream_to_key(
         obj.insert("model".into(), Value::String(real_model.clone()));
     }
     inject_default_effort(store, category, &mut payload, downstream, key.protocol);
-    // Key 上配的采样参数（下游没显式给才注入）。必须在协议转换**之前**，见该函数文档。
+    // Key 上配的 temperature / top_p（下游没显式给才注入）；输出 token 上限绝不补写。
     // count_tokens 等非补全子路径不注入（那些端点的 schema 不含采样字段，注了会被上游 400）。
     if path_takes_sampling_params(path) {
-        apply_key_params(&mut payload, &key.params, downstream);
+        apply_key_params(&mut payload, &key.params);
     }
     let payload = crate::upstream::convert_request_owned(payload, downstream, key.protocol);
 
-    // 同协议：原样保留下游路径 + query（count_tokens 等子路径正确透传）。
+    // OpenAI→Anthropic 跨协议时，Anthropic 的 max_tokens 虽必填，但客户端可能没给（OpenAI
+    // 允许省略）。转换器不知道目标 Key/真实模型，绝不能在里面回退 4096；这里才有完整信息，
+    // 因而只在补全端点按「模型最大输出 ∩ 窗口」补。count_tokens 的 schema 不收 max_tokens，
+    // 必须跳过，否则严格 Anthropic 上游 400。
+    let payload = if path_takes_sampling_params(path) {
+        ensure_anthropic_output_budget(payload, key, &real_model)?
+    } else {
+        payload
+    };
     // 跨协议：退回上游协议的补全端点。
     let resource_path: std::borrow::Cow<str> = if downstream == key.protocol {
         std::borrow::Cow::Borrowed(path)
@@ -1769,32 +1777,14 @@ fn inject_default_effort(
     }
 }
 
-/// 把 Key 上配置的采样参数（temperature / top_p / max_tokens）注入请求体。
-///
-/// **为什么需要**：`KeyParams` 的四个字段里，此前只有 `timeout_ms` 被转发路径读过
-/// （`key.params.timeout_ms` 是全 proxy.rs 唯一一处 `key.params.` 引用），
-/// 另外三个在**整个后端零使用**——`max_tokens` 仅被 `aggregate.rs` 的大脑聚合读，
-/// `temperature` / `top_p` 连那里都没有。而 KeyEditor 让用户填这三个值、保存进 config.json、
-/// 「批量应用 Max Tokens 到本分类全部 Key」还会回一条「已应用到 N 条」的成功提示。
-/// 于是形成本项目最忌讳的失效形态：**能配、能存、有回执、对转发零作用**，
-/// 用户把「设了没用」归因成「这个中转商不听参数」，排查方向完全错。
-/// （FR-005 验收判据 2 要求「转发请求携带该 Key 配置的参数，可通过代理日志验证」。）
-///
-/// **口径：只在下游未显式给出时注入**，与 [`inject_default_effort`] 的「已有则不覆盖」一致。
-/// 客户端显式发的值代表用户当下的意图（如 Claude Code 针对某次对话调的 temperature），
-/// 优先级高于 Key 上配的默认值；Key 参数的定位是「这个 Key 的缺省」，不是「强制覆盖」。
-///
-/// **必须在协议转换之前调用**：字段名按**下游**协议写，转换层会负责改写成上游形态
-/// （如 Responses 的 `max_output_tokens` → Anthropic 的 `max_tokens`，见 convert.rs:921）。
-/// 若放在转换之后，就得自己再判一次上游协议，那正是「两套真相」的开端。
-/// Key 上配的采样参数（temperature / max_tokens / top_p）是否该注入本次请求。
+/// Key 上配的采样参数（temperature / top_p）是否该注入本次请求。
 ///
 /// **只有「补全端点」该注入**。Claude CLI / 桌面端做 token 计数会发
 /// `POST /v1/messages/count_tokens`，body 只含 model/messages、无采样字段，
 /// 同协议直通会原样发到上游的 count_tokens 端点 —— 而该端点的 schema **不含**
-/// max_tokens/temperature/top_p，严格上游（Anthropic 官方）会以 400「extra inputs
+/// temperature/top_p，严格上游（Anthropic 官方）会以 400「extra inputs
 /// not permitted」拒绝，客户端 token 计数功能失效。而 KeyEditor 默认就带
-/// temperature=1.0 + max_tokens=8192，几乎每个 Key 都会触发，不是边角场景。
+/// temperature=1.0，几乎每个 Key 都会触发，不是边角场景。
 ///
 /// 判据用「路径**不含** count_tokens」而非「等于补全路径」：各端补全路径形态不同
 /// （/v1/messages、/chat/completions、/responses，还可能带 ?beta= 等 query），
@@ -1803,30 +1793,72 @@ fn path_takes_sampling_params(path: &str) -> bool {
     !path.contains("count_tokens")
 }
 
-fn apply_key_params(payload: &mut Value, params: &crate::model::KeyParams, downstream: Protocol) {
+/// 为跨协议到 Anthropic 的请求补**协议必填**的 `max_tokens`，但只在客户端本来没给时。
+///
+/// 代理的总原则仍是「不替客户端决定输出长度」：
+/// - 目标不是 Anthropic → 原样返回；
+/// - 客户端已经给了上限 → 原样返回（即使值不理想，也不擅自覆盖）；
+/// - 客户端没给且目标是 Anthropic → 这是协议唯一不允许省略的字段，按实际目标模型的
+///   最大输出能力与窗口（若已有）计算一个合法值。
+///
+/// 计算放这里而不是 `convert.rs`：转换器只有 JSON/协议，没有 `ProviderKey` 和已经解析过的
+/// `real_model`，在那层只能瞎填 4096；那正是审计发现的跨协议静默截断。
+fn ensure_anthropic_output_budget(
+    mut payload: Value,
+    key: &ProviderKey,
+    real_model: &str,
+) -> AppResult<Value> {
+    if key.protocol != Protocol::Anthropic
+        || payload
+            .get("max_tokens")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Ok(payload);
+    }
+    let input_tokens = crate::upstream::estimate_json_tokens_without_image_transport(&payload);
+    let max_tokens = crate::upstream::anthropic_required_max_tokens(
+        real_model,
+        key.context_window_of_real(real_model),
+        input_tokens,
+    )
+    .map_err(AppError::Invalid)?;
+    let obj = payload
+        .as_object_mut()
+        .ok_or_else(|| AppError::Invalid("请求体必须是 JSON 对象".into()))?;
+    obj.insert("max_tokens".into(), Value::from(max_tokens));
+    Ok(payload)
+}
+
+/// 把 Key 上配置的采样参数（temperature / top_p）注入请求体。
+///
+/// **输出 token 上限刻意不在此列**（产品定调，2026-08-14）：代理相对 cc-switch 的增量只有
+/// 路由与自动故障转移，**不替客户端决定它没要求过的输出长度**。客户端没发 `max_tokens`
+/// 时，那是「由客户端/上游自己的默认值决定」，而不是「等着代理填一个」——
+/// 此前用 Key 上的值（新建 Key 默认 8192）补进去，等于悄悄给每个请求加了个上限，
+/// 用户看到长回答被截断只会去查上游，永远查不到是代理加的。
+/// `KeyParams.max_tokens` 现在**没有任何请求路径读它**（后续 2026-08-15 那次定调把
+/// 大脑聚合也改成按协议与模型上下文窗口现算了，见 `upstream/budget.rs`），仅兼容旧配置。
+///
+/// 客户端**显式**发的输出上限一律原样保留：同协议直通不动，跨协议由
+/// `convert.rs` 负责改名（`max_output_tokens` ↔ `max_tokens` ↔ `max_completion_tokens`）。
+/// 故障转移换到别的 Key 也不改——每个候选都从同一份原始 body 生成，
+/// 不会出现「同一问题落到 A Key 完整、落到 B Key 被切断」。
+///
+/// **口径：只在下游未显式给出时注入**，与 [`inject_default_effort`] 的「已有则不覆盖」一致。
+/// 客户端显式发的值代表用户当下的意图（如 Claude Code 针对某次对话调的 temperature），
+/// 优先级高于 Key 上配的默认值；Key 参数的定位是「这个 Key 的缺省」，不是「强制覆盖」。
+fn apply_key_params(payload: &mut Value, params: &crate::model::KeyParams) {
     let Some(obj) = payload.as_object_mut() else { return };
 
     // Anthropic 扩展思考（下游 body 已带 `thinking`）与采样参数互斥：开 thinking 时
     // Anthropic 要求 temperature 固定为 1、且不可有 top_p，否则 400（判据见 convert.rs:410/421，
     // 跨协议路径已按此归一）。此处是**同协议 Anthropic 直通**，没有那道归一化 ——
     // 若把 Key 上配的非 1 temperature / top_p 注进带 thinking 的请求，上游直接 400。
-    // 故 thinking 在场时不碰采样字段（max_tokens 与 thinking 不冲突，仍照注）。
+    // 故 thinking 在场时不碰采样字段。
     let has_thinking = obj.get("thinking").is_some_and(|t| !t.is_null());
-    // max_tokens 的字段名随**下游**协议不同：Responses 用 max_output_tokens，
-    // Anthropic 与 Chat 用 max_tokens。Chat 另接受 max_completion_tokens 作为别名，
-    // 故判「已有」时两个名字都要看，否则会在客户端已用新名时重复注入旧名。
-    let max_tokens_key = match downstream {
-        Protocol::OpenaiResponses => "max_output_tokens",
-        Protocol::Anthropic | Protocol::OpenaiChat => "max_tokens",
-    };
-    if let Some(v) = params.max_tokens {
-        let already = obj.get(max_tokens_key).is_some_and(|x| !x.is_null())
-            || (downstream == Protocol::OpenaiChat
-                && obj.get("max_completion_tokens").is_some_and(|x| !x.is_null()));
-        if !already {
-            obj.insert(max_tokens_key.into(), Value::from(v));
-        }
-    }
+
+    // 这里**故意没有 max_tokens 分支**：客户端没给输出上限就是没给，代理不代它决定。
+    // 见本函数文档顶部那段产品定调；`params.max_tokens` 现在是纯兼容字段，无人读。
 
     // temperature / top_p 三协议同名。thinking 在场时**跳过**（见上，避免同协议直通 400）。
     for (name, val) in [("temperature", params.temperature), ("top_p", params.top_p)] {
@@ -1921,12 +1953,19 @@ async fn forward_to_key(
     // 与 try_stream_to_key 同进同退：Key 参数注入必须两条路径都做，
     // 否则「非流式生效、流式不生效」这种按客户端而异的分叉极难归因。
     // 同样跳过 count_tokens 等非补全子路径（见 path_takes_sampling_params）。
+    // 输出 token 上限不从 Key 补写；apply_key_params 只处理 temperature / top_p。
     if path_takes_sampling_params(path) {
-        apply_key_params(&mut payload, &key.params, downstream);
+        apply_key_params(&mut payload, &key.params);
     }
 
     // 跨协议转换（下游协议 → 上游 Key 协议；同协议时 convert_request 内部直接返回克隆）
     let payload = crate::upstream::convert_request_owned(payload, downstream, key.protocol);
+    // 与流式路径同进同退：补 Anthropic 必填的 max_tokens（见那里的完整说明）。
+    let payload = if path_takes_sampling_params(path) {
+        ensure_anthropic_output_budget(payload, key, &real_model)?
+    } else {
+        payload
+    };
 
     // 发往上游的请求体快照（pretty，方便页面阅读；密钥不在 body 里，安全）。
     //
@@ -2512,10 +2551,10 @@ mod tests {
 
     /// 推理强度必须取**本请求所属分类**的设置，不能硬编码 Codex。
     /// 硬编码时把任一 Responses 客户端接到别的分类端口，就会读到 Codex 的强度（口径串台）。
-    /// Key 上配的采样参数必须真的进请求体。
+    /// Key 上配的 temperature / top_p 必须真的进请求体。
     ///
-    /// 钉住的是一条**静默失效**：`temperature` / `top_p` / `max_tokens` 曾在整个后端零使用
-    /// （只有 `timeout_ms` 被读），而 UI 能填、能存、批量应用还回「已应用到 N 条」。
+    /// 钉住的是一条**静默失效**：`temperature` / `top_p` 曾在整个后端零使用
+    /// （只有 `timeout_ms` 被读），而 UI 能填、能存。
     /// 删掉 `apply_key_params` 的调用，本测试必须变红。
     #[test]
     fn key_params_are_injected_into_payload() {
@@ -2526,30 +2565,61 @@ mod tests {
             timeout_ms: Some(30_000),
         };
 
-        // Anthropic / Chat 下游：max_tokens 原名
-        for downstream in [Protocol::Anthropic, Protocol::OpenaiChat] {
-            let mut payload = json!({ "model": "m", "messages": [] });
-            apply_key_params(&mut payload, &params, downstream);
-            assert_eq!(payload["max_tokens"], 8192, "{downstream:?} 应注入 max_tokens");
-            assert_eq!(payload["temperature"], 0.2, "{downstream:?} 应注入 temperature");
-            assert_eq!(payload["top_p"], 0.9, "{downstream:?} 应注入 top_p");
+        for body in [
+            json!({ "model": "m", "messages": [] }),
+            json!({ "model": "m", "input": [] }),
+        ] {
+            let mut payload = body;
+            apply_key_params(&mut payload, &params);
+            assert_eq!(payload["temperature"], 0.2, "应注入 temperature");
+            assert_eq!(payload["top_p"], 0.9, "应注入 top_p");
         }
+    }
 
-        // Responses 下游：字段名是 max_output_tokens（写错名字上游会忽略 → 又一次静默失效）
-        let mut payload = json!({ "model": "m", "input": [] });
-        apply_key_params(&mut payload, &params, Protocol::OpenaiResponses);
-        assert_eq!(payload["max_output_tokens"], 8192);
-        assert!(
-            payload.get("max_tokens").is_none(),
-            "Responses 下游不该写 max_tokens 这个名字"
-        );
+    /// 输出 token 上限**绝不由代理凭空补写**（产品定调 2026-08-14）。
+    ///
+    /// 钉住的是一条会被误当成上游问题的行为：客户端（Claude Code / Codex）没发输出上限时，
+    /// 代理曾用 Key 上的 `max_tokens` 补一个进去 —— 而 KeyEditor 新建 Key 默认就是 8192，
+    /// 于是几乎每个用户的每个请求都被悄悄加了上限，长回答被截断只会去查中转商。
+    /// 相对 cc-switch，本代理的增量只有路由与故障转移，不含「替客户端决定输出长度」。
+    ///
+    /// 若有人把 max_tokens 注入加回 `apply_key_params`，本测试必须变红。
+    #[test]
+    fn key_max_tokens_is_never_injected_by_proxy() {
+        let params = crate::model::KeyParams {
+            temperature: Some(0.2),
+            max_tokens: Some(8192),
+            top_p: Some(0.9),
+            timeout_ms: Some(30_000),
+        };
+
+        // 两种下游 body 形态（Anthropic/Chat 的 messages、Responses 的 input）都不得出现
+        // 代理新增的输出上限 —— 三个可能的字段名一个都不许冒出来。
+        //
+        // 本函数**不再按协议分支**（这正是本次改动的一部分：没有按协议选字段名这回事了），
+        // 故这里不传协议、也不必枚举三种协议 —— 覆盖两种 body 形态即穷尽了输入空间。
+        for body in [
+            json!({ "model": "m", "messages": [] }),
+            json!({ "model": "m", "input": [] }),
+        ] {
+            let mut payload = body;
+            apply_key_params(&mut payload, &params);
+            for name in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
+                assert!(
+                    payload.get(name).is_none(),
+                    "代理不得凭空写入 {name}（客户端没要求过输出上限）"
+                );
+            }
+            // 但采样参数照旧注入，证明「没写 max_tokens」不是因为整个函数没跑。
+            assert_eq!(payload["temperature"], 0.2);
+        }
     }
 
     /// count_tokens 等非补全子路径**不得**注入采样参数。
     ///
     /// 钉住一条 P2：Claude CLI/桌面端做 token 计数发 /v1/messages/count_tokens，
-    /// 该端点 schema 不含 max_tokens/temperature/top_p，而 KeyEditor 默认就带这两个值 ——
-    /// 若无条件注入，同协议直通会把它们原样发到 count_tokens 端点，严格上游 400。
+    /// 该端点 schema 不含 temperature/top_p，而 KeyEditor 默认就带 temperature ——
+    /// 若无条件注入，同协议直通会把它原样发到 count_tokens 端点，严格上游 400。
     /// 判据函数是 `path_takes_sampling_params`；转发路径据它决定调不调 apply_key_params。
     #[test]
     fn count_tokens_path_excluded_from_sampling_params() {
@@ -2569,7 +2639,6 @@ mod tests {
 
     /// 扩展思考（thinking）在场时不注入 temperature / top_p —— 同协议 Anthropic 直通
     /// 没有跨协议那道「开 thinking 归一 temperature=1、去 top_p」，注了非 1 值上游会 400。
-    /// max_tokens 与 thinking 不冲突，仍应注入。
     #[test]
     fn key_params_skip_sampling_when_thinking_present() {
         let params = crate::model::KeyParams {
@@ -2584,7 +2653,7 @@ mod tests {
             "messages": [],
             "thinking": { "type": "enabled", "budget_tokens": 2048 }
         });
-        apply_key_params(&mut payload, &params, Protocol::Anthropic);
+        apply_key_params(&mut payload, &params);
         assert!(
             payload.get("temperature").is_none(),
             "thinking 在场时不得注入 temperature（Anthropic 会 400）"
@@ -2593,13 +2662,17 @@ mod tests {
             payload.get("top_p").is_none(),
             "thinking 在场时不得注入 top_p"
         );
-        assert_eq!(
-            payload["max_tokens"], 8192,
-            "max_tokens 与 thinking 不冲突，仍应注入"
+        // 输出上限也不补：thinking 请求同样由客户端自己定长度。
+        assert!(
+            payload.get("max_tokens").is_none(),
+            "代理不得凭空写入 max_tokens"
         );
     }
 
     /// 下游显式给了值 → 尊重下游，不覆盖（与 inject_default_effort 同口径）。
+    ///
+    /// 客户端显式发的输出上限也在此钉住：三种名字都必须**原值原名**留在 body 里
+    /// （同协议直通不动，跨协议由 convert.rs 改名），代理既不覆盖也不追加第二个名字。
     #[test]
     fn key_params_do_not_override_explicit_downstream_values() {
         let params = crate::model::KeyParams {
@@ -2612,18 +2685,27 @@ mod tests {
             "model": "m", "messages": [],
             "max_tokens": 512, "temperature": 1.5, "top_p": 0.1
         });
-        apply_key_params(&mut payload, &params, Protocol::Anthropic);
+        apply_key_params(&mut payload, &params);
         assert_eq!(payload["max_tokens"], 512, "客户端显式值优先");
         assert_eq!(payload["temperature"], 1.5);
         assert_eq!(payload["top_p"], 0.1);
 
-        // Chat 的别名 max_completion_tokens 也算「已有」，否则会两个名字都出现。
-        let mut payload = json!({ "model": "m", "messages": [], "max_completion_tokens": 256 });
-        apply_key_params(&mut payload, &params, Protocol::OpenaiChat);
-        assert!(
-            payload.get("max_tokens").is_none(),
-            "已有 max_completion_tokens 时不应再注入 max_tokens"
-        );
+        // 客户端用别名 / Responses 名字时，同样原封不动，且不会多冒出一个同义字段。
+        for (given, other_names) in [
+            ("max_completion_tokens", ["max_tokens", "max_output_tokens"]),
+            ("max_output_tokens", ["max_tokens", "max_completion_tokens"]),
+        ] {
+            let mut payload = json!({ "model": "m", "messages": [] });
+            payload[given] = json!(256);
+            apply_key_params(&mut payload, &params);
+            assert_eq!(payload[given], 256, "{given} 应原值保留");
+            for name in other_names {
+                assert!(
+                    payload.get(name).is_none(),
+                    "已有 {given} 时不应再出现 {name}"
+                );
+            }
+        }
 
         // 未配置的字段不该凭空造出来。
         let none = crate::model::KeyParams {
@@ -2633,7 +2715,7 @@ mod tests {
             timeout_ms: None,
         };
         let mut payload = json!({ "model": "m", "messages": [] });
-        apply_key_params(&mut payload, &none, Protocol::Anthropic);
+        apply_key_params(&mut payload, &none);
         assert!(payload.get("max_tokens").is_none());
         assert!(payload.get("temperature").is_none());
         assert!(payload.get("top_p").is_none());
@@ -2653,7 +2735,7 @@ mod tests {
             timeout_ms: None,
         };
         let mut payload = json!({ "model": "m", "messages": [] });
-        apply_key_params(&mut payload, &params, Protocol::Anthropic);
+        apply_key_params(&mut payload, &params);
 
         // 比字符串而非比数值：0.20000000298023224 == 0.2 在 f64 比较下是 false，
         // 但真正要钉的是「序列化出去长什么样」。
@@ -2671,7 +2753,7 @@ mod tests {
             timeout_ms: None,
         };
         let mut payload = json!({ "model": "m", "messages": [] });
-        apply_key_params(&mut payload, &params, Protocol::Anthropic);
+        apply_key_params(&mut payload, &params);
         assert!(payload.get("temperature").is_none(), "NaN 不应注入");
         assert!(payload.get("top_p").is_none(), "Inf 不应注入");
     }
@@ -3010,6 +3092,39 @@ mod tests {
             fetched_at: None,
             context_window: ctx,
         }
+    }
+
+    /// OpenAI 客户端省略上限、跨协议转到 Anthropic Key 时：代理必须补**模型能力值**，
+    /// 不能让 convert.rs 凭空回退 4096。此函数是两个转发路径（流式/非流式）共用的最后防线。
+    #[test]
+    fn cross_protocol_anthropic_budget_uses_model_cap_not_4096() {
+        let mut k = key("k", 0, "https://example.com");
+        k.models = vec![model_ctx("claude-sonnet-4-5", Some(200_000))];
+        let original = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        // 模拟 OpenAI→Anthropic 转换后仍缺字段的状态。
+        let converted = crate::upstream::convert_request_owned(
+            original,
+            Protocol::OpenaiChat,
+            Protocol::Anthropic,
+        );
+        assert!(converted.get("max_tokens").is_none(), "转换层不应猜 4096");
+        let final_body = ensure_anthropic_output_budget(converted, &k, "claude-sonnet-4-5")
+            .expect("代理握有 Key/模型能力数据，必须能补 Anthropic 必填字段");
+        assert_eq!(final_body["max_tokens"], 64_000);
+        assert_ne!(final_body["max_tokens"], 4096);
+    }
+
+    /// 客户端明确给出的上限必须优先，即使目标协议为 Anthropic 也不得被能力计算覆盖。
+    #[test]
+    fn cross_protocol_anthropic_budget_preserves_client_cap() {
+        let mut k = key("k", 0, "https://example.com");
+        k.models = vec![model_ctx("claude-sonnet-4-5", Some(200_000))];
+        let payload = json!({ "model": "claude-sonnet-4-5", "max_tokens": 1234, "messages": [] });
+        let final_body = ensure_anthropic_output_budget(payload, &k, "claude-sonnet-4-5").unwrap();
+        assert_eq!(final_body["max_tokens"], 1234);
     }
 
     #[test]

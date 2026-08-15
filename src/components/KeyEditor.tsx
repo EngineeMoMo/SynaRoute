@@ -126,8 +126,12 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   /**
    * 把当前输入框里的 Max Tokens 一次应用到本分类**全部** Key。
    *
-   * 为什么要有：逐 Key 存是对的（各厂商上限不同），但漏改一个就会在故障转移落到它时按旧值
-   * 截断回答 —— 表现为「同一个问题有时完整、有时被切断」，极难联想到是某个备用 Key 的参数。
+   * ⚠️ 该值**当前不参与任何请求**（2026-08-15 定调）：代理转发透明不补上限；大脑聚合的
+   * 输出预算按协议与模型上下文窗口自动算（见 upstream/budget.rs）。字段与本批量入口
+   * 仅为兼容旧配置保留 —— 老配置里存着值，删字段要做迁移，收益不抵风险。
+   *
+   * 文案已如实标注「不生效」。**不要**因为「看起来没用」就悄悄把它接回某条请求路径：
+   * 那正是本次要消除的东西（4096 默认值把长回答截断在一半，用户无从归因）。
    *
    * 用的是**当前输入框的值**（可能尚未保存到本 Key）：用户改完数字直接点批量是最自然的流程，
    * 要求先保存再批量反而绕。本 Key 自身的值仍由「保存」按钮落盘。
@@ -691,8 +695,14 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
             <Field label="Temperature" className="flex-1">
               <input type="number" step={0.1} min={0} max={2} className={inputCls} value={temperature} onChange={(e) => setTemperature(Number(e.target.value))} />
             </Field>
-            <Field label="Max Tokens" className="flex-1">
-              <input type="number" className={inputCls} value={maxTokens} onChange={(e) => setMaxTokens(Number(e.target.value))} />
+            <Field label={t("editor.maxTokens")} className="flex-1">
+              <input
+                type="number"
+                title={t("editor.maxTokensHint")}
+                className={inputCls}
+                value={maxTokens}
+                onChange={(e) => setMaxTokens(Number(e.target.value))}
+              />
             </Field>
             <Field label="请求超时 (ms)" className="flex-1">
               <input
@@ -708,8 +718,8 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
             </Field>
           </div>
 
-          {/* Max Tokens 批量应用：漏改一个 Key 会在故障转移落到它时按旧值截断回答，
-              那种偶发性问题极难排查，故给一个「一次统一」的入口（含已停用的 Key）。 */}
+          {/* Max Tokens 批量应用：该值当前不参与任何请求，仅兼容旧配置（见
+              applyMaxTokensToAll 的说明）。保留入口是为了让老配置能被统一清理/对齐。 */}
           <div className="flex items-center gap-2">
             <Button
               variant="outline"

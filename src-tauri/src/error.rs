@@ -50,6 +50,7 @@ pub enum AppError {
 /// 示例：
 /// - Windows: `C:\Users\Alice\Documents\project\file.txt` → `C:\Users\***\Documents\project\file.txt`
 /// - Unix: `/home/alice/.config/app/data.json` → `/home/***/.config/app/data.json`
+#[allow(dead_code)]
 pub fn redact_file_path(path: &str) -> String {
     use std::path::Path;
 
@@ -91,6 +92,7 @@ pub fn redact_file_path(path: &str) -> String {
 /// 示例：
 /// - `https://api.example.com/v1/chat?key=sk-xxx&user=alice` → `https://api.example.com/v1/chat?<redacted>`
 /// - `https://user:pass@api.example.com/path` → `https://***:***@api.example.com/path`
+#[allow(dead_code)]
 pub fn redact_url(url: &str) -> String {
     // 简单实现：隐藏查询字符串
     if let Some(pos) = url.find('?') {
@@ -116,6 +118,7 @@ pub fn redact_url(url: &str) -> String {
 }
 
 /// 脱敏错误消息：综合处理路径、URL等敏感信息。
+#[allow(dead_code)]
 pub fn redact_error_msg(msg: &str) -> String {
     let mut result = msg.to_string();
 

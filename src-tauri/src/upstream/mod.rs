@@ -15,6 +15,7 @@
 // ② glob 会把只在内部用的名字也导出去，而未被使用的 re-export 会触发 unused_imports。
 // 契约由 crate 根的 upstream_api_surface 守卫在编译期兜住（**必须在 upstream 外面**，
 // 否则私有项对后代可见会让守卫恒真，详见该文件注释）。
+mod budget;
 mod cache;
 mod client;
 mod completion;
@@ -28,6 +29,11 @@ mod tools_meta;
 mod usage;
 mod util;
 
+/// 大脑聚合的输出预算（协议感知）。代理转发不用它——转发一律透明，见 proxy::apply_key_params。
+pub use budget::{
+    anthropic_required_max_tokens, estimate_json_tokens_without_image_transport, estimate_tokens,
+    output_budget,
+};
 pub use client::shared_client;
 /// 转发用的 per-Key 响应超时。流式探头阶段与非流式共用同一口径（见 proxy.rs 两处调用）。
 pub use client::key_timeout;

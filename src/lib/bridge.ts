@@ -293,36 +293,10 @@ export const api = {
   setAutoStart: (enabled: boolean) =>
     call<void>("set_auto_start", { enabled }, () => mockBridge.setAutoStart(enabled)),
 
-  /**
-   * 悬浮窗开关。**专用命令，不走 saveSettings**：它带窗口副作用（建/销毁 WebView），
-   * 而批量保存路径提交的是前端挂载时的旧快照 —— `autoStart` 正因此出过 P0
-   * （切主题把用户刚关掉的开关又打开）。
-   *
-   * 注意：开启后**不会立刻出现**，还要求主窗口已最小化到托盘。
-   */
-  setFloatingWidget: (enabled: boolean) =>
-    call<void>("set_floating_widget", { enabled }, () => mockBridge.setFloatingWidget(enabled)),
+  // 悬浮窗的三条命令（setFloatingWidget / setFloatingPinned / setFloatingExpanded）
+  // 已随该功能于 2026-08-15 一并删除，后端也不再注册它们。见 docs/14 第十八节。
 
-  /** 悬浮球置顶开关。默认关 —— 写死置顶会在用别的软件时一直挡着。 */
-  setFloatingPinned: (pinned: boolean) =>
-    call<void>("set_floating_pinned", { pinned }, () => mockBridge.setFloatingPinned(pinned)),
-
-  /**
-   * 悬浮球悬停展开 / 移出收起。
-   *
-   * **为什么这是一次 IPC 而不是纯 CSS**：WebView 画不出窗口以外的东西。悬浮球窗口
-   * 只有 64×64，光在 CSS 里展开会被窗口边界裁掉 —— 表现为「悬停没反应」。
-   * 窗口尺寸只能由后端改，故每次悬停都要过来一趟。
-   *
-   * 浏览器预览里是个 no-op（没有窗口可改）。
-   */
-  setFloatingExpanded: (expanded: boolean) =>
-    call<void>("set_floating_expanded", { expanded }, async () => {}),
-
-  /**
-   * 显示并聚焦主窗口（从悬浮球/托盘恢复）。
-   * 主窗口回到前台后，悬浮球会自动隐藏。
-   */
+  /** 显示并聚焦主窗口（从托盘恢复）。 */
   showMainWindow: () => call<void>("show_main_window_cmd", {}, async () => {}),
 
   // ---- 首启向导（UX#1）----

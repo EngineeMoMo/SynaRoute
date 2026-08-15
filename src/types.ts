@@ -451,23 +451,9 @@ export interface AppSettings {
   activeModels?: Record<string, string>; // 各分类当前选定的对外模型名（key=分类）。借鉴 EchoBird：客户端菜单拉不到中转模型时，在应用内选、代理转发时覆盖。后端自管，走 setActiveModel 专用命令
   activeEfforts?: Record<string, string>; // 各分类默认推理强度（key=分类，值 minimal/low/medium/high/xhigh）。Codex 对自定义 provider 不发 reasoning.effort，故在此配置、转发时注入。后端自管，走 setActiveEffort 专用命令
   trayModelSwitchEnabled?: boolean; // 托盘快切 Codex 模型子菜单开关（默认开）。开启后右键托盘可直接切 Codex 当前对外模型，免打开主窗口
-  /**
-   * 桌面悬浮窗开关（默认关）。
-   *
-   * **不在 UserPrefs 白名单里**：它带窗口副作用，由专用命令 `setFloatingWidget`
-   * 修改（理由同 autoStart —— 批量保存会用旧快照把它覆盖回去）。
-   *
-   * 开启后不会立刻显示，还要求主窗口已最小化到托盘。
-   */
-  floatingWidgetEnabled?: boolean;
-  /**
-   * 悬浮球是否置顶（默认关）。同样**不在 UserPrefs 白名单里**，走专用命令
-   * `setFloatingPinned`。
-   *
-   * 默认关的理由：悬浮球原先是写死置顶的，于是用别的软件时它一直盖在最上面挡着。
-   * 置顶对「瞥一眼状态」有用，但该由用户自己选。
-   */
-  floatingWidgetAlwaysOnTop?: boolean;
+  // 桌面悬浮球的两个字段（floatingWidgetEnabled / floatingWidgetAlwaysOnTop）
+  // 已随该功能于 2026-08-15 删除。老配置里残留这两个键是安全的（后端 serde 忽略），
+  // 但类型上不再声明，避免有人以为还能通过设置控制它。见 docs/14 第十八节。
   proxyPorts?: Record<string, number>; // 各分类代理首选监听端口（key=分类）。粘滞固定端口：默认 CLI=47100/Codex=47101/Desktop=47102，改端口走 setProxyPort（重启代理+重写客户端 config）
   /**
    * 首启向导是否已完成（UX#1）。**三态**：null/undefined = 从未判定（旧配置或全新安装），

@@ -292,6 +292,8 @@ pub(crate) fn set_primary_key(
 
 /// 把 Max Tokens 一次应用到该分类下全部 Key（FR-005 批量设置）。
 ///
+/// ⚠️ 该值**当前不参与任何请求**（代理转发与大脑聚合都不读它），仅兼容旧配置 ——
+/// 理由见 [`Store::apply_max_tokens_to_category`] 与 `upstream/budget.rs`。
 /// 规则在 [`Store::apply_max_tokens_to_category`] 里（含已停用的 Key：否则日后重新启用
 /// 又带回旧值）。返回**实际改动条数**，让前端如实提示「已应用到 N 条」——
 /// 全都已是该值时返回 0，不谎报「已保存」。

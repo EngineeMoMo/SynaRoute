@@ -929,6 +929,15 @@ async fn run_member_turns(
         }
         let mut up = ctx.up;
         up.request_timeout = up.request_timeout.min(turn_budget);
+        // 输出预算**每轮重算**：工具循环每轮重发整份历史，历史越长可用输出空间越小。
+        // 首轮算一次然后沿用会在后面几轮把 max_tokens 算得过大 → 输入+输出超窗口 → 400。
+        // OpenAI 侧恒为 None（不发上限）；Anthropic 侧按「窗口 − 本轮输入」现算。
+        //
+        // `Err` = 缺上下文窗口数据的 Anthropic Key：不猜一个上限（那会静默截断），
+        // 如实报不可用并告诉用户去补窗口。只会在第 1 轮命中 —— 同一 Key 的判定不随轮次变化。
+        up.max_tokens =
+            upstream::output_budget(up.key, up.model, session.estimated_input_tokens(&tools))
+                .map_err(MemberError::own)?;
         let outcome = match session.turn(&up, &tools).await {
             Ok(o) => o,
             // 轮内失败：已有正文就交差而不是整次作废（多轮探索的价值就在这里 —— 第 3 轮
@@ -1311,7 +1320,6 @@ async fn gather_members(
                     };
                 }
             };
-            let max_tokens = key.params.max_tokens.unwrap_or(4096);
             // 仅对实际模型调用套超时（这才是「成员自己的工作时间」）。
             // 单请求 HTTP 超时给 brain 预算 +5s 余量（此前误用 key 的 30s 代理级超时，
             // 非流式长回答必然被掐死、重试 3 次 ≈ 91s 全灭）；外层 tokio timeout 先到点，
@@ -1333,7 +1341,11 @@ async fn gather_members(
                     key: &key,
                     secret: &secret,
                     model: &model,
-                    max_tokens,
+                    // 占位：真值由 `run_member_turns` 每轮按当前历史重算（见那里的注释）。
+                    // 这里给 None 而不是某个默认值 —— 万一将来有人加了条绕过重算的路径，
+                    // OpenAI 侧表现为「不设上限」（符合定调），Anthropic 侧会被上游明确拒绝，
+                    // 而不是悄悄按一个本地常量截断。
+                    max_tokens: None,
                     retry,
                     request_timeout: req_timeout,
                 },
@@ -1802,7 +1814,12 @@ async fn call_ref(
         .read()
         .get(key_id)?
         .ok_or_else(|| AppError::Invalid("决策者密钥缺失".into()))?;
-    let max_tokens = key.params.max_tokens.unwrap_or(4096);
+    // 输出预算：OpenAI 不发上限；Anthropic 按「窗口 − 本次 prompt」现算。
+    // 决策者/汇总者的 prompt 里嵌着全部成员答案，可达数十万字符 —— 正是最需要按实际输入
+    // 算、而不是套一个常量的场合（旧实现在这里用 4096，长结论必被截断）。
+    // `Err` = Anthropic 缺窗口数据，如实报错并指出要补什么，不猜上限。
+    let max_tokens = upstream::output_budget(&key, model, upstream::estimate_tokens(prompt))
+        .map_err(AppError::Invalid)?;
     let retry = store.get_settings().upstream_retry_enabled;
     // 大脑聚合路径：固定打该引用对应的 Key+模型，不走代理故障转移。
     // 上游瞬时错误仍可按设置做同 Key 重试（upstream_retry），但绝不会换成别的 Key。
@@ -2492,7 +2509,16 @@ mod tests {
             priority: 0,
             headers_json: None,
             params: crate::model::KeyParams::default(),
-            models: vec![],
+            // 带上 `context_window`：Anthropic 的 `max_tokens` 是必填字段，而聚合已改为按
+            // 「窗口 − 本轮输入」现算（不再用 4096 那个会截断长回答的默认值）。缺窗口数据的
+            // Anthropic Key 会被如实判为不可用，故可用的 Key 必须有这项 —— 这与真实用户
+            // 拉取/填写过模型列表的状态一致。
+            models: vec![crate::model::ModelInfo {
+                real_name: "claude-sonnet-4-5".into(),
+                source: "manual".into(),
+                fetched_at: None,
+                context_window: Some(200_000),
+            }],
             mappings: vec![],
             default_model: None,
             tier_haiku: None,
@@ -2530,8 +2556,10 @@ mod tests {
             up: upstream::TurnParams {
                 key,
                 secret,
-                model: "m",
-                max_tokens: 256,
+                model: "claude-sonnet-4-5",
+                // 占位值：`run_member_turns` 会按协议与实际输入重算并覆盖它
+                // （这些用例造的是 Anthropic Key，故走 Limit 分支）。
+                max_tokens: None,
                 retry: false,
                 request_timeout: Duration::from_secs(10),
             },
@@ -2750,6 +2778,157 @@ mod tests {
         assert_eq!(msgs[2]["role"], "tool");
         assert_eq!(msgs[2]["tool_call_id"], "call_1");
         assert!(msgs[2]["content"].as_str().unwrap().contains("answer_42"));
+
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// OpenAI 聚合请求**每一轮**都不得携带输出上限字段（产品定调 2026-08-15）。
+    ///
+    /// 钉住的是本次撤掉的那个截断点：聚合曾一律用 `key.params.max_tokens.unwrap_or(4096)`，
+    /// 于是参与者/决策者的长回答在 4096 token 处被切掉，而用户无从知道是本地配置造成的。
+    /// Chat Completions 的 `max_tokens` 是可选项，故这里能做到真正不限制。
+    ///
+    /// **每轮都要查**：工具循环第 2 轮起走的是另一条代码路径（历史重发），
+    /// 只查第 1 轮会漏掉「后续轮次又把上限加回来」。
+    #[tokio::test]
+    async fn openai_aggregation_requests_carry_no_output_cap() {
+        let (upstream, seen) = spawn_scripted(vec![
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"main.rs\"}"}}]}}]}"#,
+            r#"{"choices":[{"message":{"role":"assistant","content":"结论"}}]}"#,
+        ])
+        .await;
+        let (work, env) = tool_env_with_file("oai_nocap").await;
+        let (sdir, store) = test_store("oai_nocap_store");
+        let mut key = test_key(&upstream);
+        key.protocol = Protocol::OpenaiChat;
+        // 刻意配一个旧的 max_tokens：它绝不能重新出现在请求里。
+        key.params.max_tokens = Some(4096);
+        let mut session =
+            ToolSession::new(Protocol::OpenaiChat, &MultimodalPrompt::from_text("问题"));
+
+        run_member_turns(
+            &store,
+            CategoryType::ClaudeCli,
+            &mut session,
+            &ctx_for(&key, "sk", "mock/m"),
+            Some(&env),
+            6,
+            60_000,
+            0,
+        )
+        .await
+        .unwrap();
+
+        let reqs = seen.lock().clone();
+        assert!(reqs.len() >= 2, "应至少两轮，实际 {}", reqs.len());
+        for (i, r) in reqs.iter().enumerate() {
+            for name in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
+                assert!(
+                    r.get(name).is_none(),
+                    "第 {} 轮请求不得携带 {name}（实际请求体: {r}）",
+                    i + 1
+                );
+            }
+        }
+
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// Anthropic 聚合请求必须带 `max_tokens`（协议必填），且值是**按上下文窗口现算**的、
+    /// 最大输出受模型能力钳在 64k，且工具历史增长后不得变大。
+    ///
+    /// 这条与上面那条是一对：Anthropic 无法省略字段，所以能做的是「能力范围内尽可能大」而非「不发」。
+    /// 若有人把 `unwrap_or(4096)` 加回来，第一个断言就会红。
+    #[tokio::test]
+    async fn anthropic_aggregation_uses_dynamic_cap_not_the_old_default() {
+        let (upstream, seen) = spawn_scripted(vec![
+            r#"{"content":[{"type":"text","text":"先看文件"},{"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"main.rs"}}],"stop_reason":"tool_use"}"#,
+            r#"{"content":[{"type":"text","text":"结论"}]}"#,
+        ])
+        .await;
+        let (work, env) = tool_env_with_file("ant_dyncap").await;
+        let (sdir, store) = test_store("ant_dyncap_store");
+        let mut key = test_key(&upstream); // test_key 已带 context_window = 200_000
+        key.params.max_tokens = Some(4096); // 旧值必须被忽略
+        let mut session =
+            ToolSession::new(Protocol::Anthropic, &MultimodalPrompt::from_text("问题"));
+
+        run_member_turns(
+            &store,
+            CategoryType::ClaudeCli,
+            &mut session,
+            &ctx_for(&key, "sk", "mock/m"),
+            Some(&env),
+            6,
+            60_000,
+            0,
+        )
+        .await
+        .unwrap();
+
+        let reqs = seen.lock().clone();
+        assert!(reqs.len() >= 2, "应至少两轮，实际 {}", reqs.len());
+        let caps: Vec<u64> = reqs
+            .iter()
+            .map(|r| {
+                r["max_tokens"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("Anthropic 请求必须带 max_tokens: {r}"))
+            })
+            .collect();
+        for (i, c) in caps.iter().enumerate() {
+            assert_ne!(*c, 4096, "第 {} 轮又用回了旧的 4096 默认值", i + 1);
+            assert_eq!(
+                *c, 64_000,
+                "第 {} 轮应受 Claude 4.5 的 64k 最大输出能力钳制，实际 {c}",
+                i + 1
+            );
+        }
+        // 第 2 轮历史更长；当前两轮都仍被模型 64k 上限钳住，故允许相等，
+        // 但绝不许变大（输入增长后预算不能增加）。
+        assert!(
+            caps[1] <= caps[0],
+            "历史变长后预算不得变大：第1轮 {} 第2轮 {}",
+            caps[0],
+            caps[1]
+        );
+
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// 模型名可辨识时，无窗口数据仍可安全按模型最大输出参与聚合；这避免拒掉
+    /// 用户手填模型名/刚拉取模型列表这类常见可用配置。
+    #[tokio::test]
+    async fn anthropic_member_without_context_window_uses_known_model_cap() {
+        let (upstream, seen) = spawn_scripted(vec![r#"{"content":[{"type":"text","text":"x"}]}"#]).await;
+        let (work, env) = tool_env_with_file("ant_nowin").await;
+        let (sdir, store) = test_store("ant_nowin_store");
+        let mut key = test_key(&upstream);
+        key.models.clear(); // 抹掉窗口数据（等于用户手填模型名 / 只拉取过列表）
+        key.params.max_tokens = Some(4096); // 有旧值也不许拿来兜底
+        let mut session =
+            ToolSession::new(Protocol::Anthropic, &MultimodalPrompt::from_text("问题"));
+
+        let out = run_member_turns(
+            &store,
+            CategoryType::ClaudeCli,
+            &mut session,
+            &ctx_for(&key, "sk", "mock/m"),
+            Some(&env),
+            6,
+            60_000,
+            0,
+        )
+        .await
+        .expect("已知 Claude 模型即使未填窗口也应按 64k 能力参与聚合");
+        assert_eq!(out, "x");
+        let reqs = seen.lock().clone();
+        assert_eq!(reqs.len(), 1, "应发出一次请求");
+        assert_eq!(reqs[0]["max_tokens"], 64_000);
+        assert_ne!(reqs[0]["max_tokens"], 4096, "不得回退旧默认值");
 
         std::fs::remove_dir_all(&work).ok();
         std::fs::remove_dir_all(&sdir).ok();

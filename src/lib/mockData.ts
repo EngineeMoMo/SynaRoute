@@ -928,15 +928,6 @@ export const mockBridge = {
     await delay();
     settings.autoStart = enabled;
   },
-  async setFloatingWidget(enabled: boolean) {
-    await delay();
-    // 浏览器预览里没有 Tauri 窗口，只落状态；真实环境由后端建/销毁悬浮窗。
-    settings.floatingWidgetEnabled = enabled;
-  },
-  async setFloatingPinned(pinned: boolean) {
-    await delay();
-    settings.floatingWidgetAlwaysOnTop = pinned;
-  },
   async listVendors(): Promise<Vendor[]> {
     await delay();
     return clone(vendors);

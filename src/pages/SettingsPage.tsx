@@ -248,54 +248,7 @@ export function SettingsPage() {
       });
   };
 
-  /**
-   * 悬浮窗开关。与自启动同样走**专用命令**，不走 update()。
-   *
-   * 理由完全相同：它带窗口副作用（建/销毁一个 WebView），而 update() 提交的是本页
-   * 局部 state 的整份快照 —— 那正是出过 P0 的地方（切主题/语言会把用户刚关掉的
-   * 开关重新打开）。`floatingWidgetEnabled` 也不在 `saveSettings` 的入参类型里，
-   * 物理上走不到那条路。
-   *
-   * 失败必须回滚开关：UI 显示已开、实际没开是这类设置最坑的形态。
-   */
-  const handleToggleFloating = (v: boolean) => {
-    if (!settings) return;
-    const prev = settings;
-    setSettings({ ...settings, floatingWidgetEnabled: v });
-    void api
-      .setFloatingWidget(v)
-      .then(() => {
-        useStore.setState({ settings: { ...prev, floatingWidgetEnabled: v } });
-      })
-      .catch((e) => {
-        console.error("setFloatingWidget failed", e);
-        setSettings(prev);
-        showToast("error", String((e as Error)?.message ?? e));
-      });
-  };
-
-  /**
-   * 悬浮球置顶开关。同上走专用命令、失败回滚。
-   *
-   * 单独开这个开关是因为原先置顶是**写死**的（`always_on_top(true)`），
-   * 于是用别的软件时悬浮球一直盖在最上面挡着。置顶对「瞥一眼状态」有用，
-   * 但该由用户自己选，默认关。
-   */
-  const handleToggleFloatingPinned = (v: boolean) => {
-    if (!settings) return;
-    const prev = settings;
-    setSettings({ ...settings, floatingWidgetAlwaysOnTop: v });
-    void api
-      .setFloatingPinned(v)
-      .then(() => {
-        useStore.setState({ settings: { ...prev, floatingWidgetAlwaysOnTop: v } });
-      })
-      .catch((e) => {
-        console.error("setFloatingPinned failed", e);
-        setSettings(prev);
-        showToast("error", String((e as Error)?.message ?? e));
-      });
-  };
+  // 悬浮窗的两个开关处理函数已随该功能于 2026-08-15 删除（见 docs/14 第十八节）。
 
   // MCP 开关/端口走专用命令：携带当前活跃分类，后端据此自动注册 synaroute 到对应工具客户端
   // （~/.claude.json 或 ~/.codex/config.toml），并在端口漂移时重写。不走通用 saveSettings，
@@ -914,24 +867,10 @@ export function SettingsPage() {
               checked={settings?.autoStart ?? false}
               onChange={handleToggleAutoStart}
             />
-            {/* 悬浮窗（第⑥批）。desc 里必须写明「最小化到托盘后才出现」——
-                否则用户开了开关却什么都没发生，会当成 bug 反复点。 */}
-            <ToggleRow
-              title={t("settings.floatingTitle")}
-              desc={t("settings.floatingDesc")}
-              checked={settings?.floatingWidgetEnabled ?? false}
-              onChange={handleToggleFloating}
-            />
-            {/* 置顶子开关：只在悬浮球开着时才有意义，故关着时不显示 ——
-                摆一个开了也看不到效果的开关，正是本项目反复防的那种困惑。 */}
-            {settings?.floatingWidgetEnabled && (
-              <ToggleRow
-                title={t("settings.floatingPinTitle")}
-                desc={t("settings.floatingPinDesc")}
-                checked={settings?.floatingWidgetAlwaysOnTop ?? false}
-                onChange={handleToggleFloatingPinned}
-              />
-            )}
+            {/* 这里原先还有「桌面悬浮球」与「悬浮球置顶」两个开关。该功能已于
+                2026-08-15 整体删除：真机实测其子 WebView 从未初始化、用户彻底看不见，
+                而后端状态机却打出「已显示」—— 能开、能存、有日志、零效果。
+                见 docs/14 第十八节。**不要**只把开关加回来，那只会复现同一个静默失效。 */}
           </CardContent>
         </Card>
 

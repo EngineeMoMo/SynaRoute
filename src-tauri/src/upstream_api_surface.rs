@@ -51,6 +51,8 @@ fn public_functions_stay_reachable() {
     let _ = crate::upstream::collect_search_tools;
     let _ = crate::upstream::convert_request_owned;
     let _ = crate::upstream::convert_response_ext;
+    let _ = crate::upstream::output_budget;
+    let _ = crate::upstream::estimate_tokens;
     // with_usage 是泛型 async：给足类型参数太啰嗦，用一个具体调用点证明它可达即可。
     let _fut = crate::upstream::with_usage(async {});
 }

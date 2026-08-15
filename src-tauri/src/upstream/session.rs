@@ -311,7 +311,12 @@ pub struct TurnParams<'a> {
     pub key: &'a ProviderKey,
     pub secret: &'a str,
     pub model: &'a str,
-    pub max_tokens: u32,
+    /// 输出上限；`None` = 请求体**不带**该字段（OpenAI 侧才可能为 `None`）。
+    ///
+    /// **不要在这里塞一个默认值**。工具循环每轮都重发整份历史，历史越长可用输出空间越小，
+    /// 故 Anthropic 的值由调用方**每轮重算**（见 `aggregate::run_member_turns`）；
+    /// 而 OpenAI 侧恒为 `None`，让上游自己决定长度。
+    pub max_tokens: Option<u32>,
     /// 对临时性上游错误（502/503/504/429/连接失败）自动重试。
     pub retry: bool,
     /// **单次** HTTP 请求的超时（含上游完整生成时间）。
@@ -361,6 +366,37 @@ impl ToolSession {
     #[cfg(test)]
     pub fn messages(&self) -> &[Value] {
         &self.messages
+    }
+
+    /// 本轮**将要发出去**的输入内容的 token 估计（消息历史 + 工具声明）。
+    ///
+    /// 给 Anthropic 算输出预算用（`max_tokens ≤ 窗口 − 输入`）。必须每轮重新调用：
+    /// 工具循环每轮把整份历史重发，第 5 轮的输入可能是第 1 轮的十几倍，
+    /// 沿用首轮的估计会把输出预算算得过大 → 输入加输出超窗口 → 上游 400。
+    ///
+    /// 按结构遍历 JSON 估算，工具 schema 计入，但**图片 base64 正文不按文本计**：
+    /// 那是传输编码，不是模型看到的 token。一张允许的 5MB 图片 base64 后约 670 万字符，
+    /// 当文本算会被估成数百万 token，于是「窗口 − 输入」直接见底、明明有效的视觉请求
+    /// 被本地判成没有输出空间。见 [`crate::upstream::estimate_json_tokens_without_image_transport`]。
+    pub fn estimated_input_tokens(&self, tools: &[ToolDef]) -> u32 {
+        let mut total = 0u32;
+        for m in &self.messages {
+            total = total.saturating_add(
+                crate::upstream::estimate_json_tokens_without_image_transport(m),
+            );
+        }
+        if !tools.is_empty() {
+            // 按本协议实际会发出的形状算：两家的工具声明字段名/嵌套不同，字符数也不同。
+            let decl = if self.protocol.is_openai() {
+                openai_tools(tools)
+            } else {
+                anthropic_tools(tools)
+            };
+            total = total.saturating_add(
+                crate::upstream::estimate_json_tokens_without_image_transport(&decl),
+            );
+        }
+        total
     }
 
     /// 回填工具执行结果，供下一轮使用。
@@ -582,9 +618,20 @@ impl ToolSession {
         };
         let mut payload = json!({
             "model": model,
-            "max_tokens": p.max_tokens,
             "messages": self.messages,
         });
+        // 输出上限：OpenAI 侧为 None 时**不写这个字段**（可选项，省略即不由请求方限制）；
+        // Anthropic 必填，故 None 时补协议下限 1 而不是省略（省略必然 400，理由同
+        // completion.rs::anthropic_message）。正常路径上调用方总会给 Anthropic 一个 Some。
+        match p.max_tokens {
+            Some(n) => {
+                payload["max_tokens"] = json!(n);
+            }
+            None if !openai => {
+                payload["max_tokens"] = json!(1);
+            }
+            None => {}
+        }
         // tools 为空时**不发** tools 字段：部分网关对 `tools: []` 直接 400，
         // 而「强制出结论」那一轮正是空 tools。
         if !tools.is_empty() {
@@ -632,9 +679,11 @@ impl ToolSession {
         if want_cache && status == reqwest::StatusCode::BAD_REQUEST && looks_like_cache_rejection(&raw)
         {
             mark_cache_unsupported(&key.base_url);
+            // 这条重发路径只在 `want_cache` 为真时可达，而 `want_cache = !openai` ——
+            // 即必然是 Anthropic，`max_tokens` 是必填字段，不能像 OpenAI 那样省略。
             let mut plain = json!({
                 "model": model,
-                "max_tokens": p.max_tokens,
+                "max_tokens": p.max_tokens.unwrap_or(1),
                 "messages": self.messages,
             });
             if !tools.is_empty() {

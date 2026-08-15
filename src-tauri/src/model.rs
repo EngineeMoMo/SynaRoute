@@ -325,6 +325,16 @@ pub struct ModelMapping {
 pub struct KeyParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// 输出上限。**当前没有任何请求路径读它**，仅为兼容旧配置保留。
+    ///
+    /// 两次定调把它的两个用途都撤掉了：
+    /// - 2026-08-14：代理转发不注入（客户端没给就是没给）——
+    ///   见 `proxy.rs::apply_key_params` + `key_max_tokens_is_never_injected_by_proxy`；
+    /// - 2026-08-15：大脑聚合也不用它（那个 `unwrap_or(4096)` 会把长回答截断在一半，
+    ///   而用户只会去查上游）——改为按协议与模型上下文窗口现算，见 `upstream/budget.rs`。
+    ///
+    /// 保留字段而非删除：老配置文件里存着值，删掉要做迁移，而它现在是惰性的、无害。
+    /// **想把它接回任何请求路径前，先读上面两处的理由。**
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1639,20 +1649,14 @@ pub struct AppSettings {
     /// 免打开主窗口（借鉴 cc-switch 托盘切换范式）。默认开。关闭则托盘只留显示/退出。
     #[serde(default = "default_true")]
     pub tray_model_switch_enabled: bool,
-    /// 桌面悬浮窗开关（第⑥批）。**默认关**。
-    ///
-    /// 开启后并不立即显示 —— 只在主窗口**最小化到托盘**时才出现（见 `lib.rs` 的
-    /// `CloseRequested` 处理）。这是用户明确要求的语义：主窗口在前台时悬浮窗只会挡事。
-    #[serde(default)]
-    pub floating_widget_enabled: bool,
-    /// 悬浮球是否**置顶**（始终在其它窗口之上）。**默认关**。
-    ///
-    /// 为什么单开一个开关、且默认关：悬浮球原先是无条件 `always_on_top(true)` 的，
-    /// 于是用别的软件时它一直盖在最上面挡着 —— 这是用户实测反馈的问题。
-    /// 置顶对「瞥一眼状态」确实有用（否则会被别的窗口埋掉），但那该由用户自己选，
-    /// 不该是写死的行为。
-    #[serde(default)]
-    pub floating_widget_always_on_top: bool,
+    // ⚠️ 曾有两个桌面悬浮球字段（`floatingWidgetEnabled` /
+    // `floatingWidgetAlwaysOnTop`），已随该功能一并删除（2026-08-15，见
+    // docs/14 第十八节）：真机实测悬浮窗的子 WebView 从未初始化，用户彻底看不见，
+    // 而后端状态机却打出「已显示」—— 一个能开、能存、有日志、零效果的静默失效开关。
+    //
+    // **旧配置里残留这两个键是安全的**：本结构没有 `deny_unknown_fields`，
+    // serde 会直接忽略它们（`legacy_floating_fields_are_ignored_on_load` 钉住）。
+    // 不要为了「清理」去写迁移代码删键 —— 那是一次无收益的整份重写风险。
     /// 各分类的「默认推理强度」（key=分类字符串，value=effort 档位 low/medium/high/xhigh）。
     /// 缘由：Codex Desktop 对自定义 provider 不下发 reasoning.effort（只发 reasoning.summary），
     /// 客户端 UI 设的强度传不到上游。故在此配一个默认值，转发时若下游 body 无 effort 就注入，
@@ -1836,15 +1840,13 @@ pub struct UserPrefs {
     pub aggregate_trace_enabled: bool,
     #[serde(default = "default_true")]
     pub tray_model_switch_enabled: bool,
-    // ⚠️ **悬浮球那两个字段刻意不在这里**（`floating_widget_enabled` /
-    // `floating_widget_always_on_top`）。它们带窗口副作用，由专用命令
-    // `set_floating_widget` / `set_floating_pinned` 管。
+    // ⚠️ **带副作用的开关一律不进这里**（如 `auto_start`，它要写系统注册表）。
     //
-    // 曾经在这里，是个**静默关掉用户开关**的缺陷：前端 `prefs.ts` 的白名单里
-    // 从来没有这两个键（那侧的注释也写着「不在白名单里」），于是每次 `saveSettings`
-    // 提交的 JSON 都缺键 → `#[serde(default)]` 补成 false → `apply_to` 把它们
-    // 写成 false。表现为「切一下主题/语言，开着的悬浮球就没了」，而用户完全不知道
-    // 是那个动作干的。与自启动那条 P0 同类，方向相反。
+    // 历史教训：两个已删除的悬浮球开关曾误入本结构体，造成**静默关掉用户开关**的缺陷 ——
+    // 前端 `prefs.ts` 白名单里没有那两个键，于是每次 `saveSettings` 提交的 JSON 都缺键
+    // → `#[serde(default)]` 补成 false → `apply_to` 把它们写成 false。表现为
+    // 「切一下主题/语言，开着的开关就没了」。`auto_start` 出过同类 P0（方向相反：
+    // 把用户刚关掉的自启动装回系统）。
     //
     // 判据：本结构体的字段集必须与 `src/lib/prefs.ts` 的 `pickPrefs` 逐字段对齐。
     // 加字段时先问「前端白名单里有吗」——没有就不该加到这里。
@@ -1869,8 +1871,9 @@ impl UserPrefs {
         s.health_probe_test_messages = self.health_probe_test_messages;
         s.aggregate_trace_enabled = self.aggregate_trace_enabled;
         s.tray_model_switch_enabled = self.tray_model_switch_enabled;
-        // 悬浮球两个开关**刻意不赋值**：它们不在 UserPrefs 里（理由见该结构体的注释）。
-        // 别"顺手补上"——补上就等于把那个静默关开关的缺陷再装回来。
+        // `auto_start` 等带副作用的开关**刻意不赋值**：它们不在 UserPrefs 里
+        // （理由见该结构体末尾的注释）。别「顺手补上」——补上就等于把那类
+        // 「切主题顺手改掉系统状态」的缺陷再装回来。
     }
 }
 
@@ -1922,10 +1925,6 @@ impl Default for AppSettings {
             // None = 从未判定。启动时 reconcile_onboarding_flag 会据当前 Key 数定下来，
             // 老用户因此不会突然被首启向导拦住。
             onboarding_done: None,
-            // 悬浮窗默认**关闭**（用户明确要求）：它是个额外的常驻窗口，
-            // 不该在用户没开口的情况下自己冒出来。
-            floating_widget_enabled: false,
-            floating_widget_always_on_top: false,
         }
     }
 }
@@ -1965,29 +1964,32 @@ pub struct AppConfig {
 /// 版本历史：
 /// - v1: 初始版本（隐式，未存储版本号）
 /// - v2: 余额查询 URL 从 `/v1/usage` 迁移到 `/user/balance`
+///
+/// ⚠️ 此常量仅供文档说明用，实际迁移 gate 使用字面量（如 `config_version < 2`），
+/// 各版本 gate 独立判断，不引用此常量——这是刻意设计，避免修改常量影响已部署的迁移逻辑。
+#[allow(dead_code)]
 pub const CURRENT_CONFIG_VERSION: u32 = 2;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 带窗口/系统副作用的开关**不能**被批量 `save_settings` 改动。
+    /// 带系统副作用的开关**不能**被批量 `save_settings` 改动。
     ///
-    /// 钉的是一个真实发生过的缺陷：`floating_widget_enabled` 与
-    /// `floating_widget_always_on_top` 曾在 `UserPrefs` 里，而前端 `prefs.ts` 的白名单
-    /// 从来没有这两个键 —— 于是每次 saveSettings 提交的 JSON 都缺键，serde 补成 false，
-    /// `apply_to` 把用户开着的悬浮球静默关掉。表现为「切一下主题，悬浮球就没了」。
+    /// 钉的是一个真实发生过的 P0：`auto_start` 曾被前端挂载时的旧快照覆盖 ——
+    /// 切一下主题就把用户刚关掉的开机自启动重新装回系统。
     ///
-    /// 判据刻意用**前端会真实发出的那种 JSON**（缺这些键）走一遍完整往返，
-    /// 而不是直接断言结构体没有该字段 —— 后者在字段被加回来时才失败，
+    /// 判据刻意用**前端会真实发出的那种 JSON**（只含白名单键）走一遍完整往返，
+    /// 而不是直接断言结构体没有该字段 —— 后者在字段被加回 `UserPrefs` 时才失败，
     /// 而这个在「加回来 且 前端没同步补键」时就失败，正是缺陷的真实形状。
+    ///
+    /// 历史：这里原先还断言两个悬浮球开关（它们曾误入 `UserPrefs`，导致切主题把用户
+    /// 开着的悬浮球静默关掉）。悬浮窗功能已于 2026-08-15 整体删除，故那两条断言随之移除。
     #[test]
     fn batch_save_settings_never_touches_side_effect_toggles() {
         // 用户已通过专用命令开启的状态。用结构体更新语法而非「先 default 再逐个赋值」：
         // 后者会触发 clippy 的 field_reassign_with_default，而本仓基线是零警告。
         let mut s = AppSettings {
-            floating_widget_enabled: true,
-            floating_widget_always_on_top: true,
             auto_start: true,
             ..Default::default()
         };
@@ -1999,17 +2001,33 @@ mod tests {
         prefs.apply_to(&mut s);
 
         assert!(
-            s.floating_widget_enabled,
-            "批量保存把悬浮球开关关掉了 —— 它必须只由 set_floating_widget 改"
-        );
-        assert!(
-            s.floating_widget_always_on_top,
-            "批量保存把悬浮球置顶关掉了 —— 它必须只由 set_floating_pinned 改"
-        );
-        assert!(
             s.auto_start,
             "批量保存把开机自启动关掉了 —— 那是已修过的 P0，不能回归"
         );
+    }
+
+    /// 老配置里残留的悬浮球键**必须被安全忽略**，不能让整份配置读不出来。
+    ///
+    /// 悬浮窗功能删除后（2026-08-15），已经跑过旧版本的用户磁盘上仍有
+    /// `floatingWidgetEnabled` / `floatingWidgetAlwaysOnTop`。若 `AppSettings` 哪天被加上
+    /// `deny_unknown_fields`，这两个键会让**整个 config.json 解析失败** ——
+    /// 那不是「悬浮球没了」，而是用户全部 Key 与设置一起读不出来。故在此钉住。
+    #[test]
+    fn legacy_floating_fields_are_ignored_on_load() {
+        let legacy = serde_json::json!({
+            "theme": "dark",
+            "floatingWidgetEnabled": true,
+            "floatingWidgetAlwaysOnTop": true,
+        });
+        let s: AppSettings =
+            serde_json::from_value(legacy).expect("含已删除字段的老配置必须仍能读出来");
+        assert_eq!(s.theme, "dark", "同一份配置里的其它字段不能受影响");
+
+        // 反向：新写出的配置**不再包含**这两个键（否则等于功能删了、配置还在宣传它）。
+        let out = serde_json::to_value(AppSettings::default()).unwrap();
+        let obj = out.as_object().expect("设置应序列化为对象");
+        assert!(!obj.contains_key("floatingWidgetEnabled"));
+        assert!(!obj.contains_key("floatingWidgetAlwaysOnTop"));
     }
 
     /// 表里的 wire_id 必须与 serde 的 rename 完全一致（P2-8）。

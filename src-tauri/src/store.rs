@@ -357,9 +357,11 @@ impl Store {
             let migrated = Self::migrate_balance_query_url(&mut config.keys);
             if migrated {
                 tracing::info!("配置迁移：v1 → v2（余额查询 URL 从 /v1/usage 改为 /user/balance）");
-                config.config_version = 2;
-                needs_persist = true;
             }
+            // 无论是否迁移成功，只要进入该版本门，就提升版本号并落盘，
+            // 防止版本号永久停留在 v1 导致将来 v3 迁移的时序错误
+            config.config_version = 2;
+            needs_persist = true;
         }
 
         // 后续版本迁移在此追加（如 config.config_version < 3 时的逻辑）
@@ -1453,17 +1455,20 @@ impl Store {
 
     /// 把 `max_tokens` 一次应用到该分类下**全部** Key（FR-005 批量设置）。
     ///
-    /// ## 为什么需要
+    /// ## ⚠️ 该值当前不参与任何请求
     ///
-    /// `max_tokens` 逐 Key 存是对的（各厂商上限不同，必须能分别配），但实际用法里用户往往
-    /// 希望整个分类统一。一条条改十来个 Key 既繁琐又容易漏掉一个 —— 而**漏掉的那个会在
-    /// 故障转移落到它时按旧值截断回答**，表现为「同一个问题有时答得完整、有时被切断」，
-    /// 这种偶发性问题极难联想到是某个备用 Key 的参数没跟上。
+    /// 两个用途都已按产品定调撤掉：代理转发不注入（2026-08-14，
+    /// `proxy.rs::apply_key_params`）、大脑聚合改为按协议与模型上下文窗口现算
+    /// （2026-08-15，`upstream/budget.rs`）。字段与本命令仅为**兼容旧配置**保留，
+    /// UI 也已如实标注「不生效」。
+    ///
+    /// 保留这个批量入口的意义：让老配置能被统一改成同一个值（或清理），
+    /// 而不是留一堆各不相同的历史残值让日后接手的人困惑。
     ///
     /// ## 含已停用的 Key
     ///
-    /// 停用只是暂时不进候选池。若跳过它们，日后重新启用时又带着旧值回来，
-    /// 上面那种偶发截断会再次出现。要统一就真的统一。
+    /// 停用只是暂时不进候选池。若跳过它们，日后重新启用时又带着旧值回来。
+    /// 要统一就真的统一。
     ///
     /// 幂等：全部 Key 已是该值时返回 0 且**不落盘**（避免每次点击都整份重写 config.json）。
     /// 返回实际改动的条数，供前端如实提示「已应用到 N 条」而不是一律报成功。
@@ -2285,37 +2290,6 @@ impl Store {
                 false
             } else {
                 cfg.settings.auto_start = enabled;
-                true
-            }
-        })
-    }
-
-    /// 悬浮窗开关的专用写入（后端自管字段）。已是目标值则幂等跳过写盘。
-    ///
-    /// 窗口的创建与销毁由 `lib.rs` 的 `set_floating_widget` 命令负责，这里只管配置持久化。
-    ///
-    /// 走 `mutate_and_persist_if` 而非「改内存 + persist()」：落盘失败要按磁盘对账回滚，
-    /// 否则「内存领先磁盘」这个方向**永不自愈**（mtime 自愈只认「磁盘比内存新」），
-    /// 表现为开关看着生效了、重启后悄悄回退。与 `set_active_model` 同一套取舍。
-    pub fn set_floating_widget_flag(&self, enabled: bool) -> AppResult<()> {
-        self.mutate_and_persist_if(|cfg| {
-            if cfg.settings.floating_widget_enabled == enabled {
-                false
-            } else {
-                cfg.settings.floating_widget_enabled = enabled;
-                true
-            }
-        })
-    }
-
-    /// 悬浮球置顶开关的专用写入（后端自管字段）。与 `set_floating_widget_flag` 同一套语义：
-    /// 幂等跳过、落盘失败按磁盘对账回滚。
-    pub fn set_floating_pinned_flag(&self, pinned: bool) -> AppResult<()> {
-        self.mutate_and_persist_if(|cfg| {
-            if cfg.settings.floating_widget_always_on_top == pinned {
-                false
-            } else {
-                cfg.settings.floating_widget_always_on_top = pinned;
                 true
             }
         })
@@ -3856,9 +3830,9 @@ mod tests {
 
     /// 批量应用 Max Tokens：覆盖全分类（**含已停用**）、不牵连别的分类。
     ///
-    /// 「含已停用」是关键判据：跳过它们的话，日后重新启用又带着旧值回来，
-    /// 故障转移落到它时按旧值截断回答 —— 表现为「同一问题有时完整、有时被切断」，
-    /// 而这种偶发性极难联想到是某个备用 Key 的参数没跟上。
+    /// 「含已停用」是关键判据：跳过停用项的话，日后重新启用又带着旧值回来，
+    /// 「批量统一」就没做到。注意该值本身当前不参与任何请求（既不进代理转发、
+    /// 也不进大脑聚合），这里验的只是**批量写入的覆盖面**。
     #[test]
     fn apply_max_tokens_covers_whole_category_including_disabled() {
         let dir = temp_dir("mt_all");
@@ -4414,34 +4388,6 @@ mod tests {
     }
 
     /// `auto_start` 的专用写入是幂等的，且能双向改。
-    /// 悬浮窗开关：默认关、可落盘、幂等。
-    ///
-    /// 「默认关」是用户明确要求的，单独断言一次 —— 若哪天有人把 `#[serde(default)]`
-    /// 改成 `default_true`，这条会立刻失败，而不是让悬浮窗在所有人升级后自己冒出来。
-    #[test]
-    fn set_floating_widget_flag_defaults_off_and_persists() {
-        let dir = temp_dir("floating_widget_flag");
-        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
-
-        assert!(
-            !store.get_settings().floating_widget_enabled,
-            "悬浮窗必须默认关闭"
-        );
-
-        store.set_floating_widget_flag(true).unwrap();
-        assert!(store.get_settings().floating_widget_enabled);
-        store.set_floating_widget_flag(true).unwrap(); // 幂等
-        assert!(store.get_settings().floating_widget_enabled);
-
-        // 重开确认落盘
-        let store2 = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
-        assert!(store2.get_settings().floating_widget_enabled);
-
-        store2.set_floating_widget_flag(false).unwrap();
-        assert!(!store2.get_settings().floating_widget_enabled);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     #[test]
     fn set_auto_start_flag_is_idempotent_and_persists() {
         let dir = temp_dir("auto_start_flag");

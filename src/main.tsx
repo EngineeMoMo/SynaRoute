@@ -1,29 +1,19 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
-import { FloatingWidget } from "./components/FloatingWidget";
 import "./styles.css";
 
 /**
- * 悬浮窗与主窗口共用这一份前端，靠查询串分流（后端建窗时用的是
- * `index.html?floating=1`，见 `floating.rs`）。
+ * 单一入口：这份前端只服务主窗口。
  *
- * 用 `search` 而不是 `hash`：hash 变化不会让 WebView 重新求值初始 URL，
- * 而这里需要在**首次加载**时就决定渲染哪棵树。
+ * 历史：这里曾按 `?floating=1` 分流出一棵 `FloatingWidget` 树（桌面悬浮球用的独立
+ * Tauri 窗口共用同一份 index.html）。悬浮窗功能已于 2026-08-15 整体删除
+ * —— 真机实测它的子 WebView 从未初始化、用户彻底看不见，而后端却打出「已显示」。
+ * 详见 docs/14 第十八节。**不要**在这里重新加查询串分流：那条路已被证明不可靠，
+ * 要做桌面浮层需要重新立项并先解决 WebView 初始化问题。
  */
-const isFloating = new URLSearchParams(window.location.search).get("floating") === "1";
-
-/**
- * 悬浮球要的是「圆」，而窗口永远是方的 —— 圆是靠**三层同时透明**换来的：
- * 窗口 `transparent(true)`（floating.rs）、body 透明（本行打的类）、
- * 组件外层不给背景（FloatingWidget）。任意一层不透明，屏幕上就是个白方块套着球。
- *
- * 在 render **之前**打这个类：晚一步就会在首帧闪一下方形白底。
- */
-if (isFloating) {
-  document.documentElement.classList.add("floating-mode");
-}
-
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  <React.StrictMode>{isFloating ? <FloatingWidget /> : <App />}</React.StrictMode>
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
 );

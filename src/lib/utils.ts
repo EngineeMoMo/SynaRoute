@@ -25,7 +25,7 @@ export function maskSecret(secret: string, visible = 4): string {
 export function formatRelativeTime(ts: number | null | undefined, t: TFunc): string {
   if (!ts) return t("time.never");
   const diff = Date.now() - ts;
-  const sec = Math.floor(diff / 1000);
+  const sec = Math.max(0, Math.floor(diff / 1000));
   if (sec < 60) return t("time.secondsAgo", { n: sec });
   const min = Math.floor(sec / 60);
   if (min < 60) return t("time.minutesAgo", { n: min });

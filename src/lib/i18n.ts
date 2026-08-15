@@ -99,10 +99,6 @@ const zh: Dict = {
   "balance.multiplierHint":
     "中转站常按官方价打折，如 0.3 表示三折。用量页据此估算花费；留空按 1.0（原价）。只是估算，与实际账单可能有差。",
 
-  // 桌面悬浮窗（第⑥批）
-  "floating.runningCount": "{n}/3 运行",
-  "floating.todayTokens": "今日 token",
-  "floating.estCost": "花费（估算）",
 
 
   // 命令面板（Ctrl/Cmd+K）
@@ -345,7 +341,9 @@ const zh: Dict = {
   "editor.showSecret": "显示",
   "editor.hideSecret": "隐藏",
   "editor.temperature": "Temperature（采样温度）",
-  "editor.maxTokens": "Max Tokens（最大输出长度）",
+  "editor.maxTokens": "Max Tokens（当前不生效，仅兼容旧配置）",
+  "editor.maxTokensHint":
+    "SynaRoute 已不再用这个值限制任何回答长度。代理转发完全透明：客户端（Claude Code / Codex）给多少就是多少，没给也不补。大脑聚合的输出预算按协议与模型能力自动决定：OpenAI 上游不发上限；Anthropic 上游因 API 要求必填，按「该模型上下文窗口 − 本轮输入」现算。该字段仅为兼容旧配置保留，改它不会影响请求。",
   "editor.modelList": "模型列表",
   "editor.fetch": "拉取",
   "editor.modelManualPlaceholder": "手动输入模型名后回车，如 gpt-4o",
@@ -379,10 +377,10 @@ const zh: Dict = {
   "editor.errSave": "保存失败：{err}",
   "editor.applyMaxTokensAll": "应用 {n} 到本分类全部 Key",
   "editor.applyMaxTokensAllHint":
-    "把上面的 Max Tokens 一次写入本分类所有 Key（含已停用的）。漏改一个的后果是：故障转移落到它时按旧值截断回答，表现为「同一问题有时完整、有时被切断」，很难排查。",
+    "把上面的 Max Tokens 一次写入本分类所有 Key（含已停用的）。注意：该值当前不参与任何请求（代理转发与大脑聚合都不读它），仅为兼容旧配置保留。",
   "editor.maxTokensApplied": "已应用到 {n} 条 Key",
   "editor.maxTokensNoChange": "本分类全部 Key 已是该值，无需修改",
-  "editor.errMaxTokensZero": "Max Tokens 必须大于 0（上游会直接拒绝请求）",
+  "editor.errMaxTokensZero": "Max Tokens 必须大于 0（仅为保持旧配置格式有效；该值当前不参与请求）",
   "editor.errApplyAll": "批量应用失败：{err}",
 
   // 大脑聚合
@@ -676,14 +674,7 @@ const zh: Dict = {
   "settings.startup": "启动",
   "settings.autoStartTitle": "开机自启动并最小化到托盘",
   "settings.autoStartDesc": "随 Windows 启动，后台驻留系统托盘",
-  "settings.floatingTitle": "桌面悬浮球",
-  // ⚠️ 本条是**纯文本渲染**（ToggleRow 的 desc 直接进 div），写 `**粗体**` 会露出星号。
-  // 原文写着「常驻一个小窗」「always-on-top」，改成球+可选置顶后那两句都成了假话。
-  "settings.floatingDesc":
-    "在桌面角落放一颗小球，显示有几个代理在跑；鼠标移上去展开今日用量与花费估算。开启后只在关闭主窗口（最小化到托盘）时出现，主窗口在前台时自动隐藏。",
-  "settings.floatingPinTitle": "悬浮球置顶",
-  "settings.floatingPinDesc":
-    "让悬浮球始终显示在其它窗口之上。默认关闭 —— 开了它在你用别的软件时也会盖在最前面。",
+  // 悬浮球相关的四条文案已随该功能于 2026-08-15 删除（docs/14 第十八节）。
   "settings.backup": "配置备份",
   "settings.export": "导出配置…",
   "settings.import": "导入配置…",
@@ -874,10 +865,6 @@ const en: Dict = {
   "balance.multiplierHint":
     "Providers often discount official pricing — 0.3 means 30% of list price. The usage page estimates spend from this; empty means 1.0. Estimates only; may differ from your actual bill.",
 
-  // Desktop widget (batch ⑥)
-  "floating.runningCount": "{n}/3 running",
-  "floating.todayTokens": "Today's tokens",
-  "floating.estCost": "Spend (est.)",
 
 
   // Command palette (Ctrl/Cmd+K)
@@ -1115,7 +1102,9 @@ const en: Dict = {
   "editor.showSecret": "Show",
   "editor.hideSecret": "Hide",
   "editor.temperature": "Temperature",
-  "editor.maxTokens": "Max Tokens",
+  "editor.maxTokens": "Max Tokens (inactive; kept for legacy configs)",
+  "editor.maxTokensHint":
+    "SynaRoute no longer uses this value to cap any reply. Proxy forwarding is fully transparent: client requests (Claude Code / Codex) keep whatever they sent, and nothing is added if they sent none. Brain aggregation derives its own budget from the protocol and model: no cap is sent to OpenAI upstreams; Anthropic requires the field, so it is computed per request as (model context window − this turn's input). This field is retained only for backward compatibility — changing it does not affect requests.",
   "editor.modelList": "Model list",
   "editor.fetch": "Fetch",
   "editor.modelManualPlaceholder": "Type a model name and press Enter, e.g. gpt-4o",
@@ -1149,10 +1138,10 @@ const en: Dict = {
   "editor.errSave": "Save failed: {err}",
   "editor.applyMaxTokensAll": "Apply {n} to every key in this category",
   "editor.applyMaxTokensAllHint":
-    "Write the Max Tokens above to every key in this category (including disabled ones). Missing one means that when failover lands on it, replies get truncated at the old value — showing up as \"sometimes complete, sometimes cut off\", which is hard to trace.",
+    "Write the Max Tokens above to every key in this category (including disabled ones). Note: this value no longer takes part in any request — neither proxy forwarding nor brain aggregation reads it. Kept for backward compatibility only.",
   "editor.maxTokensApplied": "Applied to {n} key(s)",
   "editor.maxTokensNoChange": "Every key in this category already uses this value",
-  "editor.errMaxTokensZero": "Max Tokens must be greater than 0 (upstream rejects the request outright)",
+  "editor.errMaxTokensZero": "Max Tokens must be greater than 0 (only to keep legacy config valid; it is not used by requests)",
   "editor.errApplyAll": "Bulk apply failed: {err}",
 
   "brain.title": "Brain Aggregation",
@@ -1438,12 +1427,7 @@ const en: Dict = {
   "settings.startup": "Startup",
   "settings.autoStartTitle": "Auto-start and minimize to tray",
   "settings.autoStartDesc": "Launch with Windows and stay in the system tray",
-  "settings.floatingTitle": "Desktop ball",
-  "settings.floatingDesc":
-    "Puts a small ball in a screen corner showing how many proxies are running; hover it to expand today's usage and estimated spend. Once enabled it only appears when the main window is closed (minimized to tray), and hides while the main window is in front.",
-  "settings.floatingPinTitle": "Keep ball on top",
-  "settings.floatingPinDesc":
-    "Keeps the ball above other windows. Off by default — with it on, the ball also sits in front while you're using other apps.",
+  // Desktop-ball strings removed together with the feature on 2026-08-15.
   "settings.backup": "Config backup",
   "settings.export": "Export config…",
   "settings.import": "Import config…",

@@ -9,7 +9,6 @@ mod codegraph;
 mod crypto;
 mod error;
 mod events;
-mod floating;
 mod health;
 mod mcp;
 mod model;
@@ -730,80 +729,6 @@ async fn set_auto_start(
     service::toggle_auto_start(&state.store, &PluginAutostart(&app), enabled)
 }
 
-/// 悬浮窗开关。
-///
-/// **专用命令，不走 saveSettings**：它带窗口副作用（建/销毁一个 WebView），
-/// 而通用保存路径提交的是前端挂载时的整份快照 —— 那正是 `auto_start` 出过 P0 的地方
-/// （切主题会把用户刚关掉的开关重新打开）。
-///
-/// 开启后**不立即显示**：显示条件还要求主窗口已隐藏到托盘。所以这里只是
-/// 落盘 + 同步一次可见性，用户此刻通常在设置页（主窗口可见），悬浮窗不会冒出来。
-/// 这不是 bug，是用户明确要的语义 —— 提示文案里已写明。
-#[tauri::command]
-fn set_floating_widget(
-    app: tauri::AppHandle,
-    state: tauri::State<AppState>,
-    enabled: bool,
-) -> AppResult<()> {
-    // 走 mutate_and_persist_if：落盘失败时按磁盘对账回滚。
-    // 直接改内存再 persist 的话，落盘失败即「内存领先磁盘」，而该方向永不自愈 ——
-    // 表现为开关看着生效了、重启后悄悄回退（store.rs 的 set_active_model 有同样注释）。
-    state.store.set_floating_widget_flag(enabled)?;
-    // 把开关动作与随后的窗口真实状态一起记进日志。
-    //
-    // 这里是**命令线程**，查询窗口属性是安全的（事件回调里不行，会等自己）——
-    // 所以这是唯一能拿到「窗口到底存在没、可见没、URL 对不对」的位置。
-    state.store.append_event(
-        CategoryType::ClaudeCli,
-        "config",
-        None,
-        &format!(
-            "悬浮窗开关 → {} · {}",
-            if enabled { "开" } else { "关" },
-            floating::diagnose(&app)
-        ),
-    );
-    if enabled {
-        // 这里在 IPC 命令线程上，不是事件循环回调 —— 建窗是安全的。
-        // `destroy` 之后重新打开开关时窗口已不存在，需要在此重建；
-        // `sync_visibility` 内部的 `ensure_window` 会处理。
-        let pinned = state.store.get_settings().floating_widget_always_on_top;
-        floating::sync_visibility(&app, true, pinned);
-    } else {
-        // 关掉就销毁，不留着占一个 WebView 进程。
-        floating::destroy(&app);
-    }
-    Ok(())
-}
-
-/// 悬浮球置顶开关。
-///
-/// 与 `set_floating_widget` 同一套「先落盘（带磁盘对账回滚）再改窗口」的顺序：
-/// 反过来的话落盘失败就成了「窗口已置顶、配置说没置顶」，重启后静默回退。
-#[tauri::command]
-fn set_floating_pinned(
-    app: tauri::AppHandle,
-    state: tauri::State<AppState>,
-    pinned: bool,
-) -> AppResult<()> {
-    state.store.set_floating_pinned_flag(pinned)?;
-    // 即时改属性而不重建窗口：重建会让球闪一下并跳回右下角，
-    // 而用户可能刚把它拖到别处。
-    floating::set_pinned(&app, pinned);
-    Ok(())
-}
-
-/// 悬浮球悬停展开 / 移出收起（由悬浮窗前端的 mouseenter / mouseleave 调）。
-///
-/// **必须有这条 IPC**：WebView 画不出窗口以外的东西，光在 CSS 里展开会被窗口边界裁掉，
-/// 表现为「悬停没反应」。窗口尺寸只能由后端改，故前端每次悬停都要过来一趟。
-///
-/// 纯视觉状态，不落盘 —— 它不是用户偏好，重启后没有「上次是展开的」这种语义。
-#[tauri::command]
-fn set_floating_expanded(app: tauri::AppHandle, expanded: bool) {
-    floating::set_expanded(&app, expanded);
-}
-
 /// 用 `tauri-plugin-autostart` 实现 [`service::AutostartToggle`]。
 ///
 /// Windows 下写/删注册表 `Run` 键，跨平台由插件适配。插件对「已启用再 enable」不报错，
@@ -1479,17 +1404,6 @@ pub fn run() {
             }
             service::reconcile_auto_start(&state.store, &PluginAutostart(app.handle()));
 
-            // 预建悬浮窗（隐藏态）。**必须在 setup 里做**，不能等到用户藏窗口时才建 ——
-            // 那时的代码跑在事件循环回调里，同步建窗会死等自己（详见 floating::preload）。
-            //
-            // 无条件预建、不看开关：开关是运行期可改的，而 setup 只跑一次。若只在
-            // 「开关已开」时预建，用户启动后才打开开关就又落回「回调里建窗」那条坏路径。
-            // 代价是一个隐藏的 WebView；关掉开关时 `destroy` 会销毁它。
-            crate::floating::preload(
-                app.handle(),
-                state.store.get_settings().floating_widget_always_on_top,
-            );
-
             // 随系统启动时最小化到托盘（FR-025 需求原文要求）。判据是启动参数里有
             // `--autostart`（注册自启动项时带上的），而非「auto_start 为真」——
             // 后者在用户手动双击时也成立，那时把窗口藏起来会让人以为程序没启动。
@@ -1498,18 +1412,6 @@ pub fn run() {
                     let _ = w.hide();
                 }
                 tracing::info!("随系统启动，已最小化到托盘（{AUTOSTART_FLAG}）");
-                // 这一刻主窗口已隐藏 → 若用户开了悬浮窗开关，它现在就该出现。
-                //
-                // **少了这一句就是一个静默失效**：自启动路径不经过 `CloseRequested`
-                // （那是用户点关闭按钮才走的），于是「开机自启 + 开了悬浮窗」的用户
-                // 开机后什么也看不到，要先把主窗口叫出来再关一次才行 —— 而他并不知道
-                // 需要这么做，只会认为悬浮窗坏了。
-                let s = state.store.get_settings();
-                crate::floating::sync_visibility(
-                    app.handle(),
-                    s.floating_widget_enabled,
-                    s.floating_widget_always_on_top,
-                );
             }
 
             // 内置 MCP 服务器：用户已启用则随应用启动（Q8），端口取自设置（默认 9527，Q7）。
@@ -1550,24 +1452,8 @@ pub fn run() {
         // 真正退出走托盘菜单「退出」→ app.exit(0)（不触发本事件）。
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                // 悬浮窗自己被关（无边框窗虽无关闭按钮，但 Alt+F4 仍可触发）：
-                // 直接放行销毁，不要按主窗口那套「藏起来」处理 —— 否则用户关不掉它。
-                if window.label() == crate::floating::FLOATING_LABEL {
-                    return;
-                }
                 api.prevent_close();
                 let _ = window.hide();
-                // 主窗口刚藏进托盘 → 这正是悬浮窗该出现的时刻（若用户开了开关）。
-                // 读磁盘最新值而不是启动时的快照：用户可能刚在设置页改过。
-                let app = window.app_handle();
-                if let Some(state) = app.try_state::<AppState>() {
-                    let s = state.store.get_settings();
-                    crate::floating::sync_visibility(
-                        app,
-                        s.floating_widget_enabled,
-                        s.floating_widget_always_on_top,
-                    );
-                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1600,9 +1486,6 @@ pub fn run() {
             get_daily_usage,
             get_usage_with_cost,
             query_key_balance,
-            set_floating_widget,
-            set_floating_pinned,
-            set_floating_expanded,
             show_main_window_cmd,
             recent_failure,
             get_event_trace,
@@ -2105,27 +1988,16 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// 显示并聚焦主窗口（从托盘/悬浮球恢复）
+/// 显示并聚焦主窗口（从托盘恢复）
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
-    // 主窗口回到前台 → 悬浮窗该收起来（显示条件之一是「主窗口已隐藏」）。
-    // 这里传 enabled 无所谓真假：`sync_visibility` 会发现主窗口已可见而一律隐藏，
-    // 但仍按真实开关传值，避免日后有人把这个函数挪去别处时行为悄悄变了。
-    if let Some(state) = app.try_state::<AppState>() {
-        let s = state.store.get_settings();
-        crate::floating::sync_visibility(
-            app,
-            s.floating_widget_enabled,
-            s.floating_widget_always_on_top,
-        );
-    }
 }
 
-/// Tauri 命令：显示主窗口（供悬浮球点击调用）
+/// Tauri 命令：显示主窗口（托盘菜单等入口调用）
 #[tauri::command]
 fn show_main_window_cmd(app: tauri::AppHandle) {
     show_main_window(&app);

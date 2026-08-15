@@ -273,9 +273,10 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
         <MappingGapDialog gaps={gaps} onClose={() => setGapDialogOpen(false)} />
       )}
 
-      {/* pb-24 而非 pb-6：右下角有常驻的快捷面板悬浮按钮（48px + 24px 边距），
-          底部留白不足时它会压住最后一张卡片的「启用」开关，用户滚到底也点不到
-          （实测过：FAB 矩形与最后一个 Switch 重叠）。 */}
+      {/* pb-24 是**底部留白**，不是为了避开某个浮动按钮。
+          原注释说这里要给右下角常驻的快捷面板悬浮按钮让位 —— 那个 FAB 早已删除
+          （见 App.tsx 的说明），理由已不成立。保留这段留白只是让最后一张卡片滚到底时
+          不贴着窗口边缘；要改数值请按视觉效果自行决定，不必再顾虑 FAB 重叠。 */}
       <div className="flex-1 space-y-2 overflow-y-auto px-6 pb-24">
         {loading && <div className="py-10 text-center text-sm text-text-muted">{t("common.loading")}</div>}
 

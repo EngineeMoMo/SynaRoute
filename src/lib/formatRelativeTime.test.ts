@@ -69,4 +69,10 @@ describe("formatRelativeTime", () => {
     expect(formatRelativeTime(NOW - 42 * 60_000, zh)).toBe("42 分钟前");
     expect(formatRelativeTime(NOW - 3 * 86400_000, zh)).not.toContain("{n}");
   });
+
+  it("未来时间戳不产出负数", () => {
+    const future = Date.now() + 10_000;
+    expect(formatRelativeTime(future, en)).toBe("0s ago");
+    expect(formatRelativeTime(future, zh)).toBe("0 秒前");
+  });
 });
