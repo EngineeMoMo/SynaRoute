@@ -52,6 +52,35 @@ pub use session::{
 pub use endpoint::join_endpoint;
 pub use usage::{extract_usage, extract_usage_from_sse, with_usage, TokenUsage};
 
+/// 判断上游非流式响应体里是否出现截断信号。
+///
+/// - OpenAI Chat: `choices[0].finish_reason == "length"`
+/// - Anthropic Messages: `stop_reason == "max_tokens"`
+/// - Responses API: `status == "incomplete"`（由 Codex / Responses 下游使用）
+///
+/// 用于 proxy.rs 的 `log_success` 路径，向 `RequestTrace.was_truncated` 写入截断标志，
+/// 从而在运行日志里对用户可见（A5-11/A5-12 修复）。
+pub fn is_truncated_response(body: &serde_json::Value) -> bool {
+    // Anthropic Messages
+    if body.get("stop_reason").and_then(|r| r.as_str()) == Some("max_tokens") {
+        return true;
+    }
+    // OpenAI Chat Completions
+    if body.get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|r| r.as_str()) == Some("length")
+    {
+        return true;
+    }
+    // Responses API
+    if body.get("status").and_then(|s| s.as_str()) == Some("incomplete") {
+        return true;
+    }
+    false
+}
+
 // 子模块里被本文件使用的项。`pub(super)` 的项对父模块可见需要显式 use ——
 // Rust 的私有项可见性只向**下**流（父的私有项对子可见），反向必须显式提升并引入。
 

@@ -255,6 +255,8 @@ export interface RequestTrace {
   status?: number; // 上游 HTTP 状态码（连接失败时缺省）
   latencyMs: number; // 本次耗时（毫秒）
   ok: boolean; // 是否成功（2xx）
+  /** 响应是否因达到输出上限而被截断（finish_reason:"length" / stop_reason:"max_tokens"） */
+  wasTruncated?: boolean;
 }
 
 /** 事件日志条目（FR-020，敏感信息已脱敏） */

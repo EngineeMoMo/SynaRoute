@@ -3637,6 +3637,7 @@ mod tests {
             status: Some(200),
             latency_ms: 1234,
             ok: true,
+            was_truncated: None,
         };
         store.append_event_full(
             CategoryType::Codex,

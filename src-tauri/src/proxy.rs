@@ -611,6 +611,7 @@ async fn handle_request(
                        response_body: String,
                        status: u16,
                        streaming: bool,
+                       was_truncated: Option<bool>,
                        usage: Option<crate::upstream::TokenUsage>| {
         let verb = if streaming { "流式返回" } else { "成功返回" };
         // token 用量直接写进 detail：这是用户判断「额度花在哪」的唯一入口，
@@ -640,6 +641,7 @@ async fn handle_request(
             status: Some(status),
             latency_ms: elapsed,
             ok: true,
+            was_truncated,
         });
         let collapse = format!("ok:{}:{}:{}", key.id, requested_model, streaming);
         store.append_event_full(
@@ -702,6 +704,7 @@ async fn handle_request(
             status,
             latency_ms: elapsed,
             ok,
+            was_truncated: None,
         };
         let collapse = format!(
             "req:{}:{}:{}:{}",
@@ -885,6 +888,7 @@ async fn handle_request(
                         "（流式响应：边收边发，body 不留存。如需完整响应体，请在客户端侧抓取）".to_string(),
                         200,
                         true,
+                        None, // 流式直通时无法检测截断（边收边发，不解析完整响应）
                         // 流式直通拿不到 usage：SSE 是边收边发、不缓存全文，用量藏在
                         // 最后几个 chunk 里，要取就得把整个流缓存下来 —— 那会毁掉流式的
                         // 首字节延迟优势。故如实留空，而不是编一个数字。
@@ -972,9 +976,12 @@ async fn handle_request(
                 clear_all_failed_gate(&gate_key);
                 // 非流式有完整响应体 → 能真取到 token 用量（两协议字段名已在
                 // extract_usage 里归一）。上游没给用量时返回 None，日志如实不显示。
-                let usage = serde_json::from_slice::<Value>(&outcome.bytes)
-                    .ok()
-                    .and_then(|v| crate::upstream::extract_usage(&v));
+                let parsed_body = serde_json::from_slice::<Value>(&outcome.bytes).ok();
+                let usage = parsed_body.as_ref().and_then(crate::upstream::extract_usage);
+                // 检测截断：finish_reason:"length"（OpenAI）/ stop_reason:"max_tokens"（Anthropic）
+                let was_truncated = parsed_body.as_ref().and_then(|v| {
+                    crate::upstream::is_truncated_response(v).then_some(true)
+                });
                 // 解构取走三个 String（url / real_model / request_body），消掉三次 clone。
                 // `bytes` 是 `Bytes`（引用计数，clone 廉价）留到最后回给下游；`status` 是 Copy。
                 // 这是本分支对 outcome 的最后一次使用，故可以整体移动而非借用。
@@ -989,6 +996,7 @@ async fn handle_request(
                     resp_text,
                     status,
                     false,
+                    was_truncated,
                     usage,
                 );
                 return Ok(json_resp(StatusCode::OK, bytes));

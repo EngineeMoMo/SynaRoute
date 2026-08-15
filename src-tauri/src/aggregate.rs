@@ -58,6 +58,7 @@ fn trace_for_ref(
         status: None,
         latency_ms,
         ok,
+        was_truncated: None,
     })
 }
 
@@ -1415,6 +1416,7 @@ async fn gather_members(
                     status: None,
                     latency_ms: meta.latency_ms,
                     ok: true,
+                    was_truncated: None,
                 });
                 let usage_part = if meta.usage.is_empty() {
                     String::new()
@@ -1456,6 +1458,7 @@ async fn gather_members(
                     status: None,
                     latency_ms: m.latency_ms,
                     ok: false,
+                    was_truncated: None,
                 });
                 store.append_event_full(
                     category,

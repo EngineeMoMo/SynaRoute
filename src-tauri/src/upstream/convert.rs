@@ -1078,13 +1078,20 @@ fn responses_content_text(content: Option<&Value>) -> String {
 
 /// Chat Completions 响应体 → Responses 响应体。
 /// choices[0].message.content → output[].message；tool_calls → output[].function_call；
-/// usage.{prompt,completion}_tokens → usage.{input,output}_tokens。
+/// usage.{prompt,completion}_tokens → usage.{input,output}_tokens；
+/// finish_reason:"length" → status:"incomplete"（A5-12 修复）。
 pub fn chat_resp_to_responses(body: &Value) -> Value {
     let choice0 = body
         .get("choices")
         .and_then(|c| c.as_array())
         .and_then(|arr| arr.first());
     let message = choice0.and_then(|c| c.get("message"));
+    // finish_reason:"length" 表示截断，映射为 Responses status:"incomplete"（A5-12）
+    let finish = choice0
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|r| r.as_str())
+        .unwrap_or("stop");
+    let resp_status = if finish == "length" { "incomplete" } else { "completed" };
     let id = body
         .get("id")
         .and_then(|i| i.as_str())
@@ -1137,7 +1144,7 @@ pub fn chat_resp_to_responses(body: &Value) -> Value {
         "id": id,
         "object": "response",
         "created_at": chrono::Utc::now().timestamp(),
-        "status": "completed",
+        "status": resp_status,
         "model": model,
         "output": output,
         "usage": {
@@ -1396,9 +1403,14 @@ pub fn responses_resp_to_chat(body: &Value) -> Value {
     let mut message = serde_json::Map::new();
     message.insert("role".into(), json!("assistant"));
     message.insert("content".into(), if text.is_empty() { Value::Null } else { json!(text) });
+
+    // Responses status:"incomplete" → Chat finish_reason:"length"（A5-12 修复）
+    let status = body.get("status").and_then(|s| s.as_str()).unwrap_or("completed");
     let finish = if !tool_calls.is_empty() {
         message.insert("tool_calls".into(), json!(tool_calls));
         "tool_calls"
+    } else if status == "incomplete" {
+        "length"
     } else {
         "stop"
     };
@@ -1927,6 +1939,87 @@ mod tests {
         assert_eq!(out["usage"]["input_tokens"], 5);
         assert_eq!(out["usage"]["output_tokens"], 3);
         assert_eq!(out["usage"]["total_tokens"], 8);
+    }
+
+    /// A5-12 回归：Chat finish_reason:"length" → Responses status:"incomplete"。
+    ///
+    /// 此前一律硬写 `"completed"`，截断信号在跨协议路径（Codex → Chat 上游）完全丢失。
+    /// 故障注入验证：把判定从 `"length"` 改成 `"xxx"` 后，此测试的 `status` 断言变红。
+    #[test]
+    fn chat_resp_to_responses_length_becomes_incomplete() {
+        let resp = json!({
+            "id": "chatcmpl-trunc",
+            "model": "gpt-4o",
+            "choices": [ {
+                "index": 0,
+                "message": { "role": "assistant", "content": "部分回答…" },
+                "finish_reason": "length"
+            } ],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 50 }
+        });
+        let out = chat_resp_to_responses(&resp);
+        assert_eq!(
+            out["status"], "incomplete",
+            "Chat finish_reason:\"length\" 必须映射为 Responses status:\"incomplete\""
+        );
+    }
+
+    /// A5-12 回归（反向）：Responses status:"incomplete" → Chat finish_reason:"length"。
+    ///
+    /// 此前 `responses_resp_to_chat` 对 `finish_reason` 只有 `"tool_calls"` 和 `"stop"` 两条路，
+    /// `"incomplete"` 被静默当成普通完成。
+    #[test]
+    fn responses_resp_to_chat_incomplete_becomes_length() {
+        let resp = json!({
+            "id": "resp-trunc",
+            "model": "gpt-5",
+            "status": "incomplete",
+            "output": [ {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [ { "type": "output_text", "text": "部分回答…" } ]
+            } ],
+            "usage": { "input_tokens": 10, "output_tokens": 50, "total_tokens": 60 }
+        });
+        let out = responses_resp_to_chat(&resp);
+        let finish = out["choices"][0]["finish_reason"].as_str().unwrap_or("MISSING");
+        assert_eq!(
+            finish, "length",
+            "Responses status:\"incomplete\" 必须映射为 Chat finish_reason:\"length\""
+        );
+    }
+
+    /// is_truncated_response 辅助函数：三种协议的截断信号都能识别。
+    #[test]
+    fn is_truncated_detects_all_three_signals() {
+        // Anthropic Messages
+        let a = serde_json::json!({
+            "stop_reason": "max_tokens",
+            "content": [{"type":"text","text":"hi"}]
+        });
+        assert!(crate::upstream::is_truncated_response(&a), "Anthropic max_tokens 必须检出");
+
+        // OpenAI Chat
+        let o = serde_json::json!({
+            "choices": [{"finish_reason": "length", "message": {"content": "hi"}}]
+        });
+        assert!(crate::upstream::is_truncated_response(&o), "OpenAI length 必须检出");
+
+        // Responses API
+        let r = serde_json::json!({
+            "status": "incomplete",
+            "output": []
+        });
+        assert!(crate::upstream::is_truncated_response(&r), "Responses incomplete 必须检出");
+
+        // 正常结束不算截断
+        let n = serde_json::json!({
+            "stop_reason": "end_turn",
+            "choices": [{"finish_reason": "stop"}],
+            "status": "completed"
+        });
+        assert!(!crate::upstream::is_truncated_response(&n), "正常结束不得误判截断");
     }
 
     #[test]

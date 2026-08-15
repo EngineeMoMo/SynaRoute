@@ -397,6 +397,12 @@ function TraceDetail({ trace }: { trace: RequestTrace }) {
   const t = useT();
   return (
     <div className="border-t border-border px-3 py-3 text-xs">
+      {/* 截断警告 */}
+      {trace.wasTruncated && (
+        <div className="mb-3 flex items-center gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-warning">
+          <span className="font-semibold">{t("logs.trace.truncatedWarning")}</span>
+        </div>
+      )}
       {/* 概要信息栏 */}
       <div className="mb-3 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5">
         <Field label={t("logs.trace.vendor")} value={`${trace.keyName} · ${trace.vendor}`} />

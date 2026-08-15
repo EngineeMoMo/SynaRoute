@@ -1565,6 +1565,9 @@ pub struct RequestTrace {
     pub latency_ms: u64,
     /// 是否成功（2xx）
     pub ok: bool,
+    /// 响应是否因达到输出上限而被截断（finish_reason: "length" / stop_reason: "max_tokens"）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub was_truncated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -776,6 +776,7 @@ async fn handle_tool_call(
                 status: Some(200),
                 latency_ms: elapsed,
                 ok: true,
+                was_truncated: None,
             };
             store.append_event_trace(category, "mcp", None, &detail, Some(trace));
 
@@ -795,6 +796,7 @@ async fn handle_tool_call(
                 status: None,
                 latency_ms: elapsed,
                 ok: false,
+                was_truncated: None,
             };
             store.append_event_trace(
                 category,
