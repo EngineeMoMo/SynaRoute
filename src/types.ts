@@ -119,6 +119,14 @@ export interface ModelInfo {
   source: "fetched" | "manual";
   fetchedAt?: number;
   contextWindow?: number;
+  /**
+   * 最大单次输出 token（如 Claude 4.5 系的 64000）。
+   *
+   * ⚠️ 与 contextWindow 是**两个不同的能力**：4.5 系都是 200k 窗口但最大输出只有 64k。
+   * 留空 = 用内置能力表（只认 Claude 家族名）；第三方中转的私有模型名认不出时，
+   * 大脑聚合会拒绝该模型 —— 填上这个值即可正常参与。
+   */
+  maxOutputTokens?: number;
 }
 
 /** 健康状态（FR-011 / FR-012） */

@@ -1846,6 +1846,7 @@ fn ensure_anthropic_output_budget(
         real_model,
         key.context_window_of_real(real_model),
         input_tokens,
+        key.max_output_of_real(real_model),
     )
     .map_err(AppError::Invalid)?;
     let obj = payload
@@ -3189,6 +3190,7 @@ mod tests {
             source: "manual".into(),
             fetched_at: None,
             context_window: ctx,
+                    max_output_tokens: None,
         }
     }
 
@@ -4362,7 +4364,7 @@ mod tests {
     use crate::model::{ModelInfo, ModelMapping};
 
     fn model_info(name: &str) -> ModelInfo {
-        ModelInfo { real_name: name.into(), source: "manual".into(), fetched_at: None, context_window: None }
+        ModelInfo { real_name: name.into(), source: "manual".into(), fetched_at: None, context_window: None, max_output_tokens: None }
     }
     fn mapping(expected: &str, real: &str) -> ModelMapping {
         ModelMapping { id: format!("{expected}->{real}"), expected_name: expected.into(), real_name: real.into() }

@@ -104,10 +104,17 @@ interface AppState {
    * 查一条 Key 的余额。
    *
    * `fingerprint` 由调用方用 `balanceFingerprint(key)` 算好传入：缓存命中判据是
-   * 「指纹相同 且 未超 TTL」，指纹变了（用户改了查询地址等）就必须重查。
-   * `force` = 用户手点刷新，跳过 TTL 但仍受并发去重约束。
+   * 「指纹相同 且 未超新鲜度门槛」，指纹变了（用户改了查询地址等）就必须重查。
+   * `force` = 用户手点刷新，跳过门槛但仍受并发去重约束。
+   * `maxAgeMs` = 自定义新鲜度门槛（自动轮询用它传用户配的间隔，否则默认 5 分钟 TTL
+   * 会把短间隔轮询全部拦掉 —— 表现为「设了自动查询不生效」）。
    */
-  refreshBalance: (keyId: string, fingerprint: string, force?: boolean) => Promise<void>;
+  refreshBalance: (
+    keyId: string,
+    fingerprint: string,
+    force?: boolean,
+    maxAgeMs?: number,
+  ) => Promise<void>;
   /** 编辑器「测试查询」的结果直接写回缓存，省掉卡片再发一次同样的请求 */
   setBalanceResult: (keyId: string, fingerprint: string, result: BalanceResult) => void;
 
@@ -184,18 +191,25 @@ export const useStore = create<AppState>((set, get) => ({
   balances: {},
   balanceLoading: {},
 
-  async refreshBalance(keyId, fingerprint, force = false) {
+  async refreshBalance(keyId, fingerprint, force = false, maxAgeMs) {
     // 并发去重。**这一条不能省**：StrictMode 下 effect 会连跑两次，
     // 卡片挂载即发两个一模一样的请求。这里同步读同步写，第二次调用必然看到 true。
     if (get().balanceLoading[keyId]) return;
 
     if (!force) {
       const cached = get().balances[keyId];
-      // 指纹相同 = 同一份配置查出来的；未超 TTL = 还算新鲜。两条都满足才复用。
+      // 新鲜度门槛：调用方给了 `maxAgeMs` 就用它，否则用默认 TTL。
+      //
+      // **为什么必须可传**：自动轮询的间隔由用户配（可低至 1 分钟），而默认 TTL 是 5 分钟。
+      // 若一律按 5 分钟判，用户把间隔设成 1 分钟时前 4 次轮询会全部被缓存拦掉 ——
+      // 表现为「设了自动查询却不生效」，正是本项目最忌讳的静默失效。
+      // 轮询也不能改用 `force: true`：那会连并发去重一起绕过。
+      const freshFor = maxAgeMs && maxAgeMs > 0 ? maxAgeMs : BALANCE_TTL_MS;
+      // 指纹相同 = 同一份配置查出来的；未超门槛 = 还算新鲜。两条都满足才复用。
       if (
         cached &&
         cached.fingerprint === fingerprint &&
-        Date.now() - cached.result.queriedAt < BALANCE_TTL_MS
+        Date.now() - cached.result.queriedAt < freshFor
       ) {
         return;
       }

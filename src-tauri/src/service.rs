@@ -378,11 +378,16 @@ fn merge_context_windows(names: Vec<String>, previous: &[ModelInfo]) -> Vec<Mode
         .into_iter()
         .map(|n| {
             let context_window = old_ctx.get(n.as_str()).copied().flatten();
+            let max_output_tokens = previous
+                .iter()
+                .find(|m| m.real_name == n)
+                .and_then(|m| m.max_output_tokens);
             ModelInfo {
                 real_name: n,
                 source: "fetched".into(),
                 fetched_at: Some(now),
                 context_window,
+                max_output_tokens,
             }
         })
         .collect()
@@ -1567,6 +1572,7 @@ mod tests {
             source: "manual".into(),
             context_window: None,
             fetched_at: None,
+            max_output_tokens: None,
         }
     }
 
@@ -1899,12 +1905,15 @@ mod tests {
                 source: "manual".into(),
                 context_window: Some(1_000_000),
                 fetched_at: None,
+                // 与 context_window 同样要被继承（拉取不该抹掉用户手填的能力数据）
+                max_output_tokens: Some(64_000),
             },
             ModelInfo {
                 real_name: "已下线的模型".into(),
                 source: "manual".into(),
                 context_window: Some(200_000),
                 fetched_at: None,
+                max_output_tokens: None,
             },
         ];
         let names = vec![
@@ -1923,6 +1932,18 @@ mod tests {
         assert_eq!(
             merged[1].context_window, None,
             "上游新出现的模型没有历史值，保持 None（由用户补）"
+        );
+        // max_output_tokens 与 context_window 同样是**用户手填的能力数据**，拉取不得抹掉。
+        // 抹掉的后果比窗口更严重：budget.rs 会因「认不出最大输出」直接拒绝该模型参与聚合，
+        // 而用户只会看到「模型 X 缺少最大输出 token 能力数据」，想不到是刚点的那次拉取干的。
+        assert_eq!(
+            merged[0].max_output_tokens,
+            Some(64_000),
+            "同名条目也要继承用户填过的最大输出（丢了会让该模型被 budget 拒掉）"
+        );
+        assert_eq!(
+            merged[1].max_output_tokens, None,
+            "上游新出现的模型没有历史值，保持 None（回退内置表）"
         );
         assert!(
             merged.iter().all(|m| m.source == "fetched" && m.fetched_at.is_some()),

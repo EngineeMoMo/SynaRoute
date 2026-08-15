@@ -545,6 +545,7 @@ mod tests {
                 source: "manual".into(),
                 fetched_at: None,
                 context_window: None,
+                    max_output_tokens: None,
             }],
             mappings: vec![],
             default_model: None,

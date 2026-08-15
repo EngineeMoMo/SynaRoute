@@ -341,6 +341,20 @@ pub struct ModelInfo {
     /// 上下文窗口大小（token 数），如 200000、1000000
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
+    /// **最大单次输出** token 数（如 Claude 4.5 系的 64000）。
+    ///
+    /// ⚠️ **与 `context_window` 是两个不同的能力，不可互相推导**：4.5 系都是 200k 上下文窗口
+    /// 但最大输出只有 64k。只按窗口算会发出近 200k 的 `max_tokens`，官方与严格中转直接 400
+    /// （这是 2026-08-15 审计实测出的 provider-break，详见 docs/14 §17.1）。
+    ///
+    /// 为什么需要这个字段：`budget.rs::CLAUDE_MAX_OUTPUT_TABLE` 是代码内置表，只认 Claude
+    /// 家族片段。第三方中转的自定义模型名（`gpt-5.6-sol`、某些站点的私有别名）认不出来，
+    /// 此前会被 budget 直接拒绝、大脑聚合完全用不了。填了这个字段就能参与聚合。
+    ///
+    /// 留空 = 回退内置表；内置表也认不出才报错。**绝不能在 budget 里给它兜个默认值** ——
+    /// 猜大可能被上游 400，猜小就是静默截断长回答，两边都是赌（见 budget.rs 顶部文档）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1153,6 +1167,19 @@ impl ProviderKey {
             .iter()
             .find(|m| m.real_name == real_name)
             .and_then(|m| m.context_window)
+    }
+
+    /// 本 Key 里某个**真实模型名**的用户填写的最大单次输出（token）。
+    ///
+    /// 与 [`Self::context_window_of_real`] 并列而不是合并：两者是**不同的能力**
+    /// （200k 窗口 / 64k 输出），合成一个返回值必然有一方被误用（见 `ModelInfo` 字段文档）。
+    ///
+    /// 返回 `None` 时调用方（`budget.rs`）回退到内置 `CLAUDE_MAX_OUTPUT_TABLE`。
+    pub fn max_output_of_real(&self, real_name: &str) -> Option<u32> {
+        self.models
+            .iter()
+            .find(|m| m.real_name == real_name)
+            .and_then(|m| m.max_output_tokens)
     }
 
     /// 选一个「保证能被上游接受」的真实模型名，用于真实补全健康探测。
@@ -2062,6 +2089,7 @@ mod tests {
             source: "fetched".into(),
             fetched_at: None,
             context_window: None,
+                    max_output_tokens: None,
         }
     }
 

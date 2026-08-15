@@ -2521,6 +2521,7 @@ mod tests {
                 source: "manual".into(),
                 fetched_at: None,
                 context_window: Some(200_000),
+                    max_output_tokens: None,
             }],
             mappings: vec![],
             default_model: None,

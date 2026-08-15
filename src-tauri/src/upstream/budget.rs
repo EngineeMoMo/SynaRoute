@@ -152,13 +152,24 @@ fn anthropic_max_output_for(model: &str) -> Option<u32> {
 /// `window` 传 `None` 表示没有窗口数据：此时仍可只按模型最大输出取值
 /// （真实 Claude 窗口都 ≥ 200k，输入通常远小于它，故这个值实际安全），
 /// 但**模型最大输出未知时必须报错**，因为那时无论填什么都是猜。
+///
+/// `user_max_output`：用户在该模型上手填的最大输出（`ModelInfo.max_output_tokens`）。
+/// **它优先于内置表** —— 内置表只认 Claude 家族片段，第三方中转的私有模型名
+/// （`gpt-5.6-sol` 之类）认不出来就会被整个拒掉；用户填了就该信他的。
+/// 传 `None` 时回退内置表，内置表也认不出才报错。
 pub fn anthropic_required_max_tokens(
     model: &str,
     window: Option<u32>,
     input_text_len_tokens: u32,
+    user_max_output: Option<u32>,
 ) -> Result<u32, String> {
-    let max_output =
-        anthropic_max_output_for(model).ok_or_else(|| missing_max_output_reason(model))?;
+    // 用户手填优先于内置表：内置表按 Claude 家族片段匹配，认不出第三方私有模型名。
+    // `filter(|v| *v > 0)` 挡掉手填 0 —— 那会让 max_tokens=0，上游必然 400，
+    // 而用户以为「填 0 = 不限制」。前端也校验，这里是纵深防御。
+    let max_output = user_max_output
+        .filter(|v| *v > 0)
+        .or_else(|| anthropic_max_output_for(model))
+        .ok_or_else(|| missing_max_output_reason(model))?;
     let Some(window) = window else {
         // 无窗口数据：只受模型能力约束。不报错是刻意的 —— 报错会拒掉「用户没填窗口
         // 但模型名可辨识」这类完全可用的配置（本项目主场景之一）。
@@ -218,6 +229,7 @@ pub fn output_budget(
             model,
             key.context_window_of_real(model),
             input_text_len_tokens,
+            key.max_output_of_real(model),
         )
         .map(Some),
     }
@@ -240,11 +252,7 @@ mod tests {
             enabled: true,
             priority: 0,
             headers_json: None,
-            // 刻意配一个旧的 max_tokens：本模块**绝不能**读它（那是被撤下的截断源头）。
-            params: KeyParams {
-
-                ..Default::default()
-            },
+            params: KeyParams::default(),
             models: models
                 .iter()
                 .map(|(n, ctx)| ModelInfo {
@@ -252,6 +260,7 @@ mod tests {
                     source: "manual".into(),
                     fetched_at: None,
                     context_window: *ctx,
+                    max_output_tokens: None,
                 })
                 .collect(),
             mappings: vec![],
@@ -341,6 +350,54 @@ mod tests {
         let err = output_budget(&k, "third-party-claude", 100)
             .expect_err("未知最大输出时不得猜一个数");
         assert!(err.contains("最大输出"), "错误应指出缺的能力数据：{err}");
+    }
+
+    /// 用户手填的 `max_output_tokens` **优先于内置表**，且能救回内置表认不出的模型。
+    ///
+    /// 为什么需要这条能力：`CLAUDE_MAX_OUTPUT_TABLE` 只认 Claude 家族片段，而第三方中转
+    /// 普遍用私有模型名（`gpt-5.6-sol`、站点自定义别名）。此前这类模型会被
+    /// `missing_max_output_reason` 整个拒掉 —— 用户明知该模型能输出多少，却没有地方告诉程序。
+    ///
+    /// 三条断言各覆盖一种情形，去掉 `user_max_output` 那一支后三条都会红。
+    #[test]
+    fn user_supplied_max_output_overrides_builtin_table() {
+        let mut k = key_with(Protocol::Anthropic, &[("third-party-claude", Some(200_000))]);
+
+        // ① 内置表认不出的模型：填了就能用（此前必被拒）
+        k.models[0].max_output_tokens = Some(16_000);
+        assert_eq!(
+            output_budget(&k, "third-party-claude", 100),
+            Ok(Some(16_000)),
+            "内置表认不出的模型，用户填了最大输出就该照用"
+        );
+
+        // ② 手填值优先于内置表：模型名能被内置表认出（claude-sonnet-4-5 = 64k），
+        //    但用户填了 8k（如中转商实际限制更严），必须用 8k
+        let mut k2 = key_with(Protocol::Anthropic, &[("claude-sonnet-4-5", Some(200_000))]);
+        k2.models[0].max_output_tokens = Some(8_000);
+        assert_eq!(
+            output_budget(&k2, "claude-sonnet-4-5", 100),
+            Ok(Some(8_000)),
+            "用户手填必须覆盖内置表的 64k"
+        );
+
+        // ③ 窗口钳制仍然生效：手填 100k 但窗口只剩 ~50k 时取窗口余量
+        let mut k3 = key_with(Protocol::Anthropic, &[("custom-model", Some(60_000))]);
+        k3.models[0].max_output_tokens = Some(100_000);
+        let got = output_budget(&k3, "custom-model", 8_000).unwrap().unwrap();
+        assert!(
+            got < 60_000 && got > 40_000,
+            "手填值不得绕过窗口钳制（窗口 60k − 输入 8k − 余量 1k ≈ 51k），实际 {got}"
+        );
+
+        // ④ 手填 0 视为未填（回退内置表）：0 会让上游 400，而用户可能以为「0 = 不限制」
+        let mut k4 = key_with(Protocol::Anthropic, &[("claude-sonnet-4-5", Some(200_000))]);
+        k4.models[0].max_output_tokens = Some(0);
+        assert_eq!(
+            output_budget(&k4, "claude-sonnet-4-5", 100),
+            Ok(Some(64_000)),
+            "手填 0 必须回退内置表，不能真的发 max_tokens=0"
+        );
     }
 
     /// 缺窗口数据的 Anthropic Key：**不猜**，报出可执行的原因。

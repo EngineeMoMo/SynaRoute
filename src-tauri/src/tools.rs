@@ -3516,6 +3516,7 @@ tool_timeout_sec = 600
                     source: "manual".into(),
                     fetched_at: None,
                     context_window: *ctx,
+                    max_output_tokens: None,
                 })
                 .collect(),
             mappings: mappings

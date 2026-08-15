@@ -98,6 +98,27 @@ describe("refreshBalance", () => {
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
+  it("传 maxAgeMs（轮询用它把间隔当作新鲜度门槛）：缓存超龄才打上游", async () => {
+    // 场景：用户设的自动间隔是 1 分钟（60_000 ms），现在缓存是 59 秒前的 —— 还没到期
+    const customTTL = 60_000;
+    useStore.setState({
+      balances: { k1: { result: okResult(Date.now() - 59_000), fingerprint: "fp1" } },
+    });
+    spy = vi.spyOn(api, "queryKeyBalance");
+
+    // 传了 maxAgeMs=60_000，59 秒内的缓存判为「还新鲜」→ 不打
+    await useStore.getState().refreshBalance("k1", "fp1", false, customTTL);
+    expect(spy).not.toHaveBeenCalled();
+
+    // 同样的缓存，但已经 61 秒了 → 必须重查
+    useStore.setState({
+      balances: { k1: { result: okResult(Date.now() - 61_000), fingerprint: "fp1" } },
+    });
+    spy = vi.spyOn(api, "queryKeyBalance").mockResolvedValue(okResult(Date.now()) as never);
+    await useStore.getState().refreshBalance("k1", "fp1", false, customTTL);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
   it("查询失败的结果也要落缓存（卡片要显示那句原因，而不是停在「未查询」）", async () => {
     const failed: BalanceResult = {
       ok: false,

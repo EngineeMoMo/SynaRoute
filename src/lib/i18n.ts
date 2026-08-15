@@ -368,6 +368,10 @@ const zh: Dict = {
   "editor.contextWindow": "上下文窗口",
   "editor.contextWindowPlaceholder": "如 200",
   "editor.contextWindowUnit": "单位（token / K / M）",
+  "editor.maxOutput":
+    "最大单次输出（与上下文窗口不同：如 4.5 系是 200K 窗口 / 64K 输出）。留空则用内置能力表；第三方中转的私有模型名内置表认不出时，填上此值该模型才能参与大脑聚合",
+  "editor.maxOutputPlaceholder": "如 64",
+  "editor.maxOutputUnit": "单位（token / K / M）",
   "editor.oneMHint": "窗口 ≥ 1M 时自动启用 1M 上下文（转发时补 anthropic-beta 头），Claude Code / CLI 与桌面端均生效",
   "editor.errNeedName": "请填写 Key 名称",
   "editor.errNeedBaseUrl2": "请填写 base_url",
@@ -1122,6 +1126,10 @@ const en: Dict = {
   "editor.contextWindow": "Context window",
   "editor.contextWindowPlaceholder": "e.g. 200",
   "editor.contextWindowUnit": "Unit (token / K / M)",
+  "editor.maxOutput":
+    "Max single output (different from context window: the 4.5 family has a 200K window but 64K output). Leave empty to use the built-in capability table; for relay-specific model names the table cannot recognize, set this so the model can join brain aggregation",
+  "editor.maxOutputPlaceholder": "e.g. 64",
+  "editor.maxOutputUnit": "Unit (token / K / M)",
   "editor.oneMHint": "A window ≥ 1M enables 1M context automatically (an anthropic-beta header is added when forwarding); applies to Claude Code / CLI and the desktop app",
   "editor.errNeedName": "Please enter a key name",
   "editor.errNeedBaseUrl2": "Please enter base_url",

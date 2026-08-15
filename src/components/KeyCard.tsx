@@ -10,6 +10,7 @@ import { type ProviderKey, protocolLabel } from "@/types";
 import { useStore } from "@/store";
 import { formatRelativeTime } from "@/lib/utils";
 import { balanceFingerprint, formatBalanceAmount, usedPercent } from "@/lib/balance";
+import { usePolling } from "@/lib/usePolling";
 import { useT } from "@/lib/useT";
 import { ChevronUp, ChevronDown, RefreshCw, Pencil, Trash2, ArrowRight, Wallet } from "lucide-react";
 
@@ -63,6 +64,35 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast 
     // 只有在 store 里同步读写那面旗才拦得住重复请求。
     void refreshBalance(k.id, fingerprint);
   }, [k.id, balanceEnabled, fingerprint, refreshBalance]);
+
+  /**
+   * 余额自动轮询（对齐 cc-switch 的 `autoQueryInterval`）。
+   *
+   * `autoIntervalMin` 此前是**死字段**：结构里有、UI 能填、值能落盘，却没有任何代码读它
+   * —— 用户设了「每 30 分钟自动查」，实际永远只在打开界面时查一次。
+   *
+   * 三条刻意约束：
+   * 1. **`0` = 不自动查**（与字段文档一致）。`usePolling` 对 `intervalMs <= 0` 直接不起表，
+   *    故这里传 0 即可，无需另加分支。
+   * 2. **`force: false`**：仍然过 store 的指纹 + TTL 判定。轮询只是「到点了去问一下」，
+   *    真正要不要打上游由 store 决定 —— 否则用户把间隔设成 1 分钟就是每分钟一次真实上游
+   *    请求，而余额几乎不会那么快变。
+   * 3. **窗口不可见时停表**（`usePolling` 自带）：余额查询打的是真实上游、消耗额度，
+   *    最小化到托盘后还在后台定时烧额度是用户不会预期的。
+   */
+  const autoIntervalMs = React.useMemo(() => {
+    const min = k.balanceQuery?.autoIntervalMin ?? 0;
+    // 下限 1 分钟：防手填 0.x 之类的极小值把上游打爆（0 仍然表示「关闭」，见上）。
+    return min > 0 ? Math.max(min, 1) * 60_000 : 0;
+  }, [k.balanceQuery?.autoIntervalMin]);
+
+  usePolling(
+    // 把轮询间隔当作新鲜度门槛传下去：否则默认 5 分钟 TTL 会把「间隔 1 分钟」
+    // 这类配置的前几次轮询全部拦掉，用户看到的是「设了不生效」。
+    () => void refreshBalance(k.id, fingerprint, false, autoIntervalMs),
+    autoIntervalMs,
+    balanceEnabled,
+  );
 
   const balance = balanceEntry?.result;
   // `remaining` 必须显式判 null 才显示：后端刻意让它可缺失（查不到时不给 0），

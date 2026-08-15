@@ -498,7 +498,14 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     if (!name.trim()) return setError(t("editor.errNeedName"));
     if (!baseUrl.trim()) return setError(t("editor.errNeedBaseUrl2"));
     const currentModelNames = new Set(models.map((m) => m.realName));
-    if ([...invalidContextModels].some((model) => currentModelNames.has(model))) {
+    // 校验集里同时装着两类 tag：窗口用裸模型名、最大输出用 `模型名::maxout`。
+    // **必须先剥掉后缀再比对** —— 否则 `foo::maxout` 永远匹配不上 `foo`，
+    // 最大输出填了非法值也能一路保存进去（那正是这道拦截要防的）。
+    if (
+      [...invalidContextModels].some((tag) =>
+        currentModelNames.has(tag.replace(/::maxout$/, "")),
+      )
+    ) {
       return setError(t("editor.errInvalidContextWindow"));
     }
 
@@ -752,12 +759,39 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                       unitTitle={t("editor.contextWindowUnit")}
                       placeholder={t("editor.contextWindowPlaceholder")}
                     />
+                    {/* 最大单次输出：与上下文窗口**并列而非合并** —— 两者是不同的能力
+                        （4.5 系 200k 窗口 / 64k 输出）。留空走内置能力表；第三方中转的
+                        私有模型名内置表认不出，填上这个值该模型才能参与大脑聚合。
+                        复用 ContextWindowInput 的 K/M 单位与非法值拦截逻辑（同一套交互）。 */}
+                    <ContextWindowInput
+                      value={m.maxOutputTokens}
+                      onChange={(val) =>
+                        setModels(models.map((x) => x.realName === m.realName ? { ...x, maxOutputTokens: val } : x))
+                      }
+                      onValidityChange={(valid) =>
+                        setInvalidContextModels((prev) => {
+                          const next = new Set(prev);
+                          // 用独立的 key 后缀，避免与窗口那一项的校验状态互相覆盖
+                          const tag = `${m.realName}::maxout`;
+                          if (valid) next.delete(tag);
+                          else next.add(tag);
+                          return next;
+                        })
+                      }
+                      title={t("editor.maxOutput")}
+                      unitTitle={t("editor.maxOutputUnit")}
+                      placeholder={t("editor.maxOutputPlaceholder")}
+                    />
                     <button
                       onClick={() => {
                         setModels(models.filter((x) => x.realName !== m.realName));
                         setInvalidContextModels((prev) => {
                           const next = new Set(prev);
+                          // 两个 tag 都要删：窗口那项是裸名，最大输出那项带 `::maxout` 后缀。
+                          // 漏删后者会留下一个指向已删除模型的残项 —— 虽然 save 的比对
+                          // 会因模型已不在列表而放过它，但那是靠巧合，不该依赖。
                           next.delete(m.realName);
+                          next.delete(`${m.realName}::maxout`);
                           return next;
                         });
                       }}
