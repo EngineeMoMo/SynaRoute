@@ -77,15 +77,26 @@ const BALANCE_TEMPLATES: Record<string, { url: string; method: string; auth: str
   official: { url: "{{baseUrl}}/v1/organizations/me", method: "GET", auth: "x-api-key" },
 };
 
-/** 模板按钮的顺序与文案 key（与 cc-switch 的排列一致：自定义在最前）。 */
-const BALANCE_TEMPLATE_ORDER = ["custom", "relay", "generic", "newapi", "deepseek", "official"] as const;
+/** 模板按钮的顺序与文案 key。「自动」在最前：它是默认值，也是绝大多数用户唯一需要的一项。 */
+const BALANCE_TEMPLATE_ORDER = ["auto", "custom", "relay", "generic", "newapi", "deepseek", "official"] as const;
 
-/** 新建 Key 时的余额查询初值：默认**关闭**，但把通用模板填好，用户开开关即可用。 */
+/**
+ * 新建 Key 时的余额查询初值：默认**关闭**，但用「自动」模板（url/auth 留空）。
+ *
+ * 为什么初值不再是 generic：generic 写死 `{{baseUrl}}/user/balance`，而中转站普遍
+ * 在那个路径上返回网页而非 API（实测 sotamodel）—— 新用户一开开关就失败，而他无从
+ * 判断自己的站该选哪个模板。留空则由后端 `detect_balance_endpoint` 按域名自动识别
+ * （对齐 cc-switch 的 detect_provider），认不出时兜底到中转站命中率最高的那条端点。
+ */
 function defaultBalanceQuery(): BalanceQuery {
   return {
     enabled: false,
-    template: "generic",
-    ...BALANCE_TEMPLATES.generic,
+    template: "auto",
+    // url/auth 刻意留空 —— 后端见空即自动识别。填了值就等于替用户做了选择，
+    // 而这正是「一直不行」的根因（选错模板且用户不知道该选哪个）。
+    url: "",
+    method: "GET",
+    auth: "",
     timeoutSecs: 10,
     autoIntervalMin: 0,
   };
@@ -303,6 +314,13 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     setBalanceProbe(null); // 换了目标地址，上次的探测结果不再代表现在
     if (tpl === "custom") {
       setBalance((b) => ({ ...b, template: "custom" }));
+      return;
+    }
+    // 「自动」= 清空 url/auth，让后端按 base_url 域名自动识别端点
+    // （对齐 cc-switch 的 detect_provider）。清空是关键：后端见空才走自动识别，
+    // 留着旧模板的值等于继续用那个可能选错的端点。
+    if (tpl === "auto") {
+      setBalance((b) => ({ ...b, template: "auto", url: "", auth: "", method: "GET" }));
       return;
     }
     const preset = BALANCE_TEMPLATES[tpl];
@@ -1069,11 +1087,19 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                       <input
                         className={`${inputCls} font-mono`}
                         value={balance.url}
-                        placeholder="{{baseUrl}}/v1/usage"
+                        // 留空 = 自动识别，故 placeholder 要说明这件事，
+                        // 而不是给一个看起来「应该填这个」的示例路径。
+                        placeholder={t("balance.urlAutoPlaceholder")}
                         onChange={(e) => {
                           // 用户手改地址即视为自定义：模板高亮跟着走，
                           // 否则会出现「高亮在通用模板、地址却不是它」的错配。
-                          setBalance((b) => ({ ...b, url: e.target.value, template: "custom" }));
+                          // 清空回退到 auto —— 与后端「见空即自动识别」一致。
+                          const next = e.target.value;
+                          setBalance((b) => ({
+                            ...b,
+                            url: next,
+                            template: next.trim() === "" ? "auto" : "custom",
+                          }));
                           setBalanceProbe(null);
                         }}
                       />

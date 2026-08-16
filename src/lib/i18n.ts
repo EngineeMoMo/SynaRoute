@@ -60,15 +60,17 @@ const zh: Dict = {
   "balance.enableHint":
     "从中转站的计费接口读取剩余额度，配好后显示在这条 Key 的卡片上。各站接口不统一，先用预设模板试，不行再手填取值路径；配好后用下面的「测试查询」验证。",
   "balance.template": "预设模板",
+  "balance.tpl.auto": "自动（推荐）",
   "balance.tpl.custom": "自定义",
-  "balance.tpl.relay": "中转站（推荐）",
+  "balance.tpl.relay": "中转站",
   "balance.tpl.generic": "通用模板",
   "balance.tpl.newapi": "NewAPI",
   "balance.tpl.deepseek": "DeepSeek",
   "balance.tpl.official": "官方",
   "balance.url": "请求地址",
+  "balance.urlAutoPlaceholder": "留空 = 按接口地址自动识别端点",
   "balance.urlHint":
-    "占位符：{{baseUrl}} 本 Key 的接口地址（含路径）、{{origin}} 只取域名（剥掉路径）、{{apiKey}} 密钥。余额端点在域名根下、而接口地址带路径后缀时（如 DeepSeek 的 /anthropic），要用 {{origin}}。",
+    "留空即按本 Key 的接口地址**自动识别**余额端点（DeepSeek / SiliconFlow / OpenRouter / StepFun / Novita / GLM / Kimi / 官方 Anthropic 已内置；认不出的按中转站通用端点试）。自动识别不对时再手填。占位符：{{baseUrl}} 本 Key 的接口地址（含路径）、{{origin}} 只取域名（剥掉路径）、{{apiKey}} 密钥。余额端点在域名根下、而接口地址带路径后缀时（如 DeepSeek 的 /anthropic），要用 {{origin}}。",
   "balance.accessToken": "Access Token",
   "balance.userId": "用户 ID",
   "balance.accessTokenHint":
@@ -827,15 +829,17 @@ const en: Dict = {
   "balance.enableHint":
     "Reads remaining credit from the provider's billing endpoint and shows it on this key's card. Endpoints vary by provider — try a preset first, then set a value path if needed; verify with \"Test query\" below.",
   "balance.template": "Preset",
+  "balance.tpl.auto": "Auto (recommended)",
   "balance.tpl.custom": "Custom",
-  "balance.tpl.relay": "Relay (recommended)",
+  "balance.tpl.relay": "Relay",
   "balance.tpl.generic": "Generic",
   "balance.tpl.newapi": "NewAPI",
   "balance.tpl.deepseek": "DeepSeek",
   "balance.tpl.official": "Official",
   "balance.url": "Request URL",
+  "balance.urlAutoPlaceholder": "Leave empty to auto-detect from the base URL",
   "balance.urlHint":
-    "Placeholders: {{baseUrl}} this key's base URL (path included), {{origin}} scheme+host only (path stripped), {{apiKey}} the secret. Use {{origin}} when the balance endpoint sits at the domain root but the base URL carries a path suffix (e.g. DeepSeek's /anthropic).",
+    "Leave empty to **auto-detect** the balance endpoint from this key's base URL (DeepSeek / SiliconFlow / OpenRouter / StepFun / Novita / GLM / Kimi / official Anthropic are built in; unknown hosts fall back to the common relay endpoint). Fill it in manually only when auto-detection gets it wrong. Placeholders: {{baseUrl}} this key's base URL (path included), {{origin}} scheme+host only (path stripped), {{apiKey}} the secret. Use {{origin}} when the balance endpoint sits at the domain root but the base URL carries a path suffix (e.g. DeepSeek's /anthropic).",
   "balance.accessToken": "Access Token",
   "balance.userId": "User ID",
   "balance.accessTokenHint":

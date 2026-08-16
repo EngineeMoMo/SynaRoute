@@ -109,6 +109,77 @@ const UNIT_CANDIDATES: &[&str] = &[
     "balance_infos.0.currency",
 ];
 
+/// 按 `base_url` 自动识别厂商的余额端点（域名子串 → 完整 URL 模板）。
+///
+/// ## 为什么需要它
+///
+/// 这是 cc-switch 唯一真正比我们好用的地方（2026-08-17 读其源码
+/// `src-tauri/src/services/balance.rs` 核对）：它的 `detect_provider` 按 `base_url`
+/// 子串匹配，用户**零配置**就能查余额；而我们要求用户自己判断「我这个站属于哪一类」
+/// 并手选模板 —— 而这恰恰是用户最不可能知道的信息（同一个中转站可能是 NewAPI 架构、
+/// 也可能自研面板，端点路径没有任何规律可循）。真机反馈的「余额查询一直不行」
+/// 大概率就是选错了模板。
+///
+/// ## 判据与取舍
+///
+/// - **只在用户没手选过模板时生效**（`template` 为空或 `"auto"`）。用户明确选过的
+///   一律尊重 —— 自动识别猜错时用户还有手动出路，反过来会让「我明明选了 NewAPI」失效。
+/// - 用 `{{origin}}` 而非 `{{baseUrl}}`：这些余额端点都在**域名根**下，而转发用的
+///   baseUrl 常带 `/v1`、`/anthropic` 之类后缀（DeepSeek 就是），用 baseUrl 必然 404。
+/// - 匹配**域名子串**而非全等：同一家常有多个域名（`api.foo.com` / `foo.com` /
+///   区域镜像），全等匹配会把绝大多数真实配置判成未知。
+/// - 顺序有讲究：更具体的域名必须排在更宽泛的之前（如 `openrouter.ai` 若将来出现
+///   `openrouter.ai.cn` 这类，具体的要先命中）。
+///
+/// 前 5 家逐条对齐 cc-switch 的硬编码函数；其后是本项目实测补的。
+const VENDOR_ENDPOINTS: &[(&str, &str, &str)] = &[
+    // (域名子串, URL 模板, 认证方式)
+    //
+    // ---- 以下 5 家对齐 cc-switch（其 detect_provider + 各 provider 函数）----
+    ("api.deepseek.com", "{{origin}}/user/balance", "bearer"),
+    // cc-switch 的 StepFun 分支匹配 .ai/.com 两个域名但请求恒发 .com
+    ("api.stepfun.ai", "https://api.stepfun.com/v1/accounts", "bearer"),
+    ("api.stepfun.com", "{{origin}}/v1/accounts", "bearer"),
+    ("api.siliconflow.cn", "{{origin}}/v1/user/info", "bearer"),
+    ("api.siliconflow.com", "{{origin}}/v1/user/info", "bearer"),
+    ("openrouter.ai", "{{origin}}/api/v1/credits", "bearer"),
+    ("api.novita.ai", "{{origin}}/v3/user/balance", "bearer"),
+    // ---- 以下是本项目实测补的（cc-switch 没有）----
+    // 智谱 GLM：开放平台的额度接口
+    ("open.bigmodel.cn", "{{origin}}/api/paas/v4/account/balance", "bearer"),
+    // 月之暗面 Kimi
+    ("api.moonshot.cn", "{{origin}}/v1/users/me/balance", "bearer"),
+    ("api.moonshot.ai", "{{origin}}/v1/users/me/balance", "bearer"),
+    // 官方 Anthropic：走组织信息端点，认证头也不同（x-api-key）
+    ("api.anthropic.com", "{{origin}}/v1/organizations/me", "x-api-key"),
+];
+
+/// 认不出具体厂商时的兜底端点链（按命中概率排序）。
+///
+/// 为什么值得有：中转站占本项目用户的绝大多数，而它们几乎都是 NewAPI / OneAPI 系
+/// 的二次开发 —— 端点高度收敛到这几条。逐条试比让用户在 5 个模板里盲猜靠谱得多。
+///
+/// **刻意不在这里做多端点轮询**：那会对上游发 N 次请求（部分站点按请求计费/限流）。
+/// 这里只提供「第一条」作为自动模板的默认值，试不中时错误信息会把其余候选列给用户
+/// （见 `looks_like_html` 分支的提示文案）。
+const FALLBACK_ENDPOINT: (&str, &str) = ("{{origin}}/v1/dashboard/billing/subscription", "bearer");
+
+/// 按 `base_url` 猜该站点的余额端点。返回 `(url 模板, 认证方式)`。
+///
+/// 命中 [`VENDOR_ENDPOINTS`] 里的域名就用那家的；认不出则用 [`FALLBACK_ENDPOINT`]
+/// （NewAPI/OneAPI 系的通用计费端点，中转站命中率最高的一条）。
+///
+/// 大小写不敏感：用户可能把域名写成 `API.DeepSeek.com`。
+pub fn detect_balance_endpoint(base_url: &str) -> (&'static str, &'static str) {
+    let lower = base_url.to_ascii_lowercase();
+    for (domain, url, auth) in VENDOR_ENDPOINTS {
+        if lower.contains(domain) {
+            return (url, auth);
+        }
+    }
+    FALLBACK_ENDPOINT
+}
+
 /// Key 是否有效的候选字段链。
 ///
 /// `is_available` 是 DeepSeek 的字段名（实测），与 cc-switch 文档里的
@@ -351,9 +422,6 @@ pub async fn query_balance(
     if !cfg.enabled {
         return BalanceResult::failed("未启用余额查询");
     }
-    if cfg.url.trim().is_empty() {
-        return BalanceResult::failed("未配置查询地址");
-    }
 
     let base = cfg
         .base_url_override
@@ -362,11 +430,27 @@ pub async fn query_balance(
         .filter(|s| !s.is_empty())
         .unwrap_or(&key.base_url);
 
+    // 自动识别：按 base_url 域名猜端点，**只填补用户没填的那一项**。
+    //
+    // 规则就一条：**用户填了什么就用什么，没填的才自动补**。
+    //   - `url` 非空 → 用用户的（哪怕它是错的：那样他才能从报错里看出自己填错了；
+    //     被自动识别悄悄改成能用的地址反而是「我改的不生效」这类静默失效）
+    //   - `url` 为空 → 用自动识别的端点
+    //   - `auth` 同理
+    //
+    // 刻意**不看 `template` 字段**：它只是界面上「用户当初点了哪个按钮」的回显，
+    // 真正决定行为的是 url/auth 有没有值。早先按 template 判 auto 模式的写法与
+    // 这条 url 判空规则重复，两层判据永远同向，多出来的那层是死代码
+    // （故障注入实测：把 auto_mode 恒置 true，行为不变）。
+    let detected = detect_balance_endpoint(base);
+    let url_template = if cfg.url.trim().is_empty() { detected.0 } else { cfg.url.trim() };
+    let auth_scheme = if cfg.auth.trim().is_empty() { detected.1 } else { cfg.auth.trim() };
+
     // NewAPI 类面板用 accessToken + userId 而非 API Key，故一并展开。
     // 两者留空时展开成空串，模板里没用到就无影响。
     let access_token = cfg.access_token.as_deref().unwrap_or("");
     let user_id = cfg.user_id.as_deref().unwrap_or("");
-    let url = expand_placeholders(&cfg.url, base, secret, access_token, user_id);
+    let url = expand_placeholders(url_template, base, secret, access_token, user_id);
     // 占位符展开后仍不是绝对 URL 说明配置有问题，早报错好过让 reqwest 抛一句晦涩的解析错。
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return BalanceResult::failed(format!("查询地址不是合法的 http(s) URL: {url}"));
@@ -391,7 +475,7 @@ pub async fn query_balance(
     //   bearer / x-api-key —— 用转发密钥，与转发路径同口径
     //   access-token       —— NewAPI 类面板：认的是面板登录态，不是 API Key
     //   none               —— 密钥已在 URL 里的站点
-    req = match cfg.auth.trim().to_ascii_lowercase().as_str() {
+    req = match auth_scheme.to_ascii_lowercase().as_str() {
         "" | "bearer" => req.bearer_auth(secret),
         "x-api-key" => req.header("x-api-key", secret),
         "access-token" => {
@@ -824,15 +908,23 @@ mod tests {
         let off = BalanceQuery { enabled: false, ..Default::default() };
         assert!(!query_balance(&key, &off, "sk").await.ok);
 
-        // 启用但没填地址
+        // 启用但没填地址：**不再报「未配置查询地址」** —— 自动识别会按 base_url 给一个
+        // 兜底端点（这条断言随自动识别功能一起改，原先的行为是直接失败）。
+        // 这里 base_url 是 api.foo.com（认不出的域名），故走 FALLBACK_ENDPOINT，
+        // 会真的去打网络 —— 本测试只验「不因缺地址而立即失败」，不验网络结果。
         let no_url = BalanceQuery { enabled: true, url: "  ".into(), ..Default::default() };
         let r = query_balance(&key, &no_url, "sk").await;
-        assert!(!r.ok);
-        assert!(r.error.as_deref().unwrap().contains("未配置查询地址"));
+        assert!(
+            !r.error.as_deref().unwrap_or("").contains("未配置查询地址"),
+            "自动识别接上后不该再因缺地址而拒绝，实际: {:?}",
+            r.error
+        );
 
-        // 展开后不是合法 URL（用户把 baseUrl 占位符打错成 baseurl）
+        // 展开后不是合法 URL（用户把 baseUrl 占位符打错成 baseurl）。
+        // 注意 template 必须非 auto，否则自动识别会忽略这个坏 url。
         let bad = BalanceQuery {
             enabled: true,
+            template: "custom".into(),
             url: "{{baseurl}}/v1/usage".into(),
             ..Default::default()
         };
@@ -847,10 +939,114 @@ mod tests {
         // 不支持的方法 / 认证方式也要早报错
         let bad_method = BalanceQuery {
             enabled: true,
+            template: "custom".into(),
+            url: "{{baseUrl}}/x".into(),
             method: "DELETE".into(),
             ..Default::default()
         };
         assert!(query_balance(&key, &bad_method, "sk").await.error.is_some());
+    }
+
+    /// 按 `base_url` 自动识别厂商端点：cc-switch 的 5 家 + 本项目补的几家都要命中。
+    ///
+    /// 这是「余额查询一直不行」的正面修复 —— 用户不再需要判断自己的站属于哪一类。
+    /// 判据全部对齐 cc-switch 源码里的实际端点（2026-08-17 逐函数核对），
+    /// 改动其中任一条前请先核对上游文档，别凭印象改。
+    #[test]
+    fn detect_balance_endpoint_covers_known_vendors() {
+        // cc-switch 的 5 家
+        assert_eq!(
+            detect_balance_endpoint("https://api.deepseek.com/anthropic").0,
+            "{{origin}}/user/balance",
+            "DeepSeek 的余额在域名根下，必须用 origin 剥掉 /anthropic 后缀"
+        );
+        assert_eq!(
+            detect_balance_endpoint("https://api.siliconflow.cn/v1").0,
+            "{{origin}}/v1/user/info"
+        );
+        assert_eq!(
+            detect_balance_endpoint("https://openrouter.ai/api/v1").0,
+            "{{origin}}/api/v1/credits"
+        );
+        assert_eq!(
+            detect_balance_endpoint("https://api.novita.ai/v3/openai").0,
+            "{{origin}}/v3/user/balance"
+        );
+        // StepFun 的 .ai 域名要改打 .com（对齐 cc-switch：匹配两个域名但恒发 .com）
+        assert_eq!(
+            detect_balance_endpoint("https://api.stepfun.ai/v1").0,
+            "https://api.stepfun.com/v1/accounts",
+            "cc-switch 的 StepFun 分支匹配 .ai 但请求发 .com"
+        );
+
+        // 官方 Anthropic 的认证头不是 bearer
+        let (url, auth) = detect_balance_endpoint("https://api.anthropic.com");
+        assert_eq!(url, "{{origin}}/v1/organizations/me");
+        assert_eq!(auth, "x-api-key", "官方 Anthropic 用 x-api-key 而非 Bearer");
+
+        // 认不出的域名 → 兜底到 NewAPI/OneAPI 系的通用计费端点（中转站命中率最高）
+        let (url, auth) = detect_balance_endpoint("https://www.some-relay-station.net");
+        assert_eq!(url, "{{origin}}/v1/dashboard/billing/subscription");
+        assert_eq!(auth, "bearer");
+
+        // 大小写不敏感：用户可能把域名写成大写
+        assert_eq!(
+            detect_balance_endpoint("HTTPS://API.DeepSeek.COM/v1").0,
+            "{{origin}}/user/balance"
+        );
+    }
+
+    /// **用户填的地址必须优先于自动识别** —— 这条是自动识别的安全边界。
+    ///
+    /// 若自动识别覆盖了用户填的地址，就成了「我改的不生效」这类静默失效（本项目最忌讳
+    /// 的形态）：用户改了地址、报错却还是老样子，他会以为改动没保存。反过来自动识别
+    /// 猜错时，用户手填就是唯一出路，必须留着。
+    ///
+    /// 判据设计：给一个**能被自动识别命中**的 base_url（deepseek），同时手填一个
+    /// 刻意打错占位符的 url。
+    /// - 用户地址被尊重 → `{{bad_placeholder}}` 展不开 → 报「不是合法 URL」
+    /// - 被自动识别覆盖 → 变成合法的 deepseek 端点 → 不会报这个错
+    ///
+    /// 故障注入验证：把 `url_template` 的三元改成无条件用 `detected.0`，此断言立刻变红。
+    #[tokio::test]
+    async fn user_filled_url_beats_auto_detection() {
+        let key = ProviderKey {
+            id: "k".into(),
+            category_id: crate::model::CategoryType::ClaudeCli,
+            name: "t".into(),
+            vendor: "v".into(),
+            // 这个域名会被自动识别命中（→ {{origin}}/user/balance）
+            base_url: "https://api.deepseek.com/anthropic".into(),
+            protocol: crate::model::Protocol::Anthropic,
+            ..Default::default()
+        };
+
+        let user_choice = BalanceQuery {
+            enabled: true,
+            template: "custom".into(),
+            url: "{{bad_placeholder}}/my/own/path".into(),
+            ..Default::default()
+        };
+        let r = query_balance(&key, &user_choice, "sk").await;
+        assert!(
+            r.error.as_deref().unwrap_or("").contains("不是合法"),
+            "用户填的地址必须被使用（哪怕它是错的）；被自动识别覆盖了就是静默失效。实际: {:?}",
+            r.error
+        );
+
+        // 反面：url 留空时才该用自动识别。用「地址合法性」区分两条分支 ——
+        // 自动识别给的是合法 URL，故不会报「不是合法」（会走到网络请求）。
+        let auto = BalanceQuery {
+            enabled: true,
+            url: String::new(),
+            ..Default::default()
+        };
+        let r = query_balance(&key, &auto, "sk").await;
+        assert!(
+            !r.error.as_deref().unwrap_or("").contains("不是合法"),
+            "url 留空时该用自动识别给出的合法端点，实际: {:?}",
+            r.error
+        );
     }
 
     /// 余额查询**必须带客户端身份头（UA）**。

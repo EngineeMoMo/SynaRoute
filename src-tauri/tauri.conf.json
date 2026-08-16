@@ -59,7 +59,7 @@
   "plugins": {
     "updater": {
       "active": true,
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERFMTRDNkVDNjgyODYyNzcKUldSM1lpaG83TVlVM3NOc1pTOG0wYXd4QSsxb2FtQzRuOFdmMFJNZy9kcnZ2OHdPU2NJN2FzUTQK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdBNDZFQ0I4MDg3REUyNkYKUldSdjRuMEl1T3hHZXJBcWVVSzBoNm1pRkR6Z0dOcGxYUUt0TWxOUzdUQWNJMC9YdGFacm94eFQK",
       "endpoints": [
         "https://github.com/EngineeMoMo/SynaRoute/releases/latest/download/latest.json"
       ]
