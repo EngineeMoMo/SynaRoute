@@ -82,8 +82,8 @@ const zh: Dict = {
   "balance.auth": "认证方式",
   "balance.authNone": "不认证",
   "balance.timeout": "超时（秒）",
-  // "balance.interval" / "balance.intervalHint" 已移除：那个输入框填了不生效
-  // （后端无定时查询任务），摆着就是个静默失效开关。定时查询落地后再连同 UI 一起加回。
+  "balance.interval": "自动查询间隔（分钟）",
+  "balance.intervalHint": "设为 0 关闭自动查询；设为 N 则每 N 分钟查询一次上游余额。窗口不可见时不查。",
   "balance.remainingPath": "取值路径（选填）",
   "balance.remainingPathPlaceholder": "如 data.balance",
   "balance.remainingPathHint":
@@ -848,7 +848,8 @@ const en: Dict = {
   "balance.auth": "Auth",
   "balance.authNone": "None",
   "balance.timeout": "Timeout (s)",
-  // "balance.interval" / "balance.intervalHint" removed — see the zh section.
+  "balance.interval": "Auto-refresh interval (minutes)",
+  "balance.intervalHint": "Set to 0 to disable auto-refresh; set to N to query balance every N minutes. No queries when window is hidden.",
   "balance.remainingPath": "Value path (optional)",
   "balance.remainingPathPlaceholder": "e.g. data.balance",
   "balance.remainingPathHint":

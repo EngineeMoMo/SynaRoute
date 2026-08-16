@@ -1135,6 +1135,27 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                       </Field>
                     </div>
 
+                    {/* 自动查询间隔。这个输入框曾被删掉（当时没有任何定时任务读该字段，
+                        摆着就是静默失效开关）；现在 KeyCard 的 usePolling 已按它起表，
+                        必须加回来 —— 否则轮询功能反过来变成**不可达功能**：代码都在，
+                        初值恒为 0（关闭），用户没有任何入口能打开它。 */}
+                    <Field label={t("balance.interval")}>
+                      <input
+                        type="number"
+                        min={0}
+                        className={inputCls}
+                        value={balance.autoIntervalMin}
+                        onChange={(e) =>
+                          setBalance((b) => ({
+                            ...b,
+                            autoIntervalMin: Math.max(0, Math.floor(Number(e.target.value) || 0)),
+                          }))
+                        }
+                      />
+                      <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
+                        {t("balance.intervalHint")}
+                      </p>
+                    </Field>
                     {/* Access Token / 用户 id：只在选了 access-token 认证时才出现。
                         NewAPI 类面板认的是面板登录态而非 API Key，两个都得填；
                         其它认证方式下这两格无意义，显示出来只会让人以为漏填了东西。 */}
