@@ -4392,7 +4392,7 @@ tool_timeout_sec = 600
         // 旧版此测试断言的是 temp legacy 文件仍在，但那文件与真实 cleanup 操作的 config_dir()
         // 路径永不相交、恒真，无法捕获回归（审查 F2）。
         //
-        // 计数器是进程全局，与其它并发测试隔离靠 _CLEANUP_TEST_LOCK 串行化。
+        // 计数器是进程全局，与其它并发测试隔离靠 cleanup_test_lock()（backing: static LOCK）串行化。
         let _guard = cleanup_test_lock();
         let before = REAL_CLEANUP_CALLS.load(std::sync::atomic::Ordering::SeqCst);
 
