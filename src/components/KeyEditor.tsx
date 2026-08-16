@@ -100,6 +100,20 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const t = useT();
   const isNew = !initial;
 
+  /**
+   * 本次编辑会话中**已落盘的真实 id**。
+   *
+   * 挂载时取 initial.id（编辑已有 Key）或空串（新建）；`probeBalance` 先保存拿到后端
+   * 回填的 uuid 后更新它。`buildDraftKey` 读它而**不是** `initial?.id` ——
+   * 这样无论调用方是否通过 onSaved 回填 initial prop（App.tsx 回填了，
+   * OnboardingWizard 只推进步骤不回填），后续「保存」都走 update 而不是再 insert 一条。
+   *
+   * 真机复现过的事故形态（2026-08-16）：首启向导里「测试查询 → 保存」插出两条相同 Key，
+   * 因为向导的 initial 恒为 null，第二次 upsert 仍带空 id。修调用方只能修一处，
+   * 在组件内保活 id 才能覆盖所有现在与将来的调用方。
+   */
+  const [persistedId, setPersistedId] = useState(initial?.id ?? "");
+
   const [name, setName] = useState(initial?.name ?? "");
   const [vendor, setVendor] = useState(initial?.vendor ?? "custom");
   const [baseUrl, setBaseUrl] = useState(initial?.baseUrl ?? "");
@@ -312,6 +326,17 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
    * 与其让上游回一个 401 让用户猜，不如就地说清楚。
    */
   const probeBalance = async () => {
+    // 「测试查询」会**先把表单落盘**（见下方注释），故必填校验与「保存」同一口径：
+    // 不拦的话，名称/地址还没填就点测试 → 一条无名无地址、无法转发的 Key 已被插入，
+    // 用户没点过保存却「多了一条空 Key」，且关抽屉也不会回收它。
+    if (!name.trim()) {
+      setBalanceProbe({ ok: false, queriedAt: Date.now(), error: t("editor.errNeedName") });
+      return;
+    }
+    if (!baseUrl.trim()) {
+      setBalanceProbe({ ok: false, queriedAt: Date.now(), error: t("editor.errNeedBaseUrl2") });
+      return;
+    }
     // 没有可用密钥（既没有已落盘的、也没在表单里填）→ 就地说明，别去打一次注定 401 的上游。
     if (!secret && !initial?.hasSecret) {
       setBalanceProbe({
@@ -328,6 +353,9 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
       // **用返回值里的 id**：新建时 draft.id 是空串，真正的 uuid 由后端生成并回填。
       const draft = buildDraftKey();
       const saved = await api.upsertKey(draft);
+      // 保活落盘 id：此后 buildDraftKey 带真实 uuid，再点「保存」走 update 而非再 insert。
+      // 这一行就是 persistedId 机制的写入点，漏掉它 = 首启向导「测一次多一条 Key」复现。
+      setPersistedId(saved.id);
       const keyId = saved.id;
       if (secret) await api.saveSecret(keyId, secret);
       // force=true 跳过缓存，确保「测试查询」总是查询上游最新值
@@ -377,7 +405,11 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     // id 被导入逻辑当作全局唯一标识做「同 id 即同一条 Key」的覆盖判据，而
     // 「两台机器照同一份教程配置」是真实场景，落在同一毫秒即撞号 → 跨机导入会把一条
     // 完全无关的本机 Key 静默覆盖成对方的配置。后端 upsert_key 会回填 id 并随返回值给回。
-    id: initial?.id ?? "",
+    //
+    // 读 `persistedId` 而非 `initial?.id`：probeBalance 先保存后会把后端 uuid 写进
+    // persistedId，此后再点「保存」走 update；读 initial 会在「调用方不回填 initial」时
+    // 二次 insert（首启向导真机复现过），见 persistedId 的声明注释。
+    id: persistedId,
     // 编辑已有 Key 时用**它自己的分类**，不是当前页的分类。
     //
     // 编辑器 UI 根本不提供「改分类」，所以这里取 initial 才是语义正确的。
@@ -390,7 +422,12 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     vendor,
     baseUrl: baseUrl.trim(),
     protocol,
-    hasSecret: initial?.hasSecret || secret.length > 0,
+    // ⚠️ 只沿用旧值，**不因表单里填了密钥就预置 true**：save/probeBalance 都是先 upsert
+    // 再 saveSecret，若这里带 true 而 saveSecret 随后失败（主口令锁定态、secrets.enc 写盘
+    // 失败），config 里就永久记着「已配密钥」而密钥库里没有 —— UI 显示已配置、转发却报
+    // 「未配置密钥」，且无对账路径修正。后端 save_secret 的设计就是「写库成功后才置位」
+    // （service.rs），这里预置 true 等于从载荷侧绕过那道防线。
+    hasSecret: initial?.hasSecret ?? false,
     enabled: initial?.enabled ?? false,
     priority: initial?.priority ?? 999,
     params: { ...initial?.params, temperature, timeoutMs: typeof timeoutMs === "number" && timeoutMs >= 1000 ? timeoutMs : undefined },
@@ -499,15 +536,16 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     if (!baseUrl.trim()) return setError(t("editor.errNeedBaseUrl2"));
     const currentModelNames = new Set(models.map((m) => m.realName));
     // 校验集里同时装着两类 tag：窗口用裸模型名、最大输出用 `模型名::maxout`。
-    // **必须先剥掉后缀再比对** —— 否则 `foo::maxout` 永远匹配不上 `foo`，
-    // 最大输出填了非法值也能一路保存进去（那正是这道拦截要防的）。
-    if (
-      [...invalidContextModels].some((tag) =>
-        currentModelNames.has(tag.replace(/::maxout$/, "")),
-      )
-    ) {
-      return setError(t("editor.errInvalidContextWindow"));
-    }
+    // **报错必须分开指字段**：两个输入框同行同外观，把最大输出的非法值报成
+    // 「上下文窗口格式无效」会让用户反复检查旁边那个完全正常的窗口框。
+    const invalidWindow = [...invalidContextModels].some(
+      (tag) => !tag.endsWith("::maxout") && currentModelNames.has(tag),
+    );
+    const invalidMaxOut = [...invalidContextModels].some(
+      (tag) => tag.endsWith("::maxout") && currentModelNames.has(tag.replace(/::maxout$/, "")),
+    );
+    if (invalidWindow) return setError(t("editor.errInvalidContextWindow"));
+    if (invalidMaxOut) return setError(t("editor.errInvalidMaxOutput"));
 
     const key = buildDraftKey();
 
@@ -518,6 +556,9 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
       // 用本地那个空 id 去 saveSecret/checkHealth 会写到一条不存在的 Key 上（密钥成孤儿、
       // 探测无对象），而界面看起来一切正常——正是本项目最防的静默失效形态。
       const saved = await api.upsertKey(key);
+      // 保活落盘 id：若后续 saveSecret/loadCategory 抛错走 catch（编辑器不关闭），
+      // 用户重试「保存」必须走 update —— 否则每点一次就多 insert 一条。
+      setPersistedId(saved.id);
       if (secret) await api.saveSecret(saved.id, secret);
       await loadCategory(activeCategory);
       // 保存成功的专用回调。**不能用 onClose 代替**：onClose 在「保存成功」与「点取消」
@@ -1041,17 +1082,39 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                       </p>
                     </Field>
 
-                    {/* 认证方式 + 超时。
-                        「自动查询间隔」那一格已移除：字段本身留在数据结构里（后端
-                        `BalanceQuery.auto_interval_min` 已定义），但**没有任何定时任务读它**
-                        —— 摆一个填了不生效的输入框，正是本项目反复防的「静默失效开关」。
-                        等定时查询真正落地再把它加回来。 */}
-                    <div className="grid grid-cols-2 gap-2">
+                    {/* 请求方法 + 认证方式 + 超时。
+                        `method` 此前**没有 UI 入口**：后端 `balance.rs` 明确支持 GET/POST
+                        （其余方法报「不支持的请求方法」），而 5 个预设模板全是 GET ——
+                        于是需要 POST 的余额端点在界面上根本配不出来，用户只能看着
+                        「自定义」模板却改不了方法。 */}
+                    <div className="grid grid-cols-3 gap-2">
+                      <Field label={t("balance.method")}>
+                        <select
+                          className={inputCls}
+                          value={balance.method || "GET"}
+                          onChange={(e) => {
+                            // method 是模板定义字段（BALANCE_TEMPLATES 的三元组之一）：
+                            // 手改即视为自定义、并清掉旧探测结果 —— 与 URL 输入框同一原则，
+                            // 否则高亮停在「通用」而实际已是 POST，旧的成功结果框还挂着，
+                            // 看起来像改后的配置已验证通过（实际验证的是改前的）。
+                            setBalance((b) => ({ ...b, method: e.target.value, template: "custom" }));
+                            setBalanceProbe(null);
+                          }}
+                        >
+                          {/* 只列后端真正支持的两个：多列一个就是「填了报错」 */}
+                          <option value="GET">GET</option>
+                          <option value="POST">POST</option>
+                        </select>
+                      </Field>
                       <Field label={t("balance.auth")}>
                         <select
                           className={inputCls}
                           value={balance.auth}
-                          onChange={(e) => setBalance((b) => ({ ...b, auth: e.target.value }))}
+                          onChange={(e) => {
+                            // 同 method：auth 也是模板定义字段，手改即 custom + 清探测结果。
+                            setBalance((b) => ({ ...b, auth: e.target.value, template: "custom" }));
+                            setBalanceProbe(null);
+                          }}
                         >
                           <option value="bearer">Bearer</option>
                           <option value="x-api-key">x-api-key</option>
@@ -1107,9 +1170,13 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                         className={`${inputCls} font-mono`}
                         value={balance.remainingPath ?? ""}
                         placeholder={t("balance.remainingPathPlaceholder")}
-                        onChange={(e) =>
-                          setBalance((b) => ({ ...b, remainingPath: e.target.value }))
-                        }
+                        onChange={(e) => {
+                          // 取值路径是探测取值验证的**对象本身**：改了它，旧探测结果就不再
+                          // 代表现在的配置，必须清掉 —— 否则旧的成功框像在给改后的路径背书。
+                          // （它不是模板定义字段，不置 custom。）
+                          setBalance((b) => ({ ...b, remainingPath: e.target.value }));
+                          setBalanceProbe(null);
+                        }}
                       />
                       <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
                         {t("balance.remainingPathHint")}

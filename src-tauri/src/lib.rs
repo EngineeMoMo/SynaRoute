@@ -358,8 +358,11 @@ async fn query_key_balance(
         .unwrap_or(&key.base_url);
     let access_token = cfg.access_token.as_deref().unwrap_or("");
     let user_id = cfg.user_id.as_deref().unwrap_or("");
-    // 脱敏：只显示协议+域名+路径，隐藏 apiKey/accessToken 等敏感参数
-    let url_for_log = crate::balance::expand_placeholders(&cfg.url, base, "***", access_token, user_id);
+    // 脱敏：apiKey 与 accessToken 都换成 ***。{{accessToken}} 是占位符体系明文支持的
+    // URL 写法（部分面板把 token 放 query 参数），原样展开会把面板 token 明文写进
+    // 运行日志（可见、可导出、可截图）—— 此前只遮了 apiKey，与本行注释自己的声明矛盾。
+    let token_masked = if access_token.is_empty() { "" } else { "***" };
+    let url_for_log = crate::balance::expand_placeholders(&cfg.url, base, "***", token_masked, user_id);
 
     // 记录查询结果到运行日志（成功与失败都记，满足「失败必须可见」原则）
     // 格式：状态 | 耗时 | URL | 详情

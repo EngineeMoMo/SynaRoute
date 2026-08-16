@@ -128,10 +128,16 @@ export function OnboardingWizard({ ccswitchAvailable, onPickCategory, onOpenLogs
 
   return createPortal(
     <>
-      {/* z-[80]：低于命令面板 z-[90] 与 Toast z-[100]，高于普通弹窗 z-50。
-          向导会自己打开 KeyEditor（z-50），必须盖在向导之上才能填表 —— 所以向导不能比它高。
-          这里用 80 是因为向导本身要盖住主界面，而 KeyEditor 走的是 portal 的后挂载顺序。 */}
-      <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-4">
+      {/* 层级规则：低于命令面板 z-[90] 与 Toast z-[100]；平时 z-[80] 盖住主界面。
+          ⚠️ 子弹窗（KeyEditor / CcSwitchImportDialog）都是 z-50 —— 同一层叠上下文里
+          z-index 高者恒在上，DOM 后挂载顺序**不能**翻转它（此前注释的「portal 后挂载
+          所以能盖住」是错误认知，实测第②步整个编辑器被向导遮罩挡住、鼠标完全点不到）。
+          故子弹窗打开期间把向导整体降到 z-40：编辑器浮上来可交互，向导仍盖住主界面。 */}
+      <div
+        className={`fixed inset-0 flex items-center justify-center bg-black/50 p-4 ${
+          editorOpen || importOpen ? "z-40" : "z-[80]"
+        }`}
+      >
         <div className="flex max-h-[86vh] w-[min(560px,94vw)] flex-col overflow-hidden rounded-lg border border-border bg-surface shadow-2xl">
           {/* 头部：进度指示 */}
           <div className="border-b border-border px-5 py-4">

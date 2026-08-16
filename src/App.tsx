@@ -173,10 +173,14 @@ export default function App() {
           key={editingKey?.id ?? "new"}
           initial={editingKey}
           onClose={() => setEditorOpen(false)}
-          onSaved={(saved) => {
-            // probeBalance 先保存时，把 editingKey 对齐到后端回填的真实 uuid。
-            // 如果不更新，后续点「保存」会因为 initial?.id 仍是 null/空串而再 insert 一条新 Key。
-            setEditingKey(saved);
+          onSaved={() => {
+            // ⚠️ 这里**不能** setEditingKey(saved)：新建路径下那会让上面的 key prop 从
+            // "new" 变成后端 uuid → KeyEditor 整个重挂载 → 「测试查询」的结果与所有
+            // 未提交草稿在同一帧被清空（用户看到按钮转完什么都不出现）。
+            // 防「测完再保存插重复 Key」由 KeyEditor 内部的 persistedId 机制负责
+            // （probeBalance/save 落盘后保活真实 uuid），不再依赖重挂载。
+            // 这里只刷新列表，让新 Key 立即出现在分类页（不等 5s 轮询）。
+            void loadCategory(activeCategory);
           }}
         />
       )}

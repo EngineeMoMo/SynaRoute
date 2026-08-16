@@ -85,6 +85,14 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
     setTakeover(null);
     setRecentFailure(null);
     // vaultLocked 刻意**不清**：密钥库锁没锁与分类无关，是全局状态，清了反而会闪一下。
+    // 清空后**立即补查一次**新分类的失败横幅：它的两个数据源都不会因切分类触发
+    // （usePolling 的 deps 不含分类、useBackendEvent 只在新日志时来），不补查的话
+    // 新分类 5 分钟内的失败横幅最长要等 30s 兜底轮询才出现 —— 用户刚看到的失败提示
+    // 来回切页后凭空消失，误以为问题已解决。gen 校验在函数内部，串台无虞。
+    refreshRecentFailure();
+    // refreshRecentFailure 每次渲染都是新引用，放进 deps 会让本 effect 每帧重跑；
+    // 它内部只读 genRef 与 activeCategory（后者已在 deps 里），语义等价。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeCategory]);
 
   // 桌面端接入是否已被其他工具接管（cc-switch 重写 _meta.json）。

@@ -1933,8 +1933,12 @@ impl Store {
     /// 返回 `Some(result)` 表示缓存命中且未过期，调用方可直接使用；
     /// 返回 `None` 表示无缓存或已过期，需要重新查询上游。
     ///
-    /// 缓存有效期：与 `auto_interval_min` 对齐（用户配置的自动查询间隔即为缓存时长）；
-    /// 若未配置自动查询（`auto_interval_min == 0`），则缓存 5 分钟（避免短时间内重复查询）。
+    /// 缓存有效期：与 `auto_interval_min` 对齐，但**取其 90%** ——
+    /// 前端轮询在 t=T 时到达，此刻缓存年龄 = T − 网络延迟，恒小于 T；
+    /// 有效期取整 T 会把每个奇数次轮询拦掉，实际查询周期变成配置的 2 倍
+    /// （用户设 30 分钟实为 1 小时的静默偏差）。留 10% 余量后奇数次轮询正常放行。
+    /// 未配置自动查询（`auto_interval_min == 0`）时缓存 5 分钟（避免短时间内重复查询，
+    /// 该路径没有定时轮询打边界，不需要余量）。
     pub fn get_balance_cache(&self, key_id: &str) -> Option<BalanceResult> {
         let cfg = self.config.read();
         let key = cfg.keys.iter().find(|k| k.id == key_id)?;
@@ -1943,7 +1947,8 @@ impl Store {
         // 计算缓存有效期（秒）
         let cache_duration_secs = if let Some(bq) = &key.balance_query {
             if bq.auto_interval_min > 0 {
-                (bq.auto_interval_min as i64) * 60
+                // 90% 余量：与前端 KeyCard 轮询的 freshFor 同一口径（见上方文档注释）
+                (bq.auto_interval_min as i64) * 60 * 9 / 10
             } else {
                 5 * 60 // 默认 5 分钟
             }

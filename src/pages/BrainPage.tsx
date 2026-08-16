@@ -161,8 +161,15 @@ export function BrainPage() {
     const target = config.members.find((m) => m.id === memberId);
     if (!target) return;
     if (config.members.some((m) => m.id !== memberId && m.keyId === target.keyId && m.modelName === newModel)) return;
+    const model = newModel.trim();
     update({
-      members: config.members.map((m) => (m.id === memberId ? { ...m, modelName: newModel.trim() } : m)),
+      // **id 必须随模型同步重算**（`bm_${keyId}_${model}` 是确定性 id）：只改 modelName
+      // 保留旧 id 的话，改完 m1→m2 后添加器里 m1 不再显示已加，再加 k1/m1 会生成与旧行
+      // **相同的 id** —— 此后按 id 匹配的下拉联动会把两行同时改掉（用户改 A 行 B 行跟着变）、
+      // React 列表 key 重复、去重护栏失效、重复 id 落盘。
+      members: config.members.map((m) =>
+        m.id === memberId ? { ...m, id: `bm_${m.keyId}_${model}`, modelName: model } : m,
+      ),
     });
   };
 
@@ -556,7 +563,12 @@ function AggregateRunner({ category }: { category: CategoryType }) {
       const res = await api.runAggregatePlan(category, prompt);
       if (res.resultType === "plan") {
         setPlan(res.content);
-        setPlanWorkDir(res.workDir);
+        // ⚠️ `?? ""` 不能省：Plan.work_dir 为 None 时被 serde skip，前端拿到 undefined，
+        // Phase2 原样回传 undefined 会让后端 run_apply 走「回退实时解析」分支 ——
+        // 若用户在确认计划前于任意项目里开过一个 CLI/Codex 会话，Phase2 会解析出一个
+        // Phase1 从未使用、用户从未确认的目录，把决策者输出直接写进那个项目（目录漂移）。
+        // 空字符串是后端约定的「Phase1 确认无工作目录」哨兵：Phase2 据此不写任何文件。
+        setPlanWorkDir(res.workDir ?? "");
         setPhase("planned");
       } else {
         setResult(res.content);
@@ -744,7 +756,10 @@ function MemberPicker({
             <option value="">{t("brain.pickKeyPlaceholder")}</option>
             {keys.map((key) => (
               <option key={key.id} value={key.id}>
-                {key.name}
+                {/* 禁用的 Key 必须带标识：聚合运行时会跳过禁用成员（gather_members），
+                    选择器里若与启用的长得一样，用户会加进来一个「永远不参与」的成员，
+                    结果面板少一位专家还查不出原因。 */}
+                {key.enabled ? key.name : `${key.name}（${t("brain.keyDisabled")}）`}
               </option>
             ))}
           </select>
@@ -873,7 +888,9 @@ function KeyModelSelect({
             <option value="">{emptyLabel ?? t("brain.pickKeyPlaceholder")}</option>
             {keys.map((key) => (
               <option key={key.id} value={key.id}>
-                {key.name}
+                {/* 同 MemberPicker：禁用 Key 带标识 —— 决策者/汇总者路径对禁用 Key 直接报错
+                    （call_ref 的 enabled 检查），选了它整轮聚合会失败。 */}
+                {key.enabled ? key.name : `${key.name}（${t("brain.keyDisabled")}）`}
               </option>
             ))}
           </select>

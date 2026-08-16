@@ -78,6 +78,7 @@ const zh: Dict = {
   "balance.cardLabel": "余额",
   "balance.usedPct": "已用 {pct}%",
   "balance.refresh": "刷新余额",
+  "balance.method": "请求方法",
   "balance.auth": "认证方式",
   "balance.authNone": "不认证",
   "balance.timeout": "超时（秒）",
@@ -304,6 +305,7 @@ const zh: Dict = {
   // Key 卡片
   "key.primary": "主",
   "key.setPrimary": "设为主",
+  "key.collapse": "收起",
   "key.setPrimaryHint": "提为主 Key（优先级最高，故障转移最先使用）",
   "key.protocolSuffix": "协议",
   "key.moveUp": "上移（提高优先级，故障转移更早使用）",
@@ -376,6 +378,7 @@ const zh: Dict = {
   "editor.errNeedName": "请填写 Key 名称",
   "editor.errNeedBaseUrl2": "请填写 base_url",
   "editor.errInvalidContextWindow": "上下文窗口格式无效：请输入正数，并确保换算后是整数 token",
+  "editor.errInvalidMaxOutput": "最大单次输出格式无效：请输入正数，并确保换算后是整数 token",
   "editor.errSave": "保存失败：{err}",
   "editor.errApplyAll": "批量应用失败：{err}",
 
@@ -432,6 +435,7 @@ const zh: Dict = {
   "brain.join": "加入",
   "brain.addMember": "添加成员",
   "brain.pickKeyPlaceholder": "选择 Key…",
+  "brain.keyDisabled": "已禁用",
   "brain.checkKeyHealth": "检测",
   "brain.keyNoModels": "该 Key 暂无模型，可手动输入模型名加入",
   "brain.workDir": "工作目录",
@@ -840,6 +844,7 @@ const en: Dict = {
   "balance.cardLabel": "Balance",
   "balance.usedPct": "{pct}% used",
   "balance.refresh": "Refresh balance",
+  "balance.method": "Method",
   "balance.auth": "Auth",
   "balance.authNone": "None",
   "balance.timeout": "Timeout (s)",
@@ -1063,6 +1068,7 @@ const en: Dict = {
 
   "key.primary": "Primary",
   "key.setPrimary": "Set as primary",
+  "key.collapse": "Collapse",
   "key.setPrimaryHint": "Move to the top (priority 0), tried first on failover",
   "key.protocolSuffix": "protocol",
   "key.moveUp": "Move up (higher priority, tried earlier on failover)",
@@ -1134,6 +1140,7 @@ const en: Dict = {
   "editor.errNeedName": "Please enter a key name",
   "editor.errNeedBaseUrl2": "Please enter base_url",
   "editor.errInvalidContextWindow": "Invalid context window: enter a positive number that converts to a whole token count",
+  "editor.errInvalidMaxOutput": "Invalid max output: enter a positive number that converts to a whole token count",
   "editor.errSave": "Save failed: {err}",
   "editor.errApplyAll": "Bulk apply failed: {err}",
 
@@ -1189,6 +1196,7 @@ const en: Dict = {
   "brain.join": "Add",
   "brain.addMember": "Add member",
   "brain.pickKeyPlaceholder": "Select a key…",
+  "brain.keyDisabled": "disabled",
   "brain.checkKeyHealth": "Check",
   "brain.keyNoModels": "This key has no models yet — type a model name to include it",
 

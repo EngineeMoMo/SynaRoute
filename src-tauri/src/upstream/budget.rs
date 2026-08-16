@@ -136,11 +136,35 @@ const CLAUDE_MAX_OUTPUT_TABLE: &[(&str, u32)] = &[
 ];
 
 /// 返回已知 Anthropic 模型的最大输出能力；认不出来则 `None`（调用方须报错，不许猜）。
+///
+/// **子版本边界检查**：家族片段后紧跟 `-<1~2 位数字>` 说明是表里没列的**更新子版本**
+/// （如 `claude-opus-4-6` 命中片段 `claude-opus-4`）——其能力未知，不得静默继承旧同族的
+/// 上限（旧族 32k、新族实际 64k 时，长回答会在 32k 处被截断且无任何报错，正是本模块
+/// 声称要消除的本地静默截断点，只是从 4096 变成了 32000）。这类返回 `None`，
+/// 落到 `missing_max_output_reason` 引导用户手填「最大单次输出」。
+///
+/// `-<4 位以上数字>` 是**日期后缀**（`claude-sonnet-4-5-20250929`），属同一型号的快照，
+/// 照常匹配 —— 用位数区分这两种形态（版本号 1~2 位、日期 8 位，中间没有现实用例）。
 fn anthropic_max_output_for(model: &str) -> Option<u32> {
     let lower = model.to_ascii_lowercase();
     CLAUDE_MAX_OUTPUT_TABLE
         .iter()
-        .find(|(family, _)| lower.contains(family))
+        .find(|(family, _)| {
+            let Some(pos) = lower.find(family) else {
+                return false;
+            };
+            let rest = &lower[pos + family.len()..];
+            match rest.strip_prefix('-') {
+                Some(after_dash) => {
+                    let digits = after_dash.chars().take_while(|c| c.is_ascii_digit()).count();
+                    // 1~2 位数字 = 未列出的新子版本 → 不匹配（宁可报错让用户手填）
+                    !(1..=2).contains(&digits)
+                }
+                // 片段后不是 `-`（如 `claude-3-5-sonnet` 命中 `claude-3-5` 后是 `-s`，
+                // 或整串结束）→ 正常匹配
+                None => true,
+            }
+        })
         .map(|(_, max)| *max)
 }
 
@@ -195,11 +219,16 @@ fn input_exhausts_context_reason(model: &str, window: u32, input: u32) -> String
 }
 
 /// 缺模型最大输出数据时的可行动错误。
+///
+/// 必须指向**用户 30 秒能自助完成的修复入口**（Key 编辑器模型列表的「最大单次输出」），
+/// 而不是「等后续版本」—— 那个字段正是为救回内置表认不出的第三方模型名而加的，
+/// 文案不提它等于把用户引向死胡同。
 fn missing_max_output_reason(model: &str) -> String {
     format!(
         "模型 {model} 缺少最大输出 token 能力数据：Anthropic 的 max_tokens 必填，\
          但上下文窗口不等于最大输出，猜一个大数可能被上游拒绝、猜一个小数又会截断回答。\
-         请改用已知能力的模型，或在后续版本补充该模型的最大输出能力后重试。"
+         请到「Key 编辑器 → 模型列表」为该模型填写「最大单次输出」（如 64000，\
+         可查上游服务商的模型文档），保存后重试即可。"
     )
 }
 
@@ -421,6 +450,45 @@ mod tests {
     fn anthropic_unknown_model_is_treated_as_missing_window() {
         let k = key_with(Protocol::Anthropic, &[("claude-x", Some(200_000))]);
         assert!(output_budget(&k, "some-other-model", 100).is_err());
+    }
+
+    /// 表里未列出的**新子版本号**不得静默继承旧同族的上限；日期后缀照常匹配。
+    ///
+    /// 反例（本条要防的）：`claude-opus-4-6` 不含 `claude-opus-4-5` 片段、但含
+    /// `claude-opus-4` → 旧逻辑静默取 32k。若新族实际支持 64k+，长回答在 32k 处被截断
+    /// 且无任何报错 —— 本模块声称消除的「本地静默截断点」换个数字回来了。
+    /// 现在这类必须报「缺能力数据」，引导用户手填最大单次输出。
+    ///
+    /// 故障注入判据：把 `anthropic_max_output_for` 的边界检查删掉（退回裸 `contains`）
+    /// → 前两条断言变红。
+    #[test]
+    fn newer_subversion_does_not_inherit_older_family_cap() {
+        // 未列出的新子版本 → 必须报错（而不是拿 claude-opus-4 的 32k）
+        for m in ["claude-opus-4-6", "claude-opus-4-7-20260301", "claude-haiku-4-6"] {
+            let k = key_with(Protocol::Anthropic, &[(m, Some(200_000))]);
+            let err = output_budget(&k, m, 100)
+                .expect_err("新子版本不得继承旧同族上限，必须报缺能力数据");
+            assert!(err.contains("最大单次输出"), "错误应指向手填入口：{err}");
+        }
+        // 日期后缀（≥4 位数字）是同一型号的快照，照常匹配
+        let k = key_with(Protocol::Anthropic, &[("claude-sonnet-4-5-20250929", Some(200_000))]);
+        assert_eq!(
+            output_budget(&k, "claude-sonnet-4-5-20250929", 100),
+            Ok(Some(64_000)),
+            "日期后缀不该被当成新子版本拒掉"
+        );
+        // 家族片段后接文字（claude-3-5-sonnet-20241022）也照常匹配
+        let k = key_with(Protocol::Anthropic, &[("claude-3-5-sonnet-20241022", Some(200_000))]);
+        assert_eq!(
+            output_budget(&k, "claude-3-5-sonnet-20241022", 100),
+            Ok(Some(8_192))
+        );
+        // 中转前缀（anthropic/claude-sonnet-4-5）仍要能匹配 —— contains 的初衷不能丢
+        let k = key_with(Protocol::Anthropic, &[("anthropic/claude-sonnet-4-5", Some(200_000))]);
+        assert_eq!(
+            output_budget(&k, "anthropic/claude-sonnet-4-5", 100),
+            Ok(Some(64_000))
+        );
     }
 
     /// 中文按字符而非 UTF-8 字节估算，并刻意按 1 字符/token 取**上界**。

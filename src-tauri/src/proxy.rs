@@ -961,11 +961,19 @@ async fn handle_request(
         // 绝不能走缓冲路径返回 application/json——下游按 text/event-stream 解析必失败。
         // 跳过该候选，让故障转移去找可流式的 Key。
         if wants_stream && !can_stream(key) {
-            last_err = "流式请求不支持跨协议转换（该 Key 协议与下游不一致）".to_string();
-            // 501：这是**配置不匹配**，等多久都不会好转，不能包装成「过载请重试」
-            // （见函数尾部的状态码分流）。用一个明确的「不支持」码让用户去改配置。
-            last_status = Some(StatusCode::NOT_IMPLEMENTED.as_u16());
-            log_failover(&store, key, "跳过", &last_err, next);
+            // ⚠️ 只在**还没有真实失败记录**时才写 last_err/last_status：这个候选根本没被
+            // 尝试过，它的「跳过」不能覆盖前面候选的真实失败性质 —— 否则「前面的 Key 全是
+            // 429/5xx 临时错误、最后一个候选恰好协议不兼容」时，循环尾部按 last_status 分流
+            // 会把整轮判成 501 硬错误：不带 Retry-After、不武装短路窗口、文案只剩「协议
+            // 不一致」，客户端视为永不恢复的配置错误不再重试，真实根因（限流/上游抖动）
+            // 被完全掩盖。全部候选都被跳过时 last_err 仍为空，501 语义照常成立。
+            if last_err.is_empty() {
+                last_err = "流式请求不支持跨协议转换（该 Key 协议与下游不一致）".to_string();
+                // 501：这是**配置不匹配**，等多久都不会好转，不能包装成「过载请重试」
+                // （见函数尾部的状态码分流）。用一个明确的「不支持」码让用户去改配置。
+                last_status = Some(StatusCode::NOT_IMPLEMENTED.as_u16());
+            }
+            log_failover(&store, key, "跳过", "流式请求不支持跨协议转换（该 Key 协议与下游不一致）", next);
             continue;
         }
 
@@ -2277,74 +2285,19 @@ fn is_contentless_probe(req_json: &Value, requested_model: &str) -> bool {
 
 /// `POST /v1/messages/count_tokens` 的本地 token 估算。
 ///
-/// Claude 桌面端在每次对话前调用该端点估算输入 token 数，决定是否截断上下文。
-/// 中转站普遍不实现 → 大量 404 日志；高频调用还会触发 429 限流。
+/// Claude 桌面端在每次对话前调用该端点估算输入 token 数，决定是否截断/压缩上下文。
+/// 中转站普遍不实现 → 大量 404 日志；高频调用还会触发 429 限流。故本地估算直接应答。
 ///
-/// 改为本地估算：
-/// - 遍历 `messages`/`system` 里的文本内容，用 `estimate_tokens` 估算
-/// - 精度在 ±10~20% 以内（Anthropic 官方自己的实现也是估算，用 tiktoken-style）
-/// - 对客户端完全透明：只要返回合理的 `input_tokens` 数字，客户端就能正常截断
+/// **必须走全 JSON 遍历**（`estimate_json_tokens_without_image_transport`），不能只挑
+/// `text` 字段：agentic 会话里 Write/Edit 工具把整个文件内容装在 `tool_use.input`、
+/// 扩展思考把大段文本装在 `thinking` 块 —— 首版手写遍历漏掉这两类，工具密集会话的
+/// 估算值只有真实值的几分之一，客户端据此认为上下文充裕、不触发压缩，随后的真实补全
+/// 直接被上游 400（prompt too long），且 400 不计熔断不换 Key，重试恒败无法自愈。
+/// 全遍历会把 JSON 键名也计进去（轻微高估），对「决定何时压缩」这个用途而言，
+/// 高估安全、低估致命 —— 与 budget.rs 对输入估算「取上界」的纪律一致。
+/// 图片 base64 由该函数替换为固定视觉占位，不会把传输编码当文本膨胀计入。
 fn estimate_count_tokens_local(req_json: &Value) -> u32 {
-    let mut total: u32 = 0;
-
-    // system prompt
-    if let Some(sys) = req_json.get("system") {
-        match sys {
-            Value::String(s) => total = total.saturating_add(crate::upstream::estimate_tokens(s)),
-            Value::Array(blocks) => {
-                for b in blocks {
-                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                        total = total.saturating_add(crate::upstream::estimate_tokens(t));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // messages
-    if let Some(msgs) = req_json.get("messages").and_then(|m| m.as_array()) {
-        for msg in msgs {
-            match msg.get("content") {
-                Some(Value::String(s)) => {
-                    total = total.saturating_add(crate::upstream::estimate_tokens(s));
-                }
-                Some(Value::Array(blocks)) => {
-                    for b in blocks {
-                        // text 块
-                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                            total = total.saturating_add(crate::upstream::estimate_tokens(t));
-                        }
-                        // tool_result 内嵌内容
-                        if let Some(inner) = b.get("content") {
-                            match inner {
-                                Value::String(s) => {
-                                    total = total.saturating_add(crate::upstream::estimate_tokens(s));
-                                }
-                                Value::Array(inner_blocks) => {
-                                    for ib in inner_blocks {
-                                        if let Some(t) = ib.get("text").and_then(|t| t.as_str()) {
-                                            total = total.saturating_add(crate::upstream::estimate_tokens(t));
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // tools 声明本身也占 token（通常几百，用 JSON 字符串简单估算）
-    if let Some(tools) = req_json.get("tools") {
-        let tools_str = tools.to_string();
-        total = total.saturating_add(crate::upstream::estimate_tokens(&tools_str));
-    }
-
-    total
+    crate::upstream::estimate_json_tokens_without_image_transport(req_json)
 }
 
 /// 故障转移日志里的动词：**按真实状态码分类**，让用户一眼看出该去修什么。
@@ -2734,6 +2687,51 @@ mod tests {
         assert!(path_takes_sampling_params("/v1/messages"));
         assert!(path_takes_sampling_params("/v1/chat/completions"));
         assert!(path_takes_sampling_params("/v1/responses"));
+    }
+
+    /// count_tokens 本地估算**必须计入** `tool_use.input` 与 `thinking` 块。
+    ///
+    /// 钉住一条 P2：agentic 会话里 Write/Edit 把整个文件内容装在 tool_use.input，
+    /// 首版手写遍历只挑 `text` 字段 → 工具密集会话估算值只有真实值的几分之一 →
+    /// 客户端不触发压缩 → 真实补全被上游 400（prompt too long）且重试恒败。
+    /// 判据：含大段 tool_use.input / thinking 的请求，估算值必须显著大于「只有 text」的版本。
+    #[test]
+    fn count_tokens_estimate_includes_tool_use_input_and_thinking() {
+        let big = "x".repeat(40_000); // 模拟一个被 Write 进 input 的文件（≈1 万 token）
+        let text_only = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let with_tool_use = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": [
+                    { "type": "thinking", "thinking": big },
+                    { "type": "tool_use", "id": "t1", "name": "write_file",
+                      "input": { "path": "a.rs", "content": big } }
+                ] }
+            ]
+        });
+        let base = estimate_count_tokens_local(&text_only);
+        let full = estimate_count_tokens_local(&with_tool_use);
+        assert!(
+            full > base + 15_000,
+            "tool_use.input 与 thinking 必须计入估算（base={base} full={full}）——\
+             漏计会让客户端不压缩上下文、随后真实请求被上游 400"
+        );
+        // 图片 base64 是传输编码不是文本，必须仍被有界占位替换（复用 budget.rs 的防线）。
+        let with_image = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{ "role": "user", "content": [
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png",
+                  "data": "A".repeat(6_000_000) } }
+            ] }]
+        });
+        assert!(
+            estimate_count_tokens_local(&with_image) < 20_000,
+            "图片 base64 不得按文本膨胀计入"
+        );
     }
 
     /// 扩展思考（thinking）在场时不注入 temperature / top_p —— 同协议 Anthropic 直通

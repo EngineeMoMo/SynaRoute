@@ -47,13 +47,22 @@ async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
 /**
  * 统一调用入口：Tauri 环境走真实后端命令，浏览器环境走 mock。
  *
- * `mock` 参数是一个**惰性 thunk**（`() => mockBridge.x()`）：Tauri 环境下永不调用，
- * 故那些演示数据在生产环境不会被执行。但 `mockData.ts` 仍会被打进 bundle
- * （顶层 import 无法 tree-shake），这是刻意接受的代价 —— 见文件顶部注释。
+ * `mock` 参数是一个**惰性 thunk**：`() => mockBridge.x()` 或内联假实现。
+ * mockData.ts 在生产构建被 vite alias 换成「全方法抛错」的 Proxy 桩，但本文件里还有
+ * 30 余处**内联** thunk（revealSecret 返回伪造密钥、exportConfig 返回不存在的假路径…）
+ * 不经过 mockBridge —— 生产环境 `isTauri()` 若误判（Tauri 注入失效），一半 API 抛错、
+ * 另一半静默返回捏造数据，比全炸更难排查（导出假成功在备份场景等于数据丢失）。
+ * 故守卫收进 call() 本体：**非 DEV 构建走到 mock 分支一律抛错**，覆盖所有 thunk。
+ * `import.meta.env.DEV` 是编译期常量，浏览器预览（vite dev）不受影响。
  */
 async function call<T>(cmd: string, args: Record<string, unknown> | undefined, mock: () => Promise<T> | T): Promise<T> {
   if (isTauri()) {
     return tauriInvoke<T>(cmd, args);
+  }
+  if (!import.meta.env.DEV) {
+    throw new Error(
+      `[SynaRoute] 运行环境检测失败（cmd=${cmd}）：本应走 Tauri 后端，却落到了浏览器预览分支。请重启应用；若持续出现请反馈此错误。`,
+    );
   }
   return mock();
 }

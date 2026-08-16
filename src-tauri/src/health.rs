@@ -75,9 +75,6 @@ pub async fn check_one(store: &Arc<Store>, key_id: &str) {
     // 绝不碰 breaker_until / fail_count。可达即 Up、连接层不可达即 Down；此 status 仅供
     // UI 展示，不参与路由门槛（is_candidate 只看熔断窗口）。故一次探测端点 401 / 探测模型名
     // 不匹配，再也不会把一个真实流量本可成功的 Key 踢出路由——熔断只由真实流量驱动。
-    // 探测可能长达 8s（`fast_timeout` 封顶），期间 health 可能已被真实流量更新 breaker/fail_count，
-    // 故读最新快照，只覆盖 status/latency/last_checked 三个探测字段，其余原样保留。
-    let prev = store.get_key(key_id).map(|k| k.health).unwrap_or_default();
 
     // 探测失败落日志（归「健康检查」分组）——供排查，但不触发任何熔断动作。
     if !ok {
@@ -93,18 +90,18 @@ pub async fn check_one(store: &Arc<Store>, key_id: &str) {
 
     let status = if ok { HealthStatus::Up } else { HealthStatus::Down };
 
-    let _ = store.update_health(
-        key_id,
-        HealthState {
-            status,
-            last_checked: Some(now),
-            latency_ms: Some(latency),
-            // 熔断相关字段原样保留——探测不参与熔断。
-            fail_count: prev.fail_count,
-            breaker_until: prev.breaker_until,
-            last_live_success: prev.last_live_success,
-        },
-    );
+    // 走 `mutate_health` 在**单个写锁临界区内**只改探测三字段（status/latency/last_checked），
+    // 其余字段原地保留 —— 旧写法「get_key 读快照 → append_event（含日志 I/O）→
+    // update_health 整份写回」跨两个临界区，窗口内 record_live_failure 刚累加的
+    // fail_count / 刚武装的 breaker_until 会被 stale 快照覆盖回去：熔断计数被回退、
+    // 甚至刚武装的熔断被静默解除，坏 Key 留在候选池首位。`mutate_health` 的文档
+    // 与 concurrent_failures_never_lose_count 测试钉的正是这类跨临界区丢失更新。
+    let _ = store.mutate_health(key_id, |h| {
+        h.status = status;
+        h.last_checked = Some(now);
+        h.latency_ms = Some(latency);
+        true
+    });
 }
 
 /// 把一次「实时转发失败」计入熔断器（连接失败 / 上游非 2xx）。

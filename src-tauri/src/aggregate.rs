@@ -120,7 +120,7 @@ struct MemberCallMeta {
 /// gather_members 的结果：成功答案 + 统计（供结果面板展示「N 参与 / M 失败」）。
 struct GatherOutcome {
     answers: Vec<MemberAnswer>,
-    /// 实际发起调用的成员数（不含被禁用而跳过的）。
+    /// 被处理的成员数（含调用失败与前置不可用；不含被禁用而跳过的）。恒 ≥ 成功数 + 失败数不成立时是账目缺陷。
     attempted: usize,
     /// 调用失败 / 不可用的成员数。
     failed: usize,
@@ -192,8 +192,22 @@ pub async fn run_plan(
     if answers.is_empty() {
         let fallback_prompt = build_solo_decider_prompt(prompt, &file_context);
         // 独答降级：无成员/压缩阶段，决策者独享整轮剩余时间。
+        // with_usage 包住：独答同样烧额度，桌面路径此前完全不记这笔账。
         let solo_budget = decider_phase_budget_ms(remaining_ms(deadline), PHASE_MIN_BUDGET_MS);
-        let fallback = call_ref(store, &decider_ref, &fallback_prompt, solo_budget).await?;
+        let (fallback, solo_used) =
+            upstream::with_usage(call_ref(store, &decider_ref, &fallback_prompt, solo_budget)).await;
+        let fallback = fallback?;
+        if !solo_used.is_empty() {
+            store.append_event_full(
+                category,
+                "aggregate",
+                None,
+                &format!("独答降级 · {} · {}", label_ref(store, &decider_ref), solo_used.fmt_compact()),
+                None,
+                None,
+                Some(solo_used),
+            );
+        }
         return Ok(AggregateResult::Plan {
             content: fallback,
             work_dir: effective_work_dir,
@@ -241,7 +255,58 @@ pub async fn run_plan(
     );
     // 决策者阶段：整轮剩余时间全给它（前面阶段省下的它全拿，保底 decider_floor 已被保护）。
     let plan_budget = decider_phase_budget_ms(remaining_ms(deadline), PHASE_MIN_BUDGET_MS);
-    let plan = call_ref(store, &decider_ref, &plan_prompt, plan_budget).await?;
+    // 决策者失败（限流/超时/余额/被删）**不作废**已成功的成员答案 —— 与 run_mcp 同口径
+    // （那边注释明言「用户等了数十秒的多专家意见不能因决策者一句错就整轮丢失」）。
+    // 降级：把已聚合的成员意见作为「计划」正文返回并在头部标注失败原因；此时它只是
+    // 参考材料而非可执行计划，用户不该直接点「确认执行」——头部的警告就是说明这一点。
+    // 本函数对压缩阶段失败（上方 compress 分支）早有同款降级，决策者阶段此前漏了。
+    //
+    // with_usage 包住：决策者是整轮最重的一笔（prompt 内嵌全部成员答案），
+    // 桌面路径此前完全不记它的用量 —— 用户按日志对账必然偏低。失败也烧额度，同样要记。
+    let (plan_res, decider_used) =
+        upstream::with_usage(call_ref(store, &decider_ref, &plan_prompt, plan_budget)).await;
+    let plan = match plan_res {
+        Ok(p) => p,
+        Err(e) => {
+            store.append_event(
+                category,
+                "aggregate",
+                None,
+                &format!(
+                    "决策者失败 · {} · {e} · 降级为「返回已聚合成员意见」",
+                    label_ref(store, &decider_ref)
+                ),
+            );
+            format!(
+                "> ⚠️ 决策者 `{}` 未能完成综合分析：{e}\n\
+                 > 以下是已成功获取的 {} 位专家意见（**不是可执行计划**，请勿直接确认执行）：\n\n{}",
+                label_ref(store, &decider_ref),
+                answers.len(),
+                aggregated
+            )
+        }
+    };
+    // 整轮合计（成员 + 决策者）：与 run_mcp 同口径 —— 这是用户判断「一次会诊花了多少
+    // 额度」的唯一入口，桌面路径此前没有这条，决策者的最大开销在账上完全消失。
+    let mut grand = gathered.usage;
+    grand.add(&decider_used);
+    if !grand.is_empty() {
+        store.append_event_full(
+            category,
+            "aggregate",
+            None,
+            &format!(
+                "本次聚合合计 · {} · 共 {} tokens（成员 {} + 决策者 {}）",
+                grand.fmt_compact(),
+                grand.total(),
+                gathered.usage.total(),
+                decider_used.total()
+            ),
+            None,
+            None,
+            Some(grand),
+        );
+    }
     Ok(AggregateResult::Plan {
         content: plan,
         work_dir: effective_work_dir,
@@ -313,7 +378,26 @@ pub async fn run_apply(
         }
     );
 
-    let result = call_ref(store, &decider_ref, &exec_prompt, brain.total_timeout_ms).await?;
+    // with_usage 包住：Phase2 执行同样是决策者级别的大请求，账不能少这笔。
+    let (result, exec_used) = upstream::with_usage(call_ref(
+        store,
+        &decider_ref,
+        &exec_prompt,
+        brain.total_timeout_ms,
+    ))
+    .await;
+    let result = result?;
+    if !exec_used.is_empty() {
+        store.append_event_full(
+            category,
+            "aggregate",
+            None,
+            &format!("确认执行 · {} · {}", label_ref(store, &decider_ref), exec_used.fmt_compact()),
+            None,
+            None,
+            Some(exec_used),
+        );
+    }
 
     // 解析输出中的 ```file:path\ncontent\n``` 块，写入工作目录
     let changes = if let Some(ref work_dir) = effective_work_dir {
@@ -352,7 +436,7 @@ pub struct McpAggregateResult {
     pub decider_ref: String,
     /// 注入的相关文件数
     pub file_count: usize,
-    /// 实际发起调用的成员数（不含被禁用而跳过的）
+    /// 被处理的成员数（含调用失败与前置不可用；不含被禁用而跳过的）
     pub members_attempted: usize,
     /// 调用失败 / 不可用的成员数
     pub members_failed: usize,
@@ -805,8 +889,9 @@ enum MemberOutcome {
     Ok(MemberAnswer, MemberCallMeta),
     /// 调用失败：label + 具体原因（超时 / HTTP / 连接 / 空答案）；meta 供 trace。
     Failed { label: String, reason: String, meta: Option<MemberCallMeta> },
-    /// 被禁用而跳过（不计失败）。
-    SkippedDisabled,
+    /// 被禁用而跳过（不计失败）。带 label 供日志点名 —— 无痕跳过会让桌面端聚合
+    /// 「结果面板少一位专家、无任何解释」，用户以为聚合坏了或模型没答。
+    SkippedDisabled { label: String },
     /// 无密钥 / 熔断 / Key 不存在等前置不可用（计入失败，附原因）。
     Unavailable { label: String, reason: String },
 }
@@ -934,11 +1019,31 @@ async fn run_member_turns(
         // 首轮算一次然后沿用会在后面几轮把 max_tokens 算得过大 → 输入+输出超窗口 → 400。
         // OpenAI 侧恒为 None（不发上限）；Anthropic 侧按「窗口 − 本轮输入」现算。
         //
-        // `Err` = 缺上下文窗口数据的 Anthropic Key：不猜一个上限（那会静默截断），
-        // 如实报不可用并告诉用户去补窗口。只会在第 1 轮命中 —— 同一 Key 的判定不随轮次变化。
-        up.max_tokens =
-            upstream::output_budget(up.key, up.model, session.estimated_input_tokens(&tools))
-                .map_err(MemberError::own)?;
+        // `Err` 有两种：① 缺能力数据（确实只会第 1 轮命中，同一 Key 判定不随轮次变化）；
+        // ② **输入占满窗口**（`input_exhausts_context_reason`）—— 它取决于逐轮膨胀的
+        // 历史（工具返回的大段文件内容每轮重发），完全可能在第 2~N 轮才越线。
+        // 后者发生时前几轮已产出的 preamble 仍然值钱，必须与下方 turn 失败分支同口径
+        // 「有正文就交差」，而不是把整个成员判失败、已读到的信息与已烧的 token 全作废。
+        up.max_tokens = match upstream::output_budget(
+            up.key,
+            up.model,
+            session.estimated_input_tokens(&tools),
+        ) {
+            Ok(v) => v,
+            Err(e) if !preamble.trim().is_empty() => {
+                store.append_event(
+                    category,
+                    "aggregate",
+                    None,
+                    &format!(
+                        "工具循环中断 · {} · 第 {round}/{rounds} 轮输入已占满上下文窗口（{e}），采用已有正文",
+                        ctx.label
+                    ),
+                );
+                return Ok(preamble);
+            }
+            Err(e) => return Err(MemberError::own(e)),
+        };
         let outcome = match session.turn(&up, &tools).await {
             Ok(o) => o,
             // 轮内失败：已有正文就交差而不是整次作废（多轮探索的价值就在这里 —— 第 3 轮
@@ -1260,6 +1365,18 @@ async fn gather_members(
         cap_text(&prompt)
     });
 
+    // 成员阶段的**整体墙钟 deadline**。此前只对「单个成员的模型调用」套 timeout、排队时间
+    // 不设限 —— 成员数 > 并发上限时阶段墙钟变成 ceil(N/并发)×budget（6 成员/并发 1 =
+    // 6 倍预算），整轮 deadline 被吃穿，compress 与决策者各只剩 5s 保底、几乎必超时，
+    // MCP 客户端还可能先杀连接，已烧的全部成员额度作废。
+    //
+    // 现在的规则：排队仍不预先掐死成员（保住原注释的意图 —— 排到了就该有机会跑），
+    // 但拿到 permit 后只分到 deadline 的**剩余时间**而非整份预算；剩余不足最小片时
+    // 直接判 Unavailable 并写明「排队耗尽 + 怎么修」，不再白打一次注定超时的上游。
+    let phase_deadline = std::time::Instant::now() + total_timeout;
+    // 进闭包用（u32 是 Copy，直接按值捕获）：排队耗尽的错误文案里要点名当前并发上限。
+    let brain_concurrency = brain.concurrency_limit.max(1);
+
     // 超时按「单个成员的实际模型调用」计。信号量排队时间**不**计入超时——否则
     // concurrency_limit 小于成员数时，后排成员在队列里就耗尽预算、从未发出请求即被判超时。
     // 故先 acquire permit（排队，不设时限），再对真正的模型调用套 timeout。
@@ -1287,7 +1404,7 @@ async fn gather_members(
             let label = format!("{} / {}", key.name, model);
             // 禁用的 Key 不参与聚合（此前遗漏此判断，导致禁用 Key 仍被调用）。
             if !key.enabled {
-                return MemberOutcome::SkippedDisabled;
+                return MemberOutcome::SkippedDisabled { label };
             }
             // 大脑聚合：成员固定 Key，不做故障转移换 Key。
             // 仅在「明确熔断窗口内」跳过该成员（真实流量连续失败触发），探测 Down 不挡路由。
@@ -1321,11 +1438,25 @@ async fn gather_members(
                     };
                 }
             };
+            // 排队结束后按阶段 deadline 重算本成员实际可用的时间。剩余不足最小片时
+            // 不再发起注定超时的调用 —— 白烧一次上游额度还拖长整轮。
+            let member_left = phase_deadline.saturating_duration_since(std::time::Instant::now());
+            if member_left < Duration::from_millis(PHASE_MIN_BUDGET_MS) {
+                return MemberOutcome::Unavailable {
+                    label,
+                    reason: format!(
+                        "成员阶段预算已被排队耗尽（并发上限 {} 低于成员数，后排成员分不到时间）。\
+                         可提高「并发上限」、减少成员数或增大「总超时」。",
+                        brain_concurrency
+                    ),
+                };
+            }
+            let member_budget_ms = member_left.as_millis() as u64;
             // 仅对实际模型调用套超时（这才是「成员自己的工作时间」）。
-            // 单请求 HTTP 超时给 brain 预算 +5s 余量（此前误用 key 的 30s 代理级超时，
+            // 单请求 HTTP 超时给成员预算 +5s 余量（此前误用 key 的 30s 代理级超时，
             // 非流式长回答必然被掐死、重试 3 次 ≈ 91s 全灭）；外层 tokio timeout 先到点，
             // 报出干净的「超时（>Xms）」而非 reqwest 的晦涩错误。
-            let req_timeout = Duration::from_millis(budget_ms.saturating_add(5_000));
+            let req_timeout = Duration::from_millis(member_budget_ms.saturating_add(5_000));
             let started = std::time::Instant::now();
             let mk_meta = |latency_ms: u64, usage: upstream::TokenUsage| MemberCallMeta {
                 key_name: key.name.clone(),
@@ -1359,13 +1490,13 @@ async fn gather_members(
                 &ctx,
                 tool_env.as_deref(),
                 max_tool_rounds,
-                budget_ms,
+                member_budget_ms,
                 tool_ctx_budget,
             );
             // 用量 scope 包住整个成员调用（含工具循环的每一轮）：
             // 失败/超时的成员同样烧了额度，四个分支都要把 used 记进 meta，
             // 否则「这次聚合花了多少」的账会少算 —— 而工具循环跑几轮才超时恰恰是最贵的情形。
-            let (res, used) = upstream::with_usage(timeout(total_timeout, call)).await;
+            let (res, used) = upstream::with_usage(timeout(member_left, call)).await;
             match res {
                 Ok(Ok(ans)) if !ans.trim().is_empty() => {
                     let meta = mk_meta(started.elapsed().as_millis() as u64, used);
@@ -1384,7 +1515,7 @@ async fn gather_members(
                 },
                 Err(_) => MemberOutcome::Failed {
                     label,
-                    reason: format!("超时（>{}ms）", budget_ms),
+                    reason: format!("超时（>{}ms）", member_budget_ms),
                     meta: Some(mk_meta(started.elapsed().as_millis() as u64, used)),
                 },
             }
@@ -1478,6 +1609,10 @@ async fn gather_members(
                 );
             }
             MemberOutcome::Unavailable { label, reason } => {
+                // 计入 attempted：不计的话汇总行会出现「发起 1 · 失败 2」的矛盾账
+                // （Unavailable 只加 failed 不加 attempted，失败数大于发起数），
+                // 用户对账必然困惑。attempted 的口径是「被处理的成员数（禁用跳过除外）」。
+                attempted += 1;
                 failed += 1;
                 store.append_event(
                     category,
@@ -1486,8 +1621,17 @@ async fn gather_members(
                     &format!("参与者不可用 · {label} · {reason}"),
                 );
             }
-            MemberOutcome::SkippedDisabled => {
+            MemberOutcome::SkippedDisabled { label } => {
                 skipped_disabled += 1;
+                // 必须落日志：此前只递增计数，「禁用跳过 N」的汇总行只在 MCP 路径打，
+                // 桌面端聚合的禁用成员**零痕迹消失** —— 结果面板少一位专家、日志查不到
+                // 任何解释。逐条点名后两条路径都可追溯。
+                store.append_event(
+                    category,
+                    "aggregate",
+                    None,
+                    &format!("参与者已禁用，跳过 · {label}（在分类页重新启用后才会参与聚合）"),
+                );
             }
         }
     }
@@ -1812,6 +1956,18 @@ async fn call_ref(
     let key = store
         .get_key(key_id)
         .ok_or_else(|| AppError::NotFound(key_id.into()))?;
+    // 禁用的 Key 不发任何请求：用户禁用常因欠费/出问题（想止损），而决策者请求
+    // 内嵌全部成员答案、是整轮最重的一笔。成员路径早已跳过禁用 Key（gather_members
+    // 注释自认「此前遗漏此判断」是缺陷），这里必须同口径 —— 否则用户在 Key 页禁用
+    // 决策者后聚合照常烧它的额度，界面日志无任何提示，正是最忌讳的静默失效。
+    // 错误文案点明去哪修（换决策者/汇总者，或重新启用该 Key）。
+    if !key.enabled {
+        return Err(AppError::Invalid(format!(
+            "Key「{}」已被禁用，无法作为决策者/汇总者调用。\
+             请到「大脑聚合」页换一条启用中的 Key，或到分类页重新启用它。",
+            key.name
+        )));
+    }
     let secret = store
         .secrets
         .read()

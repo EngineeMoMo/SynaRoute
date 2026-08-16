@@ -55,20 +55,37 @@ export const BALANCE_TTL_MS = 5 * 60 * 1000;
  * 注意 `autoStart` **不再走这条路径**：它有系统副作用（写注册表），已改走专用命令
  * `api.setAutoStart`。那正是出过 P0 的地方 —— 切主题会把用户刚关掉的自启动重新装回系统。
  */
+/**
+ * persistOneSetting 的串行化链。
+ *
+ * 没有它时两次快速连续调用（切主题后立刻切语言，两个控件相邻，真实可发生）各自并发执行
+ * getSettings → merge → saveSettings：第二次的 getSettings 读到的是**未含第一次 patch**
+ * 的磁盘旧值，其 saveSettings 会把旧 theme 连同新 language 一起写回 —— UI 即时态正确
+ * （theme/lang 单独维护），磁盘上先保存的那项却被静默顶回，重启后跳回旧值。
+ * 正是本函数注释里最忌讳的「切 X 顶掉刚改的 Y」，只是发生在它自己的两次调用之间。
+ * 链式串行让第二次的 getSettings 必然读到第一次已落盘的结果。
+ */
+let persistChain: Promise<void> = Promise.resolve();
+
 async function persistOneSetting(
   patch: Partial<AppSettings>,
   get: () => AppState,
 ): Promise<void> {
-  try {
-    const latest = await api.getSettings();
-    const next = { ...latest, ...patch };
-    await api.saveSettings(pickPrefs(next));
-    // 落盘成功后同步 store 副本，避免它继续陈旧下去（下一次调用仍会重拉，这里只是保持一致）
-    useStore.setState({ settings: next });
-  } catch (e) {
-    console.error("persistOneSetting failed", patch, e);
-    get().showToast("error", String((e as Error)?.message ?? e));
-  }
+  const run = async () => {
+    try {
+      const latest = await api.getSettings();
+      const next = { ...latest, ...patch };
+      await api.saveSettings(pickPrefs(next));
+      // 落盘成功后同步 store 副本，避免它继续陈旧下去（下一次调用仍会重拉，这里只是保持一致）
+      useStore.setState({ settings: next });
+    } catch (e) {
+      console.error("persistOneSetting failed", patch, e);
+      get().showToast("error", String((e as Error)?.message ?? e));
+    }
+  };
+  // run 自吞异常（catch 里已提示用户），链上不会累积 rejected 状态。
+  persistChain = persistChain.then(run);
+  return persistChain;
 }
 
 interface AppState {
@@ -217,7 +234,11 @@ export const useStore = create<AppState>((set, get) => ({
 
     set((s) => ({ balanceLoading: { ...s.balanceLoading, [keyId]: true } }));
     try {
-      const result = await api.queryKeyBalance(keyId);
+      // force 必须**透传给后端**：后端有自己的缓存（有效期 = autoIntervalMin，未配则 5 分钟，
+      // 且失败结果也缓存）。只跳过前端 TTL 不透传的话，卡片「手动刷新」在后端缓存期内
+      // 是空操作 —— 数值与时间戳纹丝不动，一次瞬时失败会被钉住整个缓存期，
+      // 用户点多少次刷新都拿到同一条旧错误。
+      const result = await api.queryKeyBalance(keyId, force);
       // 失败结果**也要落缓存**：后端把失败装在 `BalanceResult.error` 里正常返回
       // （不抛 Err），卡片要如实显示那句原因。丢掉它会让卡片停在「未查询」，
       // 用户既看不到余额也看不到为什么。

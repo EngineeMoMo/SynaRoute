@@ -58,12 +58,15 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast 
   const fingerprint = balanceFingerprint(k);
 
   React.useEffect(() => {
-    if (!balanceEnabled) return;
+    // `k.enabled` 门：已禁用的 Key **不自动**打上游（用户禁用常因欠费/出问题，自动请求
+    // 既烧额度又可能触发限流；健康探测对禁用 Key 同样不发，这里保持同一约定）。
+    // 手动点刷新按钮不受此门限制 —— 用户主动要看时仍可查。
+    if (!balanceEnabled || !k.enabled) return;
     // 是否真的发请求由 store 判定（指纹 + TTL + 并发去重），这里只管声明「该有值」。
     // 判定逻辑放 store 而不是这里，是因为 StrictMode 下本 effect 会跑两次，
     // 只有在 store 里同步读写那面旗才拦得住重复请求。
     void refreshBalance(k.id, fingerprint);
-  }, [k.id, balanceEnabled, fingerprint, refreshBalance]);
+  }, [k.id, balanceEnabled, k.enabled, fingerprint, refreshBalance]);
 
   /**
    * 余额自动轮询（对齐 cc-switch 的 `autoQueryInterval`）。
@@ -87,11 +90,14 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast 
   }, [k.balanceQuery?.autoIntervalMin]);
 
   usePolling(
-    // 把轮询间隔当作新鲜度门槛传下去：否则默认 5 分钟 TTL 会把「间隔 1 分钟」
-    // 这类配置的前几次轮询全部拦掉，用户看到的是「设了不生效」。
-    () => void refreshBalance(k.id, fingerprint, false, autoIntervalMs),
+    // 新鲜度门槛取**间隔的 90%**而不是间隔本身：挂载即查后 queriedAt ≈ 网络延迟 L，
+    // 第 1 次 tick 在 t=T 时缓存年龄 = T−L 恒小于 T —— 门槛取 T 会把每个奇数次 tick
+    // 全部拦掉，实际生效周期变成配置值的 2 倍（设 30 分钟实为 1 小时，静默偏差）。
+    // 留 10% 余量后 tick 时年龄 T−L > 0.9T（只要 L < 0.1T，间隔下限 1 分钟 → 余量 6s，
+    // 网络往返远小于它），奇数次 tick 正常放行。后端缓存同样留了 10% 余量（get_balance_cache）。
+    () => void refreshBalance(k.id, fingerprint, false, autoIntervalMs * 0.9),
     autoIntervalMs,
-    balanceEnabled,
+    balanceEnabled && k.enabled,
   );
 
   const balance = balanceEntry?.result;
@@ -191,7 +197,7 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast 
                     onClick={() => setModelsExpanded(!modelsExpanded)}
                     className="text-xs text-text-muted hover:text-text-secondary"
                   >
-                    {modelsExpanded ? "收起" : `+${k.models.length - 3}`}
+                    {modelsExpanded ? t("key.collapse") : `+${k.models.length - 3}`}
                   </button>
                 )}
               </>
