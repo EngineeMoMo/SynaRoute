@@ -73,6 +73,46 @@ fn effort_to_thinking_budget(effort: &str, max_tokens: u64) -> Option<u64> {
     Some(base.min(cap).max(1024))
 }
 
+/// 消费 `openai_to_anthropic` 暂存的 `_pending_effort`，在 max_tokens 补齐后补打 thinking。
+///
+/// **为什么需要这一步**（Codex→Anthropic 跨协议的扩展思考修复）：
+/// thinking.budget_tokens 必须 < max_tokens，而 Codex 常态不发 max_tokens——转换时算不了，
+/// 只能把 effort 暂存。proxy 层 `ensure_anthropic_output_budget` 按目标模型补完 max_tokens
+/// 后调本函数，effort 才真正落成 thinking。不调它 = effort 被静默丢弃（扩展思考不生效）。
+///
+/// 无论是否命中，都会**移除** `_pending_effort` 这个内部中转字段——它绝不能发给上游
+/// （Anthropic 会因未知字段 400，或至少是脏字段）。故对「已显式给 max_tokens、
+/// 转换时已算过 thinking」的正常请求，这里只是清理一个不存在的键，无副作用。
+pub fn apply_pending_thinking(payload: &mut Value, max_tokens: u64) {
+    let Some(obj) = payload.as_object_mut() else { return };
+    // take 出来即移除；无论后续是否开 thinking，这个中转字段都不留。
+    let Some(effort) = obj.remove("_pending_effort").and_then(|v| v.as_str().map(String::from))
+    else {
+        return;
+    };
+    // 若 payload 已带 thinking（理论上不会——暂存路径与已算路径互斥），不覆盖。
+    if obj.contains_key("thinking") {
+        return;
+    }
+    if let Some(budget) = effort_to_thinking_budget(&effort, max_tokens) {
+        obj.insert(
+            "thinking".into(),
+            json!({ "type": "enabled", "budget_tokens": budget }),
+        );
+        obj.insert("temperature".into(), json!(1));
+        obj.remove("top_p");
+    }
+}
+
+/// 兜底清除 `_pending_effort`：某些路径可能不走 `apply_pending_thinking`
+/// （如同协议直通、或 max_tokens 已存在时根本没暂存），但只要它意外残留就绝不能发上游。
+/// 幂等：字段不存在时无操作。
+pub fn strip_pending_effort(payload: &mut Value) {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.remove("_pending_effort");
+    }
+}
+
 /// Anthropic thinking.budget_tokens → OpenAI 推理强度档位（反向，补全对称）。
 /// 按预算落到最接近的档位，供下游 Chat/Responses 客户端连 Anthropic-thinking 上游时还原语义。
 fn thinking_budget_to_effort(budget: u64) -> &'static str {
@@ -420,18 +460,28 @@ pub fn openai_to_anthropic(body: &Value) -> Value {
     // 只有已经有**真实输出上限**时才在这里打开 thinking：源请求没给 max_tokens 的跨协议
     // 情况，要等 proxy 层按目标模型窗口补齐后再判断（convert.rs 不知道 Key/真实模型，不能
     // 为了算 thinking 偷偷回退 4096）。
-    if let (Some(effort), Some(max_tokens)) = (
-        read_reasoning_effort(body),
-        out.get("max_tokens").and_then(|v| v.as_u64()),
-    ) {
-        if let Some(budget) = effort_to_thinking_budget(&effort, max_tokens) {
-            out.insert(
-                "thinking".into(),
-                json!({ "type": "enabled", "budget_tokens": budget }),
-            );
-            // Anthropic 扩展思考要求 temperature 固定为 1（top_p 亦不可与 thinking 同用）。
-            out.insert("temperature".into(), json!(1));
-            out.remove("top_p");
+    if let Some(effort) = read_reasoning_effort(body) {
+        match out.get("max_tokens").and_then(|v| v.as_u64()) {
+            // 已有 max_tokens：直接算 thinking。
+            Some(max_tokens) => {
+                if let Some(budget) = effort_to_thinking_budget(&effort, max_tokens) {
+                    out.insert(
+                        "thinking".into(),
+                        json!({ "type": "enabled", "budget_tokens": budget }),
+                    );
+                    // Anthropic 扩展思考要求 temperature 固定为 1（top_p 亦不可与 thinking 同用）。
+                    out.insert("temperature".into(), json!(1));
+                    out.remove("top_p");
+                }
+            }
+            // 无 max_tokens（Codex 常态）：此刻算不了 thinking（budget 必须 < max_tokens），
+            // 但**不能就此丢弃 effort** —— 否则 Codex→Anthropic 的扩展思考被静默关闭。
+            // 暂存到私有字段，等 proxy::ensure_anthropic_output_budget 补完 max_tokens 后
+            // 由 apply_pending_thinking 消费并移除。用 `_` 前缀标记这是内部中转字段、
+            // 不该发给上游（apply_pending_thinking 会删掉它，兜底见那里）。
+            None => {
+                out.insert("_pending_effort".into(), json!(effort));
+            }
         }
     }
     // OpenAI stop → Anthropic stop_sequences（Anthropic 要求数组）
@@ -1862,6 +1912,82 @@ mod tests {
         let a = openai_to_anthropic(&chat);
         let budget = a["thinking"]["budget_tokens"].as_u64().unwrap();
         assert!(budget <= 3000, "预算应被 max_tokens/2 钳制，实际 {budget}");
+    }
+
+    /// P2-2 回归：Codex→Anthropic 常态（有 effort、**无 max_tokens**）。
+    ///
+    /// 转换时算不了 thinking（budget 必须 < max_tokens），但 effort **不能丢**——
+    /// 暂存到 `_pending_effort`，等 proxy 补完 max_tokens 后再落。这条钉住「暂存」这一步：
+    /// 此刻不该有 thinking，但必须有 `_pending_effort`。
+    #[test]
+    fn codex_effort_without_max_tokens_is_stashed_not_dropped() {
+        let chat = json!({
+            "model": "claude-opus-4-8",
+            "messages": [ { "role": "user", "content": "hi" } ],
+            "reasoning": { "effort": "high" }
+        });
+        let a = openai_to_anthropic(&chat);
+        assert!(
+            a.get("thinking").is_none(),
+            "无 max_tokens 时算不了 thinking（budget 必须 < max_tokens）"
+        );
+        assert_eq!(
+            a["_pending_effort"], "high",
+            "effort 必须暂存，否则 Codex→Anthropic 扩展思考被静默丢弃"
+        );
+    }
+
+    /// P2-2 回归：apply_pending_thinking 在 max_tokens 补齐后把暂存的 effort 落成 thinking，
+    /// 并**移除** `_pending_effort`（该中转字段绝不能发上游）。
+    #[test]
+    fn apply_pending_thinking_derives_and_removes_sentinel() {
+        // 模拟 proxy 补完 max_tokens 后的 payload（转换阶段暂存了 effort）
+        let mut payload = json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64000,
+            "messages": [ { "role": "user", "content": "hi" } ],
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "_pending_effort": "high"
+        });
+        apply_pending_thinking(&mut payload, 64000);
+        assert_eq!(payload["thinking"]["type"], "enabled", "补完 max_tokens 后应落 thinking");
+        assert!(payload["thinking"]["budget_tokens"].as_u64().unwrap() > 0);
+        assert_eq!(payload["temperature"], 1, "开思考须归一 temperature=1");
+        assert!(payload.get("top_p").is_none(), "开思考须去 top_p");
+        assert!(
+            payload.get("_pending_effort").is_none(),
+            "中转字段必须被移除，绝不能发给上游（Anthropic 会因未知字段报错）"
+        );
+    }
+
+    /// P2-2 回归：minimal 档暂存后，apply_pending_thinking 不开思考，但仍清掉中转字段。
+    #[test]
+    fn apply_pending_thinking_minimal_still_strips_sentinel() {
+        let mut payload = json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64000,
+            "_pending_effort": "minimal"
+        });
+        apply_pending_thinking(&mut payload, 64000);
+        assert!(payload.get("thinking").is_none(), "minimal 不开思考");
+        assert!(
+            payload.get("_pending_effort").is_none(),
+            "即便不开思考，中转字段也必须清掉"
+        );
+    }
+
+    /// P2-2 安全网：strip_pending_effort 幂等，且能兜住不走 apply 的路径。
+    #[test]
+    fn strip_pending_effort_is_idempotent_and_thorough() {
+        let mut with = json!({ "max_tokens": 100, "_pending_effort": "high" });
+        strip_pending_effort(&mut with);
+        assert!(with.get("_pending_effort").is_none(), "必须移除中转字段");
+        // 幂等：再调一次、以及对本就没有该字段的 payload 调，都不报错、不改别的
+        strip_pending_effort(&mut with);
+        let mut without = json!({ "max_tokens": 100 });
+        strip_pending_effort(&mut without);
+        assert_eq!(without["max_tokens"], 100, "不该动其它字段");
     }
 
     #[test]

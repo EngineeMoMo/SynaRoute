@@ -180,6 +180,26 @@ pub fn detect_balance_endpoint(base_url: &str) -> (&'static str, &'static str) {
     FALLBACK_ENDPOINT
 }
 
+/// 解析本次查询实际用的 `(url 模板, 认证方式)`：**用户填了什么就用什么，没填的才自动补**。
+///
+/// 规则就一条（url 与 auth 各自独立判空）：
+///   - 非空 → 用用户的（哪怕 url 是错的：那样他才能从报错里看出自己填错了；被自动识别
+///     悄悄改成能用的地址反而是「我改的不生效」这类静默失效）
+///   - 为空 → 用 `detect_balance_endpoint` 按域名猜的
+///
+/// 刻意**不看 `template` 字段**：它只是界面上「用户点了哪个按钮」的回显，真正决定行为的
+/// 是 url/auth 有没有值。早先按 template 判 auto 模式的写法与这条判空规则重复、恒同向，
+/// 是死代码（故障注入实测：把 auto_mode 恒置 true 行为不变）。
+///
+/// 抽成纯函数是为了让「用户填优先 / 留空回退」两条分支能脱离网络单测（`query_balance`
+/// 要真打上游才走到 auth，无法在单测里观察 auth 解析结果）。
+fn resolve_endpoint<'a>(cfg: &'a BalanceQuery, base: &str) -> (&'a str, &'a str) {
+    let detected = detect_balance_endpoint(base);
+    let url = if cfg.url.trim().is_empty() { detected.0 } else { cfg.url.trim() };
+    let auth = if cfg.auth.trim().is_empty() { detected.1 } else { cfg.auth.trim() };
+    (url, auth)
+}
+
 /// Key 是否有效的候选字段链。
 ///
 /// `is_available` 是 DeepSeek 的字段名（实测），与 cc-switch 文档里的
@@ -430,21 +450,8 @@ pub async fn query_balance(
         .filter(|s| !s.is_empty())
         .unwrap_or(&key.base_url);
 
-    // 自动识别：按 base_url 域名猜端点，**只填补用户没填的那一项**。
-    //
-    // 规则就一条：**用户填了什么就用什么，没填的才自动补**。
-    //   - `url` 非空 → 用用户的（哪怕它是错的：那样他才能从报错里看出自己填错了；
-    //     被自动识别悄悄改成能用的地址反而是「我改的不生效」这类静默失效）
-    //   - `url` 为空 → 用自动识别的端点
-    //   - `auth` 同理
-    //
-    // 刻意**不看 `template` 字段**：它只是界面上「用户当初点了哪个按钮」的回显，
-    // 真正决定行为的是 url/auth 有没有值。早先按 template 判 auto 模式的写法与
-    // 这条 url 判空规则重复，两层判据永远同向，多出来的那层是死代码
-    // （故障注入实测：把 auto_mode 恒置 true，行为不变）。
-    let detected = detect_balance_endpoint(base);
-    let url_template = if cfg.url.trim().is_empty() { detected.0 } else { cfg.url.trim() };
-    let auth_scheme = if cfg.auth.trim().is_empty() { detected.1 } else { cfg.auth.trim() };
+    // 自动识别：按 base_url 域名猜端点，**只填补用户没填的那一项**。见 resolve_endpoint。
+    let (url_template, auth_scheme) = resolve_endpoint(cfg, base);
 
     // NewAPI 类面板用 accessToken + userId 而非 API Key，故一并展开。
     // 两者留空时展开成空串，模板里没用到就无影响。
@@ -477,7 +484,13 @@ pub async fn query_balance(
     //   none               —— 密钥已在 URL 里的站点
     req = match auth_scheme.to_ascii_lowercase().as_str() {
         "" | "bearer" => req.bearer_auth(secret),
-        "x-api-key" => req.header("x-api-key", secret),
+        // x-api-key 是官方 Anthropic 的认证形态，其端点（如 /v1/organizations/me）
+        // **强制要求 anthropic-version 头**，缺了直接 400。自动识别把 api.anthropic.com
+        // 映射到这个认证方式，故必须一并带上版本头——否则本轮新增的官方 Anthropic
+        // 自动识别端点必然失败。版本号与转发路径同口径（apply_auth 里也用这个）。
+        "x-api-key" => req
+            .header("x-api-key", secret)
+            .header("anthropic-version", "2023-06-01"),
         "access-token" => {
             if access_token.is_empty() {
                 return BalanceResult::failed("该认证方式需要填 Access Token");
@@ -984,6 +997,35 @@ mod tests {
         assert_eq!(url, "{{origin}}/v1/organizations/me");
         assert_eq!(auth, "x-api-key", "官方 Anthropic 用 x-api-key 而非 Bearer");
 
+        // StepFun 的 .com 直连（区别于上面 .ai→.com 的改写）：用 origin
+        assert_eq!(
+            detect_balance_endpoint("https://api.stepfun.com/v1").0,
+            "{{origin}}/v1/accounts",
+            ".com 域名直接用 origin，不改写"
+        );
+        // SiliconFlow 的 .com 域名（与 .cn 同端点）
+        assert_eq!(
+            detect_balance_endpoint("https://api.siliconflow.com/v1").0,
+            "{{origin}}/v1/user/info"
+        );
+        // 本项目实测补的三家（cc-switch 没有）——不加断言就等于「加了映射却没锁住」，
+        // 日后有人误删或改错端点不会被测试发现。
+        assert_eq!(
+            detect_balance_endpoint("https://open.bigmodel.cn/api/paas/v4").0,
+            "{{origin}}/api/paas/v4/account/balance",
+            "智谱 GLM 开放平台额度接口"
+        );
+        assert_eq!(
+            detect_balance_endpoint("https://api.moonshot.cn/v1").0,
+            "{{origin}}/v1/users/me/balance",
+            "月之暗面 Kimi（.cn）"
+        );
+        assert_eq!(
+            detect_balance_endpoint("https://api.moonshot.ai/v1").0,
+            "{{origin}}/v1/users/me/balance",
+            "月之暗面 Kimi（.ai）"
+        );
+
         // 认不出的域名 → 兜底到 NewAPI/OneAPI 系的通用计费端点（中转站命中率最高）
         let (url, auth) = detect_balance_endpoint("https://www.some-relay-station.net");
         assert_eq!(url, "{{origin}}/v1/dashboard/billing/subscription");
@@ -1047,6 +1089,55 @@ mod tests {
             "url 留空时该用自动识别给出的合法端点，实际: {:?}",
             r.error
         );
+    }
+
+    /// P3-3 修复配套：`resolve_endpoint` 的四个分支（url 填/空 × auth 填/空）逐一钉住。
+    ///
+    /// 抽出纯函数就是为了能不打网络验这两条独立判空。此前只有 url 分支被 `query_balance`
+    /// 的「不是合法 URL」间接覆盖，auth 分支完全没测——用户手选 x-api-key 却被自动识别
+    /// 覆盖成 bearer 这类静默失效不会被发现。
+    #[test]
+    fn resolve_endpoint_fills_only_empty_fields() {
+        // base_url 命中 deepseek（自动识别 → url={{origin}}/user/balance, auth=bearer）
+        let base = "https://api.deepseek.com/anthropic";
+
+        // ① url 与 auth 都留空 → 全用自动识别
+        let cfg = BalanceQuery { enabled: true, ..Default::default() };
+        let (u, a) = resolve_endpoint(&cfg, base);
+        assert_eq!(u, "{{origin}}/user/balance", "url 留空该用自动识别");
+        assert_eq!(a, "bearer", "auth 留空该用自动识别");
+
+        // ② url 填了、auth 留空 → url 用用户的、auth 仍自动识别（两者独立判空）
+        let cfg = BalanceQuery {
+            enabled: true,
+            url: "https://panel.example.com/my/balance".into(),
+            ..Default::default()
+        };
+        let (u, a) = resolve_endpoint(&cfg, base);
+        assert_eq!(u, "https://panel.example.com/my/balance", "用户填的 url 优先");
+        assert_eq!(a, "bearer", "auth 没填仍走自动识别");
+
+        // ③ auth 填了、url 留空 → auth 用用户的、url 仍自动识别
+        //    这正是 P3-3 未覆盖的分支：用户手选 x-api-key 不该被自动识别的 bearer 覆盖
+        let cfg = BalanceQuery {
+            enabled: true,
+            auth: "x-api-key".into(),
+            ..Default::default()
+        };
+        let (u, a) = resolve_endpoint(&cfg, base);
+        assert_eq!(u, "{{origin}}/user/balance", "url 没填走自动识别");
+        assert_eq!(a, "x-api-key", "用户手选的 auth 必须优先，不被自动识别覆盖");
+
+        // ④ 都填了 → 全用用户的
+        let cfg = BalanceQuery {
+            enabled: true,
+            url: "https://x.com/b".into(),
+            auth: "none".into(),
+            ..Default::default()
+        };
+        let (u, a) = resolve_endpoint(&cfg, base);
+        assert_eq!(u, "https://x.com/b");
+        assert_eq!(a, "none");
     }
 
     /// 余额查询**必须带客户端身份头（UA）**。

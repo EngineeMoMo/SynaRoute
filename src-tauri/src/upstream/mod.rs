@@ -43,7 +43,9 @@ pub use completion::text_completion;
 pub use discovery::fetch_models;
 pub use probe::{health_probe, health_probe_real};
 pub use sse::{sse_direction, SseTranslator};
-pub use convert::{convert_request_owned, convert_response_ext};
+pub use convert::{
+    apply_pending_thinking, convert_request_owned, convert_response_ext, strip_pending_effort,
+};
 pub use tools_meta::{collect_custom_tools, collect_search_tools, collect_tool_namespaces};
 pub use session::{
     ImagePart, MultimodalPrompt, ToolDef, ToolInvocation, ToolResultMsg, ToolSession, TurnOutcome,

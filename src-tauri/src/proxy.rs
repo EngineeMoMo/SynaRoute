@@ -761,6 +761,15 @@ async fn handle_request(
     // 最后一次失败的上游状态码（连接层失败为 None）。用于区分「等一等可能好」与
     // 「不可自愈的配置错误」——两者该给下游的状态码完全不同，见函数尾部。
     let mut last_status: Option<u16> = None;
+    // 最后一次失败是否为**本地配置错误**（`AppError::Invalid`，如缺 maxOutputTokens、
+    // 输入占满窗口）。这类错误永不自愈，且**与 Key 凭据无关**：
+    //   - 不能记进熔断（record_live_failure）——否则一条凭据完好的 Key 被误判坏掉，
+    //     还连累它上面其它可用模型；
+    //   - 不能包装成 529「过载重试」——那让客户端持续退避重试而配置永远不好，
+    //     还把可行动的引导文案（「去 Key 编辑器填最大单次输出」）藏进「过载」UI；
+    //   - 不能武装短路窗口——窗口内正常请求会被无辜挡住。
+    // 与本仓契约 all_hard_errors_return_status_verbatim 一致：硬错误原样回、不退避、不熔断。
+    let mut config_error = false;
 
     // 故障转移总预算（FR：见 AppSettings::failover_total_budget_ms）。
     //
@@ -928,6 +937,12 @@ async fn handle_request(
                         retry_after_hint = Some(retry_after_hint.map_or(s, |cur: i64| cur.min(s)));
                     }
                     last_status = Some(status);
+                    // 上游给了状态码 → 这次失败不是本地配置错误。必须复位 config_error，
+                    // 否则前一个候选的 Invalid（缺 maxOutputTokens 等）会**粘住**这个标志：
+                    // 「配置错 Key 优先 + 后续 Key 撞 429/5xx」时尾部会被判成硬错误，
+                    // 原样回状态码、跳过短路窗口与 Retry-After —— 正是 529 设计要防的重试风暴。
+                    // 契约同尾部注释：按「最后一次失败的性质」分流（config_error 必须只反映最后一次）。
+                    config_error = false;
                     log_request(&store, key, elapsed, url, real_model, downstream_body.clone(), body, Some(status), false);
                     // 429/5xx 临时错误只切、不罚（不熔断好 Key）；4xx 硬错误才计入熔断。
                     // **带路径判**：辅助端点（count_tokens）的 404 是「上游没实现该端点」，
@@ -947,10 +962,16 @@ async fn handle_request(
                 // 连接层失败：记录并切下一个
                 Err(e) => {
                     let elapsed = started.elapsed().as_millis() as u64;
+                    // 本地配置错误（缺 maxOutputTokens 等）与连接层失败分开处理：前者永不自愈、
+                    // 与 Key 无关，不该熔断、不该按临时错误 529 重试（见 config_error 声明）。
+                    let is_config_err = matches!(e, AppError::Invalid(_));
                     last_err = e.to_string();
                     last_status = None; // 连接层失败：无状态码，按临时错误对待
+                    config_error = is_config_err;
                     log_request(&store, key, elapsed, String::new(), key.resolve_model(&requested_model), downstream_body.clone(), last_err.clone(), None, false);
-                    health::record_live_failure(&store, &key.id);
+                    if !is_config_err {
+                        health::record_live_failure(&store, &key.id);
+                    }
                     log_failover(&store, key, "失败", &last_err, next);
                     continue;
                 }
@@ -1046,6 +1067,9 @@ async fn handle_request(
                     retry_after_hint = Some(retry_after_hint.map_or(s, |cur: i64| cur.min(s)));
                 }
                 last_status = Some(outcome.status);
+                // 复位理由同流式 HttpError 分支：上游有状态码 → 非本地配置错误，
+                // config_error 必须只反映最后一次失败的性质，不能被前一候选的 Invalid 粘住。
+                config_error = false;
                 // 解构取走三个 String，消掉三次 clone（本分支对 outcome 的最后一次使用）。
                 // 必须放在 `resp_cow` 用完之后：它借用了 `outcome.bytes`。
                 let ForwardOutcome { url, real_model, request_body, status, .. } = outcome;
@@ -1076,8 +1100,11 @@ async fn handle_request(
             }
             // 连接层失败（无响应）：也记一条日志，response_body 为错误信息
             Err(e) => {
+                // 同流式分支：区分本地配置错误与连接层失败（见 config_error 声明）。
+                let is_config_err = matches!(e, AppError::Invalid(_));
                 last_err = e.to_string();
                 last_status = None; // 连接层失败：无状态码，按临时错误对待
+                config_error = is_config_err;
                 log_request(
                     &store,
                     key,
@@ -1089,7 +1116,9 @@ async fn handle_request(
                     None,
                     false,
                 );
-                health::record_live_failure(&store, &key.id);
+                if !is_config_err {
+                    health::record_live_failure(&store, &key.id);
+                }
                 log_failover(&store, key, "失败", &last_err, next);
             }
         }
@@ -1114,16 +1143,18 @@ async fn handle_request(
     //
     // 429/408/409 之所以划进临时性：它们本就是「稍后重试」语义，且与 Anthropic SDK 的
     // 重试判据（408/409/429 或 >= 500）一致。
-    const TRANSIENT_4XX: [u16; 3] = [408, 409, 429];
-    let is_hard_error = matches!(
-        last_status,
-        Some(s) if (s == 501 || ((400..500).contains(&s) && !TRANSIENT_4XX.contains(&s)))
-    );
+    let is_hard_error = all_failed_is_hard_error(config_error, last_status);
 
     if is_hard_error {
+        // config_error 无上游状态码（last_status=None），用 400 Bad Request：
+        // 它确实是「请求/配置不合法」，且客户端不会对 400 做过载退避重试。
         let status = last_status
             .and_then(|s| StatusCode::from_u16(s).ok())
-            .unwrap_or(StatusCode::BAD_GATEWAY);
+            .unwrap_or(if config_error {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            });
         return Ok(error_resp(status, &format!("全部 Key 不可用：{last_err}")));
     }
 
@@ -1146,6 +1177,26 @@ async fn handle_request(
 /// http crate 无关联常量，只能 `from_u16` 构造；它对 100~999 恒成功，故 expect 不会触发。
 fn overloaded_status() -> StatusCode {
     StatusCode::from_u16(STATUS_OVERLOADED).expect("529 是合法 HTTP 状态码")
+}
+
+/// 全 Key 失败后的「硬错误」判定（决定尾部分流）。
+///
+/// - **硬错误** → 原样回状态码（config_error 无码时回 400）、**不**武装短路窗口、**不**带
+///   Retry-After：401/403/404 等 4xx、协议不匹配的 501、以及本地配置错误（缺 maxOutputTokens 等，
+///   `config_error=true` 而 `last_status=None`）—— 都永不自愈，包装成 529 只会让客户端无限退避。
+/// - **临时性**（429/408/409/5xx/连接层失败）→ 回 529 + Retry-After + 武装短路窗口。
+///
+/// `config_error` 契约：**只反映最后一次失败的性质**。两个上游状态码失败分支都会把它复位为
+/// false，否则「配置错 Key 优先 + 后续 Key 撞 429/5xx」时它会被前一候选的 Invalid 粘住，
+/// 把一整轮临时故障误判成硬错误（回裸状态码、丢掉 Retry-After 与短路窗口）。
+fn all_failed_is_hard_error(config_error: bool, last_status: Option<u16>) -> bool {
+    // 429/408/409：本就是「稍后重试」语义，划进临时性，与 Anthropic SDK 的重试判据一致。
+    const TRANSIENT_4XX: [u16; 3] = [408, 409, 429];
+    config_error
+        || matches!(
+            last_status,
+            Some(s) if (s == 501 || ((400..500).contains(&s) && !TRANSIENT_4XX.contains(&s)))
+        )
 }
 
 /// 单模型检索 `GET /v1/models/{id}`：返回**单个**模型对象（Anthropic SDK 的 models.retrieve
@@ -1421,6 +1472,11 @@ async fn try_stream_to_key(
     let payload = if path_takes_sampling_params(path) {
         ensure_anthropic_output_budget(payload, key, &real_model)?
     } else {
+        // 非补全端点（count_tokens 等）不补 max_tokens → 不会触发 apply_pending_thinking。
+        // 若转换阶段暂存过 `_pending_effort`（仅目标 Anthropic + 有 effort + 无 max_tokens 时），
+        // 这里兜底剥掉，杜绝把中转哨兵字段发给上游（真实客户端不走此路径，属纵深防御）。
+        let mut payload = payload;
+        crate::upstream::strip_pending_effort(&mut payload);
         payload
     };
     // 跨协议：退回上游协议的补全端点。
@@ -1847,6 +1903,10 @@ fn ensure_anthropic_output_budget(
             .get("max_tokens")
             .is_some_and(|value| !value.is_null())
     {
+        // 提前返回也要清掉可能残留的中转字段：`_pending_effort` 绝不能发给上游。
+        // 命中此分支的两种情况都不需要它——目标非 Anthropic（不会有该字段），
+        // 或已带 max_tokens（转换时 thinking 已算过、不会暂存）。幂等清理，兜底而已。
+        crate::upstream::strip_pending_effort(&mut payload);
         return Ok(payload);
     }
     let input_tokens = crate::upstream::estimate_json_tokens_without_image_transport(&payload);
@@ -1861,6 +1921,10 @@ fn ensure_anthropic_output_budget(
         .as_object_mut()
         .ok_or_else(|| AppError::Invalid("请求体必须是 JSON 对象".into()))?;
     obj.insert("max_tokens".into(), Value::from(max_tokens));
+    // max_tokens 补齐后，把转换时暂存的 reasoning.effort 落成 thinking（Codex→Anthropic
+    // 跨协议扩展思考修复）。apply_pending_thinking 内部会移除 `_pending_effort` 中转字段，
+    // 无暂存时是无副作用的清理。必须在插入 max_tokens **之后**——thinking 预算依赖它。
+    crate::upstream::apply_pending_thinking(&mut payload, max_tokens as u64);
     Ok(payload)
 }
 
@@ -1999,6 +2063,9 @@ async fn forward_to_key(
     let payload = if path_takes_sampling_params(path) {
         ensure_anthropic_output_budget(payload, key, &real_model)?
     } else {
+        // 兜底剥掉可能暂存的 `_pending_effort`（理由同流式路径 else 分支）。
+        let mut payload = payload;
+        crate::upstream::strip_pending_effort(&mut payload);
         payload
     };
 
@@ -3223,6 +3290,109 @@ mod tests {
         let payload = json!({ "model": "claude-sonnet-4-5", "max_tokens": 1234, "messages": [] });
         let final_body = ensure_anthropic_output_budget(payload, &k, "claude-sonnet-4-5").unwrap();
         assert_eq!(final_body["max_tokens"], 1234);
+    }
+
+    /// P2-2 端到端：Codex(有 effort、无 max_tokens) → Anthropic Key 的完整链路里，
+    /// 扩展思考必须**真的生效**——convert 暂存 effort、ensure_anthropic_output_budget 补完
+    /// max_tokens 后落成 thinking。此前 thinking 映射依赖 max_tokens 存在，而 Codex 常态
+    /// 不发它，导致扩展思考被静默丢弃（本项目主场景「Codex 接 Claude 中转」直接受损）。
+    ///
+    /// 走两个真实函数（convert_request_owned + ensure_anthropic_output_budget），
+    /// 与转发路径 proxy.rs:2026-2029 完全同序，故这条覆盖的是链路而非孤立函数。
+    #[test]
+    fn codex_effort_survives_full_budget_path_to_anthropic() {
+        let mut k = key("k", 0, "https://example.com");
+        k.models = vec![model_ctx("claude-opus-4-5", Some(200_000))];
+        // Codex 常态：reasoning.effort 有，但不发 max_tokens
+        let original = json!({
+            "model": "claude-opus-4-5",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning": { "effort": "high" }
+        });
+        let converted = crate::upstream::convert_request_owned(
+            original,
+            Protocol::OpenaiChat,
+            Protocol::Anthropic,
+        );
+        // 转换后：max_tokens 还没补，thinking 也还没落，但 effort 已暂存
+        assert!(converted.get("thinking").is_none(), "此刻不该有 thinking");
+        assert_eq!(converted["_pending_effort"], "high", "effort 必须已暂存");
+
+        let final_body = ensure_anthropic_output_budget(converted, &k, "claude-opus-4-5")
+            .expect("应能补 max_tokens 并落 thinking");
+        assert_eq!(final_body["max_tokens"], 64_000, "按模型能力补 max_tokens");
+        assert_eq!(final_body["thinking"]["type"], "enabled", "扩展思考必须真的生效");
+        assert!(final_body["thinking"]["budget_tokens"].as_u64().unwrap() > 0);
+        assert_eq!(final_body["temperature"], 1, "开思考须归一 temperature=1");
+        assert!(
+            final_body.get("_pending_effort").is_none(),
+            "中转字段必须已被清除，绝不能发给上游"
+        );
+    }
+
+    /// P2-1：缺 maxOutputTokens 的**配置错误**是永不自愈的硬错误，
+    /// ensure_anthropic_output_budget 必须返回 `AppError::Invalid`（而非可重试的 Upstream）。
+    ///
+    /// 这条钉住错误**类型**：handle_request 的失败分流靠 `matches!(e, AppError::Invalid(_))`
+    /// 把它判为硬错误——原样回 4xx、不熔断、不武装短路窗口、不包装成 529 让客户端无限退避。
+    /// 若这里退化成别的错误变体，那套分流就会把配置错误误当临时故障。
+    #[test]
+    fn missing_max_output_yields_invalid_not_retryable() {
+        let mut k = key("k", 0, "https://example.com");
+        // 内置表认不出的第三方模型名 + 用户没填 max_output + 无 context_window
+        k.models = vec![model_ctx("some-relay-private-model", None)];
+        let payload = json!({
+            "model": "some-relay-private-model",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let err = ensure_anthropic_output_budget(payload, &k, "some-relay-private-model")
+            .expect_err("缺能力数据必须报错，不许猜一个上限");
+        assert!(
+            matches!(err, crate::error::AppError::Invalid(_)),
+            "必须是 Invalid（配置错误/永不自愈），否则会被误判为可重试临时故障、包装成 529"
+        );
+        // 错误文案要引导用户去填「最大单次输出」（可行动，而非「等后续版本」）
+        assert!(
+            err.to_string().contains("最大单次输出"),
+            "错误应指向 Key 编辑器的可自助修复入口，实际：{err}"
+        );
+    }
+
+    #[test]
+    fn all_failed_classification_config_error_must_not_stick_across_candidates() {
+        // 回归（本轮对抗式复核发现）：config_error 曾是「只置不复位」的粘滞标志——
+        // 只在两个 Err(Invalid) 分支被赋值，两个上游状态码失败分支从不触碰它。
+        // 于是「配置错 Key 优先（Invalid）+ 后续 Key 撞 429」这一常见故障转移序列里，
+        // config_error 残留 true，尾部把整轮判成硬错误：原样回 429、跳过短路窗口与 Retry-After，
+        // 正是 529 设计要防的重试风暴。修复：状态码分支复位 config_error=false。
+
+        // ① 纯配置错误（所有 Key 都缺 maxOutputTokens）→ 硬错误，回 400、不 529。
+        assert!(
+            all_failed_is_hard_error(true, None),
+            "config_error 单独出现必须判硬错误（回 400 可行动原因，不能 529 让客户端无限退避）"
+        );
+
+        // ② 关键回归场景：最后一次是上游 429 临时限流 → 必须判临时性（529+Retry-After），
+        //    即使循环早期某个 Key 曾因配置错误失败。修复后状态码分支已把 config_error 复位，
+        //    故到这里传入的 config_error 必为 false —— 断言这种组合被判为临时性。
+        assert!(
+            !all_failed_is_hard_error(false, Some(429)),
+            "最后一次是 429 限流 → 临时性：应 529+Retry-After+短路窗口，不能原样回 429"
+        );
+        for transient in [408u16, 409, 429, 500, 502, 503, 529] {
+            assert!(
+                !all_failed_is_hard_error(false, Some(transient)),
+                "{transient} 属临时性，应回 529 让客户端退避重试"
+            );
+        }
+
+        // ③ 真正的硬状态码（配置/密钥错）不受影响：原样回、不退避。
+        for hard in [400u16, 401, 403, 404, 422, 501] {
+            assert!(
+                all_failed_is_hard_error(false, Some(hard)),
+                "{hard} 是永不自愈的硬错误，应原样回、不武装短路窗口"
+            );
+        }
     }
 
     #[test]

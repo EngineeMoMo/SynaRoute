@@ -514,14 +514,18 @@ impl Default for BalanceQuery {
     fn default() -> Self {
         Self {
             enabled: true,  // 对齐 cc-switch：默认启用余额查询（用户添加 Key 后即可查询）
-            template: "generic".into(),
-            // 与 cc-switch 通用模板**逐字一致**（其文档 §2.5：`url: "{{baseUrl}}/user/balance"`）。
-            //
-            // 此前这里写的是 `/v1/usage` —— 那是我从某个站的**自定义脚本**里读到的路径，
-            // 误当成了通用默认值，导致新用户一开开关就 404。对齐官方模板才是正确起点。
-            url: "{{baseUrl}}/user/balance".into(),
+            template: "auto".into(),
+            // url/auth 留空 = 交给 `balance::detect_balance_endpoint` 按 base_url 域名**自动识别**
+            // 端点（对齐 cc-switch 的 detect_provider）。**必须与前端 defaultBalanceQuery() 一致**：
+            // 前端新建 Key 用 auto+空串，若后端 Default 仍写死 `{{baseUrl}}/user/balance`，
+            // 会造成「前端建的 Key 能自动识别、后端 Default 构造的却被写死 url 挡住自动识别」
+            // 这类按来源而异的分叉（本项目最忌讳的静默失效）。
+            // 历史坑记录：这里一度写 `/v1/usage`（某站自定义脚本路径，误当通用默认），
+            // 后改 `{{baseUrl}}/user/balance`（cc-switch 通用模板），但中转站在该路径多返回网页；
+            // 现统一改为**留空自动识别**，不再猜单一路径。
+            url: String::new(),
             method: "GET".into(),
-            auth: "bearer".into(),
+            auth: String::new(),
             base_url_override: None,
             api_key_ref: None,
             timeout_secs: DEFAULT_BALANCE_TIMEOUT_SECS,

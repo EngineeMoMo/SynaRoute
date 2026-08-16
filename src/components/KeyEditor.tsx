@@ -821,7 +821,13 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                     {/* 最大单次输出：与上下文窗口**并列而非合并** —— 两者是不同的能力
                         （4.5 系 200k 窗口 / 64k 输出）。留空走内置能力表；第三方中转的
                         私有模型名内置表认不出，填上这个值该模型才能参与大脑聚合。
-                        复用 ContextWindowInput 的 K/M 单位与非法值拦截逻辑（同一套交互）。 */}
+                        复用 ContextWindowInput 的 K/M 单位与非法值拦截逻辑（同一套交互）。
+
+                        **仅 Anthropic 协议显示**：max_tokens 是 Anthropic 的必填字段，
+                        这个值只在 budget.rs 的 Anthropic 分支被消费（output_budget 对
+                        OpenAI Chat/Responses 直接返回 None、不发上限）。若对所有协议显示，
+                        Codex/OpenAI 用户填了会以为生效、实则静默无效——本项目最忌讳的形态。 */}
+                    {protocol === "anthropic" && (
                     <ContextWindowInput
                       value={m.maxOutputTokens}
                       onChange={(val) =>
@@ -841,6 +847,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                       unitTitle={t("editor.maxOutputUnit")}
                       placeholder={t("editor.maxOutputPlaceholder")}
                     />
+                    )}
                     <button
                       onClick={() => {
                         setModels(models.filter((x) => x.realName !== m.realName));
@@ -1135,13 +1142,22 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                       <Field label={t("balance.auth")}>
                         <select
                           className={inputCls}
-                          value={balance.auth}
+                          // auto 态下 balance.auth 是空串（后端据此走自动识别）。
+                          // 空串映射到「自动」选项，否则 <select> 会渲染成空白/落到第一项，
+                          // 让用户误以为认证方式是 Bearer（本轮把默认 auth 改空后引入的 bug）。
+                          value={balance.auth || "auto"}
                           onChange={(e) => {
-                            // 同 method：auth 也是模板定义字段，手改即 custom + 清探测结果。
-                            setBalance((b) => ({ ...b, auth: e.target.value, template: "custom" }));
+                            const v = e.target.value;
+                            // 选「自动」= 清空 auth 回到自动识别；其余值是用户显式指定 → custom。
+                            if (v === "auto") {
+                              setBalance((b) => ({ ...b, auth: "", template: b.url.trim() === "" ? "auto" : "custom" }));
+                            } else {
+                              setBalance((b) => ({ ...b, auth: v, template: "custom" }));
+                            }
                             setBalanceProbe(null);
                           }}
                         >
+                          <option value="auto">{t("balance.authAuto")}</option>
                           <option value="bearer">Bearer</option>
                           <option value="x-api-key">x-api-key</option>
                           <option value="access-token">Access Token</option>
@@ -1399,6 +1415,17 @@ function ContextWindowInput({
   const [unit, setUnit] = useState<TokenUnit>(() => preferredUnit(value));
   const [bad, setBad] = useState(false);
   const nativeBadInput = useRef(false);
+
+  // 卸载时上报「有效」，清掉可能残留的校验失败标记。
+  // 场景：最大输出输入框仅 Anthropic 协议渲染（见调用处条件）。若它此刻是非法态
+  // （红框、`::maxout` 标记在 invalidContextModels 里），用户切到 OpenAI/Codex 协议后
+  // 该输入框卸载，但标记留在父级 → Save 被「最大输出格式无效」挡住，而报错指向的控件
+  // 已不在屏上，成了无法自助解除的死胡同。卸载即报有效，把标记清掉。
+  // 用 ref 持最新回调、空依赖：**不能**把 onValidityChange 放进依赖数组 —— 它每次渲染
+  // 都是新闭包，会让 cleanup 每次渲染都跑一遍、把非法态标记误清，反而放行非法值。
+  const onValidityChangeRef = useRef(onValidityChange);
+  onValidityChangeRef.current = onValidityChange;
+  useEffect(() => () => onValidityChangeRef.current(true), []);
 
   // 单位是用户的显式选择，父组件回写 value 时不能擅自改档：
   // 用户填 `1.5` 选 M 后，value=1_500_000；若重新按「能整除的最大单位」拆分，
