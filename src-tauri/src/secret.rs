@@ -692,6 +692,18 @@ fn keychain_vault_key() -> AppResult<[u8; 32]> {
     if let Some(k) = CACHED.get() {
         return Ok(*k);
     }
+    // 串行化首次初始化（见上文「同进程 / 同进程竞态」）：`SecretStore::get` 可在多个转发任务
+    // 持读锁时并发调用本函数，单实例插件只挡第二个 GUI 进程、不挡同进程线程。没有这把锁，
+    // 两线程会各自越过上面的 `CACHED.get()`、各自向 Keychain 写入**不同的随机密钥**
+    // （create-or-update 语义，后写覆盖前写），谁先 `CACHED.set` 谁赢，另一把密钥加密过的条目
+    // 此后永久 AEAD 解不开。这正是函数文档描述、但此前漏实现的那把锁
+    // （CI macOS 并行跑测时以 `aead::Error` 暴露）。毒化容忍同 `atomic_write` 的 `WRITE_LOCK`。
+    static INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // 锁内二次检查：等锁期间前一个持锁线程可能已完成初始化。
+    if let Some(k) = CACHED.get() {
+        return Ok(*k);
+    }
     let key = keychain_fetch_or_create()?;
     let _ = CACHED.set(key);
     Ok(key)
