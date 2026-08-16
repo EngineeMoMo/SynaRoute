@@ -1267,6 +1267,10 @@ pub fn run() {
             ),
         );
     }
+    // 清理超过保留期的旧日志文件（按文件名日期判，best-effort）。
+    // 放在启动自检**之后**：那条自检日志是今天的文件，不受清理影响，
+    // 而先清理再自检会让「清理了 N 个文件」这条 info 落在旧文件被删之前，读日志时顺序更自然。
+    store.cleanup_old_logs();
     let proxy = Arc::new(ProxyManager::new(store.clone()));
     let mcp = Arc::new(McpManager::new(store.clone()));
 

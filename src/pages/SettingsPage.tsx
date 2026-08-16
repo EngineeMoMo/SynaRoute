@@ -764,6 +764,17 @@ export function SettingsPage() {
               checked={settings?.logDownstreamRawEnabled ?? false}
               onChange={(v) => update({ logDownstreamRawEnabled: v })}
             />
+            {/* trace 类开关开着时常驻警告：这些日志含完整请求体（可能有源码、密钥片段、
+                业务数据）。用户为排一次障打开后极易忘关，而日志文件是会被拷走/截图的。
+                只在真的开着时显示 —— 常驻无条件警告会被当背景噪音忽略。 */}
+            {(settings?.requestLogEnabled || settings?.logDownstreamRawEnabled) && (
+              <div className="flex gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2">
+                <AlertTriangle size={14} className="mt-0.5 shrink-0 text-warning" />
+                <p className="text-[11px] leading-relaxed text-warning">
+                  {t("settings.traceOnWarning")}
+                </p>
+              </div>
+            )}
             <div className="flex items-start justify-between gap-4">
               <div className="flex gap-2.5">
                 <Activity size={16} className="mt-0.5 shrink-0 text-text-secondary" />
@@ -841,6 +852,16 @@ export function SettingsPage() {
               checked={settings?.aggregateTraceEnabled ?? false}
               onChange={(v) => update({ aggregateTraceEnabled: v })}
             />
+            {/* 同上：聚合 trace 落的是成员完整答案 + 喂给它们的完整 prompt，
+                量比转发日志更大、内容更敏感（含检索到的源码）。 */}
+            {settings?.aggregateTraceEnabled && (
+              <div className="flex gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2">
+                <AlertTriangle size={14} className="mt-0.5 shrink-0 text-warning" />
+                <p className="text-[11px] leading-relaxed text-warning">
+                  {t("settings.traceOnWarning")}
+                </p>
+              </div>
+            )}
             <ToggleRow
               icon={MousePointerClick}
               title={t("settings.trayModelTitle")}

@@ -186,6 +186,17 @@ enum LogCmd {
 /// 拖垮转发。
 const LOG_QUEUE_CAP: usize = 4096;
 
+/// 日志文件保留天数。启动时清理更早的 `YYYY-MM-DD.jsonl`。
+///
+/// 为什么需要清理：日志已按日轮转（写线程跨天自动重开文件），但旧文件此前永久保留 ——
+/// 长期运行一年就攒 365 个文件。虽然单个文件不大（trace 关时约 250 KB/天），
+/// 但目录里几百个文件会让用户「打开日志目录」时无从下手。
+///
+/// 30 天的依据：排障场景基本是「刚才/昨天出的问题」，跨月回溯极少；而真要长期留存的用户
+/// 会自己拷走。**刻意不做成配置项**：又一个开关意味着又一处要对账的状态，
+/// 而这个值的合理区间很窄（7~90），没人会真去调它。
+const LOG_RETAIN_DAYS: i64 = 30;
+
 /// 事件日志内存上限
 const MAX_EVENTS: usize = 500;
 
@@ -643,6 +654,42 @@ impl Store {
     /// 已丢弃的日志条数（可观测性：静默丢日志是本项目最忌讳的形态，必须能被问到）。
     pub fn log_dropped_count(&self) -> u64 {
         self.log_dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 清理超过 [`LOG_RETAIN_DAYS`] 天的日志文件。启动时调一次。
+    ///
+    /// **判据是文件名里的日期，不是文件 mtime**：写线程用 `{date}.jsonl` 命名，
+    /// 文件名即权威日期。mtime 会被备份工具/杀软/同步盘改写 —— 那会误删今天的日志，
+    /// 或让三个月前的文件因为被扫过而永远留着。
+    ///
+    /// 全程 best-effort（失败只记 warn 不上抛）：清不掉旧日志是纯磁盘占用问题，
+    /// 而让它把启动流程搞挂就成了功能故障。
+    pub fn cleanup_old_logs(&self) {
+        let dir = self.effective_log_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return; // 目录还不存在（首次运行）或读不了：无事可做
+        };
+        let cutoff = chrono::Utc::now().date_naive() - chrono::Duration::days(LOG_RETAIN_DAYS);
+        let mut removed = 0usize;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // 只认写线程产出的 `YYYY-MM-DD.jsonl`；别的文件（用户自己放的、旧版遗留的
+            // events.jsonl）一律不碰 —— 删错文件比留着旧日志严重得多。
+            let Some(date_str) = name.strip_suffix(".jsonl") else { continue };
+            let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") else {
+                continue;
+            };
+            if date < cutoff {
+                match std::fs::remove_file(entry.path()) {
+                    Ok(()) => removed += 1,
+                    Err(e) => tracing::warn!("清理旧日志 {name} 失败: {e}"),
+                }
+            }
+        }
+        if removed > 0 {
+            tracing::info!("已清理 {removed} 个超过 {LOG_RETAIN_DAYS} 天的日志文件");
+        }
     }
 
     /// 等待写线程把当前队列排空（退出钩子与测试用）。
@@ -3650,6 +3697,66 @@ mod tests {
             MAX_EVENTS,
             "落盘失败不影响内存事件环形缓冲"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 旧日志清理：只删超期的 `YYYY-MM-DD.jsonl`，**其它文件一律不碰**。
+    ///
+    /// 两个方向都要钉住：
+    /// - 该删的删掉（否则长期运行攒几百个文件，用户打开日志目录无从下手）；
+    /// - **不该删的一个都不能少** —— 删错用户文件比留着旧日志严重得多，
+    ///   故用「非日期命名」「今天的」「刚过期边界的」三类样本一起验。
+    ///
+    /// 判据刻意用**文件名日期**而非 mtime：mtime 会被备份工具/杀软/同步盘改写，
+    /// 那会误删今天的日志或让三个月前的文件永远留着。把 mtime 判据换回来这条测试会红
+    /// （测试文件都是刚创建的，mtime 全是今天）。
+    #[test]
+    fn cleanup_old_logs_removes_only_expired_dated_files() {
+        let dir = temp_dir("log_cleanup");
+        let log_dir = dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        {
+            let mut cfg = store.config.write();
+            cfg.settings.log_dir = Some(log_dir.display().to_string());
+        }
+
+        let today = chrono::Utc::now().date_naive();
+        let d = |offset: i64| (today - chrono::Duration::days(offset)).format("%Y-%m-%d").to_string();
+
+        // 该删的：超过保留期
+        let expired = [
+            format!("{}.jsonl", d(LOG_RETAIN_DAYS + 1)),
+            format!("{}.jsonl", d(LOG_RETAIN_DAYS + 100)),
+        ];
+        // 不该删的：今天、边界内、以及**非日期命名的一切**
+        let kept = [
+            format!("{}.jsonl", d(0)),                    // 今天（正在写的那个）
+            format!("{}.jsonl", d(LOG_RETAIN_DAYS - 1)),  // 边界内
+            format!("{}.jsonl", d(LOG_RETAIN_DAYS)),      // 恰好等于保留期：不删（cutoff 用 `<`）
+            "events.jsonl".to_string(),                   // 旧版遗留命名
+            "notes.txt".to_string(),                      // 用户自己放的
+            "2026-99-99.jsonl".to_string(),               // 像日期但解析不出来
+        ];
+        for f in expired.iter().chain(kept.iter()) {
+            std::fs::write(log_dir.join(f), "x").unwrap();
+        }
+
+        store.cleanup_old_logs();
+
+        for f in &expired {
+            assert!(
+                !log_dir.join(f).exists(),
+                "{f} 已超过 {LOG_RETAIN_DAYS} 天，应被清理"
+            );
+        }
+        for f in &kept {
+            assert!(
+                log_dir.join(f).exists(),
+                "{f} 不该被删 —— 删错文件比留着旧日志严重得多"
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

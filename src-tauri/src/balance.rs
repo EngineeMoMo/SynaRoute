@@ -62,8 +62,40 @@ const REMAINING_CANDIDATES: &[&str] = &[
     //
     // 排在末尾：`hard_limit_usd` 是「额度上限」而非严格意义的「剩余」，
     // 前面任一更精确的字段命中时都不该被它抢先。
-        "hard_limit_usd",
+    "hard_limit_usd",
     "data.hard_limit_usd",
+    // ---- 以下三条对齐 cc-switch 的硬编码厂商实现（2026-08-17 从其源码
+    // `src-tauri/src/services/balance.rs` 逐个函数核对，非文档推测）----
+    //
+    // cc-switch 为这 5 家各写一个函数、按 base_url 子串路由：DeepSeek（我们已有
+    // `balance_infos.0.total_balance`）、SiliconFlow（已有 `data.totalBalance`）、
+    // OpenRouter（已有 `data.limit_remaining`，但它实际算的是 total_credits −
+    // total_usage，见下）、StepFun（`balance`，已被泛化项覆盖）、Novita（缺）。
+    //
+    // Novita AI：`{"availableBalance": 123456}`，单位是 **0.0001 USD**
+    // （cc-switch 除以 10000）。我们的候选链只取原始数字，故这里取到的是
+    // 「万分之一美元」的整数 —— 单位换算见 `as_number` 下方的 SCALED_FIELDS。
+    "availableBalance",
+    "data.availableBalance",
+    // StepFun：`{"balance": ...}` 已由上面的泛化 `balance` 命中，无需单列。
+    //
+    // OpenRouter 的 `/api/v1/credits`：`{"data":{"total_credits":X,"total_usage":Y}}`，
+    // 剩余 = X − Y。**这是个减法、不是单字段**，候选链表达不了 ——
+    // 由 `derive_openrouter_remaining` 在候选链之前单独处理（见 extract_balance）。
+];
+
+/// 需要按固定倍数缩放的字段（字段名 → 除数）。
+///
+/// 为什么需要它：多数站点的余额字段就是「多少钱」，但少数厂商用整数最小单位存以避免浮点。
+/// Novita AI 的 `availableBalance` 是 0.0001 USD 的整数倍（cc-switch 的
+/// `novita` 函数里明确 `/ 10000.0`）——不缩放会把 12.3456 USD 显示成 123456，
+/// 用户看到一个荒谬的大数只会以为程序坏了。
+///
+/// 只对**精确匹配的字段名**生效，不做前缀/子串匹配：泛化匹配会把别家同名字段
+/// 也误缩放，那比不缩放更糟（12.34 显示成 0.0012）。
+const SCALED_FIELDS: &[(&str, f64)] = &[
+    ("availableBalance", 10_000.0),
+    ("data.availableBalance", 10_000.0),
 ];
 
 /// 货币单位的候选字段链。取不到时默认 USD（与 cc-switch 通用模板一致）。
@@ -138,6 +170,42 @@ fn as_number(v: &Value) -> Option<f64> {
 /// 按候选链找第一个能转成数字的字段。
 fn find_number(root: &Value, candidates: &[&str]) -> Option<f64> {
     candidates.iter().find_map(|p| pick(root, p).and_then(as_number))
+}
+
+/// 同 [`find_number`]，但对 [`SCALED_FIELDS`] 里的字段按其除数缩放。
+///
+/// 分成两个函数而不是给 `find_number` 加参数：`find_number` 还被单位/总额/已用等
+/// 候选链复用，那些字段没有缩放语义，混在一起会让「哪些会被缩放」变得不可预测。
+fn find_number_scaled(root: &Value, candidates: &[&str]) -> Option<f64> {
+    candidates.iter().find_map(|p| {
+        let raw = pick(root, p).and_then(as_number)?;
+        let divisor = SCALED_FIELDS
+            .iter()
+            .find(|(name, _)| name == p)
+            .map(|(_, d)| *d)
+            .unwrap_or(1.0);
+        Some(raw / divisor)
+    })
+}
+
+/// OpenRouter 的 `/api/v1/credits` 要做减法：剩余 = `total_credits` − `total_usage`。
+///
+/// 为什么单独一个函数：候选链是「取某个字段的值」，表达不了两字段相减。cc-switch 为此
+/// 专门写了 `openrouter` 函数（`remaining = total_credits - total_usage`，
+/// 且 `is_valid = remaining > 0`），我们对齐它的语义。
+///
+/// 判据要求**两个字段都在**才算命中：只有其中一个时无法得出剩余，返回 `None` 让候选链
+/// 继续尝试（例如某天 OpenRouter 直接给了 `remaining`）。兼容 `data` 包裹与根上两种形态。
+fn derive_openrouter_remaining(body: &Value) -> Option<f64> {
+    // `data` 包裹优先（OpenRouter 实际返回带 data），根上作为兜底
+    for root in [body.get("data").unwrap_or(body), body] {
+        let credits = pick(root, "total_credits").and_then(as_number);
+        let usage = pick(root, "total_usage").and_then(as_number);
+        if let (Some(c), Some(u)) = (credits, usage) {
+            return Some(c - u);
+        }
+    }
+    None
 }
 
 /// 按候选链找第一个非空字符串。
@@ -226,7 +294,12 @@ pub fn extract_balance(body: &Value, custom_path: Option<&str>) -> BalanceResult
                 ))
             }
         },
-        None => find_number(body, REMAINING_CANDIDATES),
+        // 自动探测：先试 OpenRouter 式的两字段减法（候选链表达不了），再走候选链。
+        //
+        // 顺序不能反：OpenRouter 的返回里 `total_credits` 会被泛化候选项误当成
+        // 「剩余」（它其实是总额），那样已用掉的部分不会被扣掉、余额虚高。
+        None => derive_openrouter_remaining(body)
+            .or_else(|| find_number_scaled(body, REMAINING_CANDIDATES)),
     };
 
     let is_valid = find_bool(body, VALID_CANDIDATES);
@@ -511,6 +584,82 @@ mod tests {
             extract_balance(&with_remaining, None).remaining,
             Some(3.25),
             "remaining 比 hard_limit_usd 精确，必须优先"
+        );
+    }
+
+    /// OpenRouter：剩余额度是 `total_credits − total_usage` 的**减法**，不是单字段。
+    ///
+    /// 判据来源：cc-switch `src-tauri/src/services/balance.rs` 的 `openrouter` 函数
+    /// （2026-08-17 从其源码核对：`remaining = total_credits - total_usage`，
+    /// `is_valid = remaining > 0`）。
+    ///
+    /// **这条最容易被"优化"破坏**：若有人把减法删掉、只留候选链，泛化的
+    /// `total_credits` 或 `data.limit_remaining` 会命中「总额」而不是「剩余」——
+    /// 余额虚高，用户以为还有钱、实际已用完。故断言里同时钉住「不等于总额」。
+    #[test]
+    fn openrouter_remaining_is_credits_minus_usage() {
+        // OpenRouter 实际返回形态（data 包裹）
+        let body = serde_json::json!({
+            "data": { "total_credits": 25.0, "total_usage": 18.75 }
+        });
+        let r = extract_balance(&body, None);
+        assert!(r.ok, "OpenRouter 结构必须能解析：{:?}", r.error);
+        assert_eq!(r.remaining, Some(6.25), "剩余 = 25 − 18.75；错了说明减法没生效");
+        assert_ne!(
+            r.remaining,
+            Some(25.0),
+            "绝不能把 total_credits 当剩余 —— 那样已用掉的 18.75 被无视，余额虚高"
+        );
+
+        // 根上直挂（无 data 包裹）也要认
+        let flat = serde_json::json!({ "total_credits": 10.0, "total_usage": 3.0 });
+        assert_eq!(extract_balance(&flat, None).remaining, Some(7.0));
+
+        // 只有其中一个字段时不做减法，回落候选链（将来 OpenRouter 若直接给 remaining）
+        let only_credits = serde_json::json!({ "total_credits": 10.0, "remaining": 4.0 });
+        assert_eq!(
+            extract_balance(&only_credits, None).remaining,
+            Some(4.0),
+            "凑不成减法时应回落候选链的 remaining"
+        );
+
+        // 用光后余额为 0：如实报 0，不能因为「像失败」就报错
+        let spent = serde_json::json!({ "data": { "total_credits": 5.0, "total_usage": 5.0 } });
+        let r = extract_balance(&spent, None);
+        assert!(r.ok, "余额恰好用光是有效结果，不是错误");
+        assert_eq!(r.remaining, Some(0.0));
+    }
+
+    /// Novita AI：`availableBalance` 的单位是 **0.0001 USD**，必须除以 10000。
+    ///
+    /// 判据来源：cc-switch 的 `novita` 函数（`availableBalance / 10000.0`，
+    /// 其注释说明金额以 0.0001 USD 为单位）。
+    ///
+    /// 不缩放的后果是用户看到 `123456` 而真实余额是 `12.3456` —— 一个荒谬的大数，
+    /// 用户只会以为程序坏了；而缩放错方向（乘 10000）则会把余额显示成 0，
+    /// 让人误以为额度用光。两个方向都不可接受，故断言精确值。
+    #[test]
+    fn novita_available_balance_is_scaled_by_10000() {
+        let body = serde_json::json!({ "availableBalance": 123_456 });
+        let r = extract_balance(&body, None);
+        assert!(r.ok, "Novita 结构必须能解析：{:?}", r.error);
+        assert_eq!(
+            r.remaining,
+            Some(12.3456),
+            "availableBalance 必须除以 10000（0.0001 USD 为单位）"
+        );
+
+        // 字符串形态同样要缩放（部分站点为避免精度问题用字符串传数字）
+        let as_str = serde_json::json!({ "availableBalance": "98765" });
+        assert_eq!(extract_balance(&as_str, None).remaining, Some(9.8765));
+
+        // **不误伤**：别家的同名字段若在 data 下也按同规则缩放（已在 SCALED_FIELDS 里列出），
+        // 但**其它字段一律不缩放** —— 这条钉住「缩放只对精确匹配的字段名生效」。
+        let other = serde_json::json!({ "balance": 123_456 });
+        assert_eq!(
+            extract_balance(&other, None).remaining,
+            Some(123_456.0),
+            "普通 balance 字段不得被缩放"
         );
     }
 
