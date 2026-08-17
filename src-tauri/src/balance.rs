@@ -478,7 +478,10 @@ pub async fn query_balance(
         cfg.timeout_secs as u64
     });
 
-    let client = crate::upstream::shared_client();
+    // 用带自动解压的客户端：本函数拿到 body 后自己 resp.text()+from_str 解析，而中转站/CDN
+    // 可能主动返回 gzip/br 压缩体（实测「余额查询返回一堆乱码字节」正是不解压所致）。
+    // **不能用 shared_client()**——那是转发路径的字节透明客户端，不解压。
+    let client = crate::upstream::decoding_client();
     let method = cfg.method.trim().to_ascii_uppercase();
     let mut req = match method.as_str() {
         "" | "GET" => client.get(&url),

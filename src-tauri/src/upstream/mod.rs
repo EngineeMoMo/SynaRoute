@@ -35,6 +35,8 @@ pub use budget::{
     output_budget,
 };
 pub use client::shared_client;
+/// 带自动解压的自建请求客户端（余额查询等直接取它，不经 build_client）。
+pub use client::decoding_client;
 /// 转发用的 per-Key 响应超时。流式探头阶段与非流式共用同一口径（见 proxy.rs 两处调用）。
 pub use client::key_timeout;
 /// 自建请求的客户端身份头（UA 等）。缺它会被部分中转渠道判 `detected: unknown` 而 403。

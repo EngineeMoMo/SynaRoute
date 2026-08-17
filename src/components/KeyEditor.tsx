@@ -653,7 +653,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="flex h-full w-[440px] flex-col bg-surface shadow-2xl">
+      <div className="flex h-full w-[min(560px,100vw)] flex-col bg-surface shadow-2xl">
 
         {/* 头 */}
         <div className="flex items-center justify-between border-b border-border px-5 py-4">
@@ -765,16 +765,16 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
 
           {/* 参数 */}
           <div className="flex gap-3">
-            <Field label="Temperature" className="flex-1">
+            <Field label={t("editor.temperature")} className="flex-1">
               <input type="number" step={0.1} min={0} max={2} className={inputCls} value={temperature} onChange={(e) => setTemperature(Number(e.target.value))} />
             </Field>
-            <Field label="请求超时 (ms)" className="flex-1">
+            <Field label={t("editor.reqTimeout")} className="flex-1">
               <input
                 type="number"
                 min={1000}
                 step={1000}
                 placeholder="30000"
-                title="非流式转发的单请求超时,慢厂商可调大;留空=默认 30000。健康探测/拉模型固定≤30s;大脑聚合用大脑页「总超时」,均不受此值影响"
+                title={t("editor.reqTimeoutHint")}
                 className={inputCls}
                 value={timeoutMs}
                 onChange={(e) => setTimeoutMs(e.target.value === "" ? "" : Number(e.target.value))}

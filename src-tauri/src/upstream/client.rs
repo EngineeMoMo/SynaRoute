@@ -65,44 +65,94 @@ pub(super) fn truncate_body(raw: &str) -> String {
 
 // ---- 内部工具 ----
 
+/// 连接池 / 保活的公共基线（两个共享客户端共用，避免调参漂移）。
+///
+/// 取值理由见 [`shared_client`]。**不含**任何解压设置——解压是否开启由各构造点决定：
+/// 转发路径要字节透明（[`shared_client`]），自建请求要能读明文（[`decoding_client`]）。
+fn base_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        // ---- 连接池与保活：针对「突发 + 长空闲」的桌面代理流量特征 ----
+        //
+        // 为什么要显式设：reqwest 的 `pool_idle_timeout` 默认 **90 秒**，而桌面代理的
+        // 真实流量是「用户问一句 → 想几分钟 → 再问一句」。默认值下每次「想一会儿再问」
+        // 都超过 90s，连接已被回收，下一发要重做 TCP 三次握手 + 完整 TLS 握手；
+        // 跨境到中转商 RTT 常 100~300ms、完整握手 2~3 个 RTT，即**每次白付
+        // 300~900ms 首字节延迟**。这是用户能直接感知的卡顿，且极易被误读成「上游慢」
+        // 或「这个 Key 不行」，从而引导错误的排查方向。
+        //
+        // 取值理由：
+        // - `pool_idle_timeout(300s)`：覆盖典型思考间隔（几分钟），比 90s 默认宽裕。
+        //   不设更长是因为中转商侧通常也有空闲上限，本地留着已被对端关掉的连接
+        //   反而要多付一次失败重连。
+        // - `pool_max_idle_per_host(8)`：单请求只用一条连接，8 条足够覆盖故障转移与
+        //   健康探测并发；上界存在是为了避免多 Key 场景下空闲连接无限累积。
+        // - `tcp_keepalive(60s)`：家用路由器 / NAT 会静默丢弃空闲映射，
+        //   没有 keepalive 时表现为「连接看着还在、一写就 reset」。
+        //
+        // 注：**当前是 HTTP/1.1 连接池**——`Cargo.toml` 里 reqwest 是
+        // `default-features = false` 且未开 `http2` feature，故不存在 h2 多路复用，
+        // 也就没有 `http2_keep_alive_*` 可设（编译期即报错）。h1 下「一连接一请求」，
+        // 靠上面的池上限与保活即可。是否开启 h2 需单独评估：它会改变与**所有**上游的
+        // ALPN 协商结果，部分中转商网关对 h2 的行为与 h1 不同，属于需要真机验证的改动，
+        // 不应与本轮的纯增益调参混在一起。
+        .pool_idle_timeout(Duration::from_secs(300))
+        .pool_max_idle_per_host(8)
+        .tcp_keepalive(Duration::from_secs(60))
+        // ⚠️ 必须显式关掉自动解压。reqwest 的 `Accepts::default()` 对**编译进的**
+        // gzip/brotli/deflate feature 一律置 `true`（async_impl/client.rs），与是否调用
+        // `.gzip(true)` **无关**——Cargo.toml 为余额/拉模型加了这三个 feature 后，若这里不显式
+        // 关闭，转发路径的 `shared_client()` 会被默认翻成「自动解压」：tower-http 还会顺带注入
+        // `Accept-Encoding: gzip,br,deflate`，正好抵消 proxy.rs 剥离 accept-encoding 的用意，
+        // 且解压后删除 `content-encoding`/`content-length`、把 gzip 解码塞进 SSE 热路径——
+        // 破坏「字节透明转发」这条硬约束。故基线一律关；需要解压的 `decoding_client()` 再逐项开。
+        .gzip(false)
+        .brotli(false)
+        .deflate(false)
+}
+
 /// 全局共享 HTTP 客户端：复用连接池 / TLS 会话，避免每请求重做 TCP+TLS 握手。
 /// 不设总超时（response timeout）——总超时由各调用点按 Key 用 `.timeout()` 逐请求指定；
 /// 仅设连接超时（连接层握手上限）。reqwest::Client 内部是 Arc，clone 廉价、共享同一连接池。
+///
+/// **刻意不开自动解压**：这是**转发路径**（proxy.rs 流式/非流式）用的客户端，必须对上游
+/// 响应体字节透明——代理把上游的 body 与 `content-encoding` 头原样转给下游客户端，由下游
+/// 自己解压。若在这里开 gzip/brotli，reqwest 会自动解压并删掉 `content-encoding`/
+/// `content-length`，导致「头说压缩、体已解压」的不一致，甚至扰乱 SSE 分块。
+/// 需要读明文 body 的**自建请求**（余额/拉模型/健康探测/聚合）用 [`decoding_client`]。
 pub fn shared_client() -> reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(30))
-                // ---- 连接池与保活：针对「突发 + 长空闲」的桌面代理流量特征 ----
-                //
-                // 为什么要显式设：reqwest 的 `pool_idle_timeout` 默认 **90 秒**，而桌面代理的
-                // 真实流量是「用户问一句 → 想几分钟 → 再问一句」。默认值下每次「想一会儿再问」
-                // 都超过 90s，连接已被回收，下一发要重做 TCP 三次握手 + 完整 TLS 握手；
-                // 跨境到中转商 RTT 常 100~300ms、完整握手 2~3 个 RTT，即**每次白付
-                // 300~900ms 首字节延迟**。这是用户能直接感知的卡顿，且极易被误读成「上游慢」
-                // 或「这个 Key 不行」，从而引导错误的排查方向。
-                //
-                // 取值理由：
-                // - `pool_idle_timeout(300s)`：覆盖典型思考间隔（几分钟），比 90s 默认宽裕。
-                //   不设更长是因为中转商侧通常也有空闲上限，本地留着已被对端关掉的连接
-                //   反而要多付一次失败重连。
-                // - `pool_max_idle_per_host(8)`：单请求只用一条连接，8 条足够覆盖故障转移与
-                //   健康探测并发；上界存在是为了避免多 Key 场景下空闲连接无限累积。
-                // - `tcp_keepalive(60s)`：家用路由器 / NAT 会静默丢弃空闲映射，
-                //   没有 keepalive 时表现为「连接看着还在、一写就 reset」。
-                //
-                // 注：**当前是 HTTP/1.1 连接池**——`Cargo.toml` 里 reqwest 是
-                // `default-features = false` 且未开 `http2` feature，故不存在 h2 多路复用，
-                // 也就没有 `http2_keep_alive_*` 可设（编译期即报错）。h1 下「一连接一请求」，
-                // 靠上面的池上限与保活即可。是否开启 h2 需单独评估：它会改变与**所有**上游的
-                // ALPN 协商结果，部分中转商网关对 h2 的行为与 h1 不同，属于需要真机验证的改动，
-                // 不应与本轮的纯增益调参混在一起。
-                .pool_idle_timeout(Duration::from_secs(300))
-                .pool_max_idle_per_host(8)
-                .tcp_keepalive(Duration::from_secs(60))
+            base_builder()
                 .build()
                 .expect("构建共享 HTTP 客户端失败")
+        })
+        .clone()
+}
+
+/// 带**自动解压**（gzip/brotli/deflate）的共享客户端，供本应用**自己解析响应体**的自建请求
+/// 使用：余额查询、拉模型、健康探测、大脑聚合成员/决策者、工具会话。
+///
+/// 为什么单列一个：这些请求拿到 body 后自己 `resp.text()` + `serde_json::from_str` 解析。
+/// 部分中转站/CDN（Cloudflare 等）即便请求未声明 `Accept-Encoding` 也会**主动**返回
+/// gzip/br 压缩体；不解压时 `text()` 得到的是压缩字节，解析必然失败并把乱码糊进错误信息
+/// （实测「余额查询返回一堆乱码字节」正是此因）。reqwest 开启对应 feature + `.gzip(true)` 等
+/// 后：仅在请求头未含 `Accept-Encoding` 时自动补上，并**按响应的 `Content-Encoding`** 透明
+/// 解压、移除 `content-encoding`/`content-length`——故对「不问自压」的网关同样生效。
+/// 连接池参数与 [`shared_client`] 共用 [`base_builder`]，不丢保活。
+///
+/// 转发路径**绝不用它**（见 [`shared_client`] 的字节透明约束）。
+pub fn decoding_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            base_builder()
+                .gzip(true)
+                .brotli(true)
+                .deflate(true)
+                .build()
+                .expect("构建解压 HTTP 客户端失败")
         })
         .clone()
 }
@@ -129,10 +179,12 @@ pub fn fast_timeout(key: &ProviderKey) -> Duration {
     key_timeout(key).min(Duration::from_secs(8))
 }
 
-/// 返回共享客户端（保留旧签名以最小化改动；总超时改由调用点逐请求 `.timeout()` 指定）。
+/// 自建请求（拉模型/健康探测/聚合成员/工具会话）用的客户端：走 [`decoding_client`]
+/// 以透明解压上游可能主动返回的 gzip/br 响应体（它们都在本地解析 body，见该函数说明）。
+/// 保留 `key` 参数与旧签名以最小化调用点改动；总超时改由调用点逐请求 `.timeout()` 指定。
 pub(super) fn build_client(key: &ProviderKey) -> AppResult<reqwest::Client> {
     let _ = key;
-    Ok(shared_client())
+    Ok(decoding_client())
 }
 
 /// 按协议注入鉴权头**与版本头**。
@@ -275,5 +327,74 @@ mod tests {
         let out = truncate_body(&long);
         assert!(out.contains("已截断"));
         assert!(out.chars().count() < 500);
+    }
+
+    /// 转发用的 `shared_client()` **必须**字节透明：不主动索要压缩（不发 `Accept-Encoding`），
+    /// 从而上游返回未压缩体、代理原样转发。而自建请求用的 `decoding_client()` **必须**主动
+    /// 索要并透明解压（发 `Accept-Encoding`）。
+    ///
+    /// 这条为一个实测回归立的护栏：Cargo.toml 给 reqwest 加 gzip/brotli/deflate feature 后，
+    /// reqwest 的 `Accepts::default()` 会把这些 feature 一律置 true —— 若 `base_builder()` 不
+    /// 显式 `.gzip(false)…`，`shared_client()` 会被默认翻成「自动解压 + 注入 Accept-Encoding」，
+    /// 悄悄破坏转发字节透明。**故障注入判据**：删掉 base_builder 里的 `.gzip(false).brotli(false)
+    /// .deflate(false)`，本测试的「shared_client 不发 Accept-Encoding」断言立刻变红。
+    ///
+    /// 用真实 TCP 监听回读请求头（而非验代码写了哪一行）：起一个只读一个请求头块的极简 server，
+    /// 分别用两个 client 发 GET，比对是否出现 `accept-encoding`。
+    #[test]
+    fn shared_client_is_transparent_decoding_client_requests_compression() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // 起一个只应答一次的极简 HTTP server，返回捕获到的请求头。
+        fn serve_once(listener: TcpListener) -> std::thread::JoinHandle<String> {
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                );
+                let _ = stream.flush();
+                req
+            })
+        }
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // shared_client：不应出现 accept-encoding
+        let l1 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr1 = l1.local_addr().unwrap();
+        let h1 = serve_once(l1);
+        rt.block_on(async {
+            let _ = shared_client()
+                .get(format!("http://{addr1}/"))
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await;
+        });
+        let req1 = h1.join().unwrap().to_ascii_lowercase();
+        assert!(
+            !req1.contains("accept-encoding"),
+            "shared_client 必须字节透明：不得发 Accept-Encoding，实际请求头:\n{req1}"
+        );
+
+        // decoding_client：应主动索要压缩
+        let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = l2.local_addr().unwrap();
+        let h2 = serve_once(l2);
+        rt.block_on(async {
+            let _ = decoding_client()
+                .get(format!("http://{addr2}/"))
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await;
+        });
+        let req2 = h2.join().unwrap().to_ascii_lowercase();
+        assert!(
+            req2.contains("accept-encoding"),
+            "decoding_client 必须主动索要压缩（否则遇主动压缩的中转站又会乱码），实际请求头:\n{req2}"
+        );
     }
 }
