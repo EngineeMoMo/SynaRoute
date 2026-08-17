@@ -88,6 +88,26 @@ const BALANCE_TEMPLATE_ORDER = ["auto", "custom", "relay", "generic", "newapi", 
  * 判断自己的站该选哪个模板。留空则由后端 `detect_balance_endpoint` 按域名自动识别
  * （对齐 cc-switch 的 detect_provider），认不出时兜底到中转站命中率最高的那条端点。
  */
+/**
+ * base_url 是否为可用的 http(s) 地址。
+ *
+ * 用 `URL` 构造器解析（Tauri webview 里可用），并**必须**是 http/https 协议：
+ * - `api.foo.com`（缺协议头）→ `new URL` 抛错 → false；
+ * - `foo`（纯文本）→ 抛错 → false；
+ * - `ftp://x` / `file://x` → 能解析但协议不对 → false（转发只走 http(s)）；
+ * - `https://api.example.com` / 带 `/v1` 路径 → true。
+ *
+ * 不校验域名可达性（那要联网、且健康探测会做）；这里只挡「一眼就不可能转发成功」的格式。
+ */
+function isValidHttpUrl(raw: string): boolean {
+  try {
+    const u = new URL(raw.trim());
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 function defaultBalanceQuery(): BalanceQuery {
   return {
     enabled: false,
@@ -106,8 +126,10 @@ function defaultBalanceQuery(): BalanceQuery {
 export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const activeCategory = useStore((s) => s.activeCategory);
   const loadCategory = useStore((s) => s.loadCategory);
+  const storeCheckHealth = useStore((s) => s.checkHealth);
   const vendors = useStore((s) => s.vendors);
   const setBalanceResult = useStore((s) => s.setBalanceResult);
+  const clearBalance = useStore((s) => s.clearBalance);
   const t = useT();
   const isNew = !initial;
 
@@ -379,12 +401,19 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
       // force=true 跳过缓存，确保「测试查询」总是查询上游最新值
       const result = await api.queryKeyBalance(keyId, true);
       setBalanceProbe(result);
-      // 同一结果直接写进卡片的余额缓存。
+      // 同一结果直接写进卡片的余额缓存 —— **仅当成功时**。
       //
-      // 指纹用**刚落盘的那条**算（`saved` 而非 `draft`/`initial`）：那才是产出本结果的配置，
-      // 也正是卡片重新渲染后会算出的指纹 —— 两者一致，卡片才会判成缓存有效而不再发一次
-      // 一模一样的请求。用 draft 算会在新建时差一个 id、指纹对不上，白发两个请求。
-      setBalanceResult(keyId, balanceFingerprint(saved), result);
+      // 为什么要判 result.ok：probeBalance 直调 api.queryKeyBalance，绕过了 store.refreshBalance
+      // 的 balanceLoading 去重门。若此刻自动轮询恰好在途，后端 in-flight 哨兵会返回一条
+      // `失败:该Key余额查询正在进行中` 的**伪失败**；无条件写缓存会把它盖到卡片上，甚至可能
+      // 覆盖轮询随后落盘的真实成功值。伪失败只在编辑器内经 setBalanceProbe 展示即可，不入共享缓存。
+      // 成功结果才写缓存：既让卡片复用、不重发一模一样的请求，也不污染健康状态。
+      if (result.ok) {
+        // 指纹用**刚落盘的那条**算（`saved` 而非 `draft`/`initial`）：那才是产出本结果的配置，
+        // 也正是卡片重新渲染后会算出的指纹 —— 两者一致，卡片才会判成缓存有效而不再发一次
+        // 一模一样的请求。用 draft 算会在新建时差一个 id、指纹对不上，白发两个请求。
+        setBalanceResult(keyId, balanceFingerprint(saved), result);
+      }
       // 新建的 Key 已经落盘了，把编辑器的「初始态」对齐过去。否则用户接着点「保存」
       // 会因为 draft.id 仍是空串而**再插一条**，表现为「测了一次余额就多出一条 Key」。
       onSaved?.(saved);
@@ -552,6 +581,10 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const save = async () => {
     if (!name.trim()) return setError(t("editor.errNeedName"));
     if (!baseUrl.trim()) return setError(t("editor.errNeedBaseUrl2"));
+    // base_url 基本格式校验：必须是可解析、且 http(s) 协议的 URL。缺协议头（api.foo.com）或
+    // 纯文本（foo）此前会静默落盘，之后每次转发都因 URL 无法解析而失败，用户只在客户端看到
+    // 底层报文、就地无可行动提示。就地拦下并给出示例，是最省事的修复入口。
+    if (!isValidHttpUrl(baseUrl)) return setError(t("editor.errInvalidBaseUrl"));
     const currentModelNames = new Set(models.map((m) => m.realName));
     // 校验集里同时装着两类 tag：窗口用裸模型名、最大输出用 `模型名::maxout`。
     // **报错必须分开指字段**：两个输入框同行同外观，把最大输出的非法值报成
@@ -577,7 +610,13 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
       // 保活落盘 id：若后续 saveSecret/loadCategory 抛错走 catch（编辑器不关闭），
       // 用户重试「保存」必须走 update —— 否则每点一次就多 insert 一条。
       setPersistedId(saved.id);
-      if (secret) await api.saveSecret(saved.id, secret);
+      if (secret) {
+        await api.saveSecret(saved.id, secret);
+        // 写了新密钥 → 作废该 Key 的余额缓存。余额指纹不含密钥（前端只有 hasSecret，
+        // 拿不到明文），仅改密钥时指纹不变，卡片会继续复用旧的 401/陈旧余额最长 5 分钟，
+        // 看着像「换了密钥没生效」。清缓存后卡片下次渲染会用新密钥重查。（本轮审查确认）
+        clearBalance(saved.id);
+      }
       await loadCategory(activeCategory);
       // 保存成功的专用回调。**不能用 onClose 代替**：onClose 在「保存成功」与「点取消」
       // 两条路径上都会被调用，调用方无法区分。首启向导需要拿到后端回填了 uuid 的那条 Key
@@ -590,15 +629,11 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
         void api.rebuildTrayMenu().catch((e) => console.error("rebuildTrayMenu failed", e));
       }
       // 保存成功后后台跑一次可用性检查并回写 health（不阻塞关窗；探测失败仅标记 health=down）。
-      // loadCategory 来自 store，本组件已卸载后仍可安全调用（更新的是全局状态，非本组件 state）。
-      void (async () => {
-        try {
-          await api.checkHealth(saved.id);
-          await loadCategory(activeCategory);
-        } catch {
-          // 探测异常忽略：Key 已保存，后台定时健康检查仍会兜底刷新
-        }
-      })();
+      // **必须走 store.checkHealth 而非自己 await loadCategory(activeCategory)**：后者的
+      // activeCategory 是本组件挂载期冻结的旧值，健康探测可能耗时数秒，期间用户切了分类，
+      // 探测返回后 loadCategory(旧分类) 会把当前分类页整表覆盖成另一分类的 Key（切分类串台）。
+      // store.checkHealth 用 get().activeCategory（实时）且只替换目标那一条 Key，正为此设计。
+      void storeCheckHealth(saved.id);
     } catch (e) {
       // 失败时保留抽屉并显示错误，避免"报错后窗口卡住、列表不刷新"。
       // 后端校验消息（如桌面端对外模型名不合规）本身已含后果与修法，是多行文本，
@@ -795,7 +830,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                         给个可见徽标，避免又出现「配了但不知道生没生效」。 */}
                     {(m.contextWindow ?? 0) >= 1_000_000 && (
                       <span
-                        className="shrink-0 rounded bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent"
+                        className="shrink-0 rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary"
                         title={t("editor.oneMHint")}
                       >
                         1M
@@ -1475,7 +1510,7 @@ function ContextWindowInput({
         inputMode="decimal"
         min="0"
         step="any"
-        className={`h-7 w-16 rounded-control border bg-bg px-2 text-xs text-text-primary placeholder:text-text-muted ${
+        className={`h-7 w-16 rounded-control border bg-background px-2 text-xs text-text-primary placeholder:text-text-muted ${
           bad ? "border-danger" : "border-border"
         }`}
         placeholder={placeholder}
@@ -1517,7 +1552,7 @@ function ContextWindowInput({
         title={title}
       />
       <select
-        className="h-7 rounded-control border border-border bg-bg px-1 text-xs text-text-primary"
+        className="h-7 rounded-control border border-border bg-background px-1 text-xs text-text-primary"
         value={unit}
         onChange={(e) => {
           if (nativeBadInput.current) {

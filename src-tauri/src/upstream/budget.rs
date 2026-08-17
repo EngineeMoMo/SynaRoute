@@ -127,6 +127,7 @@ const CLAUDE_MAX_OUTPUT_TABLE: &[(&str, u32)] = &[
     ("claude-opus-4-5", 64_000),
     ("claude-sonnet-4-5", 64_000),
     ("claude-haiku-4-5", 64_000),
+    ("claude-opus-4-1", 32_000),
     ("claude-opus-4", 32_000),
     ("claude-sonnet-4", 64_000),
     ("claude-haiku-4", 32_000),
@@ -145,8 +146,15 @@ const CLAUDE_MAX_OUTPUT_TABLE: &[(&str, u32)] = &[
 ///
 /// `-<4 位以上数字>` 是**日期后缀**（`claude-sonnet-4-5-20250929`），属同一型号的快照，
 /// 照常匹配 —— 用位数区分这两种形态（版本号 1~2 位、日期 8 位，中间没有现实用例）。
+///
+/// **点号分隔符归一**：第三方中转与用户手写常用点号写版本（`claude-3.7-sonnet`、
+/// `claude-opus-4.5`）。不归一的话 `claude-3.7-sonnet` 会命中片段 `claude-3` 且其后是 `.`
+/// 而非 `-` → 落到 `None => true` 无条件匹配 → 静默返回 `claude-3` 的 4096（实际应 64000），
+/// 长回答被截断且无报错 —— 正是边界检查要消除的静默截断点被点号绕开。故先把 `.` 归一成 `-`
+/// 再匹配，让点号版本走与短横线版本**同一条**边界判定（含子版本拒绝）。
 fn anthropic_max_output_for(model: &str) -> Option<u32> {
-    let lower = model.to_ascii_lowercase();
+    // 先小写、再把点号版本分隔符归一成短横线（见函数文档「点号分隔符归一」）。
+    let lower = model.to_ascii_lowercase().replace('.', "-");
     CLAUDE_MAX_OUTPUT_TABLE
         .iter()
         .find(|(family, _)| {
@@ -489,6 +497,41 @@ mod tests {
             output_budget(&k, "anthropic/claude-sonnet-4-5", 100),
             Ok(Some(64_000))
         );
+    }
+
+    #[test]
+    fn dot_notation_versions_match_same_as_dash_and_opus_4_1_recognized() {
+        // 点号版本名（第三方中转/用户手写都常见）必须与短横线版本走同一判定，不能因分隔符
+        // 不同而静默继承旧同族的错误上限。回归：`claude-3.7-sonnet` 曾命中片段 `claude-3`、
+        // 其后是 `.` 落到 `None => true` → 静默返回 4096（应 64000），长回答被截断且无报错。
+        for (m, want) in [
+            ("claude-3.7-sonnet", 64_000u32), // 应同 claude-3-7，而非 claude-3 的 4096
+            ("claude-3.5-sonnet", 8_192),     // 应同 claude-3-5
+            ("claude-haiku-4.5", 64_000),     // 应同 claude-haiku-4-5
+            ("claude-opus-4.5", 64_000),      // 应同 claude-opus-4-5
+        ] {
+            let k = key_with(Protocol::Anthropic, &[(m, Some(200_000))]);
+            assert_eq!(
+                output_budget(&k, m, 100),
+                Ok(Some(want)),
+                "点号版本 {m} 应归一后匹配到 {want}，而非静默继承更旧同族的上限"
+            );
+        }
+        // 点号写的**未列出新子版本**仍要被拒（4.8 不在表里，边界检查照常生效，不许猜）。
+        let k = key_with(Protocol::Anthropic, &[("claude-opus-4.8", Some(200_000))]);
+        assert!(
+            output_budget(&k, "claude-opus-4.8", 100).is_err(),
+            "点号写的未知新子版本仍必须报错，不得继承 claude-opus-4 的 32k"
+        );
+        // Opus 4.1 是现役型号，规范 ID 与点号写法都应认得（真实上限 32000）。
+        for m in ["claude-opus-4-1-20250805", "claude-opus-4.1"] {
+            let k = key_with(Protocol::Anthropic, &[(m, Some(200_000))]);
+            assert_eq!(
+                output_budget(&k, m, 100),
+                Ok(Some(32_000)),
+                "Opus 4.1 应被内置表认出为 32000，而非开箱拒绝：{m}"
+            );
+        }
     }
 
     /// 中文按字符而非 UTF-8 字节估算，并刻意按 1 字符/token 取**上界**。

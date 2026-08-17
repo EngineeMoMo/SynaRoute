@@ -609,7 +609,7 @@ function AggregateRunner({ category }: { category: CategoryType }) {
       <CardContent className="space-y-3">
         {/* Prompt 输入 */}
         <textarea
-          className="w-full rounded-control border border-border bg-bg px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ring"
+          className="w-full rounded-control border border-border bg-background px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ring"
           rows={3}
           placeholder={t("brain.runPlaceholder")}
           value={prompt}
@@ -654,7 +654,7 @@ function AggregateRunner({ category }: { category: CategoryType }) {
         {plan && (
           <div>
             <div className="mb-1 text-xs font-medium text-text-secondary">{t("brain.runPlanTitle")}</div>
-            <pre className="max-h-64 overflow-auto rounded-control border border-border bg-bg p-3 font-mono text-xs leading-relaxed text-text-primary">
+            <pre className="max-h-64 overflow-auto rounded-control border border-border bg-background p-3 font-mono text-xs leading-relaxed text-text-primary">
               {plan}
             </pre>
           </div>
@@ -995,7 +995,7 @@ function WorkDirBlock({
           <div className="flex gap-2">
             <input
               type="text"
-              className="flex-1 rounded-control border border-border bg-bg px-2.5 py-1.5 font-mono text-xs text-text-primary placeholder:text-text-muted"
+              className="flex-1 rounded-control border border-border bg-background px-2.5 py-1.5 font-mono text-xs text-text-primary placeholder:text-text-muted"
               value={config.workDir ?? ""}
               placeholder={t("brain.workDirPlaceholder")}
               onChange={(e) => update({ workDir: e.target.value || undefined })}

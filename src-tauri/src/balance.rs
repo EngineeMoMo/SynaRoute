@@ -38,16 +38,25 @@ const REMAINING_CANDIDATES: &[&str] = &[
     "quota.remaining",
     // DeepSeek：`{"balance_infos":[{"currency":"CNY","total_balance":"4.28",...}]}`（实测）
     "balance_infos.0.total_balance",
+    // SiliconFlow 系：`{"data":{"balance":"0","chargeBalance":"5","totalBalance":"5"}}` ——
+    // `totalBalance` = 赠送额度 `balance` + 充值额度 `chargeBalance`，才是真实剩余。
+    // **必须排在 `data.balance` 之前**：赠送额度用尽时 `data.balance="0.00"` 会被 as_number
+    // 解析成 0 并命中返回（候选链取首个「可转数字」，0 也算命中、不会跳过），把「还有充值余额」
+    // 误显成 0，违反本模块「绝不返回 0」。cc-switch 的 siliconflow 函数也只读 totalBalance。
+    "data.totalBalance",
+    "totalBalance",
     "balance",
     "data.balance",
     "data.remaining",
     "data.quota.remaining",
+    // ⚠️ `data.quota`：NewAPI/OneAPI 架构里这是**内部计费单位**（默认 500000 = 1 USD，且
+    // QuotaPerUnit 由站长可配），不是 USD。这里**刻意不缩放**：硬编码 500000 对改过配额比率的
+    // 实例会错，且若别家用 `data.quota` 存的本就是 USD，除以 50 万会变约 0 → 反而违反「绝不返回
+    // 0」。NewAPI 中转站的**正确**取值路径是 relay 模板的 `hard_limit_usd`（已是 USD，见下）；
+    // 此项仅作没有更精确字段时的兜底，命中它时数值可能偏大，属已知局限（详见余额文档）。
     "data.quota",
     "credit",
     "data.credit",
-    // SiliconFlow 系：`{"data":{"totalBalance":"..."}}`
-    "data.totalBalance",
-    "totalBalance",
     // OpenRouter：`{"data":{"limit_remaining":...}}`
     "data.limit_remaining",
     "total_available",
@@ -681,6 +690,30 @@ mod tests {
             extract_balance(&with_remaining, None).remaining,
             Some(3.25),
             "remaining 比 hard_limit_usd 精确，必须优先"
+        );
+    }
+
+    /// SiliconFlow 同时返回 `balance`（赠送额度）、`chargeBalance`（充值额度）、
+    /// `totalBalance`（二者之和）。候选链必须优先总额，不能被为 0 的赠送额度抢先。
+    ///
+    /// 回归（全业务对抗审查发现）：旧顺序 `data.balance` 在 `data.totalBalance` 前，
+    /// `as_number("0.00")` 返回 `Some(0.0)`（0 是有效数字、find_map 立即停止），
+    /// 所以「赠送额度用尽 + 仍有充值余额」会被误显成 0，违反本模块「绝不返回 0」。
+    #[test]
+    fn siliconflow_uses_total_balance_before_free_balance() {
+        let body = serde_json::json!({
+            "data": {
+                "balance": "0.00",
+                "chargeBalance": "5.00",
+                "totalBalance": "5.00"
+            }
+        });
+        let r = extract_balance(&body, None);
+        assert!(r.ok, "SiliconFlow 标准响应应可解析：{:?}", r.error);
+        assert_eq!(
+            r.remaining,
+            Some(5.0),
+            "必须取 totalBalance=5，而非先命中 balance=0 误导用户账户已清零"
         );
     }
 

@@ -651,7 +651,7 @@ export function SettingsPage() {
                     type="number"
                     min={1024}
                     max={65535}
-                    className="w-24 shrink-0 rounded-control border border-border bg-bg px-2.5 py-1.5 text-xs text-text-primary"
+                    className="w-24 shrink-0 rounded-control border border-border bg-background px-2.5 py-1.5 text-xs text-text-primary"
                     defaultValue={settings?.mcpPort ?? 9527}
                     onBlur={(e) => applyMcp(true, Number(e.target.value) || 9527)}
                   />
@@ -908,7 +908,7 @@ export function SettingsPage() {
                 <div className="mt-2 flex items-center gap-2">
                   <input
                     type="text"
-                    className="flex-1 rounded-control border border-border bg-bg px-2.5 py-1.5 font-mono text-xs text-text-primary placeholder:text-text-muted"
+                    className="flex-1 rounded-control border border-border bg-background px-2.5 py-1.5 font-mono text-xs text-text-primary placeholder:text-text-muted"
                     value={settings?.logDir ?? ""}
                     placeholder={defaultLogDir || t("settings.logDirDefault")}
                     onChange={(e) => update({ logDir: e.target.value || undefined })}
@@ -1104,7 +1104,7 @@ function WizardCode({ text }: { text: string }) {
   };
   return (
     <div className="relative">
-      <pre className="overflow-x-auto rounded-control border border-border bg-bg p-2.5 pr-9 font-mono text-[11px] leading-relaxed text-text-primary whitespace-pre-wrap break-all">
+      <pre className="overflow-x-auto rounded-control border border-border bg-background p-2.5 pr-9 font-mono text-[11px] leading-relaxed text-text-primary whitespace-pre-wrap break-all">
         {text}
       </pre>
       <button

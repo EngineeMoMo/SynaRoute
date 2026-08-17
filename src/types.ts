@@ -393,7 +393,7 @@ export interface EventLogEntry {
   id: string;
   ts: number;
   categoryId: CategoryType;
-  type: "route" | "failover" | "health" | "aggregate" | "error" | "request" | "mcp" | "config";
+  type: "route" | "failover" | "health" | "aggregate" | "error" | "warning" | "request" | "mcp" | "config";
   keyId?: string;
   /** Key 的可读名（keyId 是 uuid，用户认不出；列表接口按 id 回填）。路径可视化据此
    *  在折叠态直接显示「走了哪个 Key」，不必从 detail 字符串里解析。 */

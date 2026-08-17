@@ -13,6 +13,7 @@ import {
   Radio,
   Brain,
   AlertCircle,
+  AlertTriangle,
   ScrollText,
   ArrowUpRight,
   ChevronRight,
@@ -35,6 +36,7 @@ const TYPE_META: Record<
   mcp: { tKey: "logs.type.mcp", variant: "primary", icon: Brain },
   config: { tKey: "logs.type.config", variant: "info", icon: Settings2 },
   error: { tKey: "logs.type.error", variant: "danger", icon: AlertCircle },
+  warning: { tKey: "logs.type.warning", variant: "warning", icon: AlertTriangle },
   request: { tKey: "logs.type.request", variant: "neutral", icon: ArrowUpRight },
 };
 
@@ -53,6 +55,9 @@ const GROUP_OF: Record<EventLogEntry["type"], LogGroup> = {
   request: "route",
   failover: "failover",
   error: "error",
+  // 配置告警（如余额查询 URL 用 {{baseUrl}} 应改 {{origin}}）归 error 组：它是需要用户处理的
+  // 异常，与「路由成功」严格分开，否则会被渲染成绿色成功图标而彻底埋没（本轮审查确认的缺陷）。
+  warning: "error",
 };
 
 const GROUP_ORDER: LogGroup[] = ["system", "brain", "route", "failover", "error"];
@@ -466,7 +471,7 @@ function CodeBlock({ title, body, danger }: { title: string; body: string; dange
         </button>
       </div>
       <pre
-        className={`max-h-72 overflow-auto rounded-control border border-border bg-bg p-2.5 font-mono text-[11px] leading-relaxed ${
+        className={`max-h-72 overflow-auto rounded-control border border-border bg-background p-2.5 font-mono text-[11px] leading-relaxed ${
           danger ? "text-danger" : "text-text-primary"
         }`}
       >

@@ -519,7 +519,7 @@ async fn handle_request(
     // 故在此直接回 400，且**不打上游、不计熔断、不记 error 事件**：既不白耗上游额度，也不让
     // 客户端的探测行为污染健康状态。判据要求「无内容」与「无模型」同时成立，避免误伤
     // count_tokens 等合法的无 model 子路径请求（它们带真实 messages）。
-    if is_contentless_probe(&req_json, &requested_model) {
+    if is_contentless_probe(&req_json) {
         return Ok(error_resp(
             StatusCode::BAD_REQUEST,
             "空探测请求（无消息内容且未指定模型）：已在代理侧拒绝，未转发上游",
@@ -1179,6 +1179,14 @@ fn overloaded_status() -> StatusCode {
     StatusCode::from_u16(STATUS_OVERLOADED).expect("529 是合法 HTTP 状态码")
 }
 
+/// 临时性 4xx：`稍后重试` 语义，与 Anthropic SDK 的重试判据一致（408/409/429 或 >=500）。
+///
+/// **单一事实来源**：尾部分流（[`all_failed_is_hard_error`]）与熔断计数
+/// （[`status_counts_against_breaker`]）都引用它。这两处此前各写各的名单已经漂移过一次
+/// （尾部把 408/409 与非 500/502/503/504 的 5xx 判为临时，熔断却把它们算进惩罚，
+/// 于是一次超时/Cloudflare 52x 就把完好的 Key 熔断 60s）。共用一个常量杜绝再漂移。
+const TRANSIENT_4XX: [u16; 3] = [408, 409, 429];
+
 /// 全 Key 失败后的「硬错误」判定（决定尾部分流）。
 ///
 /// - **硬错误** → 原样回状态码（config_error 无码时回 400）、**不**武装短路窗口、**不**带
@@ -1190,8 +1198,6 @@ fn overloaded_status() -> StatusCode {
 /// false，否则「配置错 Key 优先 + 后续 Key 撞 429/5xx」时它会被前一候选的 Invalid 粘住，
 /// 把一整轮临时故障误判成硬错误（回裸状态码、丢掉 Retry-After 与短路窗口）。
 fn all_failed_is_hard_error(config_error: bool, last_status: Option<u16>) -> bool {
-    // 429/408/409：本就是「稍后重试」语义，划进临时性，与 Anthropic SDK 的重试判据一致。
-    const TRANSIENT_4XX: [u16; 3] = [408, 409, 429];
     config_error
         || matches!(
             last_status,
@@ -2275,7 +2281,13 @@ fn is_stripped_header(name: &str) -> bool {
 /// ⚠️ **404 要配合 [`path_is_auxiliary_endpoint`] 一起判**，别单看状态码。见
 /// [`failure_counts_against_breaker`]。
 fn status_counts_against_breaker(status: u16) -> bool {
-    !matches!(status, 400 | 429 | 500 | 502 | 503 | 504 | 529)
+    // 只有「确定属于这个 Key」的硬错误才罚：与尾部 all_failed_is_hard_error 用同一套判据
+    // （见 TRANSIENT_4XX 注释）——4xx 里除 400（请求不合法、与 Key 无关）与 408/409/429
+    // （超时/冲突/限流，临时）之外的部分（401/403/404/422… 鉴权、端点、请求实体确与该 Key/
+    // 配置相关）。**5xx 一律不罚**：上游服务端错误或 Cloudflare 52x 与用哪个 Key 无关，
+    // 等一等可能就好。此前用反向排除表 `!matches!(400|429|500|502|503|504|529)`，把 408/409
+    // 与 505-511/520-527/530 都算进熔断，一次上游抖动/CDN 52x 就把完好的 Key 熔断 60s。
+    (400..500).contains(&status) && status != 400 && !TRANSIENT_4XX.contains(&status)
 }
 
 /// **辅助端点**（非补全）：上游不实现它是常态，不该据此判定 Key 坏了。
@@ -2324,11 +2336,20 @@ fn failure_counts_against_breaker(status: u16, path: &str) -> bool {
 /// 覆盖三种协议的载荷字段：Anthropic/Chat 用 `messages`，OpenAI Responses 用 `input`
 /// （字符串形态的 `input` 只要非空即算有内容）。非对象 body（如 `Value::Null`，解析失败）
 /// 不算探测——那是坏请求，交由既有路径处理，避免把「body 解析失败」误报成探测。
-fn is_contentless_probe(req_json: &Value, requested_model: &str) -> bool {
+fn is_contentless_probe(req_json: &Value) -> bool {
     let Some(obj) = req_json.as_object() else {
         return false;
     };
-    if !requested_model.trim().is_empty() {
+    // 客户端**原始**是否指定了模型：读 body 里的 `model`，**不**读被 active_model 覆盖后的
+    // requested_model。覆盖发生在转发前，若用覆盖后的值判定，用户一旦在应用内选定模型，
+    // `model:null` 的空探测就会被填上模型名、绕过本短路 → 照样转发上游白耗一次往返 + 400 噪声
+    // （熔断侧已由「400 不计熔断」兜住，故仅是效率/日志问题，P3）。
+    let client_named_model = obj
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if client_named_model {
         return false;
     }
     // 有任一非空载荷字段 → 不是空探测。
@@ -2550,8 +2571,13 @@ mod tests {
     fn breaker_spares_transient_status_penalizes_hard_errors() {
         // 429 限流 + 5xx 网关抖动：Key 没坏，只切不罚（不熔断）。
         // 529 也在内：上游明说「过载，稍后再来」，与我们对下游的口径一致，不该反过来判 Key 坏了。
-        for s in [429u16, 500, 502, 503, 504, 529] {
-            assert!(!status_counts_against_breaker(s), "HTTP {s} 不应计入熔断");
+        // 408/409 与「其它 5xx」（505-511 / Cloudflare 520-527 / 530）是本轮全业务审查修的回归：
+        // 尾部把它们判临时(→529)，熔断却曾用反向排除表把它们算进惩罚，一次超时/CDN 52x
+        // 就把完好的 Key 熔断 60s。现在与尾部共用 TRANSIENT_4XX，全部只切不罚。
+        for s in [
+            408u16, 409, 429, 500, 502, 503, 504, 505, 508, 509, 511, 520, 524, 527, 529, 530,
+        ] {
+            assert!(!status_counts_against_breaker(s), "HTTP {s} 属临时/上游侧，不应计入熔断");
         }
         // 400「请求不合法」与 Key 无关（换任何 Key 都同样 400）：不得因客户端空探测
         // 或我们自己的协议转换 bug 把完好的 Key 刷成熔断。
@@ -3181,43 +3207,52 @@ mod tests {
         // 桌面端发 {"messages":[],"model":null} → 转发上游必然 400 → 400 被判硬错误计入熔断
         // → 把完好的 Key 刷成熔断 → 触发全熔断兜底反复重打。必须在代理侧直接拒绝。
 
-        // 1) 用户真实抓到的形态：空 messages + model:null（requested_model 解析为空串）。
+        // 1) 用户真实抓到的形态：空 messages + model:null（客户端未指定模型）。
         let probe = json!({"max_tokens":4096,"messages":[],"model":null});
         assert!(
-            is_contentless_probe(&probe, ""),
+            is_contentless_probe(&probe),
             "用户实测的空探测形态必须被识别"
         );
 
         // 2) Responses 协议的空 input 同样是探测。
-        assert!(is_contentless_probe(&json!({"input":[]}), ""));
+        assert!(is_contentless_probe(&json!({"input":[]})));
 
         // ---- 以下都不得误伤 ----
 
         // 3) 有真实 messages 但无 model：count_tokens 等合法子路径，必须放行。
         let count_tokens = json!({"messages":[{"role":"user","content":"hi"}]});
         assert!(
-            !is_contentless_probe(&count_tokens, ""),
+            !is_contentless_probe(&count_tokens),
             "带真实消息的无 model 请求（count_tokens）不得被拒"
         );
 
-        // 4) 空 messages 但指定了模型：不是探测（交由上游判定），放行。
+        // 4) 空 messages 但客户端**原始 body** 指定了模型：不是探测（交由上游判定），放行。
         assert!(
-            !is_contentless_probe(&json!({"messages":[]}), "claude-opus-4-8"),
+            !is_contentless_probe(&json!({"messages":[],"model":"claude-opus-4-8"})),
             "已指定模型的请求不得被判为探测"
         );
 
+        // 4b) 回归（全业务审查）：判定必须基于**客户端原始** body 的 model，而非被 active_model
+        //     覆盖后的 requested_model。否则用户在应用内选定模型后，`model:null` 的空探测会被
+        //     填上模型名、绕过本短路照样转发上游。故 body 里 model 为 null/缺失即算「无模型」，
+        //     与代理是否配了 active_model 无关。
+        assert!(
+            is_contentless_probe(&json!({"messages":[],"model":null})),
+            "空 messages + body model 为 null：无论代理是否覆盖了 active_model，都应判为探测"
+        );
+
         // 5) 字符串形态的非空 input。
-        assert!(!is_contentless_probe(&json!({"input":"hello"}), ""));
+        assert!(!is_contentless_probe(&json!({"input":"hello"})));
 
         // 6) body 解析失败（Value::Null）：不是探测，交既有路径处理，避免误报。
         assert!(
-            !is_contentless_probe(&Value::Null, ""),
+            !is_contentless_probe(&Value::Null),
             "非对象 body 不应被判为空探测"
         );
 
         // 7) 完全无载荷键的请求（未来新端点）：不判探测，避免误伤。
         assert!(
-            !is_contentless_probe(&json!({"foo":1}), ""),
+            !is_contentless_probe(&json!({"foo":1})),
             "无任何载荷键的请求不应被判为空探测"
         );
     }

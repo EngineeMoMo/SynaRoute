@@ -134,6 +134,8 @@ interface AppState {
   ) => Promise<void>;
   /** 编辑器「测试查询」的结果直接写回缓存，省掉卡片再发一次同样的请求 */
   setBalanceResult: (keyId: string, fingerprint: string, result: BalanceResult) => void;
+  /** 清掉某 Key 的余额缓存，下次卡片渲染会重查。改密钥后调用它（指纹不含密钥、无法感知密钥变更）。 */
+  clearBalance: (keyId: string) => void;
 
   // 在线更新（侧栏徽章 / 设置页共用）
   updateCheck: UpdateCheckResult | null;
@@ -272,6 +274,15 @@ export const useStore = create<AppState>((set, get) => ({
 
   setBalanceResult(keyId, fingerprint, result) {
     set((s) => ({ balances: { ...s.balances, [keyId]: { result, fingerprint } } }));
+  },
+
+  clearBalance(keyId) {
+    set((s) => {
+      if (!(keyId in s.balances)) return {};
+      const next = { ...s.balances };
+      delete next[keyId];
+      return { balances: next };
+    });
   },
 
   updateCheck: null,
