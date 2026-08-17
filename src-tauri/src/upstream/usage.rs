@@ -204,6 +204,32 @@ data: [DONE]\n";
         assert!(extract_usage_from_sse("data: {\"choices\":[]}\n\ndata: [DONE]\n").is_none());
     }
 
+    /// 长流场景：proxy 只留头窗（message_start）+ 尾窗（message_delta），中间正文被丢弃。
+    /// 头尾拼接后 extract_usage_from_sse 必须仍能取到完整 input+output+cache（按字段取 max）。
+    /// 回归：此前只留尾窗 8KB，>8KB 回答的 message_start 被挤掉 → input/cache 记成 0。
+    #[test]
+    fn extract_usage_from_head_plus_tail_recovers_input_and_cache() {
+        // 头窗：message_start（input/cache 所在）
+        let head = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5000,\"cache_read_input_tokens\":42000,\"output_tokens\":1}}}\n\n";
+        // 尾窗：message_delta（output），中间几十万字节正文已被丢弃
+        let tail = "\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":880}}\n\
+\n\
+data: [DONE]\n";
+        let merged = format!("{head}\n{tail}");
+        let u = extract_usage_from_sse(&merged).expect("头尾合并后应能取到用量");
+        assert_eq!(u.input, 5000, "input 来自头窗 message_start");
+        assert_eq!(u.cache_read, 42000, "缓存读取来自头窗，不能记成 0");
+        assert_eq!(u.output, 880, "output 来自尾窗 message_delta");
+        // 只有尾窗（模拟未修复前）：input/cache 丢失，坐实缺陷方向。
+        let tail_only = extract_usage_from_sse(tail).expect("尾窗有 output");
+        assert_eq!(tail_only.input, 0, "仅尾窗时 input 必为 0（这正是被修的缺陷）");
+        assert_eq!(tail_only.cache_read, 0);
+    }
+
     #[test]
     fn token_usage_add_and_format() {
         let mut a = TokenUsage { input: 1200, output: 340, cache_read: 0, cache_creation: 0 };

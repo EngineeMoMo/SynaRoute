@@ -1348,6 +1348,12 @@ const REQ_LOG_CAP: usize = 20_000;
 /// 不缓存全文 —— 既不牺牲首字节延迟，也不让长会话的响应体常驻内存。
 const TAIL_WINDOW_BYTES: usize = 8192;
 
+/// 流式响应**头部**窗口大小。Anthropic 把 input_tokens / cache_read / cache_creation 放在流首的
+/// `message_start` 事件里；只留尾窗时，任何 >8KB 的回答会把它挤掉 → input/缓存 token 记成 0
+/// （日志与「额度花在哪」面板把占比常 >90% 的输入/缓存显示为 ~0）。故另留头部 8KB：一旦攒够
+/// 就不再增长（message_start 是第一个事件，必在其中），流末与尾窗合并取 usage。
+const HEAD_WINDOW_BYTES: usize = 8192;
+
 /// 截断超长文本，附省略提示。
 fn cap(s: &str) -> String {
     cap_to(s, REQ_LOG_CAP)
@@ -1580,10 +1586,16 @@ async fn try_stream_to_key(
             let tail_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::with_capacity(
                 TAIL_WINDOW_BYTES,
             )));
+            // 头部窗口：留住流首的 message_start（input/缓存 token 所在），攒够 HEAD_WINDOW_BYTES
+            // 即停增长。与尾窗分开两块，不合并成一个大缓冲——长会话下全文可达几十万字节。
+            let head_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::with_capacity(
+                HEAD_WINDOW_BYTES,
+            )));
             let stream_done = std::sync::Arc::new(tokio::sync::Notify::new());
             let end_guard = StreamEnd(stream_done.clone());
 
             let tail_buf2 = tail_buf.clone();
+            let head_buf2 = head_buf.clone();
             let store2 = store.clone();
             let key_id2 = key.id.clone();
             let category2 = category;
@@ -1596,7 +1608,16 @@ async fn try_stream_to_key(
                 let _ = &end_guard;
                 match chunk {
                     Ok(bytes) => {
-                        // 滑动窗口：只留尾部 8KB（usage 在 SSE 最末几个事件里）。
+                        // 头部窗口：只在未满 HEAD_WINDOW_BYTES 前追加（message_start 是第一个事件，
+                        // 必落在前 8KB 内）。满了就不再动，省得长流一直拷贝。
+                        if let Ok(mut hbuf) = head_buf.lock() {
+                            if hbuf.len() < HEAD_WINDOW_BYTES {
+                                let room = HEAD_WINDOW_BYTES - hbuf.len();
+                                let take = room.min(bytes.len());
+                                hbuf.extend_from_slice(&bytes[..take]);
+                            }
+                        }
+                        // 滑动窗口：只留尾部 8KB（output usage / 终止事件在 SSE 最末几个事件里）。
                         if let Ok(mut buf) = tail_buf.lock() {
                             buf.extend_from_slice(&bytes);
                             if buf.len() > TAIL_WINDOW_BYTES {
@@ -1615,12 +1636,30 @@ async fn try_stream_to_key(
             // poll 过一个字节，锁空闲、buffer 为空，于是永远提取不到 usage 且不报错。
             tokio::spawn(async move {
                 stream_done.notified().await;
-                let snapshot = match tail_buf2.lock() {
+                let tail_snap = match tail_buf2.lock() {
                     Ok(buf) => buf.clone(),
                     Err(_) => return,
                 };
-                let sse = String::from_utf8_lossy(&snapshot);
-                if let Some(u) = crate::upstream::extract_usage_from_sse(&sse) {
+                let head_snap = head_buf2.lock().map(|b| b.clone()).unwrap_or_default();
+                // 头窗（message_start：input/缓存 token）+ 尾窗（message_delta：output token）合并解析。
+                // 只留尾窗时，>8KB 的回答会把流首的 message_start 挤掉 → input/缓存记成 0
+                // （面板把占比常 >90% 的输入/缓存显示为 ~0）。extract_usage_from_sse 按字段取最大值，
+                // 头尾拼接即得完整用量；两窗重叠（短流全落头窗、也落尾窗）也不会翻倍（取 max 而非累加）。
+                let tail_sse = String::from_utf8_lossy(&tail_snap);
+                let mut merged = String::with_capacity(head_snap.len() + tail_snap.len() + 1);
+                merged.push_str(&String::from_utf8_lossy(&head_snap));
+                merged.push('\n');
+                merged.push_str(&tail_sse);
+                // 流内报错补记：try_stream_to_key 只探响应头，拿到 2xx 就已 record_live_success +
+                // 解除短路窗口。若上游 200 后在流内发 error 事件（Anthropic 过载常见形态），
+                // 这次转发已被误记成功、fail_count 清零、gate 解除 → 熔断/短路在流式主路径零保护，
+                // 客户端重试再打同一 Key 再 200+error，循环。故流末发现 error 事件则**补记失败**
+                // （无法故障转移已流出的这一次，但能让后续请求把该 Key 熔断，止住重试风暴）。
+                // 用尾窗判错：终止性 error 事件必在流末。
+                if crate::upstream::sse_stream_errored(&tail_sse) {
+                    health::record_live_failure(&store2, &key_id2);
+                }
+                if let Some(u) = crate::upstream::extract_usage_from_sse(&merged) {
                     // 补记进**流开始时已写下的那一行**，不新追加一条。
                     // 再 append 一条同 collapse key 的事件会被折叠逻辑当成「又发生了一次」：
                     // repeat 变 2（一次请求显示成 ×2）、detail 被覆盖（延迟数字丢失）。
@@ -2280,18 +2319,32 @@ fn is_stripped_header(name: &str) -> bool {
 ///
 /// 仍然计入熔断的是**确定属于这个 Key** 的故障：
 /// 401/403 鉴权失败（密钥错/被封）、404 端点或模型不存在——换 Key 才有意义，
+/// 请求级 4xx：错在**请求本身**（各 Key 打同样失败），与用哪个 Key 无关。
+///
+/// - `400` 请求不合法（客户端发的或我们协议转换构造的）；
+/// - `422` 请求实体语义无效（OpenAI 兼容/中转站常用来表达 schema 校验失败）。
+///
+/// 这两个都**不该计入熔断**（换 Key 白试，还会把完好的 Key 刷成熔断→全熔断兜底），
+/// 也**不是** Key 级硬错误。`failover_verb`、`status_counts_against_breaker` 共用它，
+/// 避免「日志说非 Key 问题、熔断却罚 Key」这类同码两处定性相反（本轮审查确认的 422 矛盾）。
+fn is_request_level_4xx(status: u16) -> bool {
+    status == 400 || status == 422
+}
+
 /// 重试同一个只是白试，连续几次后熔断掉它，避免每个请求都从它开始。
 ///
 /// ⚠️ **404 要配合 [`path_is_auxiliary_endpoint`] 一起判**，别单看状态码。见
 /// [`failure_counts_against_breaker`]。
 fn status_counts_against_breaker(status: u16) -> bool {
     // 只有「确定属于这个 Key」的硬错误才罚：与尾部 all_failed_is_hard_error 用同一套判据
-    // （见 TRANSIENT_4XX 注释）——4xx 里除 400（请求不合法、与 Key 无关）与 408/409/429
-    // （超时/冲突/限流，临时）之外的部分（401/403/404/422… 鉴权、端点、请求实体确与该 Key/
-    // 配置相关）。**5xx 一律不罚**：上游服务端错误或 Cloudflare 52x 与用哪个 Key 无关，
-    // 等一等可能就好。此前用反向排除表 `!matches!(400|429|500|502|503|504|529)`，把 408/409
-    // 与 505-511/520-527/530 都算进熔断，一次上游抖动/CDN 52x 就把完好的 Key 熔断 60s。
-    (400..500).contains(&status) && status != 400 && !TRANSIENT_4XX.contains(&status)
+    // （见 TRANSIENT_4XX 注释）——4xx 里除请求级（400/422，见 is_request_level_4xx）与
+    // 408/409/429（超时/冲突/限流，临时）之外的部分（401/403/404… 鉴权、端点确与该 Key
+    // 相关）。**5xx 一律不罚**：上游服务端错误或 Cloudflare 52x 与用哪个 Key 无关，
+    // 等一等可能就好。此前用反向排除表把 408/409、505-511/520-527/530 都算进熔断，
+    // 一次上游抖动/CDN 52x 就熔断好 Key 60s；且漏了 422（failover_verb 已判其为非 Key 问题）。
+    (400..500).contains(&status)
+        && !is_request_level_4xx(status)
+        && !TRANSIENT_4XX.contains(&status)
 }
 
 /// **辅助端点**（非补全）：上游不实现它是常态，不该据此判定 Key 坏了。
@@ -2583,15 +2636,25 @@ mod tests {
         ] {
             assert!(!status_counts_against_breaker(s), "HTTP {s} 属临时/上游侧，不应计入熔断");
         }
-        // 400「请求不合法」与 Key 无关（换任何 Key 都同样 400）：不得因客户端空探测
-        // 或我们自己的协议转换 bug 把完好的 Key 刷成熔断。
-        assert!(
-            !status_counts_against_breaker(400),
-            "HTTP 400 是请求问题、不是 Key 问题，不应计入熔断"
-        );
+        // 请求级 4xx（400 不合法 / 422 实体语义无效）与 Key 无关（换任何 Key 都同样失败）：
+        // 不得因客户端空探测、我们自己的协议转换 bug、或 schema 校验失败把完好的 Key 刷成熔断。
+        for s in [400u16, 422] {
+            assert!(
+                !status_counts_against_breaker(s),
+                "HTTP {s} 是请求问题、不是 Key 问题，不应计入熔断"
+            );
+        }
         // 确定属于该 Key 的故障：鉴权失败 / 端点或模型不存在 → 计入熔断。
-        for s in [401u16, 403, 404, 422] {
+        for s in [401u16, 403, 404] {
             assert!(status_counts_against_breaker(s), "HTTP {s} 应计入熔断");
+        }
+        // 同码定性必须一致：failover_verb 判为「非 Key 问题」的码，绝不能同时被熔断惩罚
+        // （本轮审查发现的 422 矛盾：日志说非 Key 问题、熔断却罚 Key）。
+        for s in [400u16, 422] {
+            assert!(
+                failover_verb(s).contains("非 Key 问题") && !status_counts_against_breaker(s),
+                "HTTP {s} 在 failover_verb 与熔断判据里定性必须一致（都视为请求级、不罚 Key）"
+            );
         }
     }
 

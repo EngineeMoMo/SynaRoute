@@ -83,6 +83,38 @@ pub fn is_truncated_response(body: &serde_json::Value) -> bool {
     false
 }
 
+/// 流式 SSE（末尾窗口）里是否出现**上游报错事件**。
+///
+/// 上游可能先回 200 响应头、随后在 SSE 流内发错误（Anthropic 过载 / 生成中报错的常见形态：
+/// `event: error` + `data: {"type":"error","error":{"type":"overloaded_error",...}}`；
+/// OpenAI 兼容流有时也在末尾 chunk 塞 `{"error":{...}}`）。这类「200 后流内失败」若不识别，
+/// 会被当成成功记账（清 fail_count、解除短路窗口），使熔断/短路在流式主路径上零保护。
+///
+/// 用于 proxy.rs 同协议流式的流末补记：命中则 `record_live_failure` 而非坐实 success。
+/// 只看**已缓存的尾部窗口**（8KB）——终止性错误事件必在流末，尾窗必然覆盖到。
+pub fn sse_stream_errored(sse: &str) -> bool {
+    for line in sse.lines() {
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(data.as_bytes()) else {
+            continue;
+        };
+        // Anthropic：顶层 {"type":"error",...}；OpenAI 兼容：顶层含非空 "error" 对象。
+        if v.get("type").and_then(|t| t.as_str()) == Some("error") {
+            return true;
+        }
+        if v.get("error").map(|e| !e.is_null()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
 // 子模块里被本文件使用的项。`pub(super)` 的项对父模块可见需要显式 use ——
 // Rust 的私有项可见性只向**下**流（父的私有项对子可见），反向必须显式提升并引入。
 
@@ -303,6 +335,35 @@ mod tests {
     /// `client_restricted` 403，排查方向被误导到「Key 配错了」），这条测试不会直接报错，
     /// 但配合下面「每个变体的取值都被显式列出」的断言，至少能保证现有三个变体的取值不被
     /// 无意改动。真正的编译期保障来自能力方法里的穷举 match 本身。
+    #[test]
+    fn sse_stream_errored_detects_in_stream_errors() {
+        // Anthropic：200 后流内发 error 事件（过载常见形态）
+        let anthropic_err = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\
+\n\
+event: error\n\
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        assert!(super::sse_stream_errored(anthropic_err), "Anthropic 流内 error 事件必须识别");
+
+        // OpenAI 兼容：末尾 chunk 塞 error 对象
+        let openai_err = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: {\"error\":{\"message\":\"upstream boom\"}}\n\n";
+        assert!(super::sse_stream_errored(openai_err), "OpenAI 流内 error 对象必须识别");
+
+        // 正常流：无 error → false（不能把成功流误判成失败去熔断好 Key）
+        let ok = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\
+\n\
+data: [DONE]\n";
+        assert!(!super::sse_stream_errored(ok), "正常流不得被判为错误");
+        // error 为 null（部分上游总带该键但成功时为 null）→ 不算错
+        assert!(!super::sse_stream_errored("data: {\"choices\":[],\"error\":null}\n\n"));
+    }
+
     #[test]
     fn protocol_capabilities_cover_all_variants() {
         use crate::model::AuthScheme;
