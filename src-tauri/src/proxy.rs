@@ -2045,6 +2045,9 @@ async fn forward_to_key(
         (
             crate::upstream::collect_custom_tools(&req_json),
             crate::upstream::collect_search_tools(&req_json),
+            // namespaces：跨协议→Responses 时，回程 function_call 全名要按它拆成 name+namespace
+            // 两字段，否则 Codex router 认不出 MCP 工具（unsupported call）。与流式路径同源收集。
+            crate::upstream::collect_tool_namespaces(&req_json),
         )
     });
 
@@ -2150,7 +2153,7 @@ async fn forward_to_key(
                 // 其他协议对不涉及此逻辑。
                 // 已在消费 req_json 之前收集好（见函数上方 resp_tool_sets）。
                 // 本分支的条件 `!same_protocol` 与那里的收集条件是同一个，故必然是 Some。
-                let (custom_tools, search_tools) = resp_tool_sets
+                let (custom_tools, search_tools, namespaces) = resp_tool_sets
                     .clone()
                     .expect("跨协议分支下 resp_tool_sets 必然已收集");
                 let translated = crate::upstream::convert_response_ext(
@@ -2159,6 +2162,7 @@ async fn forward_to_key(
                     downstream,
                     &custom_tools,
                     &search_tools,
+                    &namespaces,
                 );
                 Bytes::from(serde_json::to_vec(&translated).unwrap_or_else(|_| bytes.to_vec()))
             }

@@ -299,10 +299,15 @@ pub fn anthropic_to_openai(body: &Value) -> Value {
                         let c = if text.is_empty() { Value::Null } else { json!(text) };
                         messages.push(json!({ "role": "assistant", "content": c, "tool_calls": tool_calls }));
                     } else {
+                        // **先 tool_results、后 user 文本**：一条 user 轮次可能同时含 tool_result 与
+                        // text（如 [{tool_result},{text:"另外请…"}]）。OpenAI 要求 assistant.tool_calls
+                        // 之后必须紧跟对应的 tool 消息，中间夹一条 role:"user" 会 400
+                        // （"tool_call_ids did not have response messages"）。故先把 tool 结果贴上去
+                        // 补齐上一条 assistant 的工具调用，再追加 user 文本（工具消息之后的 user 消息合法）。
+                        messages.append(&mut tool_results);
                         if !text.is_empty() {
                             messages.push(json!({ "role": role, "content": text }));
                         }
-                        messages.append(&mut tool_results);
                     }
                 }
                 _ => {}
@@ -336,7 +341,11 @@ pub fn anthropic_to_openai(body: &Value) -> Value {
             Some("auto") => json!("auto"),
             Some("any") => json!("required"),
             Some("tool") => json!({ "type": "function", "function": { "name": tc.get("name").cloned().unwrap_or(json!("")) } }),
-            _ => tc.clone(),
+            // Anthropic（2024 末起）支持 {type:"none"} 禁用工具；OpenAI 的等价形式是**字符串** "none"，
+            // 原样发对象 {"type":"none"} 会被严格 OpenAI 上游 400。
+            Some("none") => json!("none"),
+            // 未知形态不原样克隆（那会把 Anthropic 专有对象泄漏给 OpenAI 触发 400）——回落到 "auto"。
+            _ => json!("auto"),
         };
         out.insert("tool_choice".into(), mapped);
     }
@@ -499,7 +508,7 @@ pub fn openai_to_anthropic(body: &Value) -> Value {
         let mapped = match tc {
             Value::String(s) if s == "auto" => json!({ "type": "auto" }),
             Value::String(s) if s == "required" => json!({ "type": "any" }),
-            Value::String(s) if s == "none" => json!({ "type": "auto" }), // Anthropic 无 none，退回 auto
+            Value::String(s) if s == "none" => json!({ "type": "none" }), // Anthropic（2024末起）支持 none：禁用工具，勿再退回 auto（那会静默重新启用工具选择）
             Value::Object(_) => tc
                 .get("function")
                 .and_then(|f| f.get("name"))
@@ -763,8 +772,8 @@ pub fn convert_request(body: &Value, from: Protocol, to: Protocol) -> Value {
 
 /// 跨协议**响应体**转换：上游协议 `from` → 下游协议 `to`，以 Chat Completions 为中枢。
 /// 同协议直通。用于非流式响应回写给下游客户端。
-/// 生产非流式路径统一走 [`convert_response_ext`]（可带 custom / search 工具集合）；此简单签名
-/// 保留供测试与无特殊工具场景，等价于 `convert_response_ext(.., &空集合, &空集合)`。
+/// 生产非流式路径统一走 [`convert_response_ext`]（可带 custom / search 工具集合 + namespaces）；
+/// 此简单签名保留供测试与无特殊工具场景，等价于 `convert_response_ext(.., &空, &空, &[])`。
 #[allow(dead_code)]
 pub fn convert_response(body: &Value, from: Protocol, to: Protocol) -> Value {
     convert_response_ext(
@@ -773,6 +782,7 @@ pub fn convert_response(body: &Value, from: Protocol, to: Protocol) -> Value {
         to,
         &std::collections::HashSet::new(),
         &std::collections::HashSet::new(),
+        &[],
     )
 }
 
@@ -786,6 +796,7 @@ pub fn convert_response_ext(
     to: Protocol,
     custom_tools: &std::collections::HashSet<String>,
     search_tools: &std::collections::HashSet<String>,
+    namespaces: &[String],
 ) -> Value {
     if from == to {
         return body.clone();
@@ -799,7 +810,7 @@ pub fn convert_response_ext(
         Protocol::Anthropic => openai_resp_to_anthropic(&chat),
         Protocol::OpenaiChat => chat,
         Protocol::OpenaiResponses => {
-            chat_resp_to_responses_ext(&chat, custom_tools, search_tools)
+            chat_resp_to_responses_ext(&chat, custom_tools, search_tools, namespaces)
         }
     }
 }
@@ -1215,9 +1226,10 @@ pub fn chat_resp_to_responses_ext(
     body: &Value,
     custom_tools: &std::collections::HashSet<String>,
     search_tools: &std::collections::HashSet<String>,
+    namespaces: &[String],
 ) -> Value {
     let mut resp = chat_resp_to_responses(body);
-    if custom_tools.is_empty() && search_tools.is_empty() {
+    if custom_tools.is_empty() && search_tools.is_empty() && namespaces.is_empty() {
         return resp;
     }
     if let Some(output) = resp.get_mut("output").and_then(|o| o.as_array_mut()) {
@@ -1225,15 +1237,31 @@ pub fn chat_resp_to_responses_ext(
             if item.get("type").and_then(|t| t.as_str()) != Some("function_call") {
                 continue;
             }
-            let name = item
+            let full = item
                 .get("name")
                 .and_then(|n| n.as_str())
                 .unwrap_or("")
                 .to_string();
+            // 关键：Codex router 用结构化 {namespace, name} 查工具注册表，不拆 name 字符串。
+            // 上游按展开的全名 `mcp__x__foo` 回调，这里必须拆回 name="foo" + namespace="mcp__x"
+            // 两个独立字段，否则 router 查 {namespace:None, name:"mcp__x__foo"} 匹配不到 → unsupported
+            // call。这与流式路径 SseTranslator::emit_responses_completed（sse.rs:396）口径一致；
+            // 此前非流式漏了拆分，跨协议→Responses 的非流式响应里 MCP 工具全部认不出（本轮审查确认）。
+            let (ns, real_name) = split_namespaced_tool_name(&full, namespaces);
             let Some(obj) = item.as_object_mut() else { continue };
-            if search_tools.contains(&name) {
+            // custom / search 判定必须用**拆出的真实名**（与流式 sse.rs:401/425 一致），
+            // 否则带 namespace 的 custom/search 工具也会被误判。
+            if search_tools.contains(&real_name) {
+                obj.insert("name".into(), json!(real_name));
+                if let Some(ns) = ns {
+                    obj.insert("namespace".into(), json!(ns));
+                }
                 rewrite_to_tool_search_call(obj);
-            } else if custom_tools.contains(&name) {
+            } else if custom_tools.contains(&real_name) {
+                obj.insert("name".into(), json!(real_name));
+                if let Some(ns) = ns {
+                    obj.insert("namespace".into(), json!(ns));
+                }
                 obj.insert("type".into(), json!("custom_tool_call"));
                 // 同流式路径：custom_tool_call 用裸字符串 `input`，不用 JSON `arguments`。
                 let args = obj
@@ -1243,6 +1271,12 @@ pub fn chat_resp_to_responses_ext(
                     .to_string();
                 obj.insert("input".into(), json!(unpack_custom_tool_input(&args)));
                 obj.remove("arguments");
+            } else {
+                // 普通（含 namespace 展开的 MCP）function_call：拆出真实名 + namespace 两字段。
+                obj.insert("name".into(), json!(real_name));
+                if let Some(ns) = ns {
+                    obj.insert("namespace".into(), json!(ns));
+                }
             }
         }
     }
@@ -1359,10 +1393,15 @@ pub fn chat_to_responses(body: &Value) -> Value {
         out.insert("max_output_tokens".into(), mt.clone());
     }
     copy_through(body, &mut out, &["temperature", "top_p", "stream"]);
-    // reasoning：Chat 中枢里若带 reasoning（来自 Codex Responses 透传或 Anthropic thinking 反映射），
-    // 原样带给 Responses 上游——它原生认 reasoning.effort，推理强度直达。
-    if let Some(r) = body.get("reasoning") {
+    // reasoning：Chat 中枢里若带 reasoning 对象（来自 Codex Responses 透传或 Anthropic thinking
+    // 反映射），原样带给 Responses 上游——它原生认 reasoning.effort，推理强度直达。
+    // 若只有**顶层字符串** reasoning_effort（o/gpt-5 系 Chat API 的合法字段），也要归一成
+    // reasoning:{effort:..}，否则 Chat→Responses 会把它整个丢掉、上游推理强度静默回落默认档
+    // （反向 Responses→Chat 早已把 reasoning.effort 落成顶层 reasoning_effort，此向此前漏了对称处理）。
+    if let Some(r) = body.get("reasoning").filter(|r| r.is_object()) {
         out.insert("reasoning".into(), r.clone());
+    } else if let Some(effort) = read_reasoning_effort(body) {
+        out.insert("reasoning".into(), json!({ "effort": effort }));
     }
     // tools：Chat 嵌套 {type:function,function:{name,..}} → Responses 扁平 {type:function,name,..}
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
@@ -2003,6 +2042,23 @@ mod tests {
     }
 
     #[test]
+    fn chat_to_responses_lifts_top_level_reasoning_effort() {
+        // 回归（对抗审查确认的 P2）：Chat 下游发**顶层字符串** reasoning_effort（o/gpt-5 系 Chat API
+        // 合法字段），Chat→Responses 必须归一成 reasoning:{effort:..}，否则整个丢掉、上游推理强度
+        // 静默回落默认档（反向 Responses→Chat 早有对称处理，此向此前漏了）。
+        let chat = json!({
+            "model": "gpt-5",
+            "messages": [ { "role": "user", "content": "hi" } ],
+            "reasoning_effort": "high"
+        });
+        let r = chat_to_responses(&chat);
+        assert_eq!(
+            r["reasoning"]["effort"], "high",
+            "顶层 reasoning_effort 必须被提升成 reasoning.effort：{r}"
+        );
+    }
+
+    #[test]
     fn anthropic_to_openai_maps_thinking_to_effort() {
         // 反向：Anthropic thinking.budget_tokens → Chat 中枢 reasoning.effort（补全对称）。
         let a = json!({
@@ -2305,6 +2361,65 @@ mod tests {
             json!({ "type": "function", "function": { "name": "f" } }),
             "Responses→Chat 强制档丢失"
         );
+    }
+
+    #[test]
+    fn tool_choice_none_maps_both_directions() {
+        // 回归（对抗审查确认）：Anthropic {type:"none"}（禁用工具）→ OpenAI 是**字符串** "none"，
+        // 原样发对象会被严格 OpenAI 上游 400。
+        let anthropic = json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [ { "role": "user", "content": "go" } ],
+            "tools": [ { "name": "f", "input_schema": { "type": "object" } } ],
+            "tool_choice": { "type": "none" }
+        });
+        let to_chat = convert_request(&anthropic, Protocol::Anthropic, Protocol::OpenaiChat);
+        assert_eq!(to_chat["tool_choice"], json!("none"), "Anthropic none → OpenAI 字符串 none");
+
+        // 反向：OpenAI "none" → Anthropic {type:"none"}，不得退回 auto（那会静默重新启用工具）。
+        let chat = json!({
+            "model": "m",
+            "messages": [ { "role": "user", "content": "go" } ],
+            "tools": [ { "type": "function", "function": { "name": "f", "parameters": { "type": "object" } } } ],
+            "tool_choice": "none"
+        });
+        let to_anthropic = convert_request(&chat, Protocol::OpenaiChat, Protocol::Anthropic);
+        assert_eq!(
+            to_anthropic["tool_choice"], json!({ "type": "none" }),
+            "OpenAI none → Anthropic none（不得降级成 auto 重新启用工具）"
+        );
+    }
+
+    #[test]
+    fn anthropic_to_openai_orders_tool_result_before_user_text() {
+        // 回归（对抗审查确认的 P2）：一条 user 轮次同时含 tool_result 与 text 时，OpenAI 要求
+        // assistant.tool_calls 后必须紧跟对应 tool 消息。若在中间插一条 role:"user" 文本 → 400。
+        // 故产出顺序必须是 [assistant(tool_calls), tool(result), user(text)]。
+        let anthropic = json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [
+                { "role": "user", "content": "调用工具" },
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "toolu_1", "name": "f", "input": {} }
+                ] },
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_1", "content": "结果" },
+                    { "type": "text", "text": "另外请顺便总结一下" }
+                ] }
+            ]
+        });
+        let chat = anthropic_to_openai(&anthropic);
+        let msgs = chat["messages"].as_array().expect("messages 数组");
+        // 定位 assistant(tool_calls) 的下标，其后必须是 tool 消息，再后才能是 user 文本。
+        let asst_idx = msgs.iter().position(|m| m.get("tool_calls").is_some()).expect("应有 assistant.tool_calls");
+        assert_eq!(
+            msgs[asst_idx + 1]["role"], "tool",
+            "assistant.tool_calls 之后必须紧跟 tool 消息，不能夹 user 文本：{msgs:?}"
+        );
+        assert_eq!(msgs[asst_idx + 1]["tool_call_id"], "toolu_1");
+        // user 文本应排在 tool 消息之后（合法），且内容保留。
+        let user_text = msgs.iter().skip(asst_idx + 1).find(|m| m["role"] == "user").expect("user 文本应保留");
+        assert_eq!(user_text["content"], "另外请顺便总结一下");
     }
 
     #[test]
@@ -2623,7 +2738,7 @@ mod tests {
             "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
         });
         let search = std::collections::HashSet::from(["tool_search".to_string()]);
-        let result = chat_resp_to_responses_ext(&body, &Default::default(), &search);
+        let result = chat_resp_to_responses_ext(&body, &Default::default(), &search, &[]);
         let item = &result["output"][0];
         assert_eq!(item["type"], "tool_search_call", "应改写为 tool_search_call");
         assert_eq!(item["execution"], "client", "须标明客户端执行");
@@ -2651,7 +2766,7 @@ mod tests {
             }, "finish_reason": "tool_calls" }]
         });
         let search = std::collections::HashSet::from(["tool_search".to_string()]);
-        let result = chat_resp_to_responses_ext(&body, &Default::default(), &search);
+        let result = chat_resp_to_responses_ext(&body, &Default::default(), &search, &[]);
         let item = &result["output"][0];
         assert_eq!(item["type"], "tool_search_call");
         assert_eq!(item["arguments"]["query"], "synaroute_ai", "不可解析时退化为 query 原文");
@@ -2889,7 +3004,7 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
         });
         let custom = std::collections::HashSet::from(["apply_patch".to_string()]);
-        let result = chat_resp_to_responses_ext(&body, &custom, &Default::default());
+        let result = chat_resp_to_responses_ext(&body, &custom, &Default::default(), &[]);
         let output = result["output"].as_array().unwrap();
         assert_eq!(output.len(), 1);
         assert_eq!(output[0]["type"], "custom_tool_call", "apply_patch 应输出 custom_tool_call");
@@ -2910,10 +3025,77 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
         });
         let custom = std::collections::HashSet::from(["apply_patch".to_string()]);
-        let result = chat_resp_to_responses_ext(&body, &custom, &Default::default());
+        let result = chat_resp_to_responses_ext(&body, &custom, &Default::default(), &[]);
         let output = result["output"].as_array().unwrap();
         assert_eq!(output.len(), 1);
         assert_eq!(output[0]["type"], "function_call", "非 custom 工具应保持 function_call");
+    }
+
+    #[test]
+    fn nonstreaming_cross_protocol_to_responses_splits_namespaced_tool_name() {
+        // 回归（全业务对抗审查确认的 P1）：非流式 Anthropic→Responses 回程，MCP 工具的展开全名
+        // `mcp__synaroute__synaroute_ai` 必须拆成 name="synaroute_ai" + namespace="mcp__synaroute"
+        // 两个独立字段（与流式 sse.rs:396 口径一致）。此前非流式不拆 → Codex router 查
+        // {namespace:None, name:"mcp__synaroute__synaroute_ai"} 匹配不到 → unsupported call，
+        // 大脑聚合在非流式 Responses 请求上失效。
+        let anthropic_resp = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-x",
+            "stop_reason": "tool_use",
+            "content": [
+                { "type": "tool_use", "id": "toolu_1",
+                  "name": "mcp__synaroute__synaroute_ai",
+                  "input": { "prompt": "比较快排与归并" } }
+            ],
+            "usage": { "input_tokens": 10, "output_tokens": 5 }
+        });
+        let namespaces = vec!["mcp__synaroute".to_string()];
+        let out = convert_response_ext(
+            &anthropic_resp,
+            Protocol::Anthropic,
+            Protocol::OpenaiResponses,
+            &Default::default(),
+            &Default::default(),
+            &namespaces,
+        );
+        let items = out["output"].as_array().expect("Responses 输出应为数组");
+        let fc = items
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .expect("应有 function_call item");
+        assert_eq!(
+            fc["name"], "synaroute_ai",
+            "全名必须拆出真实名，否则 Codex router 认不出：{fc}"
+        );
+        assert_eq!(
+            fc["namespace"], "mcp__synaroute",
+            "namespace 必须作为独立字段带上：{fc}"
+        );
+    }
+
+    #[test]
+    fn nonstreaming_namespaced_custom_tool_classified_by_real_name() {
+        // custom/search 判定必须用**拆出的真实名**（对齐流式 sse.rs:401/425）：带 namespace 的
+        // custom 工具全名不拆就会漏判、仍输出 function_call 而非 custom_tool_call。
+        let chat_resp = json!({
+            "choices": [{ "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{ "id": "tc1", "type": "function",
+                    "function": { "name": "mcp__ns__apply_patch", "arguments": "{\"input\":\"*** Begin Patch\"}" } }]
+            }, "finish_reason": "tool_calls" }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+        });
+        let custom = std::collections::HashSet::from(["apply_patch".to_string()]);
+        let namespaces = vec!["mcp__ns".to_string()];
+        let result = chat_resp_to_responses_ext(&chat_resp, &custom, &Default::default(), &namespaces);
+        let item = &result["output"].as_array().unwrap()[0];
+        assert_eq!(item["type"], "custom_tool_call", "按真实名 apply_patch 应判为 custom：{item}");
+        assert_eq!(item["name"], "apply_patch");
+        assert_eq!(item["namespace"], "mcp__ns");
+        assert_eq!(item["input"], "*** Begin Patch");
     }
 
     #[test]
