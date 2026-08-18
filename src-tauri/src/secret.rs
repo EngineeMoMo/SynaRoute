@@ -67,6 +67,12 @@ pub struct SecretStore {
     /// 否则「空库 + 用户新存的一条」整份覆盖会销毁其余全部密文（与 config 的 init
     /// fallback 覆盖同类风险）。备份失败则拒绝写入。
     load_failed: bool,
+    /// 降级原因是否为**读取失败**（而非解析失败）。两者后果完全不同，必须区分：
+    /// - 解析失败：磁盘那份已损坏，密文本来就解不出 → 允许「先备份再写」继续用（见 persist）。
+    /// - 读取失败：磁盘那份**完好**，只是被杀软/备份/OneDrive 临时独占 → 写入会把健康库
+    ///   换成近乎空库、并让主口令保护静默降级成 DPAPI，而正确处置只是重启重试。
+    ///   故 `set` 在这种降级下**拒写**（见其内部注释）。
+    unreadable: bool,
     /// 解锁后常驻的库密钥（仅主口令模式）。`None` = DPAPI 模式，或主口令模式但未解锁。
     /// 进程退出即消失，故每次启动都要重新解锁。
     vault_key: Option<crate::crypto::VaultKey>,
@@ -92,24 +98,29 @@ impl SecretStore {
         // 旧实现 `std::fs::read(&path)?` 会把瞬时读失败（杀软/备份独占锁、权限抖动）
         // 一路冒泡到 Store::init().expect → panic、窗口永不创建，用户无从排障。
         // 降级后 UI 正常、Key 可见，密钥暂不可用（转发时报「密钥缺失」），重启读成功即恢复。
-        let (vault, load_failed) = if path.exists() {
+        let (vault, load_failed, unreadable) = if path.exists() {
             match std::fs::read(&path) {
                 Ok(raw) => match serde_json::from_slice::<SecretVault>(&raw) {
-                    Ok(v) => (v, false),
+                    Ok(v) => (v, false, false),
                     Err(e) => {
                         tracing::error!("密钥库解析失败,降级为空库(磁盘文件保持原样,不自动覆盖): {e}. 路径={path:?}");
-                        (SecretVault::default(), true)
+                        (SecretVault::default(), true, false)
                     }
                 },
                 Err(e) => {
-                    tracing::error!("密钥库读取失败,降级为空库(磁盘文件保持原样,不自动覆盖): {e}. 路径={path:?}");
-                    (SecretVault::default(), true)
+                    // 读取失败与解析失败**分开标记**：前者磁盘数据完好、重启即恢复，
+                    // 故本次运行一律拒绝写入密钥（见 `set`），避免用空库覆盖健康库。
+                    tracing::error!(
+                        "密钥库读取失败(本次运行将拒绝保存密钥,避免覆盖磁盘上完好的库;重启即恢复): {e}. 路径={path:?} os错误码={:?}",
+                        e.raw_os_error()
+                    );
+                    (SecretVault::default(), true, true)
                 }
             }
         } else {
-            (SecretVault::default(), false)
+            (SecretVault::default(), false, false)
         };
-        Ok(Self { path, vault, load_failed, vault_key: None, os_cache: HashMap::new() })
+        Ok(Self { path, vault, load_failed, unreadable, vault_key: None, os_cache: HashMap::new() })
     }
 
     // ---- 主口令模式：状态与解锁 ----
@@ -117,6 +128,15 @@ impl SecretStore {
     /// 当前是否为主口令模式。**判据是密钥库文件本身**（有 `master` 头部），不看 settings。
     pub fn is_master_mode(&self) -> bool {
         self.vault.master.is_some()
+    }
+
+    /// 本次启动是否处于**降级态**：密钥库文件存在但读取/解析失败，内存里是空库。
+    ///
+    /// 这是个「模式不可知」的状态，**不等于 DPAPI 模式**：磁盘上那份可能有 master 头部。
+    /// 故调用方必须据它跳过一切「按内存状态回写磁盘」的动作（开关对账、写密钥），
+    /// 否则会用假状态覆盖真数据（详见 `set` 与 `reconcile_master_password_flag` 的拒绝理由）。
+    pub fn is_degraded(&self) -> bool {
+        self.load_failed
     }
 
     /// 主口令模式但本次进程尚未解锁 → 取不到任何密钥。
@@ -178,6 +198,20 @@ impl SecretStore {
     /// 旧密文，切模式后会读出**过期的密钥**（用户改过密钥、切回原模式却拿到改之前那条），
     /// 表现为「明明更新过密钥却仍报鉴权失败」。
     pub fn set(&mut self, key_id: &str, secret: &str) -> AppResult<()> {
+        if self.unreadable {
+            // **只在「读取失败」这一种降级下拒写**（与「解析失败」区别对待，两者后果完全不同）：
+            // - 解析失败：磁盘那份已经损坏，里面的密文本来就解不出来 → 允许「先备份原文件再写」
+            //   （见 persist 的降级分支），让用户能继续用；这是既有的、有测试的刻意设计。
+            // - 读取失败（杀软/备份软件/OneDrive 短暂独占）：磁盘那份**完好无损**，只是本次读不到。
+            //   此时写入会把一份健康的库（可能带 master 头部 + N 条密钥）换成「空库 + 这一条」，
+            //   虽然 persist 会留个 .corrupt-* 备份，但主口令保护会静默降级成 DPAPI、
+            //   用户界面显示「主口令已关闭」，而正确做法只是**重启重试**即可完全恢复。
+            return Err(AppError::Invalid(
+                "密钥库本次启动读取失败（文件可能被杀毒/备份软件临时占用），为避免覆盖磁盘上完好的密钥，已拒绝保存。\
+                 请重启 SynaRoute 后再试；若持续失败，请检查是否有软件正在占用 secrets.enc。"
+                    .into(),
+            ));
+        }
         if self.is_master_mode() {
             let boxed = {
                 let key = self.require_vault_key()?;
@@ -1184,6 +1218,41 @@ mod tests {
         assert_eq!(v.entries.len(), 1);
         assert!(v.entries.contains_key("k_new"));
         assert!(!store.load_failed, "首次成功写入后应清除降级标记");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **读取失败**与**解析失败**这两种降级必须区别对待（本轮审计确认的 P1）。
+    ///
+    /// - 解析失败（上一条测试）：磁盘那份已损坏、密文本来就解不出 → 允许「先备份再写」，
+    ///   让用户能继续用。
+    /// - 读取失败（本测试）：磁盘那份**完好**，只是被杀软/备份/OneDrive 临时独占。若照样写入，
+    ///   会把一份健康库（可能带 master 头部 + N 条密钥）换成「空库 + 这一条」：虽然 persist
+    ///   留了 .corrupt-* 备份，但主口令保护会静默降级成 DPAPI、界面显示「主口令已关闭」，
+    ///   而正确处置只是**重启重试**即可完全恢复。故这种降级下一律拒写。
+    ///
+    /// 故障注入判据：把 `set` 里的 `self.unreadable` 改成 `self.load_failed`，
+    /// 上一条（解析失败允许写入）立刻变红；把该守卫整段删掉，本条变红。两条互为约束。
+    #[test]
+    fn unreadable_vault_refuses_writes_while_corrupt_vault_allows_them() {
+        // 用「目录占位」模拟「文件存在但读不出来」：std::fs::read 对目录必然失败，
+        // 且不依赖平台特有的文件锁 API，跨平台稳定（CI 的 macOS 也跑这条）。
+        let dir = temp_dir("unreadable_vault");
+        let path = dir.join("secrets.enc");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let mut store = SecretStore::load(path.clone()).unwrap();
+        assert!(store.load_failed, "读不出来应置降级标记");
+        assert!(store.unreadable, "且必须标记为「读取失败」这一类降级");
+
+        let err = store
+            .set("k_new", "sk-should-be-refused")
+            .expect_err("读取失败降级下必须拒写，避免覆盖磁盘上完好的密钥库");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("重启"),
+            "错误必须给出可行动指引（重启重试），实际：{msg}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

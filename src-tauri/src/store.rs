@@ -293,12 +293,30 @@ impl Store {
     /// - 解析成功：返回 (配置, false)。
     /// - 文件存在但解析失败：返回 (空配置, true)。调用方据 load_failed=true 【绝不回写磁盘】,
     ///   避免空配置覆盖磁盘原有数据(P1 防销毁);并另存一份 .corrupt 备份供人工抢救。
+    /// - **文件存在但读取失败**（被杀软/备份软件/OneDrive 短暂独占，Windows 上表现为
+    ///   ERROR_SHARING_VIOLATION(32) 或 ACCESS_DENIED(5)）：同样返回 (空配置, true)。
+    ///   此前这里直接 `?` 冒泡，一路到 `Store::init().expect()` → **panic**。而 GUI 进程没有
+    ///   控制台、Tauri 窗口还没建起来，用户双击图标后「什么都不发生」：没有窗口、没有错误框、
+    ///   logs 里连本次启动的自检行都没有（那行在 panic 之后才写）。下次读成功即恢复，
+    ///   典型的间歇性无头案。降级成 load_failed=true 后：不回写磁盘（数据安全，见 persist 的守卫）、
+    ///   窗口照常起来、用户能看到界面与告警，重启即恢复。判据与 secret.rs 对密钥库同类失败的
+    ///   处理口径一致。
     fn load_config_from_disk(config_path: &std::path::Path) -> AppResult<(AppConfig, bool)> {
         if !config_path.exists() {
             tracing::info!("配置文件不存在,使用默认空配置: {:?}", config_path);
             return Ok((AppConfig::default(), false));
         }
-        let raw = std::fs::read(config_path)?;
+        let raw = match std::fs::read(config_path) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    "配置文件读取失败(降级为空配置且本次运行绝不回写磁盘): 路径={:?} os错误码={:?}: {e}",
+                    config_path,
+                    e.raw_os_error()
+                );
+                return Ok((AppConfig::default(), true));
+            }
+        };
         // 严格反序列化并落诊断日志:一旦失败,记录具体原因,避免 unwrap_or_default 静默吞错
         // 导致「磁盘 6 条→内存 0/N 条」这种诡异现象无迹可寻。
         match serde_json::from_slice::<AppConfig>(&raw) {

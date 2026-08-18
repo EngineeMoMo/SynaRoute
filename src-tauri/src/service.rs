@@ -81,7 +81,28 @@ pub(crate) async fn apply_tool_config(
     // - 桌面端：整份写进 gateway 档的 inferenceModels（3p 部署模式）
     let keys = store.enabled_keys_sorted(category);
     let models = crate::proxy::discoverable_models(&keys);
-    let msg = crate::tools::apply(category, &endpoint, &models, &keys)?;
+    // 写工具配置失败 → **必须把刚起来的代理停掉**，让整个「起代理」操作原子地失败。
+    //
+    // 否则：端口已在监听、`proxy.is_running` 为真 → 托盘该分类打勾、状态条显示「运行中」、
+    // proxy_running_categories 也记成已启动；而客户端配置一个字节都没写，Claude/Codex 仍走
+    // 官方端点 —— 正是本函数文档开头就点名要避免的「托盘说已启动、客户端没走代理」。
+    // 真实触发路径很日常：新建桌面端 Key 还没拉模型（models 为空）→ apply_desktop_at 直接 Err。
+    //
+    // 与本函数的语义契约保持一致：起代理 = 监听 + 写客户端配置，两者缺一即算没起来。
+    let msg = match crate::tools::apply(category, &endpoint, &models, &keys) {
+        Ok(m) => m,
+        Err(e) => {
+            // stop 是同步且不返回错误（只是撤掉监听与运行态标记）。
+            proxy.stop(category);
+            store.append_event(
+                category,
+                "error",
+                None,
+                &format!("接入失败，已回滚（代理已停止）：{e}"),
+            );
+            return Err(e);
+        }
+    };
     record_apply_success(store, category, &models, &format!("写入工具配置: {endpoint}"));
     Ok(msg)
 }
@@ -1146,6 +1167,17 @@ pub(crate) fn reconcile_auto_start(store: &Store, sys: &dyn AutostartToggle) -> 
 ///
 /// 返回 `Some(real)` 表示做了修正。
 pub(crate) fn reconcile_master_password_flag(store: &Store) -> Option<bool> {
+    // 降级态（本次启动读盘失败）下 `is_master_mode()` 恒为 false —— 因为内存里的库是空的，
+    // 而磁盘上那份可能有 master 头部。此时**绝不能**据这个假状态回写镜像：那会把
+    // settings.master_password_enabled 落盘改成 false，用户界面显示「主口令已关闭」、
+    // 不再弹解锁框，而磁盘上的库其实还是加密的 → 自造「配置说关着、库里有头部」的死局。
+    // 模式是不可知的，不是「已关闭」。
+    if store.secrets.read().is_degraded() {
+        tracing::error!(
+            "密钥库处于降级态（本次启动读取失败）：跳过主口令开关对账，避免用假状态覆盖配置。请重启确认"
+        );
+        return None;
+    }
     let real = store.secrets.read().is_master_mode();
     if store.get_settings().master_password_enabled == real {
         if real {

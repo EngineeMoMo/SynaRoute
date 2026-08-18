@@ -45,8 +45,25 @@ pub fn extract_usage(body: &Value) -> Option<TokenUsage> {
         .get("cache_creation_input_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    // 输入 token 的**语义归一**（两家协议口径不同，不归一就会重复计缓存）：
+    // - Anthropic `input_tokens`：**不含**缓存命中部分（cache_read_input_tokens 另计）；
+    // - OpenAI `prompt_tokens`：**已含** `prompt_tokens_details.cached_tokens`。
+    //
+    // TokenUsage 是按 Anthropic 语义定义的（见字段注释：input 不含缓存）。走 OpenAI 字段时
+    // 若原样填入，用量页「总计 = input+output+cache_read+cache_creation」会把缓存算两遍，
+    // 而 pricing 又对 input 与 cache_read 各乘一次单价（缓存价通常是满价的 1/10）——
+    // 该行金额可虚高近 10 倍，且同一面板上 Anthropic Key 与 OpenAI Key 口径不一致、无法对照。
+    // 故命中 OpenAI 字段时减去缓存部分（saturating：个别中转商会给出 cached > prompt 的脏数据）。
+    let input = match u.get("input_tokens").and_then(|v| v.as_u64()) {
+        Some(anthropic_input) => anthropic_input, // 本就不含缓存，原样用
+        None => u
+            .get("prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .saturating_sub(cache_read),
+    };
     let usage = TokenUsage {
-        input: num(&["input_tokens", "prompt_tokens"]),
+        input,
         output: num(&["output_tokens", "completion_tokens"]),
         cache_read,
         cache_creation,
@@ -155,6 +172,12 @@ mod tests {
         assert_eq!(u.total(), 1540);
 
         // OpenAI（缓存在 prompt_tokens_details.cached_tokens 里，无 cache_creation 等价字段）
+        //
+        // ⚠️ 这里的期望值在本轮审计后**改过**：OpenAI 的 `prompt_tokens` **已包含** cached_tokens，
+        // 而 TokenUsage 按 Anthropic 语义定义（input 不含缓存）。旧断言写的是 input=800、
+        // cache_read=512，等于把 512 个缓存 token 计了两遍 —— 用量页「总计」多算 512，
+        // 且 pricing 对 input 与 cache_read 各乘一次单价（缓存价约为满价 1/10），金额虚高。
+        // 归一后 input = 800 - 512 = 288，满足下面的不变式。
         let o = serde_json::json!({
             "usage": {
                 "prompt_tokens": 800,
@@ -164,7 +187,19 @@ mod tests {
             }
         });
         let u = extract_usage(&o).expect("OpenAI usage 应能取到");
-        assert_eq!((u.input, u.output, u.cache_read, u.cache_creation), (800, 120, 512, 0));
+        assert_eq!((u.input, u.output, u.cache_read, u.cache_creation), (288, 120, 512, 0));
+        // **不变式**：OpenAI 形态下 input + cache_read 必须等于上游给的 prompt_tokens。
+        // 这条比具体数字更能钉住语义 —— 谁把归一去掉，它立刻变红。
+        assert_eq!(u.input + u.cache_read, 800, "input+cache_read 必须还原成 prompt_tokens");
+        // Anthropic 形态**不做**减法（input_tokens 本就不含缓存），上面已断言 1200 原样保留。
+
+        // 脏数据兜底：个别中转商给出 cached > prompt，减法不得下溢 panic。
+        let dirty = serde_json::json!({
+            "usage": { "prompt_tokens": 100, "completion_tokens": 5,
+                       "prompt_tokens_details": { "cached_tokens": 999 } }
+        });
+        let u = extract_usage(&dirty).expect("脏数据也应能解析");
+        assert_eq!(u.input, 0, "saturating_sub：不得下溢");
 
         // 上游没给 usage → None（不是 0）。写 0 会让日志显示「本次 0 token」，看着像 bug。
         assert!(extract_usage(&serde_json::json!({ "content": [] })).is_none());

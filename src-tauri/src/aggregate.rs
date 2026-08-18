@@ -296,7 +296,7 @@ pub async fn run_plan(
             "aggregate",
             None,
             &format!(
-                "本次聚合合计 · {} · 共 {} tokens（成员 {} + 决策者 {}）",
+                "本次聚合合计 · {} · 共 {} tokens（成员 {} + 决策者 {}，不含压缩阶段）",
                 grand.fmt_compact(),
                 grand.total(),
                 gathered.usage.total(),
@@ -304,7 +304,12 @@ pub async fn run_plan(
             ),
             None,
             None,
-            Some(grand),
+            // ⚠️ **不把 usage 交给累加器**：这只是一条「合计」展示行，分项已各自记过账
+            // （成员在 gather_members、决策者在其调用点、压缩阶段自己记）。
+            // append_event_full 对**任何**带 usage 的事件都无条件累加进 usage_totals，
+            // 汇总行再带一次 = 用量面板与估算金额恒为真实值的 2 倍，且会落进 usage.json 日桶、
+            // 重启后依旧翻倍、永不自愈。token 数已写在上面的 detail 文本里，展示不受影响。
+            None,
         );
     }
     Ok(AggregateResult::Plan {
@@ -803,7 +808,7 @@ pub async fn run_mcp(
             "aggregate",
             None,
             &format!(
-                "本次聚合合计 · {} · 共 {} tokens（成员 {} + 决策者 {}）",
+                "本次聚合合计 · {} · 共 {} tokens（成员 {} + 决策者 {}，不含压缩阶段）",
                 grand.fmt_compact(),
                 grand.total(),
                 gathered.usage.total(),
@@ -811,7 +816,12 @@ pub async fn run_mcp(
             ),
             None,
             None,
-            Some(grand),
+            // ⚠️ **不把 usage 交给累加器**：这只是一条「合计」展示行，分项已各自记过账
+            // （成员在 gather_members、决策者在其调用点、压缩阶段自己记）。
+            // append_event_full 对**任何**带 usage 的事件都无条件累加进 usage_totals，
+            // 汇总行再带一次 = 用量面板与估算金额恒为真实值的 2 倍，且会落进 usage.json 日桶、
+            // 重启后依旧翻倍、永不自愈。token 数已写在上面的 detail 文本里，展示不受影响。
+            None,
         );
     }
 
