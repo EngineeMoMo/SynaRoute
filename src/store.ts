@@ -13,7 +13,7 @@ import type {
   UpdateCheckResult,
   Vendor,
 } from "@/types";
-import type { Lang } from "@/lib/i18n";
+import { translate, type Lang } from "@/lib/i18n";
 import { api, isTauri } from "@/lib/bridge";
 import { pickPrefs } from "@/lib/prefs";
 import { reuseUnchanged } from "@/lib/reuseUnchanged";
@@ -302,7 +302,9 @@ export const useStore = create<AppState>((set, get) => ({
       };
       set({ updateCheck: result });
       if (!silent) {
-        get().showToast("error", result.error ?? "检查更新失败");
+        // 兜底文案要跟随语言：store 不是组件、拿不到 useT()，用 translate(get().lang, …)
+        // （上游错误信息本身可能为空串/undefined，此时才用这句）。
+        get().showToast("error", result.error || translate(get().lang, "settings.updateCheckFailed"));
       }
       return result;
     } finally {

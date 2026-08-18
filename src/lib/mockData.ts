@@ -277,6 +277,23 @@ const events: EventLogEntry[] = [
     type: "config",
     detail: "已注册 MCP 到 Claude：C:\\Users\\me\\.claude.json（http://127.0.0.1:9527/mcp），重启客户端生效",
   },
+  // 这两条刻意留在 mock 里：`system`（启动自检）与 `warning`（配置告警）都曾因前端
+  // TYPE_META 未登记而被兜底渲染成绿色「路由」成功——全项目最重要的诊断行反而被埋没。
+  // 预览里常驻这两种事件，任何人改了登记表都能一眼看出回归。
+  {
+    id: "e3b1",
+    ts: now - 26000,
+    categoryId: "claude-cli",
+    type: "system",
+    detail: "启动自检 · 配置=C:\\Users\\me\\AppData\\Roaming\\SynaRoute\\config.json · keys=6 · 用户=me · exe=C:\\Program Files\\SynaRoute\\SynaRoute.exe",
+  },
+  {
+    id: "e3b2",
+    ts: now - 25000,
+    categoryId: "claude-cli",
+    type: "warning",
+    detail: "厂商2 的余额查询地址用了 {{baseUrl}}，而接口地址带路径后缀（/anthropic）——余额端点在域名根下时应改用 {{origin}}/user/balance",
+  },
   {
     id: "e3c",
     ts: now - 20000,

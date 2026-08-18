@@ -10,7 +10,9 @@ interface ComboboxProps {
   allowCustom?: boolean;
   className?: string;
   /** 无候选时的提示 */
-  emptyHint?: string;
+  /** 空态文案。**必填**：本组件在 ui/ 下、拿不到 useT()，若给默认值就只能写死一种语言
+   *  （原先默认 "无匹配项"，英文界面下会露出中文）。设为必填让编译器强制调用方传已翻译的串。 */
+  emptyHint: string;
 }
 
 /**
@@ -94,7 +96,7 @@ export function Combobox({
       {open && (
         <div className="absolute z-20 mt-1 max-h-48 w-full overflow-y-auto rounded-control border border-border bg-surface py-1 shadow-lg">
           {filtered.length === 0 ? (
-            <div className="px-3 py-2 text-xs text-text-muted">{emptyHint ?? "无匹配项"}</div>
+            <div className="px-3 py-2 text-xs text-text-muted">{emptyHint}</div>
           ) : (
             filtered.map((o) => (
               <button

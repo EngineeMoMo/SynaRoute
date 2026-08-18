@@ -1024,12 +1024,14 @@ function McpWizard({
   t: (key: string, vars?: Record<string, string | number>) => string;
 }) {
   const codexCmd = `codex mcp add --transport http synaroute ${mcpAddress}`;
-  const codexHook = "遇到复杂的代码审查、架构设计、疑难排查任务时，优先调用 synaroute_ai 工具，获取多个模型的综合分析后再动手。";
+  // 片段内容也要跟随语言：英文界面下给出中文提示词，用户复制进 AGENTS.md/settings.json
+  // 就等于把中文指令塞进自己的英文工程（matcher 里的中文关键词对英文提问也永不命中）。
+  const codexHook = t("settings.mcpWizardCodexHookText");
   const claudeCmd = `claude mcp add --transport http synaroute ${mcpAddress}`;
   const claudeHook = `{
   "hooks": {
     "UserPromptSubmit": [
-      { "matcher": "review|审查|重构", "hooks": [{ "type": "prompt", "prompt": "优先调用 synaroute_ai 做多模型分析" }] }
+      { "matcher": "${t("settings.mcpWizardClaudeHookMatcher")}", "hooks": [{ "type": "prompt", "prompt": "${t("settings.mcpWizardClaudeHookPrompt")}" }] }
     ]
   }
 }`;

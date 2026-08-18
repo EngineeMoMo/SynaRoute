@@ -4159,6 +4159,63 @@ tool_timeout_sec = 600
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// TEMP REPRO (审计验证用，跑完删除)
+    #[test]
+    fn zz_repro_marker_lost_on_second_config_failure() {
+        let (dir, normal, threep, profile, meta) = desktop_layout("zz_repro_marker");
+        // normal 接入前不存在 → 走 created 标记分支；threep 接入前存在 → 走 .bak 分支。
+        std::fs::write(&threep, b"{}").unwrap();
+        assert!(!normal.exists());
+        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
+        assert!(created_marker_path_for(&normal).exists(), "前提：normal 有 created 标记");
+        assert!(backup_path_for(&threep).exists(), "前提：threep 有 .bak");
+
+        // 注入：threep 变非法 JSON（桌面端/cc-switch 崩溃写坏）→ 第二个 config 的还原必失败。
+        std::fs::write(&threep, b"{ not json").unwrap();
+        let r = restore_desktop_at(&normal, &threep, &profile, &meta, None);
+        assert!(r.is_err(), "第二个 config 失败应整体报错");
+
+        println!("--- after failed restore ---");
+        println!("normal exists = {}", normal.exists());
+        println!("normal content = {:?}", std::fs::read_to_string(&normal).ok());
+        println!("normal marker exists = {}", created_marker_path_for(&normal).exists());
+        println!("normal .bak exists = {}", backup_path_for(&normal).exists());
+
+        // 修好 threep，再还原一次（用户重试）。
+        std::fs::write(&threep, br#"{"deploymentMode":"3p"}"#).unwrap();
+        let msg = restore_desktop_at(&normal, &threep, &profile, &meta, None).unwrap();
+        println!("--- after retry ---  msg={msg}");
+        println!("normal exists = {}", normal.exists());
+        println!("normal content = {:?}", std::fs::read_to_string(&normal).ok());
+        println!("normal .bak = {:?}", std::fs::read_to_string(backup_path_for(&normal)).ok());
+        println!("meta = {:?}", std::fs::read_to_string(&meta).ok());
+        println!("meta marker = {}", created_marker_path_for(&meta).exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TEMP REPRO 2：两个 config 都是凭空新建，第二个删除失败（文件被占用/只读）
+    #[test]
+    fn zz_repro_marker_lost_both_created() {
+        let (dir, normal, threep, profile, meta) = desktop_layout("zz_repro_both");
+        assert!(!normal.exists() && !threep.exists());
+        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
+        assert!(created_marker_path_for(&normal).exists());
+        assert!(created_marker_path_for(&threep).exists());
+        println!("meta created marker = {}", created_marker_path_for(&meta).exists());
+        println!("profile created marker = {}", created_marker_path_for(&profile).exists());
+
+        // 注入：把 threep 变成一个目录，remove_file 必失败（等价于被占用/无权限）。
+        std::fs::remove_file(&threep).unwrap();
+        std::fs::create_dir_all(&threep).unwrap();
+        let r = restore_desktop_at(&normal, &threep, &profile, &meta, None);
+        println!("restore result err = {}", r.is_err());
+        println!("normal exists = {}", normal.exists());
+        println!("normal marker = {}", created_marker_path_for(&normal).exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn desktop_restore_keeps_3p_when_ccswitch_profile_remains() {
         // 回归护栏（曾把用户踢回 get-started 的 bug）：cc-switch 档共存且 appliedId 是本档时，
