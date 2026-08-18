@@ -88,6 +88,16 @@ fn apply_upstream_headers(
     if let Some((h, v)) = key.protocol.version_header() {
         rb = rb.header(h, v);
     }
+    // **显式要求不压缩**。转发路径是字节透明的：拿到上游 body 原样转给下游，既不解压
+    // （shared_client 关掉了自动解压，否则会破坏 SSE 分块与 content-length 语义），
+    // 也不透传上游的 content-encoding。于是一旦上游返回压缩体，下游拿到的就是一堆
+    // 压缩字节且无从得知 —— 表现为「乱码」。
+    //
+    // 而我们又刻意剥掉了下游客户端的 accept-encoding（见 is_stripped_header），
+    // 按 RFC 7231「缺 Accept-Encoding 视为任何编码都可接受」，网关**完全合法地**可以压缩。
+    // 补一条 `identity` 把这个口子堵在源头：对守规范的上游即「别压」。
+    // 放在最后设置，覆盖 fwd_headers 里可能漏过来的同名头。
+    rb = rb.header("accept-encoding", "identity");
     rb
 }
 
@@ -884,8 +894,16 @@ async fn handle_request(
                 .await
             {
                 Ok(StreamAttempt::Streaming { resp, url, real_model, request_body }) => {
-                    health::record_live_success(&store, &key.id);
-                    // 有 Key 能用了 → 立即解除「全部失败」短路，不等窗口自然到期。
+                    // ⚠️ **不在这里 record_live_success**。响应头 2xx 只说明「开流了」，不代表这次
+                    // 转发成功：上游可能 200 后在流内发 error 事件（Anthropic 过载最常见形态）。
+                    // 曾经在此处同步记成功，而「流内报错补记失败」要等 body 抽干才跑 ——
+                    // 于是每次请求都先把 fail_count 清零、再加回 1，BREAKER_THRESHOLD=3 永不达到，
+                    // 该 Key 永不熔断、客户端无限重试同一条坏 Key（实测复现：fail_count 恒为 1）。
+                    // 成功/失败的记账统一推迟到**流末**，由 try_stream_to_key 内的流终止路径按
+                    // 「有无流内 error」二选一记账（同协议走尾窗判错，跨协议走翻译器旁路的原始尾窗）。
+                    //
+                    // `clear_all_failed_gate` 仍留在这里：它是并发闸门，拿到 200 就说明池子里有能用的
+                    // Key，不该继续短路其它在途请求；若这条流随后失败，流末的失败记账会重新累积熔断。
                     clear_all_failed_gate(&gate_key);
                     let elapsed = started.elapsed().as_millis() as u64;
                     // 流式成功也记一条 request 事件（开关开启时）。请求体以「转换后发往上游」为主
@@ -1560,6 +1578,17 @@ async fn try_stream_to_key(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("text/event-stream")
         .to_string();
+    // 上游的 content-encoding（正常应为空——我们已发 `accept-encoding: identity`）。
+    // 仍取它是纵深防御：个别网关不守规范、不问自压。同协议是**字节透明**透传，
+    // 此时必须把该头一并转给下游，否则下游按明文解析一堆压缩字节 → 乱码。
+    // 跨协议不透传：那条路要自己解析 SSE 文本，压缩体根本翻译不了（见下方 else 分支说明）。
+    let upstream_content_encoding = resp
+        .headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty() && s != "identity")
+        .map(|s| s.to_string());
 
     let body: ResBody = match sse_dir {
         // 同协议：reqwest 字节流 → hyper StreamBody，逐块原样透传。
@@ -1650,14 +1679,15 @@ async fn try_stream_to_key(
                 merged.push_str(&String::from_utf8_lossy(&head_snap));
                 merged.push('\n');
                 merged.push_str(&tail_sse);
-                // 流内报错补记：try_stream_to_key 只探响应头，拿到 2xx 就已 record_live_success +
-                // 解除短路窗口。若上游 200 后在流内发 error 事件（Anthropic 过载常见形态），
-                // 这次转发已被误记成功、fail_count 清零、gate 解除 → 熔断/短路在流式主路径零保护，
-                // 客户端重试再打同一 Key 再 200+error，循环。故流末发现 error 事件则**补记失败**
-                // （无法故障转移已流出的这一次，但能让后续请求把该 Key 熔断，止住重试风暴）。
-                // 用尾窗判错：终止性 error 事件必在流末。
+                // 流末统一记账（成功/失败二选一）。**必须在这里而不是拿到 200 响应头时**：
+                // 上游可能 200 后在流内发 error 事件（Anthropic 过载常见形态）。早记成功会把
+                // fail_count 清零，使随后的失败补记永远只能把它从 0 加到 1、够不到熔断阈值
+                // （该 Key 永不熔断 → 客户端反复重打同一条坏 Key，正是熔断要止住的风暴）。
+                // 用尾窗判错：终止性 error 事件必落在流末 8KB 内。
                 if crate::upstream::sse_stream_errored(&tail_sse) {
                     health::record_live_failure(&store2, &key_id2);
+                } else {
+                    health::record_live_success(&store2, &key_id2);
                 }
                 if let Some(u) = crate::upstream::extract_usage_from_sse(&merged) {
                     // 补记进**流开始时已写下的那一行**，不新追加一条。
@@ -1707,6 +1737,12 @@ async fn try_stream_to_key(
                 /// 第二遍才真终止），不设这个闩会补记两次 —— 第二次把同一行的用量
                 /// 又写一遍，虽然值相同，但下次改成累加式补记时就是静默翻倍。
                 usage_recorded: bool,
+                /// 上游**原始**字节的尾窗（≤8KB），只用来判「流内有没有 error 事件」。
+                /// 必须存原始字节而不是翻译后的输出：翻译器会把它不认识的 error 事件整个丢掉
+                /// （sse.rs 六个方向函数无一读 error），翻译后的流里根本查不到错误痕迹。
+                raw_tail: Vec<u8>,
+                /// 健康记账只做一次（Drop 与终止分支可能都会走到）。
+                health_recorded: bool,
                 store: std::sync::Arc<Store>,
                 category: CategoryType,
                 key_id: String,
@@ -1720,10 +1756,41 @@ async fn try_stream_to_key(
             impl<S> Drop for StreamState<S> {
                 fn drop(&mut self) {
                     self.record_usage();
+                    self.record_health();
                 }
             }
 
             impl<S> StreamState<S> {
+                /// 上游原始尾窗，只保留末 8KB（终止性 error 事件必在流末）。
+                fn push_raw(&mut self, bytes: &[u8]) {
+                    self.raw_tail.extend_from_slice(bytes);
+                    if self.raw_tail.len() > TAIL_WINDOW_BYTES {
+                        let drop_n = self.raw_tail.len() - TAIL_WINDOW_BYTES;
+                        self.raw_tail.drain(0..drop_n);
+                    }
+                }
+
+                /// 本次流内是否出现上游 error 事件（判据与同协议分支共用同一个函数）。
+                fn saw_upstream_error(&self) -> bool {
+                    crate::upstream::sse_stream_errored(&String::from_utf8_lossy(&self.raw_tail))
+                }
+
+                /// 流末按「有无流内 error」二选一记账。理由同同协议分支：拿到 200 响应头只代表
+                /// 开流，早记成功会清零 fail_count 让后续失败补记永远够不到熔断阈值。
+                /// 此前**跨协议这条路连失败检测都没有**（翻译器丢掉 error 后照常冲刷 completed，
+                /// 下游拿到一条「成功完成的空回答」，健康态也被记成功）。
+                fn record_health(&mut self) {
+                    if self.health_recorded {
+                        return;
+                    }
+                    self.health_recorded = true;
+                    if self.saw_upstream_error() {
+                        health::record_live_failure(&self.store, &self.key_id);
+                    } else {
+                        health::record_live_success(&self.store, &self.key_id);
+                    }
+                }
+
                 /// 流终止时把翻译器累积的用量补进「流开始时已写下的那一行」。
                 fn record_usage(&mut self) {
                     if self.usage_recorded {
@@ -1750,6 +1817,8 @@ async fn try_stream_to_key(
                 upstream,
                 finished: false,
                 usage_recorded: false,
+                raw_tail: Vec::new(),
+                health_recorded: false,
                 store: usage_store,
                 category: usage_category,
                 key_id: usage_key_id,
@@ -1759,6 +1828,8 @@ async fn try_stream_to_key(
                 loop {
                     match st.upstream.next().await {
                         Some(Ok(bytes)) => {
+                            // 先留一份原始字节用于判错（翻译器会丢掉 error 事件，之后就查不到了）
+                            st.push_raw(&bytes);
                             let out = st.translator.push(&bytes);
                             if out.is_empty() {
                                 continue; // 该块未凑齐完整行，继续拉取
@@ -1777,6 +1848,16 @@ async fn try_stream_to_key(
                                 return None;
                             }
                             st.finished = true;
+                            // **上游流内报过 error 时不冲刷收尾事件**：`finish()` 会发
+                            // `response.completed` / `message_stop` / `[DONE]`，而 error 事件本身
+                            // 已被翻译器丢弃 —— 两者叠加会让下游拿到一条「状态 completed、内容为空
+                            // 或被截断」的**假成功**，用户看到的是「模型什么都没说」而不是上游过载。
+                            // 不发终止符，下游客户端会如实报「流未正常结束」，方向至少是对的。
+                            // （更好的做法是翻成下游协议的 error 事件，需在 sse.rs 六个方向各加一条，
+                            //  属独立改动，见 docs 待办。）
+                            if st.saw_upstream_error() {
+                                return None;
+                            }
                             let tail = st.translator.finish();
                             if tail.is_empty() {
                                 return None;
@@ -1798,10 +1879,20 @@ async fn try_stream_to_key(
         content_type
     };
 
-    let response = Response::builder()
+    let mut rb = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", out_content_type)
-        .header("cache-control", "no-cache")
+        .header("cache-control", "no-cache");
+    // 同协议字节透明透传时，把上游的 content-encoding 一并带给下游，让下游自己解压。
+    // 跨协议**刻意不带**：那条路输出的是翻译器重新生成的明文事件，带上压缩标记会让下游
+    // 去解压明文而失败。（真遇到「上游压缩 + 跨协议」时，翻译器本身就读不懂压缩字节，
+    // 属另一个问题：应在源头用 accept-encoding: identity 避免，见 apply_upstream_headers。）
+    if sse_dir.is_none() {
+        if let Some(enc) = &upstream_content_encoding {
+            rb = rb.header("content-encoding", enc.as_str());
+        }
+    }
+    let response = rb
         .body(body)
         .map_err(|e| AppError::upstream_msg(e.to_string()))?;
 
@@ -4412,6 +4503,24 @@ mod tests {
         assert!(!a.is_empty(), "流式路径应已收到请求");
         assert_eq!(a, b, "两条路径的请求头集合必须完全一致\n流式={a:?}\n非流式={b:?}");
 
+        // `accept-encoding` 被 pick 剔掉了（它不参与「两条路径一致」的比较），但它的**取值**
+        // 是一条独立的硬判据：转发路径字节透明、既不解压也（跨协议时）不透传 content-encoding，
+        // 故必须显式要求上游别压。缺这条时「缺 Accept-Encoding = 任何编码都可接受」，
+        // 网关合法地返回 gzip/br，下游拿到压缩字节 → 乱码。两条路径都必须带。
+        for (name, cap) in [("流式", &cap_stream), ("非流式", &cap_plain)] {
+            let g = cap.lock();
+            let hs = g.first().cloned().unwrap_or_default();
+            let ae = hs
+                .iter()
+                .find(|(k, _)| k == "accept-encoding")
+                .map(|(_, v)| v.as_str().to_ascii_lowercase());
+            assert_eq!(
+                ae.as_deref(),
+                Some("identity"),
+                "{name}路径必须显式发 `accept-encoding: identity`（否则上游可合法返回压缩体、下游乱码）"
+            );
+        }
+
         // 顺带钉住关键头的实际取值（这些是实测判据，改了会导致鉴权失败或被判 client_restricted）
         let m: std::collections::HashMap<_, _> = a.into_iter().collect();
         assert_eq!(m.get("x-api-key").map(String::as_str), Some("sk-test"), "Anthropic 用 x-api-key");
@@ -4951,6 +5060,7 @@ mod tests {
     ///
     /// 这里用 `Notify` 复现正确的同步语义：只有流走完并 notify 之后，补记侧读到的
     /// 才是完整尾部。若把 `notified().await` 删掉（回到旧写法），断言必须变红。
+
     #[tokio::test]
     async fn stream_tail_window_is_read_only_after_stream_completes() {
         use std::sync::Arc;
@@ -4984,6 +5094,93 @@ mod tests {
         assert!(
             seen.contains("usage"),
             "补记任务必须读到流末尾的 usage 数据，实际读到: {seen:?}"
+        );
+    }
+
+    /// 上游 mock：回 200 + `text/event-stream`，流内先发一个正常事件、再发终止性 error 事件。
+    /// 这是 Anthropic 过载最常见的真实形态（响应头已 200，错误藏在流里）。
+    async fn spawn_sse_inflight_error_mock() -> String {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| async move {
+                        let body: &[u8] = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+                        let resp = Response::builder()
+                            .status(200)
+                            .header("content-type", "text/event-stream")
+                            .body(full_body(Bytes::from(body)))
+                            .unwrap();
+                        Ok::<_, hyper::Error>(resp)
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// **P0 回归**：同协议流式「200 响应头 + 流内 error」必须能把 Key 熔断。
+    ///
+    /// 曾经的缺陷（实测复现过）：拿到 2xx 响应头就同步 `record_live_success`（fail_count 清零），
+    /// 而「流内报错补记失败」要等 body 抽干后的 spawn 任务才跑 —— 于是每次请求都是
+    /// 「先清零 → 再加回 1」，`BREAKER_THRESHOLD = 3` 永远达不到：该 Key 永不熔断，
+    /// 客户端反复重打同一条坏 Key，正是熔断机制要止住的重试风暴。
+    ///
+    /// 修法：把成功/失败记账统一推迟到**流末**，按有无流内 error 二选一。
+    ///
+    /// 故障注入判据：把 `record_live_success` 移回 `StreamAttempt::Streaming` 分支
+    /// （即恢复「响应头 200 就记成功」），本测试立即变红。
+    #[tokio::test]
+    async fn in_stream_error_accumulates_and_trips_breaker() {
+        let up = spawn_sse_inflight_error_mock().await;
+        let dir = temp_dir("sse_inflight_err");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        store.upsert_key(key("k1", 0, &up)).unwrap();
+        store.secrets.write().set("k1", "sk-test").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let cli = reqwest::Client::new();
+
+        // 连打 3 次（= BREAKER_THRESHOLD）。每次都必须把 body 抽干，流末记账才会发生。
+        for _ in 0..3 {
+            let resp = cli
+                .post(format!("http://127.0.0.1:{port}/v1/messages"))
+                .json(&serde_json::json!({
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 64,
+                    "stream": true,
+                    "messages": [{ "role": "user", "content": "hi" }]
+                }))
+                .send()
+                .await
+                .expect("请求应当拿到响应（上游确实回了 200）");
+            let _ = resp.bytes().await; // 抽干 → 触发流末补记任务
+            // 补记走 tokio::spawn，给它一点时间落地
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        let k = store
+            .list_keys(CategoryType::ClaudeCli)
+            .into_iter()
+            .find(|k| k.id == "k1")
+            .expect("Key 应仍在");
+        assert!(
+            k.health.fail_count >= 3 || k.health.breaker_until.is_some(),
+            "连续 3 次「200 + 流内 error」必须累积到熔断，实际 fail_count={} breaker_until={:?} \
+             —— 若 fail_count 恒为 1，说明每次请求又在响应头阶段把它清零了",
+            k.health.fail_count,
+            k.health.breaker_until
         );
     }
 }

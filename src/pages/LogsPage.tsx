@@ -43,6 +43,8 @@ const TYPE_META: Record<
   // 于是走 `TYPE_META[type] ?? TYPE_META.route` 兜底 → 全项目最重要的诊断行被渲染成
   // 绿色「路由」成功，语义相反且极难找到。与 warning 那条是同一缺陷形态。
   system: { tKey: "logs.type.system", variant: "neutral", icon: ScrollText },
+  // 余额查询成功。失败不走这里：后端按结果分流成 warning（否则失败会被埋在信息态里）。
+  balance: { tKey: "logs.type.balance", variant: "info", icon: KeyRound },
 };
 
 /** 日志分组：把事件类型归到用户可辨识的大类。
@@ -65,6 +67,7 @@ const GROUP_OF: Record<EventLogEntry["type"], LogGroup> = {
   warning: "error",
   // 启动自检等系统事件归 system 组（此前靠 `?? "system"` 兜底碰巧落对，现在显式登记）。
   system: "system",
+  balance: "system",
 };
 
 const GROUP_ORDER: LogGroup[] = ["system", "brain", "route", "failover", "error"];

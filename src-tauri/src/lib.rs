@@ -308,7 +308,8 @@ async fn query_key_balance(
         let reason = "该 Key 未配置余额查询";
         state.store.append_event(
             key.category_id,
-            "余额",
+            // 失败用已登记的 warning（橙、归「错误」组）：中文 kind 前端认不出，会兜底成绿色「路由成功」
+            "warning",
             Some(&key_id),
             &format!("查询失败：{}", reason),
         );
@@ -320,7 +321,8 @@ async fn query_key_balance(
         let reason = "密钥库已锁定，请先用主口令解锁";
         state.store.append_event(
             key.category_id,
-            "余额",
+            // 失败用已登记的 warning（橙、归「错误」组）：中文 kind 前端认不出，会兜底成绿色「路由成功」
+            "warning",
             Some(&key_id),
             &format!("查询失败：{}", reason),
         );
@@ -334,7 +336,8 @@ async fn query_key_balance(
         let reason = "未配置密钥";
         state.store.append_event(
             key.category_id,
-            "余额",
+            // 失败用已登记的 warning（橙、归「错误」组）：中文 kind 前端认不出，会兜底成绿色「路由成功」
+            "warning",
             Some(&key_id),
             &format!("查询失败：{}", reason),
         );
@@ -384,7 +387,11 @@ async fn query_key_balance(
 
     state.store.append_event(
         key.category_id,
-        "余额",
+        // kind 必须用**前端登记过的**英文标识：曾经这里写中文 "余额"，前端 TYPE_META 没有该键，
+        // 于是走 `?? TYPE_META.route` 兜底 → 余额**查询失败**被渲染成绿色「路由成功」，
+        // 且在「错误」筛选里查不到（用户完全看不见失败）。现在按结果分流：
+        // 失败 → warning（橙、归「错误」组）；成功 → balance（信息态、归「系统」组）。
+        if result.error.is_some() { "warning" } else { "balance" },
         Some(&key_id),
         &detail,
     );
