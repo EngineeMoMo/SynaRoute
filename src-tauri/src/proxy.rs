@@ -780,6 +780,16 @@ async fn handle_request(
     //   - 不能武装短路窗口——窗口内正常请求会被无辜挡住。
     // 与本仓契约 all_hard_errors_return_status_verbatim 一致：硬错误原样回、不退避、不熔断。
     let mut config_error = false;
+    // **整池**是否出现过「等一等可能会好」的失败（429/408/409/5xx/连接层失败）。
+    //
+    // 为什么不能只看最后一个候选：`last_status` 被每个候选无条件覆盖，于是
+    // 「k1 撞按天配额回 429 + Retry-After: 7；k2 是早已过期的备用 Key 回 401」这种**混合池**
+    // 里，尾部只看到 401 → 判硬错误 → 原样回 401 `authentication_error`、**丢掉 k1 给的
+    // Retry-After**、**不武装短路窗口**。而真实结论恰恰相反：池子里有一条 Key 只是限流，
+    // 7 秒后就能服务；回 401 会让客户端认为「密钥错了」不再重试，用户被引向完全错误的排查方向。
+    // 只要池里有一条是临时性的，整轮就该按临时性处置（529 + 最早 Retry-After + 短路窗口）；
+    // 硬错误的具体状态码仍在 failover 事件里对用户可见，不丢信息。
+    let mut saw_transient = false;
 
     // 故障转移总预算（FR：见 AppSettings::failover_total_budget_ms）。
     //
@@ -955,6 +965,8 @@ async fn handle_request(
                         retry_after_hint = Some(retry_after_hint.map_or(s, |cur: i64| cur.min(s)));
                     }
                     last_status = Some(status);
+                    // 整池口径：这一条是否属「等一等可能会好」（见 saw_transient 声明处的混合池说明）
+                    saw_transient = saw_transient || !all_failed_is_hard_error(false, last_status);
                     // 上游给了状态码 → 这次失败不是本地配置错误。必须复位 config_error，
                     // 否则前一个候选的 Invalid（缺 maxOutputTokens 等）会**粘住**这个标志：
                     // 「配置错 Key 优先 + 后续 Key 撞 429/5xx」时尾部会被判成硬错误，
@@ -985,6 +997,9 @@ async fn handle_request(
                     let is_config_err = matches!(e, AppError::Invalid(_));
                     last_err = e.to_string();
                     last_status = None; // 连接层失败：无状态码，按临时错误对待
+                    // 连接层失败属临时性，但**配置错误（Invalid）走的也是这个分支**、它永不自愈，
+                    // 不能让它把整轮判成临时性（否则丢掉可行动的 400、回成 529 让客户端无限退避）。
+                    saw_transient = saw_transient || !is_config_err;
                     config_error = is_config_err;
                     log_request(&store, key, elapsed, String::new(), key.resolve_model(&requested_model), downstream_body.clone(), last_err.clone(), None, false);
                     if !is_config_err {
@@ -1085,6 +1100,8 @@ async fn handle_request(
                     retry_after_hint = Some(retry_after_hint.map_or(s, |cur: i64| cur.min(s)));
                 }
                 last_status = Some(outcome.status);
+                // 整池口径：这一条是否属「等一等可能会好」（见 saw_transient 声明处的混合池说明）
+                saw_transient = saw_transient || !all_failed_is_hard_error(false, last_status);
                 // 复位理由同流式 HttpError 分支：上游有状态码 → 非本地配置错误，
                 // config_error 必须只反映最后一次失败的性质，不能被前一候选的 Invalid 粘住。
                 config_error = false;
@@ -1122,6 +1139,9 @@ async fn handle_request(
                 let is_config_err = matches!(e, AppError::Invalid(_));
                 last_err = e.to_string();
                 last_status = None; // 连接层失败：无状态码，按临时错误对待
+                // 连接层失败属临时性，但**配置错误（Invalid）走的也是这个分支**、它永不自愈，
+                // 不能让它把整轮判成临时性（否则丢掉可行动的 400、回成 529 让客户端无限退避）。
+                saw_transient = saw_transient || !is_config_err;
                 config_error = is_config_err;
                 log_request(
                     &store,
@@ -1161,7 +1181,12 @@ async fn handle_request(
     //
     // 429/408/409 之所以划进临时性：它们本就是「稍后重试」语义，且与 Anthropic SDK 的
     // 重试判据（408/409/429 或 >= 500）一致。
-    let is_hard_error = all_failed_is_hard_error(config_error, last_status);
+    //
+    // **整池口径**：`all_failed_is_hard_error` 只看最后一个候选，而 last_status 被每个候选无条件
+    // 覆盖。混合池（k1 撞配额 429+Retry-After / k2 过期 Key 回 401）下尾部只看到 401 → 原样回
+    // 401、丢掉 Retry-After、不武装短路窗口，把「7 秒后就能用」讲成「密钥错了」。故只要**池里
+    // 出现过**临时性失败（saw_transient），整轮就按临时性处置。硬错误码仍在 failover 事件里可见。
+    let is_hard_error = !saw_transient && all_failed_is_hard_error(config_error, last_status);
 
     if is_hard_error {
         // config_error 无上游状态码（last_status=None），用 400 Bad Request：
@@ -1557,11 +1582,20 @@ async fn try_stream_to_key(
     if !status.is_success() {
         // 非 2xx：缓冲错误体供切换决策与日志。Retry-After 须在读 body（消费 resp）之前取。
         let retry_after = parse_retry_after(resp.headers());
-        let body = resp
-            .bytes()
-            .await
-            .map(|b| String::from_utf8_lossy(&b).to_string())
-            .unwrap_or_default();
+        // **读错误体也必须有超时**（与探头同一口径）。此前这里是裸 `resp.bytes().await`：
+        // shared_client 只设了 connect_timeout、没有响应超时，而故障转移的 deadline 只管
+        // 「不再开始新尝试」、管不到已开始的这一次。于是上游发完 429/5xx 响应头就停止发 body
+        // （半开连接 / LB 中途丢弃 / chunked 不收尾）时，这个候选**永久阻塞**，后续候选一个都
+        // 轮不到，下游连接一直挂着直到客户端自己超时 —— 而 stream:true 是主路径。
+        // 错误体只用于日志与 last_err，读不全无所谓，宁可给个「读取超时」也不能挂住整条链。
+        let body = match tokio::time::timeout(probe_to, resp.bytes()).await {
+            Ok(Ok(b)) => String::from_utf8_lossy(&b).to_string(),
+            Ok(Err(e)) => format!("（错误体读取失败：{e}）"),
+            Err(_) => format!(
+                "（错误体读取超时：{}ms 内未读完，已按失败切换下一个候选）",
+                probe_to.as_millis()
+            ),
+        };
         return Ok(StreamAttempt::HttpError {
             status: status.as_u16(),
             body,
@@ -4311,6 +4345,57 @@ mod tests {
             "应透传候选中最短的 Retry-After：只要有一个候选先恢复就该放下游来探路，\
              取最长会让一个撞配额的 Key 把整池停摆"
         );
+
+        pm.stop(CategoryType::Codex);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **混合失败池**（P1 回归）：只要池里有一条 Key 是「等一等会好」，整轮就必须按临时性处置。
+    ///
+    /// 场景：k1（高优先级）撞按天配额回 `429 + Retry-After: 7`；k2 是早已过期的备用 Key 回 401。
+    /// 尾部分流原先只看 `last_status`（被每个候选无条件覆盖），于是只看到 k2 的 401 → 判硬错误
+    /// → **原样回 401 `authentication_error`、丢掉 k1 给的 Retry-After、不武装短路窗口**。
+    /// 客户端（Anthropic SDK）对 401 不退避重试，用户看到「密钥错误」而真实结论是
+    /// 「7 秒后就能用」—— 排查方向完全相反。
+    ///
+    /// 故障注入判据：把尾部的 `!saw_transient &&` 去掉，本测试立即变红（收到 401 而非 529）。
+    #[tokio::test]
+    async fn mixed_failure_pool_is_treated_as_transient_not_hard() {
+        let limited = spawn_mock_with_headers(429, "quota", &[("retry-after", "7")]).await;
+        let expired = spawn_mock(401, r#"{"error":{"message":"invalid api key"}}"#).await;
+        let dir = temp_dir("mixed_pool");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // k1 先被尝试（priority 0）回 429，k2 后被尝试回 401 —— 401 是「最后一次失败」。
+        let mut k1 = key("k1", 0, &limited);
+        k1.category_id = CategoryType::Codex;
+        let mut k2 = key("k2", 1, &expired);
+        k2.category_id = CategoryType::Codex;
+        store.upsert_key(k1).unwrap();
+        store.upsert_key(k2).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        store.secrets.write().set("k2", "y").unwrap();
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::Codex).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            529,
+            "池里有一条只是限流 → 整轮按临时性回 529，不能因为最后一个候选是 401 就原样回 401"
+        );
+        let ra = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .expect("限流候选给的 Retry-After 必须透传，不能被后面的硬错误候选丢掉");
+        assert_eq!(ra, 7, "应透传 429 候选给的 7 秒");
 
         pm.stop(CategoryType::Codex);
         std::fs::remove_dir_all(&dir).ok();

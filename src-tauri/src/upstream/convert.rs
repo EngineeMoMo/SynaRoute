@@ -260,6 +260,12 @@ pub fn anthropic_to_openai(body: &Value) -> Value {
                 // block 数组：拆出 text / tool_use / tool_result
                 Some(Value::Array(blocks)) => {
                     let mut text = String::new();
+                    // 图片块 → OpenAI 的 `image_url` + inline data URL（形状与 session.rs 的
+                    // `openai_user_content` 一致）。**必须翻译而不能丢**：此前 image 落进下面的
+                    // `_ => {}` 被静默吞掉，上游只收到纯文字 → 模型回「我没有看到图片」，全程 200
+                    // 无告警，用户只会怀疑模型或中转商；纯图消息还会让 text 为空、整条 user 消息
+                    // 被跳过（messages 可能变空 → 上游 400）。跨协议是本项目核心能力，不是边缘路径。
+                    let mut images: Vec<Value> = vec![];
                     let mut tool_calls: Vec<Value> = vec![];
                     let mut tool_results: Vec<Value> = vec![];
                     for b in blocks {
@@ -291,6 +297,34 @@ pub fn anthropic_to_openai(body: &Value) -> Value {
                                     "content": extract_text_content(b.get("content"))
                                 }));
                             }
+                            Some("image") => {
+                                // Anthropic: {"type":"image","source":{"type":"base64",
+                                //             "media_type":"image/png","data":"…"}}
+                                // OpenAI   : {"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}
+                                // 也兼容 source.type=="url"（部分中转商直接给外链）。
+                                let src = b.get("source");
+                                let url = match src.and_then(|s| s.get("type")).and_then(|t| t.as_str()) {
+                                    Some("url") => src
+                                        .and_then(|s| s.get("url"))
+                                        .and_then(|u| u.as_str())
+                                        .map(|u| u.to_string()),
+                                    _ => {
+                                        let mt = src
+                                            .and_then(|s| s.get("media_type"))
+                                            .and_then(|m| m.as_str())
+                                            .unwrap_or("image/png");
+                                        src.and_then(|s| s.get("data"))
+                                            .and_then(|d| d.as_str())
+                                            .map(|d| format!("data:{mt};base64,{d}"))
+                                    }
+                                };
+                                if let Some(url) = url {
+                                    images.push(json!({
+                                        "type": "image_url",
+                                        "image_url": { "url": url }
+                                    }));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -305,7 +339,17 @@ pub fn anthropic_to_openai(body: &Value) -> Value {
                         // （"tool_call_ids did not have response messages"）。故先把 tool 结果贴上去
                         // 补齐上一条 assistant 的工具调用，再追加 user 文本（工具消息之后的 user 消息合法）。
                         messages.append(&mut tool_results);
-                        if !text.is_empty() {
+                        if !images.is_empty() {
+                            // 有图 → content 必须是**数组**（OpenAI 的多模态形态）：文本块在前、
+                            // 图片块在后，与 session.rs 的 openai_user_content 顺序一致。
+                            // 纯图（text 为空）也要发出去，否则整条消息被跳过、图片彻底消失。
+                            let mut parts: Vec<Value> = vec![];
+                            if !text.is_empty() {
+                                parts.push(json!({ "type": "text", "text": text }));
+                            }
+                            parts.append(&mut images);
+                            messages.push(json!({ "role": role, "content": parts }));
+                        } else if !text.is_empty() {
                             messages.push(json!({ "role": role, "content": text }));
                         }
                     }
@@ -2388,6 +2432,58 @@ mod tests {
             to_anthropic["tool_choice"], json!({ "type": "none" }),
             "OpenAI none → Anthropic none（不得降级成 auto 重新启用工具）"
         );
+    }
+
+    /// **图片块不得被静默丢弃**（本轮审计 P1）。
+    ///
+    /// Claude Code 粘一张报错截图、而该分类的 Key 是 OpenAI-Chat 协议时，原先 image 块落进
+    /// block 匹配的 `_ => {}` 被吞掉：上游只收到纯文字 → 模型回「我没有看到图片」，全程 200
+    /// 无任何告警，用户只会怀疑模型或中转商。纯图消息更糟：text 为空导致整条 user 消息被跳过，
+    /// messages 可能变空 → 上游直接 400。
+    ///
+    /// 故障注入判据：删掉 `Some("image")` 分支或 `!images.is_empty()` 那段，本测试立即变红。
+    #[test]
+    fn anthropic_to_openai_translates_image_blocks_instead_of_dropping() {
+        // ① 文本 + 图片：content 应为数组，文本在前、image_url 在后
+        let body = json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "这个报错怎么回事" },
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AAAB" } }
+            ]}]
+        });
+        let out = anthropic_to_openai(&body);
+        let msgs = out["messages"].as_array().expect("应有 messages");
+        assert_eq!(msgs.len(), 1, "一条 user 轮次 → 一条消息:\n{out}");
+        let parts = msgs[0]["content"].as_array().expect("有图时 content 必须是数组");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(
+            parts[1]["image_url"]["url"], "data:image/png;base64,AAAB",
+            "base64 图片应转成 inline data URL"
+        );
+
+        // ② 纯图（无文本）：整条消息**必须仍然发出**，否则 messages 变空触发上游 400
+        let only_img = json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": [
+                { "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": "ZZZ" } }
+            ]}]
+        });
+        let out = anthropic_to_openai(&only_img);
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "纯图消息不得被整条跳过:\n{out}");
+        let parts = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["image_url"]["url"], "data:image/jpeg;base64,ZZZ");
+
+        // ③ 无图时保持原有形态（content 仍是纯字符串，不得无谓改成数组）
+        let plain = json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": [{ "type": "text", "text": "hi" }] }]
+        });
+        let out = anthropic_to_openai(&plain);
+        assert_eq!(out["messages"][0]["content"], json!("hi"), "无图时不改变既有形态");
     }
 
     #[test]

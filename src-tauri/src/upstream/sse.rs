@@ -118,6 +118,11 @@ pub struct SseTranslator {
     /// `response.output_item.done` 与 `response.completed.output[]` 可能重复携带同一个调用，
     /// 靠它保证同一个工具调用只翻成一个 tool_use 块。
     anthropic_tool_seen: std::collections::HashSet<String>,
+    /// 上游是否因输出上限**截断**。翻译到下游时必须如实转达，否则下游收到「正常结束」的
+    /// 半截回答：既不提示截断、也不触发续写，用户以为模型自己就答这么多。
+    /// 三个上游形态各自置位：Chat 的 finish_reason=="length"、Responses 的
+    /// response.status=="incomplete"、Anthropic 的 stop_reason=="max_tokens"。
+    upstream_truncated: bool,
 }
 
 impl SseTranslator {
@@ -151,6 +156,7 @@ impl SseTranslator {
             anthropic_next_block: 0,
             anthropic_text_open: None,
             anthropic_tool_seen: std::collections::HashSet::new(),
+            upstream_truncated: false,
         }
     }
 
@@ -451,7 +457,10 @@ impl SseTranslator {
         let completed = json!({
             "type": "response.completed",
             "response": {
-                "id": self.resp_id, "object": "response", "status": "completed", "model": self.model,
+                "id": self.resp_id, "object": "response",
+                // 截断时必须报 incomplete：Codex 靠它判断「回答未完」。
+                "status": if self.upstream_truncated { "incomplete" } else { "completed" },
+                "model": self.model,
                 "output": output,
                 "usage": { "input_tokens": it, "output_tokens": ot, "total_tokens": it + ot }
             }
@@ -494,7 +503,10 @@ impl SseTranslator {
                         out.push_str(&self.chat_tool_call_chunk_from_item(item));
                     }
                 }
-                let finish = if self.tool_calls.is_empty() { "stop" } else { "tool_calls" };
+                // 截断优先：上游被上限截断时 Chat 下游必须收到 "length"，否则半截回答被当正常结束。
+                let finish = if self.upstream_truncated {
+                    "length"
+                } else if self.tool_calls.is_empty() { "stop" } else { "tool_calls" };
                 out.push_str(&sse_data(&json!({
                     "object": "chat.completion.chunk",
                     "choices": [ { "index": 0, "delta": {}, "finish_reason": finish } ]
@@ -641,7 +653,12 @@ impl SseTranslator {
             }
         }
         // finish_reason 到达 → tool_calls 已完整，成块发出（收尾事件由 finish()/message_stop 负责）。
-        if choice0.and_then(|c| c.get("finish_reason")).and_then(|r| r.as_str()).is_some() {
+        if let Some(fr) = choice0.and_then(|c| c.get("finish_reason")).and_then(|r| r.as_str()) {
+            // 原先只判 `is_some()` 就把值丢了 → 上游 "length"（输出被上限截断）在下游变成
+            // end_turn，用户看到一段「正常结束」的半截回答，既无提示也不会续写。
+            if fr == "length" {
+                self.upstream_truncated = true;
+            }
             out.push_str(&self.flush_anthropic_tool_calls());
         }
         // usage（Chat 末尾 chunk，需 stream_options）→ 收尾时由 message_delta 带给 Anthropic 下游。
@@ -691,7 +708,11 @@ impl SseTranslator {
         let mut out = self.flush_anthropic_tool_calls();
         self.started = false;
         out.push_str(&self.close_anthropic_text_block());
-        let stop_reason = if self.anthropic_tool_seen.is_empty() {
+        // 截断优先：被输出上限截断时必须发 max_tokens，否则下游把半截回答当「正常结束」，
+        // 既不提示截断也不触发续写（原先只按有无工具调用二选一，上游的 length/incomplete 被丢弃）。
+        let stop_reason = if self.upstream_truncated {
+            "max_tokens"
+        } else if self.anthropic_tool_seen.is_empty() {
             "end_turn"
         } else {
             "tool_use"
@@ -730,6 +751,13 @@ impl SseTranslator {
                 String::new()
             }
             "message_delta" => {
+                // 上游 Anthropic 用 delta.stop_reason=="max_tokens" 表达「被输出上限截断」。
+                // 不读它，翻到 Chat/Responses 下游就只剩 stop/completed —— 截断信号整条丢失。
+                if ev.get("delta").and_then(|d| d.get("stop_reason")).and_then(|r| r.as_str())
+                    == Some("max_tokens")
+                {
+                    self.upstream_truncated = true;
+                }
                 if let Some(ot) = ev
                     .get("usage")
                     .and_then(|u| u.get("output_tokens"))
@@ -818,7 +846,10 @@ impl SseTranslator {
             "message_stop" => {
                 // 有工具调用时 finish_reason 必须是 tool_calls：报 stop 会让下游客户端
                 // 认定本轮结束而不执行工具（与 →Anthropic 方向的 stop_reason 同一道理）。
-                let finish = if self.tool_calls.is_empty() { "stop" } else { "tool_calls" };
+                // 截断优先：上游被上限截断时 Chat 下游必须收到 "length"，否则半截回答被当正常结束。
+                let finish = if self.upstream_truncated {
+                    "length"
+                } else if self.tool_calls.is_empty() { "stop" } else { "tool_calls" };
                 let mut out = sse_data(&json!({
                     "object": "chat.completion.chunk",
                     "choices": [ { "index": 0, "delta": {}, "finish_reason": finish }]
@@ -966,6 +997,13 @@ impl SseTranslator {
             }
             // message_delta：捕获 output_tokens（收尾 usage 归位）
             "message_delta" => {
+                // 上游 Anthropic 用 delta.stop_reason=="max_tokens" 表达「被输出上限截断」。
+                // 不读它，翻到 Chat/Responses 下游就只剩 stop/completed —— 截断信号整条丢失。
+                if ev.get("delta").and_then(|d| d.get("stop_reason")).and_then(|r| r.as_str())
+                    == Some("max_tokens")
+                {
+                    self.upstream_truncated = true;
+                }
                 if let Some(ot) = ev
                     .get("usage")
                     .and_then(|u| u.get("output_tokens"))
@@ -1048,6 +1086,13 @@ impl SseTranslator {
                 }
             }
             "response.completed" => {
+                // 上游 Responses 用 `status:"incomplete"` 表达「被上限截断」（不是另一个事件名）。
+                // 不读它，下游 Anthropic 就只会收到 end_turn —— 半截回答被当正常结束。
+                if ev.get("response").and_then(|r| r.get("status")).and_then(|s| s.as_str())
+                    == Some("incomplete")
+                {
+                    self.upstream_truncated = true;
+                }
                 // usage 归位：Responses 的 usage 在 completed 里，Anthropic 由 message_delta 承载。
                 if let Some(u) = ev.get("response").and_then(|r| r.get("usage")) {
                     if let Some(it) = u.get("input_tokens").and_then(|t| t.as_u64()) {
@@ -1547,6 +1592,66 @@ mod tests {
         assert!(!out.contains("\"delta\":\"Let me\"") || out.contains("reasoning_summary_text.delta"), "思考不应作为普通文本增量");
         // 普通文本仍正常
         assert!(out.contains("\"delta\":\"Hi\""), "回答文本未透传");
+    }
+
+    /// **截断信号必须跨协议如实转达**（本轮审计 P1 + 两条同类 P2）。
+    ///
+    /// 三种上游形态各自表达「被输出上限截断」：Chat 的 `finish_reason:"length"`、
+    /// Anthropic 的 `delta.stop_reason:"max_tokens"`、Responses 的 `response.status:"incomplete"`。
+    /// 原先翻译器**一个都不读**：→Anthropic 只按有无工具发 end_turn/tool_use、→Chat 恒发
+    /// stop/tool_calls、→Responses 把 status 硬写成 completed。于是下游收到一段「正常结束」的
+    /// 半截回答：既不提示截断，也不触发续写，用户以为模型自己就答这么多。
+    ///
+    /// 故障注入判据：把 `upstream_truncated` 的任一置位点或任一消费点去掉，对应断言即变红。
+    #[test]
+    fn truncation_signal_survives_every_direction() {
+        // ① Chat 上游(length) → Anthropic 下游：必须 stop_reason=max_tokens
+        let mut tr = SseTranslator::new(SseDirection::ChatToAnthropic);
+        let mut out = tr.push(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"},\"finish_reason\":null}]}\n\n",
+        );
+        out.push_str(&tr.push(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+        ));
+        out.push_str(&tr.finish());
+        assert!(
+            out.contains("\"stop_reason\":\"max_tokens\""),
+            "Chat 的 length 必须翻成 Anthropic 的 max_tokens:\n{out}"
+        );
+
+        // ② Anthropic 上游(max_tokens) → Chat 下游：必须 finish_reason=length
+        let mut tr = SseTranslator::new(SseDirection::AnthropicToChat);
+        let mut out = tr.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}\n\n");
+        out.push_str(&tr.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":9}}\n\n"));
+        out.push_str(&tr.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+        out.push_str(&tr.finish());
+        assert!(
+            out.contains("\"finish_reason\":\"length\""),
+            "Anthropic 的 max_tokens 必须翻成 Chat 的 length:\n{out}"
+        );
+
+        // ③ Anthropic 上游(max_tokens) → Responses 下游：response.status 必须 incomplete
+        let mut tr = SseTranslator::new(SseDirection::AnthropicToResponses);
+        let mut out = tr.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}\n\n");
+        out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"half\"}}\n\n"));
+        out.push_str(&tr.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":9}}\n\n"));
+        out.push_str(&tr.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+        out.push_str(&tr.finish());
+        assert!(
+            out.contains("\"status\":\"incomplete\""),
+            "截断时 Responses 顶层 status 必须是 incomplete（Codex 靠它判断回答未完）:\n{out}"
+        );
+
+        // ④ 未截断时不得误报（防「一律写 max_tokens/length/incomplete」的过度修复）
+        let mut tr = SseTranslator::new(SseDirection::ChatToAnthropic);
+        let mut out = tr.push(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        out.push_str(&tr.finish());
+        assert!(
+            out.contains("\"stop_reason\":\"end_turn\"") && !out.contains("max_tokens"),
+            "正常结束不得报截断:\n{out}"
+        );
     }
 
     #[test]
