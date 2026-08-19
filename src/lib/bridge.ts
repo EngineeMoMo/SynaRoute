@@ -128,6 +128,16 @@ export const api = {
       mockBridge.setPrimaryKey(categoryId, keyId),
     ),
 
+  // 上移/下移优先级。与 setPrimaryKey 同理收归后端：只动 priority、原子重编号。
+  // 旧实现是前端重编号后对每条变化的 Key 各发一次 upsertKey，两个真实后果 ——
+  // ① 其中一条被桌面端对外名校验拒绝时，其余已落盘 → 优先级留下重复值/空洞；
+  // ② 弹出的错误是那条校验失败，与「调整顺序」毫不相干，读起来像排序功能坏了。
+  // 返回是否真的改了（已在两端则 false）。
+  moveKey: (categoryId: CategoryType, keyId: string, direction: "up" | "down") =>
+    call<boolean>("move_key", { categoryId, keyId, direction }, () =>
+      mockBridge.moveKey(categoryId, keyId, direction),
+    ),
+
   // ---- 从 cc-switch 导入历史 Key（只读对方库；导入后不接入）----
   scanCcswitch: () =>
     call<CcSwitchScanResult>("scan_ccswitch", undefined, () => mockBridge.scanCcswitch()),

@@ -519,6 +519,28 @@ export const mockBridge = {
     return changed;
   },
 
+  // 与后端 Store::move_key 同规则：与相邻项交换后整列重编号为连续 0,1,2…
+  // 已在两端则返回 false（不改动）。
+  async moveKey(categoryId: CategoryType, keyId: string, direction: "up" | "down") {
+    await delay();
+    const list = store[categoryId] ?? [];
+    const ordered = [...list].sort((a, b) => a.priority - b.priority);
+    const idx = ordered.findIndex((k) => k.id === keyId);
+    if (idx < 0) return false;
+    const swapWith = direction === "up" ? idx - 1 : idx + 1;
+    if (swapWith < 0 || swapWith >= ordered.length) return false;
+    [ordered[idx], ordered[swapWith]] = [ordered[swapWith], ordered[idx]];
+    let changed = false;
+    ordered.forEach((k, i) => {
+      const live = list.find((x) => x.id === k.id);
+      if (live && live.priority !== i) {
+        live.priority = i;
+        changed = true;
+      }
+    });
+    return changed;
+  },
+
   // 浏览器预览态：给出一份覆盖各种分支的假候选（可导入 / 重复 / 官方档 / 不支持端），
   // 让 UI 的每种状态都能在 npm run dev 下被看到。
   async scanCcswitch() {

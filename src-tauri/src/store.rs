@@ -1416,7 +1416,25 @@ impl Store {
         // 失败回滚：落盘失败不让内存领先磁盘（见 mutate_and_persist）。
         self.mutate_and_persist(|cfg| {
             if let Some(existing) = cfg.keys.iter_mut().find(|k| k.id == key.id) {
+                // ⚠️ **运行态字段一律沿用库里现值，前端传什么都忽略**。
+                //
+                // 这些字段由后端在运行中维护（健康探测/熔断计数/余额缓存），而前端的
+                // ProviderKey 是**打开编辑器那一刻的快照**。抽屉常开着几十秒（改映射、填窗口），
+                // 期间代理仍在转发：若该 Key 连续失败 3 次已武装熔断（分类页顶部有「熔断中」横幅），
+                // 用户此时点「保存」，整份替换就会把 breaker_until 清空、fail_count 归零 ——
+                // **熔断当场被静默解除**，下一个请求又打向那条坏 Key。
+                // 同理 cached_balance 会被旧快照顶回去，卡片显示过期余额。
+                //
+                // 「上移/下移」也走整份 upsert（前端重编号后并发提交），同样会踩中这一条。
+                // 收在这里而不是让每个调用点自觉，是因为漏一处就是一个静默失效点。
+                let health = existing.health.clone();
+                let cached_balance = existing.cached_balance.clone();
                 *existing = key.clone();
+                existing.health = health;
+                existing.cached_balance = cached_balance;
+                // 回填给调用方，避免返回值里带着被忽略的旧快照（前端据它刷新列表）。
+                key.health = existing.health.clone();
+                key.cached_balance = existing.cached_balance.clone();
             } else {
                 cfg.keys.push(key.clone());
             }
@@ -1552,6 +1570,64 @@ impl Store {
         if !changed {
             return Ok(false);
         }
+
+        self.mutate_and_persist(|cfg| {
+            for (i, id) in ordered_ids.iter().enumerate() {
+                if let Some(k) = cfg.keys.iter_mut().find(|k| &k.id == id) {
+                    k.priority = i as i32;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
+    /// 把某 Key 在**同分类内**上移/下移一位，并把整列重编号为连续 `0..n-1`。
+    /// 返回 `false` 表示已在两端、无需改动（幂等）。
+    ///
+    /// 为什么必须收在后端（与 [`Self::set_primary_key`] 同一道理）：前端原先是
+    /// 「本地重排 → 对优先级变化的每条 Key 各发一次整份 `upsert_key`（`Promise.all`）」，
+    /// 有三个问题，都不报错但结果错：
+    /// 1. **部分写入**。桌面端分类下 `upsert_key` 会过一道对外名合规校验
+    ///    （`reject_desktop_key_with_unusable_model_names`）。列里若有一条老 Key 的模型名
+    ///    不合规，它那次 upsert 被拒、其余几条已落盘 → 优先级留下重复值/空洞
+    ///    （两条都是 0），而弹出的 toast 说的是「某个模型名不能用」，与「调整顺序」
+    ///    毫不相干，用户完全对不上因果。
+    /// 2. **回写陈旧运行态**。整份 upsert 带着打开页面那一刻的 health 快照
+    ///    （`upsert_key` 现已在服务端兜住，但让顺序调整走一条根本不该碰这些字段的路，
+    ///    本身就是多余的风险面）。
+    /// 3. **非原子**。`Promise.all` 的几次写各自独立落盘，中途失败就是半套顺序。
+    ///
+    /// 这里只改 `priority` 一个字段、一次落盘、不过 Key 全量校验，也就没有上面三条。
+    pub fn move_key(&self, category: CategoryType, key_id: &str, up: bool) -> AppResult<bool> {
+        // 目标次序在读锁里算好，写锁里只做赋值（与 set_primary_key 同结构）。
+        let ordered_ids: Vec<String> = {
+            let cfg = self.config.read();
+            let mut same: Vec<&ProviderKey> =
+                cfg.keys.iter().filter(|k| k.category_id == category).collect();
+            // 与界面同一口径：按 priority 升序（含未启用的 Key，它们在列表里也占位）。
+            same.sort_by_key(|k| k.priority);
+            let mut ids: Vec<String> = same.iter().map(|k| k.id.clone()).collect();
+            let Some(idx) = ids.iter().position(|id| id == key_id) else {
+                return Err(AppError::NotFound(format!(
+                    "分类 {} 下没有 id={key_id} 的 Key",
+                    category.as_str()
+                )));
+            };
+            let swap_with = if up {
+                if idx == 0 {
+                    return Ok(false); // 已在首位
+                }
+                idx - 1
+            } else {
+                if idx + 1 >= ids.len() {
+                    return Ok(false); // 已在末位
+                }
+                idx + 1
+            };
+            ids.swap(idx, swap_with);
+            ids
+        };
 
         self.mutate_and_persist(|cfg| {
             for (i, id) in ordered_ids.iter().enumerate() {
@@ -2821,6 +2897,66 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **保存 Key 不得清掉正在生效的运行态**（本轮审计 P1）。
+    ///
+    /// 前端的 ProviderKey 是「打开编辑器那一刻的快照」，而抽屉常开着几十秒（改映射、填窗口），
+    /// 期间代理仍在转发。若该 Key 已连续失败并武装熔断，用户此时点「保存」，整份替换会把
+    /// breaker_until 清空、fail_count 归零 —— **熔断被静默解除**，下一个请求又打向坏 Key。
+    /// 「上移/下移」也走整份 upsert，同样踩这条。cached_balance 同理（旧余额顶回卡片）。
+    ///
+    /// 故障注入判据：去掉 upsert_key 里沿用 health/cached_balance 的两行，本测试立即变红。
+    #[test]
+    fn upsert_key_preserves_runtime_state_against_stale_client_snapshot() {
+        let dir = temp_dir("upsert_keeps_runtime");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let mut k = sample_key("k1", 0);
+        k.id = "k1".into();
+        store.upsert_key(k.clone()).unwrap();
+
+        // 模拟运行中：连续失败到武装熔断
+        for _ in 0..3 {
+            crate::health::record_live_failure(&store, "k1");
+        }
+        let armed = store
+            .list_keys(CategoryType::ClaudeCli)
+            .into_iter()
+            .find(|x| x.id == "k1")
+            .unwrap()
+            .health;
+        assert!(
+            armed.breaker_until.is_some(),
+            "前置条件：连续 3 次失败应已武装熔断，实际 {armed:?}"
+        );
+
+        // 用户在抽屉里点「保存」：发出的是**挂载时的旧快照**（health 为默认值）
+        let mut stale = k.clone();
+        stale.health = crate::model::HealthState::default();
+        stale.name = "改了个名字".into();
+        let saved = store.upsert_key(stale).unwrap();
+
+        // 用户可编辑字段要生效，运行态必须沿用库里现值
+        assert_eq!(saved.name, "改了个名字", "用户改的字段应正常保存");
+        let after = store
+            .list_keys(CategoryType::ClaudeCli)
+            .into_iter()
+            .find(|x| x.id == "k1")
+            .unwrap()
+            .health;
+        assert!(
+            after.breaker_until.is_some(),
+            "保存 Key 不得解除正在生效的熔断，实际 {after:?}"
+        );
+        assert_eq!(after.fail_count, armed.fail_count, "fail_count 不得被旧快照归零");
+        assert!(
+            saved.health.breaker_until.is_some(),
+            "返回值也应带库里的真实运行态（前端据它刷新列表）"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 被大脑聚合引用的 Key **不得**被删除，且错误要点明具体位置。
     ///
     /// 为什么这条防线必须有：删掉一个正在被聚合使用的 Key 后，成员会在下次调用时被静默跳过
@@ -4000,6 +4136,73 @@ mod tests {
         assert_eq!(ids[0], "c", "目标必须成为主");
         let prios: Vec<i32> = ordered.iter().map(|k| k.priority).collect();
         assert_eq!(prios, vec![0, 1, 2], "必须重编号为连续值，否则同级下无确定主备顺序");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 上移/下移：相邻交换 + 整列连续重编号，**且不碰健康态**。
+    ///
+    /// 这条测试钉住把排序收归后端的三个理由（旧实现是前端重编号后并发 `upsert_key`）：
+    /// 1. **原子**：一次调用改完整列，不会出现「一半落盘、一半被拒」的重复优先级/空洞。
+    /// 2. **不碰运行态**：只写 `priority`，正在生效的熔断不被解除（旧实现整份覆盖会清零）。
+    /// 3. **端点幂等**：已在两端时返回 false、不写盘，连点箭头不产生噪音。
+    ///
+    /// 故障注入判据：把 `move_key` 改成整份替换（连 health 一起写），第 2 段断言变红。
+    #[test]
+    fn move_key_swaps_renumbers_and_preserves_health() {
+        let dir = temp_dir("move_key");
+        let cfg = dir.join("config.json");
+        let store = std::sync::Arc::new(
+            Store::new_at(cfg.clone(), dir.join("secrets.enc")).unwrap(),
+        );
+        for (id, p) in [("a", 0), ("b", 1), ("c", 2)] {
+            let mut k = sample_key(id, p);
+            k.id = id.into();
+            store.upsert_key(k).unwrap();
+        }
+
+        // 运行中：b 连续失败到武装熔断（分类页此时显示「熔断中」横幅）。
+        for _ in 0..3 {
+            crate::health::record_live_failure(&store, "b");
+        }
+        assert!(
+            store.get_key("b").unwrap().health.breaker_until.is_some(),
+            "前置条件：b 应已武装熔断"
+        );
+
+        // 下移 a：顺序应变成 b, a, c 且优先级连续。
+        assert!(store.move_key(CategoryType::ClaudeCli, "a", false).unwrap(), "应有改动");
+        let ids: Vec<String> = {
+            let c = store.config.read();
+            let mut same: Vec<&ProviderKey> = c
+                .keys
+                .iter()
+                .filter(|k| k.category_id == CategoryType::ClaudeCli)
+                .collect();
+            same.sort_by_key(|k| k.priority);
+            same.iter().map(|k| k.id.clone()).collect()
+        };
+        assert_eq!(ids, vec!["b", "a", "c"], "下移应与后一条交换");
+        let prios: Vec<i32> = ids
+            .iter()
+            .map(|id| store.get_key(id).unwrap().priority)
+            .collect();
+        assert_eq!(prios, vec![0, 1, 2], "必须重编号为连续值（否则同级下无确定主备顺序）");
+
+        // 关键：排序不得动健康态 —— b 的熔断必须还在。
+        assert!(
+            store.get_key("b").unwrap().health.breaker_until.is_some(),
+            "调整顺序不得解除正在生效的熔断，实际 {:?}",
+            store.get_key("b").unwrap().health
+        );
+
+        // 端点幂等：b 已在队首，再上移应返回 false 且不写盘。
+        let before = std::fs::read(&cfg).unwrap();
+        assert!(
+            !store.move_key(CategoryType::ClaudeCli, "b", true).unwrap(),
+            "已在队首应返回 false"
+        );
+        assert_eq!(std::fs::read(&cfg).unwrap(), before, "幂等时磁盘不应被改写");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -203,6 +203,43 @@ fn set_primary_key(
     Ok(changed)
 }
 
+/// 上移 / 下移某 Key 的优先级（相邻交换 + 整列连续重编号）。
+///
+/// 为什么收进后端、而不是让前端重编号后并发 `upsert_key`（旧实现）：
+/// 1. **部分写入**。前端对优先级变化的每条各发一次 upsert，桌面端分类里若有一条 Key 的
+///    对外名不合规（老配置/导入后未补映射），那条会被 `reject_desktop_key_with_unusable_model_names`
+///    拒绝，而其余几条已经落盘 → 优先级留下重复值或空洞，顺序变成半调整状态。
+/// 2. **报错方向错**。上面那次拒绝弹出的是「某 Key 模型名不可服务」，与用户刚点的
+///    「调整顺序」毫无关系，读起来像是排序功能坏了。
+/// 3. **陈旧运行态**。整份 upsert 会把打开页面那一刻的 health 快照写回去（熔断被静默解除）。
+///    `upsert_key` 已加守卫沿用库里现值，但排序本来就不该走那条整份替换的路。
+///
+/// 与 `set_primary_key` 并列：重排规则只在 `Store` 里有一份，托盘与界面共用。
+#[tauri::command]
+fn move_key(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+    category_id: CategoryType,
+    key_id: String,
+    direction: String,
+) -> AppResult<bool> {
+    let up = match direction.as_str() {
+        "up" => true,
+        "down" => false,
+        other => {
+            return Err(crate::error::AppError::Invalid(format!(
+                "方向只能是 up / down，收到 `{other}`"
+            )))
+        }
+    };
+    let changed = state.store.move_key(category_id, &key_id, up)?;
+    if changed {
+        // 主 Key 可能因此易主（上移到 0 / 原主被顶下去）→ 托盘勾选要跟上。
+        let _ = rebuild_tray(&app);
+    }
+    Ok(changed)
+}
+
 // ============ 从 cc-switch 导入历史 Key ============
 //
 // 只读 cc-switch 的 SQLite 库（先复制到临时文件再打开），把它的供应商档映射成
@@ -1529,6 +1566,7 @@ pub fn run() {
             detect_codegraph,
             codegraph_init,
             set_primary_key,
+            move_key,
             get_master_password_state,
             unlock_master_password,
             lock_master_password,

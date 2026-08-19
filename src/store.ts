@@ -452,9 +452,15 @@ export const useStore = create<AppState>((set, get) => ({
     await get().loadCategory(get().activeCategory);
   },
 
-  // 调整故障转移优先级：在「同分类的全部 Key」按优先级排序后，与相邻 Key 交换位置。
-  // 重排后把整列优先级重新赋为连续值 0,1,2…，一劳永逸消除「全 999 同级」——
-  // 只有优先级互不相同，故障转移才有确定的主/备顺序（否则永远先打第一个 Key，触发限流）。
+  // 调整故障转移优先级：与相邻 Key 交换位置，并把整列重编号为连续 0,1,2…
+  // （消除「全 999 同级」——只有优先级互不相同，故障转移才有确定的主/备顺序。）
+  //
+  // **重排本身在后端一次原子完成**（`move_key` 命令 → `Store::move_key`），
+  // 前端只做乐观更新。旧实现是前端自己重编号、再对变化的每条并发 `upsertKey`：
+  // ① 那把「换个顺序」变成 N 次整份 Key 覆盖，桌面端分类里若有一条 Key 的对外名不合规，
+  //    `Promise.all` 中那条被拒、其余已落盘 → 优先级留下重复值/空洞，顺序半调整；
+  //    而 toast 弹的是「某 Key 模型名不可服务」，与用户刚点的箭头毫不相干。
+  // ② 提交的是页面快照，会把运行态（熔断计数/余额缓存）一起写回去。
   async moveKey(keyId, direction) {
     const cat = get().activeCategory;
     const ordered = [...get().keys]
@@ -465,18 +471,12 @@ export const useStore = create<AppState>((set, get) => ({
     const swapWith = direction === "up" ? idx - 1 : idx + 1;
     if (swapWith < 0 || swapWith >= ordered.length) return; // 已在两端，无法再移
 
+    // 乐观更新：先按交换后的顺序连续重编号刷新列表（后端用同一套规则，随后 reload 对齐）。
     [ordered[idx], ordered[swapWith]] = [ordered[swapWith], ordered[idx]];
-    // 规整为连续优先级 0,1,2…（消除全 999 同级），只对优先级真正变化的 Key 落盘。
-    const renumbered = ordered.map((k, i) => ({ ...k, priority: i }));
-    const toPersist = renumbered.filter((k) => {
-      const orig = get().keys.find((o) => o.id === k.id);
-      return orig && orig.priority !== k.priority;
-    });
-    // 乐观更新：立即用新优先级刷新列表。
-    const byId = new Map(renumbered.map((k) => [k.id, k]));
+    const byId = new Map(ordered.map((k, i) => [k.id, { ...k, priority: i }]));
     set({ keys: get().keys.map((k) => byId.get(k.id) ?? k) });
     try {
-      await Promise.all(toPersist.map((k) => api.upsertKey(k)));
+      await api.moveKey(cat, keyId, direction);
     } catch (e) {
       console.error("moveKey failed", e);
       get().showToast("error", String((e as Error)?.message ?? e));

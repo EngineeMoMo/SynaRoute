@@ -124,7 +124,6 @@ struct RawProvider {
     app_type: String,
     name: String,
     settings_config: String,
-    sort_index: i64,
     is_current: bool,
 }
 
@@ -162,8 +161,13 @@ fn read_providers_at(db: &std::path::Path) -> AppResult<Vec<RawProvider>> {
                 // COALESCE 不是保险起见：本机实测 cc-switch 对用户自建档的 `sort_index` 写的是
                 // NULL（只有内置官方模板写 0）。不兜底会让 rusqlite 取列时报 InvalidColumnType，
                 // 整次扫描直接失败。name / app_type 同理兜底，杜绝单条脏数据毁掉全部导入。
+                // `sort_index` 只留在 ORDER BY 里、**不再取进 RawProvider**：导入时的
+                // priority 由「本分类现有最大值 + 1」逐条分配（见 import_rows），照搬
+                // cc-switch 的值会让自建档（NULL→0）全撞成 priority=0。留着排序是有用的：
+                // 它让扫描列表的顺序与用户在 cc-switch 里看到的顺序一致，导入后的相对
+                // 先后也就随之保持。
                 "SELECT COALESCE(id, ''), COALESCE(app_type, ''), COALESCE(name, ''), \
-                 settings_config, COALESCE(sort_index, 0), COALESCE(is_current, 0) \
+                 settings_config, COALESCE(is_current, 0) \
                  FROM providers ORDER BY app_type, sort_index, name",
             )
             .map_err(|e| AppError::Other(format!("查询 providers 失败（表结构可能已变）: {e}")))?;
@@ -174,8 +178,9 @@ fn read_providers_at(db: &std::path::Path) -> AppResult<Vec<RawProvider>> {
                     app_type: r.get(1)?,
                     name: r.get(2)?,
                     settings_config: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    sort_index: r.get(4)?,
-                    is_current: r.get::<_, i64>(5)? != 0,
+                    // 列索引跟着 SELECT 走：`sort_index` 已从投影里去掉（只留在 ORDER BY），
+                    // 故 is_current 现在是第 4 列而非第 5 列。
+                    is_current: r.get::<_, i64>(4)? != 0,
                 })
             })
             .map_err(|e| AppError::Other(format!("读取 providers 行失败: {e}")))?;
@@ -451,6 +456,19 @@ fn import_rows(
         }
 
         let key_id = new_key_id(seq);
+        // 优先级**不照搬 cc-switch 的 sort_index**：它对自建档写的是 NULL，读取时
+        // `COALESCE(sort_index,0)` 会把它们全变成 0 → 一次导入 3 条自建档得到三条 priority=0：
+        // 分类页三张卡片**同时**显示「主 Key」徽标、一个「设为主」按钮都没有，用户无法从界面
+        // 判断谁是主；`enabled_keys_sorted` 是稳定排序，实际路由顺序退化为配置文件里的偶然次序。
+        // 故按「该分类现有最大 priority + 1」逐条递增分配，保证互不相同、且排在既有 Key 之后
+        // （导入的是备用来源，不该抢掉用户已配好的主 Key）。
+        let next_priority = store
+            .list_keys(category)
+            .iter()
+            .map(|k| k.priority)
+            .max()
+            .map(|m| m.saturating_add(1))
+            .unwrap_or(0);
         let key = ProviderKey {
             id: key_id.clone(),
             category_id: category,
@@ -465,7 +483,7 @@ fn import_rows(
             has_secret: false,
             // 导入即启用：用户是主动勾选的，默认可用符合预期；不想用可在列表里关。
             enabled: true,
-            priority: raw.sort_index as i32,
+            priority: next_priority,
             headers_json: None,
             params: KeyParams::default(),
             // 模型列表留空：导入不联网。用户点「拉取模型」再填，避免导入阶段卡在网络上。
@@ -759,6 +777,87 @@ mod tests {
         let third = import_at(&store, &other, &["p-same-site".to_string()]).unwrap();
         assert_eq!(third.imported, 1, "同站不同密钥应视为新账号: {:?}", third.outcomes);
         assert_eq!(store.list_keys(CategoryType::ClaudeCli).len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 一次导入多条 cc-switch 自建档时，`priority` 必须**互不相同**。
+    ///
+    /// 为什么值得单独立一条：cc-switch 对用户自建档的 `sort_index` 写的是 NULL，
+    /// 读取时 `COALESCE(sort_index, 0)` 把它们全变成 0。旧实现 `priority: raw.sort_index`
+    /// 原样照搬 → 一次导入 3 条自建档得到三条 `priority = 0`，后果是双重的：
+    /// - 分类页三张卡片**同时**显示实心的「主 Key」徽标（判据是 `priority === 0`），
+    ///   一个「设为主」按钮都没有，用户无法从界面判断谁是主；
+    /// - `enabled_keys_sorted` 用稳定排序，真实路由顺序退化为「配置文件里的偶然次序」，
+    ///   故障转移不再有确定的主备顺序 —— 而这正是用户导入多条 Key 的**目的**。
+    ///
+    /// 这里用两条 `sort_index = 0` 的行复现：它与 NULL 经 COALESCE 后完全等价。
+    ///
+    /// 故障注入判据：把 `import_rows` 里的递增分配改回照搬 sort_index，
+    /// 「两条 priority 必须不同」立刻变红。
+    #[test]
+    fn import_assigns_distinct_priorities_for_same_sort_index() {
+        let dir = temp_dir("import_prio");
+        let store = temp_store(&dir);
+        // 两条同分类、不同站点/密钥的自建档，sort_index 都是 0（= cc-switch 的 NULL）。
+        let db = make_db(
+            &dir,
+            &[
+                (
+                    "p-a",
+                    "claude",
+                    "自建A",
+                    r#"{"env":{"ANTHROPIC_BASE_URL":"https://a.example.com","ANTHROPIC_AUTH_TOKEN":"sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaa1111"}}"#,
+                    0,
+                    0,
+                ),
+                (
+                    "p-b",
+                    "claude",
+                    "自建B",
+                    r#"{"env":{"ANTHROPIC_BASE_URL":"https://b.example.com","ANTHROPIC_AUTH_TOKEN":"sk-bbbbbbbbbbbbbbbbbbbbbbbbbbbb2222"}}"#,
+                    0,
+                    0,
+                ),
+            ],
+        );
+
+        let rep = import_at(&store, &db, &["p-a".to_string(), "p-b".to_string()]).unwrap();
+        assert_eq!(rep.imported, 2, "两条都应导入: {:?}", rep.outcomes);
+
+        let keys = store.list_keys(CategoryType::ClaudeCli);
+        assert_eq!(keys.len(), 2);
+        let mut prios: Vec<i32> = keys.iter().map(|k| k.priority).collect();
+        prios.sort();
+        assert_eq!(
+            prios,
+            vec![0, 1],
+            "同 sort_index 的多条档必须分到互不相同的连续 priority，\
+             否则多张卡片同时显示「主 Key」且故障转移无确定顺序"
+        );
+
+        // 再导入第三条：应接着现有最大值往后排，而不是又撞回 0。
+        let sub = dir.join("more");
+        std::fs::create_dir_all(&sub).unwrap();
+        let db2 = make_db(
+            &sub,
+            &[(
+                "p-c",
+                "claude",
+                "自建C",
+                r#"{"env":{"ANTHROPIC_BASE_URL":"https://c.example.com","ANTHROPIC_AUTH_TOKEN":"sk-cccccccccccccccccccccccccccc3333"}}"#,
+                0,
+                0,
+            )],
+        );
+        import_at(&store, &db2, &["p-c".to_string()]).unwrap();
+        let mut prios2: Vec<i32> = store
+            .list_keys(CategoryType::ClaudeCli)
+            .iter()
+            .map(|k| k.priority)
+            .collect();
+        prios2.sort();
+        assert_eq!(prios2, vec![0, 1, 2], "二次导入应接在现有最大 priority 之后");
 
         std::fs::remove_dir_all(&dir).ok();
     }
