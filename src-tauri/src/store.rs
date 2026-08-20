@@ -2732,8 +2732,24 @@ impl Store {
         })
     }
 
-    // ---- 厂商预设 CRUD ----
+    /// 单独写「允许局域网访问代理」。
+    ///
+    /// 专用写入方法而不走 `save_settings`：这个开关必须与**监听地址重建**成对发生
+    /// （绑定地址在 `ProxyManager::start` 里一次定死、之后改不了）。走批量保存时前端只落盘，
+    /// 于是「关掉开关但端口仍监听 0.0.0.0」——界面说已关闭、实际对整个局域网敞开。
+    /// 编排在 `service::set_lan_exposure`（落盘 + 重启在跑的代理），那里是唯一调用点。
+    /// 幂等：值相同不写盘。
+    pub fn set_lan_exposure(&self, enabled: bool) -> AppResult<()> {
+        self.mutate_and_persist_if(|cfg| {
+            if cfg.settings.lan_exposure == enabled {
+                return false;
+            }
+            cfg.settings.lan_exposure = enabled;
+            true
+        })
+    }
 
+    // ---- 厂商预设 CRUD ----
     pub fn list_vendors(&self) -> Vec<Vendor> {
         self.config.read().vendors.clone()
     }

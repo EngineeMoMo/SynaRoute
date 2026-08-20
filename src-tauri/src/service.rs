@@ -213,8 +213,66 @@ pub(crate) async fn set_proxy_port(
     Ok(bound)
 }
 
-// ==== Key 与密钥 ====
+/// 切换「允许局域网访问代理」，并**让它对正在运行的代理立刻生效**。
+///
+/// ## 为什么必须重启监听
+///
+/// 绑定地址（`127.0.0.1` vs `0.0.0.0`）在 `ProxyManager::start` 里一次性决定，
+/// 之后无法更改。旧实现只把 `lan_exposure` 写进 config：
+/// - 开关打开 → 用户以为局域网能连了，实际仍只监听 127.0.0.1，别的设备一直连不上；
+/// - **开关关闭 → 监听仍留在 0.0.0.0**，界面显示「已关闭」而端口对整个局域网敞开。
+///
+/// 后者是**安全方向**的「界面说 A、实际 B」：用户点关是为了收回暴露面，而它没收回。
+/// 这类开关必须要么真的生效、要么明确告知需重启，绝不能静默不生效。
+///
+/// ## 为什么走「停 + 起」而不是热改
+///
+/// 与 [`set_proxy_port`] 同一手法（那里改端口也是停+起）：TcpListener 的绑定地址不可变，
+/// 只能重建。端口保持粘滞不变，故客户端配置**无需重写**（端口没动，客户端连的还是那个地址）
+/// —— 这是与改端口路径的关键差异，不必也不该去动客户端配置文件。
+///
+/// 返回实际受影响（重启过）的分类数，供 UI 提示「N 个代理已按新设置重启」。
+pub(crate) async fn set_lan_exposure(
+    store: &Arc<Store>,
+    proxy: &Arc<ProxyManager>,
+    enabled: bool,
+) -> AppResult<usize> {
+    // 先落盘：重启后的 `start()` 会重新读 settings 决定绑哪个地址。
+    store.set_lan_exposure(enabled)?;
 
+    // 快照当前在跑的分类（重启期间 is_running 会变，必须先取）。
+    let running: Vec<CategoryType> = CategoryType::ALL
+        .iter()
+        .copied()
+        .filter(|c| proxy.is_running(*c))
+        .collect();
+
+    for cat in &running {
+        proxy.stop(*cat);
+        // 端口粘滞不变 → 客户端配置无需重写。失败只记事件不中断其余分类：
+        // 半途返回会留下「一半分类停了没起」的更差状态。
+        match proxy.start(*cat).await {
+            Ok(port) => store.append_event(
+                *cat,
+                "config",
+                None,
+                &format!(
+                    "已按新的局域网设置重启代理（监听 {}:{port}）",
+                    if enabled { "0.0.0.0" } else { "127.0.0.1" }
+                ),
+            ),
+            Err(e) => store.append_event(
+                *cat,
+                "error",
+                None,
+                &format!("按新的局域网设置重启代理失败（该分类现已停止，请手动启动）: {e}"),
+            ),
+        }
+    }
+    Ok(running.len())
+}
+
+// ==== Key 与密钥 ====
 /// 保存（新增/更新）一条 Key。
 ///
 /// 校验项：

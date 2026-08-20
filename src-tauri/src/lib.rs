@@ -748,6 +748,22 @@ fn save_settings(state: tauri::State<AppState>, settings: UserPrefs) -> AppResul
     state.store.save_settings(settings)
 }
 
+/// 切换「允许局域网访问代理」。**专用命令**，不走批量保存。
+///
+/// 与 `set_auto_start` 同一道理：这个开关有**系统副作用**（绑定地址 127.0.0.1 ↔ 0.0.0.0），
+/// 只写配置不重建监听时，关掉开关后端口仍对整个局域网敞开 —— 界面说「已关闭」而实际没关，
+/// 属安全方向的静默失效。故 `lan_exposure` 已从 `UserPrefs` 移出，物理上走不到批量保存那条路。
+///
+/// 编排（落盘 + 重启在跑的代理、为何不必重写客户端配置）在 [`service::set_lan_exposure`]。
+/// 返回受影响的分类数，供 UI 提示。
+#[tauri::command]
+async fn set_lan_exposure(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> AppResult<usize> {
+    service::set_lan_exposure(&state.store, &state.proxy, enabled).await
+}
+
 /// 开机自启动开关（FR-025）。**专用命令**，不走批量保存。
 ///
 /// 必须与系统状态同步落地，不能只存字段：此前只把 auto_start 写进 config.json、
@@ -1570,6 +1586,7 @@ pub fn run() {
             get_settings,
             save_settings,
             set_auto_start,
+            set_lan_exposure,
             get_onboarding_state,
             set_onboarding_done,
             first_request_since,

@@ -1841,8 +1841,6 @@ pub struct UserPrefs {
     #[serde(default = "default_language")]
     pub language: String,
     #[serde(default)]
-    pub lan_exposure: bool,
-    #[serde(default)]
     pub request_log_enabled: bool,
     #[serde(default)]
     pub log_downstream_raw_enabled: bool,
@@ -1862,7 +1860,8 @@ pub struct UserPrefs {
     pub aggregate_trace_enabled: bool,
     #[serde(default = "default_true")]
     pub tray_model_switch_enabled: bool,
-    // ⚠️ **带副作用的开关一律不进这里**（如 `auto_start`，它要写系统注册表）。
+    // ⚠️ **带副作用的开关一律不进这里**（如 `auto_start`，它要写系统注册表；
+    // `lan_exposure`，它要重建监听 socket）。
     //
     // 历史教训：两个已删除的悬浮球开关曾误入本结构体，造成**静默关掉用户开关**的缺陷 ——
     // 前端 `prefs.ts` 白名单里没有那两个键，于是每次 `saveSettings` 提交的 JSON 都缺键
@@ -1870,8 +1869,13 @@ pub struct UserPrefs {
     // 「切一下主题/语言，开着的开关就没了」。`auto_start` 出过同类 P0（方向相反：
     // 把用户刚关掉的自启动装回系统）。
     //
+    // `lan_exposure` 于本轮移出：绑定地址在 `ProxyManager::start` 里一次定死，
+    // 只落盘不重建监听 → 关掉开关后端口仍在 0.0.0.0 上，界面说「已关闭」而实际对整个
+    // 局域网敞开（安全方向的「界面说 A、实际 B」）。现由专用命令 `set_lan_exposure`
+    // 编排「落盘 + 重启在跑的代理」，见 `service::set_lan_exposure`。
+    //
     // 判据：本结构体的字段集必须与 `src/lib/prefs.ts` 的 `pickPrefs` 逐字段对齐。
-    // 加字段时先问「前端白名单里有吗」——没有就不该加到这里。
+    // 加字段时先问「前端白名单里有吗」「它有系统副作用吗」——任一为否都不该加到这里。
 }
 
 impl UserPrefs {
@@ -1882,7 +1886,6 @@ impl UserPrefs {
     pub fn apply_to(self, s: &mut AppSettings) {
         s.theme = self.theme;
         s.language = self.language;
-        s.lan_exposure = self.lan_exposure;
         s.request_log_enabled = self.request_log_enabled;
         s.log_downstream_raw_enabled = self.log_downstream_raw_enabled;
         s.health_check_interval_secs = self.health_check_interval_secs;
@@ -1904,7 +1907,6 @@ impl From<&AppSettings> for UserPrefs {
         Self {
             theme: s.theme.clone(),
             language: s.language.clone(),
-            lan_exposure: s.lan_exposure,
             request_log_enabled: s.request_log_enabled,
             log_downstream_raw_enabled: s.log_downstream_raw_enabled,
             health_check_interval_secs: s.health_check_interval_secs,
@@ -2007,12 +2009,18 @@ mod tests {
     ///
     /// 历史：这里原先还断言两个悬浮球开关（它们曾误入 `UserPrefs`，导致切主题把用户
     /// 开着的悬浮球静默关掉）。悬浮窗功能已于 2026-08-15 整体删除，故那两条断言随之移除。
+    ///
+    /// **本轮新增 `lan_exposure`**：它同样有系统副作用（绑定地址 127.0.0.1 ↔ 0.0.0.0，
+    /// 需重建监听 socket）。原先它在 `UserPrefs` 里，于是「关掉开关」只落盘、监听仍在
+    /// 0.0.0.0 —— 界面说已关闭而端口对整个局域网敞开，属安全方向的静默失效。
+    /// 现改由专用命令 `set_lan_exposure` 编排（落盘 + 重启在跑的代理）。
     #[test]
     fn batch_save_settings_never_touches_side_effect_toggles() {
         // 用户已通过专用命令开启的状态。用结构体更新语法而非「先 default 再逐个赋值」：
         // 后者会触发 clippy 的 field_reassign_with_default，而本仓基线是零警告。
         let mut s = AppSettings {
             auto_start: true,
+            lan_exposure: true,
             ..Default::default()
         };
 
@@ -2025,6 +2033,10 @@ mod tests {
         assert!(
             s.auto_start,
             "批量保存把开机自启动关掉了 —— 那是已修过的 P0，不能回归"
+        );
+        assert!(
+            s.lan_exposure,
+            "批量保存把局域网开关改了 —— 它有系统副作用（需重建监听），必须走专用命令"
         );
     }
 

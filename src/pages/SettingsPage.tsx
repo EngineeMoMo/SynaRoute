@@ -250,6 +250,35 @@ export function SettingsPage() {
 
   // 悬浮窗的两个开关处理函数已随该功能于 2026-08-15 删除（见 docs/14 第十八节）。
 
+  /**
+   * 「允许局域网访问代理」走**专用命令**，不走 update()。
+   *
+   * 同 handleToggleAutoStart 的理由：它有系统副作用 —— 绑定地址（127.0.0.1 ↔ 0.0.0.0）
+   * 在 `ProxyManager::start` 里一次定死，改不了。只落盘不重建监听时：开了没生效、
+   * **关了端口仍对整个局域网敞开**（界面说「已关闭」而实际没关，安全方向的静默失效）。
+   * 后端会顺带重启正在运行的代理，返回受影响分类数，这里据它提示用户。
+   *
+   * 失败必须回滚开关：显示「已开/已关」而实际相反，是这类开关最坑的形态。
+   */
+  const handleToggleLan = (v: boolean) => {
+    if (!settings) return;
+    const prev = settings;
+    setSettings({ ...settings, lanExposure: v });
+    void api
+      .setLanExposure(v)
+      .then((restarted) => {
+        useStore.setState({ settings: { ...prev, lanExposure: v } });
+        if (restarted > 0) {
+          showToast("success", t("settings.lanRestarted", { n: restarted }));
+        }
+      })
+      .catch((e) => {
+        console.error("setLanExposure failed", e);
+        setSettings(prev);
+        showToast("error", String((e as Error)?.message ?? e));
+      });
+  };
+
   // MCP 开关/端口走专用命令：携带当前活跃分类，后端据此自动注册 synaroute 到对应工具客户端
   // （~/.claude.json 或 ~/.codex/config.toml），并在端口漂移时重写。不走通用 saveSettings，
   // 因为那拿不到 activeCategory。
@@ -577,7 +606,7 @@ export function SettingsPage() {
               title={t("settings.lanTitle")}
               desc={t("settings.lanDesc")}
               checked={settings?.lanExposure ?? false}
-              onChange={(v) => update({ lanExposure: v })}
+              onChange={handleToggleLan}
               danger
             />
 

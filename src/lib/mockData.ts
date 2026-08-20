@@ -952,6 +952,12 @@ export const mockBridge = {
     await delay();
     settings.autoStart = enabled;
   },
+  async setLanExposure(enabled: boolean): Promise<number> {
+    await delay();
+    settings.lanExposure = enabled;
+    // 真实后端返回「因此重启了几个代理」；预览里没有真代理，恒 0。
+    return 0;
+  },
   async listVendors(): Promise<Vendor[]> {
     await delay();
     return clone(vendors);

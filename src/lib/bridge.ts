@@ -305,6 +305,15 @@ export const api = {
   setAutoStart: (enabled: boolean) =>
     call<void>("set_auto_start", { enabled }, () => mockBridge.setAutoStart(enabled)),
 
+  /**
+   * 「允许局域网访问代理」开关。**专用命令，不走 saveSettings**（同 setAutoStart 的理由）：
+   * 它有系统副作用 —— 绑定地址 127.0.0.1 ↔ 0.0.0.0 在 `ProxyManager::start` 里一次定死，
+   * 只落盘不重建监听时，关掉开关后端口仍对整个局域网敞开（界面说「已关闭」而实际没关）。
+   * 后端会顺带重启正在运行的代理，返回受影响的分类数。
+   */
+  setLanExposure: (enabled: boolean) =>
+    call<number>("set_lan_exposure", { enabled }, () => mockBridge.setLanExposure(enabled)),
+
   // 悬浮窗的三条命令（setFloatingWidget / setFloatingPinned / setFloatingExpanded）
   // 已随该功能于 2026-08-15 一并删除，后端也不再注册它们。见 docs/14 第十八节。
 
