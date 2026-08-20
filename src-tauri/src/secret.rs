@@ -92,6 +92,62 @@ pub struct SecretStore {
     os_cache: HashMap<String, Zeroizing<String>>,
 }
 
+/// 主口令强度校验：**启用与修改共用同一份规则**。
+///
+/// 抽出来的理由是一条真实的绕过（本轮对抗审查确认）：规则原先只写在
+/// `enable_master_password` 里，`change_master_password` 只判了 `new.is_empty()`。
+/// 于是用户先用合格口令启用、再点「修改主口令」填 `password`（黑名单第二项、刚好 8 位，
+/// 前端只判长度与两次一致），后端照单全收 —— 整个密钥库此后由一个弱口令保护，
+/// 而用户以为自己受启用时那套强度校验保护。`abcdefgh`（无数字）、`12345678`
+/// （黑名单首项）同样能从「修改」进、从「启用」进不去：同一条安全策略在两条入口上
+/// 给出相反答案。
+///
+/// 故规则只留这一份，两处都调它。`unlock` / `disable` 是**校验既有口令**，
+/// 不能调 —— 那会把「历史上设过的弱口令」变成解不开的库。
+fn validate_master_password(password: &str) -> AppResult<()> {
+    if password.is_empty() {
+        return Err(AppError::Invalid("主口令不能为空".into()));
+    }
+    if password.len() < 8 {
+        return Err(AppError::Invalid(
+            "主口令长度至少 8 个字符。当前长度不足，无法提供足够的安全强度。".into(),
+        ));
+    }
+
+    // 基本复杂度检查：至少包含字母和数字
+    let has_letter = password.chars().any(|c| c.is_alphabetic());
+    let has_digit = password.chars().any(|c| c.is_numeric());
+    if !has_letter || !has_digit {
+        return Err(AppError::Invalid(
+            "主口令强度不足：必须同时包含字母和数字。\n\
+             建议使用大小写字母、数字和特殊符号的组合，长度 12 位以上。"
+                .into(),
+        ));
+    }
+
+    // 常见弱口令黑名单
+    const WEAK_PASSWORDS: &[&str] = &[
+        "12345678",
+        "password",
+        "admin123",
+        "qwerty123",
+        "abc12345",
+        "password123",
+        "123456789",
+        "iloveyou",
+    ];
+    let password_lower = password.to_lowercase();
+    if WEAK_PASSWORDS
+        .iter()
+        .any(|&weak| password_lower.contains(weak))
+    {
+        return Err(AppError::Invalid(
+            "检测到常见弱口令模式，已拒绝。请使用更复杂的口令组合。".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl SecretStore {
     pub fn load(path: PathBuf) -> AppResult<Self> {
         // 读失败与解析失败都降级为空库并留诊断日志，绝不让 app 起不来：
@@ -350,37 +406,8 @@ impl SecretStore {
             return Err(AppError::Invalid("已处于主口令模式，无需重复启用".into()));
         }
 
-        // 主口令强度验证：防止弱口令如 "123456"、"password"
-        if password.is_empty() {
-            return Err(AppError::Invalid("主口令不能为空".into()));
-        }
-        if password.len() < 8 {
-            return Err(AppError::Invalid(
-                "主口令长度至少 8 个字符。当前长度不足，无法提供足够的安全强度。".into()
-            ));
-        }
-
-        // 基本复杂度检查：至少包含字母和数字
-        let has_letter = password.chars().any(|c| c.is_alphabetic());
-        let has_digit = password.chars().any(|c| c.is_numeric());
-        if !has_letter || !has_digit {
-            return Err(AppError::Invalid(
-                "主口令强度不足：必须同时包含字母和数字。\n\
-                 建议使用大小写字母、数字和特殊符号的组合，长度 12 位以上。".into()
-            ));
-        }
-
-        // 常见弱口令黑名单
-        const WEAK_PASSWORDS: &[&str] = &[
-            "12345678", "password", "admin123", "qwerty123",
-            "abc12345", "password123", "123456789", "iloveyou",
-        ];
-        let password_lower = password.to_lowercase();
-        if WEAK_PASSWORDS.iter().any(|&weak| password_lower.contains(weak)) {
-            return Err(AppError::Invalid(
-                "检测到常见弱口令模式，已拒绝。请使用更复杂的口令组合。".into()
-            ));
-        }
+        // 强度校验走共用函数：启用与**修改**必须同一套规则（见 validate_master_password）。
+        validate_master_password(password)?;
 
         if self.load_failed {
             // 降级态下 entries 是空的（读盘失败），此时迁移等于「把用户的密钥全丢掉再
@@ -513,9 +540,12 @@ impl SecretStore {
         if !self.is_master_mode() {
             return Err(AppError::Invalid("当前不是主口令模式，无法修改主口令".into()));
         }
-        if new.is_empty() {
-            return Err(AppError::Invalid("新主口令不能为空".into()));
-        }
+        // 与 `enable_master_password` **同一套强度规则**（本轮对抗审查确认的缺口）：
+        // 这里原先只判 `new.is_empty()`，于是 "password"（黑名单第 2 项、刚好 8 位）、
+        // "abcdefgh"（无数字）、"12345678"（黑名单首项）都能从「修改主口令」这条入口设上，
+        // 而同样的口令在「启用主口令」那条入口会被拒 —— 同一条安全策略在两个入口给出
+        // 相反答案，用户以为自己受启用时那套校验保护，实际整个密钥库已由弱口令加密。
+        validate_master_password(new)?;
         self.unlock(old)?;
 
         let ids = self.all_key_ids();
@@ -979,7 +1009,27 @@ pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> AppResult<()> {
     // 文件清单」（见 CLAUDE.md 的 MSIX 复发速查），散着几个 .tmp 会让人误判成
     // 「落盘正在进行」或「上次写坏了」。且若失败发生在部分写入之后，残留文件会含上一次
     // 配置的完整内容（base_url、映射等；密钥不在 config 里）。
-    if let Err(e) = std::fs::write(&tmp, data) {
+    // **必须 `sync_all()`，不能只 `fs::write`**（本轮对抗审查确认的数据丢失链）：
+    // `fs::write` 返回只意味着字节进了页缓存，而 rename 的元数据提交与文件数据的提交
+    // 走不同路径（NTFS 的日志项可能先落盘）。断电/硬复位（虚机强杀、蓝屏、掉电）后重启，
+    // 目标文件**存在但是 0 字节或旧尾块** —— 对 `secrets.enc` 是数据丢失级：
+    // 下次启动解析空内容失败 → 降级空库 → 首次 persist 把这个 0 字节文件"备份"成
+    // `.enc.corrupt-*`（备份的是空文件，等于没备份）→ 用户全部 API 密钥永久丢失，
+    // 界面只显示「各 Key 未配置密钥」。
+    //
+    // 故这里显式 `write_all` + `sync_all`，让 rename 之前数据已真正落到介质上。
+    // 原子性（rename 不留半截文件）与持久性（断电后内容还在）是两件事，缺一不可 ——
+    // 旧注释只承诺了前者却按后者理解，是这条链能长期潜伏的原因。
+    //
+    // 代价：每次落盘多一次 fsync。可接受 —— 落盘只发生在用户改配置/健康态变更后的
+    // 合并写（60s 级），不在转发热路径上。
+    let write_tmp = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()
+    })();
+    if let Err(e) = write_tmp {
         let _ = std::fs::remove_file(&tmp);
         return Err(ctx("写临时文件", &e));
     }
@@ -1016,8 +1066,16 @@ pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> AppResult<()> {
     // 同样对瞬时锁（ACCESS_DENIED/SHARING_VIOLATION）短暂重试，避免单次写被瞬时锁打断即失败。
     let mut delay_ms = 5u64;
     let mut last_err: Option<std::io::Error> = None;
+    // 回退路径同样 `sync_all`：这条路走的是**直接改目标文件**，比 tmp+rename 更需要持久性
+    // 保证 —— 断电时半写入的就是目标文件本身，没有 tmp 可作后备（理由详见上面写 tmp 处）。
+    let write_in_place = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(data)?;
+        f.sync_all()
+    };
     for attempt in 0..6 {
-        match std::fs::write(path, data) {
+        match write_in_place() {
             Ok(()) => {
                 let _ = std::fs::remove_file(&tmp);
                 return Ok(());
@@ -1444,6 +1502,71 @@ mod tests {
         assert_eq!(reopened.get("k1").unwrap().as_deref().map(String::as_str), Some("sk-one"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **启用与修改主口令必须走同一套强度规则**（本轮对抗审查确认的安全缺口）。
+    ///
+    /// 旧实现里 `enable_master_password` 有四道门（非空 / ≥8 位 / 字母+数字 / 弱口令黑名单），
+    /// 而 `change_master_password` 只判 `new.is_empty()`。于是用户先用合格口令启用，再点
+    /// 「修改主口令」把它换成 `password` —— 前端也只校验长度 ≥8，8 位刚好放行 —— 整个密钥库
+    /// 此后由黑名单里的词加密，而用户以为自己受启用那套校验保护。同一条安全策略在两条入口
+    /// 上给出相反答案，这是最容易长期潜伏的一类缺口。
+    ///
+    /// 判据取「同一批口令在两条入口上的结论必须一致」，而不是逐条重复断言规则细节：
+    /// 后者在规则演进时会漂移，前者永远钉住「两条路等价」这个真正的要求。
+    ///
+    /// 故障注入判据：把 `change_master_password` 里的 `validate_master_password(new)?`
+    /// 换回 `if new.is_empty()`，本测试立刻变红。
+    #[test]
+    fn enable_and_change_master_password_share_one_strength_policy() {
+        // 三个必须被拒的口令，各代表一条规则：黑名单命中 / 无数字 / 太短。
+        // "password" 长度正好 8，能通过前端与旧后端的长度门，是该缺口的真实利用形态。
+        let rejected = ["password", "abcdefgh", "Ab1"];
+        // 一个必须放行的合格口令（同时含字母与数字、长度足够、不在黑名单里）。
+        let accepted = "NewPass456";
+
+        for pw in rejected {
+            // 入口 A：启用
+            let dir = temp_dir("pw_policy_enable");
+            let mut s = SecretStore::load(dir.join("secrets.enc")).unwrap();
+            s.set("k1", "sk-one").unwrap();
+            let enable_err = s.enable_master_password(pw).is_err();
+            std::fs::remove_dir_all(&dir).ok();
+
+            // 入口 B：修改（先用合格口令启用，再尝试改成 pw）
+            let dir2 = temp_dir("pw_policy_change");
+            let mut s2 = SecretStore::load(dir2.join("secrets.enc")).unwrap();
+            s2.set("k1", "sk-one").unwrap();
+            s2.enable_master_password("GoodPass123").unwrap();
+            let change_err = s2.change_master_password("GoodPass123", pw).is_err();
+
+            assert!(
+                enable_err && change_err,
+                "口令 {pw:?} 必须被两条入口同时拒绝（启用拒绝={enable_err}, 修改拒绝={change_err}）\
+                 —— 只拦一条等于安全策略有后门"
+            );
+            // 被拒后库必须还能用原口令解开（拒绝不等于把库改坏）
+            let mut reopened = SecretStore::load(dir2.join("secrets.enc")).unwrap();
+            reopened.unlock("GoodPass123").expect("被拒绝的修改不得影响原口令");
+            std::fs::remove_dir_all(&dir2).ok();
+        }
+
+        // 合格口令在两条入口都必须放行 —— 否则这道校验就是把功能锁死，而非保护。
+        let dir3 = temp_dir("pw_policy_ok");
+        let path3 = dir3.join("secrets.enc");
+        let mut s3 = SecretStore::load(path3.clone()).unwrap();
+        s3.set("k1", "sk-one").unwrap();
+        s3.enable_master_password("GoodPass123").unwrap();
+        s3.change_master_password("GoodPass123", accepted)
+            .expect("合格口令必须能修改成功");
+        let mut reopened = SecretStore::load(path3).unwrap();
+        reopened.unlock(accepted).expect("改后应能用新口令解锁");
+        assert_eq!(
+            reopened.get("k1").unwrap().as_deref().map(String::as_str),
+            Some("sk-one"),
+            "改口令后密钥必须还在（整份重写不得丢数据）"
+        );
+        std::fs::remove_dir_all(&dir3).ok();
     }
 
     /// 整份重写前必须留备份（唯一一次全量重写密文的操作，写坏就全没了）。

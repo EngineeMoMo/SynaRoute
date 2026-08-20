@@ -203,6 +203,7 @@ fn set_primary_key(
     Ok(changed)
 }
 
+
 /// 上移 / 下移某 Key 的优先级（相邻交换 + 整列连续重编号）。
 ///
 /// 为什么收进后端、而不是让前端重编号后并发 `upsert_key`（旧实现）：
@@ -1566,6 +1567,7 @@ pub fn run() {
             detect_codegraph,
             codegraph_init,
             set_primary_key,
+            move_key,
             move_key,
             get_master_password_state,
             unlock_master_password,

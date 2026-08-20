@@ -146,12 +146,36 @@ struct UsageLoad {
 }
 
 impl UsageLoad {
-    /// 「没有历史可继承，但可以正常写回」—— 全新安装 / 文件损坏 / 读失败都走这个。
+    /// 「没有历史可继承，但可以正常写回」—— 全新安装 / 文件**内容已损坏**走这个。
+    ///
+    /// 注意不含「读失败」：那条走 [`Self::fresh_read_only`]，理由见那里。
     fn fresh(now: i64) -> Self {
         Self {
             totals: std::collections::BTreeMap::new(),
             since: now,
             read_only: false,
+            daily_buckets: Vec::new(),
+        }
+    }
+
+    /// 「没有历史可继承，且**本次不许写回**」—— 读文件失败（非 NotFound）走这个。
+    ///
+    /// 为什么必须与 [`Self::fresh`] 分开：读失败与解析失败是两件不同的事。
+    /// - **解析失败** = 内容确已损坏（断电写坏），用好数据覆盖它是对的；
+    /// - **读失败** = 文件很可能**完好无损**，只是这一瞬间打不开：Windows 上杀软扫描、
+    ///   备份程序、OneDrive 同步都会短暂独占（ERROR_SHARING_VIOLATION），ACL 抖动则是
+    ///   ACCESS_DENIED。此时若按「从零累计且允许写回」处理，60 秒后第一次 flush 就用
+    ///   空日桶把用户最多 90 天的用量历史整份覆盖掉 —— 文件本来是好的，是我们自己毁了它，
+    ///   且不可自愈（用量是纯累加值，没有别处可恢复）。
+    ///
+    /// 这与「文件版本比我新」那道门是**同一条破坏链**，只是入口不同，故复用同一套
+    /// 自我保护：本次运行照常记账（面板显示从零开始），但一个字节都不写回磁盘，
+    /// 下次启动读成功即恢复全部历史。
+    fn fresh_read_only(now: i64) -> Self {
+        Self {
+            totals: std::collections::BTreeMap::new(),
+            since: now,
+            read_only: true,
             daily_buckets: Vec::new(),
         }
     }
@@ -1749,14 +1773,21 @@ impl Store {
     /// 合并进内存累加器,这样重启后历史累计不会丢。v1 文件继续按老逻辑读 `entries`。
     fn load_usage(path: &Path) -> UsageLoad {
         let now = chrono::Utc::now().timestamp_millis();
-        // 文件缺失 / 读不出 / 解析失败：一律降级为「从零累计」且**允许写回**。
-        // 这三种都不是「文件比我新」，让下一次 flush 用好内容覆盖它才是对的。
+        // 三种降级，**写回权限不同**（别合并成一个分支）：
+        // - 文件缺失（全新安装）：从零累计，允许写回；
+        // - 内容解析失败（断电写坏）：从零累计，允许写回 —— 用好数据覆盖坏数据是对的；
+        // - **读失败**（杀软/备份/同步盘独占、ACL 抖动）：从零累计但**禁止写回**。
+        //   文件极可能完好，只是这一瞬打不开；若允许写回，60s 后一次 flush 就用空日桶
+        //   把最多 90 天历史覆盖掉。详见 `UsageLoad::fresh_read_only`。
         let raw = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return UsageLoad::fresh(now),
             Err(e) => {
-                tracing::warn!("读取用量统计失败（本次从零开始累计）: {e}");
-                return UsageLoad::fresh(now);
+                tracing::error!(
+                    "读取用量统计失败（本次从零累计，且**本次运行不写回**以免覆盖磁盘上完好的历史；\
+                     重启读取成功即恢复）: {e} · 路径={path:?}"
+                );
+                return UsageLoad::fresh_read_only(now);
             }
         };
         let snap: UsageSnapshot = match serde_json::from_slice(&raw) {
@@ -1965,7 +1996,11 @@ impl Store {
                 return false;
             }
         };
-        // 走与 config/secrets 同一个 atomic_write：临时文件 + 重命名，断电不会留下半截 JSON。
+        // 走与 config/secrets 同一个 atomic_write：写临时文件 → `sync_all()` → 重命名。
+        // 两条保证要分开理解：**原子性**来自 rename（读者只会看到旧全量或新全量，
+        // 不会读到半截 JSON）；**持久性**来自 rename 之前那次 fsync（断电后内容真在盘上，
+        // 而不是「文件存在但 0 字节」）。缺后者时前半句仍成立、后半句不成立 ——
+        // 这正是本轮对抗审查在 `secret::atomic_write` 里补掉的那条数据丢失链。
         if let Err(e) = crate::secret::atomic_write(&self.usage_path, &bytes) {
             self.mark_usage_dirty();
             tracing::warn!("用量统计落盘失败（下一轮重试）: {e}");
@@ -3612,6 +3647,68 @@ mod tests {
         assert_eq!(
             before, after,
             "更高版本的 usage.json 必须原样保留，一个字节都不能改"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `usage.json` **读取失败**（而非解析失败）时同样必须只读：文件内容可能完好无损。
+    ///
+    /// 这是与版本门同一条数据销毁链的另一个入口，本轮对抗审查确认：
+    /// 启动瞬间该文件被杀软扫描 / 同步盘 / 备份程序独占（Windows 共享冲突 32/5），
+    /// `fs::read` 返回非 NotFound 的 Err。旧实现走 `fresh(now)` —— 累加器为空**且允许写回**，
+    /// 于是第一个带 usage 的请求标脏，60 秒后的 flush 拿「空日桶 + version=2」覆写那个
+    /// **内容完好**的文件：用户最多 90 天的用量历史与真实起算时刻一起消失，界面上只留一行
+    /// warn 日志，永不自愈。
+    ///
+    /// 与「解析失败」必须分开对待（后者内容确已损坏，覆盖是唯一出路，见
+    /// [`UsageLoad::fresh`] 与 `secret.rs` 里同一组区分）：
+    /// 判据是「读不出来 ≠ 内容没了」，故读失败一律按只读自保，重启读成功即自愈。
+    ///
+    /// 故障注入判据：把读失败分支改回 `UsageLoad::fresh(now)`，本测试立刻变红。
+    #[test]
+    fn unreadable_usage_file_is_never_overwritten() {
+        use crate::upstream::TokenUsage;
+        let dir = temp_dir("usage_read_fail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let upath = dir.join("usage.json");
+
+        // 可移植的「读失败但不是 NotFound」注入：在该路径放一个**目录**。
+        // `fs::read` 于是在三个平台都失败（Windows 拒绝访问 / Linux IsADirectory），
+        // 且 `exists()` 为真 —— 正是「文件在、但这次读不出来」的等价形态。
+        std::fs::create_dir_all(&upath).unwrap();
+
+        // 判据是**分支决策本身**（read_only 有没有被置上），不是「磁盘字节没变」。
+        //
+        // 这一点踩过一次，记下来免得后人重蹈：最初写成「flush 返回 false + 文件未变」，
+        // 结果把读失败分支改回 `fresh(now)` 后测试**依然是绿的** —— 因为目录占位
+        // 让 `atomic_write` 自己也失败了，磁盘不变是 OS 挡的、与本守卫无关，
+        // 于是测试因错误的理由通过。断言直接落在 `load_usage` 的返回上才有判别力。
+        let loaded = Store::load_usage(&upath);
+        assert!(
+            loaded.read_only,
+            "读取失败必须按只读自保：文件内容可能完好，不能用空累计覆盖它"
+        );
+        assert!(
+            loaded.totals.is_empty() && loaded.daily_buckets.is_empty(),
+            "读不出来就没有历史可继承（如实为空），但这不代表可以写回"
+        );
+
+        // 该标记必须真正传导到写侧闸门：产生新消耗后 flush 仍拒绝写盘。
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        assert!(store.usage_read_only, "只读标记应从 load_usage 传导到 Store");
+        store.append_event_full(
+            CategoryType::ClaudeCli,
+            "route",
+            Some("k1"),
+            "req",
+            None,
+            None,
+            Some(TokenUsage { input: 42, output: 7, cache_read: 0, cache_creation: 0 }),
+        );
+        assert!(
+            !store.flush_usage_if_dirty(),
+            "只读模式下必须在清脏标记之前就拒绝写盘（返回 false）"
         );
 
         std::fs::remove_dir_all(&dir).ok();
