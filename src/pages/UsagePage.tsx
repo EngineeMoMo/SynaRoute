@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
 import type { TFunc } from "@/lib/i18n";
-import type { DailyUsageBucket, UsageCostRow } from "@/types";
+import type { DailyUsageBucket, TokenUsage, UsageCostRow } from "@/types";
 import { Badge } from "@/components/ui/Badge";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { TrendingUp, AlertTriangle } from "lucide-react";
@@ -43,9 +43,16 @@ export function UsagePage() {
         api.getUsageSince(),
         api.getDailyUsage(),
       ]);
-      setRows(next);
-      setSinceMs(since);
-      setDaily(buckets);
+      // **对后端返回做形状校验**，而不是直接塞进 state。
+      //
+      // 为什么必需：本页多处直接 `.map()` / 解引用 `r.usage.input`。若某条数据缺字段
+      // （usage.json 被外部改坏、跨版本残留、或某个 Key 记账时结构异常），render 会抛异常，
+      // 而 React 会卸载整棵树 → **整窗口白屏**（真机反馈的「用量统计整页空白」）。
+      // 这里把脏数据挡在 state 之外：能用的行照常显示，坏行直接丢弃，绝不让一条脏数据
+      // 毁掉整页。App 层的 ErrorBoundary 是第二道防线，但第一道应该在数据入口。
+      setRows(Array.isArray(next) ? next.filter(isValidCostRow) : []);
+      setSinceMs(typeof since === "number" && Number.isFinite(since) ? since : null);
+      setDaily(Array.isArray(buckets) ? buckets.filter(isValidBucket) : []);
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -86,7 +93,10 @@ export function UsagePage() {
     const m = new Map<string, number>();
     for (const b of daily) {
       let sum = 0;
+      // 桶里的单条 entry 仍可能是脏的（外部改坏 usage.json / 跨版本残留）：
+      // 逐条校验后再累加，坏行跳过。否则 `e.usage.input` 会抛 TypeError → 整页白屏。
       for (const e of b.entries) {
+        if (!e || !isValidUsage(e.usage)) continue;
         sum += e.usage.input + e.usage.output + (e.usage.cacheRead ?? 0) + (e.usage.cacheCreation ?? 0);
       }
       m.set(b.date, sum);
@@ -320,6 +330,8 @@ function CostCell({ row, t }: { row: UsageCostRow; t: TFunc }) {
 
 /** 紧凑 token 数字：≥10000 用 k，≥1000000 用 M（与日志页 fmtTokens 同口径）。 */
 function fmt(n: number): string {
+  // 非有限值一律显示 0：脏数据不该让 `.toFixed()` 抛异常或渲染出 "NaN"。
+  if (!Number.isFinite(n)) return "0";
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 10_000) return `${(n / 1000).toFixed(1)}k`;
   return String(n);
@@ -331,7 +343,37 @@ function fmt(n: number): string {
  * 不显示 6 位：`$0.012345` 这种精度对用户无意义，反而挤占版面。
  */
 function fmtUsd(nano: number): string {
+  if (!Number.isFinite(nano)) return "—";
   const dollars = nano / 1_000_000_000;
   if (dollars > 0 && dollars < 0.0001) return "<$0.0001";
   return `$${dollars.toFixed(4)}`;
+}
+
+/** 一份 usage 是否结构完整（四个字段都是有限数字；缓存两项可缺，按 0 记）。 */
+function isValidUsage(u: unknown): u is TokenUsage {
+  if (!u || typeof u !== "object") return false;
+  const o = u as Record<string, unknown>;
+  const num = (v: unknown) => typeof v === "number" && Number.isFinite(v);
+  const optNum = (v: unknown) => v === undefined || v === null || num(v);
+  return num(o.input) && num(o.output) && optNum(o.cacheRead) && optNum(o.cacheCreation);
+}
+
+/**
+ * 一行成本数据是否可安全渲染。
+ *
+ * 挡掉的是「缺 usage / usage 里有 NaN / categoryId 不是已知分类」这类脏数据 ——
+ * 它们会让下面的 `.usage.input` 解引用或 `t(\`nav.\${categoryId}\`)` 出问题，
+ * 而 render 抛异常的后果是**整窗口白屏**（React 卸载整棵树）。
+ */
+function isValidCostRow(r: unknown): r is UsageCostRow {
+  if (!r || typeof r !== "object") return false;
+  const o = r as Record<string, unknown>;
+  return typeof o.keyId === "string" && typeof o.categoryId === "string" && isValidUsage(o.usage);
+}
+
+/** 一个日桶是否可安全聚合（date 是字符串、entries 是数组）。 */
+function isValidBucket(b: unknown): b is DailyUsageBucket {
+  if (!b || typeof b !== "object") return false;
+  const o = b as Record<string, unknown>;
+  return typeof o.date === "string" && Array.isArray(o.entries);
 }

@@ -13,6 +13,7 @@ import { CommandPalette } from "@/components/CommandPalette";
 import { OnboardingWizard } from "@/components/OnboardingWizard";
 import { Toast } from "@/components/Toast";
 import { UpdateBanner } from "@/components/UpdateBanner";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { ConfigAppliedDialog } from "@/components/ConfigAppliedDialog";
 import { useStore, applyTheme } from "@/store";
 import { useBackendEvents } from "@/lib/useBackendEvents";
@@ -161,7 +162,15 @@ export default function App() {
       <div className="flex min-h-0 flex-1">
         <Sidebar active={nav} onSelect={handleNav} onOpenPalette={() => setPaletteOpen(true)} />
 
-        <main className="flex-1 overflow-hidden">{renderMain()}</main>
+        {/* 页面级错误边界：任何一个页面 render 抛异常时，此前会**整窗口白屏**
+            （React 卸载整棵树，连侧栏都没了）—— 真机反馈的「用量统计整页空白」就是
+            这个形态。套上边界后异常收敛成一张可读的错误卡片，侧栏与导航照常可用，
+            用户能切走、也能把错误信息截图反馈。`resetKey={nav}` 使切页自动复位。 */}
+        <main className="flex-1 overflow-hidden">
+          <ErrorBoundary resetKey={nav} label={t(`nav.${nav}`)}>
+            {renderMain()}
+          </ErrorBoundary>
+        </main>
       </div>
 
       {editorOpen && (
