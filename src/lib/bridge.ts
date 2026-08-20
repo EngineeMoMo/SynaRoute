@@ -371,9 +371,19 @@ export const api = {
   getEffectiveLogDir: () =>
     call<string>("get_effective_log_dir", undefined, async () => "C:\\AppData\\SynaRoute\\logs"),
 
-  /** 确保日志目录存在并返回绝对路径；打开动作由调用方走 shell 插件（UX#13）。 */
+  /** 确保日志目录存在并返回绝对路径（只建不开；打开请用 `openLogDir`）。 */
   prepareLogDir: () =>
     call<string>("prepare_log_dir", undefined, async () => "C:\\AppData\\SynaRoute\\logs"),
+
+  /**
+   * 建目录**并**在系统文件管理器里打开，返回实际打开的绝对路径（UX#13）。
+   *
+   * 打开动作必须由**后端**执行：shell 插件对来自 JS 的 `open` 强制做 scope 正则校验
+   * （默认只放行 mailto/tel/http(s)），Windows 本地路径匹配不上 → 前端调必失败。
+   * 详见 `lib/openLogDir.ts` 与后端 `open_log_dir` 的注释。
+   */
+  openLogDir: () =>
+    call<string>("open_log_dir", undefined, async () => "C:\\AppData\\SynaRoute\\logs"),
 
   /**
    * 导出诊断报告（UX#12）。返回保存路径，用户取消时返回 null。

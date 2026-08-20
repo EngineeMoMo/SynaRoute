@@ -311,7 +311,10 @@ export function SettingsPage() {
    */
   const handleOpenLogDir = async () => {
     try {
-      await openLogDir();
+      // 回显实际打开的绝对路径：MSIX 虚拟化下打开的可能是包内私有副本，
+      // 用户必须能核对自己看的是哪一份（CLAUDE.md 平行宇宙惨案的复发防线）。
+      const dir = await openLogDir();
+      showToast("success", t("settings.logOpened", { dir }));
     } catch (e) {
       showToast("error", String((e as Error)?.message ?? e));
     }

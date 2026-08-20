@@ -1054,6 +1054,43 @@ fn prepare_log_dir(state: tauri::State<AppState>) -> AppResult<String> {
     Ok(dir.to_string_lossy().into_owned())
 }
 
+/// 建目录**并**在系统文件管理器里打开它。返回实际打开的绝对路径（供 UI 回显核对）。
+///
+/// ## 为什么必须由 Rust 端打开，不能让前端调 shell 插件
+///
+/// 前端原先是 `prepareLogDir()` 拿路径 → `import("@tauri-apps/plugin-shell").open(dir)`。
+/// 那条路**在生产里 100% 失败**：shell 插件对**来自 JS** 的 `open` 调用强制做 scope 正则校验，
+/// 未配置时用默认正则 `^((mailto:\w+)|(tel:\w+)|(https?://\w+)).+` —— Windows 路径
+/// `C:\Users\…\logs` 匹配不上，直接返回 `Error::Validation`。于是「打开日志目录」按钮
+/// 一按就报错，而关于页那几个 `https://` 外链却正常（它们匹配得上），
+/// 掩盖了「是路径被拦下」这个真因。
+///
+/// 而 Rust 端的 `shell.open(path, None)` 传的 scope 是 `None` → **不做正则校验**
+/// （见 tauri-plugin-shell `open::open`：`if let Some(scope) = scope` 才校验）。
+/// 这也是更安全的做法：不必为了放行本地路径去放宽那条防 JS 任意打开文件的正则。
+///
+/// 顺带把「建目录」与「打开」并成一次 IPC：两步分开时，中间那次失败会让前端拿着
+/// 路径去打开一个还不存在的目录（日志目录是懒创建的）。
+#[tauri::command]
+fn open_log_dir(app: tauri::AppHandle, state: tauri::State<AppState>) -> AppResult<String> {
+    use tauri_plugin_shell::ShellExt;
+    let dir = state.store.effective_log_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        error::AppError::Other(format!("创建日志目录失败（{}）: {e}", dir.display()))
+    })?;
+    let path = dir.to_string_lossy().into_owned();
+    // `#[allow(deprecated)]`：shell 插件把 `open` 标记为 deprecated、建议改用
+    // tauri-plugin-opener。但那是**换一个插件**（新依赖 + 新权限集 + 新前端包），
+    // 而这里要修的是「按钮点了报错」这个用户可见故障 —— 换插件属独立改动，
+    // 不该和故障修复混在一次。函数本身在 2.x 全程可用，只是不再是首选。
+    // 若日后迁到 opener，删掉这个 allow 即可，编译器会重新提醒。
+    #[allow(deprecated)]
+    app.shell()
+        .open(path.clone(), None)
+        .map_err(|e| error::AppError::Other(format!("打开日志目录失败（{path}）: {e}")))?;
+    Ok(path)
+}
+
 // ============ 配置导入 / 导出（FR-021）============
 //
 // 编排在 [`service`]：导出体不含 DPAPI 密文（绑当前 Windows 账户、换机解不出），
@@ -1551,6 +1588,7 @@ pub fn run() {
             get_default_log_dir,
             get_effective_log_dir,
             prepare_log_dir,
+            open_log_dir,
             export_diagnostics,
             export_config,
             pick_and_preview_import,

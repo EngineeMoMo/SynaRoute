@@ -311,6 +311,7 @@ const zh: Dict = {
   "key.collapse": "收起",
   "key.setPrimaryHint": "提为主 Key（优先级最高，故障转移最先使用）",
   "key.protocolSuffix": "协议",
+  "key.openSiteTip": "在浏览器打开 {site}（查额度 / 看公告 / 读文档）",
   "key.moveUp": "上移（提高优先级，故障转移更早使用）",
   "key.moveDown": "下移（降低优先级）",
   "key.mappingTitle": "模型映射",
@@ -675,6 +676,7 @@ const zh: Dict = {
   "settings.logBrowse": "浏览…",
   "settings.logReset": "恢复默认",
   "settings.logOpenDir": "打开日志目录",
+  "settings.logOpened": "已打开：{dir}",
   "settings.diagExport": "导出诊断报告",
   // 拆成三段是为了让中间那句真的**渲染成粗体**。这里没有 Markdown 渲染器，
   // 整句里写 `**…**` 只会让用户看到一对字面星号——偏偏这句是决定用户敢不敢把
@@ -1090,6 +1092,7 @@ const en: Dict = {
   "key.collapse": "Collapse",
   "key.setPrimaryHint": "Move to the top (priority 0), tried first on failover",
   "key.protocolSuffix": "protocol",
+  "key.openSiteTip": "Open {site} in your browser (balance / notices / docs)",
   "key.moveUp": "Move up (higher priority, tried earlier on failover)",
   "key.moveDown": "Move down (lower priority)",
   "key.mappingTitle": "Model mapping",
@@ -1448,6 +1451,7 @@ const en: Dict = {
   "settings.logBrowse": "Browse…",
   "settings.logReset": "Reset to default",
   "settings.logOpenDir": "Open log folder",
+  "settings.logOpened": "Opened: {dir}",
   "settings.diagExport": "Export diagnostics",
   "settings.diagDesc": "For bug reports: includes version, paths, per-key health, redacted config and a recent-event summary.",
   "settings.diagDescNoSecrets": "No API keys and no conversation content",

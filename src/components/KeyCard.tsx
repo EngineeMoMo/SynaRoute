@@ -11,8 +11,9 @@ import { useStore } from "@/store";
 import { formatRelativeTime } from "@/lib/utils";
 import { balanceFingerprint, formatBalanceAmount, usedPercent } from "@/lib/balance";
 import { usePolling } from "@/lib/usePolling";
+import { openExternalUrl } from "@/lib/openExternal";
 import { useT } from "@/lib/useT";
-import { ChevronUp, ChevronDown, RefreshCw, Pencil, Trash2, ArrowRight, Wallet } from "lucide-react";
+import { ChevronUp, ChevronDown, RefreshCw, Pencil, Trash2, ArrowRight, Wallet, ExternalLink } from "lucide-react";
 
 /**
  * 单个厂商 Key 卡片（FR-001/003/006/010/011）。
@@ -52,7 +53,18 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast 
   const balanceEntry = useStore((s) => s.balances[k.id]);
   const balanceBusy = useStore((s) => !!s.balanceLoading[k.id]);
   const refreshBalance = useStore((s) => s.refreshBalance);
+  const showToast = useStore((s) => s.showToast);
   const balanceEnabled = !!k.balanceQuery?.enabled;
+  // 站点域名根（用于「点地址在浏览器打开」）。取 origin 而非完整 baseUrl：后者带
+  // `/v1` 之类 API 路径，浏览器打开多半是 404 或一段 JSON 错误；用户真正想去的是站点首页
+  // （查额度/看公告/读文档）。地址不合法时为 null，此时不渲染可点链接。
+  const siteOrigin = React.useMemo(() => {
+    try {
+      return new URL(k.baseUrl.trim()).origin;
+    } catch {
+      return null;
+    }
+  }, [k.baseUrl]);
   // 指纹进 deps：用户改了查询地址/认证方式后指纹变，这里会自动重查一次，
   // 而不是继续显示旧配置查出来的那条错误（看着像「改了没生效」）。
   const fingerprint = balanceFingerprint(k);
@@ -171,9 +183,31 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast 
             <HealthBadge health={k.health} />
           </div>
 
-          {/* 端点与协议（UX-3：合并一行以减少卡片高度） */}
+          {/* 端点与协议（UX-3：合并一行以减少卡片高度）。
+              地址做成可点：中转站的额度/公告/文档都在自己的站点上，用户排查
+              「这个 Key 是不是欠费了」的第一动作就是去开那个域名。原先只能选中复制、
+              再切浏览器粘贴。点的是**域名根**而不是完整 baseUrl —— 后者带 `/v1`
+              之类 API 路径，直接打开多半是 404 或一段 JSON 错误，帮不上忙。 */}
           <div className="mt-1 flex items-center gap-2 text-xs">
-            <span className="truncate font-mono text-text-secondary">{k.baseUrl}</span>
+            {siteOrigin ? (
+              <Tooltip content={t("key.openSiteTip", { site: siteOrigin })}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void openExternalUrl(siteOrigin).catch((e) =>
+                      showToast("error", String((e as Error)?.message ?? e)),
+                    );
+                  }}
+                  className="group flex min-w-0 items-center gap-1 truncate font-mono text-text-secondary hover:text-primary hover:underline"
+                >
+                  <span className="truncate">{k.baseUrl}</span>
+                  <ExternalLink size={11} className="shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
+                </button>
+              </Tooltip>
+            ) : (
+              // 地址不合法（历史配置里有纯文本地址）时不给可点的假链接
+              <span className="truncate font-mono text-text-secondary">{k.baseUrl}</span>
+            )}
             <span className="shrink-0 text-text-muted">· {protocolLabel(k.protocol)} {t("key.protocolSuffix")}</span>
           </div>
 

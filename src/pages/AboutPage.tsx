@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { useT } from "@/lib/useT";
+import { openExternalUrl } from "@/lib/openExternal";
 import { useStore } from "@/store";
 import { Github, Globe, Mail, Copy, Check, Heart, ExternalLink } from "lucide-react";
 
@@ -32,8 +33,9 @@ const SITE_URL = "https://www.mofamilys.com";
  */
 async function openExternal(url: string, onError: (msg: string) => void) {
   try {
-    const { open } = await import("@tauri-apps/plugin-shell");
-    await open(url);
+    // 走共用 helper：它统一挡掉非 http(s) scheme，并把「为何外链能前端开、
+    // 本地目录必须后端开」的判据集中在一处（见 lib/openExternal.ts）。
+    await openExternalUrl(url);
   } catch (e) {
     onError(String((e as Error)?.message ?? e));
   }

@@ -251,7 +251,10 @@ export function CommandPalette({ onClose, onNavigate, onEditKey, onAddKey }: Pro
       title: t("settings.logOpenDir"),
       group: t("palette.groupActions"),
       haystack: [{ label: "", value: t("settings.logOpenDir") }],
-      run: () => openLogDir(),
+      // 丢弃返回的路径：命令面板只负责触发，不做回显（设置页那处会 toast 路径）。
+      run: async () => {
+        await openLogDir();
+      },
     });
 
     return out;

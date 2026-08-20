@@ -378,6 +378,40 @@ pub fn expand_placeholders(
         .replace("{{userId}}", user_id)
 }
 
+/// OpenAI 兼容计费层的**配对端点**：订阅（额度上限）与用量（已消耗）。
+///
+/// OpenAI 的 billing API 是**两个端点配对**设计的，NewAPI / OneAPI 系照抄了这套契约：
+/// - `/v1/dashboard/billing/subscription` → `hard_limit_usd`（额度**上限**，单位 USD）
+/// - `/v1/dashboard/billing/usage`        → `total_usage`（已消耗，单位**美分**）
+///
+/// 真正的剩余 = `hard_limit_usd − total_usage / 100`。
+///
+/// ## 为什么必须配对查，不能只拿 subscription
+///
+/// 真机反馈：大量 su2api / NewAPI 系账号查回来都是「余额 10000 USD」。根因是
+/// `hard_limit_usd` 是**上限**而非剩余 —— 这类站点给账号配的上限常是一个很大的常数
+/// （10000 是最常见的默认值），无论用掉多少它都不变。把它当余额显示，等于告诉用户
+/// 「你还有一万美元」，而账号可能早就欠费停用了。这比不显示余额糟得多，
+/// 与本模块「绝不返回 0（会让用户以为额度用光）」是同一条原则的另一面：
+/// **绝不返回一个虚高的上限当余额**。
+///
+/// ## 为什么这里可以多发一次请求（与模块开头「刻意不做多端点轮询」不矛盾）
+///
+/// 那条约束针对的是「**猜**端点」——逐个试候选路径，失败率高、纯浪费。
+/// 这里是**同一套 API 的两个必需部分**：拿不到 usage 就算不出剩余，不是可选的优化。
+/// 且只在识别出 billing subscription 形态时才发第二次（普通站点一次请求照旧）。
+const BILLING_USAGE_PATH: &str = "/v1/dashboard/billing/usage";
+
+/// OpenAI 兼容计费层的已消耗额度（USD）。响应形如 `{"object":"list","total_usage":1234.5}`，
+/// **单位是美分**（OpenAI 契约如此，NewAPI 照抄），故除以 100。
+fn parse_billing_usage_usd(body: &Value) -> Option<f64> {
+    let cents = body
+        .get("total_usage")
+        .and_then(as_number)
+        .or_else(|| body.get("data").and_then(|d| d.get("total_usage")).and_then(as_number))?;
+    Some(cents / 100.0)
+}
+
 /// 从上游返回的 JSON 里提取余额结果。
 ///
 /// 与网络层分离，故可被单测直接喂各家的真实返回结构（见本文件测试）。
@@ -438,6 +472,30 @@ pub fn extract_balance(body: &Value, custom_path: Option<&str>) -> BalanceResult
         queried_at: now,
         error: None,
     }
+}
+
+/// 本次返回是否是「OpenAI 兼容 billing subscription」形态，即余额值取自
+/// `hard_limit_usd`（**额度上限**，不是剩余）。
+///
+/// 这类返回必须再查一次 `/v1/dashboard/billing/usage` 把已消耗扣掉，否则显示的是上限
+/// —— 真机上大量 su2api / NewAPI 账号因此都显示「10000 USD」（见 [`BILLING_USAGE_PATH`]）。
+///
+/// 判据是「**余额确实取自 hard_limit_usd**」而不是「响应里有 hard_limit_usd」：
+/// 若上游同时给了更精确的 `remaining`（候选链里排在前面），那个值本身就是剩余，
+/// 再去减一次 usage 会把余额算成负数。
+fn is_billing_limit_shape(body: &Value, custom_path: Option<&str>) -> bool {
+    // 用户显式指定路径时一律尊重用户，不做任何自动修正。
+    if custom_path.map(str::trim).is_some_and(|s| !s.is_empty()) {
+        return false;
+    }
+    let Some(limit) = find_number(body, &["hard_limit_usd", "data.hard_limit_usd"]) else {
+        return false;
+    };
+    // 候选链取到的值等于 hard_limit_usd → 说明前面更精确的字段都没命中。
+    // 用 f64 相等比较是安全的：两者取自**同一个** JSON 数字，没有中间运算。
+    derive_openrouter_remaining(body)
+        .or_else(|| find_number_scaled(body, REMAINING_CANDIDATES))
+        .is_some_and(|r| r == limit)
 }
 
 /// 对单个 Key 执行一次余额查询。
@@ -548,7 +606,21 @@ pub async fn query_balance(
     }
 
     match serde_json::from_str::<Value>(&text) {
-        Ok(v) => extract_balance(&v, cfg.remaining_path.as_deref()),
+        Ok(v) => {
+            let mut result = extract_balance(&v, cfg.remaining_path.as_deref());
+            // OpenAI 兼容 billing 形态：拿到的是**额度上限**（hard_limit_usd），不是剩余。
+            // 必须再查一次配对的 usage 端点把已消耗扣掉，否则显示的是一个永不变化的大数
+            // （真机上大量 su2api / NewAPI 账号因此都显示「10000 USD」）。
+            // 详见 BILLING_USAGE_PATH 的文档。
+            if result.ok && is_billing_limit_shape(&v, cfg.remaining_path.as_deref()) {
+                result = adjust_billing_limit_with_usage(
+                    result, &client, &url, secret, auth_scheme, access_token, user_id, timeout,
+                    key.protocol,
+                )
+                .await;
+            }
+            result
+        }
         Err(e) => {
             // HTML 响应单独给一条**可照做**的提示，不要只丢一句「不是合法 JSON」。
             //
@@ -569,6 +641,100 @@ pub async fn query_balance(
             BalanceResult::failed(format!("响应不是合法 JSON（{e}）: {snippet}"))
         }
     }
+}
+
+/// 用配对的 usage 端点把「额度上限」修正成「真实剩余」。
+///
+/// 入参 `result` 的 `remaining` 目前是 `hard_limit_usd`（上限）。本函数请求
+/// [`BILLING_USAGE_PATH`] 拿 `total_usage`（美分），换算后相减：
+/// `剩余 = 上限 − 已用`，并把上限/已用一并填进 `total` / `used`（卡片据此显示已用百分比）。
+///
+/// **拿不到 usage 时保持原样返回**，只在 `error` 里留一句说明。理由：
+/// 上限值本身是上游给的真实数据，显示它总比什么都不显示好；而如实说明「这是上限、
+/// 未能扣除已用」能让用户自己判断，比悄悄显示一个虚高数字诚实得多。
+/// 绝不因为第二次请求失败就把整条查询判失败 —— 那会让原本能看到额度的用户什么也看不到。
+#[allow(clippy::too_many_arguments)]
+async fn adjust_billing_limit_with_usage(
+    mut result: BalanceResult,
+    client: &reqwest::Client,
+    subscription_url: &str,
+    secret: &str,
+    auth_scheme: &str,
+    access_token: &str,
+    user_id: &str,
+    timeout: Duration,
+    protocol: crate::model::Protocol,
+) -> BalanceResult {
+    let limit = match result.remaining {
+        Some(v) => v,
+        None => return result,
+    };
+    // usage 端点与 subscription 同源同前缀，直接替换尾部路径，不重新推导 origin
+    // （用户可能填了自定义 base_url_override，重新推导会打到别的域名去）。
+    let Some(usage_url) = subscription_url
+        .rfind("/v1/dashboard/billing/subscription")
+        .map(|pos| format!("{}{}", &subscription_url[..pos], BILLING_USAGE_PATH))
+    else {
+        return result;
+    };
+
+    let mut req = client.get(&usage_url).timeout(timeout);
+    // 认证与主请求完全一致：同一套 billing API，鉴权形态不会变。
+    req = match auth_scheme.to_ascii_lowercase().as_str() {
+        "" | "bearer" => req.bearer_auth(secret),
+        "x-api-key" => req
+            .header("x-api-key", secret)
+            .header("anthropic-version", "2023-06-01"),
+        "access-token" => req
+            .bearer_auth(access_token)
+            .header("New-Api-User", user_id)
+            .header("content-type", "application/json"),
+        _ => req,
+    };
+    req = crate::upstream::apply_client_identity(req, protocol);
+
+    let note = |result: &mut BalanceResult, why: String| {
+        // 如实标注：这个数是上限、没能扣掉已用。用户看到「10000」时至少知道为什么。
+        result.error = Some(format!(
+            "该站点只提供额度上限（hard_limit_usd），未能读取已用额度（{why}）——\
+             显示的是上限而非剩余"
+        ));
+    };
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            note(&mut result, e.to_string());
+            return result;
+        }
+    };
+    if !resp.status().is_success() {
+        let st = resp.status();
+        note(&mut result, format!("HTTP {st}"));
+        return result;
+    }
+    let text = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            note(&mut result, e.to_string());
+            return result;
+        }
+    };
+    let used = match serde_json::from_str::<Value>(&text).ok().and_then(|v| parse_billing_usage_usd(&v)) {
+        Some(u) => u,
+        None => {
+            note(&mut result, "返回里没有 total_usage 字段".into());
+            return result;
+        }
+    };
+
+    // 相减得真实剩余。负数夹到 0：上游数据不一致时（用量统计口径与上限不同源）
+    // 显示负余额只会让用户困惑，而 0 是「已用完」这个结论的正确表达。
+    result.remaining = Some((limit - used).max(0.0));
+    result.total = Some(limit);
+    result.used = Some(used);
+    result.error = None;
+    result
 }
 
 /// 响应体是否是 HTML 而非 JSON。
@@ -694,6 +860,61 @@ mod tests {
             Some(3.25),
             "remaining 比 hard_limit_usd 精确，必须优先"
         );
+    }
+
+    /// **`hard_limit_usd` 是额度上限、不是剩余**，必须配对查 usage 端点扣掉已用（真机 P1）。
+    ///
+    /// 真机反馈：大量 su2api / NewAPI 系账号余额都查回「10000 USD」。根因就是这类站点给账号
+    /// 配的 `hard_limit_usd` 是个很大的常数（10000 最常见），无论用掉多少都不变；把它当余额
+    /// 显示，等于告诉用户「你还有一万美元」，而账号可能早就欠费停用。
+    ///
+    /// 这条测两件事：
+    /// ① `is_billing_limit_shape` 能正确识别「余额确实取自 hard_limit_usd」的形态；
+    /// ② 有更精确字段（remaining）时**不得**误判 —— 否则会拿真实剩余再减一次已用，算成负数。
+    ///
+    /// 相减与单位换算（`total_usage` 是**美分**）由 `parse_billing_usage_usd` 负责，一并测。
+    #[test]
+    fn billing_hard_limit_is_recognized_as_limit_not_remaining() {
+        // ① 只有上限 → 判定为 billing 形态（需要配对查 usage）
+        let limit_only = serde_json::json!({
+            "object": "billing_subscription",
+            "hard_limit_usd": 10000.0,
+            "soft_limit_usd": 10000.0
+        });
+        assert!(
+            is_billing_limit_shape(&limit_only, None),
+            "只有 hard_limit_usd 时必须判为「上限形态」，否则用户永远看到 10000 这个假余额"
+        );
+
+        // ② 有更精确的 remaining → 不是上限形态（那个值本身就是剩余，不能再减 usage）
+        let with_remaining = serde_json::json!({
+            "object": "billing_subscription",
+            "remaining": 3.25,
+            "hard_limit_usd": 10000.0
+        });
+        assert!(
+            !is_billing_limit_shape(&with_remaining, None),
+            "上游给了真实剩余时不得再去减一次已用（会算成负数）"
+        );
+
+        // ③ 用户显式指定了取值路径 → 一律尊重用户，不做自动修正
+        assert!(
+            !is_billing_limit_shape(&limit_only, Some("hard_limit_usd")),
+            "用户手填路径时不得自动改写其语义"
+        );
+
+        // ④ usage 端点的单位换算：OpenAI 契约里 total_usage 是**美分**
+        let usage = serde_json::json!({ "object": "list", "total_usage": 1234.5 });
+        assert_eq!(
+            parse_billing_usage_usd(&usage),
+            Some(12.345),
+            "total_usage 是美分，必须除以 100 才是 USD"
+        );
+        // data 包裹形态（部分二次开发站点）也要认
+        let wrapped = serde_json::json!({ "data": { "total_usage": 500.0 } });
+        assert_eq!(parse_billing_usage_usd(&wrapped), Some(5.0));
+        // 没有该字段 → None（调用方据此保留上限值并如实标注，不编数字）
+        assert_eq!(parse_billing_usage_usd(&serde_json::json!({ "object": "list" })), None);
     }
 
     /// SiliconFlow 同时返回 `balance`（赠送额度）、`chargeBalance`（充值额度）、
