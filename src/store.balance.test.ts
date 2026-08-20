@@ -146,6 +146,46 @@ describe("refreshBalance", () => {
     expect(useStore.getState().balanceLoading["k1"]).toBeUndefined();
     err.mockRestore();
   });
+
+  it("瞬时失败（后端并发去重命中）**不入缓存**，也不覆盖已有的真实结果", async () => {
+    // 前置：卡片上已有一条真实成功的余额
+    const good = okResult(Date.now());
+    useStore.setState({ balances: { k1: { result: good, fingerprint: "fp1" } } });
+
+    // 后端 in-flight 哨兵：压根没打上游，`transient: true`
+    const busy: BalanceResult = {
+      ok: false,
+      queriedAt: Date.now(),
+      error: "该 Key 的余额查询正在进行中，请稍候",
+      transient: true,
+    };
+    spy = vi.spyOn(api, "queryKeyBalance").mockResolvedValue(busy as never);
+
+    // force 绕过 TTL，确保真的会发起这次调用
+    await useStore.getState().refreshBalance("k1", "fp1", true);
+
+    const cached = useStore.getState().balances["k1"];
+    // 关键：真实结果必须还在。旧行为会把这条伪失败写进缓存 → 卡片被一句
+    // 「查询正在进行中」钉住整个 TTL（最长 5 分钟），点刷新也没用。
+    expect(cached.result.ok).toBe(true);
+    expect(cached.result.remaining).toBe(42);
+    expect(cached.result.error).toBeUndefined();
+    // loading 标记要正常释放，否则后续刷新会被去重门永久挡住
+    expect(useStore.getState().balanceLoading["k1"]).toBeUndefined();
+  });
+
+  it("瞬时失败在没有任何缓存时也不写入（卡片保持「未查询」，而不是显示假错误）", async () => {
+    const busy: BalanceResult = {
+      ok: false,
+      queriedAt: Date.now(),
+      error: "该 Key 的余额查询正在进行中，请稍候",
+      transient: true,
+    };
+    spy = vi.spyOn(api, "queryKeyBalance").mockResolvedValue(busy as never);
+
+    await useStore.getState().refreshBalance("k1", "fp1");
+    expect(useStore.getState().balances["k1"]).toBeUndefined();
+  });
 });
 
 describe("deleteKey 清理余额缓存", () => {

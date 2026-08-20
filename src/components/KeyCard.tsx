@@ -26,11 +26,19 @@ import { ChevronUp, ChevronDown, RefreshCw, Pencil, Trash2, ArrowRight, Wallet, 
  * 若不在 store 里复用未变对象，`prevProps.k === nextProps.k` 恒为 false、memo 恒失效
  * （实测确认过：轮询后 k 引用必变而内容全等）。两者必须成对存在，改一处要想到另一处。
  */
-export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast }: {
+export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast, isRoutingPrimary }: {
   k: ProviderKey;
   onEdit: (k: ProviderKey) => void;
   isFirst: boolean;
   isLast: boolean;
+  /**
+   * 这条是否为**路由意义上**的主 Key（首个启用 Key）。
+   *
+   * 由父级算好传入，而不是在卡片内用 `k.priority === 0` 判 —— 后者需要看到整列才能得出
+   * 正确结论（priority-0 可能被禁用、也可能多条同为 0），单张卡片没有那个视野。
+   * 口径与 `routingPrimaryKey` / 后端 `enabled_keys_sorted` / 状态条 / 托盘完全一致。
+   */
+  isRoutingPrimary: boolean;
 }) {
   // 细粒度订阅：KeyCard 会被渲染 N 份（每个 Key 一份），整店解构时任何无关字段变化
   // （如日志页每 2s 的 events）都会把整列卡片全部重渲染一遍。
@@ -159,10 +167,19 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast 
             <span className="truncate text-sm font-semibold text-text-primary">
               {k.name}
             </span>
-            {k.priority === 0 ? (
+            {isRoutingPrimary ? (
               /* 主 Key 徽标用实心渐变（UI-1）：这是卡片列表里唯一需要「一眼找到」的标识，
                  故给它全卡片最强的视觉权重。其余徽标一律保持低饱和的 /12 底色，
-                 渐变只用在这一处——铺开用就等于没有重点。 */
+                 渐变只用在这一处——铺开用就等于没有重点。
+
+                 **判据是「路由意义上的主 Key」（首个启用 Key），不是 `priority === 0`。**
+                 后端路由（`enabled_keys_sorted`）与状态条、托盘都用前者。用 priority===0 会在
+                 两种真实场景下与实际路由不一致：
+                 ① priority-0 那条被禁用 → 徽标指着一条根本不进候选池的 Key，而真正在用的
+                    那条没有任何标识；
+                 ② 历史配置/cc-switch 导入曾让多条同为 0 → **多张卡片同时显示「主 Key」**，
+                    一个「设为主」按钮都没有，用户无法从界面判断谁是主。
+                 现在徽标恒定唯一，且与「实际先用哪条」严格一致。 */
               <Badge
                 variant="primary"
                 className="border-0 bg-gradient-to-r from-primary to-primary-deep text-primary-foreground"
@@ -170,15 +187,20 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast 
                 {t("key.primary")}
               </Badge>
             ) : (
-              <Tooltip content={t("key.setPrimaryHint")} side="top">
-                <button
-                  type="button"
-                  onClick={() => void setPrimaryKey(k.id)}
-                  className="shrink-0 rounded-control border border-border px-1.5 py-0.5 text-[11px] text-text-muted hover:border-primary hover:text-primary"
-                >
-                  {t("key.setPrimary")}
-                </button>
-              </Tooltip>
+              /* 「设为主」只对**已启用**的 Key 给：把禁用 Key 设为主毫无意义
+                 （它不进候选池，设完徽标还是不会亮在它身上），点了只会让人困惑。
+                 与托盘「主 Key」子菜单只列启用项同一口径。 */
+              k.enabled && (
+                <Tooltip content={t("key.setPrimaryHint")} side="top">
+                  <button
+                    type="button"
+                    onClick={() => void setPrimaryKey(k.id)}
+                    className="shrink-0 rounded-control border border-border px-1.5 py-0.5 text-[11px] text-text-muted hover:border-primary hover:text-primary"
+                  >
+                    {t("key.setPrimary")}
+                  </button>
+                </Tooltip>
+              )
             )}
             <HealthBadge health={k.health} />
           </div>

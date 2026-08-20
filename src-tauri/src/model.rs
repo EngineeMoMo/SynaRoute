@@ -584,6 +584,21 @@ pub struct BalanceResult {
     /// 失败原因（超时 / HTTP 状态 / 字段找不到）。成功时为 `None`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 这次失败是**瞬时**的（重试即可），而非「配置/账号有问题」。
+    ///
+    /// 目前只有一种来源：并发去重命中（「该 Key 的余额查询正在进行中」）。它压根没打上游，
+    /// 不代表任何结论 —— 但它长得和真失败一样（`ok:false` + `error` 有值）。
+    /// 前端若把它当真失败写进缓存，卡片会被一条**假错误钉住整个 TTL**（最长 5 分钟），
+    /// 而真正在跑的那次查询结果反而被这条后到的伪失败盖掉。
+    ///
+    /// 故用一个显式标记而不是让前端去匹配错误文案：文案是会改的、还要翻译，
+    /// 按字符串判断等于把两处代码用一句中文粘在一起。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transient: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 impl BalanceResult {
@@ -600,6 +615,15 @@ impl BalanceResult {
             used: None,
             queried_at: chrono::Utc::now().timestamp_millis(),
             error: Some(reason.into()),
+            transient: false,
+        }
+    }
+
+    /// 构造一个**瞬时**失败（没打上游、不代表结论，调用方不应缓存它）。
+    pub fn transient(reason: impl Into<String>) -> Self {
+        Self {
+            transient: true,
+            ..Self::failed(reason)
         }
     }
 }

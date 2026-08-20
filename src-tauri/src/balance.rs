@@ -471,6 +471,8 @@ pub fn extract_balance(body: &Value, custom_path: Option<&str>) -> BalanceResult
         used: find_number(body, USED_CANDIDATES),
         queried_at: now,
         error: None,
+        // 成功结果不存在「瞬时」概念（该标记只用于「没打上游、不代表结论」的失败）。
+        transient: false,
     }
 }
 

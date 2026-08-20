@@ -325,7 +325,10 @@ async fn query_key_balance(
         let mut in_flight = state.balance_queries_in_flight.lock();
         if in_flight.contains(&key_id) {
             tracing::debug!("余额查询已在进行中，拒绝重复请求: key={}", key_id);
-            return Ok(crate::model::BalanceResult::failed(
+            // **标记为瞬时**：这次压根没打上游，不代表任何结论。不标的话前端会把它
+            // 当真失败写进缓存，卡片被一条假错误钉住整个 TTL（最长 5 分钟），
+            // 而真正在跑的那次查询结果反被这条后到的伪失败盖掉。
+            return Ok(crate::model::BalanceResult::transient(
                 "该 Key 的余额查询正在进行中，请稍候",
             ));
         }

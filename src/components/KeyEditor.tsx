@@ -405,9 +405,11 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
       //
       // 为什么要判 result.ok：probeBalance 直调 api.queryKeyBalance，绕过了 store.refreshBalance
       // 的 balanceLoading 去重门。若此刻自动轮询恰好在途，后端 in-flight 哨兵会返回一条
-      // `失败:该Key余额查询正在进行中` 的**伪失败**；无条件写缓存会把它盖到卡片上，甚至可能
-      // 覆盖轮询随后落盘的真实成功值。伪失败只在编辑器内经 setBalanceProbe 展示即可，不入共享缓存。
-      // 成功结果才写缓存：既让卡片复用、不重发一模一样的请求，也不污染健康状态。
+      // 带 `transient: true` 的**伪失败**（压根没打上游）；无条件写缓存会把它盖到卡片上，
+      // 甚至可能覆盖轮询随后落盘的真实成功值。
+      // 判 `ok` 已经涵盖了这种情况（伪失败的 ok 必为 false），store 那侧另有 `transient` 显式门
+      // 作为第二道；这里保持「只有成功才入共享缓存」这条更强的约束不变。
+      // 伪失败只在编辑器内经 setBalanceProbe 展示即可。
       if (result.ok) {
         // 指纹用**刚落盘的那条**算（`saved` 而非 `draft`/`initial`）：那才是产出本结果的配置，
         // 也正是卡片重新渲染后会算出的指纹 —— 两者一致，卡片才会判成缓存有效而不再发一次

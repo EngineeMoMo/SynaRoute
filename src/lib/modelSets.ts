@@ -51,9 +51,12 @@ export function discoverableModels(enabledKeys: ProviderKey[]): string[] {
  * （`Store::enabled_keys_sorted`；托盘子菜单只列启用的，因为把禁用 Key 设为主毫无意义
  * ——它根本不进候选池）。若 priority 为 0 的那条被禁用了，真正先被使用的是下一条。
  *
- * 注意 `KeyCard` 目前仍用 `priority === 0` 画「主」徽标，所以在
- * 「priority-0 被禁用」这个场景下，列表徽标与状态条会指向不同的 Key。
- * 改 KeyCard 要连带调整「设为主」按钮的显隐规则，属独立议题，不在本次改动范围内。
+ * 全部展示位现已统一到这个口径：状态条、托盘、以及 `KeyCard` 的「主 Key」徽标
+ * （由 `CategoryPage` 算好 `isRoutingPrimary` 传进去 —— 单张卡片看不到整列，
+ * 无法自行判断）。此前 KeyCard 用 `priority === 0`，在两种真实场景下与实际路由不符：
+ * ① priority-0 被禁用 → 徽标指着一条不进候选池的 Key；
+ * ② 多条同为 0（历史配置 / cc-switch 导入曾把 sort_index 照搬成全 0）→ 多张卡片
+ *    同时显示「主 Key」，且一个「设为主」按钮都没有。
  */
 export function routingPrimaryKey(keys: ProviderKey[]): ProviderKey | undefined {
   return [...keys].filter((k) => k.enabled).sort((a, b) => a.priority - b.priority)[0];

@@ -10,7 +10,7 @@ import { Tooltip } from "@/components/ui/Tooltip";
 import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
 // 与状态条共用：两份实现必然漂移，而漂移后果是「状态条列出的模型在某备用 Key 上其实路由不了」
-import { keyExpectedSet } from "@/lib/modelSets";
+import { keyExpectedSet, routingPrimaryKey } from "@/lib/modelSets";
 import type { EventLogEntry, ProviderKey } from "@/types";
 import { Plus, AlertTriangle, Inbox, X, Database } from "lucide-react";
 
@@ -43,6 +43,11 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
     () => [...keys].sort((a, b) => a.priority - b.priority),
     [keys]
   );
+
+  // 路由意义上的主 Key（首个**启用** Key）—— 与后端 `enabled_keys_sorted`、状态条、
+  // 托盘同口径。卡片徽标据此画，而不是各自用 `priority === 0`：那个判据在
+  // 「priority-0 被禁用」与「多条同为 0」（历史配置/cc-switch 导入）时会与实际路由不符。
+  const routingPrimaryId = useMemo(() => routingPrimaryKey(keys)?.id, [keys]);
 
   // 模型映射兜底检查（FR-006a）：统计启用 Key 中，各期望模型的覆盖缺口
   const gaps = useMemo(() => detectMappingGaps(keys.filter((k) => k.enabled)), [keys]);
@@ -328,6 +333,7 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
               onEdit={onEditKey}
               isFirst={i === 0}
               isLast={i === sorted.length - 1}
+              isRoutingPrimary={k.id === routingPrimaryId}
             />
           ))}
       </div>

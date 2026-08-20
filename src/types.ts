@@ -387,6 +387,15 @@ export interface BalanceResult {
   queriedAt: number;
   /** 失败原因（超时 / HTTP 状态 / 字段找不到）。成功时无此字段 */
   error?: string;
+  /**
+   * 这次失败是**瞬时**的（重试即可），而非「配置/账号有问题」。
+   *
+   * 目前唯一来源：后端并发去重命中（「该 Key 的余额查询正在进行中」）——它压根没打上游、
+   * 不代表任何结论，但长得和真失败一样（`ok:false` + `error` 有值）。
+   * **调用方绝不能把它写进缓存**：否则卡片被一条假错误钉住整个 TTL（最长 5 分钟），
+   * 而真正在跑的那次查询结果反被这条后到的伪失败盖掉。
+   */
+  transient?: boolean;
 }
 
 export interface EventLogEntry {
