@@ -1472,9 +1472,20 @@ async fn try_stream_to_key(
 ) -> AppResult<StreamAttempt> {
     // 走 secret_for：DPAPI 模式带进程内解密缓存，免掉每请求每候选一次 CryptUnprotectData
     // 内核态系统调用（P2-6）。锁定态返 Err 的刻意语义原样保留。
+    //
+    // 密钥缺失是**本地配置错误**，不是上游故障 → 必须用 `AppError::Invalid`。
+    // 原先用 `upstream_msg`，会被尾部分流判成「临时性上游故障」：回 529 + Retry-After +
+    // 武装短路窗口 + 计入熔断，客户端据此无限退避重试 —— 而这个问题**永不自愈**
+    // （密钥根本没存进去，或主口令未解锁），用户还会以为是中转站过载、方向完全错。
+    // Invalid 走硬错误分支：原样回 400、不熔断好 Key、不退避，把可行动原因直接摆给客户端。
     let secret = store
         .secret_for(&key.id)?
-        .ok_or_else(|| AppError::upstream_msg("密钥缺失"))?;
+        .ok_or_else(|| {
+            AppError::Invalid(format!(
+                "Key「{}」没有可用的密钥：请在 Key 编辑器里填写 API 密钥并保存（若已启用主口令，请先解锁后重试）。",
+                key.name
+            ))
+        })?;
 
     // 模型解析：映射 → 原生支持 → 默认兜底 → 第一个模型 → 透传（见 ProviderKey::resolve_model）
     let real_model = key.resolve_model(requested_model);
@@ -2191,9 +2202,15 @@ async fn forward_to_key(
     budget_left: Option<std::time::Duration>,
 ) -> AppResult<ForwardOutcome> {
     // 同 try_stream_to_key：走带解密缓存的 secret_for（P2-6）。
+    // 密钥缺失同样判 `Invalid`（本地配置错误、永不自愈），理由见流式那处的完整说明。
     let secret = store
         .secret_for(&key.id)?
-        .ok_or_else(|| AppError::upstream_msg("密钥缺失"))?;
+        .ok_or_else(|| {
+            AppError::Invalid(format!(
+                "Key「{}」没有可用的密钥：请在 Key 编辑器里填写 API 密钥并保存（若已启用主口令，请先解锁后重试）。",
+                key.name
+            ))
+        })?;
 
     // 模型解析：映射 → 原生支持 → 默认兜底 → 第一个模型 → 透传（FR-006，见 resolve_model）
     let real_model = key.resolve_model(requested_model);
@@ -4176,7 +4193,66 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 端到端：全部候选失败 → 529 overloaded_error + Retry-After。
+    /// **密钥缺失是配置错误，不是上游过载**（P2 回归）。
+    ///
+    /// 原先取密钥失败用 `AppError::upstream_msg("密钥缺失")`，会被尾部分流判成「临时性上游
+    /// 故障」→ 回 529 + Retry-After + 武装短路窗口 + 计入熔断。而这个问题**永不自愈**
+    /// （密钥根本没存进去），客户端却据 529 无限退避重试，用户看到的是「上游过载」
+    /// —— 方向完全错，真因是自己没填密钥。
+    ///
+    /// 正确行为：400（硬错误分支）+ 可行动文案 + 不熔断（Key 本身没问题，是配置缺失）。
+    ///
+    /// 故障注入判据：把 `Invalid` 换回 `upstream_msg`，状态码断言立刻变红（收到 529）。
+    #[tokio::test]
+    async fn missing_secret_returns_actionable_400_not_529_overloaded() {
+        // 上游 mock 回 200：若真被打到会拿到 200，从而暴露「没在本地拦下」。
+        let upstream = spawn_mock(
+            200,
+            r#"{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}"#,
+        )
+        .await;
+        let dir = temp_dir("nosecret");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // 建 Key 但**不存密钥**（真实场景：用户填了地址就保存、密钥没填或保存失败）
+        store.upsert_key(key("k1", 0, &upstream)).unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "密钥缺失是配置错误 → 400；529 会让客户端把「没填密钥」当成上游过载无限退避"
+        );
+        assert!(
+            resp.headers().get("retry-after").is_none(),
+            "永不自愈的错误不该带 Retry-After（那是在说「等等就好了」）"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let msg = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("密钥"), "要点明缺的是密钥: {msg}");
+        assert!(
+            msg.contains("Key 编辑器") || msg.contains("填写"),
+            "要给出可自助的修复入口: {msg}"
+        );
+
+        // Key 本身没坏（凭据压根没被用过）→ 不得计入熔断，否则填上密钥后还要等窗口过去。
+        let k = store.get_key("k1").unwrap();
+        assert_eq!(k.health.fail_count, 0, "配置缺失不得把 Key 刷成失败");
+        assert!(k.health.breaker_until.is_none(), "配置缺失不得触发熔断");
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     ///
     /// 状态码判据来自官方 gateway 规范（claude.exe v2.1.219 内嵌原文）：529 是「上游暂时无产能」
     /// 的专用码，客户端 SDK 见到它走退避重试。此前回 502（→ `api_error`），SDK 的处理不确定，

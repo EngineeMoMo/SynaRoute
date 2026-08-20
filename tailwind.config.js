@@ -9,6 +9,13 @@ export default {
         background: "rgb(var(--background) / <alpha-value>)",
         surface: "rgb(var(--surface) / <alpha-value>)",
         "surface-hover": "rgb(var(--surface-hover) / <alpha-value>)",
+        // 「内嵌块」底色（代码块、路径展示、只读信息面板）。5 处代码在用它，
+        // 但 token 一直没注册 → 那 5 块**一条底色 CSS 都没生成**，看着是透明的，
+        // 与外层面板糊在一起（`bg-warning/8` 同一类静默失效，只是原因从「透明度不在标度」
+        // 换成「token 不存在」）。绑到 --surface-hover：它比 surface 略深一档，
+        // 正是「内嵌/下沉」想要的对比，且深浅主题都已定义、不必新增变量。
+        // 判据：`npm run build` 后 dist CSS 里能搜到 `.bg-surface-elevated`。
+        "surface-elevated": "rgb(var(--surface-hover) / <alpha-value>)",
         border: "rgb(var(--border) / <alpha-value>)",
         input: "rgb(var(--border) / <alpha-value>)",
         ring: "rgb(var(--primary) / <alpha-value>)",

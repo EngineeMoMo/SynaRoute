@@ -6,7 +6,8 @@
   "description": "SynaRoute - 智能 API Key 路由代理与配置管理桌面软件",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "tsc && vite build && node scripts/check-tailwind-tokens.mjs",
+    "check:tailwind": "node scripts/check-tailwind-tokens.mjs",
     "preview": "vite preview",
     "test": "vitest run",
     "tauri": "tauri"
