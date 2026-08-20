@@ -32,6 +32,8 @@ const zh: Dict = {
   "common.confirmDelete": "确认删除",
   "common.confirm": "确定",
   "common.close": "关闭",
+  "common.retry": "重试",
+  "common.listSep": "、",
 
   // 品牌 / 侧栏
   "app.tagline": "智能 Key 路由",
@@ -391,6 +393,7 @@ const zh: Dict = {
 
   // 大脑聚合
   "brain.title": "大脑聚合",
+  "brain.loadFailed": "大脑聚合配置加载失败",
   "brain.enabled": "已启用",
   "brain.disabled": "未启用",
   "brain.subtitle": "多个模型并行解答 → 聚合 → 最终决策者产出答案，提升准确性",
@@ -443,6 +446,7 @@ const zh: Dict = {
   "brain.addMember": "添加成员",
   "brain.pickKeyPlaceholder": "选择 Key…",
   "brain.keyDisabled": "已禁用",
+  "brain.keyDisabledSuffix": "（已禁用）",
   "brain.checkKeyHealth": "检测",
   "brain.keyNoModels": "该 Key 暂无模型，可手动输入模型名加入",
   "brain.workDir": "工作目录",
@@ -821,6 +825,8 @@ const en: Dict = {
   "common.confirmDelete": "Confirm delete",
   "common.confirm": "OK",
   "common.close": "Close",
+  "common.retry": "Retry",
+  "common.listSep": ", ",
 
   "app.tagline": "Smart Key Routing",
   "app.browserPreview": "Browser preview mode (mock data, not a real proxy)",
@@ -1171,6 +1177,7 @@ const en: Dict = {
   "editor.errApplyAll": "Bulk apply failed: {err}",
 
   "brain.title": "Brain Aggregation",
+  "brain.loadFailed": "Failed to load brain aggregation config",
   "brain.enabled": "Enabled",
   "brain.disabled": "Disabled",
   "brain.subtitle": "Multiple models answer in parallel → aggregate → decider produces the final answer for higher accuracy",
@@ -1223,6 +1230,7 @@ const en: Dict = {
   "brain.addMember": "Add member",
   "brain.pickKeyPlaceholder": "Select a key…",
   "brain.keyDisabled": "disabled",
+  "brain.keyDisabledSuffix": " (disabled)",
   "brain.checkKeyHealth": "Check",
   "brain.keyNoModels": "This key has no models yet — type a model name to include it",
 

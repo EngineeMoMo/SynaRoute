@@ -262,7 +262,7 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
             <div className="flex-1 leading-relaxed">
               <span className="font-medium">{t("category.trippedKeys")}</span>
               <span className="ml-1 break-all">
-                {trippedKeys.map((k) => k.name).join("、")}
+                {trippedKeys.map((k) => k.name).join(t("common.listSep"))}
               </span>
             </div>
           </div>
@@ -406,7 +406,7 @@ function MappingGapDialog({ gaps, onClose }: { gaps: Gap[]; onClose: () => void 
         <div className="flex-1 space-y-1.5 overflow-y-auto px-5 py-4">
           {gaps.map((g) => (
             <div key={g.expected} className="rounded-control bg-warning/8 px-3 py-2 text-xs text-text-secondary">
-              {t("category.mappingGapItem", { expected: g.expected, keys: g.missingKeys.join("、") })}
+              {t("category.mappingGapItem", { expected: g.expected, keys: g.missingKeys.join(t("common.listSep")) })}
             </div>
           ))}
         </div>

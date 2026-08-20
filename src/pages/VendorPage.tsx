@@ -21,6 +21,11 @@ type Draft = { id: string; name: string; defaultBaseUrl: string; defaultProtocol
 export function VendorPage() {
   const vendors = useStore((s) => s.vendors);
   const loadVendors = useStore((s) => s.loadVendors);
+  // 删除失败必须走 toast，不能只写 `error` state —— 那个 state 只在**编辑态**才渲染
+  // （见下方 `{editing && ...}` 块里的 `{error && ...}`），而删除是在**列表态**发起的：
+  // 后端拒绝删除（如厂商仍被 Key 引用）时，用户点了「删除」后界面一动不动、
+  // 没有任何提示，看着像按钮坏了。toast 与页面态无关，一定看得到。
+  const showToast = useStore((s) => s.showToast);
   const t = useT();
   // editing.id === "" 表示新增；null 表示未在编辑
   const [editing, setEditing] = useState<Draft | null>(null);
@@ -103,7 +108,12 @@ export function VendorPage() {
       await api.deleteVendor(v.id);
       await loadVendors();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      // 双写：toast 保证**列表态**一定看得到（删除就是在列表态发起的，而 `error` state
+      // 只在编辑态渲染）；`error` state 保留，供恰好在编辑态时就地显示。
+      // 后端拒绝删除（如该厂商仍被 Key 引用）是常见路径，静默会让用户以为按钮坏了。
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      showToast("error", msg);
     } finally {
       setBusy(false);
     }

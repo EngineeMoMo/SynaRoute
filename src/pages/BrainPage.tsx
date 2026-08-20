@@ -1,6 +1,6 @@
 import { usePolling } from "@/lib/usePolling";
 import { FALLBACK_POLL_MS } from "@/lib/useBackendEvents";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/bridge";
 import { useStore } from "@/store";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
@@ -31,6 +31,10 @@ export function BrainPage() {
   const loadVendors = useStore((s) => s.loadVendors);
   // 本页独立维护分类，不跟随侧栏，使三端聚合配置互相隔离
   const [category, setCategory] = useState<CategoryType>("claude-cli");
+  // 当前分类的 ref 镜像：供**异步回调**判断「返回时用户是否已切走」。
+  // 回调闭包捕获的是发起那一刻的 category，用它写 state 会造成切分类串台。
+  const categoryRef = useRef(category);
+  categoryRef.current = category;
   const [keys, setKeys] = useState<ProviderKey[]>([]);
   const [config, setConfig] = useState<BrainConfig | null>(null);
   const [saved, setSaved] = useState(false);
@@ -40,6 +44,9 @@ export function BrainPage() {
   // 与聚合配置分开：聚合配好只是「有内容」，还得接入客户端，客户端才能调 synaroute_ai。
   const [mcpRegistered, setMcpRegistered] = useState<boolean | null>(null);
   const [mcpBusy, setMcpBusy] = useState(false);
+  // 首屏加载失败的原因。`null` = 没失败（正在加载或已加载好）。
+  // 没有它的话首屏三个 IPC 任一失败就永久停在「加载中…」——无错误、无重试、无从下手。
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // 自定义厂商图标查找（成员行的品牌图标用）
   const vendorIcon = (vid?: string) => vendors.find((v) => v.id === vid)?.icon;
@@ -48,18 +55,49 @@ export function BrainPage() {
     void loadVendors();
   }, [loadVendors]);
 
-  useEffect(() => {
-    setConfig(null);
-    setSaved(false);
-    setMcpRegistered(null);
-    void Promise.all([api.getBrainConfig(category), api.listKeys(category), api.getToolConfigPreview(category)]).then(
-      ([cfg, ks, preview]) => {
+  /**
+   * 首屏加载：三个 IPC 并发拉取本分类的聚合配置 / Key 列表 / MCP 接入状态。
+   *
+   * 抽成具名函数（而非内联进 effect）是为了让「重试」按钮能复用同一条路径 ——
+   * 两份拷贝必然漂移，而漂移在这里是隐形的（重试走了另一套逻辑，修好的仍是坏的）。
+   *
+   * **必须带 catch**：原先是裸 `Promise.all(...).then(...)`，任一失败就永久停在
+   * 「加载中…」——没有错误提示、没有重试入口，用户只能切页再切回来赌一次。
+   *
+   * `generation` 门：切分类时旧请求可能后到，写进来会把新分类页填成旧分类的数据
+   * （本项目已在别处栽过这种「切分类串台」）。只有最后一次发起的加载才允许落 state。
+   */
+  const loadGenRef = useRef(0);
+  const loadBrain = useCallback(
+    async (cat: CategoryType) => {
+      const gen = ++loadGenRef.current;
+      setLoadError(null);
+      setConfig(null);
+      setSaved(false);
+      setMcpRegistered(null);
+      try {
+        const [cfg, ks, preview] = await Promise.all([
+          api.getBrainConfig(cat),
+          api.listKeys(cat),
+          api.getToolConfigPreview(cat),
+        ]);
+        if (gen !== loadGenRef.current) return; // 已被更晚的加载取代，丢弃本次结果
         setConfig(cfg);
         setKeys(ks);
         setMcpRegistered(preview.mcpRegistered);
+      } catch (e) {
+        if (gen !== loadGenRef.current) return;
+        const msg = String((e as Error)?.message ?? e);
+        console.error("loadBrain failed", e);
+        setLoadError(msg);
       }
-    );
-  }, [category]);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    void loadBrain(category);
+  }, [category, loadBrain]);
 
   // 一键接入/断开：把本分类的 synaroute MCP 写入（或移出）对应客户端配置。
   // 免去用户绕到「配置预览」弹窗底部——配好聚合的地方直接接入。
@@ -81,14 +119,22 @@ export function BrainPage() {
   };
 
   // 对单个 Key 触发健康检测并就地刷新（本页维护独立 keys 状态，不走全局 store）
+  //
+  // 用 `categoryRef` 而不是闭包里的 `category`：健康探测要打真实上游，可能耗时数秒
+  // （开启 health_probe_real_completion 时更久）。期间用户可能切了分类，而这个回调捕获的是
+  // **发起那一刻**的 category —— 用它去 `listKeys` 会把当前分类页的列表整表覆盖成旧分类的
+  // Key（切分类串台）。加代际门：探测返回时若分类已变，只清 checking 标记、不写列表。
   const checkKeyHealth = async (keyId: string) => {
+    const startedAt = categoryRef.current;
     setCheckingId(keyId);
     setKeys((ks) => ks.map((k) => (k.id === keyId ? { ...k, health: { ...k.health, status: "checking" } } : k)));
     try {
       await api.checkHealth(keyId);
     } finally {
-      const fresh = await api.listKeys(category);
-      setKeys(fresh);
+      if (categoryRef.current === startedAt) {
+        const fresh = await api.listKeys(startedAt);
+        setKeys(fresh);
+      }
       setCheckingId(null);
     }
   };
@@ -177,7 +223,28 @@ export function BrainPage() {
     return (
       <div className="h-full overflow-y-auto">
         <BrainHeader category={category} setCategory={setCategory} enabled={false} />
-        <div className="p-6 text-sm text-text-muted">{t("common.loading")}</div>
+        {loadError ? (
+          /* 加载失败必须**可见且可重试**：原先无 catch，任一 IPC 失败就永久停在
+             「加载中…」——没有原因、没有出路，用户只能切页再切回来赌一次。 */
+          <div className="p-6">
+            <div className="rounded-card border border-danger/40 bg-danger/8 p-4">
+              <div className="text-sm font-semibold text-danger">{t("brain.loadFailed")}</div>
+              <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-control bg-background p-2.5 font-mono text-[11px] text-text-secondary">
+                {loadError}
+              </pre>
+              <Button
+                variant="outline"
+                size="sm"
+                className="mt-3"
+                onClick={() => void loadBrain(category)}
+              >
+                {t("common.retry")}
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="p-6 text-sm text-text-muted">{t("common.loading")}</div>
+        )}
       </div>
     );
   }
@@ -759,7 +826,7 @@ function MemberPicker({
                 {/* 禁用的 Key 必须带标识：聚合运行时会跳过禁用成员（gather_members），
                     选择器里若与启用的长得一样，用户会加进来一个「永远不参与」的成员，
                     结果面板少一位专家还查不出原因。 */}
-                {key.enabled ? key.name : `${key.name}（${t("brain.keyDisabled")}）`}
+                {key.enabled ? key.name : `${key.name}${t("brain.keyDisabledSuffix")}`}
               </option>
             ))}
           </select>
@@ -890,7 +957,7 @@ function KeyModelSelect({
               <option key={key.id} value={key.id}>
                 {/* 同 MemberPicker：禁用 Key 带标识 —— 决策者/汇总者路径对禁用 Key 直接报错
                     （call_ref 的 enabled 检查），选了它整轮聚合会失败。 */}
-                {key.enabled ? key.name : `${key.name}（${t("brain.keyDisabled")}）`}
+                {key.enabled ? key.name : `${key.name}${t("brain.keyDisabledSuffix")}`}
               </option>
             ))}
           </select>

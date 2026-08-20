@@ -190,6 +190,20 @@ export function SettingsPage() {
     mcpEnabled,
   );
 
+  /**
+   * 文本类字段的**本地草稿**：输入时只改草稿，失焦（或按 Enter）才落盘。
+   *
+   * 为什么必需：`update()` 每次调用都要 `getSettings()`（读磁盘最新值）→ 合并 → `saveSettings()`。
+   * 逐字符触发时会并发出一串这样的往返，而**它们的返回顺序不保证**：先发的请求后返回时，
+   * 其 `.then` 里的 `setSettings(merged)` 会把输入框内容**回退到几个字符之前**
+   * ——用户看到自己打的字被吃掉，且无任何报错。开关类字段无此问题（单次点击、不连发）。
+   *
+   * `null` = 没在编辑，显示 `settings` 里的值。空串是合法草稿（用户清空路径），
+   * 故必须用 `null` 而非 `""` 表达「无草稿」。
+   */
+  const [logDirDraft, setLogDirDraft] = useState<string | null>(null);
+  const [probeMsgDraft, setProbeMsgDraft] = useState<string | null>(null);
+
   const update = (patch: Partial<AppSettings>) => {
     if (!settings) return;
     const prev = settings;
@@ -325,7 +339,12 @@ export function SettingsPage() {
 
   const handlePickLogDir = async () => {
     const dir = await api.pickDirectory();
-    if (dir) update({ logDir: dir });
+    if (dir) {
+      // 清掉草稿：否则用户先手打了一半、再用「浏览」选目录时，输入框仍显示那半截草稿
+      // （草稿优先于 settings），看着像「选了没生效」。
+      setLogDirDraft(null);
+      update({ logDir: dir });
+    }
   };
 
   // **实际生效**的日志目录：用户配了就是用户的，否则是默认目录。
@@ -870,10 +889,23 @@ export function SettingsPage() {
                 <textarea
                   className="min-h-[80px] w-full resize-y rounded-control border border-border bg-surface px-2.5 py-1.5 font-mono text-xs text-text-primary placeholder:text-text-muted"
                   placeholder={t("settings.probeMsgPlaceholder")}
-                  value={(settings?.healthProbeTestMessages ?? []).join("\n")}
-                  onChange={(e) =>
-                    update({ healthProbeTestMessages: e.target.value.split("\n") })
-                  }
+                  // 草稿优先：编辑期间不受 update() 的异步回填影响（见 probeMsgDraft 的说明）
+                  value={probeMsgDraft ?? (settings?.healthProbeTestMessages ?? []).join("\n")}
+                  onChange={(e) => setProbeMsgDraft(e.target.value)}
+                  onBlur={() => {
+                    if (probeMsgDraft === null) return;
+                    // 逐行 trim 并丢掉空行：空探测消息发给上游没有意义，
+                    // 而用户按回车换行时很容易留下尾部空行。
+                    const lines = probeMsgDraft
+                      .split("\n")
+                      .map((l) => l.trim())
+                      .filter((l) => l.length > 0);
+                    setProbeMsgDraft(null);
+                    const cur = settings?.healthProbeTestMessages ?? [];
+                    // 值没变就不落盘（避免「点进点出」也写一次盘）
+                    if (lines.length === cur.length && lines.every((l, i) => l === cur[i])) return;
+                    update({ healthProbeTestMessages: lines });
+                  }}
                 />
               </div>
             )}
@@ -941,15 +973,40 @@ export function SettingsPage() {
                   <input
                     type="text"
                     className="flex-1 rounded-control border border-border bg-background px-2.5 py-1.5 font-mono text-xs text-text-primary placeholder:text-text-muted"
-                    value={settings?.logDir ?? ""}
+                    // 草稿优先（见 logDirDraft 的说明）：逐字符落盘会让乱序返回的
+                    // saveSettings 把已输入的字符回退掉。
+                    value={logDirDraft ?? settings?.logDir ?? ""}
                     placeholder={defaultLogDir || t("settings.logDirDefault")}
-                    onChange={(e) => update({ logDir: e.target.value || undefined })}
+                    onChange={(e) => setLogDirDraft(e.target.value)}
+                    onBlur={() => {
+                      if (logDirDraft === null) return;
+                      const next = logDirDraft.trim() || undefined;
+                      setLogDirDraft(null);
+                      if (next === (settings?.logDir ?? undefined)) return; // 没变就不写盘
+                      update({ logDir: next });
+                    }}
+                    onKeyDown={(e) => {
+                      // Enter 立即提交（触发 blur 走同一条路径，不复制逻辑）；Esc 放弃编辑。
+                      if (e.key === "Enter") e.currentTarget.blur();
+                      else if (e.key === "Escape") {
+                        setLogDirDraft(null);
+                        e.currentTarget.blur();
+                      }
+                    }}
                   />
                   <Button size="sm" variant="secondary" onClick={() => void handlePickLogDir()}>
                     {t("settings.logBrowse")}
                   </Button>
                   {settings?.logDir && (
-                    <Button size="sm" variant="outline" onClick={() => update({ logDir: undefined })}>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        // 同 handlePickLogDir：先清草稿，否则「重置」后输入框仍显示手打的草稿。
+                        setLogDirDraft(null);
+                        update({ logDir: undefined });
+                      }}
+                    >
                       {t("settings.logReset")}
                     </Button>
                   )}
