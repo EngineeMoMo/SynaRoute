@@ -595,6 +595,18 @@ pub struct BalanceResult {
     /// 按字符串判断等于把两处代码用一句中文粘在一起。
     #[serde(default, skip_serializing_if = "is_false")]
     pub transient: bool,
+    /// 本次**实际命中**的查询地址模板（仅当经过多端点探测且成功时有值）。
+    ///
+    /// 存在的理由：认不出域名的中转站要按序试几条候选端点才知道哪条对。把命中的那条写回
+    /// `BalanceQuery.url`，下次就只发 1 个请求 —— 否则每次自动轮询都要重跑整条探测，
+    /// 对按请求计费/限流的站点是实打实的浪费。
+    ///
+    /// 用「模板」而非展开后的 URL：模板里带 `{{origin}}` 等占位符，跟着 base_url 走。
+    /// 存展开后的绝对地址会在用户改了 base_url 之后指向旧站点，且看不出是怎么来的。
+    ///
+    /// **不进 serde 输出**（前端不需要，它只看数值）：这是后端内部用来回写配置的通道。
+    #[serde(skip)]
+    pub resolved_url_template: Option<String>,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -616,6 +628,7 @@ impl BalanceResult {
             queried_at: chrono::Utc::now().timestamp_millis(),
             error: Some(reason.into()),
             transient: false,
+            resolved_url_template: None,
         }
     }
 

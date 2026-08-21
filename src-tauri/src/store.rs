@@ -2305,6 +2305,33 @@ impl Store {
         Ok(())
     }
 
+    /// 记住余额查询探测命中的地址模板（窄写入，只改这一个字段并落盘）。
+    ///
+    /// 返回是否真的写了盘（已是同值则幂等跳过）。
+    ///
+    /// **为什么必须是窄写入、不能让前端走 `upsert_key`**：那条路提交的是「打开编辑器那一刻」
+    /// 的整份快照，`upsert_key` 的守卫只保住 `health` 与 `cached_balance` 两项，
+    /// 其余字段一概照覆盖 —— 用一次后台余额查询去触发整份覆盖，会把这期间用户改的别的东西
+    /// 或后端自管的值顶掉。与 `set_primary_key`/`move_key` 收进后端是同一条理由。
+    ///
+    /// 只在 `balance_query` 已存在时写：`None` 表示这条 Key 压根没配余额查询，
+    /// 而能走到这里说明查过 —— 那是调用方的 bug，此时凭空造一个配置比什么都不做更糟。
+    pub fn set_balance_query_url(&self, key_id: &str, url_template: &str) -> AppResult<bool> {
+        self.mutate_and_persist_when(|cfg| {
+            let Some(k) = cfg.keys.iter_mut().find(|k| k.id == key_id) else {
+                return (false, false);
+            };
+            let Some(bq) = k.balance_query.as_mut() else {
+                return (false, false);
+            };
+            if bq.url == url_template {
+                return (false, false); // 幂等：已是目标值，不写盘
+            }
+            bq.url = url_template.to_string();
+            (true, true)
+        })
+    }
+
     /// 获取某 Key 的余额缓存（如果存在且未过期）。
     ///
     /// 返回 `Some(result)` 表示缓存命中且未过期，调用方可直接使用；

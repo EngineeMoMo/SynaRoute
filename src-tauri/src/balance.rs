@@ -183,20 +183,61 @@ const VENDOR_ENDPOINTS: &[(&str, &str, &str)] = &[
     ("api.anthropic.com", "{{origin}}/v1/organizations/me", "x-api-key"),
 ];
 
-/// 认不出具体厂商时的兜底端点链（按命中概率排序）。
+/// 认不出具体厂商时的**兜底端点链**（按序探测，命中即停）。
 ///
-/// 为什么值得有：中转站占本项目用户的绝大多数，而它们几乎都是 NewAPI / OneAPI 系
-/// 的二次开发 —— 端点高度收敛到这几条。逐条试比让用户在 5 个模板里盲猜靠谱得多。
+/// ## 为什么是一条链，而不是一个端点（本轮改动，有取证）
 ///
-/// **刻意不在这里做多端点轮询**：那会对上游发 N 次请求（部分站点按请求计费/限流）。
-/// 这里只提供「第一条」作为自动模板的默认值，试不中时错误信息会把其余候选列给用户
-/// （见 `looks_like_html` 分支的提示文案）。
-const FALLBACK_ENDPOINT: (&str, &str) = ("{{origin}}/v1/dashboard/billing/subscription", "bearer");
+/// 原先只有一条 `/v1/dashboard/billing/subscription`，而它对中转站是**错的那一条**：
+/// NewAPI 系在这个端点返回的是 `hard_limit_usd`（配额**上限**），不是余额。
+/// 于是真机上大量 su2api / NewAPI 账号一律显示「10000 USD」，且那个数字永不变化。
+///
+/// **判据来自用户本机 cc-switch 库**（2026-08-22 直接读 `~/.cc-switch/cc-switch.db`
+/// 的 `providers.meta`，非文档推测）：它给每个供应商存一段可编辑的 `usage_script`，
+/// 而用户那两个站（`Sub2API` = sub.100xlabs.space、`「林夕」公益站` = k40.shengqainbang.cn）
+/// 存的都是：
+///
+/// ```jsonc
+/// {"usage_script":{"enabled":true,"language":"javascript",
+///   "code":"({ request:{ url:\"{{baseUrl}}/v1/usage\", method:\"GET\", … }, extractor: … })",
+///   "timeout":10, "autoQueryInterval":30 }}
+/// ```
+///
+/// —— 端点是 **`/v1/usage`**。此前我们抄了它 extractor 的 `??` 字段链（见本文件开头注释），
+/// **却没抄端点**，于是「取值路径」怎么调都没用：地址本身就打错了。
+/// 而错误文案还会把人指向「去改取值路径」，方向完全相反。
+///
+/// ## 探测的代价与遏制
+///
+/// 原注释写着「刻意不做多端点轮询：那会对上游发 N 次请求」。这个顾虑仍然成立，
+/// 但**兜底端点本身是错的**这件事比它严重得多 —— 省下的请求换来的是一个恒定错误的数字。
+/// 故改为探测 + 三重遏制：
+/// 1. **命中即停**，且把命中的模板写回 `BalanceQuery.url`（见 `resolved_url_template`），
+///    此后每次只发 1 个请求 —— 探测是一次性成本，不是每轮成本；
+/// 2. 只在「用户没填 url」**且**「域名认不出」时才探测。用户填过的、能按域名认出的
+///    一律单发一次（`VENDOR_ENDPOINTS` 那 11 条精确命中的不受影响）；
+/// 3. 链长封顶 3 条，且余额端点不是推理端点、不按 token 计费。
+///
+/// 顺序即「命中概率 × 结果正确性」：`/v1/usage` 既最常见又直接给余额；
+/// `hard_limit_usd` 那条排最后 —— 它能出数但那是上限，属最后的兜底（且已有
+/// `adjust_billing_limit_with_usage` 再去扣一次已用）。
+const FALLBACK_ENDPOINTS: &[(&str, &str)] = &[
+    // cc-switch 给中转站实配的那条（上面的取证）。多数 su2api / 公益站走这条。
+    ("{{origin}}/v1/usage", "bearer"),
+    // NewAPI / OneAPI 面板自身的用户信息接口，部分站点用 API Key 也能读。
+    ("{{origin}}/api/user/self", "bearer"),
+    // OpenAI 兼容计费层。**返回的是上限而非余额**，故排最后（见上方顺序说明）。
+    ("{{origin}}/v1/dashboard/billing/subscription", "bearer"),
+];
 
 /// 按 `base_url` 猜该站点的余额端点。返回 `(url 模板, 认证方式)`。
 ///
-/// 命中 [`VENDOR_ENDPOINTS`] 里的域名就用那家的；认不出则用 [`FALLBACK_ENDPOINT`]
-/// （NewAPI/OneAPI 系的通用计费端点，中转站命中率最高的一条）。
+/// 命中 [`VENDOR_ENDPOINTS`] 里的域名就用那家的；认不出则返回
+/// [`FALLBACK_ENDPOINTS`] 的**第一条**。
+///
+/// ⚠️ 认不出时「只返回第一条」是有损的 —— 真正的处置是按序探测整条链
+/// （见 [`resolve_endpoint_candidates`]）。本函数保留是因为它已被 UI 预览与
+/// 迁移逻辑当作「这个域名会怎么查」的展示入口，那里只需要一个代表值。
+/// **查询路径不要用它**，用 `resolve_endpoint_candidates`。
 ///
 /// 大小写不敏感：用户可能把域名写成 `API.DeepSeek.com`。
 pub fn detect_balance_endpoint(base_url: &str) -> (&'static str, &'static str) {
@@ -206,27 +247,51 @@ pub fn detect_balance_endpoint(base_url: &str) -> (&'static str, &'static str) {
             return (url, auth);
         }
     }
-    FALLBACK_ENDPOINT
+    FALLBACK_ENDPOINTS[0]
 }
 
-/// 解析本次查询实际用的 `(url 模板, 认证方式)`：**用户填了什么就用什么，没填的才自动补**。
+/// 域名能否被精确识别（命中 [`VENDOR_ENDPOINTS`]）。
+fn vendor_is_known(base_url: &str) -> bool {
+    let lower = base_url.to_ascii_lowercase();
+    VENDOR_ENDPOINTS.iter().any(|(domain, _, _)| lower.contains(domain))
+}
+
+/// 本次查询要按序尝试的 `(url 模板, 认证方式)` 候选列表。
 ///
-/// 规则就一条（url 与 auth 各自独立判空）：
-///   - 非空 → 用用户的（哪怕 url 是错的：那样他才能从报错里看出自己填错了；被自动识别
-///     悄悄改成能用的地址反而是「我改的不生效」这类静默失效）
-///   - 为空 → 用 `detect_balance_endpoint` 按域名猜的
+/// 三条规则，优先级从上到下：
 ///
-/// 刻意**不看 `template` 字段**：它只是界面上「用户点了哪个按钮」的回显，真正决定行为的
-/// 是 url/auth 有没有值。早先按 template 判 auto 模式的写法与这条判空规则重复、恒同向，
-/// 是死代码（故障注入实测：把 auto_mode 恒置 true 行为不变）。
+/// 1. **用户填了 url → 只用他填的那一条，绝不探测。** 哪怕它是错的：那样他才能从报错里
+///    看出自己填错了。替他悄悄换成能用的地址是「我改的不生效」这类静默失效，
+///    而这条规则本身也是用户唯一的逃生口（自动识别猜错时他还有手动出路）。
+/// 2. **域名能精确识别 → 只用那一条。** `VENDOR_ENDPOINTS` 里 11 条是逐个取证过的，
+///    更具体的判据必须胜过泛化探测；对这些站点探测纯属多打请求。
+/// 3. **都不满足 → 返回整条 [`FALLBACK_ENDPOINTS`] 按序试。** 这是中转站的主场景，
+///    也是原先「只试一条且那条是错的」造成「恒显示 10000 USD」的地方。
 ///
-/// 抽成纯函数是为了让「用户填优先 / 留空回退」两条分支能脱离网络单测（`query_balance`
-/// 要真打上游才走到 auth，无法在单测里观察 auth 解析结果）。
-fn resolve_endpoint<'a>(cfg: &'a BalanceQuery, base: &str) -> (&'a str, &'a str) {
-    let detected = detect_balance_endpoint(base);
-    let url = if cfg.url.trim().is_empty() { detected.0 } else { cfg.url.trim() };
-    let auth = if cfg.auth.trim().is_empty() { detected.1 } else { cfg.auth.trim() };
-    (url, auth)
+/// `auth` 独立判空：用户只填了 auth 没填 url 时，把他的 auth 覆盖到每个候选上
+/// —— 他填 auth 的意图是「这个站的认证方式是这样」，与试哪个路径无关。
+///
+/// 抽成纯函数是为了让三条分支能脱离网络单测（`query_balance` 要真打上游）。
+fn resolve_endpoint_candidates<'a>(cfg: &'a BalanceQuery, base: &str) -> Vec<(&'a str, &'a str)> {
+    let user_url = cfg.url.trim();
+    let user_auth = cfg.auth.trim();
+    // auth 为空时由候选自带；非空则覆盖全部候选。
+    let with_auth = |url: &'a str, auth: &'a str| -> (&'a str, &'a str) {
+        (url, if user_auth.is_empty() { auth } else { user_auth })
+    };
+
+    if !user_url.is_empty() {
+        // 规则 1：用户填了地址 → 就这一条
+        let detected_auth = detect_balance_endpoint(base).1;
+        return vec![with_auth(user_url, detected_auth)];
+    }
+    if vendor_is_known(base) {
+        // 规则 2：域名认得出 → 就这一条
+        let (url, auth) = detect_balance_endpoint(base);
+        return vec![with_auth(url, auth)];
+    }
+    // 规则 3：认不出 → 整条链按序试
+    FALLBACK_ENDPOINTS.iter().map(|(url, auth)| with_auth(url, auth)).collect()
 }
 
 /// Key 是否有效的候选字段链。
@@ -493,6 +558,8 @@ pub fn extract_balance(body: &Value, custom_path: Option<&str>) -> BalanceResult
         error: None,
         // 成功结果不存在「瞬时」概念（该标记只用于「没打上游、不代表结论」的失败）。
         transient: false,
+        // 由 `query_balance` 在「真探测过且命中」时补上，纯解析层不知道用了哪个端点。
+        resolved_url_template: None,
     }
 }
 
@@ -523,6 +590,11 @@ fn is_billing_limit_shape(body: &Value, custom_path: Option<&str>) -> bool {
 /// 对单个 Key 执行一次余额查询。
 ///
 /// `secret` 由调用方从密钥库取出（本模块不碰密钥库，保持可测）。
+///
+/// **可能按序试多个端点**：用户没填地址、域名又认不出时走
+/// [`FALLBACK_ENDPOINTS`] 探测，命中即停并把命中的模板放进
+/// `resolved_url_template` 供调用方写回配置（此后每次只发 1 个请求）。
+/// 单端点场景（用户填了 / 域名认得出）行为与从前完全一致。
 pub async fn query_balance(
     key: &ProviderKey,
     cfg: &BalanceQuery,
@@ -539,8 +611,52 @@ pub async fn query_balance(
         .filter(|s| !s.is_empty())
         .unwrap_or(&key.base_url);
 
-    // 自动识别：按 base_url 域名猜端点，**只填补用户没填的那一项**。见 resolve_endpoint。
-    let (url_template, auth_scheme) = resolve_endpoint(cfg, base);
+    let candidates = resolve_endpoint_candidates(cfg, base);
+    let probing = candidates.len() > 1;
+    let mut first_err: Option<BalanceResult> = None;
+
+    for (url_template, auth_scheme) in &candidates {
+        let mut r = query_one_endpoint(key, cfg, secret, base, url_template, auth_scheme).await;
+        if r.ok {
+            // 只在真探测过时才回写：单端点场景没什么可「记住」的，回写等于把
+            // 自动识别的结果固化成用户配置，日后我们改进识别表就再也不生效了。
+            if probing {
+                r.resolved_url_template = Some((*url_template).to_string());
+            }
+            return r;
+        }
+        // 瞬时失败（并发去重哨兵）不代表端点不对，也不该继续打其余端点。
+        if r.transient {
+            return r;
+        }
+        if first_err.is_none() {
+            first_err = Some(r);
+        }
+    }
+
+    // 全部候选都失败：报**第一条**（最可能对的那条）的错误，并说明还试过什么 ——
+    // 只报最后一条会让用户去查 `hard_limit_usd` 那个最不可能的路径。
+    let mut out = first_err.unwrap_or_else(|| BalanceResult::failed("没有可用的查询端点"));
+    if probing {
+        let tried: Vec<&str> = candidates.iter().map(|(u, _)| *u).collect();
+        let note = format!("\n（已自动尝试 {} 个常见端点均失败：{}。若站点的余额接口不在其中，请在「查询地址」里手填。）", tried.len(), tried.join("、"));
+        out.error = Some(match out.error.take() {
+            Some(e) => format!("{e}{note}"),
+            None => note.trim_start().to_string(),
+        });
+    }
+    out
+}
+
+/// 对**一个**端点执行查询（[`query_balance`] 的单次尝试）。
+async fn query_one_endpoint(
+    key: &ProviderKey,
+    cfg: &BalanceQuery,
+    secret: &str,
+    base: &str,
+    url_template: &str,
+    auth_scheme: &str,
+) -> BalanceResult {
 
     // NewAPI 类面板用 accessToken + userId 而非 API Key，故一并展开。
     // 两者留空时展开成空串，模板里没用到就无影响。
@@ -776,6 +892,112 @@ fn looks_like_html(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 起一个**按路径分流**的 mock 上游，返回 `http://127.0.0.1:port`。
+    ///
+    /// `routes` 是 `(路径, 状态码, 响应体)`；未列出的路径一律 404。
+    /// 按路径分流是必需的：探测链要验的就是「哪个路径给出了正确答案」，
+    /// 一个恒定响应的 mock 无法区分「试对了」和「随便打哪都行」。
+    async fn spawn_path_mock(routes: &'static [(&'static str, u16, &'static str)]) -> String {
+        use hyper::service::service_fn;
+        use hyper::{Request, Response};
+        use hyper_util::rt::TokioIo;
+        let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            0,
+        )))
+        .await
+        .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<hyper::body::Incoming>| async move {
+                        let path = req.uri().path().to_string();
+                        let hit = routes.iter().find(|(p, _, _)| *p == path);
+                        let (status, body) = match hit {
+                            Some((_, s, b)) => (*s, *b),
+                            None => (404, r#"{"error":"not found"}"#),
+                        };
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .header("content-type", "application/json")
+                                .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// 端到端：认不出的中转站按序探测，拿到 `/v1/usage` 的**真实余额**而不是 10000 上限。
+    ///
+    /// 这条直接复现并锁死真机缺陷：站点同时提供
+    /// - `/v1/usage` → 真实剩余 `{"remaining": 42.5, "unit": "USD"}`
+    /// - `/v1/dashboard/billing/subscription` → `{"hard_limit_usd": 10000}`（配额上限）
+    ///
+    /// 原实现兜底只打后者 → 用户永远看到「10000 USD」，且那个数字花多少都不动。
+    /// 探测链把 `/v1/usage` 排在前面，于是拿到 42.5。
+    ///
+    /// 同时钉住「记住命中的那条」：`resolved_url_template` 必须是 `/v1/usage` ——
+    /// 没有它，每次自动轮询都要重跑整条探测，对按请求限流的站点是实打实的浪费。
+    #[tokio::test]
+    async fn probing_prefers_real_balance_over_quota_ceiling() {
+        static ROUTES: &[(&str, u16, &str)] = &[
+            ("/v1/usage", 200, r#"{"remaining": 42.5, "unit": "USD"}"#),
+            (
+                "/v1/dashboard/billing/subscription",
+                200,
+                r#"{"object":"billing_subscription","hard_limit_usd":10000}"#,
+            ),
+        ];
+        let base = spawn_path_mock(ROUTES).await;
+        let key = ProviderKey { base_url: base.clone(), ..Default::default() };
+        let cfg = BalanceQuery { enabled: true, ..Default::default() };
+
+        let r = query_balance(&key, &cfg, "sk-test").await;
+        assert!(r.ok, "应从 /v1/usage 拿到余额，实际失败：{:?}", r.error);
+        assert_eq!(
+            r.remaining,
+            Some(42.5),
+            "必须是 /v1/usage 的真实剩余，不是 billing 端点那个恒为 10000 的配额上限"
+        );
+        assert_eq!(
+            r.resolved_url_template.as_deref(),
+            Some("{{origin}}/v1/usage"),
+            "命中的端点必须被记住，否则每次轮询都要重跑整条探测"
+        );
+    }
+
+    /// 探测全部落空时：报**第一条**（最可能对的）的错，并列出试过哪些。
+    ///
+    /// 只报最后一条会把用户引向 `hard_limit_usd` 那个最不可能的路径 ——
+    /// 而他真正该做的是去手填自己站点的地址。故错误信息里必须有「试过什么」+「去哪手填」。
+    #[tokio::test]
+    async fn all_probes_failing_reports_first_error_and_lists_attempts() {
+        static NONE: &[(&str, u16, &str)] = &[]; // 全部 404
+        let base = spawn_path_mock(NONE).await;
+        let key = ProviderKey { base_url: base, ..Default::default() };
+        let cfg = BalanceQuery { enabled: true, ..Default::default() };
+
+        let r = query_balance(&key, &cfg, "sk-test").await;
+        assert!(!r.ok);
+        let err = r.error.unwrap_or_default();
+        assert!(err.contains("/v1/usage"), "要指出第一条候选是什么：{err}");
+        assert!(err.contains("已自动尝试"), "要说明试过多个端点：{err}");
+        assert!(err.contains("手填"), "要给出可行动的出路：{err}");
+        assert!(
+            r.resolved_url_template.is_none(),
+            "全失败时不得记住任何端点，否则下次连探测的机会都没了"
+        );
+    }
 
     /// 各家中转站的返回结构差异很大，候选链必须都能兜住 ——
     /// 兜不住就等于用户配了余额查询却永远显示「找不到字段」。
@@ -1347,9 +1569,12 @@ mod tests {
             "月之暗面 Kimi（.ai）"
         );
 
-        // 认不出的域名 → 兜底到 NewAPI/OneAPI 系的通用计费端点（中转站命中率最高）
+        // 认不出的域名 → 兜底链的**第一条**（`/v1/usage`，cc-switch 给中转站实配的那条）。
+        // 注意 `detect_balance_endpoint` 只给一个代表值；查询路径走的是
+        // `resolve_endpoint_candidates`，会把整条链按序试完
+        // （见 unknown_vendor_probes_usage_endpoint_first）。
         let (url, auth) = detect_balance_endpoint("https://www.some-relay-station.net");
-        assert_eq!(url, "{{origin}}/v1/dashboard/billing/subscription");
+        assert_eq!(url, "{{origin}}/v1/usage");
         assert_eq!(auth, "bearer");
 
         // 大小写不敏感：用户可能把域名写成大写
@@ -1412,19 +1637,28 @@ mod tests {
         );
     }
 
-    /// P3-3 修复配套：`resolve_endpoint` 的四个分支（url 填/空 × auth 填/空）逐一钉住。
+    /// P3-3 修复配套：`resolve_endpoint_candidates` 的四个分支（url 填/空 × auth 填/空）逐一钉住。
     ///
     /// 抽出纯函数就是为了能不打网络验这两条独立判空。此前只有 url 分支被 `query_balance`
     /// 的「不是合法 URL」间接覆盖，auth 分支完全没测——用户手选 x-api-key 却被自动识别
     /// 覆盖成 bearer 这类静默失效不会被发现。
+    ///
+    /// 本用例全部用**能被域名识别**的 base（deepseek），故候选恒为 1 条 ——
+    /// 「认不出时按序探测多条」是另一条用例
+    /// （`unknown_vendor_probes_usage_endpoint_first`）的事。
     #[test]
     fn resolve_endpoint_fills_only_empty_fields() {
         // base_url 命中 deepseek（自动识别 → url={{origin}}/user/balance, auth=bearer）
         let base = "https://api.deepseek.com/anthropic";
+        let one = |cfg: &BalanceQuery| -> (String, String) {
+            let c = resolve_endpoint_candidates(cfg, base);
+            assert_eq!(c.len(), 1, "域名认得出时不该探测多条");
+            (c[0].0.to_string(), c[0].1.to_string())
+        };
 
         // ① url 与 auth 都留空 → 全用自动识别
         let cfg = BalanceQuery { enabled: true, ..Default::default() };
-        let (u, a) = resolve_endpoint(&cfg, base);
+        let (u, a) = one(&cfg);
         assert_eq!(u, "{{origin}}/user/balance", "url 留空该用自动识别");
         assert_eq!(a, "bearer", "auth 留空该用自动识别");
 
@@ -1434,7 +1668,7 @@ mod tests {
             url: "https://panel.example.com/my/balance".into(),
             ..Default::default()
         };
-        let (u, a) = resolve_endpoint(&cfg, base);
+        let (u, a) = one(&cfg);
         assert_eq!(u, "https://panel.example.com/my/balance", "用户填的 url 优先");
         assert_eq!(a, "bearer", "auth 没填仍走自动识别");
 
@@ -1445,7 +1679,7 @@ mod tests {
             auth: "x-api-key".into(),
             ..Default::default()
         };
-        let (u, a) = resolve_endpoint(&cfg, base);
+        let (u, a) = one(&cfg);
         assert_eq!(u, "{{origin}}/user/balance", "url 没填走自动识别");
         assert_eq!(a, "x-api-key", "用户手选的 auth 必须优先，不被自动识别覆盖");
 
@@ -1456,9 +1690,59 @@ mod tests {
             auth: "none".into(),
             ..Default::default()
         };
-        let (u, a) = resolve_endpoint(&cfg, base);
+        let (u, a) = one(&cfg);
         assert_eq!(u, "https://x.com/b");
         assert_eq!(a, "none");
+    }
+
+    /// 认不出域名的中转站必须按序探测，且 **`/v1/usage` 排第一**。
+    ///
+    /// 这是「su2api 恒显示 10000 USD」的直接修复。原先兜底只有一条
+    /// `/v1/dashboard/billing/subscription`，而 NewAPI 系在那个端点返回的是
+    /// `hard_limit_usd`（配额**上限**）—— 一个永不变化的 10000。
+    ///
+    /// **判据来自用户本机 cc-switch 库**（读 `providers.meta`，非推测）：Sub2API
+    /// （sub.100xlabs.space）与「林夕」公益站（k40.shengqainbang.cn）配的
+    /// `usage_script` 端点都是 `{{baseUrl}}/v1/usage`。
+    ///
+    /// 四个方向一起钉，少一条这个修复就会被后人「简化」掉：
+    /// 1. 认不出的站 → 多条候选，且第一条是 `/v1/usage`；
+    /// 2. `hard_limit_usd` 那条必须**排最后**（它能出数，但那是上限，会掩盖前面的正确答案）；
+    /// 3. 用户填了地址 → **只用他填的那条，绝不探测**（否则「我改的不生效」）；
+    /// 4. 域名认得出 → 也只一条（对 11 个已取证厂商探测纯属多打请求）。
+    #[test]
+    fn unknown_vendor_probes_usage_endpoint_first() {
+        let cfg = BalanceQuery { enabled: true, ..Default::default() };
+
+        // ① 认不出的中转站：多条候选，第一条是 /v1/usage
+        let c = resolve_endpoint_candidates(&cfg, "https://sub.100xlabs.space");
+        assert!(c.len() > 1, "认不出域名时必须按序探测多条，实际 {} 条", c.len());
+        assert_eq!(
+            c[0].0, "{{origin}}/v1/usage",
+            "第一条必须是 /v1/usage —— cc-switch 给 Sub2API / 林夕公益站实配的就是它"
+        );
+        // ② hard_limit_usd 那条排最后
+        assert_eq!(
+            c.last().unwrap().0,
+            "{{origin}}/v1/dashboard/billing/subscription",
+            "billing/subscription 返回的是配额上限而非余额，必须排最后 —— \
+             排前面就会用一个恒为 10000 的数字盖掉后面正确的答案"
+        );
+
+        // ③ 用户填了地址 → 只用他填的，不探测
+        let filled = BalanceQuery {
+            enabled: true,
+            url: "https://my.panel/quota".into(),
+            ..Default::default()
+        };
+        let c = resolve_endpoint_candidates(&filled, "https://sub.100xlabs.space");
+        assert_eq!(c.len(), 1, "用户填了地址就不该再探测别的（否则「我改的不生效」）");
+        assert_eq!(c[0].0, "https://my.panel/quota");
+
+        // ④ 域名认得出 → 也只一条
+        let c = resolve_endpoint_candidates(&cfg, "https://api.deepseek.com");
+        assert_eq!(c.len(), 1, "已取证的厂商不该被探测");
+        assert_eq!(c[0].0, "{{origin}}/user/balance");
     }
 
     /// 余额查询**必须带客户端身份头（UA）**。

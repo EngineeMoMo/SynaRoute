@@ -437,6 +437,25 @@ async fn query_key_balance(
         &detail,
     );
 
+    // 探测命中的端点写回配置：此后每次只发 1 个请求，不再重跑整条探测链。
+    //
+    // 只在**真探测过且命中**时才有值（见 `BalanceResult::resolved_url_template`）。
+    // 走 `set_balance_query_url` 而非整份 upsert：那会把打开编辑器那一刻的旧快照写回去，
+    // 顺带清掉运行中的熔断与余额缓存（`upsert_key` 的守卫只保这两项，其余字段照覆盖）。
+    // 失败只记日志：地址没记住的代价是下次再探测一遍，而让一次成功的查询报错是更糟的。
+    if let Some(ref tpl) = result.resolved_url_template {
+        match state.store.set_balance_query_url(&key_id, tpl) {
+            Ok(true) => state.store.append_event(
+                key.category_id,
+                "config",
+                Some(&key_id),
+                &format!("余额查询地址已自动记住：{tpl}（此后不再逐个试探端点）"),
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("记住余额查询地址失败（key={key_id}，下次会重新探测）: {e}"),
+        }
+    }
+
     // 更新缓存（成功和失败都缓存，避免对失败端点短时间内重复轰炸）
     // 缓存写入失败只记日志，不阻止查询结果返回（缓存是优化手段，不是核心目标）
     if let Err(e) = state.store.update_balance_cache(&key_id, result.clone()) {
