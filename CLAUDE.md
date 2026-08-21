@@ -82,7 +82,7 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   凭据类文件一律拒读（按「模型给的名字」与「解析链接后的真实落点」**各判一次**，两次都不能省）。
   每条防线都做过故障注入验证（去掉后测试必须变红）。当前基线 **433 passed / 0 failed**
   <br>📌 **基线口径（2026-08-22 实测）**：上面各条历史行里的 311/312/368/383/433/506 都是**当时**的
-  数字，勿当现值。当前实测 `cargo test --lib` = **708 passed / 0 failed**
+  数字，勿当现值。当前实测 `cargo test --lib` = **711 passed / 0 failed**
   （连跑 12 次全绿；`cargo clippy --lib --all-targets` 零警告；`tsc --noEmit` 干净；
   `npm run build` 通过含颜色类零 CSS 检查）。
   接手时请自己跑一遍取当前值，不要引用本文档里的历史数字当基线。
@@ -148,6 +148,28 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   去掉序号照样绿 —— `db_copy_path` 自身开销就够拉开 100ns，单线程压根撞不上。
   改成并发 8×2000 后注入即红（16000 次只得 15179 个不同名）。
   **教训：测并发缺陷的用例必须并发地写，顺序版给的是假的安全感。**
+- **余额查询与图标预设已按 cc-switch 取证对齐（2026-08-22）**：判据直接读用户本机
+  `~/.cc-switch/cc-switch.db`，不是文档推测。两条硬结论：
+  - **它的余额查询不是固定候选链，而是每个供应商一段可编辑的 JS `usage_script`**
+    （存 `providers.meta`）。用户那两个站（`Sub2API` = sub.100xlabs.space、
+    `「林夕」公益站` = k40.shengqainbang.cn）配的端点都是 **`{{baseUrl}}/v1/usage`**。
+    我们此前只抄了它 extractor 的 `??` 字段链、**没抄端点** —— 兜底打
+    `/v1/dashboard/billing/subscription`，而 NewAPI 系在那里返回 `hard_limit_usd`
+    （配额上限，恒 10000）。**这就是「su2api 全查回 10000 USD」的根因**，
+    与「取值路径」无关，怎么调都没用。已改为三条按序探测 + 命中即写回
+    （`resolved_url_template` → `Store::set_balance_query_url`），
+    只在「用户没填 url 且域名认不出」时探测。
+    <br>**刻意没做**：照搬那套用户可编辑 JS（要引入 boa/quickjs + 沙箱 + 超时，
+    而绝大多数用户不会写 JS）。若日后真要做，取证已在这里。
+  - `icon`/`icon_color` **只有 3 条内置官方模板有值**（20 条 provider 里），
+    16 个中转站全是 `None` —— cc-switch 也没给中转站图标，它只是有那个入口。
+    三个官方色已对齐实测值（anthropic `#D4915D`、openai `#00A67E`、gemini `#4285F4`），
+    挑选器抽成 `BrandPresetPicker` 供厂商页与 Key 编辑器共用（Key 的图标来自其厂商，
+    `ProviderKey` 刻意不加平行的 icon 字段）。
+  <br>📎 顺带记下：它还有 `provider_endpoints`（多候选 base_url）、`model_pricing`
+  （按模型单价，我们是按 Key 倍率）、`usage_daily_rollups`（按天×模型×provider 的用量）、
+  `provider_health`、`proxy_request_logs` 等表 —— 这些**我们没有对应实现**，
+  想扩功能时那是现成的参照。
 - **刻意不修的项**（别当成遗漏重复劳动）：SmartScreen 签名告警、`retrieval.rs` 的 `cwd` 白名单、
   请求日志存明文对话（默认关闭）
 - **换机注意**：`secrets.enc` 由 DPAPI 绑账户、**不可跨机器搬运**；本文档里的绝对路径都是旧机器实测值
