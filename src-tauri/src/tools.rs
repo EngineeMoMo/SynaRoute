@@ -189,6 +189,26 @@ fn apply_codex(endpoint: &str, default_model: Option<&str>) -> AppResult<String>
     with_rollback(&[path.clone(), auth.clone()], || {
         let msg = apply_codex_at(&path, endpoint, default_model)?;
         let auth_msg = apply_codex_auth_at(&auth)?;
+        // **写完立刻读回校验**：`model_provider = "synaroute"` 与
+        // `[model_providers.synaroute]`（含非空 base_url）必须同时在位。
+        //
+        // 为什么这道校验不可省（真机 401 事故）：Codex 桌面端 App 拥有并会重写 config.toml，
+        // 若它把 provider 表丢掉而留下顶层选中项，Codex 解析不到 provider → 回落到内置默认
+        // `https://api.openai.com/v1`，再拿 auth.json 里我们写的占位 key 去打真实 OpenAI，
+        // 用户看到 `Incorrect API key provided: synarout***roxy`，被引向「我的 key 填错了」。
+        //
+        // 校验失败即报错，让 with_rollback 把**两个文件**一起回滚 —— 绝不留下
+        // 「auth.json 已是占位、config.toml 却没选中我们」这种会把假 key 发给第三方的半接入态。
+        if !codex_apply_is_intact(&path) {
+            return Err(AppError::ToolConfig(format!(
+                "写入 Codex 配置后校验未通过：{} 里 model_provider 未选中 `{}` 或 \
+                 [model_providers.{}] 表缺失/无 base_url。已回滚本次改动（含 auth.json）。\n\
+                 常见原因：Codex 桌面端正在运行并重写了该文件 —— 请先完全退出 Codex 再重试接入。",
+                path.display(),
+                MCP_CLIENT_NAME,
+                MCP_CLIENT_NAME
+            )));
+        }
         Ok(format!("{msg}；{auth_msg}"))
     })
 }
@@ -1466,6 +1486,47 @@ fn is_placeholder_only_auth(path: &Path) -> bool {
         && matches!(obj.get("OPENAI_API_KEY"), Some(Value::String(v)) if v == CODEX_AUTH_PLACEHOLDER)
 }
 
+/// `config.toml` 里我们那套接入配置是否**完好**：顶层 `model_provider` 选中 `synaroute`
+/// **且** `[model_providers.synaroute]` 表存在。
+///
+/// ## 为什么必须两条都查（真机 401 事故的判据）
+///
+/// Codex **桌面端 App 拥有并会重写 `config.toml`**（实测：它会自己加 `[features]` 段、
+/// 重排 env 表、把 `[mcp_servers.synaroute]` 从 HTTP 改成 stdio 形态）。重写时可能把我们写的
+/// `[model_providers.synaroute]` 表丢掉，而顶层 `model_provider = "synaroute"` 留着 ——
+/// 此时 Codex 解析不到该 provider，**回落到内置默认 base_url `https://api.openai.com/v1`**，
+/// 又拿着我们写进 `auth.json` 的占位 key 去打真实 OpenAI，于是用户看到：
+///
+/// ```text
+/// 401 Unauthorized: Incorrect API key provided: synarout***roxy
+/// url: https://api.openai.com/v1/responses
+/// ```
+///
+/// 这条报错把人引向「我的 OpenAI key 填错了」，而真因是**接入配置被 App 冲掉了**，
+/// 方向完全相反 —— 正是本项目最忌讳的形态。
+///
+/// 反过来「表在、但 `model_provider` 指向别人」也不行：那说明用户（或 cc-switch、或 App）
+/// 把选中项改走了，我们的代理根本不会被调用，而占位 key 仍可能被发给那个别人。
+fn codex_apply_is_intact(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(doc) = text.parse::<toml::Value>() else {
+        return false;
+    };
+    let selected = doc
+        .get("model_provider")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v == MCP_CLIENT_NAME);
+    let table_present = doc
+        .get("model_providers")
+        .and_then(|v| v.get(MCP_CLIENT_NAME))
+        .and_then(|v| v.as_table())
+        // base_url 缺失的空表等于没配：Codex 同样会回落到内置默认地址。
+        .is_some_and(|t| t.get("base_url").and_then(|b| b.as_str()).is_some_and(|s| !s.is_empty()));
+    selected && table_present
+}
+
 /// 还原某工具配置（从 .synaroute.bak 恢复）。
 ///
 /// 与接入对称：接入时 Codex 双文件写（config.toml + auth.json，见 apply_codex），
@@ -1854,7 +1915,15 @@ fn preview_codex() -> AppResult<ToolConfigPreview> {
         category_id: CategoryType::Codex,
         summary: "Codex：~/.codex/config.toml + auth.json。写入 model_provider=synaroute、[model_providers.synaroute]、可选 model、OPENAI_API_KEY 占位。不写任何 ANTHROPIC_* / settings.json。".into(),
         mcp_registered: is_mcp_registered(CategoryType::Codex),
-        takeover_warning: None,
+        // **接入漂移检测**：占位 key 已在 auth.json 里、但 config.toml 里我们那套 provider
+        // 配置不完好 → Codex 会回落到内置默认 `https://api.openai.com/v1`，拿着占位 key 去打
+        // 真实 OpenAI，用户收到 `Incorrect API key provided: synarout***roxy`，
+        // 被引向「我的 OpenAI key 填错了」这个完全错误的方向（真机 401 事故）。
+        //
+        // 为什么这里也要查（apply 已有读回校验）：Codex 桌面端 App 拥有 config.toml，
+        // 会在**接入之后**重写它（实测会加 `[features]` 段、重排 env 表、改写
+        // `[mcp_servers.synaroute]` 形态）。那时 apply 早已返回成功，只有常驻检测能发现。
+        takeover_warning: detect_codex_drift(&cfg, &auth),
         files: vec![
             ToolConfigFilePreview {
                 path: cfg.display().to_string(),
@@ -1870,6 +1939,32 @@ fn preview_codex() -> AppResult<ToolConfigPreview> {
             },
         ],
     })
+}
+
+/// Codex 接入是否已漂移（占位 key 在、但 provider 配置不完好）。返回可行动的告警文案。
+///
+/// 判据刻意是「**占位在 auth.json** 且 **config 不完好**」这个交叉条件，而不是单看 config：
+/// - 从未接入过（auth.json 是用户自己的 OAuth/真实 key）→ config 不完好完全正常，不该报警；
+/// - 只有当我们**已经把占位写进去**时，config 不完好才意味着「那个假 key 正被发往第三方」。
+///
+/// 这也是与「桌面端被 cc-switch 接管」共用 `takeover_warning` 展示位的理由：
+/// 两者都是「接入看着在、实际已失效」的常驻风险，用户需要在主界面一眼看到。
+fn detect_codex_drift(cfg_path: &Path, auth_path: &Path) -> Option<String> {
+    if !is_placeholder_only_auth(auth_path) {
+        return None; // 没有我们的占位 key → 不存在「假 key 被外发」的风险
+    }
+    if codex_apply_is_intact(cfg_path) {
+        return None; // 接入完好
+    }
+    Some(format!(
+        "Codex 接入已失效：{} 里的 model_provider 未选中 `{}`（或该 provider 表缺失/无 base_url），\
+         而 auth.json 仍是 SynaRoute 写入的占位密钥。此时 Codex 会把占位密钥发往 api.openai.com，\
+         报「Incorrect API key provided」——那不是你的密钥有问题。\n\
+         处理：完全退出 Codex，再在本页点「停止」后重新「启动」以重写接入配置。\
+         （Codex 桌面端会自行重写 config.toml，可能覆盖掉我们的配置。）",
+        cfg_path.display(),
+        MCP_CLIENT_NAME
+    ))
 }
 
 fn preview_claude_desktop() -> AppResult<ToolConfigPreview> {
@@ -2758,6 +2853,60 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
+    /// **接入完好性判据**：真机 401 事故（`Incorrect API key provided: synarout***roxy`
+    /// 打到 `https://api.openai.com/v1/responses`）的根因护栏。
+    ///
+    /// Codex 桌面端 App 拥有并会重写 `config.toml`。若它把 `[model_providers.synaroute]`
+    /// 丢掉而留下顶层 `model_provider = "synaroute"`，Codex 解析不到 provider →
+    /// **回落到内置默认 `https://api.openai.com/v1`**，再拿 auth.json 里我们写的占位 key
+    /// 去打真实 OpenAI。用户看到的报错指向「我的 OpenAI key 填错了」，而真因是接入配置被冲掉。
+    ///
+    /// 故障注入判据：把 `codex_apply_is_intact` 改成只查 `model_provider`（不查表），
+    /// 「表缺失」那条断言立刻变红。
+    #[test]
+    fn codex_apply_intactness_requires_both_selection_and_provider_table() {
+        let path = temp_file("codex_intact", "config.toml");
+
+        // ① 正常接入后：两者都在 → 完好
+        apply_codex_at(&path, "http://127.0.0.1:47101", Some("gpt-5.6")).unwrap();
+        assert!(
+            codex_apply_is_intact(&path),
+            "正常接入后应判为完好:\n{}",
+            std::fs::read_to_string(&path).unwrap()
+        );
+
+        // ② **事故形态**：App 重写时丢了 provider 表，只剩顶层选中项
+        std::fs::write(&path, "model_provider = \"synaroute\"\nmodel = \"gpt-5.6\"\n").unwrap();
+        assert!(
+            !codex_apply_is_intact(&path),
+            "选中了 synaroute 但表缺失 → 必须判为不完好（否则占位 key 会被发给真实 OpenAI）"
+        );
+
+        // ③ 表在、但选中项被改走（用户/cc-switch/App 换了 provider）→ 我们的代理不会被调用
+        std::fs::write(
+            &path,
+            "model_provider = \"custom\"\n[model_providers.synaroute]\nbase_url = \"http://127.0.0.1:47101/v1\"\n",
+        )
+        .unwrap();
+        assert!(
+            !codex_apply_is_intact(&path),
+            "选中项指向别人时必须判为不完好"
+        );
+
+        // ④ 表在、选中了，但 base_url 空/缺 → Codex 同样回落到内置默认地址
+        std::fs::write(
+            &path,
+            "model_provider = \"synaroute\"\n[model_providers.synaroute]\nname = \"SynaRoute\"\n",
+        )
+        .unwrap();
+        assert!(
+            !codex_apply_is_intact(&path),
+            "provider 表无 base_url 等于没配，必须判为不完好"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
     #[test]
     fn claude_cli_apply_skips_model_fields_when_no_default() {
         // 取不到可服务模型时，不碰用户已有 model / ANTHROPIC_MODEL；但仍清 DEFAULT_* 残留
@@ -3070,6 +3219,63 @@ mod tests {
         );
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// **接入漂移检测**：占位 key 在、但 provider 配置被冲掉 → 必须常驻告警。
+    ///
+    /// 这是真机 401 事故的第二道防线。apply 时的读回校验只能保证「写入那一刻是对的」，
+    /// 而 Codex 桌面端 App 拥有 config.toml、会在**之后**重写它（实测会加 `[features]` 段、
+    /// 重排 env 表、改写 `[mcp_servers.synaroute]` 形态）。那时 apply 早已返回成功。
+    ///
+    /// 判据刻意是**交叉条件**（占位在 auth.json ∧ config 不完好），不是单看 config：
+    /// 从未接入过时 config 本就不完好，那时报警纯属噪音。
+    #[test]
+    fn codex_drift_warns_only_when_placeholder_key_would_leak() {
+        let cfg = temp_file("codex_drift", "config.toml");
+        let auth = cfg.with_file_name("auth.json");
+
+        let intact_cfg = "model_provider = \"synaroute\"\n\
+                          [model_providers.synaroute]\n\
+                          base_url = \"http://127.0.0.1:47101/v1\"\n";
+        let broken_cfg = "model_provider = \"custom\"\n\
+                          [model_providers.custom]\n\
+                          base_url = \"https://relay.example.com/v1\"\n";
+        let placeholder = format!(r#"{{"OPENAI_API_KEY":"{CODEX_AUTH_PLACEHOLDER}"}}"#);
+        let real_oauth = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"x"}}"#;
+
+        // ① 占位在 + config 完好 → 正常接入，不报警
+        std::fs::write(&cfg, intact_cfg).unwrap();
+        std::fs::write(&auth, &placeholder).unwrap();
+        assert!(detect_codex_drift(&cfg, &auth).is_none(), "完好接入不该报警");
+
+        // ② **事故形态**：占位在 + config 被冲掉 → 占位 key 会被发往 api.openai.com
+        std::fs::write(&cfg, broken_cfg).unwrap();
+        let warn = detect_codex_drift(&cfg, &auth).expect("漂移必须报警");
+        assert!(
+            warn.contains("api.openai.com"),
+            "告警要点明假 key 会发去哪里（用户收到的 401 就来自那里）：{warn}"
+        );
+        assert!(
+            warn.contains("不是你的密钥有问题"),
+            "必须纠正「我的密钥填错了」这个错误方向：{warn}"
+        );
+        assert!(
+            warn.contains("退出 Codex"),
+            "要给出可自助的处理步骤：{warn}"
+        );
+
+        // ③ 未接入（auth.json 是用户真实 OAuth）+ config 不完好 → 正常状态，不该报警
+        std::fs::write(&auth, real_oauth).unwrap();
+        assert!(
+            detect_codex_drift(&cfg, &auth).is_none(),
+            "从未接入时 config 本就不完好，报警是噪音"
+        );
+
+        // ④ auth.json 不存在（全新环境）→ 同样不报警
+        std::fs::remove_file(&auth).unwrap();
+        assert!(detect_codex_drift(&cfg, &auth).is_none());
+
+        std::fs::remove_dir_all(cfg.parent().unwrap()).ok();
     }
 
     #[test]

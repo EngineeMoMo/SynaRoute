@@ -1,5 +1,5 @@
 import { usePolling } from "@/lib/usePolling";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { useStore } from "@/store";
 import { api } from "@/lib/bridge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
@@ -203,6 +203,14 @@ export function SettingsPage() {
    */
   const [logDirDraft, setLogDirDraft] = useState<string | null>(null);
   const [probeMsgDraft, setProbeMsgDraft] = useState<string | null>(null);
+  /**
+   * 「本次失焦是 Esc 放弃编辑」的同步标记。
+   *
+   * 为什么不能只 `setLogDirDraft(null)` 就 blur：state 更新是**异步**的，而 `blur()` 会
+   * **同步**触发 `onBlur`，那里读到的仍是本次渲染闭包里的旧草稿 → Esc 反而把草稿存了下去，
+   * 与「放弃」语义正好相反。ref 是同步的，`onBlur` 能立刻看到。
+   */
+  const abortDraftRef = useRef(false);
 
   const update = (patch: Partial<AppSettings>) => {
     if (!settings) return;
@@ -979,6 +987,13 @@ export function SettingsPage() {
                     placeholder={defaultLogDir || t("settings.logDirDefault")}
                     onChange={(e) => setLogDirDraft(e.target.value)}
                     onBlur={() => {
+                      // Esc 放弃：ref 是同步的，能挡住这次由 blur() 触发的提交
+                      // （state 更新异步，此处闭包里的 logDirDraft 仍是旧草稿）。
+                      if (abortDraftRef.current) {
+                        abortDraftRef.current = false;
+                        setLogDirDraft(null);
+                        return;
+                      }
                       if (logDirDraft === null) return;
                       const next = logDirDraft.trim() || undefined;
                       setLogDirDraft(null);
@@ -989,6 +1004,11 @@ export function SettingsPage() {
                       // Enter 立即提交（触发 blur 走同一条路径，不复制逻辑）；Esc 放弃编辑。
                       if (e.key === "Enter") e.currentTarget.blur();
                       else if (e.key === "Escape") {
+                        // **两件事都要做，且不依赖 onBlur 一定触发**：
+                        // ① 直接清草稿（输入框立刻回落到已保存值）；
+                        // ② 置 ref 抑制随后那次 blur 的提交 —— state 更新是异步的，
+                        //    `blur()` 同步触发的 onBlur 仍会读到闭包里的旧草稿。
+                        abortDraftRef.current = true;
                         setLogDirDraft(null);
                         e.currentTarget.blur();
                       }

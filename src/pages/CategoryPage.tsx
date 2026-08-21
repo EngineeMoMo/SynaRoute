@@ -75,8 +75,8 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
    *    「桌面端被 cc-switch 接管」的警告会出现在根本没有这回事的 Codex 页上；
    * 2. 各条状态本身也不会因为换了分类而自动清空。
    *
-   * 尤其阴险的是 takeover 那条：它的轮询 `enabled = isDesktop`，切到非桌面端后定时器就停了，
-   * **没有下一次轮询来纠正它**，那条假警告会一直挂到用户再切回桌面端为止。
+   * 尤其阴险的是 takeover 那条：它的轮询只在「桌面端或 Codex」分类下开启，切到不查的分类后
+   * 定时器就停了，**没有下一次轮询来纠正它**，那条假警告会一直挂到用户再切回为止。
    *
    * 故：切换分类时 ① 递增代际号，在途结果回来时代际对不上就丢弃；② 立即清空这些
    * 跨分类不通用的状态，不等下一次轮询（等的话最坏要顶着错误信息 5 秒）。
@@ -108,13 +108,22 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
   // 拉长到 30s 不会让用户等：`usePolling` 有「窗口重新可见时立即补一次」的语义，
   // 而这里的真实场景恰恰是「用户切到 cc-switch 点了一下，再切回 SynaRoute」——
   // 切回来那一刻就会刷新，根本走不到周期。
-  const isDesktop = activeCategory === "claude-desktop";
-  // `enabled` 只对桌面端开：其余分类没有「被 cc-switch 接管」这回事，不必白问。
+  // 常驻风险告警的轮询目标：桌面端查「被 cc-switch 接管」，Codex 查「接入漂移」。
+  //
+  // Codex 那条同样必需（真机 401 事故）：Codex 桌面端 App 拥有 config.toml，会在接入**之后**
+  // 重写它并可能覆盖掉我们的 provider 配置。那时 apply 早已返回成功，只有常驻检测能发现 ——
+  // 否则用户看到的是「Incorrect API key provided: synarout***roxy」打向 api.openai.com，
+  // 被引向「我的 OpenAI 密钥填错了」这个完全错误的方向。
+  //
+  // Claude CLI 不查：它读的是 settings.json 里的 env 变量，没有「provider 表被冲掉」这回事。
+  const warnCategory =
+    activeCategory === "claude-desktop" || activeCategory === "codex" ? activeCategory : null;
   usePolling(
     () => {
+      if (!warnCategory) return;
       const gen = genRef.current;
       void api
-        .getToolConfigPreview("claude-desktop")
+        .getToolConfigPreview(warnCategory)
         .then((p) => {
           if (gen === genRef.current) setTakeover(p.takeoverWarning ?? null);
         })
@@ -123,7 +132,7 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
         });
     },
     FALLBACK_POLL_MS,
-    isDesktop,
+    warnCategory !== null,
   );
 
   // 密钥库是否锁着（主口令模式尚未解锁）。锁着时**每一次转发都会失败**，
