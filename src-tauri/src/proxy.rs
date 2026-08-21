@@ -783,6 +783,19 @@ async fn handle_request(
     // 只要池里有一条是临时性的，整轮就该按临时性处置（529 + 最早 Retry-After + 短路窗口）；
     // 硬错误的具体状态码仍在 failover 事件里对用户可见，不丢信息。
     let mut saw_transient = false;
+    // 整池里是否出现过「临时性失败、但上游**没给** Retry-After」的候选。
+    //
+    // 为什么单独记：`retry_after_hint` 的最小值只在**给了头的候选之间**比较，而没给头的
+    // 候选压根不参与 —— 于是混合池 [A: 429 `Retry-After: 3600`（夹到 300）, B: 500 无头]
+    // 的结论是「等 300 秒」。可 B 的 500 很可能 1 秒后就好了，取最小值那段注释自己写的
+    // 判据正是「只要有一个候选恢复就该放行」。同一个误伤（一个撞配额的 Key 拖垮整池），
+    // 只是从「取最大值」换成了「唯一给头的那个说话」这条更隐蔽的路径。
+    //
+    // 处置：把「没给头」当作一个**默认候选**（= 短路窗口长度 5s）一起参与取最小值。
+    // 这样两个方向都对：3600 + 无头 → 5s（不再被拖到 300）；1 + 无头 → 1s（不被拖长）。
+    // 「未知恢复时间」的正确近似不是「无穷远」也不是「立刻」，而是「按本项目自己的
+    // 短路窗口再来探一次」——早到的重试若仍失败，窗口会再武装一次，代价只是一次探路请求。
+    let mut saw_transient_without_hint = false;
 
     // 故障转移总预算（FR：见 AppSettings::failover_total_budget_ms）。
     //
@@ -960,6 +973,11 @@ async fn handle_request(
                     last_status = Some(status);
                     // 整池口径：这一条是否属「等一等可能会好」（见 saw_transient 声明处的混合池说明）
                     saw_transient = saw_transient || !all_failed_is_hard_error(false, last_status);
+                    // 临时性失败却没给 Retry-After → 它的恢复时间未知，不该由别的候选的
+                    // 长退避代它发言（见 saw_transient_without_hint 声明处）。
+                    if retry_after.is_none() && !all_failed_is_hard_error(false, last_status) {
+                        saw_transient_without_hint = true;
+                    }
                     // 上游给了状态码 → 这次失败不是本地配置错误。必须复位 config_error，
                     // 否则前一个候选的 Invalid（缺 maxOutputTokens 等）会**粘住**这个标志：
                     // 「配置错 Key 优先 + 后续 Key 撞 429/5xx」时尾部会被判成硬错误，
@@ -993,9 +1011,18 @@ async fn handle_request(
                     // 连接层失败属临时性，但**配置错误（Invalid）走的也是这个分支**、它永不自愈，
                     // 不能让它把整轮判成临时性（否则丢掉可行动的 400、回成 529 让客户端无限退避）。
                     saw_transient = saw_transient || !is_config_err;
+                    // 连接层失败永远拿不到 Retry-After（没有响应头可读）→ 恒属「恢复时间未知」。
+                    saw_transient_without_hint = saw_transient_without_hint || !is_config_err;
                     config_error = is_config_err;
                     log_request(&store, key, elapsed, String::new(), key.resolve_model(&requested_model), downstream_body.clone(), last_err.clone(), None, false);
-                    if !is_config_err {
+                    // 被我们自己的预算掐短的尝试不计熔断（见 budget_truncated_attempt）。
+                    if !is_config_err
+                        && !budget_truncated_attempt(
+                            elapsed,
+                            remaining,
+                            crate::upstream::key_timeout(key),
+                        )
+                    {
                         health::record_live_failure(&store, &key.id);
                     }
                     log_failover(&store, key, "失败", &last_err, next);
@@ -1095,6 +1122,11 @@ async fn handle_request(
                 last_status = Some(outcome.status);
                 // 整池口径：这一条是否属「等一等可能会好」（见 saw_transient 声明处的混合池说明）
                 saw_transient = saw_transient || !all_failed_is_hard_error(false, last_status);
+                // 临时性失败却没给 Retry-After → 恢复时间未知，不该由别的候选的长退避代它发言
+                // （见 saw_transient_without_hint 声明处）。
+                if outcome.retry_after.is_none() && !all_failed_is_hard_error(false, last_status) {
+                    saw_transient_without_hint = true;
+                }
                 // 复位理由同流式 HttpError 分支：上游有状态码 → 非本地配置错误，
                 // config_error 必须只反映最后一次失败的性质，不能被前一候选的 Invalid 粘住。
                 config_error = false;
@@ -1135,6 +1167,8 @@ async fn handle_request(
                 // 连接层失败属临时性，但**配置错误（Invalid）走的也是这个分支**、它永不自愈，
                 // 不能让它把整轮判成临时性（否则丢掉可行动的 400、回成 529 让客户端无限退避）。
                 saw_transient = saw_transient || !is_config_err;
+                // 连接层失败永远拿不到 Retry-After（没有响应头可读）→ 恒属「恢复时间未知」。
+                saw_transient_without_hint = saw_transient_without_hint || !is_config_err;
                 config_error = is_config_err;
                 log_request(
                     &store,
@@ -1147,7 +1181,13 @@ async fn handle_request(
                     None,
                     false,
                 );
-                if !is_config_err {
+                if !is_config_err
+                    && !budget_truncated_attempt(
+                        elapsed,
+                        remaining,
+                        crate::upstream::key_timeout(key),
+                    )
+                {
                     health::record_live_failure(&store, &key.id);
                 }
                 log_failover(&store, key, "失败", &last_err, next);
@@ -1194,19 +1234,75 @@ async fn handle_request(
         return Ok(error_resp(status, &format!("全部 Key 不可用：{last_err}")));
     }
 
+    // 短路窗口长度（秒），同时是「恢复时间未知」这类候选的默认退避值。
+    let gate_secs = (ALL_FAILED_SHORT_CIRCUIT_MS / 1000).max(1);
+    let effective_hint = effective_retry_after_hint(retry_after_hint, saw_transient_without_hint);
     // 武装短路窗口：窗口内后续请求（含客户端自动重发）直接失败，不再重打全部上游。
     // 带上候选给出的最早 Retry-After（见 retry_after_hint 的取最小值理由）。
-    arm_all_failed_gate(&gate_key, retry_after_hint);
+    // **必须与下游收到的头同一个值**：窗口比头短会让客户端在窗口外白等，
+    // 窗口比头长会让客户端按头重发却被窗口挡住 —— 两者都是「说一套做一套」。
+    arm_all_failed_gate(&gate_key, effective_hint);
     // 退避秒数：有上游值就用它（夹到 [1, MAX]——上游可能给 0，那等于不退避，与短路矛盾）；
     // 没有则用短路窗口本身的长度（窗口内重试注定被挡，早回来毫无意义）。
-    let retry_after = retry_after_hint
-        .map(|s| s.clamp(1, MAX_RETRY_AFTER_SECS))
-        .unwrap_or((ALL_FAILED_SHORT_CIRCUIT_MS / 1000).max(1));
+    let retry_after = effective_hint.map(|s| s.clamp(1, MAX_RETRY_AFTER_SECS)).unwrap_or(gate_secs);
     Ok(error_resp_with_retry_after(
         overloaded_status(),
         &format!("全部 Key 不可用：{last_err}"),
         Some(retry_after),
     ))
+}
+
+/// 这次失败是否由**我们自己**掐短的超时造成（→ 不该算进该 Key 的熔断计数）。
+///
+/// 每次尝试的实际超时是 `min(Key 自身超时, 故障转移剩余预算)`。当剩余预算比 Key 的超时更小时，
+/// 一条**完全健康**的 Key 也会被我们在它答完之前掐断 —— 而那个 Err 走的是连接层分支，
+/// 于是 `record_live_failure` 给它记一次失败。三次之后这条好 Key 被熔断 60 秒。
+///
+/// 真机形态：6 条 Key、per-Key 30s、总预算 10s。前两条各耗 4s 真的坏了，第三条只剩 2s ——
+/// 它 2s 内没答完（正常，它需要 5s），被判失败。用户反复请求几轮后，**池子里最好的那条 Key
+/// 反而先被熔断**，因为它总是排在预算末尾。这是「越排后面越容易被误判」的系统性偏置，
+/// 不是偶发。
+///
+/// 判据要两个条件同时成立，缺一个都会误判：
+/// - `budget < key_timeout`：确实是我们把时间片削短了（预算未开启或比 Key 超时还长时不成立）；
+/// - `elapsed >= budget`：这次尝试**真的用完了**被削短的时间片。少了这条，一个瞬间失败的
+///   DNS 错误也会被当成「我们掐的」而免罚，等于在预算紧张时整池都不再熔断。
+///
+/// 留 50ms 容差：`elapsed` 是错误返回后才测的，与超时触发点之间有调度抖动，
+/// 严格 `>=` 会让恰好卡在边界的那次漏判（漏判方向 = 误罚好 Key，正是要修的）。
+fn budget_truncated_attempt(
+    elapsed_ms: u64,
+    budget_left: Option<std::time::Duration>,
+    key_timeout: std::time::Duration,
+) -> bool {
+    let Some(budget) = budget_left else { return false };
+    if budget >= key_timeout {
+        return false;
+    }
+    elapsed_ms.saturating_add(50) >= budget.as_millis() as u64
+}
+
+/// 全 Key 失败后真正要用的 `Retry-After` 秒数（`None` = 没有任何上游给过头）。
+///
+/// `hint` 是**给了头的候选之间**的最小值。问题在于没给头的候选压根不参与那次比较：
+/// 混合池 `[A: 429 Retry-After: 3600（解析时已夹到 300）, B: 500 无头]` 的结论会是
+/// 「等 300 秒」，而 B 的 500 很可能 1 秒后就好了。这与「取最小值」那段注释自己写的判据
+/// （**只要有一个候选恢复就该放行**）直接冲突 —— 同一个误伤（一个撞配额的 Key 拖垮整池），
+/// 只是从「取最大值」换成了「唯一给头的那个替全池发言」这条更隐蔽的路径。
+///
+/// 处置：把「恢复时间未知」当作一个默认候选（= 短路窗口长度）一起参与取最小值。
+/// 「未知」的正确近似既不是无穷远、也不是立刻，而是「按本项目自己的短路窗口再探一次」：
+/// 早到的重试若仍失败，窗口会再武装一次，代价只是一次探路请求。
+///
+/// 两个方向都必须成立（故测试各钉一条）：
+/// - `3600 + 无头` → 窗口长度（不被拖到 300）；
+/// - `1 + 无头` → 1（不被拖长到窗口长度）。取 `min` 而非直接换成窗口长度即为此。
+///
+/// `None` 时不凭空造值：调用方另有「全无头就退避一个窗口长度」的兜底，
+/// 在这里返回 `Some(gate)` 会让「上游从没提过退避」与「上游说了正好一个窗口」不可区分。
+fn effective_retry_after_hint(hint: Option<i64>, saw_transient_without_hint: bool) -> Option<i64> {
+    let gate_secs = (ALL_FAILED_SHORT_CIRCUIT_MS / 1000).max(1);
+    hint.map(|s| if saw_transient_without_hint { s.min(gate_secs) } else { s })
 }
 
 /// 529 的 `StatusCode`。529 非 IANA 注册码（Cloudflare/Anthropic 惯例的「过载」码），
@@ -4474,6 +4570,128 @@ mod tests {
             retry_after, 7,
             "应透传候选中最短的 Retry-After：只要有一个候选先恢复就该放下游来探路，\
              取最长会让一个撞配额的 Key 把整池停摆"
+        );
+
+        pm.stop(CategoryType::Codex);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 被**我们自己**的故障转移预算掐短的尝试，不得算进该 Key 的熔断计数。
+    ///
+    /// 每次尝试的超时是 `min(Key 自身超时, 剩余预算)`。剩余预算更小时，一条完全健康的 Key
+    /// 也会在答完之前被掐断，而那个 Err 走连接层分支 → `record_live_failure` 给它记一次失败。
+    /// 三次之后这条好 Key 被熔断 60 秒。且这不是偶发：排在预算末尾的候选**每一轮都**被削短，
+    /// 于是池子里最后那条（常常也是最好的备用）反而先被熔断，是系统性偏置。
+    ///
+    /// 四个方向一起钉：
+    /// 1. 预算把时间片削短、且尝试用完了那个片 → 免罚；
+    /// 2. 预算比 Key 超时还长（= 没削短）→ 照罚，这是 Key 自己超时；
+    /// 3. 预算未开启（`None`）→ 照罚；
+    /// 4. **瞬间失败**（DNS/拒连，远未用完时间片）→ 照罚。少了这条，预算紧张时整池都不再
+    ///    熔断，等于把熔断关掉。
+    #[test]
+    fn budget_shortened_timeout_does_not_count_against_breaker() {
+        let key_to = std::time::Duration::from_secs(30);
+
+        assert!(
+            budget_truncated_attempt(2_000, Some(std::time::Duration::from_millis(2_000)), key_to),
+            "预算只剩 2s、尝试也确实跑满 2s → 是我们掐的，不该罚这条 Key"
+        );
+        assert!(
+            !budget_truncated_attempt(30_000, Some(std::time::Duration::from_secs(60)), key_to),
+            "预算比 Key 超时还长 → 没被削短，这是 Key 自己超时，照罚"
+        );
+        assert!(
+            !budget_truncated_attempt(30_000, None, key_to),
+            "预算未开启 → 照罚（退化成旧行为）"
+        );
+        assert!(
+            !budget_truncated_attempt(40, Some(std::time::Duration::from_millis(2_000)), key_to),
+            "40ms 就失败（DNS/拒连）远未用完 2s 时间片 → 真失败，照罚；\
+             否则预算一紧张就等于把熔断整体关掉"
+        );
+    }
+
+    /// 「有临时性失败但上游没给 Retry-After」时，长退避必须被折回短路窗口长度。
+    ///
+    /// 这是「一个撞配额的 Key 拖垮整池」的第二条路径。第一条（取最大值）早已修掉，
+    /// 但取最小值只在**给了头的候选之间**比较 —— 没给头的候选压根不参与，于是混合池
+    /// `[429 Retry-After: 300, 500 无头]` 仍然会让下游等 300 秒，而那个 500 很可能
+    /// 1 秒后就好了。
+    ///
+    /// 四个方向一起钉（少任何一条这个修复都会被后人「简化」掉）：
+    /// 1. 全都给了头 → 原样取最小值，**不**被窗口长度截短（上游明确说的话要听）；
+    /// 2. 长退避 + 无头 → 折回窗口长度；
+    /// 3. **短**退避 + 无头 → 保持短值，不被拖长成窗口长度（故用 `min` 而非直接替换）；
+    /// 4. 谁都没给头 → 仍是 `None`，不在这里凭空造值（调用方另有兜底，
+    ///    在此返回 `Some(gate)` 会让「从没提过退避」与「正好说了一个窗口」不可区分）。
+    #[test]
+    fn missing_retry_after_folds_long_backoff_back_to_gate_window() {
+        let gate_secs = (ALL_FAILED_SHORT_CIRCUIT_MS / 1000).max(1);
+
+        assert_eq!(
+            effective_retry_after_hint(Some(300), false),
+            Some(300),
+            "所有临时失败都给了头 → 听上游的，不得被窗口长度截短"
+        );
+        assert_eq!(
+            effective_retry_after_hint(Some(300), true),
+            Some(gate_secs),
+            "有候选没给头（恢复时间未知）→ 不能让唯一给头的那个替全池发言"
+        );
+        assert_eq!(
+            effective_retry_after_hint(Some(1), true),
+            Some(1),
+            "短退避不得被拖长：取 min 而不是无条件换成窗口长度"
+        );
+        assert_eq!(
+            effective_retry_after_hint(None, true),
+            None,
+            "谁都没给头时保持 None，由调用方兜底 —— 否则与「上游正好说了一个窗口」不可区分"
+        );
+    }
+
+    /// 端到端：混合池 `[429 Retry-After: 300, 500 无头]` 下游拿到的必须是窗口长度，不是 300。
+    ///
+    /// 与 `upstream_retry_after_is_propagated_downstream` 成对：那条钉「都给了头时取最小」，
+    /// 这条钉「有一条没给头时不被长退避绑住」。真机影响是 60 倍的过度退避 ——
+    /// 客户端整整 5 分钟不再发请求，而池里那条 500 可能下一秒就恢复了。
+    #[tokio::test]
+    async fn mixed_pool_without_retry_after_backs_off_by_gate_not_by_the_only_hint() {
+        let quota = spawn_mock_with_headers(429, "daily quota", &[("retry-after", "300")]).await;
+        let flaky = spawn_mock(500, "internal error").await; // 无 retry-after 头
+        let dir = temp_dir("retry_after_mixed");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let mut k1 = key("k1", 0, &quota);
+        k1.category_id = CategoryType::Codex;
+        let mut k2 = key("k2", 1, &flaky);
+        k2.category_id = CategoryType::Codex;
+        store.upsert_key(k1).unwrap();
+        store.upsert_key(k2).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        store.secrets.write().set("k2", "y").unwrap();
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::Codex).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 529);
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .expect("整轮失败必须带 Retry-After");
+        assert_eq!(
+            retry_after,
+            (ALL_FAILED_SHORT_CIRCUIT_MS / 1000).max(1),
+            "池里有一条 500 没给头（恢复时间未知）→ 按短路窗口退避；\
+             照抄那条 429 的 300 秒等于让一个撞配额的 Key 把整池停摆 5 分钟"
         );
 
         pm.stop(CategoryType::Codex);
