@@ -959,7 +959,15 @@ async fn handle_request(
                     return Ok(resp);
                 }
                 // 上游非 2xx：记录并切下一个
-                Ok(StreamAttempt::HttpError { status, body, url, real_model, retry_after }) => {
+                Ok(StreamAttempt::HttpError {
+                    status,
+                    body,
+                    url,
+                    real_model,
+                    retry_after,
+                    request_body: upstream_request_body,
+                }) => {
+
                     let elapsed = started.elapsed().as_millis() as u64;
                     let snippet: String = body.trim().chars().take(400).collect();
                     last_err = if snippet.is_empty() {
@@ -984,7 +992,9 @@ async fn handle_request(
                     // 原样回状态码、跳过短路窗口与 Retry-After —— 正是 529 设计要防的重试风暴。
                     // 契约同尾部注释：按「最后一次失败的性质」分流（config_error 必须只反映最后一次）。
                     config_error = false;
-                    log_request(&store, key, elapsed, url, real_model, downstream_body.clone(), body, Some(status), false);
+                    // 请求体记的是**发往上游的那份**（跨协议时与 downstream_body 完全不同）。
+                    // 界面标签写着「上游请求」，此前却填 downstream_body —— 见 HttpError 变体的说明。
+                    log_request(&store, key, elapsed, url, real_model, upstream_request_body, body, Some(status), false);
                     // 429/5xx 临时错误只切、不罚（不熔断好 Key）；4xx 硬错误才计入熔断。
                     // **带路径判**：辅助端点（count_tokens）的 404 是「上游没实现该端点」，
                     // 与 Key 无关，不得据此熔断（见 failure_counts_against_breaker）。
@@ -1519,12 +1529,20 @@ enum StreamAttempt {
     },
     /// 上游有响应但非 2xx：缓冲错误体，调用方据此切换下一个 Key。
     /// `retry_after`：上游 `Retry-After` 头解析出的秒数（429/503 常带），无则 None。
+    ///
+    /// `request_body` = **转换后发往上游的**请求体快照，与 `Streaming` 那份同一口径。
+    /// 此前这个变体不带它，调用方只能退而记 `downstream_body`（客户端原样发来的那份）——
+    /// 而链路快照的界面标签写的是「上游请求」。跨协议 Key 上两者根本不是一回事：
+    /// 排查「为什么这个 Key 回 400」时，看到的是一份 Anthropic 请求体，
+    /// 而我们实际发出去的是 OpenAI Responses 格式，映射结果、`max_tokens` 补写、
+    /// reasoning→thinking 转换全都看不见 —— 恰恰是 400 最常见的成因所在。
     HttpError {
         status: u16,
         body: String,
         url: String,
         real_model: String,
         retry_after: Option<i64>,
+        request_body: String,
     },
 }
 
@@ -1702,6 +1720,13 @@ async fn try_stream_to_key(
             url,
             real_model,
             retry_after,
+            // 与成功路径同一口径：开关关闭时不构造（pretty-print 整个请求体不便宜）。
+            // 失败路径**比成功路径更需要**这份快照 —— 排 400/422 靠的就是核对我们到底发了什么。
+            request_body: if req_log {
+                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
+            } else {
+                String::new()
+            },
         });
     }
 
@@ -4573,6 +4598,74 @@ mod tests {
         );
 
         pm.stop(CategoryType::Codex);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 流式失败的链路快照里，「上游请求」必须是**转换后真正发出去的**那份。
+    ///
+    /// 场景：下游是 Anthropic（Claude Code 发 `/v1/messages` + `stream:true`），
+    /// Key 是 OpenAI Responses 协议，上游回 400。`StreamAttempt::HttpError` 此前不带
+    /// 请求体快照，调用方只能退而记 `downstream_body` —— 而界面标签写着「上游请求」。
+    ///
+    /// 后果正落在最需要它的场合：排「这个 Key 为什么回 400」时，看到的是一份 Anthropic
+    /// 请求体，而实际发出去的是 Responses 格式。模型名映射、`max_tokens` 补写、
+    /// reasoning→thinking 转换全都看不见，而 400 的成因几乎总在这些转换里。
+    ///
+    /// 判据用**协议形状**而不是字符串相等：Responses 体有 `input`、没有 Anthropic 的
+    /// `messages`/`max_tokens`。这样即便转换细节以后变了，测试仍在钉「记的是哪一份」
+    /// 这个契约本身。
+    #[tokio::test]
+    async fn streaming_failure_trace_records_upstream_request_not_downstream_body() {
+        let bad = spawn_mock(400, r#"{"error":{"message":"bad request"}}"#).await;
+        let dir = temp_dir("stream_trace_body");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // 链路快照只在「调用模型日志」开关开启时产生
+        let mut s = store.get_settings();
+        s.request_log_enabled = true;
+        store.save_settings(UserPrefs::from(&s)).unwrap();
+
+        let mut k = key("k1", 0, &bad);
+        k.protocol = Protocol::OpenaiResponses; // 跨协议：下游 Anthropic → 上游 Responses
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let _ = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({
+                "model": "m",
+                "max_tokens": 10,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        // 找到那条带快照的失败请求日志
+        let trace = store
+            .list_all_events()
+            .iter()
+            .filter(|e| e.kind == "request")
+            .find_map(|e| store.event_trace(&e.id))
+            .expect("开了调用模型日志，失败的流式尝试必须留下链路快照");
+        assert_eq!(trace.status, Some(400));
+        assert!(
+            trace.request_body.contains("\"input\""),
+            "应是转换后的 Responses 请求体（含 input），实得：\n{}",
+            trace.request_body
+        );
+        assert!(
+            !trace.request_body.contains("\"max_tokens\""),
+            "不得记下游原始的 Anthropic 请求体（那里才有 max_tokens）——\
+             界面标签写的是「上游请求」，记错会把排障引向不存在的问题。实得：\n{}",
+            trace.request_body
+        );
+
+        pm.stop(CategoryType::ClaudeCli);
         std::fs::remove_dir_all(&dir).ok();
     }
 
