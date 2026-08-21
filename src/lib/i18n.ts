@@ -332,6 +332,10 @@ const zh: Dict = {
   "editor.name": "Key 名称（备注）",
   "editor.namePlaceholder": "如：厂商1（官方直连）",
   "editor.vendor": "厂商",
+  // 图标预设：写的是**所选厂商**的图标，不是这条 Key 的（ProviderKey 没有 icon 字段，
+  // Key 的图标一直来自它的厂商）。文案必须点明厂商名，否则用户会以为只影响当前这条 Key。
+  "editor.iconPresetLabel": "「{name}」的图标（选一个内置品牌；再点一次取消）",
+  "editor.iconPresetBuiltin": "「{name}」是内置厂商，图标不可修改",
   "editor.vendorPlaceholder": "anthropic / glm / custom",
   "editor.protocol": "协议",
   "editor.baseUrl": "Base URL",
@@ -1120,6 +1124,8 @@ const en: Dict = {
   "editor.name": "Key name (label)",
   "editor.namePlaceholder": "e.g. Provider 1 (official direct)",
   "editor.vendor": "Vendor",
+  "editor.iconPresetLabel": "Icon for \"{name}\" (pick a built-in brand; click again to clear)",
+  "editor.iconPresetBuiltin": "\"{name}\" is a built-in vendor — its icon can't be changed",
   "editor.vendorPlaceholder": "anthropic / glm / custom",
   "editor.protocol": "Protocol",
   "editor.baseUrl": "Base URL",

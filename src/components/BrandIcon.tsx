@@ -47,19 +47,78 @@ export const PRESET_BRANDS: { key: BrandKey; label: string }[] = [
   { key: "mistral", label: "Mistral" },
 ];
 
+/**
+ * 内置品牌预设的**挑选器**（厂商管理页与 Key 编辑器共用一份实现）。
+ *
+ * 抽出来的理由不是「省几行」：两处各写一遍必然漂移 —— 一边加了新品牌、另一边没加，
+ * 或者「再点一次取消选择」这条交互只有一边有。而这两个入口对用户是同一件事
+ * （「告诉程序这个站是哪家的」），行为不一致比少一个入口更让人困惑。
+ *
+ * `value` 为预设键时高亮那一个；为 data-URL（用户上传的自定义图标）或 undefined 时全不高亮。
+ * 点已高亮的那个 = 取消选择，回到自动匹配（`onChange(undefined)`）。
+ */
+export function BrandPresetPicker({
+  value,
+  onChange,
+  disabled,
+}: {
+  value?: string;
+  onChange: (next: string | undefined) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {PRESET_BRANDS.map((b) => {
+        const active = value === b.key;
+        return (
+          <button
+            key={b.key}
+            type="button"
+            title={b.label}
+            aria-label={b.label}
+            aria-pressed={active}
+            disabled={disabled}
+            onClick={() => onChange(active ? undefined : b.key)}
+            className={`flex h-9 w-9 items-center justify-center rounded-control border transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+              active
+                ? "border-primary bg-primary/12"
+                : "border-border hover:border-primary/50 hover:bg-surface-hover"
+            }`}
+          >
+            <BrandIcon iconUrl={b.key} fallbackLabel={b.label} size={20} />
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 /** 某个字符串是否是内置预设键（而非用户上传的 data-URL）。 */
 export function isPresetBrand(v: string | undefined): v is BrandKey {
   return !!v && PRESET_BRANDS.some((b) => b.key === v);
 }
 
-/** 每个品牌的主色（用于图标底色 tint） */
+/**
+ * 每个品牌的主色（用于图标底色 tint）。
+ *
+ * anthropic / openai / gemini 三个取自 **cc-switch 本机库实测值**
+ * （2026-08-22 读 `~/.cc-switch/cc-switch.db` 的 `providers.icon_color`，非猜色）：
+ * 它给内置官方模板存的就是这三个值，与 `icon` 预设键配对。对齐它们的好处是
+ * 从 cc-switch 导入过来的档在两个程序里看起来是同一个东西 —— 否则用户会以为导错了。
+ *
+ * 其余品牌 cc-switch 没有内置模板（实测它 20 条 provider 里只有那 3 条有 icon_color），
+ * 保持本项目自取的官方品牌色。
+ *
+ * 刻意**不引入 `icon_color` 字段**让用户自定义颜色：颜色是跟着预设键走的内置常量，
+ * 加一个可编辑字段等于多一个「配了没生效」的面（用户上传自定义图标时颜色本就不参与）。
+ */
 const BRAND_COLOR: Record<BrandKey, string> = {
-  anthropic: "#D97757",
-  openai: "#000000",
+  anthropic: "#D4915D", // cc-switch 实测值
+  openai: "#00A67E", // cc-switch 实测值（不是纯黑）
   deepseek: "#4D6BFE",
   zhipu: "#3859FF",
   moonshot: "#000000",
-  gemini: "#1C69FF",
+  gemini: "#4285F4", // cc-switch 实测值（Google 蓝）
   qwen: "#615CED",
   mistral: "#FA520F",
 };

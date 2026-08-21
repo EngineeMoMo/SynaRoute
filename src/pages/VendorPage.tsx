@@ -4,8 +4,7 @@ import { api } from "@/lib/bridge";
 import { Card, CardContent } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
-import { BrandIcon, PRESET_BRANDS } from "@/components/BrandIcon";
-import { Tooltip } from "@/components/ui/Tooltip";
+import { BrandIcon, BrandPresetPicker } from "@/components/BrandIcon";
 import { useT } from "@/lib/useT";
 import { protocolLabel, type Protocol, type Vendor } from "@/types";
 import { Building2, Lock, Pencil, Plus, Trash2, ImagePlus, X } from "lucide-react";
@@ -173,34 +172,15 @@ export function VendorPage() {
                     的名字千奇百怪（「小明API」「林夕公益站」），猜不中时只能退化成首字母色块
                     —— 用户明知这是个 Claude 中转，却没有任何地方能告诉程序。
                     存的是**预设键字符串**（不是 data-URL），与 cc-switch 的 `icon` 列同一模型，
-                    故 `Vendor.icon` 字段无需改动。 */}
+                    故 `Vendor.icon` 字段无需改动。
+                    挑选器本体在 `BrandPresetPicker`，与 Key 编辑器共用一份实现 ——
+                    两处各写一遍必然漂移（一边加了新品牌另一边没加）。 */}
                 <div className="mt-2">
                   <div className="mb-1.5 text-[11px] text-text-muted">{t("vendor.iconPresetLabel")}</div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {PRESET_BRANDS.map((b) => {
-                      const active = editing.icon === b.key;
-                      return (
-                        <Tooltip key={b.key} content={b.label} side="top">
-                          <button
-                            type="button"
-                            aria-label={b.label}
-                            aria-pressed={active}
-                            onClick={() =>
-                              // 再点一次同一个 = 取消选择，回到自动匹配。
-                              setEditing({ ...editing, icon: active ? undefined : b.key })
-                            }
-                            className={`flex h-9 w-9 items-center justify-center rounded-control border transition-colors ${
-                              active
-                                ? "border-primary bg-primary/12"
-                                : "border-border hover:border-primary/50 hover:bg-surface-hover"
-                            }`}
-                          >
-                            <BrandIcon iconUrl={b.key} fallbackLabel={b.label} size={20} />
-                          </button>
-                        </Tooltip>
-                      );
-                    })}
-                  </div>
+                  <BrandPresetPicker
+                    value={editing.icon}
+                    onChange={(next) => setEditing({ ...editing, icon: next })}
+                  />
                 </div>
                 <p className="mt-1.5 text-[11px] text-text-muted">{t("vendor.iconHint")}</p>
               </div>

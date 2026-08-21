@@ -4,7 +4,7 @@ import { useStore } from "@/store";
 import { useT } from "@/lib/useT";
 import { Button } from "@/components/ui/Button";
 import { Combobox } from "@/components/ui/Combobox";
-import { BrandIcon } from "@/components/BrandIcon";
+import { BrandIcon, BrandPresetPicker } from "@/components/BrandIcon";
 import type {
   BalanceQuery,
   BalanceResult,
@@ -154,6 +154,10 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const loadCategory = useStore((s) => s.loadCategory);
   const storeCheckHealth = useStore((s) => s.checkHealth);
   const vendors = useStore((s) => s.vendors);
+  const loadVendors = useStore((s) => s.loadVendors);
+  // 厂商图标写盘失败必须弹 toast：这个操作没有「保存」按钮兜着，
+  // 静默失败就是「点了没反应」。
+  const showToast = useStore((s) => s.showToast);
   const setBalanceResult = useStore((s) => s.setBalanceResult);
   const clearBalance = useStore((s) => s.clearBalance);
   const t = useT();
@@ -208,6 +212,8 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const [invalidContextModels, setInvalidContextModels] = useState<Set<string>>(() => new Set());
   // 手动加模型输入框（不用原生 prompt()：WebView2 里行为不可靠）
   const [manualModel, setManualModel] = useState("");
+  // 厂商图标写盘中（禁用挑选器，避免连点打出并发 upsert）
+  const [savingVendorIcon, setSavingVendorIcon] = useState(false);
 
   const draftId = initial?.id ?? `k_new`;
 
@@ -276,6 +282,31 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
 
   // 老 Key 的 vendor 值可能不在当前厂商列表里（自由文本历史值），补一个兜底 option 不丢显示
   const vendorMissing = vendor !== "" && !vendors.some((v) => v.id === vendor);
+  /** 当前所选厂商记录（历史自由文本值找不到时为 undefined，此时不显示图标预设入口）。 */
+  const selectedVendor = vendors.find((v) => v.id === vendor);
+
+  /**
+   * 就地改「所选厂商」的图标预设。
+   *
+   * 立刻落盘而不是跟着「保存 Key」一起提交：它改的是**厂商**记录，与本 Key 的表单
+   * 不是同一份数据。攒到保存时一起写会让「点了图标却什么都没变」持续到用户保存为止，
+   * 而他改图标的意图是立刻看到效果（上面那行 BrandIcon 就该马上变）。
+   *
+   * 失败必须可见：厂商写入被后端拒（如厂商已被删）时静默吞掉会变成
+   * 「点了没反应」——本项目最忌讳的形态。
+   */
+  const applyVendorIcon = async (next: string | undefined) => {
+    if (!selectedVendor || selectedVendor.builtin) return;
+    setSavingVendorIcon(true);
+    try {
+      await api.upsertVendor({ ...selectedVendor, icon: next });
+      await loadVendors();
+    } catch (e) {
+      showToast("error", e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingVendorIcon(false);
+    }
+  };
 
   const handleFetchModels = async () => {
     if (!baseUrl.trim()) {
@@ -733,7 +764,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
           <div className="flex gap-3">
             <Field label={t("editor.vendor")} className="flex-1">
               <div className="flex items-center gap-2">
-                <BrandIcon hint={vendor} fallbackLabel={vendor} iconUrl={vendors.find((v) => v.id === vendor)?.icon} size={28} />
+                <BrandIcon hint={vendor} fallbackLabel={vendor} iconUrl={selectedVendor?.icon} size={28} />
                 <select className={inputCls} value={vendor} onChange={(e) => handleVendorChange(e.target.value)}>
                   {vendors.map((v) => (
                     <option key={v.id} value={v.id}>{v.name}</option>
@@ -741,6 +772,31 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                   {vendorMissing && <option value={vendor}>{vendor}</option>}
                 </select>
               </div>
+              {/* 图标预设：就地告诉程序「这个站是哪家的」。
+                  为什么要在这里也放一个（厂商管理页已有一个）：新增 Key 是用户唯一必经的
+                  流程，而中转站名字千奇百怪（「小明API」「林夕公益站」）猜不中时只剩首字母
+                  色块 —— 此刻他正看着那个色块，却要被打断去另一个页面才能改。
+
+                  **写的是所选厂商的 `icon` 字段，不是 Key 的**：`ProviderKey` 没有 icon，
+                  Key 的图标一直来自它的厂商（上面那行 BrandIcon 就是这么取的）。
+                  给 Key 加一个平行的 icon 字段会造出第二个事实来源 —— 同一厂商下两条 Key
+                  显示不同图标，而用户以为自己改的是「这家的图标」。
+                  内置厂商禁用：它们是只读的（与厂商管理页同一条规则），
+                  改了也会被下次启动的内置表覆盖，属静默失效。 */}
+              {selectedVendor && (
+                <div className="mt-2">
+                  <div className="mb-1.5 text-[11px] text-text-muted">
+                    {selectedVendor.builtin
+                      ? t("editor.iconPresetBuiltin", { name: selectedVendor.name })
+                      : t("editor.iconPresetLabel", { name: selectedVendor.name })}
+                  </div>
+                  <BrandPresetPicker
+                    value={selectedVendor.icon}
+                    disabled={selectedVendor.builtin || savingVendorIcon}
+                    onChange={(next) => void applyVendorIcon(next)}
+                  />
+                </div>
+              )}
             </Field>
             <Field label={t("editor.protocol")} className="w-48">
               <select
