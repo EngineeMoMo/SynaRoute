@@ -236,8 +236,40 @@ struct DerivedKey([u8; 32]);
 ///
 /// 参数从调用方传入（而非读常量）：解密时必须用**信封里记录的**参数，否则日后调参会让
 /// 老文件解不开。
+/// Argon2 参数的安全上界。**参数来自导入文件里记录的值**（信封自描述，为的是「调参后老文件
+/// 仍可解」），也就是**外部输入**，故必须校验。
+///
+/// Argon2 的 `Params::new` 只校验下界与内部一致性，不管上界：
+/// - `m = 4_000_000`（≈4 GiB）→ 当场尝试分配那么大的内存块，失败在 Rust 里是 **abort**
+///   （不可捕获，进程直接死，用户看到应用凭空消失）；
+/// - `t = 10_000_000` → 纯 CPU 空转，表现为「点了导入就永久无响应」。
+///
+/// 两者都是「拿到一个文件就能让别人的应用挂掉」，且失败方式极难归因。
+///
+/// 取值：内置参数是 m=64 MiB / t=3 / p=1，这里留 16 倍余量。既能解开任何合理的旧文件或
+/// 他人调参后的文件，也把最坏情况限制在「慢几秒」而非「挂死」。
+const MAX_M_COST_KIB: u32 = 1024 * 1024; // 1 GiB
+const MAX_T_COST: u32 = 64;
+const MAX_P_COST: u32 = 16;
+
+/// 参数是否在安全上界内。
+///
+/// **抽成纯函数是为了可测**：直接测 `derive_key` 的边界值会真跑一次 1 GiB × 64 轮的派生
+/// （实测 381 秒），把整个测试套件从 14 秒拖到 6 分钟 —— 而慢测试最终会被跳过，
+/// 那就等于没有护栏。判定逻辑与执行分开后，边界用例是纯比较、瞬间完成。
+fn argon2_params_within_limits(m: u32, t: u32, p: u32) -> bool {
+    m <= MAX_M_COST_KIB && t <= MAX_T_COST && p <= MAX_P_COST
+}
+
 fn derive_key(password: &str, salt: &[u8], m: u32, t: u32, p: u32) -> AppResult<DerivedKey> {
     use argon2::{Algorithm, Argon2, Params, Version};
+    if !argon2_params_within_limits(m, t, p) {
+        return Err(AppError::Invalid(format!(
+            "文件里的口令派生参数超出安全上限（m={m}KiB t={t} p={p}，上限 \
+             m={MAX_M_COST_KIB}KiB t={MAX_T_COST} p={MAX_P_COST}）。\
+             该文件可能已损坏或被人为篡改，已拒绝处理 —— 继续会耗尽内存或长时间无响应。"
+        )));
+    }
     let params = Params::new(m, t, p, Some(32))
         .map_err(|e| AppError::Crypto(format!("Argon2 参数非法(m={m},t={t},p={p}): {e}")))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -352,6 +384,54 @@ mod tests {
             nonce: STANDARD.encode(nonce_bytes),
             ct: STANDARD.encode(&ct),
         }
+    }
+
+    /// **恶意/损坏文件里的 Argon2 参数必须被上界挡住**（P2 安全）。
+    ///
+    /// 参数来自导入文件（信封自描述），即外部输入。不拦的后果见
+    /// `argon2_params_within_limits` 的文档：4 GiB 会让进程 **abort**（用户看到应用凭空消失）、
+    /// 一千万轮则是永久无响应。两者都是「拿到一个文件就能让别人的应用挂掉」。
+    ///
+    /// **边界用纯判定函数测，不真跑派生**：曾经这条测试直接调 `derive_key` 验「上限本身可用」，
+    /// 结果真跑了一次 1 GiB × 64 轮 —— 实测 **381 秒**，把整个套件从 14 秒拖到 6 分钟。
+    /// 慢测试最终会被跳过，那就等于没有护栏。故判定与执行分开：边界是纯比较（瞬间），
+    /// 真实派生只用轻量参数验一次「拦截确实接在 derive_key 上」。
+    ///
+    /// 故障注入判据：把 `argon2_params_within_limits` 改成恒 `true`，下面四条断言立即变红。
+    #[test]
+    fn oversized_argon2_params_are_rejected_not_attempted() {
+        // ---- 超限：必须判为不合法（纯比较，不触发任何派生）----
+        assert!(!argon2_params_within_limits(4_000_000, 3, 1), "4 GiB 内存必须被拒");
+        assert!(!argon2_params_within_limits(8 * 1024, 10_000_000, 1), "一千万轮必须被拒");
+        assert!(!argon2_params_within_limits(8 * 1024, 1, 9999), "超大并行度必须被拒");
+
+        // ---- 边界内：必须仍然合法，否则会把合法的旧文件也拒掉（比原缺陷更糟的回归）----
+        assert!(
+            argon2_params_within_limits(MAX_M_COST_KIB, MAX_T_COST, MAX_P_COST),
+            "恰好在上限上的参数必须可用"
+        );
+        assert!(
+            argon2_params_within_limits(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST),
+            "内置正式参数必须可用"
+        );
+
+        // ---- 拦截确实接在 derive_key 上（用超限参数，走不到真实派生，故很快）----
+        let msg = match derive_key("pw", &[7u8; SALT_LEN], 4_000_000, 3, 1) {
+            Ok(_) => panic!("derive_key 必须拒绝超限参数 —— 否则分配失败会 abort 整个进程"),
+            // `DerivedKey` 刻意不实现 Debug（防密钥进日志），故用 match 而非 expect_err。
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("上限"), "错误要说明是超上限：{msg}");
+        assert!(
+            msg.contains("损坏") || msg.contains("篡改"),
+            "要点明这是文件的问题，而不是让用户以为自己口令错了：{msg}"
+        );
+
+        // ---- 轻量参数仍能正常派生（证明这道守卫没把正常路径拦掉）----
+        assert!(
+            derive_key("pw", &[7u8; SALT_LEN], 8 * 1024, 1, 1).is_ok(),
+            "边界内的轻量参数必须能正常派生"
+        );
     }
 
     #[test]

@@ -39,6 +39,29 @@ fn copy_through(src: &Value, dst: &mut serde_json::Map<String, Value>, keys: &[&
     }
 }
 
+/// 流式请求补上 `stream_options.include_usage = true`（**仅对 Chat Completions 上游**）。
+///
+/// ## 为什么必须补
+///
+/// OpenAI Chat 的流式响应**默认不带 usage**：要拿 token 用量必须显式请求
+/// `stream_options: {include_usage: true}`，上游才会在末尾多发一个只含 usage 的 chunk。
+/// 不补的后果是「跨协议流式的 token 用量恒为 0」——用量页那一行永远是 0，
+/// 而用户正拿它判断额度花在哪。这属于**静默失效**：不报错，只是数字一直不动。
+///
+/// Anthropic 与 Responses 上游不需要（前者 usage 在 message_start/message_delta 里、
+/// 后者在 response.completed 里，都无需额外声明），故只在产出 Chat 请求体的两个转换函数里调。
+///
+/// **只在 stream 为真时加**：非流式响应本就带完整 usage，加了纯属多余字段，
+/// 而部分中转站对未知字段严格（历史上 `_pending_effort` 就撞过 400）。
+/// 用户已显式给了 `stream_options` 时不覆盖 —— 那是他自己的选择，可能刻意关掉了 usage。
+fn request_usage_in_stream(dst: &mut serde_json::Map<String, Value>) {
+    let streaming = dst.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    if !streaming || dst.contains_key("stream_options") {
+        return;
+    }
+    dst.insert("stream_options".into(), json!({ "include_usage": true }));
+}
+
 /// 从请求体里读出 OpenAI 推理强度档位。
 /// Codex/Responses 用 `reasoning.effort`（对象），Chat Completions 用顶层 `reasoning_effort`
 /// （字符串）。两种形态都读，取值 minimal/low/medium/high/xhigh，让下游是 Chat 客户端时
@@ -360,8 +383,12 @@ pub fn anthropic_to_openai(body: &Value) -> Value {
     }
     out.insert("messages".into(), json!(messages));
 
-    // 采样/控制字段透传（键名两协议一致）
-    copy_through(body, &mut out, &["temperature", "top_p", "stream"]);
+    // 采样/控制字段透传（键名两协议一致）。
+    // `stream_options` 一并透传：它是 Chat 的合法字段，用户显式给了就该带过去 —— 不透传的话
+    // 下面的 `request_usage_in_stream` 看不到它，会把用户「刻意关掉 usage」的设置顶掉。
+    // （这条是写测试时发现的：静默丢弃用户显式设置，正是本项目最忌讳的形态。）
+    copy_through(body, &mut out, &["temperature", "top_p", "stream", "stream_options"]);
+    request_usage_in_stream(&mut out);
     // Anthropic thinking.budget_tokens → OpenAI reasoning.effort（反向映射，补全对称）：
     // 下游 Anthropic 客户端开了扩展思考、上游是 OpenAI 协议时，把 token 预算落到最近的推理档位，
     // 使推理强度语义不在跨协议时丢失。
@@ -1038,7 +1065,9 @@ pub fn responses_to_chat(body: &Value) -> Value {
     if let Some(mt) = body.get("max_output_tokens").or_else(|| body.get("max_tokens")) {
         out.insert("max_tokens".into(), mt.clone());
     }
-    copy_through(body, &mut out, &["temperature", "top_p", "stream"]);
+    // `stream_options` 一并透传，理由同 anthropic_to_openai 那处（尊重用户显式设置）。
+    copy_through(body, &mut out, &["temperature", "top_p", "stream", "stream_options"]);
+    request_usage_in_stream(&mut out);
     // reasoning（Codex 推理强度）透传到 Chat 中枢：中枢→上游那一跳按上游协议决定如何落地
     // （Anthropic 上游映射成 thinking.budget_tokens；原生 Responses 上游原样带回）。此前被丢弃
     // 导致「改了推理强度还走默认」。
@@ -1589,6 +1618,66 @@ mod tests {
     /// 「原样」是关键语义：同协议路径是最常见场景（Claude Code→Anthropic Key、
     /// Codex→Responses Key），此时请求体应逐字节透传，任何隐式改写都会让
     /// count_tokens 等子路径行为偏离。
+    /// **跨协议流式必须显式索要 usage**，否则 token 用量恒为 0（P2）。
+    ///
+    /// OpenAI Chat 的流式响应默认不带 usage：必须请求 `stream_options.include_usage = true`，
+    /// 上游才会在末尾多发一个只含 usage 的 chunk。不补的后果是用量页那一行永远显示 0，
+    /// 而用户正拿它判断额度花在哪 —— 典型的静默失效（不报错、数字就是不动）。
+    ///
+    /// 三条边界一并钉住：非流式不加（本就带完整 usage，多加字段还可能撞严格中转站的 400）、
+    /// 用户已给 `stream_options` 时不覆盖（那是他的选择）、只对 Chat 上游加
+    /// （Anthropic/Responses 的 usage 在各自事件里，无需声明）。
+    ///
+    /// 故障注入判据：删掉 `request_usage_in_stream` 的两个调用点，前两条断言立即变红。
+    #[test]
+    fn cross_protocol_streaming_requests_usage_from_chat_upstream() {
+        // ① Anthropic 下游 → Chat 上游，流式：必须补 include_usage
+        let a_stream = json!({
+            "model": "m", "max_tokens": 100, "stream": true,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let out = anthropic_to_openai(&a_stream);
+        assert_eq!(
+            out["stream_options"]["include_usage"], json!(true),
+            "Chat 上游流式必须索要 usage，否则用量恒为 0:\n{out}"
+        );
+
+        // ② Responses 下游（Codex）→ Chat 上游，流式：同样要补
+        let r_stream = json!({
+            "model": "gpt-5", "stream": true,
+            "input": [{ "type": "message", "role": "user",
+                        "content": [{ "type": "input_text", "text": "hi" }] }]
+        });
+        let out = responses_to_chat(&r_stream);
+        assert_eq!(
+            out["stream_options"]["include_usage"], json!(true),
+            "Responses→Chat 流式同样必须索要 usage:\n{out}"
+        );
+
+        // ③ 非流式不加：响应本就带完整 usage，多余字段可能撞严格中转站的 400
+        let a_plain = json!({
+            "model": "m", "max_tokens": 100,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let out = anthropic_to_openai(&a_plain);
+        assert!(
+            out.get("stream_options").is_none(),
+            "非流式不该加 stream_options:\n{out}"
+        );
+
+        // ④ 用户已显式给了 stream_options → 不覆盖（他可能刻意关掉了 usage）
+        let explicit = json!({
+            "model": "m", "max_tokens": 100, "stream": true,
+            "stream_options": { "include_usage": false },
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let out = anthropic_to_openai(&explicit);
+        assert_eq!(
+            out["stream_options"]["include_usage"], json!(false),
+            "用户显式设置必须被尊重:\n{out}"
+        );
+    }
+
     #[test]
     fn convert_request_owned_passes_through_and_matches_borrowed() {
         let body = json!({
