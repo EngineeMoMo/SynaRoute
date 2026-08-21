@@ -956,6 +956,26 @@ fn cross_device_errno() -> i32 {
     }
 }
 
+/// fsync 父目录，让 `rename` 产生的**目录项**真正落到介质上。
+///
+/// 为什么单独需要这一步（`sync_all` 不够）：`sync_all` 保证的是**文件数据**已持久，
+/// 而 rename 改的是**父目录的目录项**。两者走不同的提交路径 —— 数据已落盘、目录项仍在
+/// 页缓存时掉电，重启后可能看到「文件不存在」或仍指向旧内容，**而我们刚刚才向调用方
+/// 报告过写入成功**。这是 tmp+rename 这套写法最后剩下的丢失窗口。
+///
+/// 仅在 Unix 生效：Windows 不支持对目录句柄做 fsync（`File::open` 目录即失败），
+/// 而 NTFS 对 rename 本身有日志保证，元数据不会丢，故那里是 no-op。
+fn fsync_parent_dir(path: &std::path::Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 /// 原子写：写临时文件再重命名替换，避免半写损坏（NFR-011 / dev-hard-rules）。
 ///
 /// 关键健壮性处理（企业管控机实战问题，真实 app 内 CDP 抓到的根因）：
@@ -1049,7 +1069,14 @@ pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> AppResult<()> {
     let mut delay_ms = 5u64;
     for attempt in 0..6 {
         match std::fs::rename(&tmp, path) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // 目录项落盘：`sync_all` 只保证**文件数据**落到介质，而 rename 改的是
+                // **父目录的目录项**。二者走不同提交路径 —— 数据已持久、目录项仍在页缓存
+                // 时掉电，重启后可能看到「文件不存在」或仍指向旧内容，而我们刚刚已向调用方
+                // 报告写入成功。这是 tmp+rename 这套写法唯一剩下的丢失窗口。
+                fsync_parent_dir(path);
+                return Ok(());
+            }
             Err(e) => {
                 if e.raw_os_error() == Some(cross_device) {
                     break; // 跨设备：立即回退

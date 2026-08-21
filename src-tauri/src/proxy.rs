@@ -641,20 +641,13 @@ async fn handle_request(
                        streaming: bool,
                        was_truncated: Option<bool>,
                        usage: Option<crate::upstream::TokenUsage>| {
-        let verb = if streaming { "流式返回" } else { "成功返回" };
-        // token 用量直接写进 detail：这是用户判断「额度花在哪」的唯一入口，
-        // 藏在链路快照里等于没有（快照默认关、且要展开才看得到）。
-        let usage_part = usage
-            .as_ref()
-            .map(|u| format!(" · {}", u.fmt_compact()))
-            .unwrap_or_default();
-        let detail = format!(
-            "{} · {} · {} · {}ms{}",
-            key.name,
-            verb,
-            fmt_route_model_for_key(key, &requested_model),
+        let detail = fmt_success_detail(
+            &key.name,
+            streaming,
+            &fmt_route_model_for_key(key, &requested_model),
             elapsed,
-            usage_part
+            was_truncated,
+            usage.as_ref(),
         );
         // 链路快照只在「调用模型日志」开关开启时产生（正文可达 2×20000 字符）。
         let trace = req_log.then(|| RequestTrace {
@@ -2660,6 +2653,36 @@ fn fmt_route_model(requested: &str, real: &str, kind: crate::model::ModelResolve
 fn fmt_route_model_for_key(key: &ProviderKey, requested: &str) -> String {
     let (real, kind) = key.resolve_model_detail(requested);
     fmt_route_model(requested, &real, kind)
+}
+
+/// 拼装成功转发的日志 detail 行。
+///
+/// 抽成独立函数只为可测：`log_success` 是个捕获了 `category`/`req_log`/`requested_model`
+/// 的闭包，测不到；而这行文本是**用户默认配置下唯一能看到的信息**，两个字段靠它才可见：
+///
+/// - `usage`：token 用量。判断额度花在哪的唯一入口。
+/// - `was_truncated`：上游按 `max_tokens` 截断。这是最需要被告知的一类异常——
+///   它不报错、不失败、不触发重试，日志是一条正常的绿色「成功返回」，
+///   只有答案莫名少了后半截。此前它**只**写进链路快照，而快照默认关闭、
+///   且要展开某一行才看得到，等于在默认配置下完全不可见。
+fn fmt_success_detail(
+    key_name: &str,
+    streaming: bool,
+    model_part: &str,
+    elapsed_ms: u64,
+    was_truncated: Option<bool>,
+    usage: Option<&crate::upstream::TokenUsage>,
+) -> String {
+    let verb = if streaming { "流式返回" } else { "成功返回" };
+    let usage_part = usage.map(|u| format!(" · {}", u.fmt_compact())).unwrap_or_default();
+    // 只有确定被截断（Some(true)）才标记：None 表示无法检测（流式直通时边收边发，
+    // 不解析完整响应），把它当成「没截断」展示是对的，当成「截断」会满屏假警。
+    let truncated_part = if was_truncated == Some(true) {
+        " · ⚠ 被上游截断（达最大输出上限）"
+    } else {
+        ""
+    };
+    format!("{key_name} · {verb} · {model_part} · {elapsed_ms}ms{usage_part}{truncated_part}")
 }
 
 fn json_resp(status: StatusCode, body: Bytes) -> Response<ResBody> {
@@ -5013,6 +5036,47 @@ mod tests {
             fmt_route_model("", "glm-5.2", ModelResolveKind::First),
             "模型 glm-5.2（列表首个）"
         );
+    }
+
+    /// 截断必须在**默认配置**下可见。
+    ///
+    /// 这条盯的不是格式好看，是一类特定的隐身故障：上游按 `max_tokens` 把回答砍掉后，
+    /// 转发本身是成功的（HTTP 200、不重试、不触发熔断），日志是一条正常的绿色
+    /// 「成功返回」。此前截断标记**只**写进 `RequestTrace`，而链路快照默认关闭、
+    /// 开了还得展开某一行才看得到 —— 于是用户唯一的线索是「答案莫名少了后半截」，
+    /// 无从查证。detail 行是默认配置下唯一可见的文本，标记必须落在这里。
+    ///
+    /// 同时钉住 `None`（流式直通无法检测）不得被展示成截断：那会满屏假警，
+    /// 假警多了真警就没人看了。
+    #[test]
+    fn success_detail_surfaces_truncation_and_usage() {
+        use crate::upstream::TokenUsage;
+        let usage = TokenUsage { input: 1200, output: 340, cache_read: 0, cache_creation: 0 };
+
+        // 被截断：detail 里必须有醒目标记
+        let truncated =
+            fmt_success_detail("百倍", false, "模型 glm-5.2", 820, Some(true), Some(&usage));
+        assert!(
+            truncated.contains("被上游截断"),
+            "上游按 max_tokens 截断必须写进 detail（默认配置下唯一可见处），实得：{truncated}"
+        );
+        assert_eq!(truncated, "百倍 · 成功返回 · 模型 glm-5.2 · 820ms · ↑1200 ↓340 · ⚠ 被上游截断（达最大输出上限）");
+
+        // 未截断：不得出现标记
+        let ok = fmt_success_detail("百倍", false, "模型 glm-5.2", 820, Some(false), Some(&usage));
+        assert!(!ok.contains("被上游截断"), "未截断不应有标记：{ok}");
+
+        // 无法检测（流式直通）：按未截断展示，不许假警
+        let unknown = fmt_success_detail("百倍", true, "模型 glm-5.2", 820, None, Some(&usage));
+        assert!(
+            !unknown.contains("被上游截断"),
+            "was_truncated=None 表示无法检测，不能当成截断报警：{unknown}"
+        );
+        assert_eq!(unknown, "百倍 · 流式返回 · 模型 glm-5.2 · 820ms · ↑1200 ↓340");
+
+        // 无 usage（上游没回 usage 字段）：只是少一段，不影响截断标记
+        let no_usage = fmt_success_detail("百倍", true, "模型 glm-5.2", 820, Some(true), None);
+        assert_eq!(no_usage, "百倍 · 流式返回 · 模型 glm-5.2 · 820ms · ⚠ 被上游截断（达最大输出上限）");
     }
 
     #[tokio::test]
