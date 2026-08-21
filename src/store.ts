@@ -364,6 +364,17 @@ export const useStore = create<AppState>((set, get) => ({
     if (proxyR.status === "rejected") console.error("getProxyState failed", proxyR.reason);
     if (brainR.status === "rejected") console.error("getBrainConfig failed", brainR.reason);
     if (eventsR.status === "rejected") console.error("listAllEvents failed", eventsR.reason);
+    // **过期结果丢弃**：await 期间用户可能已经切走了。
+    //
+    // 竞态形态：点分类 A → `loadCategory("claude-cli")` 在途；立刻点分类 B →
+    // `setActiveCategory` 同步改了 activeCategory 并发起 `loadCategory("codex")`。
+    // 两个请求没有先后保证，A 后到就把 keys/proxy/brain 整份写成 A 的 ——
+    // 界面标题是 Codex、列表是 Claude CLI 的 Key。而 `loadCategory` 只在挂载/切分类时调，
+    // **没有轮询会把它纠正回来**，这一屏就一直错到用户再切一次分类。
+    // （同一形态在 KeyEditor 的健康探测路径上已修过一次，见那里的注释；这里是它的同胞。）
+    //
+    // `loading` 也不碰：那面旗归**最新**那次调用管，过期的这次插手会把加载态提前熄掉。
+    if (get().activeCategory !== c) return;
     set((s) => ({
       keys: keysR.status === "fulfilled" ? reuseUnchanged(s.keys, keysR.value) : s.keys,
       proxy: proxyR.status === "fulfilled" ? proxyR.value : s.proxy,
@@ -380,6 +391,10 @@ export const useStore = create<AppState>((set, get) => ({
         api.listKeys(c),
         api.getProxyState(c),
       ]);
+      // 过期结果丢弃，理由同 `loadCategory`：这是 5s 轮询，await 期间用户完全可能切走。
+      // 这条的自愈性比 loadCategory 好（下一轮会拉对的），但那也意味着**最长 5 秒**
+      // 的错数据窗口 —— 而用户切过去第一眼看的就是那 5 秒。
+      if (get().activeCategory !== c) return;
       set((s) => ({
         // 逐条复用内容未变的旧对象：这是 5s 轮询，不做的话 KeyCard 的 memo 恒失效。
         keys: keysR.status === "fulfilled" ? reuseUnchanged(s.keys, keysR.value) : s.keys,
