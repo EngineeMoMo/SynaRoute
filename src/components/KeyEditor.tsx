@@ -366,15 +366,31 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
    * 与其让上游回一个 401 让用户猜，不如就地说清楚。
    */
   const probeBalance = async () => {
-    // 「测试查询」会**先把表单落盘**（见下方注释），故必填校验与「保存」同一口径：
+    // 「测试查询」会**先把表单落盘**（见下方注释），故校验必须与「保存」**逐条一致**：
     // 不拦的话，名称/地址还没填就点测试 → 一条无名无地址、无法转发的 Key 已被插入，
     // 用户没点过保存却「多了一条空 Key」，且关抽屉也不会回收它。
+    // 「逐条一致」不是修辞：下面三道（名称、地址非空、地址格式）与 `save` 的前三道一一对应，
+    // 少任何一道就等于开了一条绕过校验的落盘后门。
     if (!name.trim()) {
       setBalanceProbe({ ok: false, queriedAt: Date.now(), error: t("editor.errNeedName") });
       return;
     }
     if (!baseUrl.trim()) {
       setBalanceProbe({ ok: false, queriedAt: Date.now(), error: t("editor.errNeedBaseUrl2") });
+      return;
+    }
+    // 与 `save` 完全同一道校验，不只是判空。
+    //
+    // 上面那句「与保存同一口径」此前是**假的**：`save` 拦 `isValidHttpUrl`，这里只拦空串。
+    // 于是 `api.foo.com`（缺协议头）、`ftp://x`、`foo` 这类**保存会被拒**的地址，
+    // 从「测试查询」这条路径照样落盘 —— 而它同样调 `upsert_key`，落的是同一张表。
+    // 后果不是「测试失败」这么轻：用户没点保存却多了一条 Key，且这条 Key 每次转发都因
+    // URL 无法解析而失败，回到编辑器点保存时才第一次看到「地址格式无效」，
+    // 完全对不上「这条 Key 是怎么进来的」。
+    //
+    // 校验放在 upsert 之前而不是之后：一旦落盘就已经造成了脏数据，事后报错也收不回来。
+    if (!isValidHttpUrl(baseUrl)) {
+      setBalanceProbe({ ok: false, queriedAt: Date.now(), error: t("editor.errInvalidBaseUrl") });
       return;
     }
     // 没有可用密钥（既没有已落盘的、也没在表单里填）→ 就地说明，别去打一次注定 401 的上游。

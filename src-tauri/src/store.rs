@@ -1460,6 +1460,37 @@ impl Store {
                 key.health = existing.health.clone();
                 key.cached_balance = existing.cached_balance.clone();
             } else {
+                // 新插入：若该分类里已有 Key 用着同一个 priority，把它顶到队尾（max+1）。
+                //
+                // 为什么需要：前端新建 Key 时恒发 `priority: 999`（KeyEditor 的
+                // `initial?.priority ?? 999`）—— 它无从知道该填几。于是**每一条手工新增的
+                // Key 都是 999**，同分类里三条新 Key 全部同级。此时故障转移的主/备顺序
+                // 只由 `sort_by_key` 的稳定性（= 恰好的插入顺序）决定，而不是任何用户
+                // 可见、可控的东西：界面上三条 Key 看不出谁先谁后，用户以为拖到最上面的
+                // 那条是主 Key，实际未必。
+                //
+                // 判据放在**碰撞**而不是「无条件重编号」上，是为了不砸掉已有的正确调用方：
+                // cc-switch 导入（`ccswitch.rs`）自己算了分类内 max+1、每条都唯一，
+                // 无条件覆盖会把它精心排好的导入顺序换成我们的插入顺序。碰撞判据下，
+                // 唯一值原样保留、只有真正撞车的才顺延，两条路径都对。
+                //
+                // 999 本身不当哨兵值特殊对待：它是个合法优先级，未来前端换成别的数字
+                // （或用户导入的配置里真有 999）时这条规则依然成立。
+                let collides = cfg
+                    .keys
+                    .iter()
+                    .any(|k| k.category_id == key.category_id && k.priority == key.priority);
+                if collides {
+                    let next = cfg
+                        .keys
+                        .iter()
+                        .filter(|k| k.category_id == key.category_id)
+                        .map(|k| k.priority)
+                        .max()
+                        .map(|m| m.saturating_add(1))
+                        .unwrap_or(0);
+                    key.priority = next;
+                }
                 cfg.keys.push(key.clone());
             }
             Ok(())
@@ -4179,6 +4210,55 @@ mod tests {
         // 重载确认落盘
         let reloaded = Store::new_at(cfg, dir.join("secrets.enc")).unwrap();
         assert_eq!(reloaded.get_key("k1").unwrap().name, "改后的名字");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 新增 Key 时 priority 撞车必须顺延，不能让整列停在「全部同级」。
+    ///
+    /// 背景：前端新建 Key 恒发 `priority: 999`（`initial?.priority ?? 999` —— 它无从
+    /// 知道该填几）。不处理的话，同分类里每条手工新增的 Key 都是 999，故障转移的
+    /// 主/备顺序就只由 `sort_by_key` 的稳定性（= 恰好的插入顺序）决定，
+    /// 而不是任何用户能看见、能改的东西。
+    ///
+    /// 三个方向一起钉：
+    /// 1. 撞车的顺延（999, 999, 999 → 999, 1000, 1001），且顺延后仍保持插入先后；
+    /// 2. **不撞车的原样保留** —— cc-switch 导入自己算了分类内 max+1，无条件重编号
+    ///    会把它排好的顺序换成我们的插入顺序；
+    /// 3. 跨分类不算撞车（priority 的作用域是分类内）。
+    #[test]
+    fn inserting_key_with_taken_priority_appends_instead_of_tying() {
+        let dir = temp_dir("prio-collide");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+
+        // 前端新建三条：都带 999
+        store.upsert_key(sample_key("a", 999)).unwrap();
+        store.upsert_key(sample_key("b", 999)).unwrap();
+        store.upsert_key(sample_key("c", 999)).unwrap();
+        let prios: Vec<i32> =
+            ["a", "b", "c"].iter().map(|id| store.get_key(id).unwrap().priority).collect();
+        assert_eq!(
+            prios,
+            vec![999, 1000, 1001],
+            "三条同级必须顺延成互不相同，否则主/备顺序由稳定排序的巧合决定"
+        );
+        // 顺延后的顺序 = 插入先后（用户在界面上看到的从上到下）
+        let ids: Vec<String> =
+            store.enabled_keys_sorted(CategoryType::ClaudeCli).iter().map(|k| k.id.clone()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+
+        // 不撞车的原样保留（cc-switch 导入路径依赖这条）
+        store.upsert_key(sample_key("d", 3)).unwrap();
+        assert_eq!(store.get_key("d").unwrap().priority, 3, "唯一值不得被改写");
+
+        // 跨分类同值不算撞车
+        let mut other = sample_key("x", 999);
+        other.category_id = CategoryType::Codex;
+        store.upsert_key(other).unwrap();
+        assert_eq!(
+            store.get_key("x").unwrap().priority,
+            999,
+            "priority 的作用域是分类内，跨分类同值不该被顺延"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

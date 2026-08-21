@@ -45,6 +45,23 @@ const REMAINING_CANDIDATES: &[&str] = &[
     // 误显成 0，违反本模块「绝不返回 0」。cc-switch 的 siliconflow 函数也只读 totalBalance。
     "data.totalBalance",
     "totalBalance",
+    // 月之暗面 Kimi：`GET /v1/users/me/balance` 返回
+    // `{"code":0,"data":{"available_balance":49.58,"voucher_balance":46.58,"cash_balance":3.0},…}`
+    // —— **snake_case**，与下面 Novita 的 camelCase `availableBalance` 是两个不同的字段。
+    //
+    // 这条是**我们自己挖的坑**：`VENDOR_ENDPOINTS` 里给 `api.moonshot.cn/.ai` 加了这个端点
+    // （cc-switch 没有，是本项目补的），却没在候选链里加对应字段。结果是 Kimi 用户零配置
+    // 拿到了**正确的 URL、200 的响应**，然后卡在「上游返回里找不到余额字段」——
+    // 比根本不支持更难排查，因为报错指向「去改取值路径」，而地址其实是对的。
+    //
+    // 🔴 **绝不可加进 `SCALED_FIELDS`**：Novita 的 camelCase 版是 0.0001 USD 整数、要除
+    // 10000；Kimi 这个是**元的浮点数**，缩放会把 49.58 显示成 0.0049（看着像额度耗尽）。
+    // 两个字段名只差一个下划线、含义与量纲都不同，按名字模式推断必错，故分开列并各自注明。
+    //
+    // 排在泛化 `balance`/`data.balance` **之前**：同时返回两者的站点里，`available_balance`
+    // （可用 = 代金券 + 现金）才是真实可花的额度。同文件开头「更具体的优先」的一贯口径。
+    "available_balance",
+    "data.available_balance",
     "balance",
     "data.balance",
     "data.remaining",
@@ -84,6 +101,9 @@ const REMAINING_CANDIDATES: &[&str] = &[
     // Novita AI：`{"availableBalance": 123456}`，单位是 **0.0001 USD**
     // （cc-switch 除以 10000）。我们的候选链只取原始数字，故这里取到的是
     // 「万分之一美元」的整数 —— 单位换算见 `as_number` 下方的 SCALED_FIELDS。
+    //
+    // ⚠️ 与上面 Kimi 的 snake_case `available_balance` **不是同一个字段**：那个是元的浮点、
+    // 不缩放。改动这里时不要顺手把两者合并或统一处理。
     "availableBalance",
     "data.availableBalance",
     // StepFun：`{"balance": ...}` 已由上面的泛化 `balance` 命中，无需单列。
@@ -1016,6 +1036,48 @@ mod tests {
             extract_balance(&other, None).remaining,
             Some(123_456.0),
             "普通 balance 字段不得被缩放"
+        );
+    }
+
+    /// 月之暗面 Kimi 的真实响应必须能解析，且**不得**被 Novita 的 /10000 规则误伤。
+    ///
+    /// 这条钉的是一个「支持了一半」的缺陷：`VENDOR_ENDPOINTS` 里有
+    /// `api.moonshot.cn → /v1/users/me/balance`（本项目补的，cc-switch 没有），
+    /// 但候选链里只有 camelCase 的 `availableBalance`（Novita），没有 Kimi 的
+    /// snake_case `available_balance`。于是 Kimi 用户零配置拿到正确 URL + 200 响应，
+    /// 却收到「上游返回里找不到余额字段」—— 报错把人指向「改取值路径」，而地址是对的。
+    ///
+    /// 两个断言方向都必须钉住：
+    /// 1. 取得到值（否则等于没支持）；
+    /// 2. 值**没有**被除以 10000（把 49.58 显示成 0.0049 会被当成额度耗尽）。
+    ///    两个字段名只差一个下划线、量纲完全不同，这是最容易被后人「统一处理」掉的地方。
+    #[test]
+    fn moonshot_snake_case_available_balance_is_read_and_not_scaled() {
+        // 实测形态（platform.kimi.ai 的 Check Balance：available / voucher / cash 三项）
+        let body = serde_json::json!({
+            "code": 0,
+            "data": { "available_balance": 49.58, "voucher_balance": 46.58, "cash_balance": 3.0 },
+            "scode": "0x0",
+            "status": true
+        });
+        let r = extract_balance(&body, None);
+        assert!(r.ok, "Kimi 结构必须能解析：{:?}", r.error);
+        assert_eq!(
+            r.remaining,
+            Some(49.58),
+            "取 data.available_balance 原值；被 /10000 缩放成 0.0049 会被误读为额度耗尽"
+        );
+
+        // 无 data 包裹的形态（同一字段名放在根上）也要认，候选链本就是为形态差异而存在
+        let flat = serde_json::json!({ "available_balance": "12.34" });
+        assert_eq!(extract_balance(&flat, None).remaining, Some(12.34));
+
+        // 与 Novita 的 camelCase 分道扬镳：同一个测试里对照，防后人合并两条
+        let novita = serde_json::json!({ "availableBalance": 123_456 });
+        assert_eq!(
+            extract_balance(&novita, None).remaining,
+            Some(12.3456),
+            "camelCase 版仍须缩放 —— 两个字段不是一回事"
         );
     }
 
