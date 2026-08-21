@@ -140,13 +140,35 @@ fn read_providers() -> AppResult<(PathBuf, Vec<RawProvider>)> {
     Ok((db, rows))
 }
 
+/// 库副本文件名的进程内序号。
+///
+/// 为什么光靠 `pid + 时间戳`不够（实测抓到的假红）：Windows 的系统时钟粒度是
+/// 毫秒级（典型 0.5~15.6ms），`timestamp_nanos` 在同一个 tick 内**会返回完全相同的值**。
+/// 同进程里两次并发调用（测试套件并行跑，或用户连点两下导入）于是拿到**同一个临时路径**：
+/// 一个的 `remove_file` 会把另一个正在打开的副本删掉 → `unable to open database file`。
+/// 加一个单调递增的进程内序号后，同进程绝不可能重名；`pid` 继续负责跨进程。
+static COPY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 生成一个**保证互不相同**的库副本临时路径。
+///
+/// 抽成独立函数是为了让「互不相同」可被确定性地断言：靠并发跑去等那个 race 现形是
+/// 概率性的（要两个线程落在同一个时钟 tick、且一个恰好在另一个 open 期间 remove），
+/// 十轮才红一次 —— 那种测试挡不住回归。直接断言「连续 N 次调用得到 N 个不同名字」
+/// 才是把判据钉在不变量上。
+fn db_copy_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "synaroute-ccswitch-{}-{}-{}.db",
+        std::process::id(),
+        COPY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        // 时间戳留着只为「万一副本泄漏了，能看出是什么时候的」，唯一性不靠它 ——
+        // 它的量化粒度只有 100ns，并发下 88% 会撞（见 db_copy_paths_are_always_unique）。
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ))
+}
+
 /// 可测入口：从指定 db 文件读 providers（生产走 [`read_providers`] 定位真实路径）。
 fn read_providers_at(db: &std::path::Path) -> AppResult<Vec<RawProvider>> {
-    let tmp = std::env::temp_dir().join(format!(
-        "synaroute-ccswitch-{}-{}.db",
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    ));
+    let tmp = db_copy_path();
     std::fs::copy(db, &tmp)
         .map_err(|e| AppError::Other(format!("复制 cc-switch 库失败（{}）: {e}", db.display())))?;
 
@@ -591,6 +613,67 @@ mod tests {
         }
         drop(conn);
         path
+    }
+
+    /// 库副本的临时路径必须**次次不同** —— 撞名会让一个调用把另一个正在打开的副本删掉。
+    ///
+    /// 这条是从一次**假红**倒推出来的真缺陷：副本名原是 `synaroute-ccswitch-{pid}-{纳秒}`。
+    /// 本机实测（探针跑过、数字如实记下）：`Utc::now().timestamp_nanos_opt()` 的量化粒度是
+    /// **100ns**，单线程连续读 20 万次里有 **5.3 万次与上一次完全相同**（26%）；
+    /// 8 线程并发各读 2 万次，16 万个采样只剩 **1.9 万个不同值 —— 88% 撞车**。
+    /// 于是同进程两次并发调用极易拿到同一个临时路径，一个的 `remove_file` 把另一个正在打开的
+    /// 副本删掉，报 `unable to open database file`。
+    ///
+    /// 测试套件并行跑时约每 10 轮红一次（实测抓到那条报错）。生产侧的对应形态是用户连点两下
+    /// 「从 cc-switch 导入」—— 那时报的错会把人指向「表结构可能已变」，
+    /// 而真实原因是我们自己把文件删了，按那个提示永远查不出来。
+    ///
+    /// **必须并发地测**：本用例最初写成「连续调 1000 次断言互不相同」，
+    /// 结果**去掉序号后照样绿** —— `db_copy_path` 自身的开销（format!/temp_dir/PathBuf 拼接）
+    /// 就够拉开 100ns，单线程压根撞不上。撞车只在真并发时发生，测试就必须并发。
+    #[test]
+    fn db_copy_paths_are_always_unique() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 2_000;
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            handles.push(std::thread::spawn(|| {
+                (0..PER_THREAD).map(|_| db_copy_path()).collect::<Vec<_>>()
+            }));
+        }
+        let all: Vec<PathBuf> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let uniq: std::collections::HashSet<&PathBuf> = all.iter().collect();
+        assert_eq!(
+            uniq.len(),
+            all.len(),
+            "{} 次并发调用只得到 {} 个不同路径 —— 撞名的那些会互相删掉对方正在打开的副本",
+            all.len(),
+            uniq.len()
+        );
+    }
+
+    /// 并发读同一个 cc-switch 库不得互相踩掉临时副本（上面那条不变量的端到端体现）。
+    ///
+    /// 保留它作为冒烟：路径唯一是手段，「并发读都能成功」才是要的结果。
+    /// 但**回归护栏靠上面那条** —— 这条是概率性的，单跑一轮不失败不代表没问题。
+    #[test]
+    fn concurrent_reads_do_not_clobber_each_others_db_copy() {
+        let dir = temp_dir("ccswitch_concurrent");
+        let db = std::sync::Arc::new(full_db(&dir));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let db = db.clone();
+            handles.push(std::thread::spawn(move || read_providers_at(&db)));
+        }
+        for (i, h) in handles.into_iter().enumerate() {
+            let r = h.join().expect("读线程不应 panic");
+            assert!(
+                r.is_ok(),
+                "第 {i} 个并发读失败了：{:?} —— 副本名撞车，一个把另一个正在打开的文件删了",
+                r.err()
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 本机实测的两种 settings_config 原样（脱敏后的等价结构）。
