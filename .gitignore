@@ -39,6 +39,18 @@ secrets.enc
 .codegraph/
 .plans/
 
+# ---- 运行时数据（正常在 %APPDATA%\SynaRoute\，但误拷进仓库就会随发布外泄）----
+#
+# `config.json` 里有全部 Key 的地址/映射/余额配置，`secrets.enc` 是密钥库（DPAPI 密文，
+# 绑开发机账户）。任一进包 = 把开发者自己的付费 API Key 发给每个用户，且 secrets.enc
+# 换机解不开、还会顶掉用户自己的密钥库。exe 同级 `logs/` 里有请求快照（开了日志开关时含对话）。
+# 判据：发布前 `git ls-files` 不该列出这三者中任何一个，产物里也 grep 不到其**内容**
+#（代码里的路径常量是运行时解析的，出现属正常）。
+/config.json
+/secrets.enc
+/logs/
+/synaroute.exe
+
 # ---- 官网截图采集用的临时 Chrome 配置目录（脚本已改用系统临时目录，此处为双保险）----
 .chrome-capture/
 

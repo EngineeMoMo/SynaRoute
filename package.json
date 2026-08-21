@@ -1,7 +1,7 @@
 {
   "name": "synaroute",
   "private": true,
-  "version": "0.1.27",
+  "version": "0.1.28",
   "type": "module",
   "description": "SynaRoute - 智能 API Key 路由代理与配置管理桌面软件",
   "scripts": {
@@ -10,7 +10,8 @@
     "check:tailwind": "node scripts/check-tailwind-tokens.mjs",
     "preview": "vite preview",
     "test": "vitest run",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "audit:release": "node scripts/audit-release-bundle.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

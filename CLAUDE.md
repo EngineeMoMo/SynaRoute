@@ -114,6 +114,24 @@ npm run tauri build -- --no-bundle   # 只出 exe（快速验证）
 
 **部署前必须用可证伪证据验证前端已嵌入**：`dist/assets/` 的 chunk 名要能在产物 exe 里 `grep -c` 到（> 0）。裸 cargo build 产物该值为 0。
 
+### 🔴 发布物**绝不能**含本地数据与密钥（每次发版必查）
+
+运行数据在 `%APPDATA%\SynaRoute\{config.json, secrets.enc}`，日志在 exe 同级 `logs\`。它们**任一进包**的后果：
+
+- `config.json` 带全部 Key 的地址/映射/余额配置；`secrets.enc` 是密钥库 → 等于**把开发者自己的付费 API Key 发给每个用户**，而且 `secrets.enc` 由 DPAPI 绑账户、到了用户机器解不开，还会顶掉他自己的密钥库；
+- `logs\` 里有请求快照（开了日志开关时含对话正文）；
+- `~/.tauri/synaroute.key`（更新签名私钥，**无口令保护**）泄露 → 任何人都能签出「验签通过」的伪造更新，而已发布客户端里嵌着公钥、**换钥等于所有老用户自动更新失效**。
+
+**判据是机械检查，不是「我记得没加」**：
+
+```bash
+npm run audit:release
+```
+
+它查四项：① `git ls-files` 不含运行数据/明文密钥（`secrets/*.key.gpg` 是刻意入库的 GPG 密文，见 `secrets/README.md`）；② `bundle.resources`/`externalBin` 无仓库外引用；③ `dist/` 无数据文件、无密钥内容、无演示数据集（生产必须走 `mockData.prod.ts` 空桩）；④ **当次版本**的产物二进制里搜不到私钥/真实密钥/密钥库内容。
+
+两个已踩过的判据坑（脚本注释里也记着）：**别用 i18n 占位文案当演示数据的判据**（`厂商1（官方直连）` 是输入框灰字提示，每个包都有，会对干净的包报假警）；**别查开发机用户名**（Rust 把 `.cargo/registry` 源码路径嵌进二进制供 panic 用，每个 Rust 程序都有，不含用户数据）。签名密钥只经 `TAURI_SIGNING_PRIVATE_KEY` 环境变量传入，永不落仓库。
+
 完整流程、验证判据、部署步骤见 [docs/04-构建部署指南.md](docs/04-构建部署指南.md)。
 
 ## ⚠️ MSIX AppData 虚拟化陷阱（本项目最大惨案，务必先读）
