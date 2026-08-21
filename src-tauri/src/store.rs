@@ -2153,13 +2153,70 @@ impl Store {
         true
     }
 
-    /// 按日分桶的只读快照（面板算「今日 / 本周 / 近 7 日」用）。
+    /// 按日分桶的只读快照（面板算「今日 / 本周 / 近 7 日」用），**已并入尚未 flush 的增量**。
     ///
-    /// 不含尚未 flush 的增量（最多落后 `USAGE_FLUSH_INTERVAL_SECS`）——
-    /// 面板的「今日」由前端把这份历史与 `token_usage_by_key` 的实时增量相加得出，
-    /// 故这点延迟不会让用户看到停滞的数字。
+    /// 为什么必须在这里并、而不是让前端相加：`daily_buckets` 只在 flush 时更新
+    /// （最多落后 `USAGE_FLUSH_INTERVAL_SECS` = 60s）。原注释写着「面板的今日由前端把这份
+    /// 历史与 `token_usage_by_key` 的实时增量相加得出」，但 `UsagePage` 从来没那么做 ——
+    /// 它的 `byDate` 只用这份桶。于是同一屏上出现自相矛盾：刚发过几个请求，
+    /// 「累计」已经涨了，「今日」还是 0（新装那次尤其明显，一分钟内就是 0）。
+    ///
+    /// 收在后端的理由：增量 = `usage_totals − usage_baseline`，与 flush 用的是同一条减法。
+    /// 让前端再算一遍等于把这条口径复制到两处，而它有两个易错点（饱和减法防外部改小、
+    /// UTC 而非本地日期）—— 复制必然漂移。这里并完，前端拿到的桶天然就是最新的。
+    ///
+    /// **不动 baseline**：这是只读视图，抬基线会把这段增量从下一次 flush 里吃掉。
     pub fn daily_usage_buckets(&self) -> Vec<crate::model::DailyUsageBucket> {
-        self.daily_buckets.read().clone()
+        let mut buckets = self.daily_buckets.read().clone();
+        // 未落盘增量（口径同 flush_usage_if_dirty，但只读不抬基线）
+        let pending: Vec<crate::model::TokenUsageByKey> = {
+            let totals = self.usage_totals.read();
+            let baseline = self.usage_baseline.read();
+            totals
+                .iter()
+                .filter_map(|((cat, kid), cur)| {
+                    let base = baseline.get(&(*cat, kid.clone())).copied().unwrap_or_default();
+                    // 饱和减法：防「外部把 usage.json 改小了」导致下溢 panic。
+                    let d = TokenUsage {
+                        input: cur.input.saturating_sub(base.input),
+                        output: cur.output.saturating_sub(base.output),
+                        cache_read: cur.cache_read.saturating_sub(base.cache_read),
+                        cache_creation: cur.cache_creation.saturating_sub(base.cache_creation),
+                    };
+                    (!d.is_empty()).then(|| crate::model::TokenUsageByKey {
+                        category_id: *cat,
+                        key_id: kid.clone(),
+                        usage: d,
+                    })
+                })
+                .collect()
+        };
+        if pending.is_empty() {
+            return buckets;
+        }
+        // 落进**今天**的桶（与 flush 同一判定：UTC 日期）。跨零点时这段增量算今天，
+        // 与 flush 的处置一致 —— 两边同口径才不会在零点前后打出不同的「今日」。
+        let today = Self::utc_date_string(chrono::Utc::now().timestamp_millis());
+        match buckets.iter_mut().find(|b| b.date == today) {
+            Some(bucket) => {
+                for row in pending {
+                    match bucket
+                        .entries
+                        .iter_mut()
+                        .find(|e| e.category_id == row.category_id && e.key_id == row.key_id)
+                    {
+                        Some(slot) => slot.usage.add(&row.usage),
+                        None => bucket.entries.push(row),
+                    }
+                }
+            }
+            None => {
+                buckets.push(crate::model::DailyUsageBucket { date: today, entries: pending });
+                // 保持「最新在前」（调用方按这个顺序取最近 N 天）
+                buckets.sort_by(|a, b| b.date.cmp(&a.date));
+            }
+        }
+        buckets
     }
 
     /// 把毫秒时间戳转成 UTC 日期字符串 `"YYYY-MM-DD"`。
@@ -3697,6 +3754,84 @@ mod tests {
             "重启后总量 = retired（v1 的 500）+ 日桶之和（200）；\
              得到 200 说明 v1 历史又被重启吃掉了"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 「今日」用量不得比「累计」慢一分钟 —— 未落盘增量必须并进当天的桶。
+    ///
+    /// 缺陷形态：`daily_buckets` 只在 flush 时更新（最多落后 60s）。原注释声称
+    /// 「面板的今日由前端把这份历史与实时增量相加得出」，但 `UsagePage.byDate` 从来只用这份桶。
+    /// 于是同一屏上自相矛盾：刚发过几个请求，「累计」已经涨了，「今日」还是 0
+    /// —— 新装后的第一分钟尤其明显。
+    ///
+    /// 三个方向一起钉：
+    /// 1. flush 之前就能看到当天的量（这是缺陷本身）；
+    /// 2. flush 之后**不重复计数**（基线被抬，pending 归零，桶里已有那份）；
+    /// 3. 只读视图**不抬基线** —— 抬了就会把这段增量从下一次 flush 里吃掉，
+    ///    变成「看过一眼用量，那段就再也不落盘了」这种更隐蔽的丢数据。
+    #[test]
+    fn daily_buckets_include_unflushed_delta_without_double_counting() {
+        use crate::upstream::TokenUsage;
+        let dir = temp_dir("usage_pending");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        let today = Store::utc_date_string(chrono::Utc::now().timestamp_millis());
+        let sum_today = |s: &Store| -> u64 {
+            s.daily_usage_buckets()
+                .iter()
+                .filter(|b| b.date == today)
+                .flat_map(|b| &b.entries)
+                .map(|e| e.usage.input)
+                .sum()
+        };
+
+        assert_eq!(sum_today(&store), 0, "前置条件：还没有任何用量");
+
+        store.append_event_full(
+            CategoryType::ClaudeCli,
+            "route",
+            Some("k"),
+            "req",
+            None,
+            None,
+            Some(TokenUsage { input: 90, output: 0, cache_read: 0, cache_creation: 0 }),
+        );
+        assert_eq!(
+            sum_today(&store),
+            90,
+            "还没 flush 就该看得到今天的 90 —— 否则「今日」会比「累计」慢整整一分钟"
+        );
+
+        assert!(store.flush_usage_if_dirty(), "落盘一次");
+        assert_eq!(
+            sum_today(&store),
+            90,
+            "flush 后必须仍是 90：桶里已有那份、pending 归零，重复计数会变 180"
+        );
+
+        // 只读视图不得抬基线：再来一笔仍要能被下一次 flush 落盘
+        store.append_event_full(
+            CategoryType::ClaudeCli,
+            "route",
+            Some("k"),
+            "req",
+            None,
+            None,
+            Some(TokenUsage { input: 10, output: 0, cache_read: 0, cache_creation: 0 }),
+        );
+        let _ = store.daily_usage_buckets(); // 读一眼（旧实现若在这里抬基线就会吃掉这 10）
+        assert!(store.flush_usage_if_dirty(), "这 10 必须还能落盘");
+        let persisted: crate::model::UsageSnapshot = serde_json::from_slice(
+            &std::fs::read(Store::usage_file_path(&dir.join("config.json"))).unwrap(),
+        )
+        .unwrap();
+        let on_disk: u64 = persisted
+            .daily_buckets
+            .iter()
+            .flat_map(|b| &b.entries)
+            .map(|e| e.usage.input)
+            .sum();
+        assert_eq!(on_disk, 100, "磁盘上应是 90 + 10；得到 90 说明只读视图偷偷抬了基线");
 
         std::fs::remove_dir_all(&dir).ok();
     }

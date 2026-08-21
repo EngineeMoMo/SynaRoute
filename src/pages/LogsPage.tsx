@@ -1,5 +1,5 @@
 import * as React from "react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useStore } from "@/store";
 import { Badge } from "@/components/ui/Badge";
 import { api } from "@/lib/bridge";
@@ -313,6 +313,16 @@ const LogRow = React.memo(function LogRow({ entry, lang }: { entry: EventLogEntr
   // 展开时才按事件 id 单取一条。undefined = 还没取过；null = 已滚出保留窗口。
   const [trace, setTrace] = useState<RequestTrace | null | undefined>(undefined);
   const [loadingTrace, setLoadingTrace] = useState(false);
+  // 缓存的这份 trace 是在 repeat 为几的时候取的。
+  //
+  // 为什么必须记：折叠事件**同 id 但内容会变** —— 后端 `push_event_in_memory` 在折叠时
+  // 把 `detail` 和 `trace` 一起替换成最近一次的（只保留一份，避免 N 条正文堆在内存里）。
+  // 本行的 trace 只在首次展开时取一次，于是同一条日志越折叠越不一致：
+  // 表头显示「×7 · 最近一次 820ms」，展开的正文却还是第 1 次那份请求/响应，
+  // 而界面上没有任何东西提示这两半不是同一次。排障时按住那份旧正文查，
+  // 查的是一个已经不存在的现场。
+  const [traceRepeat, setTraceRepeat] = useState<number | undefined>(undefined);
+  const repeat = entry.repeat ?? 1;
   const meta = TYPE_META[entry.type] ?? TYPE_META.route;
   const Icon = meta.icon;
   // 所有类型都可展开：有 trace 的展开完整链路快照；无 trace 的展开 detail 全文
@@ -324,18 +334,44 @@ const LogRow = React.memo(function LogRow({ entry, lang }: { entry: EventLogEntr
     const next = !open;
     setOpen(next);
     // 首次展开且这条有快照 → 拉一次并缓存在本行 state 里（收起再展开不重复请求）。
+    // **过期重取不在这里**：由下面那个 effect 独占，否则两处都可能发起 ——
+    // setState 是异步的，`loadingTrace` 在同一轮里还是 false，会打出两个并发请求。
     if (next && entry.hasTrace && trace === undefined && !loadingTrace) {
       setLoadingTrace(true);
+      const at = repeat;
       void api
         .getEventTrace(entry.id)
-        .then((tr) => setTrace(tr))
+        .then((tr) => {
+          setTrace(tr);
+          setTraceRepeat(at);
+        })
         .catch((e) => {
           console.error("getEventTrace failed", e);
           setTrace(null); // 取不到就按「无快照」渲染，不让展开态空着
+          setTraceRepeat(at);
         })
         .finally(() => setLoadingTrace(false));
     }
   };
+
+  // 展开着的这条又被折叠进了新的一次（repeat 变了）→ 缓存的正文已过期，就地重取。
+  // 不做这一步的话，用户盯着一条展开的日志，看到 ×N 在涨、正文却纹丝不动 ——
+  // 而正文其实已经不是当前那次了。`trace === undefined` 时不管（首取归 toggle）。
+  useEffect(() => {
+    if (!open || !entry.hasTrace || loadingTrace) return;
+    if (trace === undefined || traceRepeat === repeat) return;
+    setLoadingTrace(true);
+    const at = repeat;
+    void api
+      .getEventTrace(entry.id)
+      .then((tr) => {
+        setTrace(tr);
+        setTraceRepeat(at);
+      })
+      .catch(() => setTraceRepeat(at))
+      .finally(() => setLoadingTrace(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repeat, open, entry.hasTrace, entry.id]);
 
   return (
     <div className="rounded-control border border-border bg-surface">
