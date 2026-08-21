@@ -62,7 +62,78 @@ fn request_usage_in_stream(dst: &mut serde_json::Map<String, Value>) {
     dst.insert("stream_options".into(), json!({ "include_usage": true }));
 }
 
+/// Chat 的 `response_format` → Responses 的 `text` 对象（结构化输出约束）。
+///
+/// ## 为什么必须转，而不是让 copy_through 带过去
+///
+/// 两协议表达「我要 JSON」的字段完全不同名：Chat 用顶层 `response_format`，
+/// Responses 用 `text.format`（同一份 schema、不同位置）。`response_format` 从来没进过
+/// `copy_through` 的白名单，于是 Chat→Responses 时它被**整个丢掉**。
+///
+/// 后果是纯静默失效里最难查的一种：请求 200、模型正常作答，只是回的是散文而不是 JSON，
+/// 客户端在 `JSON.parse` 上炸掉。用户看到的是「我的程序解析失败」，而根因在代理的协议转换里
+/// —— 日志、状态码、错误信息里没有任何线索。
+///
+/// ## json_schema 要**摊平**
+///
+/// Chat：`{"type":"json_schema","json_schema":{"name":…,"schema":…,"strict":true}}`
+/// Responses：`{"format":{"type":"json_schema","name":…,"schema":…,"strict":true}}`
+/// —— 内层 `json_schema` 包裹层没了，`name`/`schema`/`strict` 直接挂在 `format` 下。
+///
+/// 判据来源（非推测）：① Microsoft Learn 的结构化输出文档明确写「Chat Completions 在
+/// `response_format` 里定义 schema，Responses 在 `text.format` 里定义」；② 本机
+/// `codex.exe`（Responses 原生客户端）的 serde 字段名串里，`strict`/`schema`/`format`/
+/// `json_schema` 是同级相邻字段，与摊平形态一致、与嵌套形态不一致。
+///
+/// 未知 `type` **原样搬进 format 而不是丢掉**：上游若不认会明确报错，那比静默降级成散文好 ——
+/// 后者用户查不到，前者一次就定位。
+fn chat_response_format_to_responses_text(rf: &Value) -> Option<Value> {
+    let obj = rf.as_object()?;
+    let mut format = serde_json::Map::new();
+    match obj.get("type").and_then(|t| t.as_str()) {
+        Some("json_schema") => {
+            format.insert("type".into(), json!("json_schema"));
+            // 摊平内层：把 name/schema/strict 及未来新增字段一并提上来。
+            if let Some(inner) = obj.get("json_schema").and_then(|j| j.as_object()) {
+                for (k, v) in inner {
+                    format.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        // json_object / text 及其它：只有 type，位置换一下即可
+        _ => {
+            for (k, v) in obj {
+                format.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Some(json!({ "format": Value::Object(format) }))
+}
+
+/// Responses 的 `text.format` → Chat 的 `response_format`（[`chat_response_format_to_responses_text`] 的逆向）。
+///
+/// 反向同样漏过：Codex（Responses 客户端）配一个 Chat 协议的 Key 时，结构化输出约束
+/// 一样会被丢掉。两向都补才对称 —— 只补一向的话，同一个功能在「哪种 Key」下可用
+/// 取决于用户碰巧选了谁，而那是他最不该需要知道的事。
+///
+/// `json_schema` 要重新**包回**内层对象（`type` 留在外层，其余进 `json_schema`）。
+fn responses_text_to_chat_response_format(text: &Value) -> Option<Value> {
+    let format = text.get("format")?.as_object()?;
+    let ty = format.get("type").and_then(|t| t.as_str())?;
+    if ty != "json_schema" {
+        return Some(json!({ "type": ty }));
+    }
+    let mut inner = serde_json::Map::new();
+    for (k, v) in format {
+        if k != "type" {
+            inner.insert(k.clone(), v.clone());
+        }
+    }
+    Some(json!({ "type": "json_schema", "json_schema": Value::Object(inner) }))
+}
+
 /// 从请求体里读出 OpenAI 推理强度档位。
+///
 /// Codex/Responses 用 `reasoning.effort`（对象），Chat Completions 用顶层 `reasoning_effort`
 /// （字符串）。两种形态都读，取值 minimal/low/medium/high/xhigh，让下游是 Chat 客户端时
 /// 顶层 reasoning_effort 也能被 openai_to_anthropic 映射成 thinking 预算，不丢推理强度。
@@ -1068,6 +1139,12 @@ pub fn responses_to_chat(body: &Value) -> Value {
     // `stream_options` 一并透传，理由同 anthropic_to_openai 那处（尊重用户显式设置）。
     copy_through(body, &mut out, &["temperature", "top_p", "stream", "stream_options"]);
     request_usage_in_stream(&mut out);
+    // 结构化输出：Responses 的 text.format → Chat 的 response_format（反向对称，
+    // 见 responses_text_to_chat_response_format）。只补一向会让同一个功能在
+    // 「哪种 Key」下可用取决于用户碰巧选了谁。
+    if let Some(rf) = body.get("text").and_then(responses_text_to_chat_response_format) {
+        out.insert("response_format".into(), rf);
+    }
     // reasoning（Codex 推理强度）透传到 Chat 中枢：中枢→上游那一跳按上游协议决定如何落地
     // （Anthropic 上游映射成 thinking.budget_tokens；原生 Responses 上游原样带回）。此前被丢弃
     // 导致「改了推理强度还走默认」。
@@ -1466,7 +1543,12 @@ pub fn chat_to_responses(body: &Value) -> Value {
         out.insert("max_output_tokens".into(), mt.clone());
     }
     copy_through(body, &mut out, &["temperature", "top_p", "stream"]);
-    // reasoning：Chat 中枢里若带 reasoning 对象（来自 Codex Responses 透传或 Anthropic thinking
+    // 结构化输出：Chat 的 response_format → Responses 的 text.format（见该函数的完整理由）。
+    // 不转的话请求 200、模型回散文、客户端 JSON.parse 炸掉，而日志里毫无线索。
+    if let Some(text) = body.get("response_format").and_then(chat_response_format_to_responses_text)
+    {
+        out.insert("text".into(), text);
+    }
     // 反映射），原样带给 Responses 上游——它原生认 reasoning.effort，推理强度直达。
     // 若只有**顶层字符串** reasoning_effort（o/gpt-5 系 Chat API 的合法字段），也要归一成
     // reasoning:{effort:..}，否则 Chat→Responses 会把它整个丢掉、上游推理强度静默回落默认档
@@ -1612,6 +1694,86 @@ mod tests {
     use crate::upstream::testfix::*;
     use crate::model::Protocol;
     use serde_json::json;
+
+    /// 结构化输出约束必须跨协议**双向**保留，且 `json_schema` 的包裹层要正确摊平/包回。
+    ///
+    /// 不转的后果是最难查的一类静默失效：请求 200、模型正常作答、只是回的是散文而不是 JSON，
+    /// 客户端在 `JSON.parse` 上炸掉。用户看到「我的程序解析失败」，而根因在代理的协议转换里
+    /// —— 状态码、日志、错误信息里没有任何线索。
+    ///
+    /// 钉四件事：
+    /// 1. Chat→Responses：`response_format` → `text.format`，且内层 `json_schema` **摊平**
+    ///    （`name`/`schema`/`strict` 直接挂 `format` 下）；
+    /// 2. 反向 Responses→Chat：`text.format` → `response_format`，`json_schema` **包回**内层
+    ///    （只补一向会让同一功能在「哪种 Key」下可用取决于用户碰巧选了谁）；
+    /// 3. `json_object` 这类只有 type 的形态两向都要过；
+    /// 4. 没给约束时**不得**凭空造出 `text`/`response_format`（多余字段撞过严格中转站的 400）。
+    #[test]
+    fn structured_output_constraint_survives_both_directions() {
+        let schema = json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "reply",
+                "strict": true,
+                "schema": { "type": "object", "properties": { "a": { "type": "string" } } }
+            }
+        });
+
+        // 1) Chat → Responses：摊平
+        let resp = chat_to_responses(&json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": schema
+        }));
+        let fmt = &resp["text"]["format"];
+        assert_eq!(fmt["type"], "json_schema", "结构化输出约束不得被丢掉");
+        assert_eq!(fmt["name"], "reply", "name 必须摊平到 format 下，而不是留在 json_schema 里");
+        assert_eq!(fmt["strict"], true);
+        assert_eq!(fmt["schema"]["type"], "object");
+        assert!(
+            resp["text"]["format"].get("json_schema").is_none(),
+            "内层包裹层必须消失 —— Responses 的 text.format 是摊平形态"
+        );
+
+        // 2) Responses → Chat：包回
+        let chat = responses_to_chat(&json!({
+            "model": "m",
+            "input": [],
+            "text": { "format": {
+                "type": "json_schema", "name": "reply", "strict": true,
+                "schema": { "type": "object" }
+            }}
+        }));
+        assert_eq!(chat["response_format"]["type"], "json_schema");
+        assert_eq!(
+            chat["response_format"]["json_schema"]["name"], "reply",
+            "Chat 形态里 name 必须重新包进 json_schema"
+        );
+        assert!(
+            chat["response_format"].get("name").is_none(),
+            "Chat 的 response_format 顶层只有 type，其余在 json_schema 内"
+        );
+
+        // 3) 只有 type 的形态（json_object）两向都过
+        let jo = chat_to_responses(&json!({
+            "model": "m", "messages": [], "response_format": {"type": "json_object"}
+        }));
+        assert_eq!(jo["text"]["format"]["type"], "json_object");
+        let back = responses_to_chat(&json!({
+            "model": "m", "input": [], "text": {"format": {"type": "json_object"}}
+        }));
+        assert_eq!(back["response_format"]["type"], "json_object");
+
+        // 4) 没给约束时不得凭空造字段
+        let bare = chat_to_responses(&json!({"model": "m", "messages": []}));
+        assert!(bare.get("text").is_none(), "没要求结构化输出就不该出现 text");
+        let bare2 = responses_to_chat(&json!({"model": "m", "input": []}));
+        assert!(
+            bare2.get("response_format").is_none(),
+            "多余字段撞过严格中转站的 400，不能凭空加"
+        );
+    }
+
     /// P2-5：`convert_request_owned` 同协议时必须**零拷贝原样返回**，跨协议时与
     /// `convert_request` 结果完全一致。
     ///

@@ -309,6 +309,45 @@ fn resolve_default_log_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("logs"))
 }
 
+/// 清理某目录下超过 [`LOG_RETAIN_DAYS`] 天的日志文件，返回删除数。
+///
+/// free 函数而非 `Store` 方法：写线程只持有目录路径、拿不到 `Store`
+/// （它在 `Store` 构造过程中就已启动，持有 `Arc<Store>` 会成循环引用）。
+///
+/// **判据是文件名里的日期，不是文件 mtime**：写线程用 `{date}.jsonl` 命名，
+/// 文件名即权威日期。mtime 会被备份工具/杀软/同步盘改写 —— 那会误删今天的日志，
+/// 或让三个月前的文件因为被扫过而永远留着。
+///
+/// 全程 best-effort（失败只记 warn 不上抛）：清不掉旧日志是纯磁盘占用问题，
+/// 而让它把启动流程或写线程搞挂就成了功能故障。
+fn cleanup_old_logs_in(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0; // 目录还不存在（首次运行）或读不了：无事可做
+    };
+    let cutoff = chrono::Utc::now().date_naive() - chrono::Duration::days(LOG_RETAIN_DAYS);
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // 只认写线程产出的 `YYYY-MM-DD.jsonl`；别的文件（用户自己放的、旧版遗留的
+        // events.jsonl）一律不碰 —— 删错文件比留着旧日志严重得多。
+        let Some(date_str) = name.strip_suffix(".jsonl") else { continue };
+        let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") else {
+            continue;
+        };
+        if date < cutoff {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) => tracing::warn!("清理旧日志 {name} 失败: {e}"),
+            }
+        }
+    }
+    if removed > 0 {
+        tracing::info!("已清理 {removed} 个超过 {LOG_RETAIN_DAYS} 天的日志文件");
+    }
+    removed
+}
+
 impl Store {
     /// 初始化：定位数据目录（%APPDATA%\SynaRoute），加载配置与密钥库。
     /// 路径全部动态解析，禁止硬编码（dev-hard-rules 规则2）。
@@ -698,40 +737,15 @@ impl Store {
         self.log_dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// 清理超过 [`LOG_RETAIN_DAYS`] 天的日志文件。启动时调一次。
+    /// 清理超过 [`LOG_RETAIN_DAYS`] 天的日志文件。
     ///
-    /// **判据是文件名里的日期，不是文件 mtime**：写线程用 `{date}.jsonl` 命名，
-    /// 文件名即权威日期。mtime 会被备份工具/杀软/同步盘改写 —— 那会误删今天的日志，
-    /// 或让三个月前的文件因为被扫过而永远留着。
-    ///
-    /// 全程 best-effort（失败只记 warn 不上抛）：清不掉旧日志是纯磁盘占用问题，
-    /// 而让它把启动流程搞挂就成了功能故障。
+    /// 启动时调一次，**并且**写线程每次跨天/换目录重开文件时再调一次
+    /// （见 [`Self::spawn_log_writer`]）。只在启动时清是不够的：本应用是托盘常驻程序，
+    /// 用户几周不重启很正常，而日志按日轮转 —— 于是「保留 30 天」这个设定对
+    /// 恰恰最需要它的那批用户（长期挂着不关的）完全不生效，磁盘无上限增长。
+    /// 跨天那一刻正是新文件出现、旧文件可能刚过期的时刻，不需要额外定时器。
     pub fn cleanup_old_logs(&self) {
-        let dir = self.effective_log_dir();
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return; // 目录还不存在（首次运行）或读不了：无事可做
-        };
-        let cutoff = chrono::Utc::now().date_naive() - chrono::Duration::days(LOG_RETAIN_DAYS);
-        let mut removed = 0usize;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            // 只认写线程产出的 `YYYY-MM-DD.jsonl`；别的文件（用户自己放的、旧版遗留的
-            // events.jsonl）一律不碰 —— 删错文件比留着旧日志严重得多。
-            let Some(date_str) = name.strip_suffix(".jsonl") else { continue };
-            let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") else {
-                continue;
-            };
-            if date < cutoff {
-                match std::fs::remove_file(entry.path()) {
-                    Ok(()) => removed += 1,
-                    Err(e) => tracing::warn!("清理旧日志 {name} 失败: {e}"),
-                }
-            }
-        }
-        if removed > 0 {
-            tracing::info!("已清理 {removed} 个超过 {LOG_RETAIN_DAYS} 天的日志文件");
-        }
+        cleanup_old_logs_in(&self.effective_log_dir());
     }
 
     /// 等待写线程把当前队列排空（退出钩子与测试用）。
@@ -792,6 +806,14 @@ impl Store {
                                     open = None;
                                     continue;
                                 }
+                                // 跨天/换目录这一刻顺手清理过期日志。
+                                //
+                                // 启动时清一次是不够的：本应用是托盘常驻程序，用户几周不重启
+                                // 很正常，而日志按日轮转 —— 于是「保留 30 天」对恰恰最需要它的
+                                // 那批用户（长期挂着不关的）完全不生效，磁盘无上限增长。
+                                // 挂在这里而不是另起定时器：跨天正是新文件出现、旧文件刚过期的
+                                // 时刻，判据天然对齐，且最多一天一次（换目录时多一次，可忽略）。
+                                cleanup_old_logs_in(&dir);
                                 let path = dir.join(format!("{date}.jsonl"));
                                 match std::fs::OpenOptions::new().create(true).append(true).open(&path)
                                 {
@@ -4059,7 +4081,60 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 常驻不重启也要清：写线程跨天重开文件时必须顺手清理过期日志。
+    ///
+    /// 只在启动时清是不够的 —— 本应用是托盘常驻程序，用户几周不重启很正常，
+    /// 而日志按日轮转。于是「保留 30 天」这个设定对**恰恰最需要它的那批用户**
+    /// （长期挂着不关的）完全不生效，磁盘无上限增长。
+    ///
+    /// 测法：直接驱动写线程的重开路径 —— 先让它在 A 目录开一个文件，再改日志目录
+    /// 触发 `need_reopen`（与跨天走同一分支、同一行清理调用）。跨天本身没法在测试里
+    /// 等一天，而「换目录」是那个分支唯一可被主动触发的入口，钉住它即钉住那行调用存在。
+    #[test]
+    fn log_writer_cleans_expired_files_on_reopen_not_only_at_startup() {
+        let dir = temp_dir("log_cleanup_rollover");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        let today = chrono::Utc::now().date_naive();
+        let stale = format!(
+            "{}.jsonl",
+            (today - chrono::Duration::days(LOG_RETAIN_DAYS + 5)).format("%Y-%m-%d")
+        );
+
+        // 第一段：目录 A，写一条让写线程把 A 开起来
+        let dir_a = dir.join("logs_a");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        {
+            let mut cfg = store.config.write();
+            cfg.settings.log_dir = Some(dir_a.display().to_string());
+        }
+        store.append_event(CategoryType::ClaudeCli, "config", None, "first");
+        store.flush_logs();
+
+        // 第二段：换到目录 B，并在其中预置一个早已过期的日志文件。
+        // 换目录会让写线程走 need_reopen 分支 —— 与跨天同一条路径。
+        let dir_b = dir.join("logs_b");
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(dir_b.join(&stale), "old").unwrap();
+        {
+            let mut cfg = store.config.write();
+            cfg.settings.log_dir = Some(dir_b.display().to_string());
+        }
+        store.append_event(CategoryType::ClaudeCli, "config", None, "second");
+        store.flush_logs();
+
+        assert!(
+            !dir_b.join(&stale).exists(),
+            "重开日志文件时应顺手清掉过期文件 {stale} —— 否则常驻不重启的用户永远不清理"
+        );
+        // 今天的文件当然要留着（它就是刚写进去的那个）
+        let today_file = format!("{}.jsonl", today.format("%Y-%m-%d"));
+        assert!(dir_b.join(&today_file).exists(), "今天的日志文件不该被清理");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// P1-3：`flush_logs` 必须真的把队列排空（退出钩子依赖它，否则强杀会丢最后几条）。
+
     #[test]
     fn flush_logs_drains_the_queue() {
         let dir = temp_dir("log_flush");
