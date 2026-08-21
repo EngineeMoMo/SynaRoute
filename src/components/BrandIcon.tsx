@@ -17,6 +17,41 @@ type BrandKey =
   | "qwen"
   | "mistral";
 
+/**
+ * 可供用户**显式挑选**的内置品牌清单（厂商管理页的图标选择器用）。
+ *
+ * ## 为什么需要「显式挑选」，而不是只靠自动匹配
+ *
+ * `resolveBrand` 按 vendor id / 名称 / 模型名做启发式匹配，覆盖了大多数情况。但中转站
+ * 的名字千奇百怪（「小明API」「林夕公益站」「百倍」），猜不中时只能退化成首字母色块 ——
+ * 用户明知这是个 Claude 中转，却没有任何地方能告诉程序。cc-switch 给了这个入口，我们没有。
+ *
+ * ## 与 cc-switch 的存储形态对齐（从其本机库取证，非推测）
+ *
+ * 读 `~/.cc-switch/cc-switch.db` 的 `providers` 表可见：`icon` 列存的是**预设键字符串**
+ * （`anthropic`、`openai`），配套 `icon_color` 存品牌色（`#D4915D`、`#00A67E`），
+ * **不是** data-URL。故我们沿用同一模型：`Vendor.icon` 既可放 data-URL（自定义上传），
+ * 也可放这里的预设键 —— 字段类型无需改动（本就是 `Option<String>`），
+ * 靠 `isPresetBrand` 在渲染时区分两者。
+ *
+ * 显示名用中文常用叫法而非厂商英文全称：用户是在「我这个 Key 是哪家的」这个语境下选的。
+ */
+export const PRESET_BRANDS: { key: BrandKey; label: string }[] = [
+  { key: "anthropic", label: "Anthropic / Claude" },
+  { key: "openai", label: "OpenAI / GPT" },
+  { key: "deepseek", label: "DeepSeek 深度求索" },
+  { key: "zhipu", label: "智谱 GLM" },
+  { key: "moonshot", label: "月之暗面 Kimi" },
+  { key: "qwen", label: "通义千问 Qwen" },
+  { key: "gemini", label: "Google Gemini" },
+  { key: "mistral", label: "Mistral" },
+];
+
+/** 某个字符串是否是内置预设键（而非用户上传的 data-URL）。 */
+export function isPresetBrand(v: string | undefined): v is BrandKey {
+  return !!v && PRESET_BRANDS.some((b) => b.key === v);
+}
+
 /** 每个品牌的主色（用于图标底色 tint） */
 const BRAND_COLOR: Record<BrandKey, string> = {
   anthropic: "#D97757",
@@ -126,17 +161,30 @@ interface BrandIconProps {
   hint?: string;
   /** 无法推断品牌时，用于生成首字母占位的显示名 */
   fallbackLabel?: string;
-  /** 自定义图标（data-URL）。传入时优先渲染它，覆盖品牌启发式（自定义厂商用） */
+  /**
+   * 用户**显式指定**的图标，两种形态（与 cc-switch 的 `icon` 列同一模型，见 `PRESET_BRANDS`）：
+   * - **预设键**（`"anthropic"`、`"zhipu"`…）→ 渲染内置品牌 SVG，等于「我就要用这家的图标」；
+   * - **data-URL**（`data:image/png;base64,…`）→ 渲染上传的自定义图片。
+   *
+   * 两者都**优先于**启发式匹配 —— 显式选择必须胜过程序的猜测，否则用户会发现「选了没用」。
+   */
   iconUrl?: string;
   size?: number;
   className?: string;
 }
 
 export function BrandIcon({ hint, fallbackLabel, iconUrl, size = 18, className }: BrandIconProps) {
-  const brand = useMemo(() => resolveBrand(hint) ?? resolveBrand(fallbackLabel), [hint, fallbackLabel]);
+  // 显式预设键最高优先：用户挑了就按他挑的画，不再让启发式插手。
+  const explicitBrand = isPresetBrand(iconUrl) ? iconUrl : null;
+  const brand = useMemo(
+    () => explicitBrand ?? resolveBrand(hint) ?? resolveBrand(fallbackLabel),
+    [explicitBrand, hint, fallbackLabel],
+  );
 
-  // 自定义上传图标：最高优先级
-  if (iconUrl) {
+  // 自定义上传图标（data-URL）：仅当它**不是**预设键时才走 <img>。
+  // 预设键不是 URL，塞进 src 会被浏览器当相对路径去请求、渲染成碎图标；
+  // 它已在上面并进 `brand`，由下面的内置 SVG 分支渲染。
+  if (iconUrl && !explicitBrand) {
     return (
       <span
         className={`inline-flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-surface-hover ${className ?? ""}`}
