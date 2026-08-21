@@ -105,6 +105,10 @@ const zh: Dict = {
   "balance.multiplier": "计费倍率（选填）",
   "balance.multiplierHint":
     "中转站常按官方价打折，如 0.3 表示三折。用量页据此估算花费；留空按 1.0（原价）。只是估算，与实际账单可能有差。",
+  // 后端对非法倍率静默退回 1.0（不让笔误把金额算成 0），故必须在这里明说 ——
+  // 否则用户填了「三折」「30%」以为生效了，用量页却按原价算，金额差 3 倍而无人告知。
+  "balance.multiplierInvalid":
+    "倍率必须是 0 到 {max} 之间的数字（如 0.3）。当前填法无法识别，用量页会按原价 1.0 估算。",
 
 
 
@@ -896,6 +900,8 @@ const en: Dict = {
   "balance.multiplier": "Cost multiplier (optional)",
   "balance.multiplierHint":
     "Providers often discount official pricing — 0.3 means 30% of list price. The usage page estimates spend from this; empty means 1.0. Estimates only; may differ from your actual bill.",
+  "balance.multiplierInvalid":
+    "The multiplier must be a number between 0 and {max} (e.g. 0.3). This value can't be parsed, so the usage page will estimate at list price (1.0).",
 
 
 

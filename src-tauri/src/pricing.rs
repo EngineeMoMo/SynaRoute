@@ -184,6 +184,14 @@ pub enum PricingSource {
     Unknown,
 }
 
+/// 计费倍率的上界。超过即视为笔误、按 1.0 处理（见 [`estimate_cost`]）。
+///
+/// 1000 这个数字的取法：中转站的折扣区间实际是 0.1~5（常见 0.3、0.5、2），
+/// 官方原价是 1.0。留三个数量级的余量已足够容纳任何真实定价，
+/// 再大只可能是「少点一个小数点」或「把每百万 token 的价格当倍率填了进来」。
+/// 前端也用同一个界做输入校验（`MAX_COST_MULTIPLIER`），两处必须同值。
+pub const MAX_COST_MULTIPLIER: f64 = 1000.0;
+
 /// 估算一段用量的成本（纳美元）+ 单价来源。
 ///
 /// `model_hint` 传该 Key 的代表模型名（默认兜底模型或首个模型）。
@@ -197,9 +205,16 @@ pub fn estimate_cost(
     multiplier: Option<&str>,
 ) -> (Option<u64>, PricingSource) {
     // 倍率解析失败（用户填了 "abc"）时按 1.0，不让一个笔误把金额算成 0。
+    //
+    // `is_finite` 那道判必须有：`"inf"` 与 `"1e400"` 都能**成功**解析成 `f64::INFINITY`，
+    // 而 `INFINITY > 0.0` 为真、能过下面那道门。乘出来的 f64 转 u64 在 Rust 里是饱和转换
+    // （不是 UB），于是金额直接变成 u64::MAX —— 面板上显示 $18446744073.7 这种数字。
+    // 上界 `MAX_COST_MULTIPLIER` 同理：中转站的折扣再离谱也不会到 1000 倍，
+    // 填出这种值只会是笔误（少点一个小数点、把「每百万 token 价格」当倍率填进来），
+    // 而它把估算撑成天文数字后用户第一反应是「这程序坏了」，不是「我填错了」。
     let mult = multiplier
         .and_then(|s| s.trim().parse::<f64>().ok())
-        .filter(|m| *m > 0.0)
+        .filter(|m| m.is_finite() && *m > 0.0 && *m <= MAX_COST_MULTIPLIER)
         .unwrap_or(1.0);
 
     let Some(name) = model_hint.map(str::trim).filter(|s| !s.is_empty()) else {
@@ -348,6 +363,36 @@ mod tests {
         assert_eq!(fallback, Some(3_000_000_000), "非法倍率应退回 1.0");
         let (zero_mult, _) = estimate_cost(&usage, Some("claude-sonnet-4"), Some("0"));
         assert_eq!(zero_mult, Some(3_000_000_000), "倍率 0 视为未填，退回 1.0");
+
+        // **`"inf"` 与 `"1e400"` 都能成功解析成 f64::INFINITY**，且 `INFINITY > 0.0` 为真 ——
+        // 它们此前能穿过那道门。乘出来的 f64 转 u64 是饱和转换（不是 UB），
+        // 于是金额变成 u64::MAX，面板上显示 $18446744073.7，用户只会以为程序坏了。
+        for absurd in ["inf", "Infinity", "1e400", "-inf", "NaN", "nan"] {
+            let (got, _) = estimate_cost(&usage, Some("claude-sonnet-4"), Some(absurd));
+            assert_eq!(
+                got,
+                Some(3_000_000_000),
+                "倍率「{absurd}」不是有限正数，必须退回 1.0 而不是撑成天文数字"
+            );
+        }
+        // 上界：超过 MAX_COST_MULTIPLIER 一律视为笔误（少点小数点 / 把单价当倍率填了）
+        let (over, _) = estimate_cost(
+            &usage,
+            Some("claude-sonnet-4"),
+            Some(&format!("{}", MAX_COST_MULTIPLIER + 1.0)),
+        );
+        assert_eq!(over, Some(3_000_000_000), "超上界退回 1.0");
+        // 边界本身仍然生效（用 `<=`，别把合法的边界值也拒掉）
+        let (at_bound, _) = estimate_cost(
+            &usage,
+            Some("claude-sonnet-4"),
+            Some(&format!("{MAX_COST_MULTIPLIER}")),
+        );
+        assert_eq!(
+            at_bound,
+            Some(3_000_000_000_000),
+            "恰好等于上界应当生效（判据是 <=）"
+        );
     }
 
     #[test]

@@ -108,6 +108,32 @@ function isValidHttpUrl(raw: string): boolean {
   }
 }
 
+/**
+ * 计费倍率的上界。**必须与后端 `pricing::MAX_COST_MULTIPLIER` 同值**。
+ *
+ * 1000 的取法：中转站折扣实际区间是 0.1~5（常见 0.3、0.5、2），官方原价 1.0。
+ * 留三个数量级余量已足够容纳任何真实定价，再大只可能是笔误。
+ */
+const MAX_COST_MULTIPLIER = 1000;
+
+/**
+ * 计费倍率是否可用（空串 = 未填，合法）。
+ *
+ * 为什么要在前端也判：后端 `estimate_cost` 对非法值**静默退回 1.0**——这个兜底是对的
+ * （不能让一个笔误把整页金额算成 0），但它同时意味着用户填错时**界面上什么都不会说**：
+ * 他填了「0.3折」「三折」「30%」，以为倍率生效了，用量页却按原价算，
+ * 而那正是他配这个字段要解决的问题。金额差了 3 倍且无人告知，比压根不支持更糟。
+ *
+ * 判据与后端逐条对齐（有限、正数、不超上界），否则会出现「前端放过、后端按 1.0 算」
+ * 或反之的错位。`inf` / `1e400` 都能被 `Number()` 解析成 Infinity，必须显式挡掉。
+ */
+function isValidCostMultiplier(raw: string): boolean {
+  const s = raw.trim();
+  if (!s) return true; // 未填 = 用官方原价
+  const n = Number(s);
+  return Number.isFinite(n) && n > 0 && n <= MAX_COST_MULTIPLIER;
+}
+
 function defaultBalanceQuery(): BalanceQuery {
   return {
     enabled: false,
@@ -619,6 +645,12 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     );
     if (invalidWindow) return setError(t("editor.errInvalidContextWindow"));
     if (invalidMaxOut) return setError(t("editor.errInvalidMaxOutput"));
+    // 计费倍率与上面两个数值字段同一口径：拦在保存处。
+    // 只在编辑器里标红是不够的 —— 抽屉一关那条提示就没了，而这条 Key 会带着一个
+    // 后端只会静默退回 1.0 的废值一直存在，用量页金额差几倍且没有任何地方提示过。
+    if (!isValidCostMultiplier(costMultiplier)) {
+      return setError(t("balance.multiplierInvalid", { max: String(MAX_COST_MULTIPLIER) }));
+    }
 
     const key = buildDraftKey();
 
@@ -1392,14 +1424,24 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                     即使不开余额查询也能配（用量页靠它算金额）。 */}
                 <Field label={t("balance.multiplier")}>
                   <input
-                    className={`${inputCls} font-mono`}
+                    className={`${inputCls} font-mono ${
+                      isValidCostMultiplier(costMultiplier) ? "" : "border-danger focus:ring-danger"
+                    }`}
                     value={costMultiplier}
                     placeholder="1.0"
                     onChange={(e) => setCostMultiplier(e.target.value)}
                   />
-                  <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
-                    {t("balance.multiplierHint")}
-                  </p>
+                  {isValidCostMultiplier(costMultiplier) ? (
+                    <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
+                      {t("balance.multiplierHint")}
+                    </p>
+                  ) : (
+                    // 后端对非法值静默退回 1.0（不让笔误把金额算成 0），所以这里必须说出来：
+                    // 否则用户填了「三折」「30%」以为生效了，用量页却按原价算，金额差 3 倍而无人告知。
+                    <p className="mt-1 text-[11px] leading-relaxed text-danger">
+                      {t("balance.multiplierInvalid", { max: String(MAX_COST_MULTIPLIER) })}
+                    </p>
+                  )}
                 </Field>
               </div>
             )}
