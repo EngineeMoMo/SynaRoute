@@ -903,30 +903,47 @@ fn claude_json_path() -> AppResult<PathBuf> {
     Ok(home.join(".claude.json"))
 }
 
-/// Claude 桌面端的 MCP 配置文件：3p 部署目录下的 `claude_desktop_config.json`。
+/// Claude 桌面端的 MCP 配置文件：**两个部署目录下的 `claude_desktop_config.json` 都要写**。
 ///
 /// 桌面端 MCP **必须与 CLI 分离**：CLI 读 `~/.claude.json`，桌面端读它自己部署目录里的
 /// `claude_desktop_config.json`（`mcpServers` 段，形态同 CLI）。二者若共用一份文件同一个
 /// `synaroute` 项，两分类端口不同就会互相覆盖——接入桌面端会把 CLI 的 MCP 指到桌面端端口，
-/// 反之亦然。桌面端在 3p 模式下活跃实例读 `Claude-3p/claude_desktop_config.json`（与
-/// `deploymentMode` 同一文件，`mcpServers` 是并列键、互不干扰）。
-fn desktop_mcp_config_path() -> AppResult<PathBuf> {
-    let (_normal, threep) = claude_desktop_dirs()?;
-    Ok(threep.join(DESKTOP_CONFIG_FILE))
+/// 反之亦然。
+///
+/// ## 为什么是两个文件，而不是只写 3p 那个
+///
+/// 桌面端读哪个 `claude_desktop_config.json` 取决于**当前部署模式**：3p 模式读
+/// `Claude-3p/` 下那份（本机实测：该文件 `preferences` 里塞满活跃会话状态、随手每次操作
+/// 都在写），1p（官方）模式读 `Claude/` 下那份。而部署模式会在我们背后变：
+///
+/// - 用户还没点「接入」就先开了大脑聚合开关 —— 此刻是 1p；
+/// - **「切回官方」会把 deploymentMode 复位成 1p，却刻意保留 MCP 注册**
+///   （`restore_client_config_keeping_mcp`，事件文案写的是「已保留 MCP 注册（大脑聚合继续
+///   可用）」）。只写 3p 那份时，这句话是**假的**：复位后桌面端读的是 1p 配置，那里没有
+///   synaroute 项，聚合工具凭空消失；而 `is_mcp_registered` 读的还是 3p 那份 →
+///   界面照旧显示「已接入」。典型的「配置说接了、客户端没有」。
+///
+/// 两个都写即与模式解耦，和 `apply_claude_desktop` 把 `deploymentMode` 同时写进两个 config
+/// 的理由完全一致（同一份「说不准它读哪个」的不确定性）。非当前模式的那份是惰性的，无副作用。
+fn desktop_mcp_config_paths() -> AppResult<Vec<PathBuf>> {
+    let (normal, threep) = claude_desktop_dirs()?;
+    // 3p 优先：它是接入后（也是绝大多数时间）真正生效的那份，日志里先出现更贴合用户预期。
+    Ok(vec![threep.join(DESKTOP_CONFIG_FILE), normal.join(DESKTOP_CONFIG_FILE)])
 }
 
 /// 某 Claude 系分类的 MCP 客户端配置文件路径的**唯一决策点**：
 /// - CLI → `~/.claude.json`
-/// - 桌面端 → `Claude-3p/claude_desktop_config.json`（与 CLI 分离，见 [`desktop_mcp_config_path`]）
+/// - 桌面端 → 两个部署目录下的 `claude_desktop_config.json`（与 CLI 分离，
+///   且两个都写以与部署模式解耦，见 [`desktop_mcp_config_paths`]）
 ///
 /// register / unregister / is_registered 三处都经此路由，保证「CLI vs 桌面端写哪个文件」的判定
 /// 永远一致、且可被单测直接覆盖：一旦有人把桌面端臂改回 `claude_json_path()`（两端共用一份文件、
 /// 端口互相覆盖的原始 bug），针对本函数的测试立即失败。Codex 不走 Claude 系 MCP，显式报错而非
 /// 静默落到某文件。
-fn claude_mcp_config_path(category: CategoryType) -> AppResult<PathBuf> {
+fn claude_mcp_config_paths(category: CategoryType) -> AppResult<Vec<PathBuf>> {
     match category {
-        CategoryType::ClaudeCli => claude_json_path(),
-        CategoryType::ClaudeDesktop => desktop_mcp_config_path(),
+        CategoryType::ClaudeCli => Ok(vec![claude_json_path()?]),
+        CategoryType::ClaudeDesktop => desktop_mcp_config_paths(),
         CategoryType::Codex => {
             Err(AppError::ToolConfig("Codex 不使用 Claude 系 MCP 配置路径".into()))
         }
@@ -945,7 +962,7 @@ fn claude_mcp_config_path(category: CategoryType) -> AppResult<PathBuf> {
 pub fn register_mcp_client(category: CategoryType, mcp_url: &str, timeout_ms: u64) -> AppResult<(String, bool)> {
     match category {
         CategoryType::ClaudeCli => {
-            register_mcp_claude_at(&claude_mcp_config_path(category)?, mcp_url, timeout_ms)
+            register_mcp_claude_at(&single_claude_mcp_path(category)?, mcp_url, timeout_ms)
         }
         // 桌面端走 stdio：它不支持 HTTP transport（见 register_mcp_claude_desktop_at）。
         CategoryType::ClaudeDesktop => register_mcp_claude_desktop(),
@@ -953,25 +970,69 @@ pub fn register_mcp_client(category: CategoryType, mcp_url: &str, timeout_ms: u6
     }
 }
 
+/// CLI 臂的便捷取用：它只有一个路径，取 `claude_mcp_config_paths` 的唯一项。
+///
+/// 刻意不写成「取第 0 项」的通用助手：桌面端有两个路径，静默只用第一个正是本轮修掉的缺陷。
+fn single_claude_mcp_path(category: CategoryType) -> AppResult<PathBuf> {
+    let mut paths = claude_mcp_config_paths(category)?;
+    if paths.len() != 1 {
+        return Err(AppError::ToolConfig(format!(
+            "{} 有 {} 个 MCP 配置路径，不能按单文件处理",
+            category.as_str(),
+            paths.len()
+        )));
+    }
+    Ok(paths.remove(0))
+}
+
 /// 从某分类对应工具的客户端配置移除 synaroute MCP 项（关闭开关时）。
+///
+/// 桌面端有两份配置（见 [`desktop_mcp_config_paths`]），**两份都要摘**：只摘生效的那份，
+/// 另一份会留下一个指向已停服务的死项，用户下次切模式时它就复活了。
+/// 逐份 best-effort：一份被占用不该让另一份留着死配置。
 pub fn unregister_mcp_client(category: CategoryType) -> AppResult<(String, bool)> {
     match category {
         CategoryType::ClaudeCli | CategoryType::ClaudeDesktop => {
-            unregister_mcp_claude_at(&claude_mcp_config_path(category)?)
+            let mut msgs = Vec::new();
+            let mut wrote_any = false;
+            let mut last_err = None;
+            for path in claude_mcp_config_paths(category)? {
+                match unregister_mcp_claude_at(&path) {
+                    Ok((msg, wrote)) => {
+                        wrote_any |= wrote;
+                        if wrote {
+                            msgs.push(msg);
+                        }
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            if msgs.is_empty() {
+                // 一份都没摘到：若有过错误就如实上报，否则本来就没注册（幂等成功）。
+                return match last_err {
+                    Some(e) => Err(e),
+                    None => Ok(("Claude 未注册 synaroute，无需移除".into(), false)),
+                };
+            }
+            Ok((msgs.join("；"), wrote_any))
         }
         CategoryType::Codex => unregister_mcp_codex(),
     }
 }
 
 /// 检测某分类对应工具的客户端配置里是否已注册 synaroute MCP（供配置预览显示接入状态）。
-/// 读各端真实 MCP 客户端文件（CLI=~/.claude.json、桌面端=Claude-3p/claude_desktop_config.json
-/// 的 mcpServers；Codex=config.toml 的 mcp_servers），只判存在性、不改盘。文件不存在或解析
-/// 失败均视为未注册。
+/// 读各端真实 MCP 客户端文件（CLI=~/.claude.json、桌面端=两个部署目录下的
+/// claude_desktop_config.json 的 mcpServers；Codex=config.toml 的 mcp_servers），
+/// 只判存在性、不改盘。文件不存在或解析失败均视为未注册。
+///
+/// 桌面端用 **`all`（而非 `any`）**：注册路径两份都写，故「两份都在」才算真接上。
+/// 用 `any` 会让「只剩一份」也报「已接入」—— 而缺的那份恰恰可能是当前部署模式在读的，
+/// 界面说接了、桌面端里没有，正是本轮要消灭的形态。两份都没有时自然为 false。
 pub fn is_mcp_registered(category: CategoryType) -> bool {
     match category {
-        CategoryType::ClaudeCli | CategoryType::ClaudeDesktop => claude_mcp_config_path(category)
+        CategoryType::ClaudeCli | CategoryType::ClaudeDesktop => claude_mcp_config_paths(category)
             .ok()
-            .map(|p| json_has_mcp_server(&p))
+            .map(|paths| all_json_have_mcp_server(&paths))
             .unwrap_or(false),
         CategoryType::Codex => {
             let Ok(path) = codex_config_path() else { return false };
@@ -988,6 +1049,18 @@ pub fn is_mcp_registered(category: CategoryType) -> bool {
 }
 
 /// 某 JSON 配置文件的 `mcpServers` 里是否含 synaroute 项（CLI/桌面端同形态）。
+/// 一组配置文件是否**全部**已注册 synaroute MCP。
+///
+/// 抽出来是为了让 `all`（而非 `any`）这条判据可被单测直接钉住 —— `is_mcp_registered`
+/// 只吃 `CategoryType`、走真实系统目录，测不到。
+///
+/// 为什么必须是 `all`：桌面端注册路径两份都写（1p/3p 各一），故「两份都在」才算真接上。
+/// `any` 会让「只剩一份」也报「已接入」，而缺的那份恰恰可能正是当前部署模式在读的 ——
+/// 界面说接了、桌面端里没有。空列表返回 false（没有任何文件可证明已接入）。
+fn all_json_have_mcp_server(paths: &[PathBuf]) -> bool {
+    !paths.is_empty() && paths.iter().all(|p| json_has_mcp_server(p))
+}
+
 fn json_has_mcp_server(path: &Path) -> bool {
     if !path.exists() {
         return false;
@@ -1069,13 +1142,41 @@ fn json_stdio_mcp(exe_path: &str) -> Value {
 
 /// 把 SynaRoute 注册为 Claude 桌面端的 **stdio** MCP（桌面端不支持 HTTP，见 [`json_stdio_mcp`]）。
 /// command 指向当前运行的 synaroute.exe，故升级换目录后重新接入会自动改写为现役路径。
+///
+/// **两个部署目录下的 config 都写**（见 [`desktop_mcp_config_paths`]）：桌面端读哪份取决于
+/// 当前 `deploymentMode`，而「切回官方」会把它复位成 1p 却刻意保留 MCP 注册 ——
+/// 只写 3p 那份时那句「已保留 MCP 注册」就是假的。
+///
+/// 一份失败不放弃另一份：另一份写成了，用户在对应模式下仍然可用；全失败才报错。
 fn register_mcp_claude_desktop() -> AppResult<(String, bool)> {
     let exe = std::env::current_exe()
         .map_err(|e| AppError::ToolConfig(format!("无法定位 synaroute 可执行文件: {e}")))?;
-    register_mcp_claude_desktop_at(
-        &claude_mcp_config_path(CategoryType::ClaudeDesktop)?,
-        &exe.display().to_string(),
-    )
+    let exe = exe.display().to_string();
+    let mut msgs = Vec::new();
+    let mut wrote_any = false;
+    let mut last_err = None;
+    let mut ok_count = 0usize;
+    for path in claude_mcp_config_paths(CategoryType::ClaudeDesktop)? {
+        match register_mcp_claude_desktop_at(&path, &exe) {
+            Ok((msg, wrote)) => {
+                ok_count += 1;
+                wrote_any |= wrote;
+                if wrote {
+                    msgs.push(msg);
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if ok_count == 0 {
+        return Err(last_err.unwrap_or_else(|| {
+            AppError::ToolConfig("找不到 Claude 桌面端配置目录".into())
+        }));
+    }
+    if msgs.is_empty() {
+        return Ok(("Claude 桌面端 MCP（stdio）已是最新，跳过".to_string(), false));
+    }
+    Ok((msgs.join("；"), wrote_any))
 }
 
 /// 可测入口：把 stdio 形态的 synaroute MCP 写进指定的桌面端 config。
@@ -2415,37 +2516,81 @@ mod tests {
 
     #[test]
     fn claude_mcp_path_routes_cli_and_desktop_to_distinct_files() {
-        // 回归护栏（真能证伪版）：经**真正的分派点** claude_mcp_config_path 验证两分类落到不同
+        // 回归护栏（真能证伪版）：经**真正的分派点** claude_mcp_config_paths 验证两分类落到不同
         // 文件。旧版 desktop_and_cli_mcp_use_separate_files 直调 register_mcp_claude_at(手工分好
         // 的两个路径)，绕过了分派逻辑——若有人把 ClaudeDesktop 臂改回 claude_json_path，旧测试
         // 仍绿（审查 F3）。此处直接断言分派结果：
         // 1) 两分类解析出的路径必须不同；
-        // 2) 桌面端路径必须是 Claude-3p 侧的 claude_desktop_config.json，CLI 必须是 ~/.claude.json；
-        // 3) 二者文件名虽同（claude_desktop_config.json vs .claude.json 不同，但即便同名）也须不同目录。
-        // 一旦桌面端臂被改回 claude_json_path()，两路径相等，断言立即失败。
-        let cli = claude_mcp_config_path(CategoryType::ClaudeCli).unwrap();
-        let desktop = claude_mcp_config_path(CategoryType::ClaudeDesktop).unwrap();
-        assert_ne!(cli, desktop, "CLI 与桌面端 MCP 必须落到不同文件，否则端口互相覆盖");
+        // 2) 桌面端路径必须是部署目录下的 claude_desktop_config.json，CLI 必须是 ~/.claude.json；
+        // 3) **桌面端必须是两份**（两个部署目录各一），只写一份会在切模式后静默失联 ——
+        //    见 desktop_mcp_config_paths 的说明；一旦被改回单文件，这条断言立即失败。
+        let cli = claude_mcp_config_paths(CategoryType::ClaudeCli).unwrap();
+        let desktop = claude_mcp_config_paths(CategoryType::ClaudeDesktop).unwrap();
+        assert_eq!(cli.len(), 1, "CLI 只有一份 ~/.claude.json");
         assert_eq!(
-            cli.file_name().and_then(|n| n.to_str()),
+            desktop.len(),
+            2,
+            "桌面端必须写两个部署目录（1p/3p）各自的 config —— 切回官方会复位 deploymentMode \
+             却保留 MCP 注册，只写一份时那句「已保留 MCP 注册」是假的"
+        );
+        for d in &desktop {
+            assert!(!cli.contains(d), "CLI 与桌面端 MCP 必须落到不同文件，否则端口互相覆盖");
+            assert_eq!(
+                d.file_name().and_then(|n| n.to_str()),
+                Some(DESKTOP_CONFIG_FILE),
+                "桌面端应写 claude_desktop_config.json"
+            );
+        }
+        assert_ne!(desktop[0], desktop[1], "两个部署目录的 config 必须是不同文件");
+        assert_eq!(
+            cli[0].file_name().and_then(|n| n.to_str()),
             Some(".claude.json"),
             "CLI 应写 ~/.claude.json"
         );
-        assert_eq!(
-            desktop.file_name().and_then(|n| n.to_str()),
-            Some(DESKTOP_CONFIG_FILE),
-            "桌面端应写 claude_desktop_config.json"
-        );
-        // 桌面端路径应在 3p 部署目录（父目录名含 Claude-3p 或至少不是 CLI 的 home 根）。
         assert!(
-            desktop.parent() != cli.parent(),
+            desktop.iter().all(|d| d.parent() != cli[0].parent()),
             "两分类不能共用同一目录"
         );
         // Codex 不走 Claude 系路径，应报错而非静默落到某文件。
         assert!(
-            claude_mcp_config_path(CategoryType::Codex).is_err(),
+            claude_mcp_config_paths(CategoryType::Codex).is_err(),
             "Codex 不应解析出 Claude 系 MCP 路径"
         );
+    }
+
+    /// 桌面端「已接入 MCP」必须是**两份都在**（`all`），不是任一份在（`any`）。
+    ///
+    /// 桌面端读哪个 `claude_desktop_config.json` 取决于当前 `deploymentMode`，故注册两份都写。
+    /// 判据若用 `any`，则「3p 那份在、1p 那份缺」也报「已接入」—— 而用户一旦「切回官方」
+    /// （复位 1p、刻意保留 MCP 注册），桌面端读的正是缺的那份：界面说接了、聚合工具却消失。
+    ///
+    /// 顺带钉住 `register`/`unregister` 的两份对称性：注册两份 → all 为真；
+    /// 只摘掉一份 → all 立刻为假（这正是 `any` 会漏掉的状态）。
+    #[test]
+    fn desktop_mcp_registered_requires_both_deployment_configs() {
+        let (dir, normal, threep, _p, _m) = desktop_layout("mcp_both");
+        let paths = vec![threep.clone(), normal.clone()];
+
+        assert!(!all_json_have_mcp_server(&paths), "两份都没有 → 未接入");
+
+        // 只写 3p 那份：`any` 会说「已接入」，`all` 必须说没有
+        register_mcp_claude_desktop_at(&threep, "C:/x/synaroute.exe").unwrap();
+        assert!(json_has_mcp_server(&threep));
+        assert!(
+            !all_json_have_mcp_server(&paths),
+            "只有 3p 那份在时不能报「已接入」——切回官方后桌面端读的是 1p 那份，那里没有"
+        );
+
+        // 两份都写：才算真接上
+        register_mcp_claude_desktop_at(&normal, "C:/x/synaroute.exe").unwrap();
+        assert!(all_json_have_mcp_server(&paths), "两份都在 → 已接入");
+
+        // 摘掉任一份就不再算接入（对称性）
+        unregister_mcp_claude_at(&normal).unwrap();
+        assert!(!all_json_have_mcp_server(&paths), "少一份即不算接入");
+
+        assert!(!all_json_have_mcp_server(&[]), "空列表没有任何证据，必须为 false");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
