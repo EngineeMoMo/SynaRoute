@@ -114,6 +114,10 @@ pub struct Store {
     /// 「累计花费」，且每次 flush 都把同一批历史重复计入当天（实测踩到：v1 的 500
     /// 与当天新增的 200 相加成了 700）。
     daily_buckets: RwLock<Vec<crate::model::DailyUsageBucket>>,
+    /// 已被 90 天滚动淘汰的桶的累计（按分类 × Key）。见 `UsageSnapshot::retired`：
+    /// 没有它，启动时算出的累计总量每过一个 90 天就往下掉一截。
+    /// 只在 flush 里被读改写，不进按日视图。
+    retired_usage: RwLock<Vec<crate::model::TokenUsageByKey>>,
     /// 本次进程启动时（以及每次 flush 后）的用量快照，用于算增量（见 `daily_buckets`）。
     usage_baseline: RwLock<std::collections::BTreeMap<(CategoryType, String), TokenUsage>>,
     /// 上一次 flush 落在哪个 UTC 日期。
@@ -143,6 +147,9 @@ struct UsageLoad {
     /// 那部分历史只体现在 `totals` 里，无法反推每天各花了多少（如实丢弃日维度，
     /// 不编造一个假日期把整段历史堆到某一天）。
     daily_buckets: Vec<crate::model::DailyUsageBucket>,
+    /// 已被 90 天滚动淘汰的桶的累计（v3）。参与 `totals`，但不进按日视图。
+    /// 见 `UsageSnapshot::retired`：没有它，累计总量每过一个 90 天就往下掉一截。
+    retired: Vec<crate::model::TokenUsageByKey>,
 }
 
 impl UsageLoad {
@@ -155,6 +162,7 @@ impl UsageLoad {
             since: now,
             read_only: false,
             daily_buckets: Vec::new(),
+            retired: Vec::new(),
         }
     }
 
@@ -177,6 +185,7 @@ impl UsageLoad {
             since: now,
             read_only: true,
             daily_buckets: Vec::new(),
+            retired: Vec::new(),
         }
     }
 }
@@ -486,6 +495,7 @@ impl Store {
             usage_since_ms: RwLock::new(usage_loaded.since),
             usage_read_only: usage_loaded.read_only,
             daily_buckets: RwLock::new(usage_loaded.daily_buckets),
+            retired_usage: RwLock::new(usage_loaded.retired),
             usage_baseline: RwLock::new(baseline),
             usage_baseline_date: RwLock::new(baseline_date),
         };
@@ -1874,10 +1884,49 @@ impl Store {
                 since,
                 read_only: true,
                 daily_buckets: Vec::new(),
+                retired: Vec::new(),
             };
         }
 
         let mut map = std::collections::BTreeMap::new();
+
+        // v3：先把「已淘汰桶的累计」垫进底。
+        //
+        // 累计总量 = retired + 各存活桶之和。没有这一段，每有一个桶过 90 天被删，
+        // 下次启动读出来的累计就少一截 —— 一个「累计用量」面板越用数字越小，
+        // 用户据此估额度会严重低估。与当年「按事件环算总量」是同症状、不同成因。
+        //
+        // **v1 的 `entries` 也归到这里**：那是「过去某段时间的累计」、没有日期维度，
+        // 与「已淘汰的桶」是同一种数据（有总量、无日维度），`retired` 正是它的归宿。
+        // 此前它只进内存累加器、不落任何桶，于是**重启一次就永久消失**
+        // （旧测试把这个损失当成既定行为记着，理由是「无从得知属于哪天」——
+        // 那个理由只否定「造一个假日期」，不构成「必须丢掉总量」）。
+        let mut retired: std::collections::BTreeMap<(CategoryType, String), TokenUsage> =
+            std::collections::BTreeMap::new();
+        for row in snap.retired.iter() {
+            retired
+                .entry((row.category_id, row.key_id.clone()))
+                .or_default()
+                .add(&row.usage);
+        }
+        // v1 兼容：`entries` 非空 = 读到的是 v1 文件（v2+ 写出时该字段恒空）。
+        for row in &snap.entries {
+            retired
+                .entry((row.category_id, row.key_id.clone()))
+                .or_default()
+                .add(&row.usage);
+        }
+        for ((cat, kid), u) in retired.iter() {
+            map.entry((*cat, kid.clone())).or_insert_with(TokenUsage::default).add(u);
+        }
+        let retired: Vec<crate::model::TokenUsageByKey> = retired
+            .into_iter()
+            .map(|((cat, kid), u)| crate::model::TokenUsageByKey {
+                category_id: cat,
+                key_id: kid,
+                usage: u,
+            })
+            .collect();
 
         // v2：合并所有 daily_buckets 里的 entries
         if snap.version >= 2 {
@@ -1890,12 +1939,8 @@ impl Store {
             }
         }
 
-        // v1 兼容：若 `entries` 非空则也合并进去（v1→v2 迁移首次启动时会走这条路）
-        for row in snap.entries {
-            map.entry((row.category_id, row.key_id))
-                .or_insert_with(TokenUsage::default)
-                .add(&row.usage);
-        }
+        // v1 兼容：`entries` 已在上面并进 `retired` 并计入 `map`，这里不能再加一次
+        // （否则 v1 迁移那次启动的累计会翻倍）。
 
         // since_ms 为 0 = 旧版本文件或被手工清空过，退回「现在」而不是 1970，
         // 否则面板会显示「统计自 1970-01-01 起」这种明显错误的起始时间。
@@ -1905,6 +1950,7 @@ impl Store {
             since,
             read_only: false,
             daily_buckets: snap.daily_buckets,
+            retired,
         }
     }
 
@@ -2017,19 +2063,57 @@ impl Store {
             }),
         }
 
-        // 90 天滚动：删掉 91 天前的桶
+        // 90 天滚动：删掉 91 天前的桶 —— 但**先把它们的量折进 `retired`**。
+        //
+        // 直接丢掉的话，启动时的累计总量（= 各存活桶之和）每过一个 90 天就往下掉一截：
+        // 「累计用量」面板越用数字越小，用户据此估额度会严重低估，而 `since_ms` 仍宣称
+        // 「统计自 <安装日> 起」—— 数字覆盖的区间比它声称的短，且这事完全不可见。
+        // 与当年「按事件环算总量」是同一个症状、不同的成因（那次已修，这里在第 90 天重现）。
+        //
+        // 日维度如实丢弃：只累计到 (分类, Key) 粒度，不编造一个假日期把整段历史堆到某天。
         let cutoff_ms = now_ms - 90 * 86_400_000;
+        let mut retired_map: std::collections::BTreeMap<(CategoryType, String), TokenUsage> = self
+            .retired_usage
+            .read()
+            .iter()
+            .map(|e| ((e.category_id, e.key_id.clone()), e.usage))
+            .collect();
+        let mut retired_changed = false;
         buckets.retain(|b| {
             // 解析失败的桶保留：手工编辑过的日期不该被静默删除。
             let Ok(parsed) = chrono::NaiveDate::parse_from_str(&b.date, "%Y-%m-%d") else {
                 return true;
             };
-            parsed
+            let keep = parsed
                 .and_hms_opt(0, 0, 0)
                 .map(|dt| dt.and_utc().timestamp_millis())
                 .unwrap_or(0)
-                >= cutoff_ms
+                >= cutoff_ms;
+            if !keep {
+                for row in &b.entries {
+                    retired_map
+                        .entry((row.category_id, row.key_id.clone()))
+                        .or_default()
+                        .add(&row.usage);
+                    retired_changed = true;
+                }
+            }
+            keep
         });
+        let retired = if retired_changed {
+            let v: Vec<crate::model::TokenUsageByKey> = retired_map
+                .into_iter()
+                .map(|((cat, kid), u)| crate::model::TokenUsageByKey {
+                    category_id: cat,
+                    key_id: kid,
+                    usage: u,
+                })
+                .collect();
+            *self.retired_usage.write() = v.clone();
+            v
+        } else {
+            self.retired_usage.read().clone()
+        };
 
         // 降序（最新在前，便于面板取「最近 7/30 天」）
         buckets.sort_by(|a, b| b.date.cmp(&a.date));
@@ -2039,6 +2123,7 @@ impl Store {
             since_ms,
             updated_ms: now_ms,
             daily_buckets: buckets.clone(),
+            retired,
             entries: Vec::new(), // v2 不再用这个字段
         };
         drop(buckets);
@@ -2876,6 +2961,7 @@ impl Store {
             usage_since_ms: RwLock::new(usage_loaded.since),
             usage_read_only: usage_loaded.read_only,
             daily_buckets: RwLock::new(usage_loaded.daily_buckets),
+            retired_usage: RwLock::new(usage_loaded.retired),
             // 基线 = 启动时的历史总量（与生产构造器同一口径，测试才能覆盖「今日增量」判据）
             usage_baseline: RwLock::new(usage_loaded.totals.clone()),
             usage_baseline_date: RwLock::new(
@@ -3509,6 +3595,7 @@ mod tests {
             since_ms: chrono::Utc::now().timestamp_millis() - 95 * 86_400_000, // 95 天前
             updated_ms: chrono::Utc::now().timestamp_millis(),
             daily_buckets: Vec::new(),
+            retired: Vec::new(),
             entries: vec![TokenUsageByKey {
                 category_id: CategoryType::ClaudeCli,
                 key_id: "old-key".into(),
@@ -3537,7 +3624,12 @@ mod tests {
         // 读回文件验证迁移结果
         let raw = std::fs::read(&usage_path).unwrap();
         let v2: UsageSnapshot = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(v2.version, 2, "flush 后文件应升到 v2");
+        assert_eq!(
+            v2.version,
+            crate::model::USAGE_SNAPSHOT_VERSION,
+            "flush 后文件应升到当前格式版本（写侧与读侧共用同一常量，别写字面量）"
+        );
+
         assert!(v2.entries.is_empty(), "v2 不再使用 entries 字段");
         assert!(!v2.daily_buckets.is_empty(), "v2 应有按日分桶");
 
@@ -3581,7 +3673,12 @@ mod tests {
             "无新消耗时重复 flush 不得让当天数字翻倍（实际 {total_after}）"
         );
 
-        // 重启后：总量累加器仍是 v1 的 500 + 新增 200（跨重启不丢）
+        // 重启后：总量 = v1 的 500（已折进 retired）+ 新增 200，跨重启不丢。
+        //
+        // 旧行为是 200 —— v1 的 500 只进内存累加器、不落任何桶，**重启一次就永久消失**，
+        // 而当时把这个损失当成既定行为记着，理由是「无从得知它属于哪天」。那个理由只否定
+        // 「造一个假日期把整段历史堆到某天」，并不构成「必须丢掉总量」：`retired`
+        // （已淘汰桶的累计）就是「有总量、无日维度」这类数据的归宿，v1 的 entries 正是同一类。
         drop(store);
         let store2 = Store::new_at(cfg, sec).unwrap();
         let restored: u64 = store2
@@ -3590,9 +3687,98 @@ mod tests {
             .map(|r| r.usage.input)
             .sum();
         assert_eq!(
-            restored, 200,
-            "重启后总量 = v2 日桶之和（v1 的 500 未落进日桶，故不恢复）"
+            restored, 700,
+            "重启后总量 = retired（v1 的 500）+ 日桶之和（200）；\
+             得到 200 说明 v1 历史又被重启吃掉了"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 90 天滚动删桶**不得**让「累计用量」变小。
+    ///
+    /// 缺陷形态：启动时的累计总量 = 各存活桶之和。桶只留 90 天，于是每有一个桶过期，
+    /// **下次启动读出来的累计就往下掉一截** —— 一个「累计用量」面板越用数字越少，
+    /// 用户据此估额度会严重低估；而 `since_ms` 仍宣称「统计自 <安装日> 起」，
+    /// 数字覆盖的区间比它声称的短，且这事完全不可见。
+    /// 与当年「按事件环算总量」是同一个症状、不同的成因（那次已修，这里在第 90 天重现）。
+    ///
+    /// 处置：删桶前把它的量折进 `retired`，累计 = retired + 存活桶之和，单调不减；
+    /// 按日视图仍只看 `daily_buckets`，90 天窗口语义不变。
+    ///
+    /// 三个方向一起钉：
+    /// 1. 过期桶**确实被删**（90 天窗口不能因为这个修复失效）；
+    /// 2. 它的量进了 `retired`，且重启后累计**不小于**删除前；
+    /// 3. 存活桶原样保留（别把好桶一起折走）。
+    #[test]
+    fn rolling_out_old_buckets_keeps_cumulative_total_monotonic() {
+        use crate::model::{DailyUsageBucket, TokenUsageByKey, UsageSnapshot};
+        use crate::upstream::TokenUsage;
+        let dir = temp_dir("usage_retire");
+        let cfg = dir.join("config.json");
+        let sec = dir.join("secrets.enc");
+        let usage_path = dir.join("usage.json");
+
+        let today = chrono::Utc::now().date_naive();
+        let day = |off: i64| (today - chrono::Duration::days(off)).format("%Y-%m-%d").to_string();
+        let usage = |input: u64| TokenUsage { input, output: 0, cache_read: 0, cache_creation: 0 };
+        let row = |input: u64| TokenUsageByKey {
+            category_id: CategoryType::ClaudeCli,
+            key_id: "k".into(),
+            usage: usage(input),
+        };
+
+        // 一个早已过期的桶（100 天前，1000）+ 一个还在窗口内的桶（3 天前，7）
+        let snap = UsageSnapshot {
+            version: crate::model::USAGE_SNAPSHOT_VERSION,
+            since_ms: chrono::Utc::now().timestamp_millis() - 120 * 86_400_000,
+            updated_ms: chrono::Utc::now().timestamp_millis(),
+            daily_buckets: vec![
+                DailyUsageBucket { date: day(3), entries: vec![row(7)] },
+                DailyUsageBucket { date: day(100), entries: vec![row(1000)] },
+            ],
+            retired: Vec::new(),
+            entries: Vec::new(),
+        };
+        std::fs::write(&usage_path, serde_json::to_vec_pretty(&snap).unwrap()).unwrap();
+
+        let store = Store::new_at(cfg.clone(), sec.clone()).unwrap();
+        let before: u64 = store.token_usage_by_key().iter().map(|r| r.usage.input).sum();
+        assert_eq!(before, 1007, "前置条件：两个桶之和");
+
+        // 触发一次 flush（会执行 90 天滚动）
+        store.append_event_full(
+            CategoryType::ClaudeCli,
+            "route",
+            Some("k"),
+            "req",
+            None,
+            None,
+            Some(usage(5)),
+        );
+        assert!(store.flush_usage_if_dirty());
+
+        let after: UsageSnapshot =
+            serde_json::from_slice(&std::fs::read(&usage_path).unwrap()).unwrap();
+        let dates: Vec<&String> = after.daily_buckets.iter().map(|b| &b.date).collect();
+        assert!(!dates.contains(&&day(100)), "100 天前的桶必须被删（90 天窗口仍生效）");
+        assert!(dates.contains(&&day(3)), "窗口内的桶必须原样保留");
+        let retired_total: u64 = after.retired.iter().map(|e| e.usage.input).sum();
+        assert_eq!(
+            retired_total, 1000,
+            "被删桶的量必须折进 retired，否则它就凭空消失了"
+        );
+
+        // 重启后累计不得小于删除前（1007 + 本次新增 5）
+        drop(store);
+        let store2 = Store::new_at(cfg, sec).unwrap();
+        let restored: u64 = store2.token_usage_by_key().iter().map(|r| r.usage.input).sum();
+        assert_eq!(
+            restored, 1012,
+            "累计必须单调不减：retired(1000) + 存活桶(7) + 本次新增(5)。\
+             得到 12 说明过期桶的量被直接丢了 —— 面板数字会当着用户的面变小"
+        );
+        assert!(restored >= before, "「累计用量」永不允许变小");
 
         std::fs::remove_dir_all(&dir).ok();
     }

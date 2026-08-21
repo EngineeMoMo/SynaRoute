@@ -1437,6 +1437,18 @@ pub struct UsageSnapshot {
     /// 每个桶 = 一天内所有分类 × Key 的累计。降序排列（最新的在前）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub daily_buckets: Vec<DailyUsageBucket>,
+    /// **v3 数据**：已被 90 天滚动淘汰的桶的累计（按分类 × Key）。
+    ///
+    /// 为什么必须有：`daily_buckets` 只留 90 天，而启动时的「累计总量」= 各存活桶之和。
+    /// 于是每有一个桶过期，**下次启动读出来的累计就变小**——一个「累计用量」面板越用
+    /// 数字越少，用户据此估额度会严重低估。这与当年「按事件环算总量」那个 bug 是同一个
+    /// 症状、不同的成因（那次已修，这次在第 90 天重现）。
+    ///
+    /// 淘汰桶的量在删除前折进这里，故：**累计总量 = retired + 各存活桶之和**，
+    /// 单调不减；而按日视图仍只看 `daily_buckets`，90 天窗口的语义不变。
+    /// 日维度如实丢弃（不编造一个假日期把整段历史堆到某天）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<TokenUsageByKey>,
     /// **v1 兼容字段**：v2 写出时留空，只在读 v1 文件时有值。
     /// v2 程序首次 flush 会把这里的内容迁移进 `daily_buckets` 的一个桶。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1460,7 +1472,11 @@ pub struct DailyUsageBucket {
 /// v1→v2（按日分桶）正是这种情形：v1 程序解析 v2 文件时 `daily_buckets` 会被
 /// 忽略（未知字段），读出的 `entries` 是空的，紧接着 flush 就会用空数据覆盖
 /// 用户攒了几个月的累计 —— **版本门必须拦住**。
-pub const USAGE_SNAPSHOT_VERSION: u32 = 2;
+///
+/// v2→v3（`retired`：已淘汰桶的累计）同样符合这条规则：v2 程序会忽略 `retired`，
+/// 于是累计总量凭空少掉 90 天以前的那一整段，而它下一次 flush 就把不含 `retired` 的
+/// 文件写回去 —— 那段历史**永久消失**（用量是纯累加值，没有别处可恢复）。
+pub const USAGE_SNAPSHOT_VERSION: u32 = 3;
 
 fn usage_snapshot_version() -> u32 {
     USAGE_SNAPSHOT_VERSION
