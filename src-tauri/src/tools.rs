@@ -1719,6 +1719,14 @@ fn restore_claude_desktop() -> AppResult<String> {
 /// profile 已删、`_meta` 却仍把 `appliedId` 指着它，桌面端启动时拿不到那份 gateway 档而卡死。
 /// 与接入侧（`apply_claude_desktop`）用同一套 `with_rollback` 保证。
 ///
+/// 回滚集里还必须包含**两个 `.synaroute-created` 标记**（共 6 个文件）。
+/// 少了它们会漏掉一种**不可自愈**的半还原态：`restore_created_or_write_mode` 处理
+/// normal_config 时删掉了它和它的标记，随后处理 threep_config 时失败（比如文件被正在运行的
+/// 桌面端独占）→ 回滚把两个 config 都还原了，但 normal 的标记**已经没了**。
+/// 下次再还原时那条分支看不到标记，就会往一个「本是 SynaRoute 凭空新建」的文件里写
+/// `{"deploymentMode":"1p"}` —— 留下一个冒充「用户官方配置」的文件，而标记无从重建。
+/// 标记本身就是判据的载体，它必须和被它描述的文件同生共死。
+///
 /// `prefer`：appliedId 指向本档时优先交还给它（须仍在 entries 里），否则退化为剩余首个。
 fn restore_desktop_at(
     normal_config: &Path,
@@ -1733,6 +1741,8 @@ fn restore_desktop_at(
             threep_config.to_path_buf(),
             profile.to_path_buf(),
             meta.to_path_buf(),
+            created_marker_path_for(normal_config),
+            created_marker_path_for(threep_config),
         ],
         || restore_desktop_steps(normal_config, threep_config, profile, meta, prefer),
     )
@@ -4451,6 +4461,64 @@ tool_timeout_sec = 600
         );
         assert!(!threep.exists(), "同上（3p 目录那份）");
         assert!(!profile.exists(), "本档 profile 应删除");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 还原中途失败时，`.synaroute-created` 标记也必须被回滚 —— 它丢了就**不可自愈**。
+    ///
+    /// 标记的语义是「这个文件是接入时凭空新建的，还原应整份删掉，而不是写个
+    /// `{"deploymentMode":"1p"}` 冒充用户的官方配置」。它是判据本身，无从重建。
+    ///
+    /// 缺陷形态：回滚集只有 4 个文件（两个 config + profile + _meta），不含两个标记。
+    /// `restore_created_or_write_mode` 先处理 normal —— 删掉 config **和它的标记** ——
+    /// 随后处理 threep 时失败（真机上就是文件被正在运行的桌面端独占）。回滚把两个 config
+    /// 都还原了，但 normal 的标记已经没了。下次再还原时那条分支看不到标记，
+    /// 就往一个本是我们凭空新建的文件里写 1p，留下一个假的「用户官方配置」。
+    ///
+    /// 故障注入手法：让 normal 走「凭空新建」分支（接入前不存在 → 接入后有标记），
+    /// threep 走「原本存在」分支（接入前已存在 → 无标记，还原时要写 deploymentMode）。
+    /// 接入后把 threep 的内容改成**非法 JSON**，它那一步的 `read_json_or_empty` 必然失败 ——
+    /// 而它排在 normal 之后，normal 的「删文件 + 删标记」已经跑完，正好是那个窗口。
+    ///
+    /// 为什么不用「把 threep 换成目录」：`with_rollback` 先对全部路径拍快照，
+    /// 对目录 `fs::read` 会失败 → 还没进 op 就返回 Err，那个窗口压根不会打开
+    /// （实测：那样注入时本测试恒绿，等于没测到）。
+    #[test]
+    fn desktop_restore_rolls_back_created_markers_too() {
+        let (dir, normal, threep, profile, meta) = desktop_layout("desktop_restore_marker");
+        // 前置：normal 不存在（→ 会有 created 标记）、threep 已存在（→ 不会有标记）
+        assert!(!normal.exists(), "前置条件：normal 接入前不存在");
+        std::fs::write(&threep, b"{}").unwrap();
+        apply_desktop_at(
+            &normal,
+            &threep,
+            &profile,
+            &meta,
+            "http://127.0.0.1:1",
+            &desktop_test_models(),
+            &[],
+        )
+        .unwrap();
+        let normal_marker = created_marker_path_for(&normal);
+        assert!(normal_marker.exists(), "前置条件：normal 应有 created 标记");
+        assert!(
+            !created_marker_path_for(&threep).exists(),
+            "前置条件：threep 接入前已存在，不该有 created 标记"
+        );
+
+        // 注入：threep 变成非法 JSON → 它那一步（write_deployment_mode）必然失败
+        std::fs::write(&threep, b"{ not json").unwrap();
+
+        let r = restore_desktop_at(&normal, &threep, &profile, &meta, None);
+        assert!(r.is_err(), "中途失败必须整体返回错误");
+
+        assert!(
+            normal_marker.exists(),
+            "created 标记必须随文件一同回滚。丢了它下次还原就会往一个本是我们凭空新建的 \
+             config 里写 deploymentMode:1p，留下一个冒充「用户官方配置」的文件，而标记无从重建"
+        );
+        assert!(normal.exists(), "被删的 config 本身也该回滚回来");
 
         std::fs::remove_dir_all(&dir).ok();
     }
