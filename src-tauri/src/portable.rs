@@ -170,6 +170,13 @@ fn payload_digest(payload: &ExportPayload) -> AppResult<String> {
 /// - `mcp_enabled`：MCP 服务器要不要起是本机运行决策；带过去可能在新机器上抢占端口。
 /// - `auto_start`：自启动项注册在源机器的注册表里，配置带过去但系统侧没有，
 ///   会出现「开关开着但不生效」——正是我们刚修掉的那类不一致。故导入后由用户重新开。
+/// - `proxy_running_categories`：这是「上次退出时哪几个代理在跑」的记录，
+///   `restore_proxies_on_launch` 下次启动会照它**自动拉起代理并改写客户端配置文件**
+///   （`~/.claude/settings.json`、`~/.codex/config.toml` 等）。带过去的后果不是「多起一个
+///   服务」这么轻：新机器上用户**从未点过启动**，他的 Claude / Codex 配置就被指向了
+///   127.0.0.1，而这台机器上的 Key 可能一条都没配好 —— 客户端当场不可用，
+///   且用户根本不会往「我昨天导入了一份配置」上想。这是本清单里唯一会去改**外部程序
+///   配置文件**的一项，故也是最该剔的一项。
 fn strip_machine_local(mut s: AppSettings) -> AppSettings {
     s.proxy_ports.clear();
     s.mcp_registered_categories.clear();
@@ -177,6 +184,7 @@ fn strip_machine_local(mut s: AppSettings) -> AppSettings {
     s.mcp_enabled = false;
     s.log_dir = None;
     s.auto_start = false;
+    s.proxy_running_categories.clear();
     s
 }
 
@@ -848,6 +856,7 @@ mod tests {
         src.set_proxy_port(CategoryType::ClaudeCli, 47199).unwrap();
         src.set_mcp_port(9599).unwrap();
         src.add_registered_category(CategoryType::ClaudeCli).unwrap();
+        src.set_proxy_running_categories(&[CategoryType::ClaudeCli, CategoryType::Codex]).unwrap();
         {
             let mut s = src.get_settings();
             s.log_dir = Some("E:\\源机器专属日志目录".into());
@@ -866,6 +875,13 @@ mod tests {
         assert!(file.payload.settings.log_dir.is_none(), "日志目录不得带走");
         assert!(!file.payload.settings.auto_start, "自启动状态不得带走");
         assert!(!file.payload.settings.mcp_enabled, "MCP 开关不得带走");
+        assert!(
+            file.payload.settings.proxy_running_categories.is_empty(),
+            "「上次哪几个代理在跑」不得带走：restore_proxies_on_launch 会照它在新机器上自动拉起\
+             代理并改写 ~/.claude/settings.json、~/.codex/config.toml —— 用户从未点过启动，\
+             客户端却已被指向本机代理，而这台机器的 Key 可能一条都没配好"
+        );
+
         assert_eq!(file.payload.settings.theme, "dark", "普通设置应当带走");
 
         // 导入侧：本机现有值必须保住（哪怕有人手改导出文件塞了别的机器的端口）
@@ -878,6 +894,9 @@ mod tests {
         tampered.payload.settings.mcp_port = 2;
         tampered.payload.settings.mcp_registered_categories = vec![CategoryType::ClaudeDesktop];
         tampered.payload.settings.auto_start = true;
+        tampered.payload.settings.proxy_running_categories =
+            vec![CategoryType::ClaudeCli, CategoryType::ClaudeDesktop];
+
         // 手改载荷后校验和会不匹配——这里直接调 apply_import（跳过 parse_and_verify），
         // 正是为了验证「即使绕过校验和，导入逻辑本身也不会覆盖本机运行态」这道纵深防线。
         apply_import(&dst, &tampered, ImportMode::Merge, None).unwrap();
@@ -895,6 +914,12 @@ mod tests {
             "本机 MCP 注册记录不得被顶掉"
         );
         assert!(!now.auto_start, "自启动状态由本机系统实际情况决定，不得被导入值顶开");
+        assert!(
+            now.proxy_running_categories.is_empty(),
+            "本机没在跑任何代理，导入不得把它设成「在跑」—— 否则下次启动就替用户改写了\
+             Claude / Codex 的配置文件"
+        );
+
         assert_eq!(now.theme, "dark", "普通设置应当被导入");
 
         std::fs::remove_dir_all(&src_dir).ok();

@@ -1338,6 +1338,12 @@ impl Store {
             incoming.mcp_registered_categories = cfg.settings.mcp_registered_categories.clone();
             incoming.log_dir = cfg.settings.log_dir.clone();
             incoming.auto_start = cfg.settings.auto_start;
+            // 「上次退出时哪几个代理在跑」也是纯本机运行态，且是这批里唯一会去改**外部程序
+            // 配置文件**的一项：`restore_proxies_on_launch` 下次启动照它自动拉起代理并改写
+            // `~/.claude/settings.json` / `~/.codex/config.toml`。带过来的后果是新机器上
+            // 用户**从未点过启动**、客户端却已被指向 127.0.0.1，而这台机器的 Key 可能一条都
+            // 没配好 —— 客户端当场不可用，且没人会往「我昨天导入了配置」上想。
+            incoming.proxy_running_categories = cfg.settings.proxy_running_categories.clone();
             cfg.settings = incoming;
             Ok(removed)
         })
