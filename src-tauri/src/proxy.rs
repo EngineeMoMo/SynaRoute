@@ -582,19 +582,17 @@ async fn handle_request(
             "无可用 Key（全部停用或明确不可用）",
         ));
     }
-    if used_breaker_fallback {
-        store.append_event(
-            category,
-            "failover",
-            None,
-            "所有 Key 均在熔断窗口内，已忽略熔断兜底重试（无处可切换）",
-        );
-    }
-
     // 「全部 Key 失败」短路：上一次已确认全部候选都打不通，且仍在短路窗口内 →
     // 直接返回失败，不再逐个重打上游。见 ALL_FAILED_SHORT_CIRCUIT_MS 的完整理由。
     // 状态码用 529 overloaded_error（规范要求，客户端据此退避）并带 Retry-After。
+    //
+    // **必须排在下面那条「所有 Key 均在熔断窗口内」事件之前。** 反过来的话，短路窗口内的
+    // 每一个请求都会先记一条「已忽略熔断兜底重试」再从这里直接返回 —— 而那句话描述的动作
+    // **压根没发生**（什么都没重试，就在这里断了）。Claude Code / Codex 都会自动重发，
+    // 窗口内轻易几十次，于是日志被一串「描述了一件没做的事」的行刷满，
+    // 还把真正有用的事件从 MAX_EVENTS 环里挤出去 —— 正是排障最需要那几条的时候。
     if let Some((remaining_ms, retry_after)) = all_failed_gate_remaining(&gate_key) {
+
         return Ok(error_resp_with_retry_after(
             overloaded_status(),
             &format!(
@@ -603,6 +601,19 @@ async fn handle_request(
             ),
             Some(retry_after),
         ));
+    }
+
+    if used_breaker_fallback {
+        // 折叠：同一分类连续出现只记一条带 ×N，别让它自己变成刷屏源
+        // （短路窗口刚过期时会放一个请求进来，若它又失败、窗口再武装，这条就周期性复发）。
+        store.append_event_collapsible(
+            category,
+            "failover",
+            None,
+            "所有 Key 均在熔断窗口内，已忽略熔断兜底重试（无处可切换）",
+            None,
+            Some(format!("breaker-fallback:{}", category.as_str())),
+        );
     }
 
     // 调用模型日志开关（默认关）：开启后每次转发尝试记一条 request 事件（含完整链路快照）
@@ -4425,6 +4436,96 @@ mod tests {
         assert!(k.health.breaker_until.is_none(), "配置缺失不得触发熔断");
 
         pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 短路窗口内的请求**不得**再记「所有 Key 均在熔断窗口内，已忽略熔断兜底重试」。
+    ///
+    /// 那句话描述的动作在窗口内压根没发生 —— 什么都没重试，请求就在短路那里断了。
+    /// 而 Claude Code / Codex 都会自动重发，窗口内轻易几十次：日志被一串
+    /// 「描述了一件没做的事」的行刷满，还把真正有用的事件从 MAX_EVENTS 环里挤出去，
+    /// 正是排障最需要那几条的时候。
+    ///
+    /// 造这个状态要同时满足两件事，比看起来讲究：
+    /// - **Key 处于熔断中**（才有 `used_breaker_fallback`）：直接写 health 造，
+    ///   因为 5xx/429 **刻意不计熔断**（不罚好 Key），靠打 500 永远打不出熔断；
+    /// - **短路窗口已武装**：需要一次「临时性」的整轮失败。用**连接层失败**（指向死端口）——
+    ///   它既计熔断又被判临时，是唯一能同时满足两者的失败形态。
+    #[tokio::test]
+    async fn gated_requests_do_not_log_breaker_fallback_they_never_performed() {
+        let dir = temp_dir("gate_no_spam");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // 死端口：连接层失败（既计熔断、又被判临时 → 会武装短路窗口）
+        let mut k = key("k1", 0, "http://127.0.0.1:1");
+        k.category_id = CategoryType::Codex;
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        // 直接把它置成熔断中，让 candidates_for 走「全部熔断 → 兜底」那条路
+        store
+            .update_health(
+                "k1",
+                crate::model::HealthState {
+                    status: crate::model::HealthStatus::Down,
+                    fail_count: 3,
+                    breaker_until: Some(chrono::Utc::now().timestamp_millis() + 600_000),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::Codex).await.unwrap();
+        let url = format!("http://127.0.0.1:{port}/v1/messages");
+        let body = json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]});
+        let client = reqwest::Client::new();
+        let fallback_lines = |s: &std::sync::Arc<Store>| -> usize {
+            s.list_all_events()
+                .iter()
+                .filter(|e| e.detail.contains("已忽略熔断兜底重试"))
+                .map(|e| e.repeat.max(1) as usize)
+                .sum()
+        };
+
+        // 第一次：熔断兜底放它进来 → 连接失败 → 武装短路窗口。
+        // 这一条**应该**记兜底事件（它真的绕过熔断试了一次）。
+        let first = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(first.status().as_u16(), 529, "连接层失败属临时性 → 529");
+        let after_first = fallback_lines(&store);
+        assert!(after_first >= 1, "真的绕过熔断试过一次，那一条兜底事件该记");
+
+        // 之后连发几次：**逐条**判定，不做整体计数比较。
+        //
+        // 为什么不能整体比：短路窗口只有 5s，而测试套件里几十个 tokio 用例并行跑，
+        // 机器一卡就可能超出窗口 —— 那时某次请求会合法地再走一遍熔断兜底并记一条，
+        // 整体断言就假红了（实测十轮里红过一次）。逐条判定把「时间」这个变量摘掉：
+        // 只对**确实被短路挡住**的那些请求（响应体带短路专属文案）要求「计数没涨」。
+        let mut gated_seen = 0usize;
+        let mut prev = after_first;
+        for _ in 0..8 {
+            let resp = client.post(&url).json(&body).send().await.unwrap();
+            assert_eq!(resp.status().as_u16(), 529, "两条路径都回 529");
+            let text = resp.text().await.unwrap_or_default();
+            let now = fallback_lines(&store);
+            if text.contains("上次尝试已确认全部候选均失败") {
+                gated_seen += 1;
+                assert_eq!(
+                    now, prev,
+                    "被短路挡住的请求不得新增「已忽略熔断兜底重试」——那件事没发生。\
+                     把该事件排到短路判定之前，客户端每次自动重发都会刷一条，\
+                     把真正有用的事件挤出 MAX_EVENTS 环"
+                );
+            }
+            prev = now;
+        }
+        assert!(
+            gated_seen > 0,
+            "至少要有一次落在短路窗口内，否则本用例什么都没验到（窗口 {}ms）",
+            ALL_FAILED_SHORT_CIRCUIT_MS
+        );
+
+        pm.stop(CategoryType::Codex);
         std::fs::remove_dir_all(&dir).ok();
     }
 
