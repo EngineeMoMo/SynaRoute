@@ -136,6 +136,122 @@ const CLAUDE_MAX_OUTPUT_TABLE: &[(&str, u32)] = &[
     ("claude-3", 4_096),
 ];
 
+/// **非 Claude 家族**的最大输出（按厂商/家族片段匹配）。
+///
+/// 为什么需要它：Anthropic 协议的 `max_tokens` 必填，而本项目的主场景是**中转站**——
+/// 用户拿一个 Anthropic 协议的 Key 指向 GLM / DeepSeek / Kimi / Qwen 的中转。这些模型名
+/// 完全不含 `claude`，上面那张表一个都认不出，于是全部落到「请手填最大单次输出」。
+/// 用户视角就是「加个 Key 还要我去查文档填数字」——而这些值本就是公开且稳定的。
+///
+/// 数值来源：各家官方文档的 max output tokens（2026-08 核对）。取值刻意**偏保守**：
+/// 填小了只是长回答被截断（且下面的 `window − input` 钳制通常先生效），填大了会被上游 400，
+/// 后者是硬失败。故拿不准时取该家族的下限档。
+const OTHER_MAX_OUTPUT_TABLE: &[(&str, u32)] = &[
+    // 智谱 GLM：4.6/4.5 系 96k 输出；老 4 系 8k
+    ("glm-5", 96_000),
+    ("glm-4-6", 96_000),
+    ("glm-4-5", 96_000),
+    ("glm-4", 8_192),
+    ("glm", 8_192),
+    // DeepSeek：v3.2/reasoner 64k，chat 8k
+    ("deepseek-v4", 64_000),
+    ("deepseek-v3", 64_000),
+    ("deepseek-reasoner", 64_000),
+    ("deepseek-chat", 8_192),
+    ("deepseek", 8_192),
+    // 月之暗面 Kimi：k2 系 32k
+    ("kimi-k2", 32_000),
+    ("kimi", 32_000),
+    ("moonshot", 32_000),
+    // 通义千问：coder/plus 系 64k，其余 8k
+    ("qwen3-coder", 64_000),
+    ("qwen3", 32_000),
+    ("qwen", 8_192),
+    // OpenAI（经 Anthropic 协议中转的情形）：gpt-5 系 128k，4o 系 16k
+    ("gpt-5", 128_000),
+    ("gpt-4o", 16_384),
+    ("gpt-4", 8_192),
+    ("o3", 100_000),
+    ("o1", 100_000),
+    // xAI Grok：4 系 32k
+    ("grok-4", 32_000),
+    ("grok", 32_000),
+    // MiniMax / StepFun / Mistral
+    ("minimax", 32_000),
+    ("step-3", 32_000),
+    ("mistral", 32_000),
+];
+
+/// 认不出模型名时的**兜底最大输出**。
+///
+/// ## 为什么改成兜底、不再报错
+///
+/// 旧行为是「认不出就报错、让用户去 Key 编辑器手填」。设计初衷是「不许猜」，但实测下来
+/// 代价过高：中转站的私有模型名（`gpt-5.6-sol`、`claude-opus-5-thinking` 之类）千变万化，
+/// 内置表**永远追不上**，于是用户每加一个 Key 都撞一次「全部 Key 失败: 缺少最大输出能力数据」
+/// —— 一个本该开箱可用的软件，变成必须先查文档填数字。用户明确要求去掉这道人工步骤。
+///
+/// ## 为什么 8192 是安全的兜底值
+///
+/// 关键在于**填小了与填大了的后果不对称**：
+/// - 填大了（如按窗口取 200k）→ 官方与严格中转直接 **400**，请求根本发不出去（硬失败）；
+/// - 填小了 → 只在「回答确实超过这个长度」时被截断，而截断现在**有可见性**
+///   （`was_truncated` 会写进日志与 stop_reason，见 sse.rs 的截断信号透传）。
+///
+/// 8192 是所有主流模型都支持的下限（连 claude-3-5 与 gpt-4 都是这个值），故绝不会因为
+/// 「上游不支持这么大」而 400。且 `anthropic_required_max_tokens` 还会再取
+/// `min(window − input, 这个值)`，所以短窗口场景下它自然更小。
+///
+/// 代价是「未知的大模型只能一次输出 8k」。这是**刻意的取舍**：宁可让长回答分几次拿到，
+/// 也不要让用户开箱就撞 400 或被迫查文档。用户仍可在 Key 编辑器里手填覆盖它（那条路没删）。
+const FALLBACK_MAX_OUTPUT: u32 = 8_192;
+
+/// 按模型名推断最大输出：先查 Claude 表，再查其它厂商表，都认不出返回 `None`。
+///
+/// 两张表分开而不合并成一张：Claude 那张有**子版本边界检查**（未列出的新子版本一律不匹配，
+/// 见 [`anthropic_max_output_for`] 的文档），而其它厂商的版本号规律各不相同、没有那套判据，
+/// 混在一起会让边界检查对它们产生误判。
+fn known_max_output_for(model: &str) -> Option<u32> {
+    if let Some(v) = anthropic_max_output_for(model) {
+        return Some(v);
+    }
+    let lower = model.to_ascii_lowercase().replace('.', "-");
+    OTHER_MAX_OUTPUT_TABLE
+        .iter()
+        .find(|(family, _)| lower.contains(family))
+        .map(|(_, max)| *max)
+}
+
+/// Claude 家族的**下限参考值**：不做子版本边界检查的裸 `contains` 匹配。
+///
+/// 只用于一个地方：给「未列出的新 Claude 子版本」（如 `claude-opus-4-6`）挑兜底值。
+///
+/// ## 为什么不能直接用全局兜底 8192
+///
+/// `claude-opus-4-6` 的同族 `claude-opus-4` 是 32k。用 8192 兜底等于把一个已知支持 32k 的
+/// 模型限制到 8k —— 比「按同族取值」明显更差。而**新子版本几乎不会降低输出上限**
+/// （厂商迭代方向一直是往上），故同族的值是个安全下界。
+///
+/// ## 为什么仍要与 8192 取 max
+///
+/// 反向情形同样存在：`claude-3-8` 的同族 `claude-3` 只有 4096，比全局兜底还低。
+/// 取 `max(同族, 8192)` 在两种方向上都不差于任一单独取值：
+/// - `claude-opus-4-6` → max(32k, 8192) = 32k（拿到同族的真实能力）
+/// - `claude-3-8`      → max(4096, 8192) = 8192（不被老族的低上限拖累）
+///
+/// 子版本边界检查本身**保留**（[`anthropic_max_output_for`] 仍对未列出子版本返回 `None`）：
+/// 它区分「日期后缀」与「版本后缀」的能力仍然需要，只是「认不出之后做什么」从
+/// 「报错让用户填」改成了「按同族兜底」——因为截断现在是**可见的**
+/// （`was_truncated` 进日志、`stop_reason: max_tokens` 透传给下游，见 sse.rs），
+/// 而报错是把用户挡在门外。
+fn claude_family_floor(model: &str) -> Option<u32> {
+    let lower = model.to_ascii_lowercase().replace('.', "-");
+    CLAUDE_MAX_OUTPUT_TABLE
+        .iter()
+        .find(|(family, _)| lower.contains(family))
+        .map(|(_, max)| *max)
+}
+
 /// 返回已知 Anthropic 模型的最大输出能力；认不出来则 `None`（调用方须报错，不许猜）。
 ///
 /// **子版本边界检查**：家族片段后紧跟 `-<1~2 位数字>` 说明是表里没列的**更新子版本**
@@ -186,22 +302,26 @@ fn anthropic_max_output_for(model: &str) -> Option<u32> {
 /// 但**模型最大输出未知时必须报错**，因为那时无论填什么都是猜。
 ///
 /// `user_max_output`：用户在该模型上手填的最大输出（`ModelInfo.max_output_tokens`）。
-/// **它优先于内置表** —— 内置表只认 Claude 家族片段，第三方中转的私有模型名
-/// （`gpt-5.6-sol` 之类）认不出来就会被整个拒掉；用户填了就该信他的。
-/// 传 `None` 时回退内置表，内置表也认不出才报错。
+/// **它优先于内置表** —— 用户填了就该信他的。没填时按
+/// 「Claude 表 → 其它厂商表 → [`FALLBACK_MAX_OUTPUT`] 兜底」三级推断，**永不报错**。
+///
+/// 改成兜底而非报错的完整理由见 [`FALLBACK_MAX_OUTPUT`]：中转站的私有模型名内置表永远
+/// 追不上，报错会让用户每加一个 Key 都被迫先去查文档填数字。
 pub fn anthropic_required_max_tokens(
     model: &str,
     window: Option<u32>,
     input_text_len_tokens: u32,
     user_max_output: Option<u32>,
 ) -> Result<u32, String> {
-    // 用户手填优先于内置表：内置表按 Claude 家族片段匹配，认不出第三方私有模型名。
+    // 用户手填优先；否则查两张内置表；都认不出用保守兜底值（8192，所有主流模型都支持）。
     // `filter(|v| *v > 0)` 挡掉手填 0 —— 那会让 max_tokens=0，上游必然 400，
     // 而用户以为「填 0 = 不限制」。前端也校验，这里是纵深防御。
     let max_output = user_max_output
         .filter(|v| *v > 0)
-        .or_else(|| anthropic_max_output_for(model))
-        .ok_or_else(|| missing_max_output_reason(model))?;
+        .or_else(|| known_max_output_for(model))
+        // 未列出的新 Claude 子版本：按同族下限兜底（与 8192 取 max），见 claude_family_floor。
+        .or_else(|| claude_family_floor(model).map(|f| f.max(FALLBACK_MAX_OUTPUT)))
+        .unwrap_or(FALLBACK_MAX_OUTPUT);
     let Some(window) = window else {
         // 无窗口数据：只受模型能力约束。不报错是刻意的 —— 报错会拒掉「用户没填窗口
         // 但模型名可辨识」这类完全可用的配置（本项目主场景之一）。
@@ -228,9 +348,15 @@ fn input_exhausts_context_reason(model: &str, window: u32, input: u32) -> String
 
 /// 缺模型最大输出数据时的可行动错误。
 ///
-/// 必须指向**用户 30 秒能自助完成的修复入口**（Key 编辑器模型列表的「最大单次输出」），
-/// 而不是「等后续版本」—— 那个字段正是为救回内置表认不出的第三方模型名而加的，
-/// 文案不提它等于把用户引向死胡同。
+/// **已不再用于阻断请求**（2026-08-21）：`anthropic_required_max_tokens` 现在按
+/// 「用户手填 → Claude 表 → 其它厂商表 → [`FALLBACK_MAX_OUTPUT`] 兜底」推断，永不报错。
+/// 理由见 `FALLBACK_MAX_OUTPUT` 的文档：中转站的私有模型名内置表永远追不上，
+/// 报错等于让用户每加一个 Key 都被迫先查文档填数字。
+///
+/// 保留这个函数**只为一件事**：万一将来把兜底改回报错（比如某天发现兜底值确实会造成
+/// 数据错误），文案与它指向的自助入口（Key 编辑器 → 模型列表 → 最大单次输出）还在，
+/// 不必重新想一遍。删掉它省下 6 行，代价是下次要重建这套判据。
+#[allow(dead_code)]
 fn missing_max_output_reason(model: &str) -> String {
     format!(
         "模型 {model} 缺少最大输出 token 能力数据：Anthropic 的 max_tokens 必填，\
@@ -380,13 +506,42 @@ mod tests {
         }
     }
 
-    /// 用户填了窗口、但模型不是可靠规格表里的 Anthropic 型号时也不猜最大输出。
+    /// 完全认不出的模型名（中转站私有别名）**不再报错**，而是取安全兜底值。
+    ///
+    /// ## 契约在 2026-08-21 反过来了，这里记下为什么
+    ///
+    /// 旧行为：认不出就报错、引导用户去「Key 编辑器 → 模型列表」手填最大输出。
+    /// 初衷是「不许猜」，但实测代价过高 —— 中转站的私有模型名（`third-party-claude`、
+    /// `gpt-5.6-sol`、站点自定义别名）千变万化，内置表**永远追不上**，于是用户每加一个 Key
+    /// 都撞一次「全部 Key 失败：缺少最大输出能力数据」。一个本该开箱可用的软件变成
+    /// 「先查文档填数字才能用」。
+    ///
+    /// 新行为的安全性依据是**两种错法的后果不对称**：
+    /// - 填大了（如按窗口取 200k）→ 官方与严格中转直接 **400**，请求根本发不出去（硬失败）；
+    /// - 填小了 → 只在回答确实超长时截断，而截断现在**可见**（`was_truncated` 进日志、
+    ///   stop_reason 跨协议透传，见 sse.rs 的截断信号那批修复）。
+    ///
+    /// 8192 是所有主流模型都支持的下限（claude-3-5 与 gpt-4 都是这个值），故绝不会因
+    /// 「上游不支持这么大」而 400。用户手填仍然优先（见下一条测试），那条路没删。
     #[test]
-    fn anthropic_without_known_max_output_refuses_instead_of_guessing() {
+    fn anthropic_unknown_model_falls_back_instead_of_failing() {
         let k = key_with(Protocol::Anthropic, &[("third-party-claude", Some(200_000))]);
-        let err = output_budget(&k, "third-party-claude", 100)
-            .expect_err("未知最大输出时不得猜一个数");
-        assert!(err.contains("最大输出"), "错误应指出缺的能力数据：{err}");
+        assert_eq!(
+            output_budget(&k, "third-party-claude", 100),
+            Ok(Some(FALLBACK_MAX_OUTPUT)),
+            "认不出的模型名必须取兜底值放行，而不是把用户挡在门外"
+        );
+        // 兜底值必须是「所有主流模型都支持」的下限 —— 它的意义全在于绝不触发 400。
+        assert_eq!(FALLBACK_MAX_OUTPUT, 8_192, "兜底值改大会重新引入 400 风险");
+
+        // 连 `claude` 字样都不含的名字（用户拼错、或中转站的完全私有别名）同样走兜底。
+        // 与上面那条分开断言：上面走的是「含 claude 但认不出型号」，这条连 `claude_family_floor`
+        // 都命中不了，是最彻底的未知形态 —— 它才是「开箱可用」的底线。
+        assert_eq!(
+            output_budget(&k, "some-other-model", 100),
+            Ok(Some(FALLBACK_MAX_OUTPUT)),
+            "完全认不出的模型名必须走兜底，而不是让整轮请求失败"
+        );
     }
 
     /// 用户手填的 `max_output_tokens` **优先于内置表**，且能救回内置表认不出的模型。
@@ -437,53 +592,76 @@ mod tests {
         );
     }
 
-    /// 缺窗口数据的 Anthropic Key：**不猜**，报出可执行的原因。
+    /// 缺窗口数据的 Anthropic Key：按模型能力取值，**不报错**。
     ///
-    /// 这条是本次定调最容易被「修好意」破坏的地方：随手加个 `.unwrap_or(4096)` 就能让
-    /// 它「不报错了」，代价是回答又开始被悄悄截断。故断言里同时钉住「不是 Limit」。
+    /// 契约在 2026-08-21 改过（用户要求「不用用户设置，自己按厂商给默认」）：此前缺窗口就报错
+    /// 引导用户去填 contextWindow。现在只要能推断出最大输出就照用 —— 真实 Claude 窗口都
+    /// ≥200k，输入通常远小于它，故不带窗口钳制也安全（见 `anthropic_required_max_tokens`
+    /// 里 `window == None` 那条分支的说明）。
+    ///
+    /// **仍必须钉住的**：不能因为「不报错了」就退回某个硬编码小值。`claude-x` 含 `claude`
+    /// 但不含任何已列家族片段 → 走全局兜底 8192；若哪天有人给它加个 `.unwrap_or(4096)`
+    /// 之类的旁路，这条会红。
     #[test]
-    fn anthropic_without_context_window_refuses_instead_of_guessing() {
+    fn anthropic_without_context_window_uses_capability_not_error() {
         let k = key_with(Protocol::Anthropic, &[("claude-x", None)]);
-        let got = output_budget(&k, "claude-x", 100);
-        let reason = got.expect_err("缺窗口时必须报错，而不是给出某个上限");
-        assert!(reason.contains("claude-x"), "原因要点名具体模型：{reason}");
-        assert!(
-            reason.contains("上下文窗口"),
-            "原因必须告诉用户去补什么：{reason}"
+        assert_eq!(
+            output_budget(&k, "claude-x", 100),
+            Ok(Some(FALLBACK_MAX_OUTPUT)),
+            "缺窗口不该报错，应按兜底能力取值（8192，所有主流模型都支持）"
         );
     }
 
-    /// 模型不在列表里（拼错/未录入）同样按「缺数据」处理，不退回默认值。
-    #[test]
-    fn anthropic_unknown_model_is_treated_as_missing_window() {
-        let k = key_with(Protocol::Anthropic, &[("claude-x", Some(200_000))]);
-        assert!(output_budget(&k, "some-other-model", 100).is_err());
-    }
-
-    /// 表里未列出的**新子版本号**不得静默继承旧同族的上限；日期后缀照常匹配。
+    /// 表里未列出的**新子版本号**：按同族下限兜底（不是全局 8192，也不是报错）。
     ///
-    /// 反例（本条要防的）：`claude-opus-4-6` 不含 `claude-opus-4-5` 片段、但含
-    /// `claude-opus-4` → 旧逻辑静默取 32k。若新族实际支持 64k+，长回答在 32k 处被截断
-    /// 且无任何报错 —— 本模块声称消除的「本地静默截断点」换个数字回来了。
-    /// 现在这类必须报「缺能力数据」，引导用户手填最大单次输出。
+    /// ## 契约演进（2026-08-21）
     ///
-    /// 故障注入判据：把 `anthropic_max_output_for` 的边界检查删掉（退回裸 `contains`）
-    /// → 前两条断言变红。
+    /// 旧行为：`claude-opus-4-6` 不含 `claude-opus-4-5` 片段、但含 `claude-opus-4` →
+    /// 边界检查判它是「未列出的新子版本」→ **报错**，引导用户手填。
+    /// 那时的理由是「静默取旧族 32k，若新族实际 64k 则长回答被悄悄截断」。
+    ///
+    /// 现在改为按同族兜底，因为两个前提都变了：
+    /// 1. **截断已可见** —— `was_truncated` 进日志、`stop_reason: max_tokens` 透传给下游
+    ///    （见 sse.rs 的截断信号透传），不再是「悄悄」；
+    /// 2. 报错的代价被证实过高 —— 用户每遇到一个新模型名就被挡在门外。
+    ///
+    /// 取 `max(同族, 8192)`：新族几乎不会降低上限，故同族值是安全下界；而对
+    /// `claude-3-8` 这种同族只有 4096 的，8192 兜底更好。两个方向都不差于单独取值。
+    ///
+    /// **边界检查本身保留**：它区分「日期后缀 vs 版本后缀」的能力仍然需要（下面两条断言），
+    /// 变的只是「认不出之后做什么」。
+    ///
+    /// 故障注入判据：删掉 `claude_family_floor` 那一支 → 第一条 `claude-opus-4-6`
+    /// 期望的 32000 会变成 8192。
     #[test]
-    fn newer_subversion_does_not_inherit_older_family_cap() {
-        // 未列出的新子版本 → 必须报错（而不是拿 claude-opus-4 的 32k）
-        for m in ["claude-opus-4-6", "claude-opus-4-7-20260301", "claude-haiku-4-6"] {
+    fn newer_subversion_falls_back_to_family_floor() {
+        // 未列出的新子版本 → 取同族下限（opus-4 = 32k），而非全局兜底 8192
+        for m in ["claude-opus-4-6", "claude-opus-4-7-20260301"] {
             let k = key_with(Protocol::Anthropic, &[(m, Some(200_000))]);
-            let err = output_budget(&k, m, 100)
-                .expect_err("新子版本不得继承旧同族上限，必须报缺能力数据");
-            assert!(err.contains("最大单次输出"), "错误应指向手填入口：{err}");
+            assert_eq!(
+                output_budget(&k, m, 100),
+                Ok(Some(32_000)),
+                "{m} 应按同族 claude-opus-4 的 32k 兜底（比全局 8192 更贴近真实能力）"
+            );
         }
-        // 日期后缀（≥4 位数字）是同一型号的快照，照常匹配
+        // haiku-4-6：同族 haiku-4 = 32k
+        let k = key_with(Protocol::Anthropic, &[("claude-haiku-4-6", Some(200_000))]);
+        assert_eq!(output_budget(&k, "claude-haiku-4-6", 100), Ok(Some(32_000)));
+
+        // 同族低于全局兜底时取兜底：claude-3-8 的同族 claude-3 只有 4096
+        let k = key_with(Protocol::Anthropic, &[("claude-3-8", Some(200_000))]);
+        assert_eq!(
+            output_budget(&k, "claude-3-8", 100),
+            Ok(Some(FALLBACK_MAX_OUTPUT)),
+            "同族上限低于 8192 时不该被老族拖累"
+        );
+
+        // 日期后缀（≥4 位数字）是同一型号的快照，照常精确匹配 —— 边界检查的核心能力
         let k = key_with(Protocol::Anthropic, &[("claude-sonnet-4-5-20250929", Some(200_000))]);
         assert_eq!(
             output_budget(&k, "claude-sonnet-4-5-20250929", 100),
             Ok(Some(64_000)),
-            "日期后缀不该被当成新子版本拒掉"
+            "日期后缀不该被当成新子版本"
         );
         // 家族片段后接文字（claude-3-5-sonnet-20241022）也照常匹配
         let k = key_with(Protocol::Anthropic, &[("claude-3-5-sonnet-20241022", Some(200_000))]);
@@ -498,6 +676,35 @@ mod tests {
             Ok(Some(64_000))
         );
     }
+
+    /// **非 Claude 厂商的模型也要开箱可用**（用户要求：不用手填，按厂商给默认）。
+    ///
+    /// 本项目主场景是中转站：用户拿一个 Anthropic 协议的 Key 指向 GLM / DeepSeek / Kimi /
+    /// Qwen。这些模型名完全不含 `claude`，旧实现一个都认不出、全部要求手填。
+    ///
+    /// 故障注入判据：删掉 `OTHER_MAX_OUTPUT_TABLE` 的查表那一支 → 全部变成 8192，本条红。
+    #[test]
+    fn non_claude_vendors_get_builtin_defaults() {
+        for (model, want) in [
+            ("glm-4.6", 96_000u32),
+            ("glm-4-plus", 8_192),
+            ("deepseek-reasoner", 64_000),
+            ("deepseek-chat", 8_192),
+            ("kimi-k2-0905-preview", 32_000),
+            ("qwen3-coder-plus", 64_000),
+            ("gpt-5.6-sol", 128_000), // 中转站私有别名，含 gpt-5 片段
+            ("grok-4-fast", 32_000),
+            ("minimax-m2.7", 32_000),
+        ] {
+            let k = key_with(Protocol::Anthropic, &[(model, Some(200_000))]);
+            assert_eq!(
+                output_budget(&k, model, 100),
+                Ok(Some(want)),
+                "{model} 应按内置厂商表取 {want}，而不是要求用户手填"
+            );
+        }
+    }
+
 
     #[test]
     fn dot_notation_versions_match_same_as_dash_and_opus_4_1_recognized() {
@@ -517,11 +724,18 @@ mod tests {
                 "点号版本 {m} 应归一后匹配到 {want}，而非静默继承更旧同族的上限"
             );
         }
-        // 点号写的**未列出新子版本**仍要被拒（4.8 不在表里，边界检查照常生效，不许猜）。
+        // 点号写的**未列出新子版本**：不再报错，改为按同族下限兜底（契约已反转，
+        // 见 anthropic_unknown_model_falls_back_instead_of_failing 的完整理由）。
+        //
+        // 仍然**必须钉住的性质**：不得静默继承同族那个可能过大的上限。这里 opus-4 族下限
+        // 是 32000，兜底取 `max(族下限, 8192)`；关键是它**不会**因为 4.8 未知就去发 200k
+        // 而撞 400，也不会把用户挡在门外。
         let k = key_with(Protocol::Anthropic, &[("claude-opus-4.8", Some(200_000))]);
-        assert!(
-            output_budget(&k, "claude-opus-4.8", 100).is_err(),
-            "点号写的未知新子版本仍必须报错，不得继承 claude-opus-4 的 32k"
+        let got = output_budget(&k, "claude-opus-4.8", 100).expect("未知子版本应兜底放行，不再报错");
+        assert_eq!(
+            got,
+            Some(32_000),
+            "未列出的新子版本应按同族下限兜底（opus-4 族 = 32000），既不报错也不发 200k 撞 400"
         );
         // Opus 4.1 是现役型号，规范 ID 与点号写法都应认得（真实上限 32000）。
         for m in ["claude-opus-4-1-20250805", "claude-opus-4.1"] {

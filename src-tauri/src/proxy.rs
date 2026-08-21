@@ -3574,14 +3574,27 @@ mod tests {
         );
     }
 
-    /// P2-1：缺 maxOutputTokens 的**配置错误**是永不自愈的硬错误，
-    /// ensure_anthropic_output_budget 必须返回 `AppError::Invalid`（而非可重试的 Upstream）。
+    /// 认不出的第三方模型名**不再让整轮请求失败**，而是补上兜底 `max_tokens` 照常转发。
     ///
-    /// 这条钉住错误**类型**：handle_request 的失败分流靠 `matches!(e, AppError::Invalid(_))`
-    /// 把它判为硬错误——原样回 4xx、不熔断、不武装短路窗口、不包装成 529 让客户端无限退避。
-    /// 若这里退化成别的错误变体，那套分流就会把配置错误误当临时故障。
+    /// ## 契约在 2026-08-21 反了过来（用户明确要求），这里记下判据
+    ///
+    /// 旧行为：内置表认不出 → 返回 `AppError::Invalid` → 400 + 引导用户去
+    /// 「Key 编辑器 → 模型列表」手填「最大单次输出」。初衷是「不许猜」。
+    ///
+    /// 实测代价过高：中转站的私有模型名千变万化（`gpt-5.6-sol`、站点自定义别名），
+    /// 内置表永远追不上，于是**用户每加一个 Key 都撞一次「全部 Key 不可用」** ——
+    /// 一个本该开箱可用的软件变成「先查文档填数字才能用」。
+    ///
+    /// 反转的安全依据是两种错法后果**不对称**（见 budget.rs 同名测试的完整论证）：
+    /// 填大了是硬 400（请求发不出去），填小了只在回答超长时截断，而截断现在**可见**
+    /// （`was_truncated` 进日志、`stop_reason: max_tokens` 跨协议透传）。
+    ///
+    /// 这条测试守的是**端到端**那一段：转换层确实把兜底值写进了 payload。
+    /// budget.rs 那条守取值逻辑，两者缺一都会让「Anthropic 必填 max_tokens」漏掉。
+    ///
+    /// 故障注入判据：把 `anthropic_required_max_tokens` 的兜底支去掉 → 这里回 Err，断言立刻红。
     #[test]
-    fn missing_max_output_yields_invalid_not_retryable() {
+    fn unknown_model_gets_fallback_budget_instead_of_failing_request() {
         let mut k = key("k", 0, "https://example.com");
         // 内置表认不出的第三方模型名 + 用户没填 max_output + 无 context_window
         k.models = vec![model_ctx("some-relay-private-model", None)];
@@ -3589,16 +3602,34 @@ mod tests {
             "model": "some-relay-private-model",
             "messages": [{ "role": "user", "content": "hi" }]
         });
-        let err = ensure_anthropic_output_budget(payload, &k, "some-relay-private-model")
-            .expect_err("缺能力数据必须报错，不许猜一个上限");
-        assert!(
-            matches!(err, crate::error::AppError::Invalid(_)),
-            "必须是 Invalid（配置错误/永不自愈），否则会被误判为可重试临时故障、包装成 529"
+        let out = ensure_anthropic_output_budget(payload, &k, "some-relay-private-model")
+            .expect("认不出的模型名必须兜底放行，不能把用户挡在门外");
+        // Anthropic 协议下 max_tokens 必填：兜底值必须真的写进去，否则上游 400。
+        assert_eq!(
+            out["max_tokens"], 8_192,
+            "应补上兜底 max_tokens（8192 = 所有主流模型都支持的下限，绝不触发 400）"
         );
-        // 错误文案要引导用户去填「最大单次输出」（可行动，而非「等后续版本」）
-        assert!(
-            err.to_string().contains("最大单次输出"),
-            "错误应指向 Key 编辑器的可自助修复入口，实际：{err}"
+    }
+
+    /// 用户手填的「最大单次输出」仍然**优先于**兜底值 —— 兜底不该埋掉用户的显式设置。
+    ///
+    /// 与上一条配对：上一条证明「不填也能用」，这条证明「填了就照你说的」。
+    /// 只有上一条时，一次把兜底逻辑写成无条件覆盖的改动不会被任何测试拦住。
+    #[test]
+    fn user_supplied_max_output_still_wins_over_fallback() {
+        let mut k = key("k", 0, "https://example.com");
+        let mut m = model_ctx("some-relay-private-model", None);
+        m.max_output_tokens = Some(32_000);
+        k.models = vec![m];
+        let payload = json!({
+            "model": "some-relay-private-model",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let out = ensure_anthropic_output_budget(payload, &k, "some-relay-private-model")
+            .expect("填了最大输出必须可用");
+        assert_eq!(
+            out["max_tokens"], 32_000,
+            "用户显式填的值必须胜过兜底 8192，否则等于静默忽略用户设置"
         );
     }
 
