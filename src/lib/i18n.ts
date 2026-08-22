@@ -386,8 +386,11 @@ const zh: Dict = {
   "editor.contextWindow": "上下文窗口",
   "editor.contextWindowPlaceholder": "如 200",
   "editor.contextWindowUnit": "单位（token / K / M）",
+  // 这段文案 2026-08-22 改过：原文写「内置表认不出时，填上此值该模型才能参与大脑聚合」——
+  // 那是**旧契约**（认不出就挡住）。现在认不出会按厂商/世代自动兜底、照常可用，
+  // 留着那句话等于继续要求用户手填，正是这次要去掉的东西。
   "editor.maxOutput":
-    "最大单次输出（与上下文窗口不同：如 4.5 系是 200K 窗口 / 64K 输出）。留空则用内置能力表；第三方中转的私有模型名内置表认不出时，填上此值该模型才能参与大脑聚合",
+    "最大单次输出（与上下文窗口不同：如 Claude 5 系是 1M 窗口 / 128K 输出）。**一般留空即可** —— 内置能力表按厂商与世代自动取官方默认值；只有在自动值明显不对（回答被提前截断，或上游报 max_tokens 超限）时才需要手填覆盖",
   "editor.maxOutputPlaceholder": "如 64",
   "editor.maxOutputUnit": "单位（token / K / M）",
   "editor.oneMHint": "窗口 ≥ 1M 时自动启用 1M 上下文（转发时补 anthropic-beta 头），Claude Code / CLI 与桌面端均生效",
@@ -1177,7 +1180,7 @@ const en: Dict = {
   "editor.contextWindowPlaceholder": "e.g. 200",
   "editor.contextWindowUnit": "Unit (token / K / M)",
   "editor.maxOutput":
-    "Max single output (different from context window: the 4.5 family has a 200K window but 64K output). Leave empty to use the built-in capability table; for relay-specific model names the table cannot recognize, set this so the model can join brain aggregation",
+    "Max single output (different from the context window: the Claude 5 family has a 1M window but 128K output). **Normally leave this empty** — the built-in table picks each vendor's and generation's official default. Only override it when the automatic value is clearly wrong (answers cut short, or the upstream complains max_tokens is over the limit).",
   "editor.maxOutputPlaceholder": "e.g. 64",
   "editor.maxOutputUnit": "Unit (token / K / M)",
   "editor.oneMHint": "A window ≥ 1M enables 1M context automatically (an anthropic-beta header is added when forwarding); applies to Claude Code / CLI and the desktop app",

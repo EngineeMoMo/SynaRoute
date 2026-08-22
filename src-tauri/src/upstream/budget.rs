@@ -123,7 +123,32 @@ pub fn estimate_json_tokens_without_image_transport(v: &Value) -> u32 {
 /// 前后缀（`anthropic/claude-sonnet-4-5`、`claude-3-7-sonnet-20250219` 等），
 /// 全等匹配会把它们全判成未知、拒掉本项目的主场景（Codex 接 Claude 中转）。
 /// 顺序从**新到旧**：`claude-3-7` 必须排在 `claude-3` 之前，否则前者会先命中后者的 8192。
+///
+/// ## 数值来源（2026-08-22 逐条取证，非推测）
+///
+/// Claude 5 家族与 4.6 之后各代都是 **128k 最大输出**（4.6 那一代把 64k 翻了倍）：
+/// - Fable 5 / Opus 5 / Sonnet 5：`platform.claude.com` 各自的 what's-new 页
+///   （Opus 5 另有 AWS Bedrock model card 佐证：`Max output tokens: 128K`）；
+/// - Opus 4.8 / 4.7 / 4.6：`platform.claude.com` what's-new 页；4.6 的公告原文是
+///   「supports up to 128K output tokens, **double the previous 64K limit**」——
+///   这句同时反证了 4.5 系的 64k 是对的；
+/// - Sonnet 4.6：Google Vertex AI 合作模型页 `Maximum output tokens: 128,000`。
+///
+/// **此前这张表止于 4-5 系**，于是用户实际在用的 `claude-opus-5` / `claude-sonnet-5` /
+/// `claude-fable-5` 全部认不出、落到全局兜底 8192 —— 相当于把 128k 的模型掐到 1/16，
+/// 而用户只会看到「回答莫名断了」。这类「表落后于发布」是必然会重演的，
+/// 故除了补行，还加了按世代单调兜底（见 [`claude_generation_floor`]）。
 const CLAUDE_MAX_OUTPUT_TABLE: &[(&str, u32)] = &[
+    // ---- Claude 5 家族（含 Fable 这个新档位）----
+    ("claude-fable-5", 128_000),
+    ("claude-opus-5", 128_000),
+    ("claude-sonnet-5", 128_000),
+    // ---- 4.6 及之后：128k（4.6 那代把 64k 翻倍）----
+    ("claude-opus-4-8", 128_000),
+    ("claude-opus-4-7", 128_000),
+    ("claude-opus-4-6", 128_000),
+    ("claude-sonnet-4-6", 128_000),
+    // ---- 4.5 系：64k ----
     ("claude-opus-4-5", 64_000),
     ("claude-sonnet-4-5", 64_000),
     ("claude-haiku-4-5", 64_000),
@@ -244,12 +269,85 @@ fn known_max_output_for(model: &str) -> Option<u32> {
 /// 「报错让用户填」改成了「按同族兜底」——因为截断现在是**可见的**
 /// （`was_truncated` 进日志、`stop_reason: max_tokens` 透传给下游，见 sse.rs），
 /// 而报错是把用户挡在门外。
-fn claude_family_floor(model: &str) -> Option<u32> {
-    let lower = model.to_ascii_lowercase().replace('.', "-");
-    CLAUDE_MAX_OUTPUT_TABLE
-        .iter()
-        .find(|(family, _)| lower.contains(family))
-        .map(|(_, max)| *max)
+/// 把模型名归一成「用 `-` 分段」的形式，供世代/档位解析按段匹配。
+///
+/// 两种真实写法都要拍平，否则解析不到 `claude` 那一段：
+/// - `.` → `-`：中转站常写 `claude-sonnet-4.6`；
+/// - `/` → `-`：OpenRouter 式前缀 `anthropic/claude-opus-5`，不拍平的话首段是
+///   `anthropic/claude`，按段全等匹配 `claude` 会直接落空（写测试时抓到的）。
+fn normalize_model_segments(model: &str) -> String {
+    model.to_ascii_lowercase().replace(['.', '/'], "-")
+}
+
+/// 模型名里的 **Claude 世代号**：`claude-opus-4-8` → 4、`claude-opus-5` → 5、
+/// `claude-3-5` → 3、`claude-fable-5` → 5。认不出返回 `None`。
+///
+/// 取「`claude` 之后第一个 1~2 位纯数字段」。为什么是 1~2 位：4 位以上是日期后缀
+/// （`claude-sonnet-4-5-20250929`），与版本号在现实里没有交集（同 [`anthropic_max_output_for`]
+/// 的判据，两处用同一条位数规则）。
+fn claude_generation(model: &str) -> Option<u32> {
+    let lower = normalize_model_segments(model);
+    let mut segs = lower.split('-').skip_while(|s| *s != "claude");
+    segs.next()?; // 吃掉 "claude" 本身
+    segs.find(|s| (1..=2).contains(&s.len()) && s.chars().all(|c| c.is_ascii_digit()))
+        .and_then(|s| s.parse().ok())
+}
+
+/// 模型名里的 Claude **档位**词（`opus` / `sonnet` / `haiku` / `fable` / …）。
+///
+/// 只认「`claude-` 紧跟的那一段且不是数字」——`claude-3-5-sonnet` 这种旧式命名取不到档位，
+/// 返回 `None` 由调用方退回跨档位兜底，这正确：那一代的输出上限本就不按档位分。
+fn claude_tier(model: &str) -> Option<String> {
+    let lower = normalize_model_segments(model);
+    let mut segs = lower.split('-').skip_while(|s| *s != "claude");
+    segs.next()?;
+    let seg = segs.next()?;
+    (!seg.is_empty() && !seg.chars().all(|c| c.is_ascii_digit())).then(|| seg.to_string())
+}
+
+/// 未列出的 Claude 模型的兜底上限：**同档位、世代不晚于它的已知条目里取最大值**。
+///
+/// ## 为什么需要（这条替掉了原来的 `claude_family_floor`）
+///
+/// 原实现是「裸 `contains` 命中同族片段」。它对 `claude-opus-4-6` 有效（含 `claude-opus-4`），
+/// 但对**换了世代号**的名字完全失效：`claude-opus-5` 不含任何 `claude-opus-4*` 片段，
+/// 于是落到全局 8192 —— 把一个 128k 的模型掐到 1/16，而用户只看到「回答莫名断了」。
+/// 用户库里在跑的 `claude-opus-5` / `claude-sonnet-5` / `claude-fable-5` 全踩这一条。
+/// 而「表落后于新发布」是必然重演的，靠补行治不了根。
+///
+/// ## 判据：输出上限只涨不降
+///
+/// Anthropic 迭代方向一直是往上（4.5 的 64k → 4.6 的 128k），从未下调。故
+/// 「同档位、世代 ≤ 我的那些条目里的最大值」是新模型的**安全下界**。
+///
+/// **带档位**是必要的：跨档位取最大会让 `claude-haiku-4-9` 拿到 opus 的 128k
+/// （haiku 4-5 只有 64k）→ 上游 400。同档位取则得 64k，正确。
+/// 档位取不到（旧式 `claude-3-5` 命名）才退回跨档位——那一代的上限本就不按档位分。
+///
+/// ## 与原注释那句「拿不准取下限档」的关系
+///
+/// 那句话写在「兜底是按同族 contains」的年代，成立前提是同族片段总能命中。现在**已知它不能**
+/// （实测 Claude 5 全族命中不了），而两种错法的代价并不对称：
+/// - 填**小**了 → 长回答被静默截断，用户查不到原因（只有日志里一个标记）；
+/// - 填**大**了 → 上游 400，而 Anthropic 那句错误是 `max_tokens: X > Y, which is the maximum
+///   allowed`，**自带正确答案**，一眼就能定位并去 Key 编辑器填死。
+///
+/// 按本项目「静默错比响亮错更糟」的一贯口径，宁可偏大。
+fn claude_generation_floor(model: &str) -> Option<u32> {
+    let gen = claude_generation(model)?;
+    let tier = claude_tier(model);
+    let pick = |same_tier: bool| -> Option<u32> {
+        CLAUDE_MAX_OUTPUT_TABLE
+            .iter()
+            .filter(|(family, _)| {
+                claude_generation(family).is_some_and(|g| g <= gen)
+                    && (!same_tier || claude_tier(family) == tier)
+            })
+            .map(|(_, cap)| *cap)
+            .max()
+    };
+    // 先按同档位；该档位没有任何已知条目（如新档位 `mythos`）才跨档位兜底。
+    tier.as_ref().and_then(|_| pick(true)).or_else(|| pick(false))
 }
 
 /// 返回已知 Anthropic 模型的最大输出能力；认不出来则 `None`（调用方须报错，不许猜）。
@@ -307,21 +405,34 @@ fn anthropic_max_output_for(model: &str) -> Option<u32> {
 ///
 /// 改成兜底而非报错的完整理由见 [`FALLBACK_MAX_OUTPUT`]：中转站的私有模型名内置表永远
 /// 追不上，报错会让用户每加一个 Key 都被迫先去查文档填数字。
+/// 这个模型该用多大的 `max_tokens`（**不含**「窗口 − 输入」那层钳制）。
+///
+/// 四级优先，逐级降级：
+/// 1. **用户手填**（`filter(|v| *v > 0)` 挡掉手填 0 —— 那会让 `max_tokens=0` 必然 400，
+///    而用户以为「填 0 = 不限制」。前端也校验，这里是纵深防御）；
+/// 2. 两张内置表精确命中（Claude 表带子版本边界检查）；
+/// 3. 未列出的 Claude 模型 → 按世代单调兜底（[`claude_generation_floor`]，与全局兜底取 max）；
+/// 4. 全都认不出 → `FALLBACK_MAX_OUTPUT`。
+///
+/// **抽成独立函数就是为了能直接测这四级**：原先这段内联在
+/// [`anthropic_required_max_tokens`] 里，而那个函数的返回值同时受「窗口 − 输入」影响，
+/// 想验「Claude 5 拿到 128k」得先构造一个足够大的窗口，测的东西被搅在一起。
+pub(crate) fn resolve_max_output(model: &str, user_max_output: Option<u32>) -> u32 {
+    user_max_output
+        .filter(|v| *v > 0)
+        .or_else(|| known_max_output_for(model))
+        .or_else(|| claude_generation_floor(model).map(|f| f.max(FALLBACK_MAX_OUTPUT)))
+        .unwrap_or(FALLBACK_MAX_OUTPUT)
+}
+
 pub fn anthropic_required_max_tokens(
     model: &str,
     window: Option<u32>,
     input_text_len_tokens: u32,
     user_max_output: Option<u32>,
 ) -> Result<u32, String> {
-    // 用户手填优先；否则查两张内置表；都认不出用保守兜底值（8192，所有主流模型都支持）。
-    // `filter(|v| *v > 0)` 挡掉手填 0 —— 那会让 max_tokens=0，上游必然 400，
-    // 而用户以为「填 0 = 不限制」。前端也校验，这里是纵深防御。
-    let max_output = user_max_output
-        .filter(|v| *v > 0)
-        .or_else(|| known_max_output_for(model))
-        // 未列出的新 Claude 子版本：按同族下限兜底（与 8192 取 max），见 claude_family_floor。
-        .or_else(|| claude_family_floor(model).map(|f| f.max(FALLBACK_MAX_OUTPUT)))
-        .unwrap_or(FALLBACK_MAX_OUTPUT);
+    // 用户手填优先；否则查两张内置表；都认不出用保守兜底值。见 resolve_max_output。
+    let max_output = resolve_max_output(model, user_max_output);
     let Some(window) = window else {
         // 无窗口数据：只受模型能力约束。不报错是刻意的 —— 报错会拒掉「用户没填窗口
         // 但模型名可辨识」这类完全可用的配置（本项目主场景之一）。
@@ -625,35 +736,48 @@ mod tests {
     ///    （见 sse.rs 的截断信号透传），不再是「悄悄」；
     /// 2. 报错的代价被证实过高 —— 用户每遇到一个新模型名就被挡在门外。
     ///
-    /// 取 `max(同族, 8192)`：新族几乎不会降低上限，故同族值是安全下界；而对
-    /// `claude-3-8` 这种同族只有 4096 的，8192 兜底更好。两个方向都不差于单独取值。
+    /// 取 `max(同档位同代或更早, 8192)`：输出上限只涨不降，故这是安全下界。
     ///
-    /// **边界检查本身保留**：它区分「日期后缀 vs 版本后缀」的能力仍然需要（下面两条断言），
+    /// **边界检查本身保留**：它区分「日期后缀 vs 版本后缀」的能力仍然需要（下面几条断言），
     /// 变的只是「认不出之后做什么」。
     ///
-    /// 故障注入判据：删掉 `claude_family_floor` 那一支 → 第一条 `claude-opus-4-6`
-    /// 期望的 32000 会变成 8192。
+    /// ⚠️ **2026-08-22 更新**：本用例原来的例子（`claude-opus-4-6` / `claude-opus-4-7`）
+    /// 现在已经**进表**了（128k，见 `CLAUDE_MAX_OUTPUT_TABLE` 的取证），不再是「未列出」，
+    /// 故换成真正未列出的名字。同时兜底口径从「首个 contains 命中的同族」改成
+    /// 「同档位、世代不晚于它的条目取最大」——理由见 [`claude_generation_floor`]：
+    /// 旧口径对**换了世代号**的名字（`claude-opus-5`）一个都命中不了，全落到 8192。
     #[test]
     fn newer_subversion_falls_back_to_family_floor() {
-        // 未列出的新子版本 → 取同族下限（opus-4 = 32k），而非全局兜底 8192
-        for m in ["claude-opus-4-6", "claude-opus-4-7-20260301"] {
-            let k = key_with(Protocol::Anthropic, &[(m, Some(200_000))]);
+        // 真正未列出的新子版本 → 同档位（opus）同代或更早的最大值 = 128k
+        for m in ["claude-opus-4-9", "claude-opus-4-9-20260301"] {
+            let k = key_with(Protocol::Anthropic, &[(m, Some(1_000_000))]);
             assert_eq!(
                 output_budget(&k, m, 100),
-                Ok(Some(32_000)),
-                "{m} 应按同族 claude-opus-4 的 32k 兜底（比全局 8192 更贴近真实能力）"
+                Ok(Some(128_000)),
+                "{m} 应按同档位已知最高（opus 4 代已有 128k）兜底，而不是全局 8192"
             );
         }
-        // haiku-4-6：同族 haiku-4 = 32k
-        let k = key_with(Protocol::Anthropic, &[("claude-haiku-4-6", Some(200_000))]);
-        assert_eq!(output_budget(&k, "claude-haiku-4-6", 100), Ok(Some(32_000)));
+        // haiku-4-9：**只**继承 haiku 的上限（64k），不得跨档位拿 opus 的 128k → 那会 400
+        let k = key_with(Protocol::Anthropic, &[("claude-haiku-4-9", Some(200_000))]);
+        assert_eq!(
+            output_budget(&k, "claude-haiku-4-9", 100),
+            Ok(Some(64_000)),
+            "跨档位继承会让 haiku 拿到 opus 的 128k，上游直接 400"
+        );
 
-        // 同族低于全局兜底时取兜底：claude-3-8 的同族 claude-3 只有 4096
+        // 同代或更早的最大值低于全局兜底时取兜底：claude-3-8 那一代最高是 claude-3-7 的 64k，
+        // 仍高于 8192；而更老的世代（如假想的 claude-2-x）才会落到兜底。
         let k = key_with(Protocol::Anthropic, &[("claude-3-8", Some(200_000))]);
         assert_eq!(
             output_budget(&k, "claude-3-8", 100),
-            Ok(Some(FALLBACK_MAX_OUTPUT)),
-            "同族上限低于 8192 时不该被老族拖累"
+            Ok(Some(64_000)),
+            "3 代最高是 claude-3-7 的 64k，不该被同族里最低的 4096 拖累"
+        );
+        // 完全认不出（连 claude 世代都解析不出）→ 全局兜底，不瞎猜
+        let k = key_with(Protocol::Anthropic, &[("totally-unknown-llm", Some(200_000))]);
+        assert_eq!(
+            output_budget(&k, "totally-unknown-llm", 100),
+            Ok(Some(FALLBACK_MAX_OUTPUT))
         );
 
         // 日期后缀（≥4 位数字）是同一型号的快照，照常精确匹配 —— 边界检查的核心能力
@@ -724,18 +848,25 @@ mod tests {
                 "点号版本 {m} 应归一后匹配到 {want}，而非静默继承更旧同族的上限"
             );
         }
-        // 点号写的**未列出新子版本**：不再报错，改为按同族下限兜底（契约已反转，
-        // 见 anthropic_unknown_model_falls_back_instead_of_failing 的完整理由）。
+        // 点号写法必须与连字符写法等价（中转站两种都用）。
         //
-        // 仍然**必须钉住的性质**：不得静默继承同族那个可能过大的上限。这里 opus-4 族下限
-        // 是 32000，兜底取 `max(族下限, 8192)`；关键是它**不会**因为 4.8 未知就去发 200k
-        // 而撞 400，也不会把用户挡在门外。
-        let k = key_with(Protocol::Anthropic, &[("claude-opus-4.8", Some(200_000))]);
-        let got = output_budget(&k, "claude-opus-4.8", 100).expect("未知子版本应兜底放行，不再报错");
+        // ⚠️ 2026-08-22：`claude-opus-4.8` 现在**已进表**（Opus 4.8 官方 128k，取证见
+        // CLAUDE_MAX_OUTPUT_TABLE），故这里断言的是「点号写法能命中表里的连字符条目」，
+        // 而不再是兜底路径。原来它期望 32000（opus-4 族下限）—— 那个数字在 4.8 上是错的，
+        // 真实上限是 128k，按 32k 发等于把回答掐到 1/4。
+        let k = key_with(Protocol::Anthropic, &[("claude-opus-4.8", Some(1_000_000))]);
+        let got = output_budget(&k, "claude-opus-4.8", 100).expect("已知型号应放行");
         assert_eq!(
             got,
-            Some(32_000),
-            "未列出的新子版本应按同族下限兜底（opus-4 族 = 32000），既不报错也不发 200k 撞 400"
+            Some(128_000),
+            "点号写法要能命中表里的 claude-opus-4-8（128k）；得到 32000 说明点号没被归一"
+        );
+        // 未列出的点号新子版本仍走兜底，且不得发 200k 撞 400
+        let k = key_with(Protocol::Anthropic, &[("claude-opus-4.9", Some(1_000_000))]);
+        assert_eq!(
+            output_budget(&k, "claude-opus-4.9", 100),
+            Ok(Some(128_000)),
+            "未列出的新子版本按同档位已知最高兜底，既不报错也不发满窗口撞 400"
         );
         // Opus 4.1 是现役型号，规范 ID 与点号写法都应认得（真实上限 32000）。
         for m in ["claude-opus-4-1-20250805", "claude-opus-4.1"] {
@@ -777,6 +908,120 @@ mod tests {
         assert!(
             got < 20_000,
             "图片 base64 不应膨胀成数百万 token，实际 {got}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod claude5_caps {
+    use super::*;
+
+    /// **Claude 5 全族的最大输出必须是 128k，不能落到 8192。**
+    ///
+    /// 这条钉的是一个当时正在生效的缺陷：`CLAUDE_MAX_OUTPUT_TABLE` 止于 4-5 系，
+    /// 而 `claude-opus-5` 不含任何 `claude-opus-4*` 片段 —— 老的同族兜底
+    /// （裸 `contains`）一个都命中不了，于是全部落到全局兜底 **8192**。
+    /// 把 128k 的模型掐到 1/16，而用户只看到「回答莫名断了」（截断只在日志里有个标记）。
+    ///
+    /// 用户库里在跑的就是这几个（从其 cc-switch 库读到：`claude-opus-5`、`claude-sonnet-5`、
+    /// `claude-fable-5`、`claude-opus-5-thinking/-xhigh/-max`），全踩这一条。
+    ///
+    /// 数值取证见 `CLAUDE_MAX_OUTPUT_TABLE` 的文档（platform.claude.com 各 what's-new 页 +
+    /// AWS Bedrock model card + Google Vertex AI 合作模型页）。
+    #[test]
+    fn claude5_family_gets_128k_not_the_8192_fallback() {
+        for m in [
+            "claude-fable-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            // 中转站常见的后缀变体（思考档/强度档）都得认
+            "claude-opus-5-thinking",
+            "claude-opus-5-xhigh",
+            "claude-opus-5-max",
+            // 日期快照后缀（4 位以上数字）属同型号
+            "claude-opus-5-20260401",
+            // 第三方中转的前缀
+            "anthropic/claude-opus-5",
+            // 4.6 起就是 128k 了
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+        ] {
+            assert_eq!(
+                resolve_max_output(m, None),
+                128_000,
+                "{m} 应得 128k；得到 8192 说明又落回全局兜底了（等于把回答掐到 1/16）"
+            );
+        }
+        // 4.5 系仍是 64k —— 别把新值一把刷到旧模型上（那会 400）
+        for m in ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"] {
+            assert_eq!(resolve_max_output(m, None), 64_000, "{m} 是 64k，不是 128k");
+        }
+    }
+
+    /// 表**落后于发布**时的兜底：按世代单调、且**不跨档位**。
+    ///
+    /// 「表总会落后」是必然重演的，光补行治不了根。判据是「输出上限只涨不降」
+    /// （Anthropic 从 4.5 的 64k 涨到 4.6 的 128k，从未下调），故「同档位、世代不晚于我的
+    /// 已知条目里的最大值」是新模型的安全下界。
+    ///
+    /// **不跨档位**是必要的（这条最容易写错）：跨档位取最大会让 `claude-haiku-4-9`
+    /// 拿到 opus 的 128k，而 haiku 4-5 只有 64k → 上游直接 400。
+    #[test]
+    fn unlisted_claude_models_inherit_by_generation_within_tier() {
+        // 未来的 opus：至少拿到已知 opus 的最高值
+        assert_eq!(resolve_max_output("claude-opus-9", None), 128_000);
+        assert_eq!(resolve_max_output("claude-opus-4-9", None), 128_000);
+        // 未来的 haiku：**只**继承 haiku 的上限，不得拿 opus 的
+        assert_eq!(
+            resolve_max_output("claude-haiku-4-9", None),
+            64_000,
+            "跨档位继承会让 haiku 拿到 opus 的 128k → 上游 400"
+        );
+        // 全新档位（Anthropic 确实在 Fable 之外还发过 Mythos）：档位无已知条目 → 跨档位兜底
+        assert_eq!(resolve_max_output("claude-mythos-5", None), 128_000);
+        // 旧式 `claude-3-x` 命名（档位词在数字后面，取不到档位）→ 跨档位、世代 ≤3
+        assert_eq!(resolve_max_output("claude-3-9", None), 64_000);
+        // 完全不认识的名字仍走保守兜底，不瞎猜
+        assert_eq!(resolve_max_output("totally-unknown-llm", None), FALLBACK_MAX_OUTPUT);
+        // 非 Claude 家族不受影响（走 OTHER 表）
+        assert_eq!(resolve_max_output("glm-4.6", None), 96_000);
+    }
+
+    /// 用户手填**永远优先**，且手填 0 视为没填。
+    ///
+    /// 前者是自动取值的安全边界：自动值猜错时用户必须有出路，否则就成了「我改的不生效」。
+    /// 后者挡的是「填 0 = 不限制」这个直觉误解 —— `max_tokens: 0` 上游必然 400。
+    #[test]
+    fn user_value_wins_and_zero_means_unset() {
+        assert_eq!(resolve_max_output("claude-opus-5", Some(4_096)), 4_096, "手填优先");
+        assert_eq!(
+            resolve_max_output("claude-opus-5", Some(0)),
+            128_000,
+            "手填 0 视为没填，退回自动值 —— 而不是真发 max_tokens:0（必然 400）"
+        );
+    }
+
+    /// 世代号与档位的解析边界（上面两条测试的地基）。
+    #[test]
+    fn generation_and_tier_parsing() {
+        assert_eq!(claude_generation("claude-opus-4-8"), Some(4));
+        assert_eq!(claude_generation("claude-opus-5"), Some(5));
+        assert_eq!(claude_generation("claude-3-5"), Some(3));
+        assert_eq!(claude_generation("claude-fable-5"), Some(5));
+        // 点号写法（中转站常见）与前缀
+        assert_eq!(claude_generation("anthropic/claude-sonnet-4.6"), Some(4));
+        // 日期后缀（8 位）不该被当成世代号
+        assert_eq!(claude_generation("claude-sonnet-4-5-20250929"), Some(4));
+        assert_eq!(claude_generation("glm-4.6"), None, "非 Claude 不该解析出世代");
+
+        assert_eq!(claude_tier("claude-opus-5").as_deref(), Some("opus"));
+        assert_eq!(claude_tier("claude-fable-5").as_deref(), Some("fable"));
+        assert_eq!(
+            claude_tier("claude-3-5-sonnet"),
+            None,
+            "旧式命名里 claude- 后面就是数字，取不到档位（那一代上限本就不按档位分）"
         );
     }
 }
