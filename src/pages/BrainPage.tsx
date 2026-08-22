@@ -328,7 +328,7 @@ export function BrainPage() {
                           key={m.id}
                           className="flex items-center gap-2 rounded-control border border-border bg-surface px-2.5 py-2"
                         >
-                          <BrandIcon hint={k?.vendor ?? m.modelName} fallbackLabel={k?.name} iconUrl={vendorIcon(k?.vendor)} size={20} />
+                          <BrandIcon hint={k?.vendor ?? m.modelName} fallbackLabel={k?.name} iconUrl={k?.icon ?? vendorIcon(k?.vendor)} size={20} />
                           <div className="min-w-0 flex-1">
                             <div className="truncate text-xs font-medium text-text-primary">{k?.name ?? m.keyId}</div>
                             {k && k.models.length > 0 ? (

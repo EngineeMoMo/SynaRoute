@@ -19,6 +19,7 @@ import {
   tokensFromAmount,
   preferredUnit,
   amountForUnit,
+  fmtTokenShort,
 } from "@/lib/tokenUnit";
 import { balanceFingerprint, formatBalanceAmount } from "@/lib/balance";
 import { X, RefreshCw, Plus, Trash2, ArrowRight, Eye, EyeOff, Zap, Gauge, Brain, Download, AlertTriangle, Wallet, ChevronRight } from "lucide-react";
@@ -154,10 +155,6 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const loadCategory = useStore((s) => s.loadCategory);
   const storeCheckHealth = useStore((s) => s.checkHealth);
   const vendors = useStore((s) => s.vendors);
-  const loadVendors = useStore((s) => s.loadVendors);
-  // 厂商图标写盘失败必须弹 toast：这个操作没有「保存」按钮兜着，
-  // 静默失败就是「点了没反应」。
-  const showToast = useStore((s) => s.showToast);
   const setBalanceResult = useStore((s) => s.setBalanceResult);
   const clearBalance = useStore((s) => s.clearBalance);
   const t = useT();
@@ -206,14 +203,23 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const [probing, setProbing] = useState(false);
   // 计费倍率（如 "0.3" = 官方价三折）。存字符串，避免 0.1+0.2 那类浮点显示。
   const [costMultiplier, setCostMultiplier] = useState(initial?.costMultiplier ?? "");
+  /** 这条 Key 的图标覆盖（预设键或 data-URL）；undefined = 跟着厂商走。 */
+  const [icon, setIcon] = useState<string | undefined>(initial?.icon);
   const [fetching, setFetching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [invalidContextModels, setInvalidContextModels] = useState<Set<string>>(() => new Set());
   // 手动加模型输入框（不用原生 prompt()：WebView2 里行为不可靠）
   const [manualModel, setManualModel] = useState("");
-  // 厂商图标写盘中（禁用挑选器，避免连点打出并发 upsert）
-  const [savingVendorIcon, setSavingVendorIcon] = useState(false);
+  /**
+   * 各模型的「最大单次输出」内置默认值（模型名 → token）。只用于把占位提示写成
+   * 「自动 128K」，让用户看出这一项不用填。
+   *
+   * 取自后端 `resolve_max_output`（转发时用的同一个函数），**不在前端抄表** ——
+   * 抄一份必然漂移，而漂移的形态是「界面说 128K、实际发 8192」：用户照界面判断，
+   * 却拿到被截断的回答，且没有任何地方能看出不一致。
+   */
+  const [autoMaxOutputs, setAutoMaxOutputs] = useState<Record<string, number>>({});
 
   const draftId = initial?.id ?? `k_new`;
 
@@ -282,31 +288,8 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
 
   // 老 Key 的 vendor 值可能不在当前厂商列表里（自由文本历史值），补一个兜底 option 不丢显示
   const vendorMissing = vendor !== "" && !vendors.some((v) => v.id === vendor);
-  /** 当前所选厂商记录（历史自由文本值找不到时为 undefined，此时不显示图标预设入口）。 */
+  /** 当前所选厂商记录（历史自由文本值找不到时为 undefined）。图标兜底取它的 `icon`。 */
   const selectedVendor = vendors.find((v) => v.id === vendor);
-
-  /**
-   * 就地改「所选厂商」的图标预设。
-   *
-   * 立刻落盘而不是跟着「保存 Key」一起提交：它改的是**厂商**记录，与本 Key 的表单
-   * 不是同一份数据。攒到保存时一起写会让「点了图标却什么都没变」持续到用户保存为止，
-   * 而他改图标的意图是立刻看到效果（上面那行 BrandIcon 就该马上变）。
-   *
-   * 失败必须可见：厂商写入被后端拒（如厂商已被删）时静默吞掉会变成
-   * 「点了没反应」——本项目最忌讳的形态。
-   */
-  const applyVendorIcon = async (next: string | undefined) => {
-    if (!selectedVendor || selectedVendor.builtin) return;
-    setSavingVendorIcon(true);
-    try {
-      await api.upsertVendor({ ...selectedVendor, icon: next });
-      await loadVendors();
-    } catch (e) {
-      showToast("error", e instanceof Error ? e.message : String(e));
-    } finally {
-      setSavingVendorIcon(false);
-    }
-  };
 
   const handleFetchModels = async () => {
     if (!baseUrl.trim()) {
@@ -580,6 +563,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
           }
         : undefined,
     costMultiplier: costMultiplier.trim() || undefined,
+    icon,
   });
 
   /**
@@ -625,6 +609,32 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     // deps 精确取 serviceable_models() 真正会读的那几项，别用整个 draft（每次渲染都是新对象）
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeCategory, models, mappings, tierHaiku, tierSonnet, tierOpus]);
+
+  // 拉各模型的「最大单次输出」内置默认值，供占位提示显示成「自动 128K」。
+  //
+  // 只在**模型名集合**变化时拉（不是 models 整个数组）：用户在窗口/输出框里打字会让
+  // models 每次按键都变成新数组，跟着它拉等于每敲一个字符发一次 IPC。
+  // 失败静默退回静态占位 —— 这只是个提示，不该因为它让编辑器报错。
+  const modelNamesKey = models.map((m) => m.realName).join(" ");
+  useEffect(() => {
+    const names = modelNamesKey ? modelNamesKey.split(" ") : [];
+    if (names.length === 0) {
+      setAutoMaxOutputs({});
+      return;
+    }
+    let cancelled = false;
+    void api
+      .defaultMaxOutputs(names)
+      .then((m) => {
+        if (!cancelled) setAutoMaxOutputs(m);
+      })
+      .catch(() => {
+        if (!cancelled) setAutoMaxOutputs({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [modelNamesKey]);
 
   /** 是否已有「填完整」的映射行——决定 serviceable_models 走映射还是走 models 列表。 */
   const hasEffectiveMapping = mappings.some((m) => m.expectedName.trim() && m.realName.trim());
@@ -764,7 +774,12 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
           <div className="flex gap-3">
             <Field label={t("editor.vendor")} className="flex-1">
               <div className="flex items-center gap-2">
-                <BrandIcon hint={vendor} fallbackLabel={vendor} iconUrl={selectedVendor?.icon} size={28} />
+                <BrandIcon
+                  hint={vendor}
+                  fallbackLabel={name || vendor}
+                  iconUrl={icon ?? selectedVendor?.icon}
+                  size={28}
+                />
                 <select className={inputCls} value={vendor} onChange={(e) => handleVendorChange(e.target.value)}>
                   {vendors.map((v) => (
                     <option key={v.id} value={v.id}>{v.name}</option>
@@ -772,31 +787,20 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                   {vendorMissing && <option value={vendor}>{vendor}</option>}
                 </select>
               </div>
-              {/* 图标预设：就地告诉程序「这个站是哪家的」。
-                  为什么要在这里也放一个（厂商管理页已有一个）：新增 Key 是用户唯一必经的
-                  流程，而中转站名字千奇百怪（「小明API」「林夕公益站」）猜不中时只剩首字母
-                  色块 —— 此刻他正看着那个色块，却要被打断去另一个页面才能改。
-
-                  **写的是所选厂商的 `icon` 字段，不是 Key 的**：`ProviderKey` 没有 icon，
-                  Key 的图标一直来自它的厂商（上面那行 BrandIcon 就是这么取的）。
-                  给 Key 加一个平行的 icon 字段会造出第二个事实来源 —— 同一厂商下两条 Key
-                  显示不同图标，而用户以为自己改的是「这家的图标」。
-                  内置厂商禁用：它们是只读的（与厂商管理页同一条规则），
-                  改了也会被下次启动的内置表覆盖，属静默失效。 */}
-              {selectedVendor && (
-                <div className="mt-2">
-                  <div className="mb-1.5 text-[11px] text-text-muted">
-                    {selectedVendor.builtin
-                      ? t("editor.iconPresetBuiltin", { name: selectedVendor.name })
-                      : t("editor.iconPresetLabel", { name: selectedVendor.name })}
-                  </div>
-                  <BrandPresetPicker
-                    value={selectedVendor.icon}
-                    disabled={selectedVendor.builtin || savingVendorIcon}
-                    onChange={(next) => void applyVendorIcon(next)}
-                  />
-                </div>
-              )}
+              {/* 图标预设：**写这条 Key 自己的 `icon`**，不写厂商。
+                  原设计写厂商，被真机否掉了：绝大多数中转站 Key 选的厂商就是内置的
+                  「自定义」，而内置厂商只读 → 界面显示「图标不可修改」，
+                  而这恰恰是最需要选图标的场景（真机原话：「自定义时是需要能选预设图标，
+                  你设置的不能更改 不对」）。
+                  另一层理由：「自定义」下会挂很多条指向不同站点的 Key，
+                  把图标记在那个共享厂商上，改一条会连带改掉其余全部。
+                  故**任何厂商下都可选**（含内置），选中的值只作用于当前这条 Key；
+                  留空则跟着厂商走，与旧行为一致。 */}
+              <div className="mt-2">
+                <div className="mb-1.5 text-[11px] text-text-muted">{t("editor.iconPresetLabel")}</div>
+                <BrandPresetPicker value={icon} onChange={setIcon} />
+                <p className="mt-1.5 text-[11px] text-text-muted">{t("editor.iconPresetHint")}</p>
+              </div>
             </Field>
             <Field label={t("editor.protocol")} className="w-48">
               <select
@@ -968,6 +972,12 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                         私有模型名内置表认不出，填上这个值该模型才能参与大脑聚合。
                         复用 ContextWindowInput 的 K/M 单位与非法值拦截逻辑（同一套交互）。
 
+                        **占位提示显示后端推导出的默认值**（如「自动 128K」），而不是静态的
+                        「如 64」。后端早就会自动取默认值了，但这个框是空的、占位写着「如 64」——
+                        用户当然以为必须自己填（真机反馈原话：「最大单次输出依旧需要用户填写」）。
+                        一个已经生效的自动化，只要界面不说，对用户就等于不存在。
+                        值来自 `api.defaultMaxOutputs`，调的是转发时同一个函数，不另抄表。
+
                         **仅 Anthropic 协议显示**：max_tokens 是 Anthropic 的必填字段，
                         这个值只在 budget.rs 的 Anthropic 分支被消费（output_budget 对
                         OpenAI Chat/Responses 直接返回 None、不发上限）。若对所有协议显示，
@@ -990,7 +1000,11 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                       }
                       title={t("editor.maxOutput")}
                       unitTitle={t("editor.maxOutputUnit")}
-                      placeholder={t("editor.maxOutputPlaceholder")}
+                      placeholder={
+                        autoMaxOutputs[m.realName] !== undefined
+                          ? t("editor.maxOutputAuto", { v: fmtTokenShort(autoMaxOutputs[m.realName]) })
+                          : t("editor.maxOutputPlaceholder")
+                      }
                     />
                     )}
                     <button

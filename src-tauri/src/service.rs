@@ -1652,6 +1652,7 @@ mod tests {
             balance_query: None,
             cached_balance: None,
             cost_multiplier: None,
+            icon: None,
             health: HealthState::default(),
         }
     }

@@ -52,6 +52,22 @@ export function preferredUnit(tokens: number | undefined): TokenUnit {
 }
 
 /**
+ * 人类可读的短写（`128000` → `128K`、`1000000` → `1M`、`8192` → `8192`）。
+ *
+ * 只用于**展示**（如「自动 128K」这类占位提示），不参与任何换算 —— 故复用
+ * `preferredUnit` + `amountForUnit` 那套无损逻辑，而不是随手写个 `/1000`：
+ * 后者会把 8192 显示成 `8.192K`，读起来比原数还费劲。
+ */
+export function fmtTokenShort(tokens: number): string {
+  const unit = preferredUnit(tokens);
+  const amount = amountForUnit(tokens, unit);
+  // 带小数就说明这个数不是该单位的整数倍（如 8192 在 K 下是 8.192），
+  // 那时原样报 token 数更好读。
+  if (amount.includes(".")) return String(tokens);
+  return unit === "token" ? amount : `${amount}${unit}`;
+}
+
+/**
  * 按当前单位**无损**反算显示值。
  *
  * 不能用 `String(tokens / multiplier)`：接近 `Number.MAX_SAFE_INTEGER` 时二进制浮点

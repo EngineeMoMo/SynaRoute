@@ -374,6 +374,7 @@ mod tests {
             balance_query: None,
             cached_balance: None,
             cost_multiplier: None,
+            icon: None,
             health: HealthState::default(),
         };
         store.upsert_key(key).unwrap();
@@ -488,6 +489,7 @@ mod tests {
                     balance_query: None,
                     cached_balance: None,
                     cost_multiplier: None,
+                    icon: None,
                     health: HealthState::default(),
                 })
                 .unwrap();
@@ -558,6 +560,7 @@ mod tests {
                 balance_query: None,
                 cached_balance: None,
                 cost_multiplier: None,
+                icon: None,
                 health,
             }
         };
@@ -644,6 +647,7 @@ mod tests {
                 balance_query: None,
                 cached_balance: None,
                 cost_multiplier: None,
+                icon: None,
                 health: HealthState::default(),
             })
             .unwrap();
@@ -773,6 +777,7 @@ mod tests {
             balance_query: None,
             cached_balance: None,
             cost_multiplier: None,
+            icon: None,
             health: HealthState::default(),
         }
     }

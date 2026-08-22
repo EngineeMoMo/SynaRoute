@@ -334,8 +334,8 @@ const zh: Dict = {
   "editor.vendor": "厂商",
   // 图标预设：写的是**所选厂商**的图标，不是这条 Key 的（ProviderKey 没有 icon 字段，
   // Key 的图标一直来自它的厂商）。文案必须点明厂商名，否则用户会以为只影响当前这条 Key。
-  "editor.iconPresetLabel": "「{name}」的图标（选一个内置品牌；再点一次取消）",
-  "editor.iconPresetBuiltin": "「{name}」是内置厂商，图标不可修改",
+  "editor.iconPresetLabel": "图标（选一个内置品牌；再点一次取消）",
+  "editor.iconPresetHint": "只作用于这条 Key。留空则跟随厂商，或按名称自动识别。",
   "editor.vendorPlaceholder": "anthropic / glm / custom",
   "editor.protocol": "协议",
   "editor.baseUrl": "Base URL",
@@ -392,6 +392,9 @@ const zh: Dict = {
   "editor.maxOutput":
     "最大单次输出（与上下文窗口不同：如 Claude 5 系是 1M 窗口 / 128K 输出）。**一般留空即可** —— 内置能力表按厂商与世代自动取官方默认值；只有在自动值明显不对（回答被提前截断，或上游报 max_tokens 超限）时才需要手填覆盖",
   "editor.maxOutputPlaceholder": "如 64",
+  // 占位提示带上后端推导出的默认值 —— 让用户一眼看出「这一项不用填」。
+  // 后端早就自动取默认值了，但界面空框 + 「如 64」让用户以为必须自己填（真机反馈）。
+  "editor.maxOutputAuto": "自动 {v}（可留空）",
   "editor.maxOutputUnit": "单位（token / K / M）",
   "editor.oneMHint": "窗口 ≥ 1M 时自动启用 1M 上下文（转发时补 anthropic-beta 头），Claude Code / CLI 与桌面端均生效",
   "editor.errNeedName": "请填写 Key 名称",
@@ -1127,8 +1130,8 @@ const en: Dict = {
   "editor.name": "Key name (label)",
   "editor.namePlaceholder": "e.g. Provider 1 (official direct)",
   "editor.vendor": "Vendor",
-  "editor.iconPresetLabel": "Icon for \"{name}\" (pick a built-in brand; click again to clear)",
-  "editor.iconPresetBuiltin": "\"{name}\" is a built-in vendor — its icon can't be changed",
+  "editor.iconPresetLabel": "Icon (pick a built-in brand; click again to clear)",
+  "editor.iconPresetHint": "Applies to this key only. Leave blank to follow the vendor or auto-detect.",
   "editor.vendorPlaceholder": "anthropic / glm / custom",
   "editor.protocol": "Protocol",
   "editor.baseUrl": "Base URL",
@@ -1182,6 +1185,7 @@ const en: Dict = {
   "editor.maxOutput":
     "Max single output (different from the context window: the Claude 5 family has a 1M window but 128K output). **Normally leave this empty** — the built-in table picks each vendor's and generation's official default. Only override it when the automatic value is clearly wrong (answers cut short, or the upstream complains max_tokens is over the limit).",
   "editor.maxOutputPlaceholder": "e.g. 64",
+  "editor.maxOutputAuto": "auto {v} (leave blank)",
   "editor.maxOutputUnit": "Unit (token / K / M)",
   "editor.oneMHint": "A window ≥ 1M enables 1M context automatically (an anthropic-beta header is added when forwarding); applies to Claude Code / CLI and the desktop app",
   "editor.errNeedName": "Please enter a key name",

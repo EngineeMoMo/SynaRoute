@@ -49,7 +49,9 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast,
   const setPrimaryKey = useStore((s) => s.setPrimaryKey);
   const vendors = useStore((s) => s.vendors);
   const t = useT();
-  const vendorIcon = vendors.find((v) => v.id === k.vendor)?.icon;
+  // Key 自己的 icon 覆盖优先于厂商的（见 ProviderKey.icon：「自定义」下多条 Key 各指不同站点，
+  // 图标必须能单独设）。两者都空才退回按名字启发式猜。
+  const vendorIcon = k.icon ?? vendors.find((v) => v.id === k.vendor)?.icon;
   // 就地二次确认：不用原生 confirm()（在 Tauri WebView2 里行为不可靠，会导致删除不触发）
   const [confirmingDelete, setConfirmingDelete] = React.useState(false);
   // 模型徽标折叠态（UX-3）：超过 3 个时默认折叠，点击「+N」展开

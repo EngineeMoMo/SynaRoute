@@ -518,6 +518,9 @@ fn import_rows(
             balance_query: None,
             cached_balance: None,
             cost_multiplier: None,
+            // 导入不带图标覆盖：让它跟着厂商（统一标成 `cc-switch`）走。
+            // cc-switch 那边 16 个中转站的 `icon` 实测全是 None，本就没有可搬的值。
+            icon: None,
             health: Default::default(),
         };
 

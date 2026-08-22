@@ -449,6 +449,22 @@ pub struct ProviderKey {
     /// 真正参与运算时才 parse 一次（见 `pricing::calculate_cost_nano`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_multiplier: Option<String>,
+    /// 这条 Key 的图标**覆盖值**：预设品牌键（`anthropic`/`zhipu`…）或用户上传的 data-URL。
+    ///
+    /// ## 为什么 Key 自己要有一个，而不是只用厂商的
+    ///
+    /// 原设计是「Key 的图标一律来自它的厂商」，理由是不想有两个事实来源。真机否掉了这个判断：
+    /// 绝大多数中转站 Key 选的厂商就是内置的**「自定义」**，而内置厂商是只读的
+    /// —— 于是「想给这条 Key 配个 Claude 图标」在界面上是一条走不通的路
+    /// （真机原话：「自定义时是需要能选预设图标，你设置的不能更改 不对」）。
+    ///
+    /// 而且「自定义」下会挂很多条互不相干的 Key（各指不同中转站），
+    /// 把图标记在那个共享的厂商上，语义本来就不对：改一条会连带改掉其余全部。
+    ///
+    /// 优先级：**本字段 > 厂商 `icon` > 按名字启发式猜 > 首字母色块**。
+    /// `None` 表示「跟着厂商走」，与旧配置行为完全一致（故老数据无需迁移）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 /// 余额查询配置（对齐 cc-switch 的 `usage_script`，但不执行用户代码）。
@@ -2184,6 +2200,7 @@ mod tests {
             balance_query: None,
             cached_balance: None,
             cost_multiplier: None,
+            icon: None,
             health: HealthState::default(),
         }
     }
