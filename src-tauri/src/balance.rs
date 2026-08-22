@@ -66,11 +66,11 @@ const REMAINING_CANDIDATES: &[&str] = &[
     "data.balance",
     "data.remaining",
     "data.quota.remaining",
-    // ⚠️ `data.quota`：NewAPI/OneAPI 架构里这是**内部计费单位**（默认 500000 = 1 USD，且
-    // QuotaPerUnit 由站长可配），不是 USD。这里**刻意不缩放**：硬编码 500000 对改过配额比率的
-    // 实例会错，且若别家用 `data.quota` 存的本就是 USD，除以 50 万会变约 0 → 反而违反「绝不返回
-    // 0」。NewAPI 中转站的**正确**取值路径是 relay 模板的 `hard_limit_usd`（已是 USD，见下）；
-    // 此项仅作没有更精确字段时的兜底，命中它时数值可能偏大，属已知局限（详见余额文档）。
+    // ⚠️ `data.quota` / `quota`：NewAPI/OneAPI 架构里这是**内部计费单位**，不是 USD。
+    // 换算比率由站点的公开接口 `/api/status` 给出（`quota_per_unit`，实测两站都是 500000），
+    // 由 `newapi_quota_needs_scaling` + `read_newapi_quota_unit` 现场读取后缩放 ——
+    // **不硬编码 500000**（站长可改），也不再「刻意不缩放」（那会显示成 308240000 这种
+    // 荒谬大数，与 hard_limit_usd 那条是同一类错误）。读不到比率时报失败，不猜。
     "data.quota",
     "credit",
     "data.credit",
@@ -650,7 +650,7 @@ pub async fn query_balance(
             return r;
         }
         if informative_err.is_none()
-            && r.error.as_deref().is_some_and(|e| e.contains(BILLING_LIMIT_MARKER))
+            && r.error.as_deref().is_some_and(failure_explains_root_cause)
         {
             informative_err = Some(r.clone());
         }
@@ -772,18 +772,47 @@ async fn query_one_endpoint(
 
     match serde_json::from_str::<Value>(&text) {
         Ok(v) => {
-            let result = extract_balance(&v, cfg.remaining_path.as_deref());
+            let mut result = extract_balance(&v, cfg.remaining_path.as_deref());
             // 只拿到「配额上限」而没有余额：如实报失败并指路，**不拿 `上限 − 已用` 充当余额**。
             // 两次真机都证明那个数字是错的（10000 / 99,998,820.48 vs 真实 616.48），
             // 完整理由见 `billing_limit_is_not_a_balance`。
-            // 顺手把配对端点的「已用」读出来放进文案 —— 那个数是真的，对用户有用。
+            // 顺手把配对端点的「已用」读出来放进文案 —— 那个数是真的，对用户有用；
+            // 再顺手探一次 `/api/status`，认出 NewAPI 站就能给出**精确**的出路而不是泛泛指引。
             if let Some(limit) = billing_limit_is_not_a_balance(&v, cfg.remaining_path.as_deref()) {
                 let used = read_billing_usage_usd(
                     &client, &url, secret, auth_scheme, access_token, user_id, timeout,
                     key.protocol,
                 )
                 .await;
-                return BalanceResult::failed(billing_limit_reason(limit, used));
+                let is_newapi =
+                    read_newapi_quota_unit(&client, &origin_of(base), timeout).await.is_some();
+                return BalanceResult::failed(billing_limit_reason(limit, used, is_newapi));
+            }
+            // NewAPI 的内部计费单位 → 按站点公开的 `quota_per_unit` 换成钱。
+            // 不缩放会把 616.48 USD 显示成 308240000（与上面那条同类的错数字）；
+            // 硬编码 500000 又会在改过比率的实例上错 —— 故现场问站点要。
+            if let Some(raw) = newapi_quota_needs_scaling(&v, cfg.remaining_path.as_deref()) {
+                match read_newapi_quota_unit(&client, &origin_of(base), timeout).await {
+                    Some((per_unit, unit)) => {
+                        result.remaining = Some(raw / per_unit);
+                        // 站点自报的显示单位优先（sotamodel 给 "USD"）；没给就沿用已解析的。
+                        if let Some(u) = unit {
+                            result.unit = Some(u);
+                        }
+                        // total / used 若也取自同一套内部单位，一并换算，否则百分比会离谱。
+                        result.total = result.total.map(|t| t / per_unit);
+                        result.used = result.used.map(|u| u / per_unit);
+                    }
+                    // 读不到比率就**不猜**：宁可如实说，也不给一个可能差 50 万倍的数字。
+                    None => {
+                        return BalanceResult::failed(format!(
+                            "该站点的余额是 NewAPI 的{NEWAPI_QUOTA_MARKER}{raw}），\
+                             而换算比率要从它的 `{NEWAPI_STATUS_PATH}` 读，这次读不到。\n\
+                             直接显示 {raw} 会差出几十万倍，故不显示。\
+                             可在「取值路径」手填已是货币单位的字段，或稍后重试。"
+                        ));
+                    }
+                }
             }
             result
         }
@@ -809,31 +838,128 @@ async fn query_one_endpoint(
     }
 }
 
+/// NewAPI / OneAPI 系的**公开**状态接口（无需任何认证）。
+///
+/// 它给出两件我们必需的东西（2026-08-22 实测 agentrouter.org 与 sotamodel.net）：
+/// - `data.quota_per_unit`：内部计费单位与货币的换算比率，两站都是 **500000**（= 1 USD）；
+/// - `data.quota_display_type`：显示单位（sotamodel 给 `"USD"`）。
+///
+/// **它同时是一个免费的站点指纹**：能读到 `quota_per_unit` 就说明这是 NewAPI 系，
+/// 于是我们能精确地告诉用户「余额在 `/api/user/self`，而它要面板 Access Token」——
+/// 而不是让他从一句「找不到余额字段」里猜。
+const NEWAPI_STATUS_PATH: &str = "/api/status";
+
+/// 本次返回的余额是否取自 NewAPI 的**内部计费单位**字段（`quota` / `data.quota`）。
+///
+/// 返回 `Some(原始值)` 表示需要按 `quota_per_unit` 缩放才能变成钱。
+///
+/// ## 为什么必须缩放（而不是像从前那样「刻意不缩放」）
+///
+/// 旧注释的顾虑是「硬编码 500000 对改过比率的实例会错」。这个顾虑对，但结论错了 ——
+/// 正确做法不是放弃缩放，而是**去问站点要比率**（`/api/status` 公开、免认证）。
+/// 不缩放的后果实测是把 616.48 USD 显示成 `308240000`，与 `hard_limit_usd` 那条
+/// 属同一类「给用户一个会当真的错数字」。
+///
+/// 判据同 [`billing_limit_is_not_a_balance`]：只在「余额**确实取自**该字段」时成立；
+/// 用户显式填了取值路径时一律尊重用户，不做任何自动干预。
+fn newapi_quota_needs_scaling(body: &Value, custom_path: Option<&str>) -> Option<f64> {
+    if custom_path.map(str::trim).is_some_and(|s| !s.is_empty()) {
+        return None;
+    }
+    let quota = find_number(body, &["data.quota", "quota"])?;
+    // 候选链取到的值等于 quota → 说明前面更精确（已是货币）的字段都没命中。
+    // 用 f64 相等比较是安全的：两者取自**同一个** JSON 数字，没有中间运算。
+    let hit = derive_openrouter_remaining(body)
+        .or_else(|| find_number_scaled(body, REMAINING_CANDIDATES))?;
+    (hit == quota).then_some(quota)
+}
+
+/// 读站点的 `quota_per_unit` 与显示单位（公开接口，不带任何认证）。
+///
+/// `origin` 是站点根（`https://x.com`）。返回 `(每单位货币对应的 quota, 显示单位)`。
+/// 读不到就返回 `None` —— 调用方**不许猜一个 500000 顶上**：那正是旧实现被否掉的做法。
+async fn read_newapi_quota_unit(
+    client: &reqwest::Client,
+    origin: &str,
+    timeout: Duration,
+) -> Option<(f64, Option<String>)> {
+    let url = format!("{}{NEWAPI_STATUS_PATH}", origin.trim_end_matches('/'));
+    let resp = client.get(&url).timeout(timeout).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(&resp.text().await.ok()?).ok()?;
+    let per_unit = find_number(&v, &["data.quota_per_unit", "quota_per_unit"])?;
+    // 比率必须是正数：0 或负数会让除法产出 inf / 负余额（本项目已被 `"inf"` 咬过一次）。
+    if !(per_unit.is_finite() && per_unit > 0.0) {
+        return None;
+    }
+    let unit = find_string(&v, &["data.quota_display_type", "quota_display_type"]);
+    Some((per_unit, unit))
+}
+
 /// 「只拿到配额上限」这条失败的标识串。
 ///
-/// 生产方 [`billing_limit_reason`] 与消费方（[`query_balance`] 的探测循环）**共用这一个常量**，
-/// 避免两处各写一遍字面量而漂移。探测循环靠它把这条**有信息量**的失败挑出来当最终报告 ——
-/// 否则用户看到的是第一个候选那句干巴巴的 404，而真正解释了「为什么查不到」的是这条。
+/// 生产方 [`billing_limit_reason`] 与消费方（[`failure_explains_root_cause`]）**共用这一个常量**，
+/// 避免两处各写一遍字面量而漂移。
 const BILLING_LIMIT_MARKER: &str = "hard_limit_usd = ";
+
+/// 「拿到的是 NewAPI 内部计费单位、但读不到换算比率」这条失败的标识串。
+const NEWAPI_QUOTA_MARKER: &str = "内部计费单位（quota = ";
+
+/// 这条失败**解释了根因**吗（而不只是「404 / 找不到字段」）。
+///
+/// 探测链会按序试几个端点，最终只能报一条。默认报第一条（最可能对的那个端点），
+/// 但若某条失败其实**说清了为什么查不到**，那条才是用户需要看的 ——
+/// 否则界面上是一句干巴巴的 `404 not found`，而真正的原因（「这站的余额要面板 Access Token」
+/// 或「拿到的是内部计费单位、比率读不到」）被丢在了后面的候选里。
+///
+/// 判据集中在这里、由各生产方共用常量，是为了不让「谁算有信息量」散落成一串字面量比较。
+fn failure_explains_root_cause(err: &str) -> bool {
+    err.contains(BILLING_LIMIT_MARKER) || err.contains(NEWAPI_QUOTA_MARKER)
+}
 
 /// 「只拿到配额上限」时的失败文案。
 ///
 /// 必须可行动，且必须把**已读到的真实信息**说出来：`used` 来自配对的 usage 端点，
 /// 它与站点网页上的「历史消耗」实测逐位吻合（agentrouter.org：1179.52），对用户有用。
 /// 而 `limit` 要原样报出来 —— 用户看到 `100000000` 自己就明白那是「无限额」而非余额。
-fn billing_limit_reason(limit: f64, used: Option<f64>) -> String {
+///
+/// `is_newapi` = 站点的公开 `/api/status` 认出来了（见 [`NEWAPI_STATUS_PATH`]）。
+/// 认出来时给的是**精确到字段**的操作步骤，而不是「请填真实的余额接口」这种等于没说的话：
+/// 实测 agentrouter.org 的 `/api/user/self` 明确回「access token 无效」——
+/// 转发用的 API Key 就是拿不到余额，只有面板 Access Token 行。这一步不告诉用户，
+/// 他会一直以为是我们没查对。
+fn billing_limit_reason(limit: f64, used: Option<f64>, is_newapi: bool) -> String {
     let used_part = match used {
         Some(u) => format!("已用约 {u:.2} USD（这个数是准的，与站点「历史消耗」同源）。"),
         None => String::new(),
     };
-    format!(
+    let head = format!(
         "该站点的计费接口只给「配额上限」（{BILLING_LIMIT_MARKER}{limit}），没有余额字段。\
          {used_part}\n\
          上限不是余额：{limit} 这类数字在 NewAPI 系里通常表示「无限额」，\
-         拿它减掉已用得到的不是你的余额（实测会差出几个数量级），故这里不显示。\n\
-         请在「查询地址」里填这个站点真实的余额接口，或在「取值路径」指定余额字段；\
-         若站点只有网页版账单、没有开放接口，则无法查询余额。"
-    )
+         拿它减掉已用得到的不是你的余额（实测会差出几个数量级），故这里不显示。\n"
+    );
+    if is_newapi {
+        format!(
+            "{head}\
+             已认出这是 **NewAPI 架构**的站点。它的余额在 `/api/user/self`，\
+             而那个接口**只认面板 Access Token、不认转发用的 API Key**（实测会回\
+             「access token 无效」）。按下面四步填一次即可：\n\
+             ① 到站点网页 → 个人设置 → 生成 **Access Token**；\n\
+             ② 在本页展开「凭证覆盖」，把它填进 **Access Token**；\n\
+             ③ **用户 ID** 填站点网页上你的 ID（个人设置页顶部那个数字）；\n\
+             ④ **认证方式**选 `access-token`，**查询地址留空**（会自动探到 /api/user/self）。\n\
+             填好后点「测试查询」—— 内部计费单位会按站点公开的 quota_per_unit 自动换算成钱。"
+        )
+    } else {
+        format!(
+            "{head}\
+             请在「查询地址」里填这个站点真实的余额接口，或在「取值路径」指定余额字段；\
+             若站点只有网页版账单、没有开放接口，则无法查询余额。"
+        )
+    }
 }
 
 /// 读配对的 usage 端点拿「已用美元」；读不到返回 `None`（纯信息用途，不影响成败判定）。
@@ -1021,6 +1147,111 @@ mod tests {
         );
     }
 
+    /// **NewAPI 内部计费单位必须换成钱** —— 这条直接钉住真机那个 616.48。
+    ///
+    /// ## 取证（2026-08-22，拿用户 cc-switch 库里的明文 token 实打）
+    ///
+    /// agentrouter.org 的实际行为：
+    /// - `/v1/usage` → **404**（我们探测链的第一条对这个站无效）；
+    /// - `/api/user/self` → `{"message":"无权进行此操作，access token 无效"}`
+    ///   —— **转发用的 API Key 拿不到余额**，只有面板 Access Token 行；
+    /// - `/api/status` → **公开、免认证**，返回 `data.quota_per_unit = 500000`
+    ///   （sotamodel.net 同样是 500000，且另给 `quota_display_type = "USD"`）。
+    ///
+    /// 于是余额链闭合：`quota / quota_per_unit`。验算 `308240000 / 500000 = 616.48`，
+    /// 与站点网页显示的「当前余额 $616.48」一致。
+    ///
+    /// ## 为什么不硬编码 500000
+    ///
+    /// 站长可以改 `QuotaPerUnit`。旧注释因此选择「刻意不缩放」，但那个结论是错的 ——
+    /// 不缩放会把 616.48 显示成 `308240000`，与 `hard_limit_usd` 那条属同一类错数字。
+    /// 正确做法是**去问站点要比率**（那个接口公开、免认证、零成本）。
+    ///
+    /// 四个方向一起钉：
+    /// 1. 能读到比率 → 换算出 616.48，单位取站点自报的；
+    /// 2. 读**不**到比率 → 报失败，**不许**猜 500000 顶上（差 50 万倍）；
+    /// 3. 比率 ≤ 0 或非有限 → 当作读不到（否则除出 inf / 负余额，本仓被 `"inf"` 咬过一次）；
+    /// 4. 上游给的已是货币字段（`remaining` 等）→ 不走缩放，原样用。
+    #[tokio::test]
+    async fn newapi_internal_quota_is_scaled_into_money() {
+        // ① 正常：quota + 公开的 quota_per_unit → 616.48
+        static OK_ROUTES: &[(&str, u16, &str)] = &[
+            ("/api/user/self", 200, r#"{"success":true,"data":{"quota":308240000,"username":"x"}}"#),
+            (
+                "/api/status",
+                200,
+                r#"{"data":{"quota_per_unit":500000,"quota_display_type":"USD","price":7.3}}"#,
+            ),
+        ];
+        let base = spawn_path_mock(OK_ROUTES).await;
+        let key = ProviderKey { base_url: base, ..Default::default() };
+        let cfg = BalanceQuery { enabled: true, ..Default::default() };
+        let r = query_balance(&key, &cfg, "sk-test").await;
+        assert!(r.ok, "应换算成功：{:?}", r.error);
+        assert_eq!(
+            r.remaining,
+            Some(616.48),
+            "308240000 / 500000 = 616.48，与站点网页显示的当前余额一致；\
+             不缩放会显示成 308240000（差 50 万倍）"
+        );
+        assert_eq!(r.unit.as_deref(), Some("USD"), "单位取站点自报的 quota_display_type");
+
+        // ② 读不到比率 → 报失败，绝不猜 500000
+        static NO_STATUS: &[(&str, u16, &str)] = &[(
+            "/api/user/self",
+            200,
+            r#"{"success":true,"data":{"quota":308240000}}"#,
+        )];
+        let base = spawn_path_mock(NO_STATUS).await;
+        let key = ProviderKey { base_url: base, ..Default::default() };
+        let r = query_balance(&key, &cfg, "sk-test").await;
+        assert!(!r.ok, "拿不到换算比率时不得出数字");
+        let err = r.error.unwrap_or_default();
+        assert!(err.contains("308240000"), "要把原始值报出来供用户判断：{err}");
+        assert!(err.contains(NEWAPI_STATUS_PATH), "要说清比率该从哪读：{err}");
+
+        // ③ 比率非法（0）→ 同样当读不到，不得除出 inf
+        static BAD_UNIT: &[(&str, u16, &str)] = &[
+            ("/api/user/self", 200, r#"{"success":true,"data":{"quota":100}}"#),
+            ("/api/status", 200, r#"{"data":{"quota_per_unit":0}}"#),
+        ];
+        let base = spawn_path_mock(BAD_UNIT).await;
+        let key = ProviderKey { base_url: base, ..Default::default() };
+        let r = query_balance(&key, &cfg, "sk-test").await;
+        assert!(!r.ok, "比率为 0 时不得产出 inf 余额");
+
+        // ④ 上游给的已是货币字段 → 不走缩放
+        let money = serde_json::json!({ "data": { "remaining": 12.5, "quota": 6_250_000 } });
+        assert!(
+            newapi_quota_needs_scaling(&money, None).is_none(),
+            "remaining 已是货币，不该再按 quota 缩放"
+        );
+        assert_eq!(extract_balance(&money, None).remaining, Some(12.5));
+    }
+
+    /// 认出 NewAPI 站时，「只有配额上限」的失败必须给**精确到字段**的四步操作。
+    ///
+    /// 泛泛一句「请填真实的余额接口」等于没说 —— 用户根本不知道 agentrouter 的余额
+    /// 藏在 `/api/user/self` 后面、且那个接口不认转发用的 API Key（实测回
+    /// 「access token 无效」）。不告诉他，他会一直以为是我们没查对。
+    #[test]
+    fn newapi_site_gets_precise_four_step_instructions() {
+        let newapi = billing_limit_reason(100_000_000.0, Some(1179.52), true);
+        assert!(newapi.contains("NewAPI"), "要点明站点架构：{newapi}");
+        assert!(newapi.contains("/api/user/self"), "要说出余额到底在哪个接口：{newapi}");
+        assert!(
+            newapi.contains("Access Token") && newapi.contains("用户 ID"),
+            "要说清要填哪两样：{newapi}"
+        );
+        assert!(newapi.contains("access-token"), "要说清认证方式选哪个：{newapi}");
+        assert!(newapi.contains("查询地址留空"), "留空才会自动探到 /api/user/self：{newapi}");
+
+        // 认不出架构时不许编造这套步骤（那会把用户送去一个不存在的设置页）
+        let generic = billing_limit_reason(10_000.0, None, false);
+        assert!(!generic.contains("/api/user/self"), "认不出时不得编造具体接口：{generic}");
+        assert!(generic.contains("查询地址"), "仍要给出泛化出路：{generic}");
+    }
+
     /// 探测全部落空时：报**第一条**（最可能对的）的错，并列出试过哪些。
     ///
     /// 只报最后一条会把用户引向 `hard_limit_usd` 那个最不可能的路径 ——
@@ -1203,7 +1434,7 @@ mod tests {
         );
 
         // ④ 文案可行动：上限原值 + 已用 + 出路，且带供探测循环识别的标识串
-        let reason = billing_limit_reason(100_000_000.0, Some(1179.52));
+        let reason = billing_limit_reason(100_000_000.0, Some(1179.52), false);
         assert!(reason.contains("100000000"), "要把上限原值报出来：{reason}");
         assert!(reason.contains("1179.52"), "已用是准的，要说出来：{reason}");
         assert!(reason.contains("查询地址"), "要指出去哪里填：{reason}");
