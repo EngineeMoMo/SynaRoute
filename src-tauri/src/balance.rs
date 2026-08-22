@@ -568,28 +568,66 @@ pub fn extract_balance(body: &Value, custom_path: Option<&str>) -> BalanceResult
 /// 判据是「**余额确实取自 hard_limit_usd**」而不是「响应里有 hard_limit_usd」：
 /// 若上游同时给了更精确的 `remaining`（候选链里排在前面），那个值本身就是剩余，
 /// 再去减一次 usage 会把余额算成负数。
-/// 本次返回是不是「只有配额上限、没有余额」的 OpenAI 兼容计费形态。
+/// `hard_limit_usd` 被视为「不限额哨兵」的下限（USD）。
 ///
-/// ## 为什么必须判成失败，而不是拿 `上限 − 已用` 当余额
+/// ## 为什么需要一条线，而不是「一律信」或「一律不信」
 ///
-/// 两次真机实测，两次都给出了用户会当真的错数字：
-/// - **sotamodel.net**：`hard_limit_usd = 10000`（NewAPI 默认值）→ 卡片显示「10000 USD」，
-///   而且花多少都不变；
-/// - **agentrouter.org**：`hard_limit_usd = 100000000`（1e8，NewAPI 表达「无限额」的哨兵）
+/// NewAPI/OneAPI 的 `/v1/dashboard/billing/subscription` 里 `hard_limit_usd` 的语义随
+/// token 类型分岔（两站实测 + 站点网页对账得出）：
+///
+/// - **限额 token**：它就是这条 token 的额度，`上限 − 已用` = **真实剩余**。
+///   这条路径**零配置就能算对**，是绝不该砍掉的。
+/// - **不限额 token**：站点填一个固定大数当哨兵，与余额毫无关系。实测
+///   agentrouter.org = `100000000`（而 `历史消耗 1179.52 + 当前余额 616.48 = 1796`，
+///   和 1e8 差 5 个数量级）；sotamodel.net = `10000`（文档记着「花多少都不变」）。
+///
+/// 响应体里没有字段能直接区分两者，故用数值量级做判据：中转站的 API token 真实额度
+/// 几乎不可能 ≥ 1 万美元，而两个已知哨兵恰好都 ≥ 1 万。取值刻意贴着观测值，
+/// 而不是拍一个更大的数 —— 定太高（如 1e6）就会让 sotamodel 的 10000 漏过去，
+/// 又变成「显示一个花多少都不变的假余额」。
+///
+/// 判错的两个方向都有出路且不静默：
+/// - 真有 ≥1 万额度的 token 被误判 → 用户看到的是**可行动的失败文案**（含上限原值），
+///   照着填一次「取值路径」即可；
+/// - 哨兵被漏判 → 才是真正糟的那种（一个用户会当真的错数字）。
+///
+/// 故这条线宁可偏严。
+const BILLING_LIMIT_SENTINEL_USD: f64 = 10_000.0;
+
+/// 本次返回是不是「只有配额上限、且那个上限是不限额哨兵」的形态。
+///
+/// 返回 `Some(limit)` = 是哨兵、拿不到余额 → 调用方报可行动的失败。
+/// 返回 `None` 有两种情形：上游给了更精确的余额字段（与本函数无关），
+/// 或上限在合理量级（限额 token）→ 调用方走 `上限 − 已用` 得真实剩余。
+///
+/// ## 两次真机：哨兵会给出用户会当真的错数字
+///
+/// - **sotamodel.net**：`hard_limit_usd = 10000` → 卡片显示「10000 USD」，花多少都不变；
+/// - **agentrouter.org**：`hard_limit_usd = 100000000`（1e8）
 ///   → `1e8 − 1179.52 = 99,998,820.48 USD`，而站点网页上的真实余额是 **616.48 USD**。
-///   注意 `1179.52` 恰好等于网页上的「历史消耗」——**减法是对的，被减数没有意义**。
+///   注意 `1179.52` 恰好等于网页上的「历史消耗」——**减法是对的，被减数没有意义**
+///   （`1179.52 + 616.48 = 1796`，与 1e8 差 5 个数量级）。
 ///
-/// 这两个例子说明：这个端点的 `hard_limit_usd` 是**配额上限**，与「还剩多少钱」之间
-/// 没有可靠关系。而响应体里没有任何字段能让我们区分「上限恰好等于预付金额」
-/// （相减有效）和「上限是个哨兵」（相减无意义）—— 既然区分不了，就不能猜。
+/// ## 但不能因此把整条路砍掉
 ///
-/// 按本项目一贯口径（静默给错结果比响亮失败更糟）：如实报「该站点没给余额接口」，
-/// 并把已读到的「已用」一并说出来（那个数是真的、有用），再指路去填真实地址。
+/// 对**限额 token**，`hard_limit_usd` 就是这条 token 的额度，`上限 − 已用` = 真实剩余，
+/// 且**零配置**就能算对。上一版把 `hard_limit_usd` 从候选链里整条删掉，
+/// 顺带也让那些站查不出余额了 —— 那是修过头。故改为只挡哨兵，量级判据见
+/// [`BILLING_LIMIT_SENTINEL_USD`]。
 ///
 /// 判据是「**余额取自** `hard_limit_usd`」而不是「响应里有 `hard_limit_usd`」：
 /// 若上游同时给了更精确的字段（候选链里排在前面的都算），那个值本身就是余额，与本函数无关。
 /// 用户显式填了取值路径时一律尊重用户，不做任何自动干预。
 fn billing_limit_is_not_a_balance(body: &Value, custom_path: Option<&str>) -> Option<f64> {
+    let limit = billing_limit_only(body, custom_path)?;
+    (limit >= BILLING_LIMIT_SENTINEL_USD).then_some(limit)
+}
+
+/// 「响应里只有配额上限、没有更精确的余额字段」——不判量级。
+///
+/// 与 [`billing_limit_is_not_a_balance`] 分开：那个只回答「是不是哨兵」，
+/// 这个回答「要不要走 `上限 − 已用`」。两个问题共用同一段前置判断，抽出来免得写两遍走岔。
+fn billing_limit_only(body: &Value, custom_path: Option<&str>) -> Option<f64> {
     if custom_path.map(str::trim).is_some_and(|s| !s.is_empty()) {
         return None;
     }
@@ -787,6 +825,37 @@ async fn query_one_endpoint(
                 let is_newapi =
                     read_newapi_quota_unit(&client, &origin_of(base), timeout).await.is_some();
                 return BalanceResult::failed(billing_limit_reason(limit, used, is_newapi));
+            }
+            // **限额 token**：`hard_limit_usd` 就是这条 token 的额度，`上限 − 已用` = 真实剩余，
+            // 而且**零配置**就能算对。上一版把这条路整条砍了（连带那些本来查得出的站也废了），
+            // 是修过头 —— 现在只挡哨兵（见 BILLING_LIMIT_SENTINEL_USD），其余照算。
+            if let Some(limit) = billing_limit_only(&v, cfg.remaining_path.as_deref()) {
+                match read_billing_usage_usd(
+                    &client, &url, secret, auth_scheme, access_token, user_id, timeout,
+                    key.protocol,
+                )
+                .await
+                {
+                    Some(used) => {
+                        // 负数夹到 0：上游两个数不同源时（用量口径与上限不一致）显示负余额
+                        // 只会让人困惑，而 0 是「已用完」这个结论的正确表达。
+                        result.remaining = Some((limit - used).max(0.0));
+                        result.total = Some(limit);
+                        result.used = Some(used);
+                        result.unit = Some(result.unit.take().unwrap_or_else(|| "USD".into()));
+                        result.ok = true;
+                        result.error = None;
+                    }
+                    // 读不到已用就只有上限，那不是余额 —— 如实报，别把上限当余额显示。
+                    None => {
+                        return BalanceResult::failed(format!(
+                            "该站点只给了配额上限（{BILLING_LIMIT_MARKER}{limit}），\
+                             而配对的已用额度接口读不到，无法算出剩余。\n\
+                             直接显示上限会让人误以为那是余额，故不显示。可稍后重试，\
+                             或在「查询地址」填这个站点真实的余额接口。"
+                        ));
+                    }
+                }
             }
             // NewAPI 的内部计费单位 → 按站点公开的 `quota_per_unit` 换成钱。
             // 不缩放会把 616.48 USD 显示成 308240000（与上面那条同类的错数字）；
@@ -1104,6 +1173,73 @@ mod tests {
         );
     }
 
+    /// **限额 token 的余额必须零配置就算出来**（`上限 − 已用`），只有哨兵才拒。
+    ///
+    /// 这条钉的是一次「修过头」：上一版为了挡住 agentrouter 的 1e8 哨兵，把
+    /// `hard_limit_usd` 从候选链里**整条删掉**，顺带让那些本来零配置就查得出余额的站
+    /// 也全查不出了。用户的原话是「cc-switch 都不用用户操作」——凡是能自动算对的，
+    /// 就不该退化成「请手填」。
+    ///
+    /// 两侧都钉，缺一侧都会让这个平衡塌向一边：
+    /// 1. 上限在合理量级（20 USD）+ 已用 5 USD → **零配置**得出 15 USD；
+    /// 2. 上限是哨兵（1e8 / 10000）→ 拒绝出数字，给可行动文案；
+    /// 3. 读不到「已用」→ 也拒绝（只有上限不是余额）；
+    /// 4. 上游给了更精确的字段 → 那条优先，不走减法。
+    #[tokio::test]
+    async fn limited_token_balance_is_derived_with_zero_config() {
+        let cfg = BalanceQuery { enabled: true, ..Default::default() };
+
+        // ① 限额 token：零配置算出 15 USD
+        static LIMITED: &[(&str, u16, &str)] = &[
+            (
+                "/v1/dashboard/billing/subscription",
+                200,
+                r#"{"object":"billing_subscription","hard_limit_usd":20,"soft_limit_usd":20}"#,
+            ),
+            ("/v1/dashboard/billing/usage", 200, r#"{"object":"list","total_usage":500}"#),
+        ];
+        let base = spawn_path_mock(LIMITED).await;
+        let key = ProviderKey { base_url: base, ..Default::default() };
+        let r = query_balance(&key, &cfg, "sk-test").await;
+        assert!(r.ok, "限额 token 必须零配置算出余额，不该退化成「请手填」：{:?}", r.error);
+        assert_eq!(r.remaining, Some(15.0), "20 − 5 = 15（total_usage 是美分）");
+        assert_eq!(r.total, Some(20.0));
+        assert_eq!(r.used, Some(5.0));
+
+        // ② 哨兵：拒绝出数字（两个已知哨兵都在阈值之上）
+        for sentinel in [100_000_000.0_f64, 10_000.0] {
+            let body = serde_json::json!({
+                "object": "billing_subscription", "hard_limit_usd": sentinel
+            });
+            assert_eq!(
+                billing_limit_is_not_a_balance(&body, None),
+                Some(sentinel),
+                "{sentinel} 必须判为哨兵 —— 否则又变成显示一个花多少都不变的假余额"
+            );
+        }
+        // 阈值下方一点必须**不**判哨兵（否则限额 token 全被误伤）
+        let ok_limit = serde_json::json!({ "hard_limit_usd": 9_999.0 });
+        assert!(billing_limit_is_not_a_balance(&ok_limit, None).is_none());
+        assert_eq!(billing_limit_only(&ok_limit, None), Some(9_999.0));
+
+        // ③ 读不到「已用」→ 拒绝（只有上限不是余额）
+        static NO_USAGE: &[(&str, u16, &str)] = &[(
+            "/v1/dashboard/billing/subscription",
+            200,
+            r#"{"object":"billing_subscription","hard_limit_usd":20}"#,
+        )];
+        let base = spawn_path_mock(NO_USAGE).await;
+        let key = ProviderKey { base_url: base, ..Default::default() };
+        let r = query_balance(&key, &cfg, "sk-test").await;
+        assert!(!r.ok, "只有上限、拿不到已用时不得把上限当余额显示");
+        assert!(r.error.unwrap_or_default().contains("20"), "要报出上限原值");
+
+        // ④ 更精确的字段优先，不走减法
+        let precise = serde_json::json!({ "remaining": 3.25, "hard_limit_usd": 20 });
+        assert!(billing_limit_only(&precise, None).is_none());
+        assert_eq!(extract_balance(&precise, None).remaining, Some(3.25));
+    }
+
     /// 端到端复现真机那条错数字，并锁死它不再出现。
     ///
     /// agentrouter.org 的实际形态（2026-08-22 真机截图）：
@@ -1337,16 +1473,21 @@ mod tests {
 
     /// NewAPI / OpenAI 兼容计费层的真实返回结构（`/v1/dashboard/billing/subscription`）。
     ///
-    /// **契约在 2026-08-22 反转了**，这条测的是反转后的样子。
+    /// **契约在 2026-08-22 改过两次**，这条测的是最终形态。
     ///
-    /// 原契约：把 `hard_limit_usd` 当余额（因为 sotamodel.net 上只有这条端点认 API Key，
-    /// 不取它就什么都显示不出来）。两次真机证明这个取舍是错的 —— 显示出来的数字
-    /// 与真实余额差几个数量级（10000；99,998,820.48 vs 真实 616.48），
-    /// 而「什么都不显示 + 说清为什么」比「显示一个用户会当真的错数字」好得多。
+    /// 原契约：把 `hard_limit_usd` 直接当余额。两次真机证明对**哨兵**是错的
+    /// （10000；99,998,820.48 vs 真实 616.48）。
     ///
-    /// 现契约：这个形态**不产出余额**，由 `billing_limit_is_not_a_balance` 判为不可用，
-    /// 走可行动文案。这条只钉「候选链里确实没有 hard_limit_usd」这半边，
-    /// 完整四方向见 `billing_hard_limit_is_never_reported_as_balance`。
+    /// 第一次改：把它从候选链里整条删掉 —— **修过头**，连限额 token 那些本来
+    /// 零配置就能算对的站也废了。
+    ///
+    /// 最终契约：`hard_limit_usd` 不进候选链（它不是余额），但
+    /// - 量级合理（限额 token）→ 由调用方走 `上限 − 已用` 算真实剩余，**零配置**；
+    /// - 量级达哨兵阈值 → 拒绝出数字，走可行动文案。
+    ///
+    /// 这条钉「候选链里确实没有它」+「10.5 这种合理量级不判哨兵」两半边；
+    /// 完整方向见 `limited_token_balance_is_derived_with_zero_config` 与
+    /// `agentrouter_quota_ceiling_is_reported_as_failure_not_as_balance`。
     #[test]
     fn newapi_billing_subscription_shape() {
         // NewAPI 的标准返回（对齐 OpenAI 的 billing_subscription 契约）
@@ -1361,12 +1502,16 @@ mod tests {
         let r = extract_balance(&body, None);
         assert!(
             !r.ok && r.remaining.is_none(),
-            "配额上限不得当余额产出（把 hard_limit_usd 加回候选链，本断言必红）：{r:?}"
+            "配额上限不得**直接**当余额产出（把 hard_limit_usd 加回候选链，本断言必红）：{r:?}"
+        );
+        assert!(
+            billing_limit_is_not_a_balance(&body, None).is_none(),
+            "10.5 是合理量级（限额 token），不该被判成哨兵 —— 否则这类站会退化成「请手填」"
         );
         assert_eq!(
-            billing_limit_is_not_a_balance(&body, None),
+            billing_limit_only(&body, None),
             Some(10.5),
-            "该形态必须被识别出来，才能给出「这是上限不是余额」的可行动文案"
+            "但必须被识别为「只有上限」，调用方才会去减已用算出真实剩余"
         );
 
         // 更精确的字段存在时照常产出余额（本次改动不影响这条路径）
