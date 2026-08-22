@@ -16,10 +16,19 @@ pub async fn fetch_models(key: &ProviderKey, secret: &str) -> AppResult<Vec<Stri
     // 不同厂商的模型端点路径不一致（DeepSeek 等第三方对 /v1/models 返回 404），
     // 依次尝试候选路径，任一 2xx 即用；全失败则汇总错误。
     let mut last_err = String::from("无候选端点");
+    // **最有信息量的那条**失败，优先于「最后一条」上报。见 more_informative_models_error。
+    //
+    // 真机（2026-08-22 agentrouter.org）：`/v1/models` 回 401
+    // `unauthorized client detected`（真因），随后 `/models` 拿到站点首页 HTML。
+    // 只报最后一条时用户看到的是「返回的是网页，请确认 Base URL 是否以 /v1 结尾」——
+    // 而 Base URL 本来就是对的，方向完全错。
+    let mut best_err: Option<String> = None;
     for url in model_endpoints(&key.base_url) {
         let mut req = client.get(&url).timeout(fast_timeout(key));
         // /models 用双鉴权头（Bearer + x-api-key），兼容把 Anthropic 挂子路径的 OpenAI 风格 /models
         req = apply_models_auth(req, secret);
+        // 客户端身份头（UA 等）由 build_client 装成默认头，这里不再逐请求补 ——
+        // 结构上保证不会漏（本项目在这件事上已踩过三次，见 build_client 的文档）。
 
         let resp = match req.send().await {
             Ok(r) => r,
@@ -50,7 +59,17 @@ pub async fn fetch_models(key: &ProviderKey, secret: &str) -> AppResult<Vec<Stri
                 s if s >= 500 => "（上游服务异常，与本地配置无关）",
                 _ => "",
             };
-            last_err = format!("HTTP {status} @ {url}{hint}");
+            // **把上游自己那句话带出来**：真机上 agentrouter.org 回的是
+            // `unauthorized client detected`（客户端准入，不是密钥问题），
+            // 而我们的 hint 说「请检查密钥是否填对」——方向相反。上游原文才是真因所在。
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.trim().chars().take(200).collect();
+            last_err = if snippet.is_empty() {
+                format!("HTTP {status} @ {url}{hint}")
+            } else {
+                format!("HTTP {status} @ {url}{hint}：{snippet}")
+            };
+            best_err = more_informative_models_error(best_err, &last_err, status.as_u16());
             // 404/405 说明路径不对，换下一个候选；其他状态码同样重试下一个
             continue;
         }
@@ -80,7 +99,69 @@ pub async fn fetch_models(key: &ProviderKey, secret: &str) -> AppResult<Vec<Stri
         last_err = format!("{url} 返回了 JSON 但其中没有模型列表（该站点可能不提供模型查询接口）");
     }
     // 末尾统一附「可手动录入」的出路：这条链路失败不阻塞用户继续配置。
-    Err(AppError::upstream_msg(format!("拉取模型失败：{last_err}")))
+    // 优先报**最有信息量**的那条，而不是最后一条（见 best_err 的声明处）。
+    Err(AppError::upstream_msg(format!(
+        "拉取模型失败：{}",
+        best_err.unwrap_or(last_err)
+    )))
+}
+
+/// 在多个候选端点的失败里挑「更有信息量」的那条。
+///
+/// ## 为什么需要它
+///
+/// 候选链会按序试 2~4 个 URL，最终只能报一条。报最后一条会系统性地把用户引向**最不可能**
+/// 的那个原因：真机 agentrouter.org 的实际序列是
+///
+/// 1. `/v1/models` → `401 unauthorized client detected`  ← **真因**（客户端准入）
+/// 2. `/models`    → `200` 但返回站点首页 HTML
+///
+/// 于是界面上写的是「返回的是网页，请确认 Base URL 通常以 /v1 结尾」，而 Base URL
+/// 本来就是对的 —— 用户照着改只会越改越错。
+///
+/// ## 判据：越「具体地拒绝了你」越有信息量
+///
+/// - `401/403`（明确拒绝，且带上游原话）> 其它 4xx/5xx > `404/405`（只说明这条路径不存在）
+///   > 非 JSON / HTML（说明这个地址压根不是接口）。
+/// - 同级别时保留**先出现**的那条（候选顺序本身就是按「最可能是对的」排的）。
+///
+/// `status` 为 `None` 表示不是 HTTP 层失败（连接失败 / 非 JSON 响应），排在最低级。
+fn more_informative_models_error(
+    current: Option<String>,
+    candidate: &str,
+    status: u16,
+) -> Option<String> {
+    fn rank(status: u16) -> u8 {
+        match status {
+            401 | 403 => 3, // 明确拒绝了你，且通常带原因
+            404 | 405 => 1, // 只说明这条路径不存在，最没信息量
+            0 => 0,         // 连接失败 / 非 JSON：连是不是接口都不确定
+            _ => 2,
+        }
+    }
+    match &current {
+        // 同级别保留先出现的那条：候选顺序即「最可能是对的」的顺序。
+        Some(existing) => {
+            let keep = rank(models_error_status(existing)) >= rank(status);
+            if keep {
+                current
+            } else {
+                Some(candidate.to_string())
+            }
+        }
+        None => Some(candidate.to_string()),
+    }
+}
+
+/// 从已记下的错误串里反读状态码（`HTTP 401 @ …` 形态），读不出按 0（最低级）。
+///
+/// 之所以从文本反读而不是并存一个数字：这两者只在本函数内配对使用，
+/// 多存一个字段就多一处可能与文本不同步的地方；而格式由上面唯一一处 `format!` 产生。
+fn models_error_status(err: &str) -> u16 {
+    err.strip_prefix("HTTP ")
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
 }
 
 /// 拉取模型时上游返回**非 JSON** 的可行动提示。
@@ -133,6 +214,62 @@ fn parse_model_names(body: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 多候选端点失败时，报的必须是**最有信息量**的那条，而不是最后一条。
+    ///
+    /// ## 真机序列（2026-08-22 agentrouter.org，用真实 token 实打取证）
+    ///
+    /// 1. `/v1/models` → `401 {"type":"unauthorized_client_error",
+    ///    "message":"unauthorized client detected"}`  ← **真因：客户端准入**
+    /// 2. `/models`    → `200` 但返回站点首页 HTML
+    ///
+    /// 旧实现报最后一条，界面上写「返回的是网页，请确认 Base URL 通常以 /v1 结尾」——
+    /// 而 Base URL 本来就是对的，用户照着改只会越改越错（真机反馈就卡在这里）。
+    ///
+    /// 四个方向一起钉：
+    /// 1. 401 必须压过随后的 HTML/非 JSON（最低级）；
+    /// 2. 401 必须压过 404（后者只说明「这条路径不存在」，最没信息量）；
+    /// 3. 同级别保留**先出现**的那条（候选顺序本身就是按「最可能是对的」排的）；
+    /// 4. 首条无条件采纳。
+    #[test]
+    fn most_informative_candidate_error_wins_not_the_last_one() {
+        let unauthorized = "HTTP 401 Unauthorized @ https://x/v1/models（密钥无效或无权限）：\
+                            unauthorized client detected";
+        let not_found = "HTTP 404 Not Found @ https://x/models（该路径不存在）";
+        let html = "https://x/models 返回的是网页而不是 JSON";
+
+        // ④ 首条无条件采纳
+        let e = more_informative_models_error(None, unauthorized, 401);
+        assert_eq!(e.as_deref(), Some(unauthorized));
+
+        // ① 401 压过非 JSON（status 0 = 非 HTTP 层失败）
+        let e = more_informative_models_error(e, html, 0);
+        assert_eq!(
+            e.as_deref(),
+            Some(unauthorized),
+            "拿到 HTML 只说明那个地址不是接口；401 才说清了「为什么被拒」"
+        );
+
+        // ② 401 压过 404
+        let e = more_informative_models_error(e, not_found, 404);
+        assert_eq!(e.as_deref(), Some(unauthorized));
+
+        // ③ 同级别保留先出现的
+        let first_500 = "HTTP 500 Internal Server Error @ https://x/v1/models";
+        let second_500 = "HTTP 502 Bad Gateway @ https://x/models";
+        let e = more_informative_models_error(None, first_500, 500);
+        let e = more_informative_models_error(e, second_500, 502);
+        assert_eq!(e.as_deref(), Some(first_500), "同级别时先出现的候选优先");
+
+        // 反向：404 打头时，随后的 401 必须**顶替**它
+        let e = more_informative_models_error(None, not_found, 404);
+        let e = more_informative_models_error(e, unauthorized, 401);
+        assert_eq!(
+            e.as_deref(),
+            Some(unauthorized),
+            "404 只说明路径不存在，401 带着上游原话，必须顶替"
+        );
+    }
 
     /// 真机反例（2026-08-02）：中转商把请求挡在 HTML 页上，用户只看到
     /// `expected value at line 1 column 1`，完全不知道该改什么。

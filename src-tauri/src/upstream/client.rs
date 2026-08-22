@@ -179,12 +179,61 @@ pub fn fast_timeout(key: &ProviderKey) -> Duration {
     key_timeout(key).min(Duration::from_secs(8))
 }
 
-/// 自建请求（拉模型/健康探测/聚合成员/工具会话）用的客户端：走 [`decoding_client`]
-/// 以透明解压上游可能主动返回的 gzip/br 响应体（它们都在本地解析 body，见该函数说明）。
-/// 保留 `key` 参数与旧签名以最小化调用点改动；总超时改由调用点逐请求 `.timeout()` 指定。
+/// 自建请求（拉模型/健康探测/聚合成员/工具会话）用的客户端。
+///
+/// 走 [`decoding_client`] 的连接池与解压设置，**并把客户端身份头装成默认头**
+/// （见 [`apply_client_identity`]）。
+///
+/// ## 为什么身份头要装在这一层，而不是靠各调用点自觉
+///
+/// 这个坑本项目已经踩到**第三次**：部分中转渠道靠 UA / originator 做客户端准入，
+/// 缺了就判 `detected: unknown` 直接 401/403。前两次是聚合调用与余额查询；
+/// 第三次（2026-08-22 真机取证）是 **`discovery.rs` 拉模型** 与 **`probe.rs` 健康探测**
+/// —— 四个 `build_client` 使用者里恰好这两个漏了，而它们的失败长得完全不像「缺 UA」：
+///
+/// - 拉模型：agentrouter.org 的 `/v1/models` 回
+///   `401 {"type":"unauthorized_client_error","message":"unauthorized client detected"}`，
+///   而候选链随后试 `/models` 拿到站点首页 HTML，错误信息只报最后那条 ——
+///   用户看到「返回的是网页，请确认 Base URL」，方向完全错。
+///   **实测**：补上身份头后同一个 URL 直接 200 + 完整模型列表。
+/// - 健康探测：同一站点同样被 401 挡住，表现为这条 Key「一直不健康」。
+///
+/// 靠注释提醒「凡自建请求都要过那一道」已经失败了三次，所以改成**结构上不可能漏**：
+/// 身份头进客户端默认头，任何用 `build_client` 的路径自动带上。调用点已有的
+/// `apply_client_identity` 保持不变（逐请求头覆盖同名默认头，值一样，无副作用），
+/// 它仍是「这个请求需要身份」这一意图的显式表达。
 pub(super) fn build_client(key: &ProviderKey) -> AppResult<reqwest::Client> {
-    let _ = key;
-    Ok(decoding_client())
+    Ok(identity_client(key.protocol))
+}
+
+/// 按协议带**默认身份头**的自建请求客户端（两种口味各缓存一个）。
+fn identity_client(protocol: Protocol) -> reqwest::Client {
+    static OPENAI: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    static ANTHROPIC: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let cell = if protocol.is_openai() { &OPENAI } else { &ANTHROPIC };
+    cell.get_or_init(|| {
+        let mut h = reqwest::header::HeaderMap::new();
+        // 与 apply_client_identity 逐头对齐 —— 两处若分叉，就又回到「有的路径带、有的不带」。
+        if protocol.is_openai() {
+            h.insert("user-agent", OPENAI_CLIENT_UA.parse().expect("UA 常量必须是合法头值"));
+            h.insert("originator", CODEX_ORIGINATOR.parse().expect("originator 常量必须合法"));
+        } else {
+            h.insert("user-agent", ANTHROPIC_CLIENT_UA.parse().expect("UA 常量必须是合法头值"));
+            h.insert("x-app", "cli".parse().expect("x-app 必须合法"));
+            h.insert(
+                "anthropic-beta",
+                "claude-code-20250219".parse().expect("beta 头必须合法"),
+            );
+        }
+        base_builder()
+            .gzip(true)
+            .brotli(true)
+            .deflate(true)
+            .default_headers(h)
+            .build()
+            .expect("构建带身份头的 HTTP 客户端失败")
+    })
+    .clone()
 }
 
 /// 按协议注入鉴权头**与版本头**。
@@ -249,6 +298,96 @@ pub(super) fn apply_models_auth(req: reqwest::RequestBuilder, secret: &str) -> r
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **`build_client` 造出的客户端必须自带客户端身份头** —— 任何自建请求路径都不会漏。
+    ///
+    /// ## 为什么这条测试值得存在
+    ///
+    /// 「凡自建上游请求都要带 UA」这条纪律靠注释提醒，已经失败了**三次**：
+    /// 聚合调用、余额查询，以及本轮真机取证的 `discovery.rs`（拉模型）+ `probe.rs`（健康探测）。
+    /// 四个 `build_client` 使用者里恰好那两个漏了，而失败长得完全不像「缺 UA」：
+    /// agentrouter.org 回 `401 unauthorized client detected`，界面上却提示「请检查密钥」
+    /// 或「请确认 Base URL」。
+    ///
+    /// 实测判据（用真实 token 打同一个 URL）：不带身份头 → 401；带上 → **200 + 完整模型列表**。
+    ///
+    /// ## 为什么必须真发一次请求
+    ///
+    /// reqwest 的**默认头是在发送时**才合并进请求的（`execute_request` 里只填空缺、
+    /// 不覆盖逐请求头 —— 正是我们要的语义）。所以 `RequestBuilder::build()` 上读不到它们：
+    /// 第一版测试就是这么写的，结果读到空 UA、看着像修复没生效。
+    /// 故起一个最小 TCP 服务器，直接断言**对端收到的原始报文**里有那个 UA。
+    #[tokio::test]
+    async fn build_client_bakes_in_client_identity_headers() {
+        for (protocol, expect_ua) in
+            [(Protocol::Anthropic, "claude"), (Protocol::OpenaiChat, "codex")]
+        {
+            let raw = capture_request_headers(protocol).await;
+            let low = raw.to_ascii_lowercase();
+            assert!(
+                low.contains("user-agent:"),
+                "{protocol:?} 的自建请求必须带 User-Agent（缺它会被部分中转渠道判 \
+                 detected:unknown 而 401/403）。实收报文：\n{raw}"
+            );
+            assert!(
+                low.contains(expect_ua),
+                "{protocol:?} 的 UA 应含 `{expect_ua}`。实收报文：\n{raw}"
+            );
+        }
+    }
+
+    /// 起一个最小 TCP 服务器，用 `build_client` 打它一次，返回**收到的原始请求报文**。
+    ///
+    /// 刻意不引 hyper：这里只要看请求头文本，裸 TCP 读一次最直接，也不会因为
+    /// service 层的封装把「客户端到底发了什么」这件事遮住。
+    async fn capture_request_headers(protocol: Protocol) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+                .await;
+            let _ = stream.flush().await;
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+        let key = ProviderKey { protocol, ..Default::default() };
+        let client = build_client(&key).expect("构建客户端应成功");
+        let _ = client.get(format!("http://{addr}/v1/models")).send().await;
+        server.await.unwrap()
+    }
+
+    /// 默认头必须与 [`apply_client_identity`] **逐头一致**。
+    ///
+    /// 两处若分叉，就又回到「有的路径带、有的不带」那种最难查的状态：
+    /// 同一个站点，转发能通、拉模型 401，而两边看起来都「有 UA」。
+    /// 这条把一致性变成机械校验，而不是靠改代码的人记得同步。
+    #[tokio::test]
+    async fn baked_defaults_match_apply_client_identity_header_for_header() {
+        for protocol in [Protocol::Anthropic, Protocol::OpenaiChat, Protocol::OpenaiResponses] {
+            let baked = capture_request_headers(protocol).await.to_ascii_lowercase();
+            // 显式调用那条路：用不带默认头的 shared_client，免得两者混在一起看不出差异。
+            let explicit =
+                apply_client_identity(shared_client().get("http://127.0.0.1:1/x"), protocol)
+                    .build()
+                    .unwrap()
+                    .headers()
+                    .clone();
+            for name in ["user-agent", "originator", "x-app", "anthropic-beta"] {
+                let Some(v) = explicit.get(name).and_then(|v| v.to_str().ok()) else {
+                    continue; // 该协议不需要这个头
+                };
+                assert!(
+                    baked.contains(&format!("{name}: {}", v.to_ascii_lowercase())),
+                    "{protocol:?} 的 `{name}: {v}` 在客户端默认头里缺失或不一致 —— \
+                     会造出「有的路径带、有的不带」这种最难查的分叉。实收报文：\n{baked}"
+                );
+            }
+        }
+    }
 
     /// 重试判定必须只看**结构化状态码**，不做文本嗅探。
     ///
