@@ -82,7 +82,7 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   凭据类文件一律拒读（按「模型给的名字」与「解析链接后的真实落点」**各判一次**，两次都不能省）。
   每条防线都做过故障注入验证（去掉后测试必须变红）。当前基线 **433 passed / 0 failed**
   <br>📌 **基线口径（2026-08-22 实测）**：上面各条历史行里的 311/312/368/383/433/506 都是**当时**的
-  数字，勿当现值。当前实测 `cargo test --lib` = **711 passed / 0 failed**
+  数字，勿当现值。当前实测 `cargo test --lib` = **719 passed / 0 failed**
   （连跑 12 次全绿；`cargo clippy --lib --all-targets` 零警告；`tsc --noEmit` 干净；
   `npm run build` 通过含颜色类零 CSS 检查）。
   接手时请自己跑一遍取当前值，不要引用本文档里的历史数字当基线。
@@ -170,6 +170,37 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   （按模型单价，我们是按 Key 倍率）、`usage_daily_rollups`（按天×模型×provider 的用量）、
   `provider_health`、`proxy_request_logs` 等表 —— 这些**我们没有对应实现**，
   想扩功能时那是现成的参照。
+- **最大单次输出：「表落后于新模型」已按机制治根（2026-08-22）**。上次只做了「不用用户手填」，
+  但内置表止于 Claude 4-5 系 / 各家老版本，于是**每出一个新模型就静默掉到全局兜底 8192**：
+  实测 `claude-opus-5`/`sonnet-5`/`fable-5`（官方 128k）、`glm-6`（glm-5 是 96k）、
+  `deepseek-v5`、`qwen4-coder`、`gpt-6`（gpt-5 是 128k）全中 —— 用户只看到「回答莫名断了」。
+  <br>两条机制 + 两条**机械校验的不变量**（靠注释提醒靠不住，上一轮就是这么漏的）：
+  - Claude 侧 `claude_generation_floor`：按「同档位、世代不晚于它」取最大。
+    **必须带档位** —— 跨档位会让 `claude-haiku-4-9` 拿到 opus 的 128k（haiku 只有 64k）→ 上游 400。
+  - 非 Claude 侧：**家族兜底行（裸家族名）的语义 = 该家族当前已知最好值**，不是最老值。
+    真的更低的现役老型号显式列在它之前（`find` 取首个命中）。
+  - `family_default_is_at_least_family_max`：兜底行 ≥ 家族内任何具体行。加新行忘了同步就红。
+    ⚠️ 判据是「**不含数字**的裸家族名」，不能只看「是否为另一条的前缀」——
+    `glm-4` 是 `glm-4-6` 的前缀但它是具体版本，当成兜底行会报假警（写测试时踩过）。
+  - `more_specific_rows_come_first_in_both_tables`：顺序反了**不报错、值只是悄悄变小**
+    （`claude-opus-4-5` 排到 `claude-opus-4` 之后 → 64k 永远拿不到）。
+  <br>**数值取证**：Claude 5 全族与 4.6 之后各代 = 128k（platform.claude.com 各 what's-new 页 +
+  AWS Bedrock model card + Vertex AI 合作模型页；4.6 公告原文「double the previous 64K limit」
+  同时反证 4.5 系 64k 是对的）。
+  <br>**并反转了一条旧决策**：旧注释写「拿不准取家族下限档」（怕填大了 400），前提是
+  「同族片段总能命中」，而已实测它不能。两种错法代价不对称 —— 填小 = 静默截断查不到原因；
+  填大 = 上游 400，而那句 `max_tokens: X > Y, which is the maximum allowed` **自带正确答案**。
+  按「静默错比响亮错更糟」宁可偏大。
+- **THINKING_SIGNATURE_INVALID 不是我们的 bug**（2026-08-22 逐处核对）：同协议直通只改顶层字段、
+  跨协议只映射 `thinking.budget_tokens` ↔ `reasoning.effort`、响应侧**从不伪造** thinking 块
+  （全仓生产代码无一处构造 `"type":"thinking"`）、`budget.rs` 只读不写。真实成因是**故障转移的
+  固有代价**：思考块的签名由签发它的那个上游账号签，换 Key 后新上游验不了旧上游的名。
+  已修的是呈现：400 不再报成「全部 Key 不可用」（那会把人送去查密钥/额度），
+  并附三条可行动出路 + 一句「SynaRoute 不改写思考块」免得反复怀疑代理。
+  <br>**刻意没做**：命中该错误就中断故障转移 —— 另一条候选可能**正是**签发那些块的 Key。
+  <br>另：`status_code=502, upstream HTTP 400:` 这个格式**不是 SynaRoute 也不是 cc-switch 输出的**
+  （前者全仓搜不到，后者格式是 `上游错误 (429): {...}`，已读其 proxy_request_logs 11869 行核对），
+  那是中转站自己网关的日志行。
 - **刻意不修的项**（别当成遗漏重复劳动）：SmartScreen 签名告警、`retrieval.rs` 的 `cwd` 白名单、
   请求日志存明文对话（默认关闭）
 - **换机注意**：`secrets.enc` 由 DPAPI 绑账户、**不可跨机器搬运**；本文档里的绝对路径都是旧机器实测值
