@@ -229,20 +229,6 @@ export const api = {
     call<DailyUsageBucket[]>("get_daily_usage", undefined, () => mockBridge.dailyUsage()),
 
   /**
-   * 一批模型的「最大单次输出」内置默认值（模型名 → token 数）。
-   *
-   * Key 编辑器拿它当占位提示（`自动 128K`），让用户看出这一项**不用填**。
-   *
-   * **不在前端抄一张表**：那必然与后端漂移，而漂移的形态是「界面说 128K、实际发 8192」，
-   * 用户照界面判断却拿到被截断的回答。这里调的是转发时用的同一个函数。
-   */
-  defaultMaxOutputs: (models: string[]) =>
-    call<Record<string, number>>("default_max_outputs", { models }, () =>
-      // mock 环境（浏览器预览）没有后端：返回空表 → 界面退回静态占位，不报错。
-      Promise.resolve({} as Record<string, number>),
-    ),
-
-  /**
    * 按「分类 × Key」聚合的用量 + 成本估算。
    *
    * 成本按 Key 估算（累加器不含模型维度），代表模型取该 Key 的兜底模型或首个模型。

@@ -19,7 +19,6 @@ import {
   tokensFromAmount,
   preferredUnit,
   amountForUnit,
-  fmtTokenShort,
 } from "@/lib/tokenUnit";
 import { balanceFingerprint, formatBalanceAmount } from "@/lib/balance";
 import { X, RefreshCw, Plus, Trash2, ArrowRight, Eye, EyeOff, Zap, Gauge, Brain, Download, AlertTriangle, Wallet, ChevronRight } from "lucide-react";
@@ -211,15 +210,6 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const [invalidContextModels, setInvalidContextModels] = useState<Set<string>>(() => new Set());
   // 手动加模型输入框（不用原生 prompt()：WebView2 里行为不可靠）
   const [manualModel, setManualModel] = useState("");
-  /**
-   * 各模型的「最大单次输出」内置默认值（模型名 → token）。只用于把占位提示写成
-   * 「自动 128K」，让用户看出这一项不用填。
-   *
-   * 取自后端 `resolve_max_output`（转发时用的同一个函数），**不在前端抄表** ——
-   * 抄一份必然漂移，而漂移的形态是「界面说 128K、实际发 8192」：用户照界面判断，
-   * 却拿到被截断的回答，且没有任何地方能看出不一致。
-   */
-  const [autoMaxOutputs, setAutoMaxOutputs] = useState<Record<string, number>>({});
 
   const draftId = initial?.id ?? `k_new`;
 
@@ -610,32 +600,6 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeCategory, models, mappings, tierHaiku, tierSonnet, tierOpus]);
 
-  // 拉各模型的「最大单次输出」内置默认值，供占位提示显示成「自动 128K」。
-  //
-  // 只在**模型名集合**变化时拉（不是 models 整个数组）：用户在窗口/输出框里打字会让
-  // models 每次按键都变成新数组，跟着它拉等于每敲一个字符发一次 IPC。
-  // 失败静默退回静态占位 —— 这只是个提示，不该因为它让编辑器报错。
-  const modelNamesKey = models.map((m) => m.realName).join(" ");
-  useEffect(() => {
-    const names = modelNamesKey ? modelNamesKey.split(" ") : [];
-    if (names.length === 0) {
-      setAutoMaxOutputs({});
-      return;
-    }
-    let cancelled = false;
-    void api
-      .defaultMaxOutputs(names)
-      .then((m) => {
-        if (!cancelled) setAutoMaxOutputs(m);
-      })
-      .catch(() => {
-        if (!cancelled) setAutoMaxOutputs({});
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [modelNamesKey]);
-
   /** 是否已有「填完整」的映射行——决定 serviceable_models 走映射还是走 models 列表。 */
   const hasEffectiveMapping = mappings.some((m) => m.expectedName.trim() && m.realName.trim());
 
@@ -675,17 +639,10 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     // 底层报文、就地无可行动提示。就地拦下并给出示例，是最省事的修复入口。
     if (!isValidHttpUrl(baseUrl)) return setError(t("editor.errInvalidBaseUrl"));
     const currentModelNames = new Set(models.map((m) => m.realName));
-    // 校验集里同时装着两类 tag：窗口用裸模型名、最大输出用 `模型名::maxout`。
-    // **报错必须分开指字段**：两个输入框同行同外观，把最大输出的非法值报成
-    // 「上下文窗口格式无效」会让用户反复检查旁边那个完全正常的窗口框。
-    const invalidWindow = [...invalidContextModels].some(
-      (tag) => !tag.endsWith("::maxout") && currentModelNames.has(tag),
-    );
-    const invalidMaxOut = [...invalidContextModels].some(
-      (tag) => tag.endsWith("::maxout") && currentModelNames.has(tag.replace(/::maxout$/, "")),
-    );
+    // 校验集里现在**只有上下文窗口**一类 tag（裸模型名）——「最大单次输出」输入框已移除，
+    // 那一项由后端自动定。原先还有 `模型名::maxout` 后缀的一类，随输入框一并去掉。
+    const invalidWindow = [...invalidContextModels].some((tag) => currentModelNames.has(tag));
     if (invalidWindow) return setError(t("editor.errInvalidContextWindow"));
-    if (invalidMaxOut) return setError(t("editor.errInvalidMaxOutput"));
     // 计费倍率与上面两个数值字段同一口径：拦在保存处。
     // 只在编辑器里标红是不够的 —— 抽屉一关那条提示就没了，而这条 Key 会带着一个
     // 后端只会静默退回 1.0 的废值一直存在，用量页金额差几倍且没有任何地方提示过。
@@ -967,56 +924,28 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                       unitTitle={t("editor.contextWindowUnit")}
                       placeholder={t("editor.contextWindowPlaceholder")}
                     />
-                    {/* 最大单次输出：与上下文窗口**并列而非合并** —— 两者是不同的能力
-                        （4.5 系 200k 窗口 / 64k 输出）。留空走内置能力表；第三方中转的
-                        私有模型名内置表认不出，填上这个值该模型才能参与大脑聚合。
-                        复用 ContextWindowInput 的 K/M 单位与非法值拦截逻辑（同一套交互）。
+                    {/* 这里**刻意没有「最大单次输出」输入框**（2026-08-22 按用户要求移除）。
+                        它由后端 `resolve_max_output` 自动定：内置能力表（Claude 全族 + GLM /
+                        DeepSeek / Kimi / Qwen / GPT / Grok …）→ Claude 按世代单调兜底 →
+                        非 Claude 按家族兜底行 → 全局 8192。用户不需要知道这些数字。
 
-                        **占位提示显示后端推导出的默认值**（如「自动 128K」），而不是静态的
-                        「如 64」。后端早就会自动取默认值了，但这个框是空的、占位写着「如 64」——
-                        用户当然以为必须自己填（真机反馈原话：「最大单次输出依旧需要用户填写」）。
-                        一个已经生效的自动化，只要界面不说，对用户就等于不存在。
-                        值来自 `api.defaultMaxOutputs`，调的是转发时同一个函数，不另抄表。
+                        为什么连「自动 128K」这种占位提示也不留：那仍然是一个**看起来要填**的
+                        输入框，而它对用户不产出任何决策 —— 填错只会更糟（填大了上游 400、
+                        填小了长回答被截断）。少一个能填错的地方，比多一句解释更有用。
 
-                        **仅 Anthropic 协议显示**：max_tokens 是 Anthropic 的必填字段，
-                        这个值只在 budget.rs 的 Anthropic 分支被消费（output_budget 对
-                        OpenAI Chat/Responses 直接返回 None、不发上限）。若对所有协议显示，
-                        Codex/OpenAI 用户填了会以为生效、实则静默无效——本项目最忌讳的形态。 */}
-                    {protocol === "anthropic" && (
-                    <ContextWindowInput
-                      value={m.maxOutputTokens}
-                      onChange={(val) =>
-                        setModels(models.map((x) => x.realName === m.realName ? { ...x, maxOutputTokens: val } : x))
-                      }
-                      onValidityChange={(valid) =>
-                        setInvalidContextModels((prev) => {
-                          const next = new Set(prev);
-                          // 用独立的 key 后缀，避免与窗口那一项的校验状态互相覆盖
-                          const tag = `${m.realName}::maxout`;
-                          if (valid) next.delete(tag);
-                          else next.add(tag);
-                          return next;
-                        })
-                      }
-                      title={t("editor.maxOutput")}
-                      unitTitle={t("editor.maxOutputUnit")}
-                      placeholder={
-                        autoMaxOutputs[m.realName] !== undefined
-                          ? t("editor.maxOutputAuto", { v: fmtTokenShort(autoMaxOutputs[m.realName]) })
-                          : t("editor.maxOutputPlaceholder")
-                      }
-                    />
-                    )}
+                        **数据字段 `ModelInfo.maxOutputTokens` 保留不动**：
+                        ① 已经填过值的老配置继续生效（`resolve_max_output` 仍优先用户值），
+                           删字段等于替用户抹掉他调过的配置；
+                        ② 万一某个私有模型名的自动值不对，导入/编辑配置文件仍是条出路。
+                        即「不再展示」而非「不再支持」。 */}
                     <button
                       onClick={() => {
                         setModels(models.filter((x) => x.realName !== m.realName));
                         setInvalidContextModels((prev) => {
                           const next = new Set(prev);
-                          // 两个 tag 都要删：窗口那项是裸名，最大输出那项带 `::maxout` 后缀。
-                          // 漏删后者会留下一个指向已删除模型的残项 —— 虽然 save 的比对
-                          // 会因模型已不在列表而放过它，但那是靠巧合，不该依赖。
+                          // 删掉这一行的校验残项，否则会留下一个指向已删除模型的标记 ——
+                          // 虽然 save 的比对会因模型已不在列表而放过它，但那是靠巧合，不该依赖。
                           next.delete(m.realName);
-                          next.delete(`${m.realName}::maxout`);
                           return next;
                         });
                       }}
@@ -1586,10 +1515,11 @@ function ContextWindowInput({
   const nativeBadInput = useRef(false);
 
   // 卸载时上报「有效」，清掉可能残留的校验失败标记。
-  // 场景：最大输出输入框仅 Anthropic 协议渲染（见调用处条件）。若它此刻是非法态
-  // （红框、`::maxout` 标记在 invalidContextModels 里），用户切到 OpenAI/Codex 协议后
-  // 该输入框卸载，但标记留在父级 → Save 被「最大输出格式无效」挡住，而报错指向的控件
-  // 已不在屏上，成了无法自助解除的死胡同。卸载即报有效，把标记清掉。
+  //
+  // 立这条时的场景是「最大输出输入框仅 Anthropic 协议渲染」——那个框已按用户要求移除，
+  // 但这条清理**仍然必要且更通用**：任何条件渲染（模型行被删、列表被拉取结果替换）都会让
+  // 一个处于非法态的输入框卸载，而标记留在父级 → Save 被一句指向屏幕上已不存在的控件的
+  // 报错挡住，成了无法自助解除的死胡同。故保留。
   // 用 ref 持最新回调、空依赖：**不能**把 onValidityChange 放进依赖数组 —— 它每次渲染
   // 都是新闭包，会让 cleanup 每次渲染都跑一遍、把非法态标记误清，反而放行非法值。
   const onValidityChangeRef = useRef(onValidityChange);

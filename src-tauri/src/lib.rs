@@ -629,28 +629,6 @@ fn get_daily_usage(state: tauri::State<AppState>) -> Vec<crate::model::DailyUsag
     state.store.daily_usage_buckets()
 }
 
-/// 一批模型的「最大单次输出」内置默认值（模型名 → token 数）。
-///
-/// 给 Key 编辑器把这个数显示成占位提示用（`自动 128K`），让用户一眼看出**不用填**。
-///
-/// 此前后端已经会自动取默认值了，但界面上那个输入框仍是空的、占位写着「如 64」——
-/// 于是用户以为必须自己填（真机反馈的原话就是「最大单次输出依旧需要用户填写」）。
-/// 一个已经生效的自动化，只要界面不说，对用户就等于不存在。
-///
-/// **走后端而不是在前端抄一张表**：抄一份必然漂移，而漂移的形态是「界面说 128K、
-/// 实际发 8192」—— 用户照界面的数字判断却拿到被截断的回答，且无处看出不一致。
-/// 这里调的就是转发时用的同一个 `resolve_max_output`。
-#[tauri::command]
-fn default_max_outputs(models: Vec<String>) -> std::collections::HashMap<String, u32> {
-    models
-        .into_iter()
-        .map(|m| {
-            let v = crate::upstream::resolve_max_output(&m, None);
-            (m, v)
-        })
-        .collect()
-}
-
 /// 带成本估算的用量行（用量页表格用）。
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1622,7 +1600,6 @@ pub fn run() {
             get_token_usage,
             get_usage_since,
             get_daily_usage,
-            default_max_outputs,
             get_usage_with_cost,
             query_key_balance,
             show_main_window_cmd,

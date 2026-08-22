@@ -443,7 +443,7 @@ fn anthropic_max_output_for(model: &str) -> Option<u32> {
 /// **抽成独立函数就是为了能直接测这四级**：原先这段内联在
 /// [`anthropic_required_max_tokens`] 里，而那个函数的返回值同时受「窗口 − 输入」影响，
 /// 想验「Claude 5 拿到 128k」得先构造一个足够大的窗口，测的东西被搅在一起。
-pub fn resolve_max_output(model: &str, user_max_output: Option<u32>) -> u32 {
+pub(crate) fn resolve_max_output(model: &str, user_max_output: Option<u32>) -> u32 {
     user_max_output
         .filter(|v| *v > 0)
         .or_else(|| known_max_output_for(model))

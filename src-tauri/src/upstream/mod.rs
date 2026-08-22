@@ -32,7 +32,7 @@ mod util;
 /// 大脑聚合的输出预算（协议感知）。代理转发不用它——转发一律透明，见 proxy::apply_key_params。
 pub use budget::{
     anthropic_required_max_tokens, estimate_json_tokens_without_image_transport, estimate_tokens,
-    output_budget, resolve_max_output,
+    output_budget,
 };
 pub use client::shared_client;
 /// 带自动解压的自建请求客户端（余额查询等直接取它，不经 build_client）。
