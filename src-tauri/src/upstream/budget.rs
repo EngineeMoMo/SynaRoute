@@ -168,34 +168,59 @@ const CLAUDE_MAX_OUTPUT_TABLE: &[(&str, u32)] = &[
 /// 完全不含 `claude`，上面那张表一个都认不出，于是全部落到「请手填最大单次输出」。
 /// 用户视角就是「加个 Key 还要我去查文档填数字」——而这些值本就是公开且稳定的。
 ///
-/// 数值来源：各家官方文档的 max output tokens（2026-08 核对）。取值刻意**偏保守**：
-/// 填小了只是长回答被截断（且下面的 `window − input` 钳制通常先生效），填大了会被上游 400，
-/// 后者是硬失败。故拿不准时取该家族的下限档。
+/// 数值来源：各家官方文档的 max output tokens（2026-08 核对）。
+///
+/// ## 表的两类行：具体版本行 + **家族兜底行**（这是为「以后模型更新」设计的关键）
+///
+/// 每个家族的最后一行是**裸家族名**（`glm` / `deepseek` / `qwen` / `gpt` / `grok` …），
+/// 它只会被「没命中任何具体版本」的名字命中 —— 也就是**将来的新版本**，
+/// 或中转站的私有别名。故它的语义是「**该家族当前已知的最好值**」，
+/// 而不是「该家族最老那个版本的值」。
+///
+/// ⚠️ **这一条曾经全反了**（2026-08-22 实测抓到）：`glm` / `deepseek` / `qwen` 三个兜底行
+/// 写的都是该家族**最低**的 8192，于是每出一个新版本就掉进坑里 ——
+/// `glm-6` → 8192（而 glm-5 是 96k）、`deepseek-v5` → 8192（v4 是 64k）、
+/// `gpt-6` → 8192（gpt-5 是 128k，且它压根没有兜底行）。
+/// 而同期 `grok` / `kimi` / `moonshot` 的兜底行恰好写的是当前值，就完全没这个问题
+/// —— 差别纯粹是当初填表时的随手，不是设计。
+///
+/// 由 `family_default_is_at_least_family_max` 机械校验这条不变量：
+/// 家族兜底行的值必须 ≥ 该家族任何具体版本行。**加新版本行时若忘了同步兜底行，测试直接红。**
+///
+/// 真的比家族当前值低的老型号，必须**显式列在兜底行之前**（`glm-4`、`deepseek-chat`、
+/// `gpt-4`、`qwen-max/plus/turbo` 等）—— `find` 取首个命中，顺序即优先级。
 const OTHER_MAX_OUTPUT_TABLE: &[(&str, u32)] = &[
-    // 智谱 GLM：4.6/4.5 系 96k 输出；老 4 系 8k
+    // 智谱 GLM：4.5/4.6/5 系 96k；老 4 系 8k
     ("glm-5", 96_000),
     ("glm-4-6", 96_000),
     ("glm-4-5", 96_000),
     ("glm-4", 8_192),
-    ("glm", 8_192),
-    // DeepSeek：v3.2/reasoner 64k，chat 8k
+    ("glm", 96_000), // 家族兜底 = 当前最好（glm-6 等新版走这里）
+    // DeepSeek：v3/v4/reasoner 64k，chat 8k
     ("deepseek-v4", 64_000),
     ("deepseek-v3", 64_000),
     ("deepseek-reasoner", 64_000),
     ("deepseek-chat", 8_192),
-    ("deepseek", 8_192),
+    ("deepseek", 64_000), // 家族兜底（deepseek-v5 / r2 等新版走这里）
     // 月之暗面 Kimi：k2 系 32k
     ("kimi-k2", 32_000),
     ("kimi", 32_000),
     ("moonshot", 32_000),
-    // 通义千问：coder/plus 系 64k，其余 8k
+    // 通义千问：coder 系 64k，3 系 32k；max/plus/turbo/long 这几个现役型号是 8k，
+    // 必须显式列在兜底行之前，否则会被兜底的 32k 盖过去。
     ("qwen3-coder", 64_000),
     ("qwen3", 32_000),
-    ("qwen", 8_192),
-    // OpenAI（经 Anthropic 协议中转的情形）：gpt-5 系 128k，4o 系 16k
+    ("qwen-max", 8_192),
+    ("qwen-plus", 8_192),
+    ("qwen-turbo", 8_192),
+    ("qwen-long", 8_192),
+    ("qwen", 64_000), // 家族兜底 = 当前最好（qwen4 等新版走这里）
+    // OpenAI（经 Anthropic 协议中转的情形）：gpt-5 系 128k，4o 系 16k，3.5 系 4k
     ("gpt-5", 128_000),
     ("gpt-4o", 16_384),
     ("gpt-4", 8_192),
+    ("gpt-3", 4_096),
+    ("gpt", 128_000), // 家族兜底 = 当前最好（gpt-6 等新版走这里）
     ("o3", 100_000),
     ("o1", 100_000),
     // xAI Grok：4 系 32k
@@ -204,6 +229,7 @@ const OTHER_MAX_OUTPUT_TABLE: &[(&str, u32)] = &[
     // MiniMax / StepFun / Mistral
     ("minimax", 32_000),
     ("step-3", 32_000),
+    ("step", 32_000),
     ("mistral", 32_000),
 ];
 
@@ -915,6 +941,128 @@ mod tests {
 #[cfg(test)]
 mod claude5_caps {
     use super::*;
+
+    /// 🔒 **不变量一（为「以后模型更新」而设）**：**家族兜底行**（不含任何数字的裸家族名）
+    /// 的值必须 ≥ 该家族任何具体版本行。
+    ///
+    /// 兜底行只会被「没命中任何具体版本」的名字命中 —— 也就是**将来的新版本**。
+    /// 若它写的是家族里最低的那个值，每出一个新版就掉坑：实测抓到过
+    /// `glm-6` → 8192（glm-5 是 96k）、`deepseek-v5` → 8192（v4 是 64k）、
+    /// `gpt-6` → 8192（gpt-5 是 128k，它压根没有兜底行）。而同期 grok/kimi 恰好没这问题，
+    /// 差别纯粹是当初填表时的随手。
+    ///
+    /// **「不含数字」是判定兜底行的关键**（写这条测试时先踩了一次）：不能只看「是否为
+    /// 另一条的前缀」—— `glm-4` 是 `glm-4-6` 的前缀，但它是个**具体版本**（8192 对
+    /// glm-4/glm-4-plus 是正确的），不承担兜底职责。把它当兜底行会报一个假警。
+    ///
+    /// **这条测试的价值不在今天，而在下一次改表**：谁加了 `glm-6 → 200k` 却忘了同步
+    /// `glm` 兜底行，这里立刻红。靠注释提醒是靠不住的（上一轮就是这么漏的）。
+    #[test]
+    fn family_default_is_at_least_family_max() {
+        let is_family_default = |k: &str| !k.chars().any(|c| c.is_ascii_digit());
+        for (generic, generic_cap) in OTHER_MAX_OUTPUT_TABLE {
+            if !is_family_default(generic) {
+                continue;
+            }
+            let specifics: Vec<(&str, u32)> = OTHER_MAX_OUTPUT_TABLE
+                .iter()
+                .filter(|(k, _)| *k != *generic && k.starts_with(generic))
+                .map(|(k, v)| (*k, *v))
+                .collect();
+            if specifics.is_empty() {
+                continue;
+            }
+            let family_max = specifics.iter().map(|(_, v)| *v).max().unwrap();
+            assert!(
+                *generic_cap >= family_max,
+                "家族兜底行 `{generic}` = {generic_cap}，低于该家族已知最高 {family_max}\
+                 （具体行：{specifics:?}）。\n\
+                 兜底行只会被**将来的新版本**命中，写成家族最低值等于「每出一个新版就掉到 \
+                 8192」——glm/deepseek/gpt 三家都这么中过招。请把兜底行提到家族当前最好值，\
+                 并把真的更低的老型号显式列在它**之前**。"
+            );
+        }
+    }
+
+    /// 🔒 **不变量二**：两张表里凡「一条是另一条的前缀」，**更具体的那条必须排在前面**。
+    ///
+    /// `find` 取首个命中，顺序即优先级。`claude-opus-4-5` 排到 `claude-opus-4` 后面，
+    /// 它那 64k 就永远生效不了（会静默拿到 32k）；`glm-4-6` 排到 `glm-4` 后面同理。
+    /// 这类顺序错**不会报任何错**，只是值悄悄变小 —— 正是本模块最该机械校验的一类。
+    #[test]
+    fn more_specific_rows_come_first_in_both_tables() {
+        for (name, table) in [
+            ("CLAUDE_MAX_OUTPUT_TABLE", CLAUDE_MAX_OUTPUT_TABLE),
+            ("OTHER_MAX_OUTPUT_TABLE", OTHER_MAX_OUTPUT_TABLE),
+        ] {
+            for (i, (short, _)) in table.iter().enumerate() {
+                for (j, (long, _)) in table.iter().enumerate() {
+                    if short != long && long.starts_with(short) {
+                        assert!(
+                            j < i,
+                            "{name}：`{long}` 比 `{short}` 更具体，必须排在它之前\
+                             （现在分别在第 {j} / 第 {i} 行）。顺序反了它的值永远命中不了，\
+                             而且不会报错、只是悄悄变小。"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **将来的新版本不得掉到全局兜底 8192。**
+    ///
+    /// 这条是上面那个不变量的行为面：直接拿一批「还没发布」的名字过一遍，
+    /// 断言每个都拿到该家族当前的最好值。
+    ///
+    /// Claude 侧由 `claude_generation_floor` 按世代兜底，非 Claude 侧由家族兜底行兜住 ——
+    /// 两条机制的目的相同：**表永远落后于发布，落后时的降级必须是「同族当前最好」
+    /// 而不是「全局最差」。**
+    #[test]
+    fn future_model_versions_never_fall_to_global_floor() {
+        for (model, want) in [
+            // 非 Claude：走家族兜底行
+            ("glm-6", 96_000u32),
+            ("glm-7-air", 96_000),
+            ("deepseek-v5", 64_000),
+            ("deepseek-r2", 64_000),
+            ("qwen4-coder", 64_000),
+            ("gpt-6", 128_000),
+            ("gpt-6-mini", 128_000),
+            ("grok-5", 32_000),
+            ("kimi-k3", 32_000),
+            ("step-4", 32_000),
+            // Claude：走世代兜底（同档位、同代或更早的最大值）
+            ("claude-opus-6", 128_000),
+            ("claude-sonnet-6", 128_000),
+            ("claude-fable-6", 128_000),
+            ("claude-mythos-5", 128_000),
+        ] {
+            let got = resolve_max_output(model, None);
+            assert_eq!(
+                got, want,
+                "{model} 应得 {want}（该家族当前最好），实得 {got}。\
+                 掉到 {FALLBACK_MAX_OUTPUT} 说明「新版本降级到全局最差」那个坑又回来了"
+            );
+        }
+        // 反向：**真的**更低的现役老型号不得被兜底行抬高（抬高 → 上游 400）
+        for (model, want) in [
+            ("glm-4-plus", 8_192u32),
+            ("deepseek-chat", 8_192),
+            ("qwen-max", 8_192),
+            ("qwen-turbo", 8_192),
+            ("gpt-4o-mini", 16_384),
+            ("gpt-4-turbo", 8_192),
+            ("gpt-3.5-turbo", 4_096),
+            ("claude-haiku-4-9", 64_000), // 不得跨档位拿 opus 的 128k
+        ] {
+            assert_eq!(
+                resolve_max_output(model, None),
+                want,
+                "{model} 的真实上限更低，不该被家族兜底抬高（抬高会让上游直接 400）"
+            );
+        }
+    }
 
     /// **Claude 5 全族的最大输出必须是 128k，不能落到 8192。**
     ///
