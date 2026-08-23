@@ -18,6 +18,9 @@ mod pricing;
 mod proc;
 mod proxy;
 mod retrieval;
+/// 转发诊断响应头（`X-SynaRoute-*`）。独立成模块而不是塞进 proxy.rs：
+/// 那份「头里允许携带什么」的清单需要一个显眼的落脚点，且 proxy.rs 已经 5300+ 行。
+mod route_meta;
 mod secret;
 mod store;
 mod tools;

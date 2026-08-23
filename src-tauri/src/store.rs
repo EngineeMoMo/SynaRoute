@@ -2394,7 +2394,17 @@ impl Store {
     /// 兜底语义与 `health::select_candidates` **必须保持一致**：全部熔断时忽略熔断窗口、
     /// 原样返回全部启用 Key（熔断本为「多 Key 快速切换」而设，无处可切时不应自杀成 503）。
     /// 该语义有 4 条测试锁住，改这里前先读 `health::select_candidates` 的文档。
-    pub fn candidates_for(&self, category: CategoryType) -> (Vec<ProviderKey>, bool) {
+    ///
+    /// `requested_model`：客户端要的对外模型名。用于叠加**第二层**（单模型锁定）门槛 ——
+    /// 每条 Key 各自 `resolve_model` 后判「这条 Key 上这个模型是否被锁」。传空串则只看第一层。
+    ///
+    /// 兜底也必须包含「只被模型锁挡住」的 Key：那条 Key 的其它模型可能好着，但本次请求要的
+    /// 就是被锁那个 —— 无处可切时仍应给它一次机会（与熔断兜底同一判据，理由也同一个）。
+    pub fn candidates_for(
+        &self,
+        category: CategoryType,
+        requested_model: &str,
+    ) -> (Vec<ProviderKey>, bool) {
         let cfg = self.config.read();
         // 先按引用收集（零克隆），排序也只动指针。
         let mut enabled: Vec<&ProviderKey> = cfg
@@ -2404,16 +2414,26 @@ impl Store {
             .collect();
         enabled.sort_by_key(|k| k.priority);
 
-        // 未熔断者优先。`is_candidate` 是纯函数（只读 HealthState + 当前时间），锁内调用安全。
+        // 未熔断、且本次要的模型没被锁的优先。
+        // `is_candidate_for_model` 是纯函数（只读 HealthState + 当前时间），锁内调用安全。
+        // `resolve_model` 每条 Key 一次小字符串分配 —— 这是第二层门槛的必要代价，
+        // 且与转发循环里给诊断头算的那次同源（同一个函数、同一个结果）。
         let primary: Vec<ProviderKey> = enabled
             .iter()
-            .filter(|k| crate::health::is_candidate(&k.health))
+            .filter(|k| {
+                let real = if requested_model.is_empty() {
+                    None
+                } else {
+                    Some(k.resolve_model(requested_model))
+                };
+                crate::health::is_candidate_for_model(&k.health, real.as_deref())
+            })
             .map(|k| (*k).clone())
             .collect();
         if !primary.is_empty() {
             return (primary, false);
         }
-        // 全熔断兜底：忽略熔断窗口全部纳入。此时才克隆全部（罕见路径）。
+        // 全部被挡（熔断或模型锁）时兜底：忽略两层门槛全部纳入。此时才克隆全部（罕见路径）。
         let used_fallback = !enabled.is_empty();
         (enabled.into_iter().cloned().collect(), used_fallback)
     }
@@ -4528,6 +4548,7 @@ mod tests {
 
         let big = "X".repeat(20_000);
         let trace = RequestTrace {
+            request_id: String::new(),
             key_name: "K名".into(),
             vendor: "厂商".into(),
             protocol: Protocol::Anthropic,

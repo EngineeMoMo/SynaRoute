@@ -47,6 +47,7 @@ fn trace_for_ref(
     let (key_id, model) = reference.split_once("::")?;
     let key = store.get_key(key_id)?;
     Some(RequestTrace {
+        request_id: String::new(),
         key_name: key.name,
         vendor: key.vendor,
         protocol: key.protocol,
@@ -1546,6 +1547,7 @@ async fn gather_members(
                 attempted += 1;
                 // 带 trace：展开可见「喂给该成员的完整 prompt + 成员的完整答案」。受开关控制。
                 let trace = trace_enabled.then(|| RequestTrace {
+                    request_id: String::new(),
                     key_name: meta.key_name,
                     vendor: meta.vendor,
                     protocol: meta.protocol,
@@ -1588,6 +1590,7 @@ async fn gather_members(
                 total_usage.add(&failed_usage);
                 // 失败原因落日志（归「大脑聚合」分组），不再静默吞；带 trace 供展开看入参。受开关控制。
                 let trace = meta.filter(|_| trace_enabled).map(|m| RequestTrace {
+                    request_id: String::new(),
                     key_name: m.key_name,
                     vendor: m.vendor,
                     protocol: m.protocol,

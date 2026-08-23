@@ -36,6 +36,148 @@ const BREAKER_COOLDOWN_MS: i64 = 60_000;
 /// 「近期有真实转发成功」宽限窗口（毫秒）：窗口内后台探测失败不熔断，因真实流量证明该 Key 可用。
 const LIVE_SUCCESS_GRACE_MS: i64 = 120_000;
 
+// ===================== 弹性第二层：单模型锁定 =====================
+//
+// 借鉴 OmniRoute 的三层弹性模型（provider breaker / connection cooldown / model lockout），
+// 见 `docs/architecture/RESILIENCE_GUIDE.md`。SynaRoute 此前只有一层（Key 级熔断），
+// 于是「这条 Key 的某个模型没开通」这类失败会把整条 Key 打停 60 秒 —— 连它本来
+// 能服务的模型一起误伤。这一层把作用域收窄到 (Key, 真实模型名) 这一对。
+//
+// 层间归属判据在 `proxy::failure_scope`（状态码 + 路径 → 罚哪一层）。**不要**在这里
+// 复制一份判据：两处各写一份必然漂移，本仓已经因此出过一次缺陷
+// （见 `TRANSIENT_4XX` 的「单一事实来源」注释）。
+
+/// 单模型锁定的基础时长：第一次失败锁多久。
+///
+/// 取 120s 而不是 Key 级熔断那个 60s：模型级不可用（未开通/套餐不含）通常不是抖动，
+/// 而是稳定状态；重试太勤只是白打上游。
+const MODEL_LOCK_BASE_MS: i64 = 120_000;
+/// 指数退避上限（30 分钟）。再长就有「上游已经开通了但我们半天不去试」的风险。
+const MODEL_LOCK_MAX_MS: i64 = 1_800_000;
+/// 一条 Key 上**同时锁着**这么多个不同模型 → 证据已指向「这条 Key 本身有问题」，
+/// 升级到 Key 级熔断。
+///
+/// 为什么需要这个阀门：单模型锁定刻意**不罚** Key，那么一条对所有模型都回 404 的 Key
+/// 会永远待在候选池首位、每个新模型都要白试一次。有了它，第 3 个模型被锁时整条 Key
+/// 进入熔断窗口，行为退回到分层之前 —— 分层带来的是「误伤更少」，不该带来「坏 Key 赖着不走」。
+const MODEL_LOCK_ESCALATE_AT: usize = 3;
+
+/// 某条 Key 上的某个模型此刻是否被锁。
+///
+/// 与 [`breaker_window_active`] 同一口径（`until > now` 才算锁着），理由也相同：
+/// 条目只在「该模型成功一次」时才被删，窗口自然到期时条目仍在，按「存在即锁着」判会永不放行。
+fn model_lock_active(health: &HealthState, real_model: &str, now: i64) -> bool {
+    health
+        .model_locks
+        .get(real_model)
+        .map(|l| l.until > now)
+        .unwrap_or(false)
+}
+
+/// 当前**仍然生效**的模型锁数量（到期的不算）。升级阀门的判据。
+fn active_model_lock_count(health: &HealthState, now: i64) -> usize {
+    health.model_locks.values().filter(|l| l.until > now).count()
+}
+
+/// 把一次「上游明确表示这条 Key 不提供这个模型」计入**模型级**锁定。
+///
+/// 与 [`record_live_failure`] 的差别是作用域：这里**绝不动** `fail_count` / `breaker_until`
+/// （除了触发升级阀门那一刻），因为这类失败不构成「该 Key 不可用」的证据。
+///
+/// 退避：`MODEL_LOCK_BASE_MS * 2^(fail_count-1)`，夹到 `MODEL_LOCK_MAX_MS`。
+pub fn record_model_unavailable(store: &Arc<Store>, key_id: &str, real_model: &str) {
+    if real_model.is_empty() {
+        // 解析不出模型名时无处可锁。退回「不罚任何一层」而不是猜一个键 ——
+        // 猜错会锁掉一个本来好的模型，而那种误伤是静默的。
+        return;
+    }
+    let now = Utc::now().timestamp_millis();
+    let mut escalate = false;
+    let mut locked_secs = 0i64;
+    let mut lock_count = 0u32;
+    // 与 record_live_failure 同样走 mutate_health：read-modify-write 必须在同一个写锁内，
+    // 否则并发下两次失败会读到同一份 fail_count 各自 +1 写回，退避档位失准。
+    let _ = store.mutate_health(key_id, |h| {
+        let entry = h
+            .model_locks
+            .entry(real_model.to_string())
+            .or_insert(crate::model::ModelLock { until: 0, fail_count: 0 });
+        entry.fail_count = entry.fail_count.saturating_add(1);
+        // 2^(n-1) 用移位算，并把指数夹住防溢出。
+        //
+        // ⚠️ `.min(20)` 防的**不是**「窗口太长」（`saturating_mul` + 下面的 `.min(MAX_MS)`
+        // 已经管住了），而是 **`1i64 << 64` 的移位 panic** —— debug 构建下直接崩，
+        // 且崩在转发热路径上（一条模型被反复 404 的 Key 攒够 65 次就崩）。
+        let steps = (entry.fail_count - 1).min(20);
+        let backoff = MODEL_LOCK_BASE_MS.saturating_mul(1i64 << steps).min(MODEL_LOCK_MAX_MS);
+        entry.until = now + backoff;
+        locked_secs = backoff / 1000;
+        lock_count = entry.fail_count;
+
+        // 升级阀门：锁着的模型数达到阈值 → 同时武装 Key 级熔断。
+        // 在**同一个临界区内**判定并写入，避免「判定时 2 个、写入前变成 4 个」这类窗口。
+        if active_model_lock_count(h, now) >= MODEL_LOCK_ESCALATE_AT {
+            h.breaker_until = Some(now + BREAKER_COOLDOWN_MS);
+            escalate = true;
+        }
+        true
+    });
+    // 落一条事件。
+    //
+    // 不落的话这一层是**不可见**的：用户只会看到第一次请求的那条故障转移，
+    // 之后这条 Key 被静默跳过 —— 界面上表现为「它明明启用着、健康着，却好像没在用」。
+    // 那正是本项目反复吃过的「排障时看到的是假现场」。
+    //
+    // 折叠（`append_event_collapsible`）：同一 (Key, 模型) 连续锁定合成一条带 ×N，
+    // 否则一条被反复 404 的模型会把有用事件挤出 MAX_EVENTS 环。
+    if let Some(name) = store.key_name(key_id) {
+        store.append_event_collapsible(
+            store.get_key(key_id).map(|k| k.category_id).unwrap_or_default(),
+            "failover",
+            Some(key_id),
+            &format!(
+                "{name} · 模型 {real_model} 上游不提供，已锁定 {locked_secs}s（第 {lock_count} 次；\
+                 该 Key 的其它模型不受影响）"
+            ),
+            None,
+            Some(format!("mlock:{key_id}:{real_model}")),
+        );
+    }
+    if escalate {
+        let name = store.key_name(key_id).unwrap_or_else(|| key_id.to_string());
+        notify(
+            "Key 已熔断",
+            &format!(
+                "「{name}」已有 {MODEL_LOCK_ESCALATE_AT} 个模型不可用，已暂停整条 Key 60 秒。"
+            ),
+        );
+    }
+}
+
+/// 一次成功之后让该模型的锁**衰减**：`fail_count` 减半，到 0 即删除整条。
+///
+/// 为什么不是「成功即删」：上游按分钟/按天配额放行时，一个模型会「偶尔成功」。
+/// 成功即删会让退避档位永远停在第一档（120s），实际是在高频白打上游。
+/// 减半既能让真恢复的模型很快解锁（3 → 1 → 0，两次成功），又保留了「它最近不太行」的记忆。
+///
+/// 返回是否改动过（供调用方决定要不要落盘）。
+fn decay_model_lock(h: &mut HealthState, real_model: &str) -> bool {
+    let Some(entry) = h.model_locks.get_mut(real_model) else {
+        return false;
+    };
+    entry.fail_count /= 2;
+    if entry.fail_count == 0 {
+        h.model_locks.remove(real_model);
+    } else {
+        // 计数降了，锁窗也要相应缩短，否则「计数已经降到 1，却还按 30 分钟锁着」。
+        let steps = (entry.fail_count - 1).min(20);
+        let backoff = MODEL_LOCK_BASE_MS.saturating_mul(1i64 << steps).min(MODEL_LOCK_MAX_MS);
+        let now = Utc::now().timestamp_millis();
+        entry.until = entry.until.min(now + backoff);
+    }
+    true
+}
+
 // 「从测试消息列表随机取一条作为真实补全探测 prompt」的逻辑已移入 `Store::probe_message_if_real`：
 // 那里能在**一次读锁内**完成「读开关 + 随机选取」，避免把整个消息列表克隆出来
 // （探测是每轮 × 每 Key 调用）。此处不再保留重复实现。
@@ -151,9 +293,24 @@ pub fn record_live_failure(store: &Arc<Store>, key_id: &str) {
     }
 }
 
-/// 把一次「实时转发成功」计入熔断器：清零 fail_count、解除熔断，标记 Up。
-/// 让恢复的 Key 立即回到候选池（无需等下一次后台探测）。
-pub fn record_live_success(store: &Arc<Store>, key_id: &str) {
+/// 把一次「实时转发成功」计入熔断器：解除熔断、标记 Up、让 `fail_count` **减半**，
+/// 并让本次成功的那个模型的锁一起衰减。
+///
+/// `real_model`：本次成功打的**上游真实模型名**（拿不到时传 `None`）。用于衰减第二层的模型锁。
+///
+/// ## 为什么 `fail_count` 是减半而不是清零（2026-08-23 改）
+///
+/// 清零留了一个洞：一条「三次里坏两次」的 Key **永远不会熔断** —— 每次成功把计数抹平，
+/// `BREAKER_THRESHOLD` 再也够不着。而那正是最该被切走的一类 Key（用户体验是「时好时坏」）。
+/// 减半后同一条 Key 约 6 个请求内就会触发熔断。
+///
+/// 方向上这个改动只会让熔断**更容易**触发，故不可能复现历史上那个
+/// 「流式路径提前记成功 → fail_count 恒为 1 → 永不熔断」的缺陷（见 proxy.rs 流式分支注释）。
+///
+/// 关键是：**`breaker_until` 仍然一次成功就清空**。所以「恢复的 Key 立刻回到候选池」
+/// 这条性质完全不变（`is_candidate` 只看 `breaker_until`，不看 `fail_count`）；
+/// 变的只是「这条 Key 最近不太行」这段记忆不再被一次成功抹得一干二净。
+pub fn record_live_success(store: &Arc<Store>, key_id: &str, real_model: Option<&str>) {
     let now = Utc::now().timestamp_millis();
     // mutate 前读熔断残留：与 mutate 后对比，判断「本次是否真的清掉了熔断」。
     // 这里口径是 `is_some()`（有无残留）而非「窗口是否还活着」，且**刻意**与
@@ -171,14 +328,28 @@ pub fn record_live_success(store: &Arc<Store>, key_id: &str) {
             .last_live_success
             .map(|t| now - t < LIVE_SUCCESS_GRACE_MS / 2)
             .unwrap_or(false);
-        if h.fail_count == 0 && h.breaker_until.is_none() && h.status == HealthStatus::Up && fresh {
-            return false; // 稳态成功路径：**完全不落盘**
+        // 稳态成功路径：**完全不落盘**。
+        //
+        // 判据里必须带上 `model_locks` 为空这一条 —— 否则一条「Key 级健康、但还挂着模型锁」
+        // 的 Key 会在这里提前 return，锁永远得不到衰减（一次成功也不解锁），
+        // 那就是又造了一个「只能进不能出」的状态。
+        if h.fail_count == 0
+            && h.breaker_until.is_none()
+            && h.status == HealthStatus::Up
+            && fresh
+            && h.model_locks.is_empty()
+        {
+            return false;
         }
-        // 需要写：清零熔断计数、解除熔断、标 Up，让恢复的 Key 立即回到候选池。
+        // 需要写：解除熔断、标 Up，并让失败计数减半（不是清零，理由见函数头注释）。
         h.status = HealthStatus::Up;
-        h.fail_count = 0;
+        h.fail_count /= 2;
         h.breaker_until = None;
         h.last_live_success = Some(now);
+        // 第二层：让本次成功的那个模型的锁一起衰减（拿不到模型名时跳过，不猜）。
+        if let Some(m) = real_model.filter(|m| !m.is_empty()) {
+            decay_model_lock(h, m);
+        }
         // last_checked / latency_ms 保持不动（那是探测的观测量，不是转发的）。
         true
     });
@@ -202,12 +373,42 @@ pub fn record_live_success(store: &Arc<Store>, key_id: &str) {
 /// 探测（`check_one`）只观测「可达性」用于 UI 展示，绝不影响路由——因为探测端点
 /// （/models 返 401、探测模型名与业务不符）常与真实业务不一致，让它决定路由会误杀
 /// 一个真实流量本可成功的 Key。熔断只由真实转发流量的连续失败驱动（record_live_failure）。
+/// 判断某 Key 当前是否可作为路由候选（**只看第一层**，不看模型锁）。
+///
+/// 生产路径已改走 [`is_candidate_for_model`]（它多判一层单模型锁定）。本函数保留为
+/// 「只验熔断语义」的入口，供既有的 4 条熔断语义测试与 `select_candidates` 参照实现使用。
+///
+/// 故标 `#[cfg(test)]`：既消掉生产构建的 dead_code 警告，也从编译期阻止有人误把生产
+/// 调用点切回这条**少一层门槛**的路径 —— 那种回退是静默的（不报错，只是模型锁不再生效）。
+#[cfg(test)]
 pub fn is_candidate(health: &HealthState) -> bool {
+    is_candidate_for_model(health, None)
+}
+
+/// 同 [`is_candidate`]，但再叠加**第二层**（单模型锁定）的门槛。
+///
+/// `real_model`：本次请求在这条 Key 上解析出的**上游真实模型名**。
+/// 传 `None` 表示「不针对具体模型」（模型发现、UI 展示、只验熔断语义的测试），此时只看第一层。
+///
+/// 两层是 AND 关系，但语义不同、故**不能**并成一个计数：
+/// - 第一层（`breaker_until`）说「这条 Key 现在别用」；
+/// - 第二层（`model_locks`）说「这条 Key 别用来跑这个模型」。
+///
+/// 顺序上先判第一层：Key 级熔断成立时，模型锁的状态无关紧要。
+pub fn is_candidate_for_model(health: &HealthState, real_model: Option<&str>) -> bool {
     let now = Utc::now().timestamp_millis();
-    // 熔断中 → 不可用；其余（含探测判 Down 的）一律给机会——真实流量才是可用性裁判。
-    match health.breaker_until {
+    // 第一层：熔断中 → 不可用；其余（含探测判 Down 的）一律给机会——真实流量才是可用性裁判。
+    let key_ok = match health.breaker_until {
         Some(until) => until <= now,
         None => true,
+    };
+    if !key_ok {
+        return false;
+    }
+    // 第二层：这条 Key 上这个模型是否被锁。空模型名等同于 None（解析不出名字时不该凭空挡人）。
+    match real_model {
+        Some(m) if !m.is_empty() => !model_lock_active(health, m, now),
+        _ => true,
     }
 }
 
@@ -575,7 +776,7 @@ mod tests {
         store.upsert_key(mk("other", CategoryType::Codex, 0, true, HealthState::default())).unwrap();
 
         let legacy = select_candidates(store.enabled_keys_sorted(cat));
-        let now = store.candidates_for(cat);
+        let now = store.candidates_for(cat, "");
         assert_eq!(
             now.0.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(),
             legacy.0.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(),
@@ -594,7 +795,7 @@ mod tests {
         store.mutate_health("a", |h| { h.breaker_until = Some(future); true }).unwrap();
         store.mutate_health("c", |h| { h.breaker_until = Some(future); true }).unwrap();
         let legacy = select_candidates(store.enabled_keys_sorted(cat));
-        let now = store.candidates_for(cat);
+        let now = store.candidates_for(cat, "");
         assert_eq!(
             now.0.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(),
             legacy.0.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(),
@@ -668,12 +869,16 @@ mod tests {
             "累计已远超阈值 {BREAKER_THRESHOLD}，必须已武装熔断"
         );
 
-        // 一次成功即清零并解除熔断（让恢复的 Key 立刻回到候选池）。
-        record_live_success(&store, "k1");
+        // 一次成功：解除熔断、立刻回到候选池，但 `fail_count` 是**减半**而非清零
+        // （2026-08-23 改，理由见 `record_live_success` 文档：清零会让「三次里坏两次」
+        // 的 Key 永远熔断不了）。
+        record_live_success(&store, "k1", None);
         let h = store.get_key("k1").unwrap().health;
-        assert_eq!(h.fail_count, 0, "成功必须清零计数");
+        assert_eq!(h.fail_count, N / 2, "成功应让计数减半（不是清零，也不是不变）");
         assert!(h.breaker_until.is_none(), "成功必须解除熔断");
         assert_eq!(h.status, HealthStatus::Up);
+        // 减半不得动摇「恢复的 Key 立刻能用」这条性质 —— 候选资格只看熔断窗口。
+        assert!(is_candidate(&h), "减半后仍必须立即可用（候选资格不看 fail_count）");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -813,13 +1018,42 @@ mod tests {
         }
         assert!(!is_candidate(&store.get_key("k").unwrap().health), "先确认已熔断");
 
-        // 一次成功：清零 fail_count、解除熔断、标记 Up → 立即恢复候选。
-        record_live_success(&store, "k");
+        // 一次成功：解除熔断、标记 Up → 立即恢复候选。`fail_count` 减半（3 → 1）。
+        record_live_success(&store, "k", None);
         let h = store.get_key("k").unwrap().health;
-        assert_eq!(h.fail_count, 0);
+        assert_eq!(h.fail_count, 1, "3 次失败后一次成功 → 减半为 1");
         assert!(h.breaker_until.is_none());
         assert_eq!(h.status, HealthStatus::Up);
         assert!(is_candidate(&h), "成功后应立即恢复");
+    }
+
+    /// 「三次里坏两次」的 Key **必须**最终熔断。
+    ///
+    /// 这是把 `record_live_success` 从「清零」改成「减半」的**唯一理由**，
+    /// 故单独一条测试盯住它：清零语义下这个循环永远跑不出熔断
+    /// （每次成功把计数抹平，`BREAKER_THRESHOLD` 再也够不着），
+    /// 用户体验就是一条「时好时坏」的 Key 永远赖在候选池首位。
+    #[test]
+    fn a_flapping_key_eventually_trips_the_breaker() {
+        let store = temp_store();
+        store.upsert_key(key("k")).unwrap();
+
+        // 「坏坏好」循环。清零语义下 fail_count 恒在 {1,2,0} 之间跳，永不达 3。
+        let mut tripped = false;
+        for _ in 0..6 {
+            record_live_failure(&store, "k");
+            record_live_failure(&store, "k");
+            if store.get_key("k").unwrap().health.breaker_until.is_some() {
+                tripped = true;
+                break;
+            }
+            record_live_success(&store, "k", None);
+        }
+        assert!(
+            tripped,
+            "「三次里坏两次」的 Key 必须最终熔断；若这里恒不熔断，说明 record_live_success \
+             又回到了清零语义 —— 那条洞正是本测试存在的原因"
+        );
     }
 
     #[test]
@@ -828,7 +1062,7 @@ mod tests {
         store.upsert_key(key("k")).unwrap();
         let before = Utc::now().timestamp_millis();
 
-        record_live_success(&store, "k");
+        record_live_success(&store, "k", None);
         let h = store.get_key("k").unwrap().health;
         let ts = h.last_live_success.expect("应记录真实成功时间戳，供探测宽限窗口判定");
         assert!(ts >= before, "时间戳应为记录时刻");
@@ -836,5 +1070,329 @@ mod tests {
         // 宽限窗口内：探测失败不应熔断该 Key（在 check_one 里用 last_live_success 判定）。
         let now = Utc::now().timestamp_millis();
         assert!(now - ts < LIVE_SUCCESS_GRACE_MS, "刚记录应在宽限窗口内");
+    }
+
+    // ==================== 弹性第二层：单模型锁定 ====================
+    //
+    // 这一层存在的唯一理由是「作用域」：`404` 说的是「这个模型没有」，不是「这条 Key 坏了」。
+    // 下面每条测试都盯住这句话的一个侧面。
+
+    /// 层与层的**基本分离**：404 只锁模型，绝不动 Key 级的 `fail_count` / `breaker_until`。
+    #[test]
+    fn model_lock_does_not_touch_the_key_level_breaker() {
+        let store = temp_store();
+        store.upsert_key(key("k")).unwrap();
+
+        // 连锁 5 次同一个模型 —— 远超 BREAKER_THRESHOLD。
+        for _ in 0..5 {
+            record_model_unavailable(&store, "k", "gpt-9-turbo");
+        }
+        let h = store.get_key("k").unwrap().health;
+        assert_eq!(
+            h.fail_count, 0,
+            "模型级失败绝不能累加 Key 级计数 —— 否则分层就白做了"
+        );
+        assert!(
+            h.breaker_until.is_none(),
+            "只有一个模型不可用时不该熔断整条 Key（升级阀门要 {MODEL_LOCK_ESCALATE_AT} 个不同模型）"
+        );
+        assert_eq!(h.model_locks.len(), 1);
+        assert_eq!(h.model_locks["gpt-9-turbo"].fail_count, 5);
+    }
+
+    /// 这一层的**产品价值**：被锁的模型走不通，同一条 Key 的其它模型照常可用。
+    ///
+    /// 旧行为（只有 Key 级熔断）下第二个断言必然失败 —— 整条 Key 被打停，
+    /// 它本来能服务的模型一起被挡住。
+    #[test]
+    fn only_the_locked_model_is_blocked_other_models_on_the_same_key_still_serve() {
+        let store = temp_store();
+        store.upsert_key(key("k")).unwrap();
+        record_model_unavailable(&store, "k", "gpt-9-turbo");
+        let h = store.get_key("k").unwrap().health;
+
+        assert!(
+            !is_candidate_for_model(&h, Some("gpt-9-turbo")),
+            "被锁的模型必须被挡住"
+        );
+        assert!(
+            is_candidate_for_model(&h, Some("claude-opus-5")),
+            "同一条 Key 的其它模型必须照常可用 —— 这就是分层的全部意义"
+        );
+        // 不指定模型（模型发现、UI 展示）时只看第一层
+        assert!(is_candidate_for_model(&h, None), "不针对模型时只看熔断层");
+        assert!(is_candidate(&h), "Key 级依然健康");
+    }
+
+    /// 锁窗按指数退避递增，并被 `MODEL_LOCK_MAX_MS` 夹住。
+    #[test]
+    fn model_lock_backoff_grows_exponentially_and_is_capped() {
+        let store = temp_store();
+        store.upsert_key(key("k")).unwrap();
+
+        let remaining = |store: &Arc<Store>| {
+            let h = store.get_key("k").unwrap().health;
+            h.model_locks["m"].until - Utc::now().timestamp_millis()
+        };
+
+        record_model_unavailable(&store, "k", "m");
+        let first = remaining(&store);
+        assert!(
+            (first - MODEL_LOCK_BASE_MS).abs() < 2_000,
+            "第一次应约等于基础时长，实际 {first}ms"
+        );
+
+        record_model_unavailable(&store, "k", "m");
+        let second = remaining(&store);
+        assert!(second > first * 3 / 2, "第二次应显著变长: {first} → {second}");
+
+        // 打到远超上限的档位，必须被夹住。
+        for _ in 0..30 {
+            record_model_unavailable(&store, "k", "m");
+        }
+        let capped = remaining(&store);
+        assert!(
+            capped <= MODEL_LOCK_MAX_MS + 2_000,
+            "锁窗必须被 {MODEL_LOCK_MAX_MS}ms 夹住，实际 {capped}ms —— 否则模型可能被锁到天荒地老"
+        );
+        // 并且没有因为 1<<n 溢出而 panic 或变成负数
+        assert!(capped > 0, "锁窗算成了非正数：{capped}");
+
+        // ⚠️ 必须把 `fail_count` 推过 **64**：`steps` 那个 `.min(20)` 夹子防的不是「窗口太长」
+        // （`saturating_mul` + `.min(MAX_MS)` 已经管住了），而是 **`1i64 << 64` 的移位 panic**
+        // ——debug 构建下那是 `attempt to shift left with overflow` 直接崩，
+        // 而这条崩溃会发生在**转发热路径上**（一条模型被反复 404 的 Key 攒够次数就崩）。
+        //
+        // 写这条测试时先只跑到 33 次，去掉 `.min(20)` 依然全绿 —— 那是个假的安全感。
+        // 教训同 CLAUDE.md 里 `db_copy_path` 那条：注入不变红时先怀疑用例没压到边界。
+        for _ in 0..70 {
+            record_model_unavailable(&store, "k", "m");
+        }
+        let h = store.get_key("k").unwrap().health;
+        assert!(
+            h.model_locks["m"].fail_count > 64,
+            "前置条件：计数要真的推过 64（实际 {}）",
+            h.model_locks["m"].fail_count
+        );
+        let still = remaining(&store);
+        assert!(
+            still > 0 && still <= MODEL_LOCK_MAX_MS + 2_000,
+            "计数远超移位位宽后仍必须给出合法锁窗，实际 {still}ms"
+        );
+        // 衰减路径上有同一份指数计算，同样要过 64 这一关。
+        record_live_success(&store, "k", Some("m"));
+        let after = store.get_key("k").unwrap().health.model_locks["m"].until
+            - Utc::now().timestamp_millis();
+        assert!(after > 0, "衰减路径也不得算出非正锁窗：{after}ms");
+    }
+
+    /// 成功衰减：`fail_count` 减半，到 0 时整条删除（解锁）。
+    #[test]
+    fn success_decays_the_model_lock_and_eventually_clears_it() {
+        let store = temp_store();
+        store.upsert_key(key("k")).unwrap();
+        for _ in 0..3 {
+            record_model_unavailable(&store, "k", "m");
+        }
+        assert_eq!(store.get_key("k").unwrap().health.model_locks["m"].fail_count, 3);
+
+        // 第一次成功：3 → 1，仍然锁着（但窗口应已缩短）
+        record_live_success(&store, "k", Some("m"));
+        let h = store.get_key("k").unwrap().health;
+        assert_eq!(h.model_locks["m"].fail_count, 1, "应减半");
+
+        // 第二次成功：1 → 0 → 整条删除，模型解锁
+        record_live_success(&store, "k", Some("m"));
+        let h = store.get_key("k").unwrap().health;
+        assert!(
+            h.model_locks.is_empty(),
+            "计数归零应删除整条锁，实际仍有 {:?}",
+            h.model_locks
+        );
+        assert!(is_candidate_for_model(&h, Some("m")), "解锁后应可用");
+    }
+
+    /// 成功只衰减**本次成功的那个**模型，不碰别的。
+    #[test]
+    fn success_decays_only_the_model_that_actually_succeeded() {
+        let store = temp_store();
+        store.upsert_key(key("k")).unwrap();
+        record_model_unavailable(&store, "k", "a");
+        record_model_unavailable(&store, "k", "b");
+
+        record_live_success(&store, "k", Some("a"));
+        let h = store.get_key("k").unwrap().health;
+        assert!(!h.model_locks.contains_key("a"), "a 成功后应解锁");
+        assert!(
+            h.model_locks.contains_key("b"),
+            "b 没成功过，不该被顺手解锁 —— 那等于用一个模型的成功给另一个背书"
+        );
+    }
+
+    /// 「稳态成功不落盘」的短路判据里必须带上 `model_locks.is_empty()`。
+    ///
+    /// 少了这一条，一条 Key 级健康、但还挂着模型锁的 Key 会在短路处提前 return，
+    /// 锁永远得不到衰减 —— 又造一个「只能进不能出」的状态。
+    #[test]
+    fn steady_state_shortcut_does_not_strand_a_model_lock() {
+        let store = temp_store();
+        store.upsert_key(key("k")).unwrap();
+
+        // 先把 Key 级刷成「健康且新鲜」，让短路条件的前四项全部成立。
+        record_live_success(&store, "k", None);
+        let h = store.get_key("k").unwrap().health;
+        assert_eq!(h.fail_count, 0);
+        assert!(h.breaker_until.is_none());
+        assert_eq!(h.status, HealthStatus::Up);
+
+        // 此时给某个模型上锁，再来一次该模型的成功。
+        record_model_unavailable(&store, "k", "m");
+        record_live_success(&store, "k", Some("m"));
+        assert!(
+            store.get_key("k").unwrap().health.model_locks.is_empty(),
+            "稳态短路不得把模型锁卡死 —— 若这里仍有锁，说明短路判据漏了 model_locks"
+        );
+    }
+
+    /// 升级阀门：同一条 Key 上锁到第 N 个**不同**模型 → 熔断整条 Key。
+    ///
+    /// 这个阀门是分层的配套代价：模型级刻意不罚 Key，那么一条「对什么模型都回 404」的 Key
+    /// 就会永远待在候选池首位、每来一个新模型都要白试一次。
+    #[test]
+    fn locking_enough_distinct_models_escalates_to_the_key_breaker() {
+        let store = temp_store();
+        store.upsert_key(key("k")).unwrap();
+
+        for i in 0..MODEL_LOCK_ESCALATE_AT - 1 {
+            record_model_unavailable(&store, "k", &format!("m{i}"));
+            assert!(
+                store.get_key("k").unwrap().health.breaker_until.is_none(),
+                "第 {} 个模型被锁时还不该升级（阈值是 {MODEL_LOCK_ESCALATE_AT}）",
+                i + 1
+            );
+        }
+        record_model_unavailable(&store, "k", "last");
+        let h = store.get_key("k").unwrap().health;
+        assert!(
+            h.breaker_until.is_some(),
+            "锁满 {MODEL_LOCK_ESCALATE_AT} 个不同模型必须升级成 Key 级熔断，\
+             否则一条「什么都 404」的 Key 会永远赖在候选池首位"
+        );
+        assert!(!is_candidate(&h));
+    }
+
+    /// 升级阀门只数**仍然生效**的锁，不数已过期的残留条目。
+    ///
+    /// 条目只在「该模型成功一次」时才被删（同 `breaker_until` 的口径），所以过期条目会长期
+    /// 留在表里。若按 `len()` 数，一条 Key 上历史累计锁过 3 个模型就会被永久反复熔断。
+    #[test]
+    fn escalation_counts_live_locks_not_expired_leftovers() {
+        let store = temp_store();
+        store.upsert_key(key("k")).unwrap();
+        let now = Utc::now().timestamp_millis();
+
+        // 手工塞两条**已过期**的锁 + 一条新鲜的
+        let _ = store.mutate_health("k", |h| {
+            for m in ["old1", "old2"] {
+                h.model_locks.insert(
+                    m.to_string(),
+                    crate::model::ModelLock { until: now - 60_000, fail_count: 1 },
+                );
+            }
+            true
+        });
+        record_model_unavailable(&store, "k", "fresh");
+
+        let h = store.get_key("k").unwrap().health;
+        assert_eq!(h.model_locks.len(), 3, "表里确实有 3 条（含 2 条过期残留）");
+        assert!(
+            h.breaker_until.is_none(),
+            "只有 1 条锁真的生效，不该升级 —— 若这里熔断了，说明阀门在数 len() 而不是数活锁"
+        );
+    }
+
+    /// 到期即自动放行（惰性恢复，无后台定时器）。判据与 `breaker_until` 完全同源。
+    #[test]
+    fn an_expired_model_lock_stops_blocking_even_though_the_entry_remains() {
+        let now = Utc::now().timestamp_millis();
+        let mut h = HealthState::default();
+        h.model_locks.insert(
+            "m".into(),
+            crate::model::ModelLock { until: now - 1, fail_count: 9 },
+        );
+        assert!(
+            is_candidate_for_model(&h, Some("m")),
+            "窗口已过期就该放行 —— 条目仍在不等于还锁着（同 breaker_until 的口径）"
+        );
+
+        h.model_locks.get_mut("m").unwrap().until = now + 60_000;
+        assert!(!is_candidate_for_model(&h, Some("m")), "窗口内必须挡住");
+    }
+
+    /// 空模型名不得凭空锁住什么，也不得凭空挡住什么。
+    ///
+    /// 解析不出模型名时猜一个键会锁掉一个本来好的模型，而那种误伤是静默的。
+    #[test]
+    fn an_empty_model_name_locks_nothing_and_blocks_nothing() {
+        let store = temp_store();
+        store.upsert_key(key("k")).unwrap();
+        record_model_unavailable(&store, "k", "");
+        let h = store.get_key("k").unwrap().health;
+        assert!(h.model_locks.is_empty(), "空模型名不该产生锁条目");
+        assert!(is_candidate_for_model(&h, Some("")), "空模型名不该被挡");
+    }
+
+    /// 老 `config.json`（没有 `modelLocks` 字段）必须仍能读进来。
+    ///
+    /// 这条盯的是「加字段把老用户的配置读崩」——那是升级即数据丢失级的事故。
+    /// `serde(default)` 靠注释提醒不住，得有机械判据。
+    #[test]
+    fn a_config_without_model_locks_still_deserializes() {
+        // 刻意手写一份**缺** modelLocks 的 health（模拟 0.1.31 之前落盘的形态）
+        let json = r#"{"status":"up","failCount":2,"breakerUntil":1234567890}"#;
+        let h: HealthState = serde_json::from_str(json).expect("老配置必须能读");
+        assert_eq!(h.fail_count, 2);
+        assert_eq!(h.breaker_until, Some(1234567890));
+        assert!(h.model_locks.is_empty(), "缺字段时应回退成空表");
+    }
+
+    /// 空锁表**不得**被序列化出去。
+    ///
+    /// 判据不是洁癖：`config.json` 里每条 Key 都带一个 `"modelLocks":{}` 是纯噪声，
+    /// 而且这个结构会随 Key 数放大。`skip_serializing_if` 少写一次就静默退化。
+    #[test]
+    fn an_empty_model_lock_table_is_omitted_from_json() {
+        let h = HealthState::default();
+        let s = serde_json::to_string(&h).unwrap();
+        assert!(!s.contains("modelLocks"), "空表不该落盘，实际: {s}");
+
+        let mut h2 = HealthState::default();
+        h2.model_locks
+            .insert("m".into(), crate::model::ModelLock { until: 1, fail_count: 1 });
+        let s2 = serde_json::to_string(&h2).unwrap();
+        assert!(s2.contains("modelLocks"), "非空表必须落盘，实际: {s2}");
+        // 前端 types.ts 用的是 camelCase 键名，两侧必须一致
+        assert!(s2.contains("failCount"), "字段名应是 camelCase（前端 types.ts 依赖它）: {s2}");
+    }
+
+    /// 模型被锁时必须落一条日志。
+    ///
+    /// 不落的话这一层是**不可见**的：用户只看到第一次请求的故障转移，之后那条 Key 被静默
+    /// 跳过 —— 界面上表现为「它明明启用着、健康着，却好像没在用」。
+    #[test]
+    fn locking_a_model_writes_a_visible_event() {
+        let store = temp_store();
+        store.upsert_key(key("k")).unwrap();
+        record_model_unavailable(&store, "k", "gpt-9");
+
+        let found = store
+            .list_all_events()
+            .into_iter()
+            .any(|e| e.detail.contains("gpt-9") && e.detail.contains("锁定"));
+        assert!(
+            found,
+            "模型锁定必须留下可见事件，否则这一层对用户完全不可见。实际事件: {:?}",
+            store.list_all_events().iter().map(|e| e.detail.clone()).collect::<Vec<_>>()
+        );
     }
 }

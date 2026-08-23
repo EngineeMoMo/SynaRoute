@@ -148,6 +148,19 @@ export interface HealthState {
   latencyMs?: number;
   failCount: number;
   breakerUntil?: number; // 熔断结束时间戳；存在且未到则处于熔断中
+  /**
+   * 弹性第二层：单模型锁定表（上游真实模型名 → 锁定态）。
+   *
+   * 与 `breakerUntil` 的作用域不同：那个说「这条 Key 现在别用」，这个说「这条 Key 别用来
+   * 跑这个模型」。补全端点上的 404（上游不提供该模型）走这一层，不再熔断整条 Key。
+   *
+   * 判「是否还锁着」必须用 `until > Date.now()`，**不能**用「条目是否存在」——
+   * 条目只在该模型成功一次时才删，窗口自然到期时条目仍在（与 `breakerUntil` 同一口径，
+   * 后端 `health::model_lock_active` 有同样的注释）。
+   *
+   * 后端在表为空时**省略**该字段（`skip_serializing_if`），故是可选的。
+   */
+  modelLocks?: Record<string, { until: number; failCount: number }>;
 }
 
 /** 大脑聚合配置（FR-013 ~ FR-017） */

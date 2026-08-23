@@ -765,6 +765,7 @@ async fn handle_tool_call(
                 res.member_labels.join(" · ")
             };
             let trace = crate::model::RequestTrace {
+                request_id: String::new(),
                 key_name: "synaroute_ai".into(),
                 vendor: "mcp".into(),
                 protocol: crate::model::Protocol::Anthropic,
@@ -785,6 +786,7 @@ async fn handle_tool_call(
         }
         Err(e) => {
             let trace = crate::model::RequestTrace {
+                request_id: String::new(),
                 key_name: "synaroute_ai".into(),
                 vendor: "mcp".into(),
                 protocol: crate::model::Protocol::Anthropic,

@@ -436,6 +436,15 @@ impl ProxyManager {
 
 /// 处理一次下游工具请求：故障转移路由。
 ///
+/// 本函数只做一件事：调 [`handle_request_inner`] 拿响应，再在**唯一出口**挂上
+/// `X-SynaRoute-*` 诊断头（见 [`crate::route_meta`]）。
+///
+/// 为什么要拆这一层，而不是在 inner 里各个 `return` 前分别挂头：inner 有 8 个出口
+/// （模型发现、单模型检索、gateway 侧端点、读体失败、短路窗口、无候选、成功×2、全失败），
+/// 「记得在每个出口调一次」是**必然会漏**的纪律，而漏掉的表现是静默的
+/// —— 没人会因为「少了个响应头」提 bug，只会在下次排障时发现某类请求查不到路由信息。
+/// 收成一个出口后，漏掉这件事在结构上做不到：inner 返回什么，都会经过这里。
+///
 /// `gate_key`：本次请求所属「代理实例 + 分类」的短路窗口键（见 [`all_failed_gate`]）。
 async fn handle_request(
     store: Arc<Store>,
@@ -443,6 +452,34 @@ async fn handle_request(
     gate_key: String,
     req: Request<Incoming>,
 ) -> Result<Response<ResBody>, hyper::Error> {
+    // 请求 id 在这里生成（而不是 inner 里）：inner 的每个早退出口都要用它，
+    // 且它必须与最终挂上的头是同一个值。
+    let mut meta = crate::route_meta::RouteMeta {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        ..Default::default()
+    };
+    let out = handle_request_inner(store, category, gate_key, req, &mut meta).await;
+    out.map(|mut resp| {
+        crate::route_meta::attach(&mut resp, &meta);
+        resp
+    })
+}
+
+/// 转发主体。**不要直接调它** —— 走 [`handle_request`]，否则响应上不会带诊断头。
+///
+/// `meta`：出参。沿路把「命中哪条 Key / 实际打的模型 / 试了几次 / 耗时 / 上游状态码」
+/// 填进去，由 [`handle_request`] 在唯一出口转成响应头。填不满没关系（早退路径本来就没有
+/// 这些信息），`build_headers` 会省略空字段。
+async fn handle_request_inner(
+    store: Arc<Store>,
+    category: CategoryType,
+    gate_key: String,
+    req: Request<Incoming>,
+    meta: &mut crate::route_meta::RouteMeta,
+) -> Result<Response<ResBody>, hyper::Error> {
+    // 本地副本：`log_success` / `log_request` 两个闭包要按值捕获它写进 `RequestTrace`，
+    // 而 `meta` 全程要可变借用（沿路填字段）。借一次 String 比让闭包持有 `&mut meta` 简单得多。
+    let request_id = meta.request_id.clone();
     // 保留完整路径 + query（如 /v1/messages/count_tokens?beta=true）：同协议转发时原样透传，
     // 使 count_tokens 等非补全端点不被误改写为补全端点。协议判定仍用 contains 兼容。
     let path = req
@@ -574,7 +611,7 @@ async fn handle_request(
     // 避免无处可切却直接 503——熔断本为多 Key 快速切换，无候选可切时不应自杀。
     // 走 `candidates_for`：一次读锁内筛选排序、只克隆入选者（旧路径
     // `enabled_keys_sorted` + `select_candidates` 要克隆两轮全量启用 Key）。
-    let (candidates, used_breaker_fallback) = store.candidates_for(category);
+    let (candidates, used_breaker_fallback) = store.candidates_for(category, &requested_model);
 
     if candidates.is_empty() {
         return Ok(error_resp(
@@ -662,6 +699,7 @@ async fn handle_request(
         );
         // 链路快照只在「调用模型日志」开关开启时产生（正文可达 2×20000 字符）。
         let trace = req_log.then(|| RequestTrace {
+            request_id: request_id.clone(),
             key_name: key.name.clone(),
             vendor: key.vendor.clone(),
             protocol: key.protocol,
@@ -725,6 +763,7 @@ async fn handle_request(
             )
         };
         let trace = RequestTrace {
+            request_id: request_id.clone(),
             key_name: key.name.clone(),
             vendor: key.vendor.clone(),
             protocol: key.protocol,
@@ -816,6 +855,17 @@ async fn handle_request(
     let deadline = store.failover_budget().map(|b| std::time::Instant::now() + b);
 
     for (i, key) in candidates.iter().enumerate() {
+        // 诊断头：一进候选就记「试到第几条、是哪条」。放在循环**开头**而不是各分支里，
+        // 是为了让**任何**出口（含预算耗尽 break、跨协议 skip、循环尾的全失败）都能带上
+        // 最后一次实际触及的候选——分支里各写一遍必然漏掉那些 `break`/`continue` 路径。
+        // `attempts` 是 1-based：1 = 首选就成了，> 1 即发生过故障转移。
+        meta.attempts = (i + 1) as u32;
+        meta.key_name = key.name.clone();
+        meta.key_id = key.id.clone();
+        // 实际模型名先按该 Key 的解析结果填（真正打出去的名字在成功/失败分支里会被
+        // 上游返回的口径覆盖）。这样即使这条候选在预算门那里被跳过，头里也有信息。
+        meta.real_model = key.resolve_model(&requested_model);
+
         // 剩余预算。第一个候选永不因预算被跳过（i == 0 时至少要试一次，否则配置了极小预算
         // 会变成「一个都不试直接 529」，那比慢更糟）。
         let remaining = match deadline {
@@ -893,6 +943,25 @@ async fn handle_request(
             store.append_event(category, "failover", Some(&failed.id), &detail);
         };
 
+        // 分层记账：把这次失败罚到**正确的作用域**（见 [`failure_scope`]）。
+        //
+        // 收成一个闭包而不是在流式/非流式两处各写一遍 match：这条判据刚从「一个 bool」
+        // 升级成「三个作用域」，两处各抄一份就是给下一次漂移留位置 ——
+        // `TRANSIENT_4XX` 那条注释记着同类漂移的代价（一次上游抖动熔断好 Key 60s）。
+        //
+        // `real_model` 必须是**真正发往上游的那个名字**：模型锁的键就是它，
+        // 用对外名去锁会被「同一真实模型的另一个对外名」绕过。
+        let record_failure_by_scope =
+            |store: &Arc<Store>, key: &ProviderKey, status: u16, real_model: &str| {
+                match failure_scope(status, &path) {
+                    FailureScope::Key => health::record_live_failure(store, &key.id),
+                    FailureScope::Model => {
+                        health::record_model_unavailable(store, &key.id, real_model)
+                    }
+                    FailureScope::None => {}
+                }
+            };
+
         // 本次尝试传给转发函数的 body（P2-5 第二步）。
         //
         // **只有「没有后续候选」时才交出所有权**（零拷贝移动）；只要还有下一个候选，
@@ -933,6 +1002,12 @@ async fn handle_request(
                     // Key，不该继续短路其它在途请求；若这条流随后失败，流末的失败记账会重新累积熔断。
                     clear_all_failed_gate(&gate_key);
                     let elapsed = started.elapsed().as_millis() as u64;
+                    // 诊断头：用上游实际接受的模型名覆盖循环开头填的解析结果，并记本次耗时。
+                    // 必须在 `real_model` 被 move 进 `log_success` **之前**。
+                    // 一次 String clone（模型名，几十字节）换掉一个「响应头里的模型名可能与
+                    // 实际打出去的不一致」的坑，值。
+                    meta.real_model = real_model.clone();
+                    meta.latency_ms = elapsed;
                     // 流式成功也记一条 request 事件（开关开启时）。请求体以「转换后发往上游」为主
                     // （含 reasoning→thinking 映射结果，排障核心），单独完整保留、放最前；
                     // 「下游原始 body」（Codex 发来、转换前）体量极大（可达十几万字符），仅在
@@ -980,6 +1055,8 @@ async fn handle_request(
                 }) => {
 
                     let elapsed = started.elapsed().as_millis() as u64;
+                    // 诊断头：本次（失败的）尝试耗时，供失败出口的响应头使用。
+                    meta.latency_ms = elapsed;
                     let snippet: String = body.trim().chars().take(400).collect();
                     last_err = if snippet.is_empty() {
                         format!("HTTP {status}")
@@ -1003,15 +1080,13 @@ async fn handle_request(
                     // 原样回状态码、跳过短路窗口与 Retry-After —— 正是 529 设计要防的重试风暴。
                     // 契约同尾部注释：按「最后一次失败的性质」分流（config_error 必须只反映最后一次）。
                     config_error = false;
+                    // 分层记账放在 log_request **之前**：那一行会 move 掉 `real_model`，
+                    // 而模型锁的键就是它。（此前顺序相反，加分层时才发现。）
+                    // 429/5xx 只切不罚；补全端点 404 → 只锁这个模型；其余 4xx 硬错误 → 罚 Key。
+                    record_failure_by_scope(&store, key, status, &real_model);
                     // 请求体记的是**发往上游的那份**（跨协议时与 downstream_body 完全不同）。
                     // 界面标签写着「上游请求」，此前却填 downstream_body —— 见 HttpError 变体的说明。
                     log_request(&store, key, elapsed, url, real_model, upstream_request_body, body, Some(status), false);
-                    // 429/5xx 临时错误只切、不罚（不熔断好 Key）；4xx 硬错误才计入熔断。
-                    // **带路径判**：辅助端点（count_tokens）的 404 是「上游没实现该端点」，
-                    // 与 Key 无关，不得据此熔断（见 failure_counts_against_breaker）。
-                    if failure_counts_against_breaker(status, &path) {
-                        health::record_live_failure(&store, &key.id);
-                    }
                     log_failover(
                         &store,
                         key,
@@ -1024,6 +1099,8 @@ async fn handle_request(
                 // 连接层失败：记录并切下一个
                 Err(e) => {
                     let elapsed = started.elapsed().as_millis() as u64;
+                    // 诊断头：本次（失败的）尝试耗时，供失败出口的响应头使用。
+                    meta.latency_ms = elapsed;
                     // 本地配置错误（缺 maxOutputTokens 等）与连接层失败分开处理：前者永不自愈、
                     // 与 Key 无关，不该熔断、不该按临时错误 529 重试（见 config_error 声明）。
                     let is_config_err = matches!(e, AppError::Invalid(_));
@@ -1082,6 +1159,9 @@ async fn handle_request(
             forward_to_key(&store, category, key, &path, body, &requested_model, &fwd_headers, req_log, remaining)
                 .await;
         let elapsed = started.elapsed().as_millis() as u64;
+        // 诊断头：本次尝试耗时。放在这里（三个分支之前）而不是各分支里 ——
+        // 成功/上游非 2xx/连接层失败都会经过这一行，少一处漏的可能。
+        meta.latency_ms = elapsed;
         match result {
             Ok(outcome) if outcome.ok => {
                 // 响应体快照只在开关开启时构造：唯一去向是下面的 log_success，
@@ -1092,7 +1172,9 @@ async fn handle_request(
                 } else {
                     String::new()
                 };
-                health::record_live_success(&store, &key.id);
+                // 模型名用 `outcome.real_model`（上游实际接受的那个），不是对外名 ——
+                // 模型锁的键就是它。此处 outcome 还没解构，直接借。
+                health::record_live_success(&store, &key.id, Some(&outcome.real_model));
                 // 有 Key 能用了 → 立即解除「全部失败」短路，不等窗口自然到期。
                 clear_all_failed_gate(&gate_key);
                 // 非流式有完整响应体 → 能真取到 token 用量（两协议字段名已在
@@ -1107,6 +1189,9 @@ async fn handle_request(
                 // `bytes` 是 `Bytes`（引用计数，clone 廉价）留到最后回给下游；`status` 是 Copy。
                 // 这是本分支对 outcome 的最后一次使用，故可以整体移动而非借用。
                 let ForwardOutcome { bytes, url, real_model, request_body, status, .. } = outcome;
+                // 诊断头：用上游实际接受的模型名覆盖循环开头填的解析结果。
+                // 必须在 `real_model` 被 move 进 `log_success` 之前。耗时已在三分支之前统一记过。
+                meta.real_model = real_model.clone();
                 log_success(
                     &store,
                     key,
@@ -1154,6 +1239,9 @@ async fn handle_request(
                 // 解构取走三个 String，消掉三次 clone（本分支对 outcome 的最后一次使用）。
                 // 必须放在 `resp_cow` 用完之后：它借用了 `outcome.bytes`。
                 let ForwardOutcome { url, real_model, request_body, status, .. } = outcome;
+                // 分层记账放在 log_request **之前**（同流式分支）：那一行会 move 掉 `real_model`，
+                // 而模型锁的键就是它。
+                record_failure_by_scope(&store, key, status, &real_model);
                 log_request(
                     &store,
                     key,
@@ -1165,12 +1253,6 @@ async fn handle_request(
                     Some(status),
                     false,
                 );
-                // 429/5xx 临时错误只切、不罚（不熔断好 Key）；4xx 硬错误才计入熔断。
-                // **带路径判**：辅助端点（count_tokens）的 404 是「上游没实现该端点」，
-                // 与 Key 无关，不得据此熔断（见 failure_counts_against_breaker）。
-                if failure_counts_against_breaker(status, &path) {
-                    health::record_live_failure(&store, &key.id);
-                }
                 log_failover(
                     &store,
                     key,
@@ -1217,6 +1299,14 @@ async fn handle_request(
     }
 
     store.append_event(category, "error", None, &format!("全部 Key 失败: {last_err}"));
+
+    // 诊断头：把**最后一次**上游状态码带给下游。
+    //
+    // 这是这组头在失败路径上最值钱的一个字段：下游只会看到我们合成的 529 / 或原样回传的
+    // 4xx，看不出「是上游真的 429 了」还是「代理这边判成了配置错误」。有了它，用户贴一条
+    // `x-synaroute-upstream-status: 401` 就直接指向密钥失效，不必先怀疑网络/额度。
+    // 连接层失败无状态码（`last_status` 为 None）→ 头省略，本身也是一个信号。
+    meta.upstream_status = last_status;
 
     // 按「最后一次失败的性质」分流。全部候选失败有两类完全不同的成因，给下游同一个状态码
     // 是错的：
@@ -1797,6 +1887,9 @@ async fn try_stream_to_key(
             let head_buf2 = head_buf.clone();
             let store2 = store.clone();
             let key_id2 = key.id.clone();
+            // 流末记账要按「哪个模型」衰减第二层的模型锁，故必须带上真实模型名
+            // （`req_model2` 是**对外名**，不是这个）。
+            let real_model2 = real_model.clone();
             let category2 = category;
             // 补记只需要「定位到哪一行」的三要素（分类 + key + collapse_key），
             // 不再自己拼 detail —— detail 由流开始时那条同步日志负责，补记只往里补用量。
@@ -1857,7 +1950,7 @@ async fn try_stream_to_key(
                 if crate::upstream::sse_stream_errored(&tail_sse) {
                     health::record_live_failure(&store2, &key_id2);
                 } else {
-                    health::record_live_success(&store2, &key_id2);
+                    health::record_live_success(&store2, &key_id2, Some(&real_model2));
                 }
                 if let Some(u) = crate::upstream::extract_usage_from_sse(&merged) {
                     // 补记进**流开始时已写下的那一行**，不新追加一条。
@@ -1898,6 +1991,8 @@ async fn try_stream_to_key(
             let usage_key_id = key.id.clone();
             let usage_category = category;
             let usage_req_model = requested_model.to_string();
+            // 同同协议分支：流末衰减模型锁要用真实模型名，不是对外名。
+            let usage_real_model = real_model.clone();
 
             struct StreamState<S> {
                 translator: crate::upstream::SseTranslator,
@@ -1917,6 +2012,9 @@ async fn try_stream_to_key(
                 category: CategoryType,
                 key_id: String,
                 req_model: String,
+                /// 发往上游的真实模型名。只用于流末按模型衰减第二层的模型锁
+                /// （`req_model` 是对外名，锁的键不是它）。
+                real_model: String,
             }
 
             // 挂在 Drop 上而不是在几个 `return None` 分支里各调一次：unfold 的累加器在
@@ -1957,7 +2055,11 @@ async fn try_stream_to_key(
                     if self.saw_upstream_error() {
                         health::record_live_failure(&self.store, &self.key_id);
                     } else {
-                        health::record_live_success(&self.store, &self.key_id);
+                        health::record_live_success(
+                            &self.store,
+                            &self.key_id,
+                            Some(&self.real_model),
+                        );
                     }
                 }
 
@@ -1993,6 +2095,7 @@ async fn try_stream_to_key(
                 category: usage_category,
                 key_id: usage_key_id,
                 req_model: usage_req_model,
+                real_model: usage_real_model,
             };
             let translated = futures_util::stream::unfold(init, |mut st| async move {
                 loop {
@@ -2644,11 +2747,68 @@ fn path_is_auxiliary_endpoint(path: &str) -> bool {
 /// 判据的本质：熔断要回答的是「**这个 Key** 还能不能服务」。辅助端点的 404 回答的是
 /// 「**这个端点**上游没实现」——与用哪个 Key 无关，换任何 Key 都同样 404，
 /// 与 400「请求不合法」属同一类，故同样只切不罚。
+/// 「这次失败该罚 Key 吗」的布尔版。
+///
+/// 生产路径已改走 [`failure_scope`]（三个作用域，而不是一个 bool）。本函数保留为
+/// **既有 4 条判据测试的入口**，并作为「Key 级」这一档的可读定义。
+///
+/// 标 `#[cfg(test)]` 的理由同 `health::is_candidate`：从编译期阻止有人把生产调用点切回
+/// 这条**丢掉模型级作用域**的路径 —— 那种回退不报错，只是 404 又开始熔断整条 Key。
+#[cfg(test)]
 fn failure_counts_against_breaker(status: u16, path: &str) -> bool {
+    matches!(failure_scope(status, path), FailureScope::Key)
+}
+
+/// 一次失败该罚到**哪一层**（借鉴 OmniRoute 的三层弹性作用域划分，
+/// 见 `docs/architecture/RESILIENCE_GUIDE.md`）。
+///
+/// 这是把「熔断要回答什么问题」这句话落成类型：
+/// - [`FailureScope::Key`] —— 「**这条 Key** 还能不能服务」。凭据级硬错误（401 等）。
+/// - [`FailureScope::Model`] —— 「这条 Key 能不能跑**这个模型**」。范围小一级，
+///   不该让整条 Key 停摆。
+/// - [`FailureScope::None`] —— 谁都不罚。临时性（429/5xx）、请求级（400/422）、辅助端点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureScope {
+    Key,
+    Model,
+    None,
+}
+
+/// 状态码 + 路径 → 罚哪一层。**单一事实来源**，别在 health.rs 里复制一份
+/// （`TRANSIENT_4XX` 那条注释记着两处判据漂移过一次的代价）。
+///
+/// ## 为什么 404 归模型级而不是 Key 级（2026-08-23 改）
+///
+/// 补全端点上的 404 字面意思就是「这里没有这个模型/路由」。此前它走 Key 级：三次之后整条
+/// Key 熔断 60 秒，**连它本来能服务的模型一起被挡住**。而中转站「某条 Key 的某个模型没开通」
+/// 是最常见的一类失败形态。
+///
+/// 判据与既有的 [`path_is_auxiliary_endpoint`] 完全同源 —— 那条已经在说
+/// 「`count_tokens` 的 404 回答的是**这个端点**上游没实现，与用哪个 Key 无关」。
+/// 这里只是把同一句话往前推一步：补全端点的 404 回答的是**这个模型**上游没有，
+/// 与这条 Key 的其它模型无关。
+///
+/// ## 为什么 401/403 仍归 Key 级
+///
+/// 401 是明确的凭据失效。403 有歧义（可能是「套餐不含该模型」，也可能是「Key 被封/IP 被拦」），
+/// 但没有本项目自己的取证支撑把它划到模型级，所以**不猜** —— 保持原样。
+/// 真要改，先拿到用户机器上中转站的实际响应体，别按推测改。
+///
+/// 一条 Key 上模型锁攒到阈值时会自动升级成 Key 级熔断
+/// （`health::MODEL_LOCK_ESCALATE_AT`），所以「404 一切」的坏 Key 不会赖在池子里。
+fn failure_scope(status: u16, path: &str) -> FailureScope {
+    // 辅助端点（count_tokens）上游普遍不实现：谁都不罚。这条必须最先判 ——
+    // 否则它的 404 会掉进下面的模型级分支，把一个完好模型锁 120 秒。
     if path_is_auxiliary_endpoint(path) {
-        return false;
+        return FailureScope::None;
     }
-    status_counts_against_breaker(status)
+    if status == 404 {
+        return FailureScope::Model;
+    }
+    if status_counts_against_breaker(status) {
+        return FailureScope::Key;
+    }
+    FailureScope::None
 }
 
 /// 是否为「无内容探测请求」：消息载荷为空**且**未解析出任何模型名。
@@ -3055,13 +3215,39 @@ mod tests {
             );
         }
 
-        // 反面：补全端点的 404（模型真的不存在）**仍要**计入熔断，
-        // 否则这个修复就把原本正确的那条判据也一起废掉了。
+        // 补全端点的 404 归**模型级**，不再罚 Key（2026-08-23 分层，见 `failure_scope`）。
+        //
+        // 这条断言的方向此前是相反的（「仍应计入熔断」）。改的理由：补全端点 404 的字面
+        // 意思是「这里没有这个模型」，而中转站「某条 Key 的某个模型没开通」是最常见的
+        // 一类失败 —— 旧语义下三次之后整条 Key 停摆 60 秒，连它本来能服务的模型一起误伤。
+        // 与上面辅助端点那条是同一句话再往前推一步：404 回答的是「这个模型/端点」有没有，
+        // 不是「这条 Key」还能不能用。
         for p in ["/v1/messages", "/v1/chat/completions", "/v1/responses"] {
             assert!(!path_is_auxiliary_endpoint(p), "{p:?} 是补全端点，不是辅助端点");
+            assert_eq!(
+                failure_scope(404, p),
+                FailureScope::Model,
+                "{p:?} 的 404 应只锁这个模型，不该熔断整条 Key"
+            );
             assert!(
-                failure_counts_against_breaker(404, p),
-                "{p:?} 的 404 表示模型/端点真的不存在，仍应计入熔断"
+                !failure_counts_against_breaker(404, p),
+                "{p:?} 的 404 不得再计入 Key 级熔断"
+            );
+            // 但 401 仍是 Key 级：那是明确的凭据失效，与模型无关。
+            assert_eq!(
+                failure_scope(401, p),
+                FailureScope::Key,
+                "{p:?} 的 401 是凭据问题，必须仍罚 Key（否则坏密钥永远切不走）"
+            );
+        }
+
+        // 辅助端点的 404 必须仍归 None —— **不能**掉进上面那条模型级分支，
+        // 否则 count_tokens 的常态 404 会把一个完好模型锁 120 秒。
+        for p in ["/v1/messages/count_tokens", "/v1/messages/count_tokens?beta=true"] {
+            assert_eq!(
+                failure_scope(404, p),
+                FailureScope::None,
+                "{p:?} 的 404 是「上游没实现该端点」，谁都不该罚"
             );
         }
 
@@ -6021,5 +6207,525 @@ mod tests {
             k.health.fail_count,
             k.health.breaker_until
         );
+    }
+
+    // ==================== 诊断响应头（route_meta）端到端 ====================
+    //
+    // `route_meta` 自己的单测覆盖「值怎么构造」；这里覆盖「它到底有没有到下游」——
+    // 两者缺一不可：头构造正确但没挂上，或挂上了但没填对候选，都是纯单测抓不到的。
+
+    /// 取响应上全部 `x-synaroute-*` 头（小写名 → 值）。
+    fn synaroute_headers(resp: &reqwest::Response) -> std::collections::BTreeMap<String, String> {
+        resp.headers()
+            .iter()
+            .filter(|(n, _)| n.as_str().starts_with("x-synaroute-"))
+            .map(|(n, v)| (n.as_str().to_string(), v.to_str().unwrap_or("<非法>").to_string()))
+            .collect()
+    }
+
+    /// 成功转发必须带全套诊断头，且 `attempts=1`（首选就成了）。
+    #[tokio::test]
+    async fn success_response_carries_route_meta_headers() {
+        let up = spawn_mock(200, r#"{"ok":true}"#).await;
+        let dir = temp_dir("meta_success");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        store.upsert_key(key("k1", 0, &up)).unwrap();
+        store.secrets.write().set("k1", "sk-secret-value").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"claude-x","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let hs = synaroute_headers(&resp);
+
+        assert_eq!(hs.get("x-synaroute-key").map(String::as_str), Some("k-k1"));
+        assert_eq!(hs.get("x-synaroute-key-id").map(String::as_str), Some("k1"));
+        assert_eq!(hs.get("x-synaroute-model").map(String::as_str), Some("claude-x"));
+        assert_eq!(hs.get("x-synaroute-attempts").map(String::as_str), Some("1"));
+        assert_eq!(
+            hs.get("x-synaroute-version").map(String::as_str),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        // 成功出口不带 upstream_status（下游看得到自己的 200）
+        assert_eq!(hs.get("x-synaroute-upstream-status"), None);
+        // request_id 是个 uuid，且与复合头同属一次请求
+        let rid = hs.get("x-synaroute-request-id").expect("必须有 request-id");
+        assert_eq!(rid.len(), 36, "request-id 应为 uuid: {rid}");
+        let decision = hs.get("x-synaroute-decision").expect("必须有 decision");
+        assert!(
+            decision.starts_with("key=k-k1; model=claude-x; attempts=1; latency_ms="),
+            "复合头形状不对: {decision}"
+        );
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 故障转移后，头必须指向**最终成功的那条** Key，且 `attempts` 反映真实尝试次数。
+    ///
+    /// 这条是这组头存在的首要理由：客户端此前完全看不出「这次悄悄换过 Key」。
+    #[tokio::test]
+    async fn failover_is_visible_in_attempts_and_key_headers() {
+        let bad = spawn_mock(500, r#"{"error":"boom"}"#).await;
+        let good = spawn_mock(200, r#"{"ok":true}"#).await;
+        let dir = temp_dir("meta_failover");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        store.upsert_key(key("k1", 0, &bad)).unwrap();
+        store.upsert_key(key("k2", 1, &good)).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        store.secrets.write().set("k2", "y").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "应转移到第二条");
+        let hs = synaroute_headers(&resp);
+        assert_eq!(
+            hs.get("x-synaroute-attempts").map(String::as_str),
+            Some("2"),
+            "试了两条候选，头里必须是 2（否则客户端看不出发生过故障转移）"
+        );
+        assert_eq!(
+            hs.get("x-synaroute-key-id").map(String::as_str),
+            Some("k2"),
+            "头必须指向**最终成功**的那条 Key，不是首选那条"
+        );
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **失败出口也必须带头**，且带上最后一次上游状态码。
+    ///
+    /// 这是失败路径上最值钱的字段：下游只看到我们回的状态码，分不清「上游真的 401」
+    /// 与「代理这边判成了配置错误」。漏掉失败出口是最容易犯的错（大家只顾成功路径），
+    /// 故单独一条测试盯住。
+    #[tokio::test]
+    async fn failure_exit_also_carries_headers_with_upstream_status() {
+        let up = spawn_mock(401, r#"{"error":"bad key"}"#).await;
+        let dir = temp_dir("meta_fail");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        store.upsert_key(key("k1", 0, &up)).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert!(!resp.status().is_success(), "上游 401，不该是成功");
+        let hs = synaroute_headers(&resp);
+        assert_eq!(
+            hs.get("x-synaroute-upstream-status").map(String::as_str),
+            Some("401"),
+            "失败出口必须带最后一次上游状态码"
+        );
+        assert_eq!(hs.get("x-synaroute-attempts").map(String::as_str), Some("1"));
+        assert_eq!(hs.get("x-synaroute-key-id").map(String::as_str), Some("k1"));
+        assert!(
+            hs.get("x-synaroute-decision").unwrap().contains("upstream_status=401"),
+            "复合头也该带上"
+        );
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 🔴 **安全不变量**：诊断头绝不能携带 base_url / 端口 / 密钥。
+    ///
+    /// 理由见 `route_meta` 模块注释：部分中转站把访问令牌放在 URL 路径里
+    /// （`https://host/v1/<token>/`），把 url 写进响应头等于把密钥回显给下游。
+    ///
+    /// 这条测试是那份禁令的**机械判据**：谁哪天往 `RouteMeta` 加了 url 字段并挂上头，
+    /// 这里立刻变红。仅靠模块注释提醒是不够的——本项目的历史证明注释会被跳过。
+    #[tokio::test]
+    async fn route_meta_headers_never_leak_base_url_or_secret() {
+        let up = spawn_mock(200, r#"{"ok":true}"#).await;
+        let dir = temp_dir("meta_noleak");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // 把「像令牌一样的 URL 路径」也放进 base_url，模拟真实中转站形态
+        let mut k = key("k1", 0, &format!("{up}/v1/tok-abc123"));
+        k.name = "Sub2API".into();
+        store.upsert_key(k).unwrap();
+        const SECRET: &str = "sk-ant-super-secret-0987654321";
+        store.secrets.write().set("k1", SECRET).unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        let hs = synaroute_headers(&resp);
+        assert!(!hs.is_empty(), "前置条件：确实挂上了诊断头");
+
+        // up 形如 http://127.0.0.1:PORT —— 取其 host:port 段做判据
+        let host_port = up.trim_start_matches("http://").to_string();
+        for (name, value) in &hs {
+            assert!(!value.contains(SECRET), "{name} 泄露了密钥: {value}");
+            assert!(!value.contains("tok-abc123"), "{name} 泄露了 URL 路径里的令牌: {value}");
+            assert!(!value.contains(&host_port), "{name} 泄露了上游地址: {value}");
+            assert!(!value.contains("http"), "{name} 里出现了 URL: {value}");
+        }
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 中文 Key 名（本项目用户的常态）必须被 percent-encode，且**可解码回原值**。
+    ///
+    /// 只断言「是 ASCII」不够：那样把值整段丢掉也能过。这里真解一遍。
+    #[tokio::test]
+    async fn chinese_key_name_is_percent_encoded_and_decodable() {
+        let up = spawn_mock(200, r#"{"ok":true}"#).await;
+        let dir = temp_dir("meta_cjk");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let mut k = key("k1", 0, &up);
+        k.name = "「林夕」公益站".into();
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let hs = synaroute_headers(&resp);
+        let raw = hs.get("x-synaroute-key").expect("必须有 key 头");
+        assert!(raw.is_ascii() && raw.contains('%'), "中文名应被编码: {raw}");
+
+        // 逐字节 percent-decode 回 UTF-8，必须等于原名
+        let decoded = {
+            let b = raw.as_bytes();
+            let mut out = Vec::with_capacity(b.len());
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'%' && i + 2 < b.len() {
+                    let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap();
+                    out.push(u8::from_str_radix(hex, 16).unwrap());
+                    i += 3;
+                } else {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            }
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(
+            decoded, "「林夕」公益站",
+            "解码后必须还原成原始 Key 名（否则只是把值丢了）"
+        );
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **单一 chokepoint 的结构证明**：连「压根不进转发」的出口也带头。
+    ///
+    /// `GET /v1/models` 在 `handle_request_inner` 里是第一个早退分支，它没有候选、没有耗时；
+    /// 未配置任何 Key 时的 POST 走的是「无候选」早退。它们照样带上 version 头，说明头是在
+    /// **唯一出口**挂的，而不是在各转发分支里逐个挂的——后者必然漏，且漏得静默。
+    /// 谁哪天把 wrapper 拆掉、改回分支内挂头，这条会变红。
+    #[tokio::test]
+    async fn every_exit_goes_through_the_single_chokepoint() {
+        let dir = temp_dir("meta_chokepoint");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+
+        // 三个不同性质的非转发出口：模型发现、单模型检索、无候选（未配置任何 Key）
+        for (method_post, path) in [
+            (false, "/v1/models"),
+            (false, "/v1/models/claude-x"),
+            (true, "/v1/messages"),
+        ] {
+            let c = reqwest::Client::new();
+            let url = format!("http://127.0.0.1:{port}{path}");
+            let resp = if method_post {
+                c.post(&url)
+                    .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+                    .send()
+                    .await
+                    .unwrap()
+            } else {
+                c.get(&url).send().await.unwrap()
+            };
+            let hs = synaroute_headers(&resp);
+            assert_eq!(
+                hs.get("x-synaroute-version").map(String::as_str),
+                Some(env!("CARGO_PKG_VERSION")),
+                "{path} 这个出口没走 chokepoint —— 头是不是被挪回各分支里挂了？"
+            );
+            // 每个出口都该有 request-id：它是「响应头 ↔ 日志」对账的锚点
+            assert!(
+                hs.contains_key("x-synaroute-request-id"),
+                "{path} 缺 request-id"
+            );
+        }
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ============ 弹性第二层（单模型锁定）端到端 ============
+    //
+    // health.rs 的单测覆盖「锁的算术」；这里覆盖「它有没有真的改变路由」。
+    // 断言大量借用上一批加的诊断响应头 —— 两个改动互为判据：
+    // 头证明路由确实换了 Key，锁证明头里的 attempts 变化不是偶然。
+
+    /// 补全端点 404 → 只锁那个模型，Key 不熔断；**下一次同模型请求直接跳过这条 Key**。
+    ///
+    /// 第二个断言是这一层的产品价值所在：旧行为下 k1 要被连打 3 次才熔断，
+    /// 期间每个请求都白花一次往返；而熔断之后 k1 上**所有**模型一起被挡 60 秒。
+    #[tokio::test]
+    async fn completion_404_locks_only_that_model_and_next_request_skips_the_key() {
+        let bad = spawn_mock(404, r#"{"error":{"message":"model not found"}}"#).await;
+        let good = spawn_mock(200, r#"{"ok":true}"#).await;
+        let dir = temp_dir("mlock_e2e");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        store.upsert_key(key("k1", 0, &bad)).unwrap();
+        store.upsert_key(key("k2", 1, &good)).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        store.secrets.write().set("k2", "y").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let send = |model: &'static str| {
+            let url = format!("http://127.0.0.1:{port}/v1/messages");
+            async move {
+                reqwest::Client::new()
+                    .post(url)
+                    .json(&json!({"model":model,"max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // 第一次：k1 回 404 → 锁 gpt-9 这个模型 → 转移到 k2 成功
+        let r1 = send("gpt-9").await;
+        assert_eq!(r1.status().as_u16(), 200);
+        assert_eq!(
+            synaroute_headers(&r1).get("x-synaroute-attempts").map(String::as_str),
+            Some("2"),
+            "第一次应该试了 k1（404）再转到 k2"
+        );
+
+        let h1 = store.get_key("k1").unwrap().health;
+        assert_eq!(h1.fail_count, 0, "404 不该累加 Key 级计数");
+        assert!(h1.breaker_until.is_none(), "404 不该熔断整条 Key");
+        assert!(h1.model_locks.contains_key("gpt-9"), "应锁住 gpt-9，实际 {:?}", h1.model_locks);
+
+        // 第二次：同一个模型 → k1 已被模型锁挡住，**一次就命中 k2**
+        let r2 = send("gpt-9").await;
+        assert_eq!(r2.status().as_u16(), 200);
+        let hs = synaroute_headers(&r2);
+        assert_eq!(
+            hs.get("x-synaroute-attempts").map(String::as_str),
+            Some("1"),
+            "被锁的 Key 应被跳过、一次命中 —— 若仍是 2，说明模型锁没进候选筛选"
+        );
+        assert_eq!(hs.get("x-synaroute-key-id").map(String::as_str), Some("k2"));
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 🔴 模型锁的键必须是**真实模型名**，不是客户端要的对外名。
+    ///
+    /// 同一条 Key 上把两个对外名映射到同一个真实模型是常见配置。若锁在对外名上，
+    /// 换一个对外名就能绕过锁 —— 那这层形同虚设，而且失效是静默的（没人会发现
+    /// 「换了个别名就又开始白打 404 了」）。
+    #[tokio::test]
+    async fn the_model_lock_is_keyed_by_the_upstream_name_not_the_client_facing_alias() {
+        let bad = spawn_mock(404, r#"{"error":"nope"}"#).await;
+        let good = spawn_mock(200, r#"{"ok":true}"#).await;
+        let dir = temp_dir("mlock_alias");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // k1：两个不同的对外名 → **同一个**真实模型
+        let mut k1 = key("k1", 0, &bad);
+        k1.mappings = vec![
+            crate::model::ModelMapping {
+                id: "m1".into(),
+                expected_name: "alias-A".into(),
+                real_name: "upstream-X".into(),
+            },
+            crate::model::ModelMapping {
+                id: "m2".into(),
+                expected_name: "alias-B".into(),
+                real_name: "upstream-X".into(),
+            },
+        ];
+        store.upsert_key(k1).unwrap();
+        store.upsert_key(key("k2", 1, &good)).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        store.secrets.write().set("k2", "y").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let send = |model: &'static str| {
+            let url = format!("http://127.0.0.1:{port}/v1/messages");
+            async move {
+                reqwest::Client::new()
+                    .post(url)
+                    .json(&json!({"model":model,"max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // 用 alias-A 触发锁
+        let r1 = send("alias-A").await;
+        assert_eq!(r1.status().as_u16(), 200, "应转移到 k2");
+        let locks = store.get_key("k1").unwrap().health.model_locks;
+        assert!(
+            locks.contains_key("upstream-X"),
+            "锁的键应是真实模型名 upstream-X，实际 {:?}",
+            locks.keys().collect::<Vec<_>>()
+        );
+        assert!(!locks.contains_key("alias-A"), "不该锁在对外名上");
+
+        // 换成 alias-B（映射到同一个真实模型）→ k1 仍必须被跳过
+        let r2 = send("alias-B").await;
+        assert_eq!(r2.status().as_u16(), 200);
+        assert_eq!(
+            synaroute_headers(&r2).get("x-synaroute-attempts").map(String::as_str),
+            Some("1"),
+            "换个对外名不该绕过模型锁 —— 若这里是 2，说明锁键用的是对外名"
+        );
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 无处可切时，模型锁也要走兜底 —— 不能因为「唯一那条 Key 的这个模型被锁了」就直接 503。
+    ///
+    /// 与 Key 级熔断的兜底完全同一判据（见 `Store::candidates_for` 文档）：
+    /// 锁是为「多 Key 快速切换」设计的，无处可切时不该自杀。
+    #[tokio::test]
+    async fn a_locked_model_still_falls_back_when_it_is_the_only_key() {
+        let up = spawn_mock(404, r#"{"error":"nope"}"#).await;
+        let dir = temp_dir("mlock_fallback");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        store.upsert_key(key("k1", 0, &up)).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let send = || {
+            let url = format!("http://127.0.0.1:{port}/v1/messages");
+            async move {
+                reqwest::Client::new()
+                    .post(url)
+                    .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let r1 = send().await;
+        assert!(!r1.status().is_success());
+        assert!(
+            store.get_key("k1").unwrap().health.model_locks.contains_key("m"),
+            "前置条件：模型已被锁"
+        );
+
+        // 第二次：唯一候选被模型锁挡住 → 必须走兜底再试它一次，而不是「无可用 Key」
+        let r2 = send().await;
+        let hs = synaroute_headers(&r2);
+        assert_eq!(
+            hs.get("x-synaroute-attempts").map(String::as_str),
+            Some("1"),
+            "兜底应仍然试那条唯一的 Key（attempts=0 意味着一条都没试 → 直接判死）"
+        );
+        assert_eq!(
+            hs.get("x-synaroute-upstream-status").map(String::as_str),
+            Some("404"),
+            "应真的打到了上游（拿到 404），而不是本地直接拒绝"
+        );
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 401 仍然走 Key 级：坏密钥必须能被切走，不能被降级成「只是某个模型不行」。
+    ///
+    /// 这条是分层的**反向防线**：分层的风险是把该罚 Key 的也只罚了模型，
+    /// 于是一条废密钥永远赖在候选池首位。
+    #[tokio::test]
+    async fn a_401_still_penalizes_the_key_not_just_the_model() {
+        let bad = spawn_mock(401, r#"{"error":"bad key"}"#).await;
+        let good = spawn_mock(200, r#"{"ok":true}"#).await;
+        let dir = temp_dir("mlock_401");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        store.upsert_key(key("k1", 0, &bad)).unwrap();
+        store.upsert_key(key("k2", 1, &good)).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+        store.secrets.write().set("k2", "y").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        for _ in 0..3 {
+            let _ = reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/v1/messages"))
+                .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+                .send()
+                .await
+                .unwrap();
+        }
+        let h = store.get_key("k1").unwrap().health;
+        assert!(
+            h.breaker_until.is_some(),
+            "连续 401 必须熔断整条 Key（fail_count={}）—— 若只锁了模型，废密钥就切不走了",
+            h.fail_count
+        );
+        assert!(
+            h.model_locks.is_empty(),
+            "401 不该产生模型锁：它跟模型无关"
+        );
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

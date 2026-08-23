@@ -357,6 +357,25 @@ pub struct ModelInfo {
     pub max_output_tokens: Option<u32>,
 }
 
+/// 「这条 Key 上的这个模型不可用」的锁定态 —— 弹性的**第二层**
+/// （借鉴 OmniRoute 的 Model Lockout，见 `docs/architecture/RESILIENCE_GUIDE.md` §3）。
+///
+/// 为什么需要它：熔断（`HealthState.breaker_until`）回答的是「**这条 Key** 还能不能服务」。
+/// 而中转站最常见的一类失败是「这条 Key 的**某个模型**没开通」——上游对该模型回 404，
+/// 对它服务的其它模型完全正常。此前这类 404 记进 Key 级熔断，三次之后整条 Key 停摆 60 秒，
+/// 连它本来能服务的模型一起被误伤。作用域分开后，只有那个模型被挡住。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelLock {
+    /// 锁定到何时（毫秒时间戳）。到期即自动放行（惰性恢复，无后台定时器）。
+    pub until: i64,
+    /// 该模型累计失败次数。驱动指数退避；一次成功**减半**，到 0 时整条删除。
+    ///
+    /// 用「减半」而非「清零」：一个偶尔可用的模型（上游按分钟配额放行）若每次成功就清零，
+    /// 退避永远停在第一档、锁定窗口永远是 120s，实际是在高频白打上游。减半让它平滑退回。
+    pub fail_count: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthState {
@@ -373,6 +392,12 @@ pub struct HealthState {
     /// 正在成功服务的 Key——真实流量才是可用性的最终裁判。仅内存/持久化标记，不下发前端展示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_live_success: Option<i64>,
+    /// 单模型锁定表：**上游真实模型名** → 锁定态。见 [`ModelLock`]。
+    ///
+    /// 键为**映射后的真实模型名**而不是客户端要的对外名：同一条 Key 上多个对外名可能映射到
+    /// 同一个真实模型，上游拒的是真实模型，锁也应该锁在那一层（否则换个对外名就绕过了锁）。
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub model_locks: std::collections::HashMap<String, ModelLock>,
 }
 
 impl Default for HealthState {
@@ -384,6 +409,7 @@ impl Default for HealthState {
             fail_count: 0,
             breaker_until: None,
             last_live_success: None,
+            model_locks: std::collections::HashMap::new(),
         }
     }
 }
@@ -1630,6 +1656,17 @@ pub struct EventLogEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestTrace {
+    /// 本次代理请求的 id，与响应头 `X-SynaRoute-Request-Id` 是同一个值。
+    ///
+    /// 存在的唯一理由是**对账**：用户手里只有客户端收到的响应头，我们手里只有日志。
+    /// 没有这个字段时，「用户说那次 529」与「日志里哪一条」之间只能靠时间戳猜，
+    /// 而高频转发下同一秒内可能有好几条。
+    ///
+    /// 非代理路径（大脑聚合、MCP、测试构造）没有代理请求 id，填空串——
+    /// 不编一个假的，空串在界面上就是「不适用」。
+    /// `serde(default)` 是为了老日志文件：这个字段是后加的，旧文件里没有。
+    #[serde(default)]
+    pub request_id: String,
     /// 命中的 Key 名称
     pub key_name: String,
     /// 命中的厂商标识（ProviderKey.vendor）
