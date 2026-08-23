@@ -366,6 +366,31 @@ Rust 测试是**同文件内联**的。若按整文件行数冻结，「补一�
 `HKCU\…\Uninstall\SynaRoute` 并可能关掉你正在用的实例，于是可能顶掉你自己那份安装的
 卸载入口。CI 上无此顾虑（一次性环境），故 CI 里不需要这个参数。
 
+🔴 **`smoke:installer` 目前只能在 CI 跑，本机一律红** —— 这是 2026-08-23 第一次真跑时
+发现的：那条自检行报 `配置=%APPDATA%\SynaRoute\config.json · keys=13`，
+**冒烟实例读的是用户真实配置**。而真实配置里 `proxyRunningCategories` 非空，
+于是它开机会自动启动代理并顺带写工具配置（起=写、停=还原）。
+那次没造成损害纯属运气：脚本一看到自检行就收尾，早于代理自启动写完
+（已核对 `claude_desktop_config.json` mtime 仍是一个多月前、无 `.synaroute-created`、
+config.json 13 keys 完好）。慢一点、或那条分类是 claude-cli，就会把
+`~/.claude/settings.json` 改写成指向一个随后被 kill 的临时实例的端口，
+而「起了没还原」这种状态**不自愈**。第二重问题：与用户自己那份实例抢同一个代理端口。
+
+已加一条**可证伪的硬判据**：自检行的 `keys=` 必须为 0，否则整个门红（一个静默失去
+隔离的门比一个红的门糟得多）。故本机跑到那一步必然红 —— 但**前两步是真过了的**，
+「装得上、起得来」这个结论成立，红的只是隔离这一项。
+
+<br>❌ **已证伪的修法，别再试**：给子进程传 `env: { APPDATA: <临时目录> }`。
+`dirs::data_dir()`（`store.rs` 解析配置路径用的）在 Windows 上走
+`SHGetKnownFolderPath(FOLDERID_RoamingAppData)` 这个已知文件夹 API，**不读 `APPDATA`
+环境变量**，改了照样 `keys=13`。
+
+<br>✅ **待办（未做）**：生产侧加一个 `SYNAROUTE_DATA_DIR` 环境变量覆盖
+（`store.rs:429` 那处 `dirs::data_dir()`），同 OmniRoute 的 `DATA_DIR`
+—— 它的 `check-pack-boot.mjs` 正是靠这个隔离，注释写着 "DATA_DIR isolated"。
+那是一处生产代码改动 + 回归测试，刻意没塞进 v0.1.32 那次发版
+（发版当口往产物里加新的路径解析分支，风险与收益不匹配）。做完之后本机就能跑这个门了。
+
 ## 其他硬规则
 
 - 改配置/二进制前必先备份（带日期后缀，可回滚）。

@@ -34,7 +34,14 @@
 //   - 顶掉用户自己那份安装的卸载入口；
 //   - 把用户正在用的 SynaRoute 关掉。
 // CI 上无所谓（一次性容器），本地必须由人点头。故本地运行要带 `--yes-install-on-this-machine`。
-import { existsSync, readdirSync, readFileSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import {
+  existsSync,
+  readdirSync,
+  readFileSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, execFileSync } from "node:child_process";
@@ -130,6 +137,31 @@ try {
 
   // ---- 2. 启动并等它自证 ----
   console.log(`启动并等启动自检日志 …（超时 ${BOOT_TIMEOUT_MS / 1000}s）`);
+
+  // 🔴 数据目录**目前无法隔离** —— 这决定了本门只能在 CI（干净环境）跑。
+  //
+  // 实测（2026-08-23 第一次真跑）：不隔离时那条自检行写的是
+  //   `配置=%APPDATA%\SynaRoute\config.json · keys=13`
+  // —— 冒烟实例读的是**用户真实配置**。而真实配置里 `proxyRunningCategories` 非空，
+  // 于是它开机会自动启动代理并顺带写工具配置（CLAUDE.md：起=写、停=还原）。
+  // 那次没造成损害纯属运气：脚本一看到自检行就收尾，早于代理自启动写完
+  // （已核对：`claude_desktop_config.json` mtime 仍是一个多月前、无 `.synaroute-created`）。
+  // 慢一点、或用户那条分类是 claude-cli，就会把 `~/.claude/settings.json` 改写成指向一个
+  // 随后被 kill 的临时实例的端口 —— 而「起了没还原」这种状态**不自愈**。
+  // 第二重问题：与用户自己那份实例抢同一个代理端口。
+  //
+  // ❌ 试过并**证伪**的修法：给子进程传 `env: { APPDATA: <临时目录> }`。
+  //    `dirs::data_dir()`（store.rs 解析配置路径用的）在 Windows 上走
+  //    `SHGetKnownFolderPath(FOLDERID_RoamingAppData)` 这个已知文件夹 API，
+  //    **不读 `APPDATA` 环境变量**。改了照样 keys=13。
+  //    别再往这个方向试 —— 留一句在这里省下下一个人的半小时。
+  //
+  // ✅ 真正的修法（未做，见下方 TODO）：生产侧加一个 `SYNAROUTE_DATA_DIR` 覆盖，
+  //    同 OmniRoute 的 `DATA_DIR` env（它的 check-pack-boot.mjs 正是靠这个隔离，
+  //    注释写着 "DATA_DIR isolated"）。那是一处生产代码改动 + 回归测试，
+  //    刻意不塞进这次发版（详见 CLAUDE.md 该条 TODO）。
+  //
+  // 在那之前：本地一律拒跑（下面的 keys 判据会红），CI 上因环境干净而 keys=0 自然通过。
   child = spawn(exe, [], { cwd: prefix, detached: true, stdio: "ignore" });
   let died = null;
   child.on("exit", (code) => (died = code ?? -1));
@@ -152,6 +184,29 @@ try {
   // 顺带核对它读的是**exe 同级**的配置，而不是被虚拟化重定向到了别处
   if (!bootLine.includes("exe=")) {
     console.log("⚠️  启动自检行里没有 exe= 段 —— 该行格式变了？（判据依赖它）");
+  }
+
+  // 🔴 隔离判据（可证伪）：干净环境里不可能有 Key，故 `keys=` 必须是 0。
+  //
+  // 这条是**硬失败**而不是警告：一个静默失去隔离的门比一个红的门糟得多 ——
+  // 它会一边报绿，一边拿用户的真实配置和真实代理端口做冒烟
+  // （见上面那段注释里记的实测：本机跑时这里是 keys=13）。
+  // `keys=` 整段缺失只警告：那是自检行格式变了，属于判据自身失效，与隔离无关，
+  // 两种失败形态不该共用一个出口。
+  const keysMatch = bootLine.match(/keys=(\d+)/);
+  if (!keysMatch) {
+    console.log("⚠️  启动自检行里没有 keys= 段 —— 该行格式变了？（隔离判据依赖它）");
+  } else if (keysMatch[1] !== "0") {
+    throw new Error(
+      `冒烟实例读到了真实运行数据（keys=${keysMatch[1]}，干净环境应为 0）。\n` +
+        `   配置段：${(bootLine.match(/配置=[^·]+/) || ["?"])[0].trim()}\n` +
+        `   这台机器上有真实配置，而产物**目前没有数据目录覆盖**（见上方注释：\n` +
+        `   dirs::data_dir() 走 Win32 已知文件夹 API，不读 APPDATA），故无法隔离。\n` +
+        `   本门在 CI（干净环境）上才能安全跑。要在本机跑，先给生产侧加 SYNAROUTE_DATA_DIR。\n` +
+        `   \n` +
+        `   ⚠️ 注意：安装与启动这两步**已经做过了**（上面两条 ✅），\n` +
+        `      也就是说「装得上、起得来」这个结论本身是成立的，红的只是隔离这一项。`
+    );
   }
   exitCode = 0;
   console.log("\n✅ 安装器冒烟通过：装得上、起得来");
