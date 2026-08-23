@@ -1,0 +1,80 @@
+name: Gates
+
+# 质量门。分两类（借鉴 OmniRoute 把 gate 分成 policy 与 ratchet 两档）：
+#   - **策略门**（check:forbidden）：必须为 0，只能修，不能冻结；
+#   - **棘轮**（ratchet / ratchet:verify）：现状不理想但可接受，只要求不变坏；
+#     并且 `ratchet:verify` 专门拦「悄悄抬高上限」这条解红最快的路。
+#
+# 为什么单独一个 workflow 而不是塞进 release.yml：这些门必须在**每次改动**时跑，
+# 而 release 只在打 tag 时跑。一个只在发版时才生效的门，等于把问题攒到最不该出问题的时刻。
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gates:
+    runs-on: ubuntu-22.04
+    steps:
+      # fetch-depth: 2 —— `ratchet:verify` 要读 `git show HEAD:<baseline>` 做对比。
+      # 浅到 1 层时 HEAD 就是本次提交本身，对比不出任何变化（那会让它静默空转）。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: 'npm'
+
+      - run: npm ci
+
+      # 硬规则策略门：硬编码本机路径、前端调不存在的后端命令
+      - name: 硬规则（policy）
+        run: npm run check:forbidden
+
+      # 体积/计数棘轮：只准降
+      - name: 棘轮（不得变坏）
+        run: npm run ratchet
+
+      # 棘轮防作弊：基线只准往好的方向动，抬高必须附理由
+      - name: 棘轮基线未被悄悄放宽
+        run: npm run ratchet:verify
+
+      - name: TypeScript
+        run: npx tsc --noEmit
+
+      # 构建顺带跑 check-tailwind-tokens（「写了颜色类但一条 CSS 都没生成」的产物判据）
+      - name: 前端构建 + Tailwind 零 CSS 检查
+        run: npm run build
+
+      - name: 前端单测
+        run: npm test
+
+  rust:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: clippy（零警告）
+        working-directory: ./src-tauri
+        run: cargo clippy --lib --all-targets -- -D warnings
+
+      # 跑两遍。第一遍是基线，第二遍抓「并发/端口/时间窗」类偶发 ——
+      # 本仓的历史证明这类用例会约每 10 轮红一次，单跑一遍等于没测到
+      # （见 CLAUDE.md 里 `db_copy_path` 那条：测并发缺陷的用例必须并发地写，
+      #  而并发用例必须重复地跑）。
+      - name: cargo test（第 1 遍）
+        working-directory: ./src-tauri
+        run: cargo test --lib
+      - name: cargo test（第 2 遍，抓偶发）
+        working-directory: ./src-tauri
+        run: cargo test --lib

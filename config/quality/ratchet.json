@@ -1,0 +1,26 @@
+{
+  "$comment": "体积/计数棘轮基线。数字只准降。想抬高必须手改并写理由，CI 的 verify-ratchet-update 会拦。详见 scripts/check-ratchet.mjs",
+  "newFileCapLines": 900,
+  "frozen": {
+    "src-tauri/src/agent_tools.rs": 1117,
+    "src-tauri/src/aggregate.rs": 2037,
+    "src-tauri/src/balance.rs": 1088,
+    "src-tauri/src/lib.rs": 2209,
+    "src-tauri/src/model.rs": 2102,
+    "src-tauri/src/proxy.rs": 3137,
+    "src-tauri/src/secret.rs": 1126,
+    "src-tauri/src/service.rs": 1608,
+    "src-tauri/src/store.rs": 3084,
+    "src-tauri/src/tools.rs": 2416,
+    "src-tauri/src/upstream/convert.rs": 1690,
+    "src-tauri/src/upstream/sse.rs": 1247,
+    "src/components/KeyEditor.tsx": 1645,
+    "src/lib/i18n.ts": 1601,
+    "src/lib/mockData.ts": 1028,
+    "src/pages/BrainPage.tsx": 1393,
+    "src/pages/SettingsPage.tsx": 1907
+  },
+  "counters": {
+    "bare_persist_calls": 3
+  }
+}

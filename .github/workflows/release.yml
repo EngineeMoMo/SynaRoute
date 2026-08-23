@@ -93,6 +93,30 @@ jobs:
           args: ${{ matrix.args }}
           includeUpdaterJson: true
 
+      # ---- 产物门：在这里，而不是「发完再人工看一眼」 ----
+      #
+      # 这三步都是在 tauri-action **之后**跑，因为它们要检查的是它的输出。
+      # 顺序有意：先查内容（快、无副作用），再执行产物（慢、有副作用）。
+
+      # 判据来自 CLAUDE.md 的构建硬规则：dist chunk 名要能在 exe 里搜到（> 0）。
+      # 裸 cargo build 的产物该值为 0 —— 那种 exe 装上去界面一片空白。
+      # 此前这是条**人工**判据。
+      - name: 前端已嵌入产物
+        run: npm run check:embedded
+
+      # 外泄审计：运行数据 / 密钥 / 演示数据都不得进包。
+      # 只在 Windows 跑 —— 它的判据是 NSIS 包与 windows exe 的路径（见脚本内常量）。
+      - name: 发布物外泄审计
+        if: matrix.platform == 'windows-latest'
+        run: npm run audit:release
+
+      # 🔴 真装真启动。CLAUDE.md 里「仍未验证：NSIS 安装器能否装成」挂了很久，
+      # 而历史上静默安装卡死过两次 —— 也就是说交付给用户的那个包从未被任何流程执行过。
+      # 只在 Windows 跑（NSIS 是 Windows 专属）。
+      - name: 安装器冒烟（装得上 + 起得来）
+        if: matrix.platform == 'windows-latest'
+        run: npm run smoke:installer
+
   publish-release:
     permissions:
       contents: write
