@@ -608,9 +608,9 @@ pub(crate) fn sync_master_flag(store: &Store, enabled: bool) {
 
 // ==== MCP 辅助 ====
 
-/// MCP 服务器地址（供前端展示实际绑定端口的接入地址）。
+/// MCP 服务器**基址**（仅供前端展示）。写进客户端配置的是 `crate::mcp::client_url`。
 pub(crate) fn mcp_url_for(port: u16) -> String {
-    format!("http://127.0.0.1:{port}/mcp")
+    crate::mcp::base_url(port)
 }
 
 /// MCP 客户端单次工具调用超时（毫秒）= 各分类整轮预算 total_timeout_ms 的最大值 + 余量，
@@ -721,7 +721,7 @@ pub(crate) fn restore_client_config_keeping_mcp(
 /// 失败只记事件、不返回 Err：注册失败时 MCP 服务本身还在跑，
 /// 让整个「启用 MCP」失败反而更糟（用户以为服务没起来）。
 pub(crate) fn register_and_record(store: &Store, category: CategoryType, port: u16) {
-    let url = mcp_url_for(port);
+    let url = crate::mcp::client_url(port, category);
     let timeout_ms = mcp_client_timeout_ms(store);
     match crate::tools::register_mcp_client(category, &url, timeout_ms) {
         Ok((msg, _wrote)) => {
@@ -742,9 +742,9 @@ pub(crate) fn register_and_record(store: &Store, category: CategoryType, port: u
 /// 只在真写了盘时记事件（`wrote`）：`register_mcp_client` 内容相同即跳过写盘，
 /// 无条件记录会让每次重启都在日志里刷出三条「已重写」而其实什么都没变。
 pub(crate) fn rewrite_registered_clients(store: &Store, port: u16, reason: RewriteReason) {
-    let url = mcp_url_for(port);
     let timeout_ms = mcp_client_timeout_ms(store);
     for category in store.get_settings().mcp_registered_categories {
+        let url = crate::mcp::client_url(port, category);
         match crate::tools::register_mcp_client(category, &url, timeout_ms) {
             Ok((msg, wrote)) => {
                 if wrote {

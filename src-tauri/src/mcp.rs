@@ -1,13 +1,30 @@
 //! 内置 MCP（Model Context Protocol）服务器。
 //!
 //! 让 Codex CLI / Claude Code 等 MCP 客户端直接调用 SynaRoute 的多模型大脑聚合。
-//! - 传输：Streamable HTTP（JSON-RPC 2.0 over HTTP POST），监听 127.0.0.1:{port}/mcp
+//! - 传输：Streamable HTTP（JSON-RPC 2.0 over HTTP POST），监听 127.0.0.1:{port}/mcp/{分类}
 //! - 工具：单个 `synaroute_ai`，参数区分意图（Q3）
 //! - 只出主意不写文件（Q5）：返回分析/修改计划，由客户端自己执行修改
 //! - 不鉴权（Q9，仅 127.0.0.1）；调用日志走 store 事件流 + 落盘（Q10）
 //!
 //! 协议实现为手写最小子集（无 SDK 依赖）：仅支持
 //! initialize / notifications/initialized / tools/list / tools/call。
+//!
+//! ## 🔴 分类身份来自 URL 路径段，不是工具参数
+//!
+//! 每个分类有自己的 Key 池、聚合成员、预算与日志页，所以「这次调用属于哪个分类」是**必须**
+//! 答对的问题。早期靠 `synaroute_ai` 的 `category` 参数回答，那是错的：模型不知道自己活在哪个
+//! 客户端里，只能反问用户或省略，而省略会被默认成 `claude-cli` —— 用错 Key 池、额度记在别的
+//! 分类头上、Codex 的聚合日志落在 Claude CLI 页，全都是静默的。
+//!
+//! 现在身份由**接入那一刻**写进注册（那时分类是已知的，是我们自己在写配置）：
+//! CLI 的 url 写成 `/mcp/claude-cli`；两个 stdio 端的 args 带 `--mcp-category=…`，
+//! 由子进程翻成同样的路径段转发（见 [`stdio`]）。
+//! 写侧 [`client_url`] 与读侧 [`caller_from_path`] 成对，有 round-trip 测试钉住。
+
+/// stdio 端（Codex / Claude 桌面端）：客户端侧的分类身份标记 + 子进程转发。
+/// 作为 `mcp` 的子模块而非平级模块 —— 它与本模块共用同一套「路径段携带身份」的方案，
+/// 且要复用这里的 `local_static_response` / `rpc_ok` / 端口文件等，拆成平级只会互相 `pub`。
+pub(crate) mod stdio;
 
 use crate::aggregate;
 use crate::model::CategoryType;
@@ -27,12 +44,79 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 /// MCP 协议版本（与主流客户端对齐）
-const PROTOCOL_VERSION: &str = "2024-11-05";
+pub(crate) const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// MCP 端点的固定前缀。分类作为它后面的一段：`/mcp/claude-cli`。
+const MCP_PATH: &str = "/mcp";
+
+/// 旧版 stdio 注册（args 里没有分类标记）转发时用的哨兵段。
+///
+/// 它存在的意义是**保留信息**：服务端据此知道「这次来自某个 stdio 客户端，
+/// 但它的配置是旧版」，从而能在「桌面端 / Codex」之间精确兜底（CLI 走 HTTP，到不了这里）。
+/// 若让旧子进程直接打裸 `/mcp`，这个信息就丢了，只能一律当 CLI —— 那正是要修的缺陷。
+///
+/// `_` 开头保证永远不会撞上某个分类的 wire_id（有测试钉住）。
+const STDIO_LEGACY_SEG: &str = "_stdio";
+
+/// 一次 MCP 调用的**调用方身份**，由传输层（URL 路径段）决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpCaller {
+    /// 路径段是一个已知分类 —— 权威身份，不再看任何参数。
+    Bound(CategoryType),
+    /// 旧版 stdio 子进程（哨兵段）：必是桌面端或 Codex，但不知道是哪个。
+    StdioLegacy,
+    /// 裸 `/mcp` 或认不出的段：旧版 CLI 注册、docs 里的手写 curl、探活。
+    Unbound,
+}
 
 /// 运行中的 MCP 服务器句柄
 struct RunningMcp {
     port: u16,
     handle: JoinHandle<()>,
+}
+
+/// MCP 服务基址（不带分类段）。前端展示与重启日志用它。
+pub(crate) fn base_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}{MCP_PATH}")
+}
+
+/// 写进某分类客户端配置的接入地址（**写侧**，与 [`caller_from_path`] 成对）。
+///
+/// 全仓唯一的取址点：注册（`service::register_and_record`）与端口漂移后的重写
+/// （`service::rewrite_registered_clients`）都走它。漏挂分类段的表现是**静默**的
+/// —— 客户端照样连得上，只是服务端认不出调用方、一律退回兜底分类。
+pub(crate) fn client_url(port: u16, category: CategoryType) -> String {
+    format!("{}/{}", base_url(port), category.as_str())
+}
+
+/// stdio 子进程的转发地址：知道自己分类就带分类段，否则走哨兵段。
+pub(crate) fn forward_url(port: u16, category: Option<CategoryType>) -> String {
+    match category {
+        Some(c) => client_url(port, c),
+        None => format!("{}/{STDIO_LEGACY_SEG}", base_url(port)),
+    }
+}
+
+/// 从请求路径解析调用方身份（**读侧**）。
+///
+/// 🔴 认不出的段一律 [`McpCaller::Unbound`]，**绝不**静默落成 `ClaudeCli`：
+/// 那样等于把「不知道」伪装成「知道」，用户会拿到一个走错 Key 池却毫无提示的结果。
+/// 兜底该由 [`resolve_caller_category`] 一处集中做，并且落可见事件。
+fn caller_from_path(path: &str) -> McpCaller {
+    let Some(rest) = path.trim_end_matches('/').strip_prefix(MCP_PATH) else {
+        return McpCaller::Unbound;
+    };
+    let seg = rest.trim_start_matches('/');
+    if seg.is_empty() {
+        return McpCaller::Unbound;
+    }
+    if seg == STDIO_LEGACY_SEG {
+        return McpCaller::StdioLegacy;
+    }
+    match CategoryType::from_str(seg) {
+        Some(c) => McpCaller::Bound(c),
+        None => McpCaller::Unbound,
+    }
 }
 
 /// stdio 子进程发现主应用 MCP 端口用的文件名。
@@ -84,7 +168,7 @@ fn write_mcp_port_file(port: u16) {
 }
 
 /// 读端口文件（stdio 子进程用）。读不到返回 None。
-fn read_mcp_port_file() -> Option<u16> {
+pub(crate) fn read_mcp_port_file() -> Option<u16> {
     let path = mcp_port_file_path()?;
     let content = std::fs::read_to_string(path).ok()?;
     content.trim().parse::<u16>().ok()
@@ -110,7 +194,7 @@ fn clear_mcp_port_file() {
 /// 端口占用时，向上探测的最大候选数（configured .. configured+FALLBACK_RANGE）。
 /// 9527 等常用端口在部分 Windows 机器上被系统进程（WUDFHost / GoodixSessionService 等）占用，
 /// 单端口硬绑定会静默失败，故自动向上找一个可用端口，并把真实端口暴露给 UI。
-const FALLBACK_RANGE: u16 = 20;
+pub(crate) const FALLBACK_RANGE: u16 = 20;
 
 /// MCP 服务器管理器：负责生命周期（启用即启动，改端口需重启）。
 pub struct McpManager {
@@ -225,180 +309,6 @@ impl McpManager {
     }
 }
 
-// ─── stdio 层（Codex 专用）─────────────────────────────────────────────────
-//
-// Codex 对 HTTP/streamable MCP 支持是实验性的（需 experimental_use_rmcp_client，且
-// 握手挑剔、易「空壳」）。stdio 是 Codex 一等公民（codegraph/sqlcl 等均为 stdio），
-// 稳定、无端口漂移、无首字节超时。故 Codex 走 stdio：由 Codex 以子进程拉起
-// `synaroute.exe --mcp-stdio`，用 stdin/stdout 传 JSON-RPC（每行一条，LSP 无框架式）。
-//
-// 复用与 HTTP 完全相同的 dispatch（initialize / tools/list / tools/call / ping），
-// 只是传输层换成标准输入输出。通知（无 id）不回响应，与 HTTP 语义一致。
-
-/// stdio MCP 主循环：逐行读 stdin 的 JSON-RPC 请求，处理后把响应逐行写 stdout。
-/// 阻塞直到 stdin 关闭（Codex 结束子进程时）。返回后进程应退出。
-///
-/// **关键设计（MSIX 宇宙错位的根治）**：本子进程**不读配置、不跑聚合**。
-/// 早期版本让子进程自己 `dispatch`（含跑聚合），但 stdio 子进程被 Codex 桌面端
-/// （MSIX 包）拉起时，继承其包身份 → 读 %APPDATA% 被虚拟化到包容器私有副本，
-/// 那份配置没有用户在真实应用里配的 codex 聚合成员 → 永远「未启用大脑聚合」。
-///
-/// 现在改为**纯转发**：initialize/tools/list/ping 用本地静态响应（不依赖配置，
-/// 且 Codex 启动即能握手拿到工具）；`tools/call` 转发到**运行中主应用**的 HTTP MCP
-/// （127.0.0.1:{port}/mcp）。主应用是用户双击启动的、读真实配置，聚合在那里跑。
-/// localhost TCP 端口不受 MSIX 虚拟化影响（系统全局），故转发能跨包身份连通。
-pub async fn run_stdio() {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
-    let mut stdout = tokio::io::stdout();
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break, // EOF：Codex 关闭了管道，退出循环 → 进程结束
-            Ok(_) => {}
-            Err(_) => break,
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let msg: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => continue, // 非法 JSON：忽略该行（无 id 无从回错）
-        };
-
-        let id = msg.get("id").cloned();
-        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        // 通知（无 id，如 notifications/initialized）：不回响应。
-        if id.is_none() {
-            continue;
-        }
-        let id = id.unwrap();
-        let params = msg.get("params").cloned().unwrap_or(Value::Null);
-
-        let resp = match local_static_response(method, &params) {
-            // 握手/列举/心跳/资源探测：本地静态响应（与 HTTP dispatch 共用同一表），
-            // 不依赖主应用是否已启动，保证 Codex 启动即能完成握手、看到 synaroute_ai。
-            Some(Ok(result)) => rpc_ok(id, result),
-            Some(Err((code, msg))) => rpc_error(id, code, &msg),
-            // tools/call：转发到运行中主应用（持有真实配置）。
-            None => match forward_tool_call_to_main(&params).await {
-                Ok(value) => rpc_ok(id, value),
-                Err(msg) => rpc_ok(id, tool_error_content(&msg)),
-            },
-        };
-        let mut out = serde_json::to_vec(&resp).unwrap_or_default();
-        out.push(b'\n');
-        if stdout.write_all(&out).await.is_err() {
-            break;
-        }
-        let _ = stdout.flush().await;
-    }
-}
-
-/// 把 stdio 收到的 `tools/call` 转发到运行中主应用的 HTTP MCP。
-/// 端口发现：先读平台共享端口文件（Windows=exe 同级；macOS=Application Support），
-/// 读不到再扫描默认端口范围。主应用未运行时返回可读错误，提示用户启动应用。
-async fn forward_tool_call_to_main(params: &Value) -> Result<Value, String> {
-    let port = discover_main_mcp_port()
-        .await
-        .ok_or_else(|| "未找到运行中的 SynaRoute 主程序，请先启动 SynaRoute 桌面应用".to_string())?;
-    let url = format!("http://127.0.0.1:{port}/mcp");
-    // 组装标准 MCP tools/call 请求（JSON-RPC over HTTP），转发给主应用。
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": params,
-    });
-    // 聚合可能耗时较久（多模型并行 + 决策者），给足超时（与 tool_timeout_sec 对齐留余量）。
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
-        .build()
-        .map_err(|e| format!("构造 HTTP 客户端失败: {e}"))?;
-    let resp = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .header("accept", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("连接 SynaRoute 主程序失败({url}): {e}"))?;
-    let v: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("解析主程序响应失败: {e}"))?;
-    // JSON-RPC 响应：优先取 result（工具结果），有 error 则透出其 message。
-    if let Some(result) = v.get("result") {
-        Ok(result.clone())
-    } else if let Some(err) = v.get("error") {
-        let m = err.get("message").and_then(|m| m.as_str()).unwrap_or("主程序返回错误");
-        Err(m.to_string())
-    } else {
-        Err("主程序响应缺少 result/error".into())
-    }
-}
-
-/// 发现运行中主应用的 MCP 端口：先读平台共享端口文件，再扫描默认端口范围探活。
-async fn discover_main_mcp_port() -> Option<u16> {
-    // 1. 端口文件（主应用启动时写，最可靠）。读到后探活确认真的是 SynaRoute MCP。
-    if let Some(p) = read_mcp_port_file() {
-        if probe_mcp_alive(p).await {
-            return Some(p);
-        }
-    }
-    // 2. 兜底：扫描默认端口范围（端口文件缺失/过期时）。默认起始端口 9527，与 default_mcp_port
-    //    对齐；主应用端口占用回退时也在 [9527, 9527+FALLBACK_RANGE] 内，故这里同范围扫描能覆盖。
-    let start = 9527u16;
-    for p in start..=start.saturating_add(FALLBACK_RANGE) {
-        if probe_mcp_alive(p).await {
-            return Some(p);
-        }
-    }
-    None
-}
-
-/// 探活：向候选端口发一个最小 initialize，确认对面是活着的 SynaRoute MCP。
-async fn probe_mcp_alive(port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{port}/mcp");
-    let body = json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": { "protocolVersion": PROTOCOL_VERSION }
-    });
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-    else {
-        return false;
-    };
-    match client
-        .post(&url)
-        .header("content-type", "application/json")
-        .header("accept", "application/json")
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            // 确认是 SynaRoute（serverInfo.name），避免误连其它占用同端口的服务。
-            if let Ok(v) = resp.json::<Value>().await {
-                return v
-                    .get("result")
-                    .and_then(|r| r.get("serverInfo"))
-                    .and_then(|s| s.get("name"))
-                    .and_then(|n| n.as_str())
-                    == Some("SynaRoute");
-            }
-            false
-        }
-        Err(_) => false,
-    }
-}
-
 // ─── HTTP 层 ────────────────────────────────────────────────────────────────
 
 fn json_response(status: StatusCode, body: Value) -> Response<Full<Bytes>> {
@@ -484,6 +394,8 @@ async fn handle_http(
     if req.method() != hyper::Method::POST {
         return Ok(empty_response(StatusCode::METHOD_NOT_ALLOWED));
     }
+    // 调用方身份必须在 `into_body()` **之前**取：那一步会消耗掉整个 Request（含 uri）。
+    let caller = caller_from_path(req.uri().path());
 
     let body_bytes = match req.into_body().collect().await {
         Ok(c) => c.to_bytes(),
@@ -517,7 +429,7 @@ async fn handle_http(
 
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     let is_initialize = method == "initialize";
-    let result = dispatch(&store, method, params).await;
+    let result = dispatch(&store, method, params, caller).await;
 
     match result {
         Ok(value) => {
@@ -554,11 +466,11 @@ fn new_session_id() -> String {
 
 // ─── JSON-RPC 分发 ───────────────────────────────────────────────────────────
 
-fn rpc_ok(id: Value, result: Value) -> Value {
+pub(crate) fn rpc_ok(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
-fn rpc_error(id: Value, code: i64, message: &str) -> Value {
+pub(crate) fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
@@ -572,7 +484,10 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 /// 不提供，也必须返回**空列表**而非 -32601。Codex 桌面端（protocol 2025-06-18）在
 /// initialize 后会探测这些方法，收到 error 会判定 server 启动失败并 cancel 整个连接，
 /// 导致 synaroute_ai 进不了工具目录（模型侧表现为「没有这个工具」）。
-fn local_static_response(method: &str, params: &Value) -> Option<Result<Value, (i64, String)>> {
+pub(crate) fn local_static_response(
+    method: &str,
+    params: &Value,
+) -> Option<Result<Value, (i64, String)>> {
     match method {
         // 回显客户端请求的 protocolVersion：rmcp（Codex 用的客户端）会协商版本，服务器硬编码
         // 旧版而客户端要更新版时，握手被判不完整、后续 tools/list 拿不到工具。回显即对齐；
@@ -602,15 +517,92 @@ async fn dispatch(
     store: &Arc<Store>,
     method: &str,
     params: Value,
+    caller: McpCaller,
 ) -> Result<Value, (i64, String)> {
     match local_static_response(method, &params) {
         Some(res) => res,
         // tools/call：HTTP 路径本地执行（主应用持有真实配置）。
-        None => handle_tool_call(store, params).await,
+        None => handle_tool_call(store, params, caller).await,
     }
 }
 
+/// 这次调用属于哪个分类。**唯一决策点** —— 别在任何别的地方再算一遍。
+///
+/// 优先级（从最可信到最兜底）：
+/// 1. **传输层身份**：路径段里的分类。它是「接入」那一刻由我们自己写进客户端配置的，
+///    因此权威 —— 此时**不看参数**，免得模型瞎填一个值把正确答案覆盖掉。
+/// 2. `arguments.category`：只在传输层认不出时用。工具 schema 已不再暴露它
+///    （见 [`tool_schema`]），保留读取纯为兼容：旧版注册尚未被重写、docs 里的手写
+///    curl、用户自己写的 hook 提示词。
+/// 3. **旧版 stdio 的精确兜底**：哨兵段说明「来自某个 stdio 客户端」，而 stdio 只可能是
+///    桌面端或 Codex（CLI 走 HTTP）。若这两个里只有一个接入过，那就是它 —— 这是在两个里
+///    排除，不是在三个里猜。
+/// 4. `claude-cli`：历史默认。裸 `/mcp` 本就只可能是旧版 CLI 注册或手写 curl。
+///
+/// 2~4 档都会落一条可见事件（[`warn_unbound_once`]），因为它们都意味着
+/// 「客户端配置是旧版、该重启一次」。
+fn resolve_caller_category(store: &Store, caller: McpCaller, args: &Value) -> CategoryType {
+    if let McpCaller::Bound(c) = caller {
+        return c;
+    }
+    let resolved = pick_unbound_category(store, caller, args);
+    warn_unbound_once(store, resolved);
+    resolved
+}
+
+/// [`resolve_caller_category`] 的第 2~4 档（抽出来是为了能不带事件副作用地单测）。
+fn pick_unbound_category(store: &Store, caller: McpCaller, args: &Value) -> CategoryType {
+    args.get("category")
+        .and_then(|v| v.as_str())
+        .and_then(CategoryType::from_str)
+        .or_else(|| match caller {
+            McpCaller::StdioLegacy => sole_registered_stdio_category(store),
+            _ => None,
+        })
+        .unwrap_or(CategoryType::ClaudeCli)
+}
+
+/// 两个 stdio 端（桌面端 / Codex）里是否**只有一个**接入过 MCP。都接入或都没接入返回 None。
+fn sole_registered_stdio_category(store: &Store) -> Option<CategoryType> {
+    let registered = store.get_settings().mcp_registered_categories;
+    let mut it = [CategoryType::ClaudeDesktop, CategoryType::Codex]
+        .into_iter()
+        .filter(|c| registered.contains(c));
+    let only = it.next()?;
+    it.next().is_none().then_some(only)
+}
+
+/// 已就「调用方未携带分类标识」告警过的分类位图（每次应用运行、每个分类只落一条）。
+///
+/// **必须节流**：不节流就是每次工具调用刷一条，把有用事件挤出 `MAX_EVENTS`(500) 环 ——
+/// 与已修过的「短路窗口内每次客户端重发都记一条『已忽略熔断兜底重试』」是同一个坑。
+/// 一条/分类/运行 恰好对上补救动作的粒度（重启那个客户端一次）。
+static UNBOUND_WARNED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn warn_unbound_once(store: &Store, resolved: CategoryType) {
+    use std::sync::atomic::Ordering;
+    let idx = CategoryType::ALL.iter().position(|c| *c == resolved).unwrap_or(0);
+    let bit = 1u8 << idx;
+    if UNBOUND_WARNED.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+        return;
+    }
+    store.append_event(
+        resolved,
+        "config",
+        None,
+        &format!(
+            "MCP 调用方未携带分类标识（客户端配置为旧版），已按「{}」处理。\
+             应用启动时会自动重写客户端配置，把该客户端重启一次后此提示消失。",
+            resolved.display_name()
+        ),
+    );
+}
+
 /// synaroute_ai 工具的 schema（Q6：基本参数）
+///
+/// 🔴 **不得再加 `category`**：分类由传输层决定（见模块头）。把它放回 schema 会让模型
+/// 反过来问用户「当前是哪个分类」—— 而模型无从得知，用户也没理由需要知道。
+/// `tool_schema_does_not_advertise_category` 那条测试专盯这件事。
 fn tool_schema() -> Value {
     json!({
         "name": "synaroute_ai",
@@ -625,11 +617,6 @@ fn tool_schema() -> Value {
                 "cwd": {
                     "type": "string",
                     "description": "可选：当前项目根目录的绝对路径。仅当问题与某个代码库相关、需要 SynaRoute 检索项目文件作为上下文时才传；纯问答/与代码无关的任务可省略。省略时若开启了自动跟随，则用最近活跃的项目。"
-                },
-                "category": {
-                    "type": "string",
-                    "enum": ["claude-cli", "claude-desktop", "codex"],
-                    "description": "使用哪个分类下配置的 Key 池与聚合设置，省略默认 claude-cli"
                 },
                 "languageHint": {
                     "type": "string",
@@ -689,6 +676,7 @@ fn parse_image_paths(images: Option<&Value>) -> Result<Vec<String>, String> {
 async fn handle_tool_call(
     store: &Arc<Store>,
     params: Value,
+    caller: McpCaller,
 ) -> Result<Value, (i64, String)> {    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     if name != "synaroute_ai" {
         return Err((-32602, format!("未知工具: {name}")));
@@ -709,11 +697,8 @@ async fn handle_tool_call(
         .get("cwd")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let category = args
-        .get("category")
-        .and_then(|v| v.as_str())
-        .and_then(CategoryType::from_str)
-        .unwrap_or(CategoryType::ClaudeCli);
+    // 分类来自**传输层**（接入时写进客户端配置的路径段），不是模型传的参数。
+    let category = resolve_caller_category(store, caller, &args);
     let language_hint = args
         .get("languageHint")
         .and_then(|v| v.as_str())
@@ -880,7 +865,7 @@ fn tool_text_content(text: &str) -> Value {
 }
 
 /// 标准 MCP 工具错误响应（isError=true，客户端会显示为工具失败）
-fn tool_error_content(text: &str) -> Value {
+pub(crate) fn tool_error_content(text: &str) -> Value {
     json!({
         "content": [ { "type": "text", "text": text } ],
         "isError": true
@@ -938,7 +923,7 @@ mod tests {
             Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let params = json!({ "protocolVersion": "2025-06-18" });
-        let res = dispatch(&store, "initialize", params).await.unwrap();
+        let res = dispatch(&store, "initialize", params, McpCaller::Unbound).await.unwrap();
         assert_eq!(
             res.get("protocolVersion").and_then(|v| v.as_str()),
             Some("2025-06-18"),
@@ -956,7 +941,7 @@ mod tests {
         let store = Arc::new(
             Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
-        let res = dispatch(&store, "initialize", Value::Null).await.unwrap();
+        let res = dispatch(&store, "initialize", Value::Null, McpCaller::Unbound).await.unwrap();
         assert_eq!(
             res.get("protocolVersion").and_then(|v| v.as_str()),
             Some(PROTOCOL_VERSION),
@@ -973,7 +958,7 @@ mod tests {
         let store = Arc::new(
             Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
-        let res = dispatch(&store, "tools/list", Value::Null).await.unwrap();
+        let res = dispatch(&store, "tools/list", Value::Null, McpCaller::Unbound).await.unwrap();
         let tools = res.get("tools").and_then(|t| t.as_array()).unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].get("name").and_then(|n| n.as_str()), Some("synaroute_ai"));
@@ -983,6 +968,286 @@ mod tests {
             .and_then(|r| r.as_array())
             .unwrap();
         assert!(required.iter().any(|v| v.as_str() == Some("prompt")), "prompt 必填");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 建一个隔离的临时 Store（测试专用；绝不碰开发机的真实配置）。
+    fn tmp_store(tag: &str) -> (std::path::PathBuf, Arc<Store>) {
+        // 加进程内自增序号：同一进程里多个用例并发跑，只靠 pid 会撞同一个目录，
+        // 表现是彼此删掉对方的 config.json（偶发红）。同 store.rs 里 db_copy_path 那个坑。
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "mcp_{tag}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let store =
+            Arc::new(Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
+        (dir, store)
+    }
+
+    /// 🔴 用户报的那条：schema 里**不得**再出现 `category`。
+    ///
+    /// 它在时模型会反问用户「当前是哪个工具分类」—— 而模型无从得知（它不知道自己活在
+    /// 哪个客户端里），用户也没理由需要知道。分类由传输层携带（见模块头）。
+    #[test]
+    fn tool_schema_does_not_advertise_category() {
+        let schema = tool_schema();
+        let props = schema["inputSchema"]["properties"].as_object().unwrap();
+        assert!(
+            !props.contains_key("category"),
+            "category 不得回到 schema —— 它一在，模型就会反过来问用户是哪个分类"
+        );
+        // 其余参数必须还在（别把这条测试变成「删光参数也绿」）。
+        for k in ["prompt", "cwd", "languageHint", "images"] {
+            assert!(props.contains_key(k), "{k} 应仍在 schema 里");
+        }
+        assert_eq!(
+            schema["inputSchema"]["required"],
+            json!(["prompt"]),
+            "prompt 仍是唯一必填项"
+        );
+    }
+
+    /// 写侧（注册时写进客户端配置的 url）与读侧（服务端解析路径）必须成对。
+    /// 改了一侧忘了另一侧的表现是**静默**的：客户端照样连得上，只是身份丢了、
+    /// 一律退回兜底分类。
+    ///
+    /// 同时钉住「写进客户端配置的地址**必须带分类段**」：做故障注入时把 `client_url`
+    /// 改回返回裸基址，只验 tools.rs 那侧的用例会**照样全绿**（注入不变红 = 什么都没测到），
+    /// 因为那边只验证「给它带分类段的 url 就会写下去」，不管谁决定带不带。
+    #[test]
+    fn client_url_round_trips_through_caller_from_path() {
+        let base = base_url(9527);
+        let mut seen = std::collections::HashSet::new();
+        for c in CategoryType::ALL {
+            let url = client_url(9527, c);
+            assert!(url.ends_with(c.as_str()), "url 应以分类结尾: {url}");
+            assert_ne!(url, base, "{c:?} 的接入地址不得等于裸基址（那就丢了身份）");
+            assert!(seen.insert(url.clone()), "三个分类的接入地址必须互不相同");
+            // 取 url 的 path 部分（去掉 scheme+host）再解析，模拟服务端拿到的东西。
+            let path = url.strip_prefix("http://127.0.0.1:9527").unwrap();
+            assert_eq!(
+                caller_from_path(path),
+                McpCaller::Bound(c),
+                "{c:?} 的地址应能解析回同一分类"
+            );
+        }
+        assert_eq!(seen.len(), CategoryType::ALL.len());
+    }
+
+    /// 端到端：**真起一个 HTTP 监听**，按 `/mcp/codex` 打一次 `tools/call`，
+    /// 断言事件落在 Codex 分类下。
+    ///
+    /// 🔴 这条补的是一处真实盲区：`caller_from_path` 自己有单测、`dispatch` 也有，但
+    /// **`handle_http` 里「取 path → 传给 dispatch」这一步接线**原先没有任何覆盖 ——
+    /// 把它改成硬编码 `McpCaller::Unbound` 时全套 776 条测试**照样全绿**，
+    /// 而那正是本轮要修的缺陷本身（每个客户端都静默退回 claude-cli）。
+    ///
+    /// 刻意**不走 `McpManager::start`**：它会写 exe 同级的端口文件，与
+    /// `mcp_port_file_write_read_clear_roundtrip` 抢同一个文件 → 引入偶发红。
+    /// 这里自己 bind 端口 0（由 OS 分配空闲端口，不会撞）并直接挂 `handle_http`。
+    #[tokio::test]
+    async fn handle_http_derives_the_caller_from_the_request_path() {
+        let (dir, store) = tmp_store("httpcaller");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv_store = store.clone();
+        let server = tokio::spawn(async move {
+            // 只需服务本用例发起的那几个连接；连接结束即退出循环。
+            for _ in 0..4 {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let s = srv_store.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| handle_http(s.clone(), req));
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "synaroute_ai", "arguments": { "prompt": "问点什么" } }
+        });
+        // 打分类专属端点 —— 与注册时写进客户端配置的地址同形（client_url）。
+        let url = client_url(port, CategoryType::Codex);
+        let resp: Value = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .expect("HTTP 请求应发得出去")
+            .json()
+            .await
+            .expect("响应应是 JSON");
+        // 未配置聚合 → 工具级错误；本条的判据不是它，而是事件落在哪个分类。
+        assert_eq!(resp["result"]["isError"], json!(true), "实际响应: {resp}");
+
+        assert!(
+            store.list_events(CategoryType::Codex).iter().any(|e| e.kind == "mcp"),
+            "打 /mcp/codex 后事件必须落在 Codex 分类下"
+        );
+        assert!(
+            !store.list_events(CategoryType::ClaudeCli).iter().any(|e| e.kind == "mcp"),
+            "不得落到 claude-cli（把 handle_http 的路径解析去掉就会这样）"
+        );
+
+        server.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 用户拿到一个走错 Key 池、却毫无提示的结果。
+    #[test]
+    fn bare_and_unknown_paths_are_unbound_not_claude_cli() {
+        for p in [
+            "/mcp",             // 旧版 CLI 注册 / docs 里的手写 curl
+            "/mcp/",            // 带尾斜杠
+            "/",                // 有些客户端会探测根路径
+            "/mcp/claude-clii", // 手改配置时打错一个字母
+            "/mcp/CLAUDE-CLI",  // 大小写不同不算同一个（wire_id 是精确值）
+            "/mcpfoo",          // 前缀像但不是
+            "/other/codex",     // 分类段不在 /mcp 之下
+        ] {
+            let got = caller_from_path(p);
+            assert_eq!(got, McpCaller::Unbound, "{p} 应判为 Unbound，实际 {got:?}");
+        }
+    }
+
+    /// 哨兵段必须永远不可能撞上某个分类的 wire_id —— 撞了的话那个分类的正常调用
+    /// 会被当成「旧版 stdio」走兜底推断。
+    #[test]
+    fn stdio_legacy_segment_is_recognized_and_never_a_real_category() {
+        assert_eq!(
+            caller_from_path(&format!("/mcp/{STDIO_LEGACY_SEG}")),
+            McpCaller::StdioLegacy
+        );
+        for c in CategoryType::ALL {
+            assert_ne!(c.as_str(), STDIO_LEGACY_SEG, "{c:?} 的 wire_id 撞上了哨兵段");
+        }
+        // forward_url 的两条分支：知道分类走分类段，不知道走哨兵段。
+        assert_eq!(forward_url(9527, Some(CategoryType::Codex)), "http://127.0.0.1:9527/mcp/codex");
+        assert_eq!(forward_url(9527, None), "http://127.0.0.1:9527/mcp/_stdio");
+    }
+
+    /// 🔴 传输层身份**压过**参数。模型若瞎填一个 category（它无从得知正确值），
+    /// 不得覆盖掉我们在接入时写死的那个答案。
+    #[tokio::test]
+    async fn transport_identity_beats_explicit_argument() {
+        let (dir, store) = tmp_store("bound");
+        let args = json!({ "category": "claude-cli" });
+        assert_eq!(
+            resolve_caller_category(&store, McpCaller::Bound(CategoryType::Codex), &args),
+            CategoryType::Codex,
+            "路径段说 codex，参数说 claude-cli —— 必须听路径段"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 参数只在传输层认不出时才生效（旧配置 / 手写 curl 的兼容路径）。
+    #[test]
+    fn explicit_argument_is_used_only_when_transport_is_unbound() {
+        let (dir, store) = tmp_store("unbound");
+        assert_eq!(
+            pick_unbound_category(&store, McpCaller::Unbound, &json!({ "category": "codex" })),
+            CategoryType::Codex,
+            "认不出调用方时，显式参数应生效"
+        );
+        // 非法值不得让整次调用报错，落回历史默认。
+        assert_eq!(
+            pick_unbound_category(&store, McpCaller::Unbound, &json!({ "category": "nope" })),
+            CategoryType::ClaudeCli
+        );
+        assert_eq!(
+            pick_unbound_category(&store, McpCaller::Unbound, &Value::Null),
+            CategoryType::ClaudeCli,
+            "裸 /mcp 且无参数 → claude-cli（HTTP 本就只有 CLI 会用）"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 旧版 stdio（哨兵段）的精确兜底：stdio 只可能是桌面端或 Codex（CLI 走 HTTP），
+    /// 所以这是**在两个里排除**，不是在三个里猜。两个都接入时才退回默认。
+    #[test]
+    fn stdio_legacy_resolves_to_the_only_registered_stdio_category() {
+        let (dir, store) = tmp_store("stdiolegacy");
+
+        // 一个都没接入 → 无从判断，退回历史默认。
+        assert_eq!(
+            pick_unbound_category(&store, McpCaller::StdioLegacy, &Value::Null),
+            CategoryType::ClaudeCli
+        );
+
+        // 只有 Codex 接入 → 必然是它。（若这里退回 claude-cli，就是本轮要修的那个缺陷。）
+        store.add_registered_category(CategoryType::Codex).unwrap();
+        assert_eq!(
+            pick_unbound_category(&store, McpCaller::StdioLegacy, &Value::Null),
+            CategoryType::Codex,
+            "两个 stdio 端里只有 Codex 接入过，就该是 Codex"
+        );
+
+        // CLI 也接入不影响：它走 HTTP，不参与 stdio 的排除。
+        store.add_registered_category(CategoryType::ClaudeCli).unwrap();
+        assert_eq!(
+            pick_unbound_category(&store, McpCaller::StdioLegacy, &Value::Null),
+            CategoryType::Codex,
+            "claude-cli 走 HTTP，不该把 stdio 的判断搅浑"
+        );
+
+        // 两个 stdio 端都接入 → 真的分不出，退回默认（并由 warn_unbound_once 告知用户）。
+        store.add_registered_category(CategoryType::ClaudeDesktop).unwrap();
+        assert_eq!(
+            pick_unbound_category(&store, McpCaller::StdioLegacy, &Value::Null),
+            CategoryType::ClaudeCli,
+            "两个都接入时无从判断"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 端到端：带分类身份的 tools/call，事件必须落在**那个**分类下。
+    ///
+    /// 这条盯的是修复前最隐蔽的后果：Codex 的聚合调用记在「Claude CLI」的运行日志里，
+    /// 用户在 Codex 页怎么翻都看不到自己刚才那次调用。
+    /// 聚合本身会因该分类未配置而失败，但失败事件同样带解析后的分类，故无需真上游。
+    #[tokio::test]
+    async fn tool_call_events_are_filed_under_the_transport_category() {
+        let (dir, store) = tmp_store("evtcat");
+        let params = json!({
+            "name": "synaroute_ai",
+            "arguments": { "prompt": "随便问点什么" }
+        });
+        let res = dispatch(
+            &store,
+            "tools/call",
+            params,
+            McpCaller::Bound(CategoryType::Codex),
+        )
+        .await
+        .unwrap();
+        // 未配置聚合 → isError，但这不是本条的判据。
+        assert_eq!(res["isError"], json!(true));
+
+        let codex_evts = store.list_events(CategoryType::Codex);
+        let cli_evts = store.list_events(CategoryType::ClaudeCli);
+        assert!(
+            codex_evts.iter().any(|e| e.kind == "mcp"),
+            "MCP 事件必须落在 codex 分类下，实际 codex={codex_evts:?}"
+        );
+        assert!(
+            !cli_evts.iter().any(|e| e.kind == "mcp"),
+            "不得落到 claude-cli 分类（修复前正是这样）"
+        );
+        // 报错文案要点出是哪个分类，否则用户不知道该去配哪一页。
+        let text = res["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains(CategoryType::Codex.display_name()),
+            "报错应点明分类名，实际: {text}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

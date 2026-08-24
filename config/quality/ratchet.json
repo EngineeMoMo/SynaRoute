@@ -18,7 +18,7 @@
     "src/lib/i18n.ts": 1601,
     "src/lib/mockData.ts": 1028,
     "src/pages/BrainPage.tsx": 1393,
-    "src/pages/SettingsPage.tsx": 1907
+    "src/pages/SettingsPage.tsx": 1900
   },
   "counters": {
     "bare_persist_calls": 3

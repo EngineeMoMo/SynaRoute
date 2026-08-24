@@ -873,13 +873,10 @@ fn write_desktop_meta_apply(path: &Path) -> AppResult<()> {
 // 幂等：已存在同 url 则跳过写盘（不产生无谓备份 / 事件噪音）。
 
 /// MCP 服务器在客户端配置里的固定名称（不随端口变化，故端口变了只需改 url）。
+///
+/// 两个 stdio 端（Codex / 桌面端）的 args 见 [`crate::mcp::stdio::args`]
+/// （`--mcp-stdio` + 分类标记）—— 那里是**唯一事实来源**，JSON 与 TOML 两个注册点都从它取。
 const MCP_CLIENT_NAME: &str = "synaroute";
-
-/// Codex 顶层实验开关：启用支持 HTTP/streamable 传输的 rmcp MCP 客户端。
-/// Codex 默认 MCP 客户端仅支持 stdio；不开此开关时 HTTP 型（url）MCP server 连不上
-/// （表现为「命名空间空壳、tools/list 拿不到工具」）。接入 Codex 大脑聚合时自动写入。
-/// Codex stdio MCP 的 args：`synaroute.exe --mcp-stdio`，进入无 UI 的 stdio JSON-RPC 模式。
-const MCP_STDIO_FLAG: &str = "--mcp-stdio";
 
 /// Codex stdio MCP 的每工具调用超时（秒），写进 `tool_timeout_sec`。默认 60s 不够大脑聚合
 /// 跑完（多模型并行 + 决策者综合常 30s+，偶尔超 60s → `user cancelled MCP tool call`），放大到 600s。
@@ -1122,21 +1119,20 @@ fn json_http_mcp(mcp_url: &str, timeout_ms: u64) -> Value {
     Value::Object(m)
 }
 
-/// Claude 桌面端的 stdio MCP 项：{ "command": "<synaroute.exe>", "args": ["--mcp-stdio"] }。
+/// Claude 桌面端的 stdio MCP 项：`{ command, args: ["--mcp-stdio", "--mcp-category=…"] }`。
 ///
 /// 桌面端的 `claude_desktop_config.json` **只接受 stdio transport**：写 CLI 那套
 /// `{type:"http", url, timeout}` 会被判「not valid MCP server configurations」整项跳过
 /// （用户可见弹窗：`The following entries ... were skipped: synaroute`）。
-/// 形态与 Codex stdio 注册同源（`synaroute.exe --mcp-stdio` 进无 UI 的 stdio JSON-RPC 模式），
-/// 差别是这里是 JSON、且不写 `type`/超时字段（桌面端 schema 只需 command+args；无 HTTP 首字节
-/// 计时器，故 timeout 无处可写——聚合慢由服务端自身优雅降级保证）。
-fn json_stdio_mcp(exe_path: &str) -> Value {
+/// 形态与 Codex stdio 注册同源，差别是这里是 JSON、且不写 `type`/超时字段（桌面端 schema
+/// 只需 command+args；无 HTTP 首字节计时器，故 timeout 无处可写——聚合慢由服务端自身优雅降级保证）。
+///
+/// **args 必须带分类**：桌面端与 Codex 的 command 都是同一个 exe，args 里若只有
+/// `--mcp-stdio` 两端就一字不差，服务端无从分辨调用方（那正是「还要问用户是哪个分类」的根因）。
+fn json_stdio_mcp(exe_path: &str, category: CategoryType) -> Value {
     let mut m = serde_json::Map::new();
     m.insert("command".into(), Value::String(exe_path.to_string()));
-    m.insert(
-        "args".into(),
-        Value::Array(vec![Value::String(MCP_STDIO_FLAG.to_string())]),
-    );
+    m.insert("args".into(), crate::mcp::stdio::args_json(category));
     Value::Object(m)
 }
 
@@ -1196,7 +1192,7 @@ fn register_mcp_claude_desktop_at(path: &Path, exe_path: &str) -> AppResult<(Str
         .as_object_mut()
         .ok_or_else(|| AppError::ToolConfig("mcpServers 非对象".into()))?;
 
-    let desired = json_stdio_mcp(exe_path);
+    let desired = json_stdio_mcp(exe_path, CategoryType::ClaudeDesktop);
     // 幂等：整项完全相等才跳过。用整项比对（而非逐字段）顺带保证旧 HTTP 残留键必被判为不同 →
     // 触发重写，把非法项换成合法 stdio 项。
     if servers_obj.get(MCP_CLIENT_NAME) == Some(&desired) {
@@ -1244,6 +1240,8 @@ fn unregister_mcp_claude_at(path: &Path) -> AppResult<(String, bool)> {
 ///   command = "<synaroute.exe 绝对路径>"
 ///   args = ["--mcp-stdio"]
 /// 由 Codex 以子进程拉起 synaroute.exe --mcp-stdio，用 stdin/stdout 传 JSON-RPC。
+/// args 里还带 `--mcp-category=codex`（见 [`crate::mcp::stdio::args`]）——
+/// 没有它，Codex 与桌面端的注册一字不差，服务端分辨不出这次调用属于哪个分类。
 /// `_timeout_ms` 于 stdio 不需要（无 HTTP 首字节超时），保留形参与 Claude 端签名一致。
 fn register_mcp_codex(_mcp_url: &str, _timeout_ms: u64) -> AppResult<(String, bool)> {
     let exe = std::env::current_exe()
@@ -1268,8 +1266,13 @@ fn register_mcp_codex_at(path: &Path, exe_path: &str) -> AppResult<(String, bool
         .as_table_mut()
         .ok_or_else(|| AppError::ToolConfig("config.toml 顶层非表".into()))?;
 
-    // 幂等：mcp_servers.synaroute 已是 stdio 形态（command 指向当前 exe、args=["--mcp-stdio"]）
+    // 幂等：mcp_servers.synaroute 已是 stdio 形态（command 指向当前 exe、args 完全一致）
     // → 跳过写盘。exe 路径变化（升级换目录）时会重写，保证 command 始终指向现役 exe。
+    //
+    // 🔴 args 必须**整体**比对（而非只看第一项/长度）：旧版注册的 args 只有 `--mcp-stdio`、
+    // 没有分类标记，若比对放宽到「首项是 --mcp-stdio 就算最新」，旧配置会被永久判为
+    // 「已是最新」而跳过重写 —— 自愈路径失效，用户的 Codex 永远走不到分类身份那条路，
+    // 且失效是静默的。
     let already = table
         .get("mcp_servers")
         .and_then(|v| v.as_table())
@@ -1277,10 +1280,7 @@ fn register_mcp_codex_at(path: &Path, exe_path: &str) -> AppResult<(String, bool
         .and_then(|v| v.as_table())
         .map(|e| {
             e.get("command").and_then(|c| c.as_str()) == Some(exe_path)
-                && e.get("args")
-                    .and_then(|a| a.as_array())
-                    .map(|a| a.len() == 1 && a[0].as_str() == Some(MCP_STDIO_FLAG))
-                    .unwrap_or(false)
+                && e.get("args") == Some(&crate::mcp::stdio::args_toml(CategoryType::Codex))
                 // type="stdio" 必须纳入幂等：Codex 桌面端靠此字段识别 stdio MCP，缺了就不加载
                 // 该 MCP（CLI 宽松、不需要也能识别，但桌面端严格）。老配置缺 type 时须重写补上，
                 // 不能因 command/args 一致就判「已最新」跳过。
@@ -1308,7 +1308,7 @@ fn register_mcp_codex_at(path: &Path, exe_path: &str) -> AppResult<(String, bool
     entry.insert("command".to_string(), toml::Value::String(exe_path.to_string()));
     entry.insert(
         "args".to_string(),
-        toml::Value::Array(vec![toml::Value::String(MCP_STDIO_FLAG.to_string())]),
+        crate::mcp::stdio::args_toml(CategoryType::Codex),
     );
     entry.insert("type".to_string(), toml::Value::String("stdio".to_string()));
     // tool_timeout_sec：大脑聚合要跑多模型并行 + 决策者综合，常 30s+，偶尔更久。Codex 默认
@@ -2618,8 +2618,8 @@ mod tests {
         assert_eq!(entry["command"], exe, "command 应指向当前 exe");
         assert_eq!(
             entry["args"],
-            serde_json::json!(["--mcp-stdio"]),
-            "args 应为 --mcp-stdio"
+            crate::mcp::stdio::args_json(CategoryType::ClaudeDesktop),
+            "args 应为带分类标记的 stdio args（只有 --mcp-stdio 的话与 Codex 一字不差，服务端分辨不出）"
         );
         // 关键：绝不能出现 HTTP 形态的键，否则桌面端整项跳过。
         assert!(entry.get("type").is_none(), "stdio 项不应带 type");
@@ -2692,16 +2692,17 @@ mod tests {
         assert!(wrote);
 
         let doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
-        // stdio 形态：command 指向 exe、args=["--mcp-stdio"]，无 url/timeout/实验开关。
+        // stdio 形态：command 指向 exe、args=[--mcp-stdio, --mcp-category=codex]，
+        // 无 url/timeout/实验开关。
         assert_eq!(
             doc["mcp_servers"]["synaroute"]["command"].as_str(),
             Some(exe),
             "应写入 stdio command 指向 synaroute.exe"
         );
         assert_eq!(
-            doc["mcp_servers"]["synaroute"]["args"][0].as_str(),
-            Some(MCP_STDIO_FLAG),
-            "args 应为 [--mcp-stdio]"
+            doc["mcp_servers"]["synaroute"]["args"],
+            crate::mcp::stdio::args_toml(CategoryType::Codex),
+            "args 应为带分类标记的 stdio args"
         );
         assert!(
             doc["mcp_servers"]["synaroute"].get("url").is_none(),
@@ -2761,11 +2762,116 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
+    /// 🔴 迁移判据：旧版注册的 args 只有 `--mcp-stdio`（没有分类标记），再次接入**必须重写**。
+    ///
+    /// 这条盯的是「幂等比对放宽了就静默失去自愈能力」：若比对只看首项 / 长度，
+    /// 旧配置会被永久判为「已是最新」而跳过，用户的 Codex 就永远拿不到分类身份 ——
+    /// 而这件事没有任何外部表现（工具照样能调，只是一直走 claude-cli 的 Key 池）。
+    ///
+    /// 预置里把 type / tool_timeout_sec / startup_timeout_sec 都填成最新值，
+    /// 让**只有 args 不同**：否则别的字段也不一致，测试即便在 args 判据坏掉时也会绿
+    /// （那就什么都没测到 —— CLAUDE.md 里 B64_MIN_RUN 那条就是这么栽的）。
+    #[test]
+    fn codex_register_rewrites_legacy_args_without_category_marker() {
+        let path = temp_file("codex_cat_migrate", "config.toml");
+        let exe = "C:\\Program Files\\SynaRoute\\synaroute.exe";
+        std::fs::write(
+            &path,
+            format!(
+                "model = \"gpt-5\"\n\n[mcp_servers.synaroute]\ncommand = '{exe}'\n\
+                 args = [\"--mcp-stdio\"]\ntype = \"stdio\"\n\
+                 tool_timeout_sec = {MCP_TOOL_TIMEOUT_SEC}\nstartup_timeout_sec = 30\n"
+            ),
+        )
+        .unwrap();
+
+        let (_, wrote) = register_mcp_codex_at(&path, exe).unwrap();
+        assert!(wrote, "旧 args（无分类标记）必须被重写，否则自愈路径静默失效");
+
+        let doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(
+            doc["mcp_servers"]["synaroute"]["args"],
+            crate::mcp::stdio::args_toml(CategoryType::Codex),
+            "重写后 args 应带 --mcp-category=codex"
+        );
+
+        // 迁移完成后必须重新变幂等：否则每次启动都写盘 + 造备份 + 刷一条事件。
+        let (_, wrote2) = register_mcp_codex_at(&path, exe).unwrap();
+        assert!(!wrote2, "已是新形态时不该再写盘");
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// 桌面端同上：旧 args 无分类标记 → 必须重写；重写后幂等。
+    #[test]
+    fn desktop_register_rewrites_legacy_args_without_category_marker() {
+        let (dir, _normal, threep, _profile, _meta) = desktop_layout("desk_cat_migrate");
+        let exe = r"C:\Program Files\SynaRoute\synaroute.exe";
+        // 预置旧形态：command 已是现役 exe，**只有 args 不同**。
+        std::fs::write(
+            &threep,
+            serde_json::to_vec(&serde_json::json!({
+                "mcpServers": { "synaroute": { "command": exe, "args": ["--mcp-stdio"] } }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (_, wrote) = register_mcp_claude_desktop_at(&threep, exe).unwrap();
+        assert!(wrote, "旧 args（无分类标记）必须被重写");
+
+        let v: Value = serde_json::from_slice(&std::fs::read(&threep).unwrap()).unwrap();
+        assert_eq!(
+            v["mcpServers"]["synaroute"]["args"],
+            crate::mcp::stdio::args_json(CategoryType::ClaudeDesktop),
+            "重写后 args 应带 --mcp-category=claude-desktop"
+        );
+
+        let (_, wrote2) = register_mcp_claude_desktop_at(&threep, exe).unwrap();
+        assert!(!wrote2, "已是新形态时不该再写盘");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CLI 侧同理：旧注册的 url 是裸 `/mcp`（不带分类段），必须被重写成 `/mcp/claude-cli`。
+    /// 不重写的话服务端只能把它当「认不出的调用方」，走兜底。
+    #[test]
+    fn claude_cli_register_rewrites_legacy_url_without_category_segment() {
+        let path = temp_file("cli_cat_migrate", ".claude.json");
+        let base = crate::mcp::base_url(9527);
+        let scoped = crate::mcp::client_url(9527, CategoryType::ClaudeCli);
+        // 预置旧形态：url 是裸基址，type / timeout 都已是最新 → **只有 url 不同**。
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "mcpServers": {
+                    "synaroute": { "type": "http", "url": base, "timeout": MCP_TOOL_TIMEOUT_MS }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (_, wrote) = register_mcp_claude_at(&path, &scoped, MCP_TOOL_TIMEOUT_MS).unwrap();
+        assert!(wrote, "裸 /mcp 的旧 url 必须被重写成带分类段的地址");
+
+        let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            v["mcpServers"]["synaroute"]["url"].as_str(),
+            Some(scoped.as_str())
+        );
+        assert!(scoped.ends_with("/claude-cli"), "地址应带分类段: {scoped}");
+
+        let (_, wrote2) = register_mcp_claude_at(&path, &scoped, MCP_TOOL_TIMEOUT_MS).unwrap();
+        assert!(!wrote2, "已是新形态时不该再写盘");
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
     /// 回归：老配置已是 stdio（command/args 都对）但**缺 type="stdio"**（首版接入按钮漏写）。
     /// 再次接入必须补上 type，不能因 command/args 一致就判「已最新」跳过——否则 Codex 桌面端
     /// 靠 type 识别 stdio MCP，缺了就不加载该工具（对话里根本没有 synaroute_ai）。
-    #[test]
-    fn codex_register_backfills_missing_type_stdio() {
+    #[test]    fn codex_register_backfills_missing_type_stdio() {
         let path = temp_file("codex_type_backfill", "config.toml");
         let exe = "C:\\Program Files\\SynaRoute\\synaroute.exe";
         // 预置：stdio 形态但缺 type 字段。

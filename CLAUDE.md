@@ -246,6 +246,39 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   一条是**真的测试盲区**：`steps.min(20)` 防的是 `1i64 << 64` 的**移位 panic**（会崩在转发热路径上），
   而用例只把计数推到 33、压根没到边界。已改成推过 64。**教训同 `db_copy_path` 那条：
   注入不变红时先怀疑用例没压到边界，别当成脚本没问题。**
+- **大脑聚合 MCP：分类改由「接入时」写死，不再问模型（2026-08-24，用户报的 bug）**：
+  症状是客户端调 `synaroute_ai` 时反过来问用户「当前是哪个工具分类」。根因不是提示词 ——
+  **服务端真的分辨不出调用方**：桌面端与 Codex 的注册形态一字不差（都是
+  `command=<exe>, args=["--mcp-stdio"]`），且都转发到同一个 `/mcp`，于是只能靠
+  `category` 参数当拐杖，而**模型不可能知道自己活在哪个客户端里** —— 省略即被默认成
+  `claude-cli`：用错 Key 池、额度记在别的分类头上、**Codex 的聚合日志一直落在 Claude CLI 页**。
+  <br>分类在「接入」那一刻本就是已知的（那时是我们自己在写客户端配置），故写进注册本身：
+  CLI 的 url 写成 `/mcp/claude-cli`；两个 stdio 端的 args 加 `--mcp-category=<分类>`，
+  子进程读自己 argv 后翻成同样的路径段转发 —— HTTP 与 stdio 共用**一套**解析。
+  schema 里的 `category` 已摘掉（它一在，模型就会问）。
+  <br>**优先级**（`mcp::resolve_caller_category`，单一决策点）：路径段 → `arguments.category`
+  （仅兼容旧配置/手写 curl）→ 旧版 stdio 哨兵段 `_stdio` 在「桌面端/Codex」里排除出唯一那个
+  → `claude-cli`。后三档各落一条**每次运行每分类只一条**的可见事件（不节流就会把有用事件
+  挤出 `MAX_EVENTS` 环，与已修过的「短路窗口每次重发记一条」同一个坑）。
+  <br>**刻意不做**：认不出就报错。升级后应用启动 `rewrite_registered_clients` 已自动重写三端
+  配置，但客户端要**重启一次**才读到；那段窗口里报错=工具直接不可用，代价不对称。
+  <br>**结构上的连带改动**：`mcp.rs` 当时 889/900 顶着新文件上限，故把 stdio 层拆成
+  `mcp/stdio.rs`（`mcp::stdio` 子模块）。**没有抬高任何棘轮上限**，`SettingsPage.tsx` 反而
+  1907→1900。设置页那个复制框也从裸 `/mcp` 改成按分类三条（抽出 `McpAddressList.tsx`）。
+  <br>**注入验证 14 条全部变红**，其中**两条**第一次注入时仍绿，都是真盲区：
+  ① tools.rs 那侧只验证「给它带分类段的 url 就会写下去」，而「谁决定 url 带不带分类段」
+  在 service 层，改回裸基址它照样全绿 → 补了
+  `client_url_round_trips_through_caller_from_path`；
+  ② **`handle_http` 里「取 path → 传给 dispatch」这一步接线**压根没人覆盖 ——
+  把它硬编码成 `McpCaller::Unbound`，全套 776 条**全绿**，而那就是本缺陷本身
+  （每个客户端都静默退回 claude-cli）→ 补了 `handle_http_derives_the_caller_from_the_request_path`
+  （真 bind 端口 0 起 HTTP、直接挂 `handle_http`；**刻意不走 `McpManager::start`**，
+  它会写 exe 同级端口文件、与那条端口文件用例抢同一个文件 → 会引入偶发红）。
+  <br>**教训**：单元覆盖了「解析函数」和「分发函数」不等于覆盖了**两者之间的接线**，
+  而接线漏了的表现恰恰是静默的。同 CLAUDE.md 里 `route_meta` 那条「记得在每个出口调一次
+  是必然会漏的纪律」。
+  <br>另加一条**跨语言**判据 `tests/mcpEndpointParity.test.ts`：前端那份地址与 Rust
+  `mcp::client_url` 分叉时变红（编译器管不到这条缝，而分叉是静默的）。
 - **换机注意**：`secrets.enc` 由 DPAPI 绑账户、**不可跨机器搬运**；本文档里的绝对路径都是旧机器实测值
 - **判据取证方法**：如何反查 `claude.exe` / `codex.exe` 的字段与内嵌官方 gateway 规范
   （本轮所有「客户端认什么字段」的结论都出自此，不是文档推测）

@@ -9,6 +9,7 @@ import { useT } from "@/lib/useT";
 import { LANGS } from "@/lib/i18n";
 import { openLogDir } from "@/lib/openLogDir";
 import { pickPrefs } from "@/lib/prefs";
+import { McpAddressList, mcpCategoryUrl } from "@/components/McpAddressList";
 import type {
   AppSettings,
   McpStatus,
@@ -386,16 +387,9 @@ export function SettingsPage() {
     }
   };
 
-  // MCP 接入地址：优先用实际绑定端口（占用时会 fallback），否则用配置端口。
+  // MCP 端口：优先用实际绑定端口（占用时会 fallback），否则用配置端口。
+  // 接入地址按分类各一条（见 McpAddressList）——分类段是服务端识别调用方的唯一途径。
   const mcpPort = mcp?.port ?? settings?.mcpPort ?? 9527;
-  const mcpAddress = `http://127.0.0.1:${mcpPort}/mcp`;
-  const [copied, setCopied] = useState(false);
-  const handleCopyAddr = () => {
-    void navigator.clipboard?.writeText(mcpAddress).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1400);
-    });
-  };
 
   // MCP 重启：先停后起、强制重绑端口。用于端口变更/冲突排障/强制重连。
   // 大脑聚合参数是每次调用实时读的，改了保存即生效，不需要走这里。
@@ -716,32 +710,29 @@ export function SettingsPage() {
                   />
                 </div>
 
-                {/* 服务地址 + 复制 */}
-                <div className="flex items-start justify-between gap-4">
-                  <div className="flex gap-2.5">
-                    <Activity size={16} className={`mt-0.5 shrink-0 ${mcp?.running ? "text-success" : "text-text-muted"}`} />
-                    <div className="min-w-0">
-                      <div className="text-sm font-medium text-text-primary">
-                        {t("settings.mcpAddress")}
-                        <span className={`ml-2 text-xs ${mcp?.running ? "text-success" : "text-text-muted"}`}>
-                          {mcp?.running ? `● ${t("settings.mcpRunning")}` : `○ ${t("settings.mcpStopped")}`}
-                        </span>
-                      </div>
-                      <div className="mt-1 break-all font-mono text-xs text-text-muted">{mcpAddress}</div>
-                      {mcp?.running && mcp.port != null && mcp.port !== (settings?.mcpPort ?? 9527) && (
-                        <div className="mt-1 text-xs text-warning">
-                          {t("settings.mcpPortFallback", { port: mcp.port })}
-                        </div>
-                      )}
-                      {mcp?.lastError && (
-                        <div className="mt-1 text-xs text-danger">{mcp.lastError}</div>
-                      )}
+                {/* 服务地址 + 复制：**按分类三条**。分类段是服务端识别调用方的唯一途径，
+                    只给裸基址会让手工配置的用户永久走兜底分类（见 McpAddressList 注释）。 */}
+                <div className="flex items-start gap-2.5">
+                  <Activity size={16} className={`mt-0.5 shrink-0 ${mcp?.running ? "text-success" : "text-text-muted"}`} />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium text-text-primary">
+                      {t("settings.mcpAddress")}
+                      <span className={`ml-2 text-xs ${mcp?.running ? "text-success" : "text-text-muted"}`}>
+                        {mcp?.running ? `● ${t("settings.mcpRunning")}` : `○ ${t("settings.mcpStopped")}`}
+                      </span>
                     </div>
+                    <div className="mt-1.5">
+                      <McpAddressList port={mcpPort} t={t} />
+                    </div>
+                    {mcp?.running && mcp.port != null && mcp.port !== (settings?.mcpPort ?? 9527) && (
+                      <div className="mt-1 text-xs text-warning">
+                        {t("settings.mcpPortFallback", { port: mcp.port })}
+                      </div>
+                    )}
+                    {mcp?.lastError && (
+                      <div className="mt-1 text-xs text-danger">{mcp.lastError}</div>
+                    )}
                   </div>
-                  <Button size="sm" variant="secondary" onClick={handleCopyAddr}>
-                    {copied ? <Check size={14} /> : <Copy size={14} />}
-                    {copied ? t("settings.mcpCopied") : t("settings.mcpCopy")}
-                  </Button>
                 </div>
 
                 <div className="flex flex-wrap gap-2">
@@ -1098,7 +1089,7 @@ export function SettingsPage() {
       )}
 
       {showWizard && (
-        <McpWizard mcpAddress={mcpAddress} onClose={() => setShowWizard(false)} t={t} />
+        <McpWizard mcpPort={mcpPort} onClose={() => setShowWizard(false)} t={t} />
       )}
 
       {masterDialog && (
@@ -1124,19 +1115,21 @@ export function SettingsPage() {
 
 /** MCP 接入向导弹窗：分步展示 Codex / Claude Code 的接入命令与可选钩子。 */
 function McpWizard({
-  mcpAddress,
+  mcpPort,
   onClose,
   t,
 }: {
-  mcpAddress: string;
+  mcpPort: number;
   onClose: () => void;
   t: (key: string, vars?: Record<string, string | number>) => string;
 }) {
-  const codexCmd = `codex mcp add --transport http synaroute ${mcpAddress}`;
+  // 命令里的地址**必须带分类段**：手工 `mcp add` 的用户若用裸基址，服务端认不出调用方、
+  // 一律退回兜底分类（用错 Key 池、日志落错页，且无任何提示）。
+  const codexCmd = `codex mcp add --transport http synaroute ${mcpCategoryUrl(mcpPort, "codex")}`;
   // 片段内容也要跟随语言：英文界面下给出中文提示词，用户复制进 AGENTS.md/settings.json
   // 就等于把中文指令塞进自己的英文工程（matcher 里的中文关键词对英文提问也永不命中）。
   const codexHook = t("settings.mcpWizardCodexHookText");
-  const claudeCmd = `claude mcp add --transport http synaroute ${mcpAddress}`;
+  const claudeCmd = `claude mcp add --transport http synaroute ${mcpCategoryUrl(mcpPort, "claude-cli")}`;
   const claudeHook = `{
   "hooks": {
     "UserPromptSubmit": [

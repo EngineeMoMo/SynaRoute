@@ -1308,15 +1308,15 @@ async fn codegraph_init(work_dir: String) -> AppResult<String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Codex 大脑聚合走 stdio MCP：Codex 以子进程拉起 `synaroute.exe --mcp-stdio`，
-    // 用 stdin/stdout 传 JSON-RPC。此模式不启动 Tauri UI、不开窗口、不监听端口，
-    // 读到 stdin EOF（Codex 结束子进程）即退出。必须最先判定，早于任何 UI 初始化。
-    if std::env::args().any(|a| a == "--mcp-stdio") {
+    // 桌面端 / Codex 的大脑聚合走 stdio MCP：客户端以子进程拉起
+    // `synaroute.exe --mcp-stdio --mcp-category=<分类>`，用 stdin/stdout 传 JSON-RPC。
+    // 此模式不启动 Tauri UI、不开窗口、不监听端口，读到 stdin EOF 即退出。必须最先判定。
+    if std::env::args().any(|a| a == mcp::stdio::MCP_STDIO_FLAG) {
         // 转发模式：不初始化 Store（避免读到 MSIX 虚拟化的错误配置宇宙——被 Codex 桌面端等
         // 打包应用拉起时，子进程读的是包容器里的空/旧配置）。tools/call 转发到运行中主应用的
         // HTTP MCP 端口，由持有真实配置的主应用执行聚合。TCP 端口不受 MSIX 虚拟化影响。
         let rt = tokio::runtime::Runtime::new().expect("tokio rt");
-        rt.block_on(mcp::run_stdio());
+        rt.block_on(mcp::stdio::run_stdio());
         return;
     }
 

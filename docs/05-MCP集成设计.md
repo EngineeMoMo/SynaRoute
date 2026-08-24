@@ -18,12 +18,12 @@ SynaRoute 的核心定位是「AI API 请求的中转港口」——路由、故
 
 | # | 决策点 | 结论 |
 |---|--------|------|
-| Q1 | MCP 服务器运行形式 | **HTTP MCP，桌面端内置**，监听 `127.0.0.1:9527/mcp`（Streamable HTTP 传输） |
+| Q1 | MCP 服务器运行形式 | **HTTP MCP，桌面端内置**，监听 `127.0.0.1:9527/mcp/{分类}`（Streamable HTTP）。桌面端 / Codex 走 stdio 子进程转发到同一端点 |
 | Q2 | Hook（钩子）支持 | **两个都提供**：Claude Code hooks（`.claude/settings.json`）+ Codex AGENTS.md 提示词 |
 | Q3 | 暴露几个工具 | **合并为 1 个工具** `synaroute_ai`，通过参数区分意图 |
 | Q4 | 返回内容格式 | **兼容 Codex 和 Claude Code**：标准 MCP `content: [{type:"text", text}]`，text 用 Markdown |
 | Q5 | MCP 通道是否写文件 | **不写文件**。决策者返回计划到 Codex/Claude，用户同意后由客户端自己改文件 |
-| Q6 | 工具参数 schema | **基本参数**：`prompt`(必填)、`cwd`(可选)、`category`(可选)、`languageHint`(可选) |
+| Q6 | 工具参数 schema | **基本参数**：`prompt`(必填)、`cwd`(可选)、`languageHint`(可选)、`images`(可选)。**分类不是参数**，由传输层携带（见 4.3 节） |
 | Q7 | 端口 | 默认 **9527**，可在设置页修改 |
 | Q8 | 启动时机 | **启用即自动启动**，无独立「启动/停止」按钮，只有一个「启用 MCP 服务器」开关 |
 | Q9 | 鉴权 | **不鉴权**（仅监听 127.0.0.1，本机可访问） |
@@ -36,7 +36,7 @@ SynaRoute 的核心定位是「AI API 请求的中转港口」——路由、故
 │  Codex CLI  │         │            SynaRoute 桌面端             │
 │  Claude Code│         │                                        │
 │             │  MCP    │  ┌────────────────────────────────┐   │
-│  (MCP       │ ──HTTP─>│  │  MCP Server (127.0.0.1:9527)   │   │
+│  (MCP       │ ──HTTP─>│  │ MCP Server 127.0.0.1:9527/mcp/*│   │
 │   Client)   │ <──────  │  │  tool: synaroute_ai            │   │
 │             │  JSON-  │  └───────────────┬────────────────┘   │
 │             │  RPC    │                  │                     │
@@ -79,7 +79,6 @@ SynaRoute 的核心定位是「AI API 请求的中转港口」——路由、故
     "properties": {
       "prompt":       { "type": "string", "description": "任务描述，如「审查鉴权模块的安全性」" },
       "cwd":          { "type": "string", "description": "当前项目根目录绝对路径。省略时使用 SynaRoute 自动跟随的最近活跃项目" },
-      "category":     { "type": "string", "enum": ["claude-cli","claude-desktop","codex"], "description": "使用哪个分类下配置的 Key 池，省略默认 claude-cli" },
       "languageHint": { "type": "string", "description": "回答语言提示，如 zh / en，省略跟随 prompt 语言" }
     },
     "required": ["prompt"]
@@ -88,7 +87,6 @@ SynaRoute 的核心定位是「AI API 请求的中转港口」——路由、故
 ```
 
 ### 4.2 返回格式
-
 标准 MCP 工具响应：
 
 ```json
@@ -103,8 +101,41 @@ SynaRoute 的核心定位是「AI API 请求的中转港口」——路由、故
 - 内容包含：综合建议/修改计划 + 参与模型信息 + （可选）分歧点标注
 - 不含 plan_id / 两阶段状态（因为不写文件，无需确认回调）
 
-## 5. 配置（AppSettings 新增字段）
+### 4.3 分类身份由传输层携带（不是工具参数）
 
+每个分类有自己的 Key 池、聚合成员、预算与日志页，所以「这次调用属于哪个分类」必须答对。
+早期用 `category` 参数回答，那是错的：**模型不知道自己活在哪个客户端里**，只能反问用户，
+或省略后被默认成 `claude-cli` —— 用错 Key 池、额度记在别的分类头上、Codex 的聚合日志
+落在 Claude CLI 页，全都是静默的。
+
+分类在**「接入」那一刻就已确定**（那时是我们自己在写客户端配置），所以写进注册本身：
+
+| 分类 | 注册形态 | 身份载体 |
+|---|---|---|
+| Claude CLI | `~/.claude.json` → `{type:"http", url, timeout}` | url = `…/mcp/claude-cli` |
+| Claude 桌面端 | `claude_desktop_config.json` → stdio | args 含 `--mcp-category=claude-desktop` |
+| Codex | `~/.codex/config.toml` → stdio | args 含 `--mcp-category=codex` |
+
+两个 stdio 端的 `command` 都是同一个 exe，**args 里的分类标记是唯一区分它们的东西**；
+子进程读自己的 argv，再把身份翻成转发地址的路径段（`/mcp/{分类}`），于是 HTTP 与 stdio
+两条路共用同一套解析。写侧 `mcp::client_url` 与读侧 `mcp::caller_from_path` 成对，
+有 round-trip 测试钉住；前端设置页那份地址另有一条跨语言判据
+（`tests/mcpEndpointParity.test.ts`）。
+
+**解析优先级**（`mcp::resolve_caller_category`，单一决策点）：
+
+1. 路径段里的分类 → 权威，**不看参数**（防模型瞎填一个值覆盖掉正确答案）
+2. `arguments.category` → 仅当传输层认不出时。schema 已不暴露它，保留读取纯为兼容
+   （旧版注册尚未被重写、手写 curl）
+3. 旧版 stdio 的哨兵段 `/mcp/_stdio` → 必是桌面端或 Codex 之一（CLI 走 HTTP）：
+   若这两个里只有一个接入过，就是它
+4. `claude-cli` → 历史默认（裸 `/mcp` 本就只可能是旧版 CLI 注册或手写 curl）
+
+第 2~4 档各落一条可见事件（每次运行、每分类一条，防挤爆事件环），提示「客户端配置为旧版，
+重启一次即可」。升级后应用启动时 `rewrite_registered_clients` 会自动把三端配置改成新形态，
+客户端重启一次后过渡窗口关闭。
+
+## 5. 配置（AppSettings 新增字段）
 ```rust
 pub struct AppSettings {
     // ... 现有字段 ...
@@ -118,7 +149,7 @@ pub struct AppSettings {
 新增「MCP 服务器」卡片：
 - **启用 MCP 服务器** 开关（Q8：开启即自动启动）
 - **端口** 输入框（默认 9527，Q7）
-- **服务地址** 只读展示 `http://127.0.0.1:{port}/mcp` + 复制按钮
+- **接入地址（按分类）** 只读展示三条 `http://127.0.0.1:{port}/mcp/{分类}` + 各自的复制按钮
 - **连接状态** 指示灯（运行中 / 已停止）
 - **配置向导** 按钮 → 打开客户端配置教程（一键复制 Codex / Claude Code 配置片段）
 
@@ -129,7 +160,7 @@ pub struct AppSettings {
 **config.toml（MCP 连接）：**
 ```toml
 [mcp_servers.synaroute]
-url = "http://127.0.0.1:9527/mcp"
+url = "http://127.0.0.1:9527/mcp/codex"
 ```
 
 **AGENTS.md（提示词钩子，让 Codex 主动调用）：**
@@ -145,7 +176,7 @@ url = "http://127.0.0.1:9527/mcp"
 ```json
 {
   "mcpServers": {
-    "synaroute": { "url": "http://127.0.0.1:9527/mcp" }
+    "synaroute": { "url": "http://127.0.0.1:9527/mcp/claude-cli" }
   }
 }
 ```

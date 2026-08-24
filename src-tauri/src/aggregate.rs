@@ -465,9 +465,9 @@ pub async fn run_mcp(
 ) -> AppResult<McpAggregateResult> {
     let brain = store.get_brain(category);
     if !brain.enabled {
-        return Err(AppError::Invalid(
-            "该分类未启用大脑聚合，请先在 SynaRoute 桌面端配置参与者和决策者".into(),
-        ));
+        // 带上分类名：分类现在由接入端自动决定，用户没传过它，报错必须自己说清是哪一页。
+        let who = category.display_name();
+        return Err(AppError::Invalid(format!("「{who}」未启用大脑聚合，请在 SynaRoute 桌面端切到该分类，配好参与者与决策者")));
     }
     let decider_ref = brain
         .decider_ref
