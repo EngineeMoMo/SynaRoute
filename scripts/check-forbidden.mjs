@@ -19,6 +19,7 @@
 //    所以下面对「解析到 0 个」这种情形**主动判失败**，不让它悄悄空转。
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, sep } from "node:path";
+import { scanRepo } from "./lib/secret-scan.mjs";
 
 const SKIP_DIRS = new Set(["node_modules", "target", "dist", ".git"]);
 
@@ -181,6 +182,49 @@ const pass = (name, detail) => console.log(`✅ ${name}${detail ? ` —— ${det
         `${used.size} 个命令调用全部对上（Rust 侧共 ${declared.size} 个命令）`
       );
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 规则 3：仓库里不许有私钥材料或签名凭据口令
+// ---------------------------------------------------------------------------
+{
+  const WHY =
+    "      CLAUDE.md 铁律：签名密钥只经 TAURI_SIGNING_PRIVATE_KEY 环境变量传入，永不落仓库。\n" +
+    "      2026-08-14 这条被破过一次（更新签名私钥 + 口令一起进了公开仓库，08-23 才发现），\n" +
+    "      而当时**已有**一道门（audit:release）—— 它按文件名判，而密钥贴在 .md 正文里、\n" +
+    "      还包了一层 base64。判据存在 ≠ 判对了维度，故本规则改为「解码后匹配内容特征」。";
+
+  // 🔴 刻意放在**策略门**里而不是只放在 audit:release 里。
+  // 那次泄露发生在一次 commit，而 audit:release 只在发版时跑 —— 于是密钥在仓库里
+  // 躺了 9 天。门必须在它能拦住的那个时刻跑。
+  const { findings, stats } = scanRepo();
+
+  if (stats.scanned === 0) {
+    fail("no-secrets-in-tracked-files", "      扫到 0 个文件 —— 解析器坏了，本检查形同虚设");
+  } else if (findings.length) {
+    const lines = findings.map((f) => {
+      const where = f.file ? `${f.file}${f.line ? `:${f.line}` : ""}` : "(仓库)";
+      return `      ${where}  ${f.what}`;
+    });
+    fail(
+      "no-secrets-in-tracked-files",
+      `${WHY}\n${lines.join("\n")}\n\n` +
+        "      ⚠️ 注意：把文件删掉能让这道门变绿，但**那不等于泄露被修复了** ——\n" +
+        "      本门只扫工作区，不扫 git 历史、不扫已推出去的 fork。已公开的密钥必须\n" +
+        "      当作永久失效处置（换钥或明确接受风险）。",
+    );
+  } else {
+    // 如实报「实际做了多少次 gpg 试解」。没有候选口令时是 0 次 —— 那也是通过，
+    // 但不能说成「已交叉验证」：仓库里没有口令可试，本来就无从验证。
+    // 把 0 次说成验过了，正是本仓最忌的那类「门说查过了、其实没查」。
+    const cross =
+      stats.ciphertext.length === 0
+        ? ""
+        : stats.gpgChecks > 0
+          ? `，${stats.ciphertext.length} 份密文 × 候选口令共试解 ${stats.gpgChecks} 次均失败`
+          : `，${stats.ciphertext.length} 份密文未试解（仓库里没有候选口令可试）`;
+    pass("no-secrets-in-tracked-files", `扫过 ${stats.scanned} 个文件、${stats.b64Runs} 段 base64${cross}`);
   }
 }
 

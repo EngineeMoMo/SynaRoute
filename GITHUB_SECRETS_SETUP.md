@@ -1,63 +1,33 @@
-# GitHub Secrets 配置说明
+# GitHub Secrets 配置说明（更新签名）
 
-## 需要配置的 Secrets
+Release 工作流靠两个仓库 Secret 给安装包签名，客户端的 updater 用嵌在二进制里的公钥验签。
+没配 → 产物无签名 → **updater 验签失败，而这个失败不会在构建时报错**。
 
-请访问：https://github.com/EngineeMoMo/SynaRoute/settings/secrets/actions
+| Secret 名 | 内容 |
+|---|---|
+| `TAURI_SIGNING_PRIVATE_KEY` | `~/.tauri/synaroute.key` 的**全文**（`export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/synaroute.key)"` 取到的那串） |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | 该私钥的口令。**当前这把钥没有口令**（见 [docs/18 §3.4](docs/18-重装系统开发环境清单.md)），故填空值 |
 
-点击 "New repository secret" 添加以下两个密钥：
+配置位置：仓库 → Settings → Secrets and variables → Actions → New repository secret。
+消费点是 [`.github/workflows/release.yml`](.github/workflows/release.yml) 的 `tauri-action` 一步。
 
-### 1. TAURI_SIGNING_PRIVATE_KEY
+配好之后推 tag，Release 会带上 `latest.json` 与各安装包的 `.sig`。
 
-**Name**: `TAURI_SIGNING_PRIVATE_KEY`
+## 🔴 这个文件曾经泄露过签名私钥 —— 别再把值写回来
 
-**Value**: 
-```
-dW50cnVzdGVkIGNvbW1lbnQ6IHJzaWduIGVuY3J5cHRlZCBzZWNyZXQga2V5ClJXUlRZMEl5clJLUTJzN2FHVGxMK0wwV01BWHp4dlJHSHZoSEw5eGlBbDdYdUhxYU50Z0FBQkFBQUFBQUFBQUFBQUlBQUFBQVljRWpicG52bjFscTIyTG5sTFNRZnRwWHZaMFJnY3E2VmdwcldHYmNYaE5aQWhvOVZGOS82WDZUbExBTEQ2aDU2eWFpcTY5SlBSQnRwWUdLVTFQOVhLTkxrdytPdWVNNGtXSStjdEFjMit1ZndsenlJWWQwUEllcHJsNUM4cU9BajMvNmZsNGxxRFU9Cg==
-```
+2026-08-14 的 `29b9257` 把私钥（`DE14C6EC68286277`）与它的解密口令**一起**写进了本文件正文，
+推到了公开仓库，直到 2026-08-23 才发现。
 
-### 2. TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+- 那把钥刚好在 08-16 被换掉，所以只有 **v0.1.23** 那一批客户端嵌着它。是运气，不是防线。
+- 而 v0.1.23 的用户处境最坏：他们**收不到**你之后的正版更新（0.1.26+ 用新钥签，
+  他们的客户端不认），却**能收到**任何人用泄露钥签的伪造更新。
+- 删掉值**不等于修好了**：它在 git 历史里、在已 fork 的副本里。已公开的密钥只能
+  当作永久失效来处置。
 
-**Name**: `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+当时本文件的「安全说明」写着「私钥已加密，即使泄露也需要密码才能使用」——
+而密码就在同一个文件的下面几行。**把口令和它保护的东西放在一起，等于没有口令。**
 
-**Value**: 
-```
-mhm292117.
-```
-
----
-
-## 配置步骤
-
-1. 访问 https://github.com/EngineeMoMo/SynaRoute/settings/secrets/actions
-2. 点击 "New repository secret"
-3. 输入 Name: `TAURI_SIGNING_PRIVATE_KEY`
-4. 粘贴上面的 Value（完整的私钥字符串）
-5. 点击 "Add secret"
-6. 重复步骤 2-5，添加 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
-
----
-
-## 验证
-
-配置完成后：
-1. 推送代码和标签
-2. GitHub Actions 将能够正确签名发布包
-3. 用户可以通过应用内更新器自动更新
-
----
-
-## 安全说明
-
-- ⚠️ **私钥已加密**：密钥文件使用密码加密，即使泄露也需要密码才能使用
-- ⚠️ **GitHub Secrets 安全**：Secrets 在 GitHub 中加密存储，日志中自动隐藏
-- ⚠️ **本地密钥文件**：`synaroute-signing.key` 不要提交到 Git，已在 .gitignore 中
-
----
-
-## 密钥文件备份
-
-本地密钥文件位置：
-- 私钥: `C:/Users/Administrator/Desktop/temp/demo/synaroute-signing.key`
-- 公钥: `C:/Users/Administrator/Desktop/temp/demo/synaroute-signing.key.pub`
-
-**请妥善备份这两个文件！丢失后将无法签名更新包。**
+现在有一道机械判据盯着这件事：[`scripts/lib/secret-scan.mjs`](scripts/lib/secret-scan.mjs)，
+由 `npm run check:forbidden`（每次 `npm run gates` 与 CI 都跑）与 `npm run audit:release` 共同消费。
+它按**解码后的内容特征**判 —— 因为这次的密钥是包了一层 base64 存的，
+按文件名判和按明文 grep 判**都抓不到**。

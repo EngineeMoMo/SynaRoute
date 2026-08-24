@@ -14,6 +14,7 @@
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
+import { scanRepo } from "./lib/secret-scan.mjs";
 
 const NSIS_DIR = "src-tauri/target/release/bundle/nsis";
 const RAW_EXE = "src-tauri/target/release/synaroute.exe";
@@ -36,6 +37,25 @@ const pass = (msg) => console.log(`✅ ${msg}`);
   );
   if (bad.length) fail(`git 跟踪了敏感文件：${bad.join(", ")}`);
   else pass("git 未跟踪运行数据 / 明文密钥");
+}
+
+// ---- 1b. 仓库内容里不该有私钥材料或签名口令（按内容判，不按文件名） ----
+{
+  // 🔴 上面第 1 项按**文件名**判，2026-08-14 的泄露正是从那个缝里过去的：
+  // 更新签名私钥 + 解密口令贴在 `GITHUB_SECRETS_SETUP.md` 正文里，文件名毫无异样，
+  // 而且密钥还包了一层 base64 —— 连内容 grep 都抓不到。判据见 lib/secret-scan.mjs。
+  //
+  // 主战场是 `npm run check:forbidden`（每次 gates 与 CI 都跑）；这里是**发版前的第二道**。
+  // 那次泄露在仓库里躺了 9 天，正因为唯一的门只在发版时跑。
+  const { findings, stats } = scanRepo();
+  if (stats.scanned === 0) fail("密钥扫描扫到 0 个文件 —— 解析器坏了，本项形同虚设");
+  else if (findings.length) {
+    for (const f of findings) {
+      fail(`${f.file ?? "(仓库)"}${f.line ? `:${f.line}` : ""} ${f.what}`);
+    }
+  } else {
+    pass(`仓库内容无私钥材料 / 签名口令（扫过 ${stats.scanned} 个文件、${stats.b64Runs} 段 base64）`);
+  }
 }
 
 // ---- 2. bundle 配置不该引用仓库外的资源 ----
