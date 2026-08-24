@@ -61,6 +61,29 @@ const B64_MIN_RUN = 60;
 const CRED_LABEL_RE =
   /\b(TAURI_SIGNING_PRIVATE_KEY_PASSWORD|TAURI_KEY_PASSWORD|SIGNING_KEY_PASSWORD|GPG_PASSPHRASE|GPG_PASSWORD|MINISIGN_PASSWORD)\b/;
 
+// 多行「前向窗口」只对**文档 / 配置**格式生效；源码只认同行形态。
+//
+// 🔴 这条限制是被自己咬出来的，值得写清楚。本次泄露的形态是 markdown
+// （标签 → 空行 → `**Value**:` → 围栏 → 值，隔了 4 行），所以必须有前向窗口。
+// 但在**源码**里，标签几乎总是以「模式定义 / 环境变量引用 / 测试夹具」的身份出现，
+// 紧随其后的任意一行都是代码，于是前向窗口把这些当成了「口令值」：
+//
+//   本文件的 CRED_LABEL_RE 那一行  → 把下面 BINARY_EXT 的正则字面量当成口令
+//   secretScan.test.ts 的夹具数组 → 把 `].join("\n");`、`expect(...)` 当成口令
+//
+// 而这个假警**直到这两个文件被 git 跟踪的那一刻才会出现** —— 扫描器只扫 tracked
+// 文件（见 [`trackedFiles`]），它们还是 untracked 时它看不见自己，于是整个开发期这道门
+// 都是绿的，提交那一刻才红。**「门是绿的」不等于「门查过了它该查的东西」。**
+//
+// 为什么不加文件白名单：本文件开头那段已经写明「白名单就是下一次泄露的藏身处」。
+// 按格式收窄判据不产生藏身处 —— 任何 `.md` / `.yml` / `.env` 里的泄露照旧被抓。
+//
+// 源码里仍保留**同行**形态（`GPG_PASSPHRASE=xxx`），那才是硬编码口令的真实写法；
+// 而「标签在注释里、值在下一行」这种形态旧实现本来也抓不到
+// （`const pw = "x";` 带空格，过不了 `looksLikeRealSecret`），故没有新增盲区。
+const SOURCE_EXT =
+  /\.(m?[jt]sx?|c[jt]s|rs|py|go|java|kt|rb|php|c|cc|cpp|h|hpp|cs|swift|sh|bash|ps1|bat|cmd)$/i;
+
 const BINARY_EXT =
   /\.(png|jpe?g|gif|webp|ico|icns|pdf|docx?|xlsx?|pptx?|zip|gz|tgz|7z|rar|exe|dll|msi|so|dylib|woff2?|ttf|otf|eot|mp4|mp3|wav|db|sqlite3?|bin|wasm|lock)$/i;
 
@@ -168,8 +191,10 @@ const SCAFFOLD_RE = /^(?:#{1,6}\s|\*\*|>|[-*+]\s|\||```|~~~|\s*$)/;
  * 前向窗口是必需的：本次泄露的形态是 markdown 的
  *   `**Name**: \`TAURI_SIGNING_PRIVATE_KEY_PASSWORD\`` → 空行 → `**Value**:` → ``` → 值
  * 标签和值隔了 4 行。同行形态（`FOO=bar`、`FOO: bar`）也要覆盖。
+ *
+ * `forwardWindow=false`（源码文件）时只认同行形态，理由见 [`SOURCE_EXT`]。
  */
-export function findCredentialValues(text) {
+export function findCredentialValues(text, { forwardWindow = true } = {}) {
   const lines = text.split("\n");
   const out = [];
   let fence = false;
@@ -186,7 +211,7 @@ export function findCredentialValues(text) {
 
     // 前向窗口：跳过 markdown 脚手架行，遇标题或下一个标签就停
     let inFence = fence;
-    for (let j = i + 1; j < Math.min(i + 10, lines.length); j++) {
+    for (let j = i + 1; forwardWindow && j < Math.min(i + 10, lines.length); j++) {
       const t = lines[j];
       if (/^\s*(?:```|~~~)/.test(t)) {
         inFence = !inFence;
@@ -287,7 +312,7 @@ export function scanFiles(files, { cwd = process.cwd() } = {}) {
     }
 
     // 3) 签名凭据口令
-    for (const c of findCredentialValues(text)) {
+    for (const c of findCredentialValues(text, { forwardWindow: !SOURCE_EXT.test(rel) })) {
       findings.push({
         kind: "passphrase",
         file: rel,

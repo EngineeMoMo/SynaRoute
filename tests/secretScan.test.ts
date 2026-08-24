@@ -1,9 +1,13 @@
 import { describe, it, expect } from "vitest";
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 // @ts-expect-error —— 纯 JS 门脚本，无类型声明；本文件不参与 tsc（tsconfig.include 只有 src）
 import { scanFiles, scanRepo, looksLikeRealSecret } from "../scripts/lib/secret-scan.mjs";
+
+/** 仓库根（按路径直读自身源码时用，与 git 跟踪状态无关）。 */
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 /**
  * `scripts/lib/secret-scan.mjs` 的故障注入测试。
@@ -162,4 +166,82 @@ describe("门本身不能空转", () => {
     expect(stats.scanned).toBeGreaterThan(50);
     expect(stats.b64Runs).toBeGreaterThan(0);
   });
+
+  /**
+   * 🔴 真仓库必须 0 条。这条盯的是一次真实的「门看不见自己」事故。
+   *
+   * 扫描器只扫 **git 跟踪的**文件（`trackedFiles` 走 `git ls-files`）。而它自己
+   * （`scripts/lib/secret-scan.mjs`）和本测试文件在开发期一直是 untracked，
+   * 于是它从未扫过自己 —— 整个开发期这道门都是绿的。**入库那一刻**它们变成 tracked，
+   * 门立刻报出 6 条假警：把自己 `CRED_LABEL_RE` 下面那条正则字面量、
+   * 以及本文件夹具里的 `].join("\n");` / `expect(...)` 当成了「口令值」。
+   *
+   * 「门是绿的」不等于「门查过了它该查的东西」—— 同 CLAUDE.md 里
+   * 「判据存在 ≠ 判对了维度」那条。
+   */
+  it("真仓库上一条 finding 都不该有", () => {
+    const { findings } = scanRepo();
+    const fmt = findings.map((f) => `${f.file ?? "-"}:${f.line ?? "-"} ${f.kind} ${f.what}`);
+    expect(fmt).toEqual([]);
+  });
+
+  /**
+   * 上一条依赖「文件已被 git 跟踪」。这条**按路径直读**，与 tracked 状态无关 ——
+   * 于是「新文件还没入库所以门看不见它」这个陷阱不可能再重演一次。
+   */
+  it("扫描器自己的源码与本测试文件，按路径直读也必须 0 条", () => {
+    const selves = ["scripts/lib/secret-scan.mjs", "tests/secretScan.test.ts"];
+    const { findings } = scanFiles(selves, { cwd: ROOT });
+    expect(findings.map((f) => `${f.file}:${f.line ?? "-"} ${f.what}`)).toEqual([]);
+  });
 });
+
+describe("源码 vs 文档：前向窗口的适用范围", () => {
+  // 修复前这三条都会红：源码里标签后面紧跟的任意一行代码都被当成口令值。
+  it("源码里『标签定义 + 下一行是另一条正则』不报（扫描器自己的形态）", () => {
+    const src = [
+      "const CRED_LABEL_RE =",
+      "  /\\b(" + "GPG" + "_PASSPHRASE|" + "MINISIGN" + "_PASSWORD)\\b/;",
+      "",
+      "const BINARY_EXT =",
+      "  /\\.(png|jpe?g|zip|exe|dll)$/i;",
+    ].join("\n");
+    const { findings } = withFixtures({ "scripts/lib/scan.mjs": src });
+    expect(findings).toHaveLength(0);
+  });
+
+  it("测试夹具形态（.ts 里的字符串数组）不报", () => {
+    const src = [
+      "const md = [",
+      '  "**Name**: `' + "GPG" + '_PASSPHRASE`",',
+      '  "**Value**:",',
+      '  "```",',
+      '  "hunter2.SoSecret",',
+      '  "```",',
+      '].join("\\n");',
+    ].join("\n");
+    const { findings } = withFixtures({ "tests/x.test.ts": src });
+    expect(findings).toHaveLength(0);
+  });
+
+  it("但源码里**同行**硬编码口令仍必须抓 —— 源码不是被整体放行了", () => {
+    const src = "const x = 1;\n" + "GPG" + "_PASSPHRASE=correct-horse-battery\n";
+    const { findings } = withFixtures({ "build.mjs": src });
+    expect(kinds(findings, "passphrase")).toHaveLength(1);
+    expect(kinds(findings, "passphrase")[0].value).toBe("correct-horse-battery");
+  });
+
+  it("文档里的多行形态照旧要抓（前向窗口没被削掉）", () => {
+    const md = [
+      "**Name**: `" + "GPG" + "_PASSPHRASE`",
+      "",
+      "**Value**:",
+      "```",
+      "hunter2.SoSecret",
+      "```",
+    ].join("\n");
+    const { findings } = withFixtures({ "SETUP.md": md });
+    expect(kinds(findings, "passphrase")).toHaveLength(1);
+  });
+});
+
