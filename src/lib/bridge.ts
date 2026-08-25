@@ -239,6 +239,16 @@ export const api = {
     call<UsageCostRow[]>("get_usage_with_cost", undefined, () => mockBridge.usageWithCost()),
 
   /**
+   * 内置单价表的核对日期（`YYYY-MM-DD`）。
+   *
+   * 界面显示它的理由：这张表是人工核对各厂商定价页得来的，会随时间变旧，
+   * 而变旧的表现是金额悄悄偏离真实账单。给用户一个日期，他就能自己判断
+   * 这个估算值得信几分，而不是把它当账单。
+   */
+  getPricingTableDate: () =>
+    call<string>("get_pricing_table_date", undefined, () => Promise.resolve("2026-08-25")),
+
+  /**
    * 查询某个 Key 的上游余额。
    *
    * **失败不抛异常**：查不到时返回 `{ok: false, error: "原因"}`，

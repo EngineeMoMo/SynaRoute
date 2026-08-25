@@ -13,7 +13,6 @@ import type {
   HealthStatus,
   MasterPasswordState,
   ModelInfo,
-  PricingSource,
   ProviderKey,
   ProxyState,
   TokenUsageByKey,
@@ -21,6 +20,7 @@ import type {
   Vendor,
 } from "@/types";
 import type { UserPrefs } from "@/lib/prefs";
+import { mockUsageWithCost } from "./mockData.usage";
 
 const now = Date.now();
 
@@ -818,64 +818,13 @@ export const mockBridge = {
   },
 
   /**
-   * 带成本估算的用量 mock。
-   *
-   * 刻意让 exact / family / unknown 三种定价来源都出现：
-   * `unknown` 那条（金额显示「—」）最容易做漏，而它在真实数据里很常见
-   * （用户用了内置表和家族兜底都不认识的模型名）。
+   * 用量 + 成本估算行。实现搬到了 `mockData.usage.ts`（本文件在棘轮上余量为 0），
+   * 那边同时铺开了「算不出金额」的**四种成因**——它们各有不同的界面文案与指路，
+   * 不在预览里各出现一次就必然做漏（这正是本文件存在的理由）。
    */
   async usageWithCost(): Promise<UsageCostRow[]> {
     await delay();
-    const rows = await this.tokenUsage();
-    const sources: PricingSource[] = ["exact", "family", "unknown"];
-    const out: UsageCostRow[] = rows.map((r, i) => {
-      const src = sources[i % sources.length];
-      const total = r.usage.input + r.usage.output;
-      return {
-        categoryId: r.categoryId,
-        keyId: r.keyId,
-        keyName:
-          store[r.categoryId]?.find((k) => k.id === r.keyId)?.name ?? r.keyId ?? null,
-        usage: r.usage,
-        // unknown 必须是 null，不是 0 —— 界面要显示「—」
-        costNano: src === "unknown" ? null : total * (src === "exact" ? 3000 : 15000),
-        pricingSource: src,
-        multiplier: src === "family" ? "0.3" : "1.0",
-      };
-    });
-
-    // mock 的事件里只有一条 Key 有用量，故上面只产出 1 行 —— 那样 family 与
-    // unknown 两条分支在浏览器预览里**永远渲染不到**，而「—」与「≈」的样式
-    // 恰恰最容易做漏。这里各补一行，让三种定价来源都能被看到。
-    // **必须挑没出现过的 keyId**：直接取 cli[1] 会与上面 rows 里已有的那条撞号，
-    // React 的 key 重复会让表格行错乱（实测报了 "two children with the same key"）。
-    const used = new Set(out.map((r) => `${r.categoryId}/${r.keyId}`));
-    const cli = (store["claude-cli"] ?? []).filter(
-      (k) => !used.has(`claude-cli/${k.id}`),
-    );
-    if (cli[0]) {
-      out.push({
-        categoryId: "claude-cli",
-        keyId: cli[0].id,
-        keyName: cli[0].name,
-        usage: { input: 42_000, output: 8_800, cacheRead: 12_000, cacheCreation: 3_100 },
-        costNano: 760_000_000,
-        pricingSource: "family",
-        multiplier: "0.3",
-      });
-    }
-    if (cli[1]) {
-      out.push({
-        categoryId: "claude-cli",
-        keyId: cli[1].id,
-        keyName: cli[1].name,
-        usage: { input: 9_100, output: 2_200, cacheRead: 0, cacheCreation: 0 },
-        costNano: null, // 无单价 → 界面必须显示「—」
-        pricingSource: "unknown",
-        multiplier: "1.0",
-      });
-    }
-    return out;
+    return mockUsageWithCost(store, await this.tokenUsage());
   },
 
   /**

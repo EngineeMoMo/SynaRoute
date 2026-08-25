@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
 import type { TFunc } from "@/lib/i18n";
-import type { DailyUsageBucket, TokenUsage, UsageCostRow } from "@/types";
+import type { DailyUsageBucket, TokenUsage, UnpricedReason, UsageCostRow } from "@/types";
 import { Badge } from "@/components/ui/Badge";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { TrendingUp, AlertTriangle } from "lucide-react";
@@ -33,15 +33,17 @@ export function UsagePage() {
   const [rows, setRows] = useState<UsageCostRow[] | null>(null);
   const [daily, setDaily] = useState<DailyUsageBucket[]>([]);
   const [sinceMs, setSinceMs] = useState<number | null>(null);
+  const [tableDate, setTableDate] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
 
   const load = async () => {
     try {
-      // 三个请求并发发，避免标题/趋势慢一拍导致界面闪一下旧值。
-      const [next, since, buckets] = await Promise.all([
+      // 四个请求并发发，避免标题/趋势慢一拍导致界面闪一下旧值。
+      const [next, since, buckets, priceDate] = await Promise.all([
         api.getUsageWithCost(),
         api.getUsageSince(),
         api.getDailyUsage(),
+        api.getPricingTableDate(),
       ]);
       // **对后端返回做形状校验**，而不是直接塞进 state。
       //
@@ -53,6 +55,7 @@ export function UsagePage() {
       setRows(Array.isArray(next) ? next.filter(isValidCostRow) : []);
       setSinceMs(typeof since === "number" && Number.isFinite(since) ? since : null);
       setDaily(Array.isArray(buckets) ? buckets.filter(isValidBucket) : []);
+      setTableDate(typeof priceDate === "string" ? priceDate : "");
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -81,6 +84,25 @@ export function UsagePage() {
       else costNano += r.costNano;
     }
     return { input, output, cacheRead, cacheCreation, costNano, unpriced };
+  }, [rows]);
+
+  /**
+   * 无价行**按成因分组**。
+   *
+   * 旧实现只数一个总数、配一句放之四海的文案（「模型名不在单价表中」），而四种成因里
+   * 只有一种是那样。用户按提示去 Key 里设兜底模型，设完「—」照旧 —— 界面没有任何新信息，
+   * 他只能认为功能坏了。分组之后每一类各自指路，且「无路可走」的两类如实说明。
+   */
+  const unpricedGroups = useMemo(() => {
+    const g = { aggregate: 0, keyDeleted: 0, noModelName: 0, modelNotInTable: 0 };
+    const models = new Set<string>();
+    for (const r of rows ?? []) {
+      const reason = r.unpricedReason;
+      if (!reason) continue;
+      g[reason.kind] += 1;
+      if (reason.kind === "modelNotInTable") models.add(reason.model);
+    }
+    return { ...g, models: [...models] };
   }, [rows]);
 
   /**
@@ -142,6 +164,13 @@ export function UsagePage() {
                 {t("usage.since")}: {new Date(sinceMs).toLocaleString()}
               </p>
             )}
+            {/* 单价表的核对日期：这张表是人工核对各厂商定价页得来的，会变旧，
+                而变旧的表现是金额悄悄偏离真实账单。给出日期，用户才能自己判断可信度。 */}
+            {tableDate && (
+              <p className="mt-0.5 text-xs text-text-muted">
+                {t("usage.tableDate", { date: tableDate })}
+              </p>
+            )}
           </div>
           <button
             onClick={() => void load()}
@@ -163,6 +192,13 @@ export function UsagePage() {
                 value={fmtUsd(summary.costNano)}
                 hint={t("usage.estimateHint")}
                 accent
+                /* 「累计花费」这个标签会被当成总计读。有行没算进去时**必须在这一格上**
+                   标出来 —— 只靠下方横幅不够，用户看数字时未必往下看。 */
+                note={
+                  summary.unpriced > 0
+                    ? t("usage.estCostExcluded", { n: summary.unpriced })
+                    : undefined
+                }
               />
             </div>
 
@@ -194,11 +230,35 @@ export function UsagePage() {
               </div>
             </div>
 
-            {/* 有 Key 算不出金额时如实提示，而不是让那几行的「—」无从解释 */}
+            {/* 有行算不出金额时**按成因**如实说明，并各自指路。
+                旧实现是一句「模型名不在单价表中」—— 对四种成因里的三种都是假话。 */}
             {summary.unpriced > 0 && (
               <div className="mt-2 flex items-start gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-[11px] leading-relaxed text-warning">
                 <AlertTriangle size={13} className="mt-0.5 shrink-0" />
-                <span>{t("usage.unpricedHint", { n: summary.unpriced })}</span>
+                <div>
+                  <div>{t("usage.unpricedBanner", { n: summary.unpriced })}</div>
+                  <ul className="mt-0.5 list-disc space-y-0.5 pl-4">
+                    {unpricedGroups.aggregate > 0 && (
+                      <li>{t("usage.unpricedGroup.aggregate", { n: unpricedGroups.aggregate })}</li>
+                    )}
+                    {unpricedGroups.keyDeleted > 0 && (
+                      <li>{t("usage.unpricedGroup.keyDeleted", { n: unpricedGroups.keyDeleted })}</li>
+                    )}
+                    {unpricedGroups.noModelName > 0 && (
+                      <li>
+                        {t("usage.unpricedGroup.noModelName", { n: unpricedGroups.noModelName })}
+                      </li>
+                    )}
+                    {unpricedGroups.modelNotInTable > 0 && (
+                      <li>
+                        {t("usage.unpricedGroup.modelNotInTable", {
+                          n: unpricedGroups.modelNotInTable,
+                          models: unpricedGroups.models.join(t("common.listSep")),
+                        })}
+                      </li>
+                    )}
+                  </ul>
+                </div>
               </div>
             )}
           </>
@@ -248,7 +308,7 @@ export function UsagePage() {
                       )}
                     </td>
                     <td className="px-4 py-2 text-right font-mono tabular-nums">
-                      <CostCell row={r} t={t} />
+                      <CostCell row={r} t={t} tableDate={tableDate} />
                     </td>
                   </tr>
                 ))}
@@ -261,17 +321,25 @@ export function UsagePage() {
   );
 }
 
-/** 概览卡片。`accent` 用于金额那格（视觉上与 token 数区分开）。 */
+/**
+ * 概览卡片。`accent` 用于金额那格（视觉上与 token 数区分开）。
+ *
+ * `note` 是挂在数字下方的小字修饰语。它存在的理由很具体：「累计花费」这个标签会被当成
+ * **总计**读，而它只是「能算出来的那部分之和」。差额必须标在数字旁边，
+ * 不能只写在下方的横幅里 —— 看数字的人未必往下看。
+ */
 function StatCard({
   label,
   value,
   hint,
   accent,
+  note,
 }: {
   label: string;
   value: string;
   hint?: string;
   accent?: boolean;
+  note?: string;
 }) {
   const body = (
     <div
@@ -287,6 +355,7 @@ function StatCard({
       >
         {value}
       </div>
+      {note && <div className="mt-0.5 text-[10px] leading-tight text-warning">{note}</div>}
     </div>
   );
   return hint ? (
@@ -301,31 +370,68 @@ function StatCard({
 /**
  * 金额单元格。
  *
- * 无单价时显示「—」并给出原因，**绝不显示 $0.0000** ——
+ * 无单价时显示「—」并给出**具体成因**，绝不显示 $0.0000 ——
  * 那会让用户以为这条 Key 没花钱，而真相是「算不出来」。
+ *
+ * 「—」是可聚焦元素（`tabIndex` + `aria-label`）：它此前是纯 `<span>` 靠 hover 出 tooltip，
+ * 键盘与触屏用户完全拿不到那句解释 —— 而这一格恰恰是最需要解释的一格。
  */
-function CostCell({ row, t }: { row: UsageCostRow; t: TFunc }) {
+function CostCell({ row, t, tableDate }: { row: UsageCostRow; t: TFunc; tableDate: string }) {
   if (row.costNano == null) {
+    const hint = unpricedHint(row.unpricedReason, t, tableDate);
     return (
-      <Tooltip content={t("usage.costUnknownHint")} side="left">
-        <span className="cursor-default text-text-muted">—</span>
+      <Tooltip content={hint} side="left">
+        <span
+          tabIndex={0}
+          role="note"
+          aria-label={hint}
+          className="cursor-default rounded text-text-muted outline-none focus-visible:ring-1 focus-visible:ring-primary"
+        >
+          —
+        </span>
       </Tooltip>
     );
   }
   const isEstimate = row.pricingSource === "family";
+  const base = t(isEstimate ? "usage.costFamilyHint" : "usage.costExactHint", {
+    multiplier: row.multiplier,
+  });
+  // 回显代表模型：同一条 Key 跑多个档位模型时，偏差恰恰来自「按哪个模型估的」，
+  // 不显示它用户就无从判断这个数字可信到什么程度。
+  const hint = row.pricedByModel
+    ? `${base}\n${t("usage.pricedBy", { model: row.pricedByModel })}`
+    : base;
   return (
-    <Tooltip
-      content={t(isEstimate ? "usage.costFamilyHint" : "usage.costExactHint", {
-        multiplier: row.multiplier,
-      })}
-      side="left"
-    >
+    <Tooltip content={hint} side="left">
       <span className="cursor-default">
         {fmtUsd(row.costNano)}
         {isEstimate && <span className="ml-0.5 text-warning">≈</span>}
       </span>
     </Tooltip>
   );
+}
+
+/**
+ * 「算不出金额」的成因文案。
+ *
+ * 四种成因各自不同的**可行动性**是分开写的全部理由（见 `usage_cost::UnpricedReason` 的
+ * 那张表）：其中两种用户压根无路可走，硬塞一句「去设兜底模型」是把他送去做无效操作。
+ */
+function unpricedHint(reason: UnpricedReason | undefined, t: TFunc, tableDate: string): string {
+  switch (reason?.kind) {
+    case "aggregate":
+      return t("usage.reason.aggregate");
+    case "keyDeleted":
+      return t("usage.reason.keyDeleted");
+    case "modelNotInTable":
+      return t("usage.reason.modelNotInTable", { model: reason.model, date: tableDate });
+    case "noModelName":
+      return t("usage.reason.noModelName");
+    default:
+      // 后端没给成因（跨版本：新前端 + 旧后端）→ 退回原来那句泛化提示。
+      // 不留这一支的话这里会渲染出空 tooltip，比说得笼统更糟。
+      return t("usage.costUnknownHint");
+  }
 }
 
 /** 紧凑 token 数字：≥10000 用 k，≥1000000 用 M（与日志页 fmtTokens 同口径）。 */

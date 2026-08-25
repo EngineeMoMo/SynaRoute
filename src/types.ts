@@ -332,6 +332,24 @@ export interface DailyUsageBucket {
 export type PricingSource = "exact" | "family" | "unknown";
 
 /** 带成本估算的用量行（后端 get_usage_with_cost 返回）。 */
+/**
+ * 为什么这一行算不出金额。
+ *
+ * **必须与 Rust 的 `usage_cost::UnpricedReason` 变体一一对应**（后端用
+ * `#[serde(tag = "kind")]` 序列化，故这里是判别式联合）。两边分叉是静默的 ——
+ * 编译器管不到这条缝，而漏一支的表现是界面渲染出空白提示。
+ * `tests/unpricedReasonParity.test.ts` 机械校验两侧的变体集合一致。
+ */
+export type UnpricedReason =
+  /** 大脑聚合的历史用量（keyId 为空串，无 Key 归属） */
+  | { kind: "aggregate" }
+  /** 这一行指向的 Key 已被删除 */
+  | { kind: "keyDeleted" }
+  /** Key 在，但没有任何代表模型名 */
+  | { kind: "noModelName" }
+  /** 有模型名，但单价表里没有它 */
+  | { kind: "modelNotInTable"; model: string };
+
 export interface UsageCostRow {
   categoryId: CategoryType;
   keyId: string;
@@ -343,6 +361,10 @@ export interface UsageCostRow {
   pricingSource: PricingSource;
   /** 实际生效的倍率（回显，空则 "1.0"） */
   multiplier: string;
+  /** 算不出金额时的成因。存在性与 `costNano === null` 严格等价（后端有测试钉住）。 */
+  unpricedReason?: UnpricedReason;
+  /** 实际用来估算的代表模型名。界面显示「按 X 估算」，让偏差的来源可见。 */
+  pricedByModel?: string;
 }
 
 /**
