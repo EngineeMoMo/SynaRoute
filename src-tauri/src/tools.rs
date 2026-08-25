@@ -26,9 +26,24 @@ use std::path::{Path, PathBuf};
 /// 备份文件后缀
 const BACKUP_SUFFIX: &str = "synaroute.bak";
 
-/// Codex auth.json 的 `OPENAI_API_KEY` 占位值。接入时写入（Codex 需非空 key 才走鉴权流程），
-/// 真实密钥由代理按路由 Key 注入、代理侧不校验此值。还原时用它识别「接入凭空新建的 auth.json」。
-const CODEX_AUTH_PLACEHOLDER: &str = "synaroute-proxy";
+/// Codex 专属接入逻辑（判据密度最高的一端，单独成模块）。
+///
+/// 子模块能访问 `tools` 的私有项（Rust 的可见性是「定义模块及其后代」），
+/// 故 `backup_and_write_bytes` / `with_rollback` / `read_preview_text` 等**无需放宽可见性**。
+pub(crate) mod codex;
+
+/// 写进客户端配置的**鉴权占位值**。代理剥掉入站鉴权头、按路由 Key 注入真实密钥，
+/// 故此值只需非空以让客户端走 bearer 鉴权流程，代理侧不校验它。
+///
+/// # 为什么必须是**一个**常量
+///
+/// 它此前在仓库里有三份：`CODEX_AUTH_PLACEHOLDER`、`DESKTOP_GATEWAY_PLACEHOLDER`，
+/// 以及 Claude CLI 写 `ANTHROPIC_AUTH_TOKEN` 时的裸字面量。改了常量而漏掉字面量，
+/// 后果不是「不一致」这么轻 —— 任何「这个 token 是不是我们写的」的判断都会答「不是我们的」，
+/// 于是清理/告警一起静默失效（与 Codex 那个 `obj.len() == 1` 同型的 fail-open）。
+/// `placeholder_has_a_single_source_of_truth` 那条测试把这件事钉住。
+pub(crate) const PROXY_PLACEHOLDER: &str = "synaroute-proxy";
+
 
 /// SynaRoute 在 Claude 桌面端 `configLibrary` 里的专属配置档 ID。
 /// 刻意区别于 cc-switch 的 `00000000-0000-4000-8000-000000157210`：两者可**共存**于
@@ -37,9 +52,8 @@ const CODEX_AUTH_PLACEHOLDER: &str = "synaroute-proxy";
 const DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000053796e61";
 /// 本档在 `_meta.entries` 里显示的名称。
 const DESKTOP_PROFILE_NAME: &str = "SynaRoute";
-/// 桌面端 gateway 档的 `inferenceGatewayApiKey` 占位值（代理剥掉入站鉴权头、按路由 Key 注入
-/// 真实密钥，故此值仅需非空以让桌面端走 bearer 鉴权流程，代理侧不校验）。
-const DESKTOP_GATEWAY_PLACEHOLDER: &str = "synaroute-proxy";
+/// 桌面端 gateway 档的 `inferenceGatewayApiKey` 占位值。见 [`PROXY_PLACEHOLDER`]。
+const DESKTOP_GATEWAY_PLACEHOLDER: &str = PROXY_PLACEHOLDER;
 /// 两个部署目录里的部署配置文件名。
 const DESKTOP_CONFIG_FILE: &str = "claude_desktop_config.json";
 /// 3p 目录下存放配置档的子目录名。
@@ -64,7 +78,7 @@ pub fn apply(
     let first = models.first().map(String::as_str);
     match category {
         CategoryType::ClaudeCli => apply_claude_cli(endpoint, first),
-        CategoryType::Codex => apply_codex(endpoint, first),
+        CategoryType::Codex => codex::apply(endpoint, first),
         CategoryType::ClaudeDesktop => apply_claude_desktop(endpoint, models, keys),
     }
 }
@@ -100,10 +114,10 @@ fn apply_claude_cli_at(
         .ok_or_else(|| AppError::ToolConfig("env 非对象".into()))?;
 
     env_obj.insert("ANTHROPIC_BASE_URL".into(), Value::String(endpoint.to_string()));
-    // 代理侧不校验 token，但工具要求存在，写占位
+    // 代理侧不校验 token，但工具要求存在，写占位。**用常量，不写字面量** —— 见 PROXY_PLACEHOLDER。
     env_obj
         .entry("ANTHROPIC_AUTH_TOKEN".to_string())
-        .or_insert_with(|| Value::String("synaroute-proxy".into()));
+        .or_insert_with(|| Value::String(PROXY_PLACEHOLDER.into()));
     // 开启网关模型发现：Claude Code 默认不调用 <base>/v1/models，必须显式置 1 才会拉取代理
     // 暴露的可选模型填充 /model 选择器（需 CLI ≥ v2.1.129）。强制写 1，这正是 SynaRoute
     // 多 Key 路由要生效的前提。
@@ -141,229 +155,6 @@ fn apply_claude_cli_at(
     backup_and_write_json(path, &root)?;
     Ok(format!(
         "已写入 Claude CLI 配置：{}（ANTHROPIC_BASE_URL={endpoint}{model_note}），原文件已备份",
-        path.display()
-    ))
-}
-
-// ---- Codex ----
-
-fn codex_config_path() -> AppResult<PathBuf> {
-    // 优先 CODEX_HOME 环境变量，回退 ~/.codex
-    if let Ok(h) = std::env::var("CODEX_HOME") {
-        return Ok(PathBuf::from(h).join("config.toml"));
-    }
-    let home = dirs::home_dir().ok_or_else(|| AppError::ToolConfig("无法定位用户目录".into()))?;
-    Ok(home.join(".codex").join("config.toml"))
-}
-
-/// Codex 密钥文件 ~/.codex/auth.json（与 config.toml 同目录）。
-/// Codex 从这里读 `OPENAI_API_KEY`（provider 的 env_key 未在真实环境变量中设置时）。
-fn codex_auth_path() -> AppResult<PathBuf> {
-    // 与 config.toml 同目录，保证 CODEX_HOME 覆盖时一起走。
-    let cfg = codex_config_path()?;
-    Ok(cfg.with_file_name("auth.json"))
-}
-
-fn apply_codex(endpoint: &str, default_model: Option<&str>) -> AppResult<String> {
-    let path = codex_config_path()?;
-    let auth = codex_auth_path()?;
-    // **双文件写**（2026-08-02 改回，见 `apply_codex_auth_at` 的完整判据）。
-    //
-    // 为什么又要写 auth.json：2026-07-31 那版只写 config.toml、把占位塞进
-    // `[model_providers.synaroute].experimental_bearer_token`，理由是「codex.exe 符号表里有
-    // 这个字段」。真机实测（2026-08-02）证明**字段存在 ≠ 该路径能过门禁**：接入后打开 Codex
-    // 仍提示需要登录，运行日志里 codex 分类**一条 route 事件都没有**（请求压根没到代理）。
-    //
-    // 反查 codex.exe 拿到决定性证据 —— 它找凭据只认三条路：
-    //   `auth.json` / 环境变量（OPENAI_API_KEY、CODEX_API_KEY、CODEX_ACCESS_TOKEN）/ auth.credentials
-    // 都没有就报 `no Codex credentials were found` + `Run codex login or provide an API key…`。
-    // `experimental_bearer_token` 只是 `ModelProviderInfo` 的一个字段（用于请求头），
-    // **不参与「有没有凭据」这道门禁**。而我们又写了 `requires_openai_auth = true`
-    // （强制走 OpenAI 鉴权），于是必然卡在登录页。
-    //
-    // cc-switch 的 codex 档正是「`requires_openai_auth = true` + auth.json 里放
-    // `OPENAI_API_KEY`」这套配套写法（本机库实测），我们照搬。
-    //
-    // 两个文件必须同进同退（with_rollback 收两条路径）：只写成一个会留下
-    // 「config 指向代理、auth 仍是官方」或反之的半接入态，两种都表现为诡异的鉴权失败。
-    with_rollback(&[path.clone(), auth.clone()], || {
-        let msg = apply_codex_at(&path, endpoint, default_model)?;
-        let auth_msg = apply_codex_auth_at(&auth)?;
-        // **写完立刻读回校验**：`model_provider = "synaroute"` 与
-        // `[model_providers.synaroute]`（含非空 base_url）必须同时在位。
-        //
-        // 为什么这道校验不可省（真机 401 事故）：Codex 桌面端 App 拥有并会重写 config.toml，
-        // 若它把 provider 表丢掉而留下顶层选中项，Codex 解析不到 provider → 回落到内置默认
-        // `https://api.openai.com/v1`，再拿 auth.json 里我们写的占位 key 去打真实 OpenAI，
-        // 用户看到 `Incorrect API key provided: synarout***roxy`，被引向「我的 key 填错了」。
-        //
-        // 校验失败即报错，让 with_rollback 把**两个文件**一起回滚 —— 绝不留下
-        // 「auth.json 已是占位、config.toml 却没选中我们」这种会把假 key 发给第三方的半接入态。
-        if !codex_apply_is_intact(&path) {
-            return Err(AppError::ToolConfig(format!(
-                "写入 Codex 配置后校验未通过：{} 里 model_provider 未选中 `{}` 或 \
-                 [model_providers.{}] 表缺失/无 base_url。已回滚本次改动（含 auth.json）。\n\
-                 常见原因：Codex 桌面端正在运行并重写了该文件 —— 请先完全退出 Codex 再重试接入。",
-                path.display(),
-                MCP_CLIENT_NAME,
-                MCP_CLIENT_NAME
-            )));
-        }
-        Ok(format!("{msg}；{auth_msg}"))
-    })
-}
-
-/// 接入时把 `~/.codex/auth.json` 整份替换为纯占位，**并确保替换前已存下本轮接入前的快照**。
-///
-/// ## 为什么是「整份替换」而不是「保留 tokens 再加一个占位 key」
-///
-/// 后者已被证伪（2026-07-30 事故，勿重犯）：`tokens` 与 `OPENAI_API_KEY` 并存时，
-/// Codex 桌面端会判定为 **api-key 模式**却又拿着 ChatGPT 账号信息去调，撞上
-/// 「no access 账号门」——用户看到的是账号无权限，比「要求登录」更难排查。
-/// cc-switch 同样是整份替换（它把完整 auth.json 存进自己的库里做还原）。
-///
-/// ## 还原能力是这条路的前提
-///
-/// 整份替换会抹掉 ChatGPT OAuth 的 `tokens`/`auth_mode`/`last_refresh`。因此
-/// **`.bak` 必须是「本轮接入前」的真实快照**，否则用户切回官方就登不回去。
-/// 这由 `backup_and_write_bytes` 的「首写即锁 + 还原后删 .bak」语义保证：
-/// - 首次接入：抓当前（真实 OAuth）→ 锁住
-/// - 重复接入：`.bak` 已存在不覆盖，故不会被「已接入态」冲掉
-/// - 还原：拿回 OAuth 并删 `.bak`，下次接入重新抓新鲜快照
-///
-/// 幂等：内容已是纯占位时 `backup_and_write_bytes` 短路（不备份不写）。
-fn apply_codex_auth_at(path: &Path) -> AppResult<String> {
-    // 已经是纯占位 → 无需再写（也避免把「已接入态」当成接入前快照存进 .bak）
-    if is_placeholder_only_auth(path) {
-        return Ok(format!("{} 已是接入态（未改动）", path.display()));
-    }
-    let had_oauth = path.exists()
-        && std::fs::read_to_string(path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            .is_some_and(|v| v.get("tokens").is_some_and(|t| !t.is_null()));
-
-    let body = serde_json::json!({ "OPENAI_API_KEY": CODEX_AUTH_PLACEHOLDER });
-    let bytes = serde_json::to_vec_pretty(&body)
-        .map_err(|e| AppError::ToolConfig(format!("序列化 auth.json 失败: {e}")))?;
-    backup_and_write_bytes(path, &bytes)?;
-    Ok(if had_oauth {
-        format!(
-            "已写入 {}（鉴权占位）；原 ChatGPT 登录态已备份，点「还原」或停止代理即可恢复",
-            path.display()
-        )
-    } else {
-        format!("已写入 {}（鉴权占位）", path.display())
-    })
-}
-
-/// 历史说明（2026-07-31 起已移除对 `auth.json` 的写入）：
-///
-/// 旧实现接入 Codex 时会**整份替换** `~/.codex/auth.json` 为 `{OPENAI_API_KEY: 占位}`。
-/// 整份替换而非 merge，本意是避开「OAuth tokens + 占位 key」混合态导致 Codex 桌面端
-/// 判定为 api-key 模式、不认 ChatGPT 账号权限的账号门。但代价是**一次接入就抹掉官方登录态**：
-/// 它的幂等守卫 `if let Some(Value::String(existing))` 对 ChatGPT OAuth 态的真实取值
-/// `"OPENAI_API_KEY": null` 并不命中（null 是 `Value::Null`），直接落到整份替换分支。
-///
-/// 现在占位写进 `[model_providers.synaroute].experimental_bearer_token`，auth.json 一律不碰。
-/// `CODEX_AUTH_PLACEHOLDER` 仍被 [`is_placeholder_only_auth`] 使用，用于让旧版接入过的用户
-/// 在 `restore` 时把遗留的纯占位 auth.json 清理掉。
-///
-/// 写入 Codex 的自定义 provider 指向本地代理。
-///
-/// 关键修复（此前 bug）：旧实现写 `shell_environment_policy.set.ANTHROPIC_BASE_URL`，
-/// 但 Codex **不认** Anthropic 环境变量——它通过 `model_provider` + `[model_providers.<id>]`
-/// 表配置上游（字段 base_url / wire_api / env_key，见 Codex 配置参考）。故旧写法对 Codex 完全无效。
-///
-/// 现改为写标准的自定义 provider：
-/// - `[model_providers.synaroute]`：base_url = `{endpoint}/v1`（Codex 按 wire_api=responses
-///   调 `{base_url}/responses`，本地代理已识别 `/v1/responses`）；wire_api="responses"（Codex 默认且唯一支持）。
-/// - `model_provider = "synaroute"` 选中它。
-/// - `requires_openai_auth = true`：与 cc-switch 的生效样本一致。**它要求 Codex 能找到
-///   OpenAI 凭据**，故必须配套写 `auth.json`（见 [`apply_codex_auth_at`]）。
-/// - `experimental_bearer_token` = 占位：保留，它是 `ModelProviderInfo` 的正式字段（用于
-///   请求头）。但**别指望它替代凭据门禁** —— 2026-08-02 真机实测：只写它、不写 auth.json，
-///   Codex 直接停在登录页，日志里连一条 route 事件都没有。反查 codex.exe 确认凭据只认
-///   `auth.json` / 环境变量（OPENAI_API_KEY、CODEX_API_KEY、CODEX_ACCESS_TOKEN）/
-///   `auth.credentials` 三条路，否则报 `no Codex credentials were found`。
-/// - 故**不写 env_key**——那会让 Codex 改从环境变量读 key，重新引入「用户手设环境变量」负担。
-///   代理侧不校验该占位值，真实密钥由代理按路由 Key 注入。
-///
-/// 幂等：序列化结果与磁盘现有内容一致时，backup_and_write_bytes 会短路（不备份不写），
-/// 故重复接入不会把已接入的 config 覆盖进 .synaroute.bak。保留 config.toml 其余表（mcp_servers 等）不动。
-fn apply_codex_at(path: &Path, endpoint: &str, default_model: Option<&str>) -> AppResult<String> {
-    let content = if path.exists() {
-        std::fs::read_to_string(path)?
-    } else {
-        String::new()
-    };
-
-    let mut doc: toml::Value = if content.trim().is_empty() {
-        toml::Value::Table(Default::default())
-    } else {
-        content
-            .parse::<toml::Value>()
-            .map_err(|e| AppError::ToolConfig(format!("解析 config.toml 失败: {e}")))?
-    };
-
-    let base_url = format!("{}/v1", endpoint.trim_end_matches('/'));
-    let table = doc
-        .as_table_mut()
-        .ok_or_else(|| AppError::ToolConfig("config.toml 顶层非表".into()))?;
-
-    // model_provider = "synaroute"
-    table.insert(
-        "model_provider".to_string(),
-        toml::Value::String(MCP_CLIENT_NAME.to_string()),
-    );
-
-    // 默认模型（借鉴 cc-switch：写顶层 model 字段，让 Codex 启动即有模型，无需 /model 手选）。
-    // 取该分类可服务模型集的首个（对外名，代理侧 resolve_model 会改写为上游真实名）。
-    // 仅在能解析出模型时写入；解析不出则不动用户已有的 model 字段（避免清空）。
-    if let Some(m) = default_model.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        table.insert("model".to_string(), toml::Value::String(m.to_string()));
-    }
-
-    // [model_providers.synaroute]
-    let providers = table
-        .entry("model_providers".to_string())
-        .or_insert_with(|| toml::Value::Table(Default::default()));
-    let providers_table = providers
-        .as_table_mut()
-        .ok_or_else(|| AppError::ToolConfig("model_providers 非表".into()))?;
-    let mut entry = toml::value::Table::new();
-    entry.insert("name".into(), toml::Value::String("SynaRoute".into()));
-    entry.insert("base_url".into(), toml::Value::String(base_url.clone()));
-    entry.insert("wire_api".into(), toml::Value::String("responses".into()));
-    // 鉴权占位直接写进 provider 表，**不碰 auth.json**。
-    //
-    // 判据（2026-07-31 实测）：codex.exe 的符号表里 `struct ModelProviderInfo with 17 elements`
-    // 明列 `experimental_bearer_token`；本机 cc-switch 生成的生效配置
-    // （`[model_providers.custom]`）正是 `experimental_bearer_token` + `requires_openai_auth`
-    // 两者并写。照抄这套已验证的组合，既让 Codex 走 bearer 鉴权流程，又完全不触及
-    // 用户的 `~/.codex/auth.json`（ChatGPT OAuth 令牌得以原样保留）。
-    //
-    // 代理侧不校验此值（真实密钥由代理按路由 Key 注入），故占位即可。
-    entry.insert(
-        "experimental_bearer_token".into(),
-        toml::Value::String(CODEX_AUTH_PLACEHOLDER.to_string()),
-    );
-    // requires_openai_auth=true：与 cc-switch 的生效样本保持一致，让 Codex 按 OpenAI 风格鉴权。
-    // 不写 env_key —— 那会让 Codex 改从环境变量读 key，重新引入「用户手设环境变量」负担。
-    entry.insert("requires_openai_auth".into(), toml::Value::Boolean(true));
-    providers_table.insert(MCP_CLIENT_NAME.to_string(), toml::Value::Table(entry));
-
-    let serialized =
-        toml::to_string_pretty(&doc).map_err(|e| AppError::ToolConfig(e.to_string()))?;
-    backup_and_write_bytes(path, serialized.as_bytes())?;
-    let model_note = default_model
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|m| format!("，默认模型={m}"))
-        .unwrap_or_default();
-    Ok(format!(
-        "已写入 Codex 配置：{}（model_provider=synaroute，base_url={base_url}，wire_api=responses{model_note}），\
-         鉴权占位写在 provider 表，未改动 auth.json（官方登录状态保留）；原文件已备份",
         path.display()
     ))
 }
@@ -1032,7 +823,7 @@ pub fn is_mcp_registered(category: CategoryType) -> bool {
             .map(|paths| all_json_have_mcp_server(&paths))
             .unwrap_or(false),
         CategoryType::Codex => {
-            let Ok(path) = codex_config_path() else { return false };
+            let Ok(path) = codex::config_path() else { return false };
             if !path.exists() {
                 return false;
             }
@@ -1246,7 +1037,7 @@ fn unregister_mcp_claude_at(path: &Path) -> AppResult<(String, bool)> {
 fn register_mcp_codex(_mcp_url: &str, _timeout_ms: u64) -> AppResult<(String, bool)> {
     let exe = std::env::current_exe()
         .map_err(|e| AppError::ToolConfig(format!("无法定位 synaroute 可执行文件: {e}")))?;
-    register_mcp_codex_at(&codex_config_path()?, &exe.display().to_string())
+    register_mcp_codex_at(&codex::config_path()?, &exe.display().to_string())
 }
 
 fn register_mcp_codex_at(path: &Path, exe_path: &str) -> AppResult<(String, bool)> {
@@ -1328,7 +1119,7 @@ fn register_mcp_codex_at(path: &Path, exe_path: &str) -> AppResult<(String, bool
 }
 
 fn unregister_mcp_codex() -> AppResult<(String, bool)> {
-    unregister_mcp_codex_at(&codex_config_path()?)
+    unregister_mcp_codex_at(&codex::config_path()?)
 }
 
 fn unregister_mcp_codex_at(path: &Path) -> AppResult<(String, bool)> {
@@ -1436,13 +1227,38 @@ fn backup_and_write_bytes(path: &Path, data: &[u8]) -> AppResult<()> {
 /// 执行闭包；闭包返回 Err 时把所有文件恢复到执行前的状态，避免部分写入。
 ///
 /// 快照失败（无法读原文件）直接返回错误、不执行闭包——宁可不写，也不在无法回滚时冒险。
+///
+/// # 副文件（`.synaroute.bak` / `.synaroute-created`）**必须一并纳入**
+///
+/// 这不是洁癖，是一条数据丢失级缺陷的修复。`backup_and_write_bytes` 除了写主文件，还会
+/// 「首写即锁」地落下 `.bak` 或 `.synaroute-created` 标记。若只回滚主文件，标记会**留在盘上**，
+/// 而它的语义是「这份文件是 SynaRoute 凭空造出来的、还原时该整份删掉」。于是：
+///
+/// 1. 机器上本无 `~/.codex/auth.json`（只走 ChatGPT 登录的新装机）→ 首次接入落下标记；
+/// 2. 读回校验失败（正是「Codex 正在运行并重写 config.toml」那个已知场景）→ 回滚删掉
+///    auth.json，**标记留着**；
+/// 3. 用户随后 `codex login` 拿回真 OAuth；
+/// 4. 下一次接入：`!backup.exists() && !marker.exists()` 因标记在而为假 → 整块备份代码被跳过，
+///    真 OAuth 被直接覆盖、`.bak` 从未生成；
+/// 5. 点还原 → 走标记支路 `remove_file` → 用户的 ChatGPT 登录态**永久消失，盘上一份副本都没有**。
+///
+/// 全程静默。故快照集必须是「主文件 + 它的两个副文件」的闭包。
 fn with_rollback<T>(
     paths: &[PathBuf],
     op: impl FnOnce() -> AppResult<T>,
 ) -> AppResult<T> {
-    // 拍快照：Some(bytes)=原内容；None=原本不存在（回滚时应删除）。
-    let mut snapshots: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::with_capacity(paths.len());
+    // 主文件 + 副文件一起纳入。副文件按主路径推导，调用方无需（也不该）自己列举 ——
+    // 让调用方记得列会漏，而漏掉的表现是静默的。
+    let mut tracked: Vec<PathBuf> = Vec::with_capacity(paths.len() * 3);
     for p in paths {
+        tracked.push(p.clone());
+        tracked.push(backup_path_for(p));
+        tracked.push(created_marker_path_for(p));
+    }
+
+    // 拍快照：Some(bytes)=原内容；None=原本不存在（回滚时应删除）。
+    let mut snapshots: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::with_capacity(tracked.len());
+    for p in &tracked {
         let snap = if p.exists() {
             Some(std::fs::read(p).map_err(|e| {
                 AppError::ToolConfig(format!("回滚快照失败(读 {}): {e}", p.display()))
@@ -1460,6 +1276,9 @@ fn with_rollback<T>(
             for (p, snap) in &snapshots {
                 let restored = match snap {
                     Some(bytes) => crate::secret::atomic_write(p, bytes),
+                    // 原本不存在 → 删除。文件本就不在时 `remove_file` 会报 NotFound，
+                    // 那不是错误（回滚的目标状态已达成），不该刷一条误导性告警。
+                    None if !p.exists() => Ok(()),
                     None => std::fs::remove_file(p).map_err(AppError::from),
                 };
                 if let Err(re) = restored {
@@ -1574,69 +1393,22 @@ fn restore_one(path: &Path) -> AppResult<bool> {
     Ok(true)
 }
 
-/// auth.json 是否为「接入凭空新建的纯占位符文件」：顶层对象恰好只有 `OPENAI_API_KEY` 且值为占位符。
-/// 用于还原时安全清理——严格要求无其它字段（尤其不能含 OAuth 的 `tokens` 段），杜绝误删真实凭证。
-fn is_placeholder_only_auth(path: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text) else {
-        return false;
-    };
-    obj.len() == 1
-        && matches!(obj.get("OPENAI_API_KEY"), Some(Value::String(v)) if v == CODEX_AUTH_PLACEHOLDER)
-}
-
-/// `config.toml` 里我们那套接入配置是否**完好**：顶层 `model_provider` 选中 `synaroute`
-/// **且** `[model_providers.synaroute]` 表存在。
-///
-/// ## 为什么必须两条都查（真机 401 事故的判据）
-///
-/// Codex **桌面端 App 拥有并会重写 `config.toml`**（实测：它会自己加 `[features]` 段、
-/// 重排 env 表、把 `[mcp_servers.synaroute]` 从 HTTP 改成 stdio 形态）。重写时可能把我们写的
-/// `[model_providers.synaroute]` 表丢掉，而顶层 `model_provider = "synaroute"` 留着 ——
-/// 此时 Codex 解析不到该 provider，**回落到内置默认 base_url `https://api.openai.com/v1`**，
-/// 又拿着我们写进 `auth.json` 的占位 key 去打真实 OpenAI，于是用户看到：
-///
-/// ```text
-/// 401 Unauthorized: Incorrect API key provided: synarout***roxy
-/// url: https://api.openai.com/v1/responses
-/// ```
-///
-/// 这条报错把人引向「我的 OpenAI key 填错了」，而真因是**接入配置被 App 冲掉了**，
-/// 方向完全相反 —— 正是本项目最忌讳的形态。
-///
-/// 反过来「表在、但 `model_provider` 指向别人」也不行：那说明用户（或 cc-switch、或 App）
-/// 把选中项改走了，我们的代理根本不会被调用，而占位 key 仍可能被发给那个别人。
-fn codex_apply_is_intact(path: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(doc) = text.parse::<toml::Value>() else {
-        return false;
-    };
-    let selected = doc
-        .get("model_provider")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v == MCP_CLIENT_NAME);
-    let table_present = doc
-        .get("model_providers")
-        .and_then(|v| v.get(MCP_CLIENT_NAME))
-        .and_then(|v| v.as_table())
-        // base_url 缺失的空表等于没配：Codex 同样会回落到内置默认地址。
-        .is_some_and(|t| t.get("base_url").and_then(|b| b.as_str()).is_some_and(|s| !s.is_empty()));
-    selected && table_present
-}
 
 /// 还原某工具配置（从 .synaroute.bak 恢复）。
 ///
-/// 与接入对称：接入时 Codex 双文件写（config.toml + auth.json，见 apply_codex），
-/// 故还原也必须双文件——否则断开后 config.toml 复原、auth.json 仍卡在占位符，
-/// 用户官方登录（ChatGPT OAuth 令牌）不会自动回来。
+/// Codex 是双文件语义，但**两个文件的角色不对称**（本版起）：
+/// - `config.toml` 是我们写的 → 从 `.bak` 还原；
+/// - `auth.json` 我们**不再写**，但旧版本（≤0.1.33）写过占位符 → 这里负责把它解除。
+///
+/// **顺序刻意是「先解除假凭据、再还原 config」**，因为两种半途残留的代价不对称：
+/// - 「config 还原了、假 key 还在」= 静默把一个假凭据发给真实 OpenAI，换回一句
+///   指向 platform.openai.com 的 401（用户被引向完全错误的方向）；
+/// - 「假 key 解除了、config 还指着我们」= 客户端连不上，**响亮失败**，用户立刻知道要重试。
+///
+/// 先做危险的那一步，它失败时另一步还没发生。
 ///
 /// 「无备份」不视为错误：还原由「停止代理」自动触发，从未接入过的分类本就没有 .bak，
 /// 此时已处于接入前状态，返回成功（无需还原），避免每次停止都弹误报错。
-/// Codex 的 auth.json 备份仅在存在时还原（用户接入前无 auth.json 则本就无此备份）。
 pub fn restore(category: CategoryType) -> AppResult<String> {
     // 桌面端不是「从 .bak 还原单文件」那套：接入切了 deploymentMode=3p 并写了 gateway 档，
     // 还原须把两个 config 复位 1p、删本档 profile、从 _meta 摘掉本档并改 appliedId（镜像
@@ -1646,27 +1418,45 @@ pub fn restore(category: CategoryType) -> AppResult<String> {
     }
     let path = match category {
         CategoryType::ClaudeCli => claude_cli_settings_path()?,
-        CategoryType::Codex => codex_config_path()?,
+        CategoryType::Codex => codex::config_path()?,
         CategoryType::ClaudeDesktop => unreachable!("桌面端已在上方分派"),
     };
     let mut restored = Vec::new();
-    if restore_one(&path)? {
-        restored.push(path.display().to_string());
-    }
-    // Codex 接入会额外覆盖 auth.json（写占位 OPENAI_API_KEY，原 OAuth 令牌被拷入 .bak）。
-    // 还原须一并把 auth.json 复原，用户官方登录才会立即恢复、无需重新登录。
+
+    // 先解除 Codex 的假凭据（见上面的顺序判据）。
+    // 失败**不早退**：config 那一步仍要尝试，错误留到最后一起上报 —— 早退会让用户
+    // 停在「假 key 摘不掉、config 也没还原」这个两头皆输的状态。
+    let mut deferred: Option<AppError> = None;
     if category == CategoryType::Codex {
-        let auth_path = codex_auth_path()?;
-        if restore_one(&auth_path)? {
-            restored.push(auth_path.display().to_string());
-        } else if is_placeholder_only_auth(&auth_path) {
-            // 无 .bak 说明接入前本无 auth.json（接入凭空建了纯占位符文件）。删除它，
-            // 让用户回到接入前的「无 auth.json」态，避免残留占位符 key 干扰官方鉴权。
-            // 严格守卫已确保只删纯占位符文件、不碰含 OAuth tokens 的真实凭证。
-            std::fs::remove_file(&auth_path)?;
-            restored.push(format!("{}（清除占位）", auth_path.display()));
+        match codex::auth_path().and_then(|p| codex::disarm_legacy_placeholder_auth(&p)) {
+            Ok(Some(note)) => restored.push(note),
+            Ok(None) => {}
+            Err(e) => deferred = Some(e),
         }
     }
+
+    match restore_one(&path) {
+        Ok(true) => restored.push(path.display().to_string()),
+        Ok(false) => {}
+        Err(e) => {
+            if let Some(prev) = deferred {
+                return Err(AppError::ToolConfig(format!(
+                    "还原 Codex 配置失败：解除占位凭据 {prev}；还原 {} 失败 {e}",
+                    path.display()
+                )));
+            }
+            return Err(e);
+        }
+    }
+
+    if let Some(e) = deferred {
+        return Err(AppError::ToolConfig(format!(
+            "已还原 {}，但解除旧版本写入的占位凭据失败：{e}。\
+             请手动检查 ~/.codex/auth.json 里是否还有 `{PROXY_PLACEHOLDER}`。",
+            path.display()
+        )));
+    }
+
     if restored.is_empty() {
         Ok("无备份，无需还原（未接入或已还原）".into())
     } else {
@@ -1988,10 +1778,14 @@ pub struct ToolConfigFilePreview {
 }
 
 /// 读取当前分类工具配置的只读预览（token 脱敏，不修改磁盘）。
-pub fn preview(category: CategoryType) -> AppResult<ToolConfigPreview> {
+///
+/// `endpoint` 是该分类**当前应当生效**的代理地址（运行中取实际绑定端口，否则取配置端口）。
+/// Codex 的漂移检测要拿它比对 provider 表里的 base_url —— 只查「非空」是不够的：
+/// 指向第三方、或指着一个已死的旧端口，都会被旧判据当成「接入完好」而永不告警。
+pub fn preview(category: CategoryType, endpoint: &str) -> AppResult<ToolConfigPreview> {
     match category {
         CategoryType::ClaudeCli => preview_claude_cli(),
-        CategoryType::Codex => preview_codex(),
+        CategoryType::Codex => codex::preview(endpoint),
         CategoryType::ClaudeDesktop => preview_claude_desktop(),
     }
 }
@@ -2011,71 +1805,6 @@ fn preview_claude_cli() -> AppResult<ToolConfigPreview> {
             content,
         }],
     })
-}
-
-fn preview_codex() -> AppResult<ToolConfigPreview> {
-    let cfg = codex_config_path()?;
-    let auth = codex_auth_path()?;
-    // config.toml 必须脱敏：它可能含 env_key/api_key 等密钥字段（用户手配的其它
-    // model_providers、MCP server 的环境变量等）。此前传 false 整份明文回显 —— 同一段密钥放
-    // settings.json 会打码、放 config.toml 却不打码，口径分叉且泄露。
-    // redact_config_secrets 同时覆盖 TOML 的 `key = "value"` 形态（见该函数）。
-    let (cfg_exists, cfg_content) = read_preview_text(&cfg, true)?;
-    let (auth_exists, auth_content) = read_preview_text(&auth, true)?;
-    Ok(ToolConfigPreview {
-        category_id: CategoryType::Codex,
-        summary: "Codex：~/.codex/config.toml + auth.json。写入 model_provider=synaroute、[model_providers.synaroute]、可选 model、OPENAI_API_KEY 占位。不写任何 ANTHROPIC_* / settings.json。".into(),
-        mcp_registered: is_mcp_registered(CategoryType::Codex),
-        // **接入漂移检测**：占位 key 已在 auth.json 里、但 config.toml 里我们那套 provider
-        // 配置不完好 → Codex 会回落到内置默认 `https://api.openai.com/v1`，拿着占位 key 去打
-        // 真实 OpenAI，用户收到 `Incorrect API key provided: synarout***roxy`，
-        // 被引向「我的 OpenAI key 填错了」这个完全错误的方向（真机 401 事故）。
-        //
-        // 为什么这里也要查（apply 已有读回校验）：Codex 桌面端 App 拥有 config.toml，
-        // 会在**接入之后**重写它（实测会加 `[features]` 段、重排 env 表、改写
-        // `[mcp_servers.synaroute]` 形态）。那时 apply 早已返回成功，只有常驻检测能发现。
-        takeover_warning: detect_codex_drift(&cfg, &auth),
-        files: vec![
-            ToolConfigFilePreview {
-                path: cfg.display().to_string(),
-                exists: cfg_exists,
-                format: "toml".into(),
-                content: cfg_content,
-            },
-            ToolConfigFilePreview {
-                path: auth.display().to_string(),
-                exists: auth_exists,
-                format: "json".into(),
-                content: auth_content,
-            },
-        ],
-    })
-}
-
-/// Codex 接入是否已漂移（占位 key 在、但 provider 配置不完好）。返回可行动的告警文案。
-///
-/// 判据刻意是「**占位在 auth.json** 且 **config 不完好**」这个交叉条件，而不是单看 config：
-/// - 从未接入过（auth.json 是用户自己的 OAuth/真实 key）→ config 不完好完全正常，不该报警；
-/// - 只有当我们**已经把占位写进去**时，config 不完好才意味着「那个假 key 正被发往第三方」。
-///
-/// 这也是与「桌面端被 cc-switch 接管」共用 `takeover_warning` 展示位的理由：
-/// 两者都是「接入看着在、实际已失效」的常驻风险，用户需要在主界面一眼看到。
-fn detect_codex_drift(cfg_path: &Path, auth_path: &Path) -> Option<String> {
-    if !is_placeholder_only_auth(auth_path) {
-        return None; // 没有我们的占位 key → 不存在「假 key 被外发」的风险
-    }
-    if codex_apply_is_intact(cfg_path) {
-        return None; // 接入完好
-    }
-    Some(format!(
-        "Codex 接入已失效：{} 里的 model_provider 未选中 `{}`（或该 provider 表缺失/无 base_url），\
-         而 auth.json 仍是 SynaRoute 写入的占位密钥。此时 Codex 会把占位密钥发往 api.openai.com，\
-         报「Incorrect API key provided」——那不是你的密钥有问题。\n\
-         处理：完全退出 Codex，再在本页点「停止」后重新「启动」以重写接入配置。\
-         （Codex 桌面端会自行重写 config.toml，可能覆盖掉我们的配置。）",
-        cfg_path.display(),
-        MCP_CLIENT_NAME
-    ))
 }
 
 fn preview_claude_desktop() -> AppResult<ToolConfigPreview> {
@@ -3114,59 +2843,6 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
-    /// **接入完好性判据**：真机 401 事故（`Incorrect API key provided: synarout***roxy`
-    /// 打到 `https://api.openai.com/v1/responses`）的根因护栏。
-    ///
-    /// Codex 桌面端 App 拥有并会重写 `config.toml`。若它把 `[model_providers.synaroute]`
-    /// 丢掉而留下顶层 `model_provider = "synaroute"`，Codex 解析不到 provider →
-    /// **回落到内置默认 `https://api.openai.com/v1`**，再拿 auth.json 里我们写的占位 key
-    /// 去打真实 OpenAI。用户看到的报错指向「我的 OpenAI key 填错了」，而真因是接入配置被冲掉。
-    ///
-    /// 故障注入判据：把 `codex_apply_is_intact` 改成只查 `model_provider`（不查表），
-    /// 「表缺失」那条断言立刻变红。
-    #[test]
-    fn codex_apply_intactness_requires_both_selection_and_provider_table() {
-        let path = temp_file("codex_intact", "config.toml");
-
-        // ① 正常接入后：两者都在 → 完好
-        apply_codex_at(&path, "http://127.0.0.1:47101", Some("gpt-5.6")).unwrap();
-        assert!(
-            codex_apply_is_intact(&path),
-            "正常接入后应判为完好:\n{}",
-            std::fs::read_to_string(&path).unwrap()
-        );
-
-        // ② **事故形态**：App 重写时丢了 provider 表，只剩顶层选中项
-        std::fs::write(&path, "model_provider = \"synaroute\"\nmodel = \"gpt-5.6\"\n").unwrap();
-        assert!(
-            !codex_apply_is_intact(&path),
-            "选中了 synaroute 但表缺失 → 必须判为不完好（否则占位 key 会被发给真实 OpenAI）"
-        );
-
-        // ③ 表在、但选中项被改走（用户/cc-switch/App 换了 provider）→ 我们的代理不会被调用
-        std::fs::write(
-            &path,
-            "model_provider = \"custom\"\n[model_providers.synaroute]\nbase_url = \"http://127.0.0.1:47101/v1\"\n",
-        )
-        .unwrap();
-        assert!(
-            !codex_apply_is_intact(&path),
-            "选中项指向别人时必须判为不完好"
-        );
-
-        // ④ 表在、选中了，但 base_url 空/缺 → Codex 同样回落到内置默认地址
-        std::fs::write(
-            &path,
-            "model_provider = \"synaroute\"\n[model_providers.synaroute]\nname = \"SynaRoute\"\n",
-        )
-        .unwrap();
-        assert!(
-            !codex_apply_is_intact(&path),
-            "provider 表无 base_url 等于没配，必须判为不完好"
-        );
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
-    }
 
     #[test]
     fn claude_cli_apply_skips_model_fields_when_no_default() {
@@ -3191,44 +2867,6 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
-    #[test]
-    fn codex_apply_writes_custom_provider_not_anthropic_env() {
-        // 核心修复回归：Codex 不认 ANTHROPIC_BASE_URL，必须写标准自定义 provider。
-        // Codex 路径不得写入任何 ANTHROPIC_*（与 Claude CLI 完全分离）。
-        let path = temp_file("codex_apply", "config.toml");
-        // 预置其它表，验证不被破坏。
-        std::fs::write(
-            &path,
-            "model = \"gpt-5\"\n\n[mcp_servers.codegraph]\ncommand = \"codegraph\"\n",
-        )
-        .unwrap();
-
-        let msg = apply_codex_at(&path, "http://127.0.0.1:8790", Some("claude-opus-4-8")).unwrap();
-        assert!(msg.contains("model_provider=synaroute"));
-
-        let doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
-        // 选中自定义 provider
-        assert_eq!(doc["model_provider"].as_str(), Some("synaroute"));
-        // 默认模型写入顶层 model（借鉴 cc-switch，让 Codex 启动即有模型）
-        assert_eq!(doc["model"].as_str(), Some("claude-opus-4-8"));
-        // provider 定义正确：base_url 追加 /v1、wire_api=responses、requires_openai_auth=true
-        let p = &doc["model_providers"]["synaroute"];
-        assert_eq!(p["base_url"].as_str(), Some("http://127.0.0.1:8790/v1"));
-        assert_eq!(p["wire_api"].as_str(), Some("responses"));
-        assert_eq!(p["requires_openai_auth"].as_bool(), Some(true));
-        // 鉴权走 auth.json，故不写 env_key（避免让 Codex 改从环境变量读、重新引入手设负担）
-        assert!(p.get("env_key").is_none(), "不应写 env_key，鉴权走 auth.json");
-        // 绝不能再写 ANTHROPIC_BASE_URL
-        assert!(
-            doc.get("shell_environment_policy").is_none(),
-            "不应再写 shell_environment_policy.set.ANTHROPIC_BASE_URL"
-        );
-        // 其它表保留
-        assert_eq!(doc["model_providers"].as_table().unwrap().len(), 1);
-        assert_eq!(doc["mcp_servers"]["codegraph"]["command"].as_str(), Some("codegraph"));
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
-    }
 
     #[test]
     fn codex_unregister_removes_only_synaroute() {
@@ -3482,90 +3120,7 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
-    /// **接入漂移检测**：占位 key 在、但 provider 配置被冲掉 → 必须常驻告警。
-    ///
-    /// 这是真机 401 事故的第二道防线。apply 时的读回校验只能保证「写入那一刻是对的」，
-    /// 而 Codex 桌面端 App 拥有 config.toml、会在**之后**重写它（实测会加 `[features]` 段、
-    /// 重排 env 表、改写 `[mcp_servers.synaroute]` 形态）。那时 apply 早已返回成功。
-    ///
-    /// 判据刻意是**交叉条件**（占位在 auth.json ∧ config 不完好），不是单看 config：
-    /// 从未接入过时 config 本就不完好，那时报警纯属噪音。
-    #[test]
-    fn codex_drift_warns_only_when_placeholder_key_would_leak() {
-        let cfg = temp_file("codex_drift", "config.toml");
-        let auth = cfg.with_file_name("auth.json");
 
-        let intact_cfg = "model_provider = \"synaroute\"\n\
-                          [model_providers.synaroute]\n\
-                          base_url = \"http://127.0.0.1:47101/v1\"\n";
-        let broken_cfg = "model_provider = \"custom\"\n\
-                          [model_providers.custom]\n\
-                          base_url = \"https://relay.example.com/v1\"\n";
-        let placeholder = format!(r#"{{"OPENAI_API_KEY":"{CODEX_AUTH_PLACEHOLDER}"}}"#);
-        let real_oauth = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"x"}}"#;
-
-        // ① 占位在 + config 完好 → 正常接入，不报警
-        std::fs::write(&cfg, intact_cfg).unwrap();
-        std::fs::write(&auth, &placeholder).unwrap();
-        assert!(detect_codex_drift(&cfg, &auth).is_none(), "完好接入不该报警");
-
-        // ② **事故形态**：占位在 + config 被冲掉 → 占位 key 会被发往 api.openai.com
-        std::fs::write(&cfg, broken_cfg).unwrap();
-        let warn = detect_codex_drift(&cfg, &auth).expect("漂移必须报警");
-        assert!(
-            warn.contains("api.openai.com"),
-            "告警要点明假 key 会发去哪里（用户收到的 401 就来自那里）：{warn}"
-        );
-        assert!(
-            warn.contains("不是你的密钥有问题"),
-            "必须纠正「我的密钥填错了」这个错误方向：{warn}"
-        );
-        assert!(
-            warn.contains("退出 Codex"),
-            "要给出可自助的处理步骤：{warn}"
-        );
-
-        // ③ 未接入（auth.json 是用户真实 OAuth）+ config 不完好 → 正常状态，不该报警
-        std::fs::write(&auth, real_oauth).unwrap();
-        assert!(
-            detect_codex_drift(&cfg, &auth).is_none(),
-            "从未接入时 config 本就不完好，报警是噪音"
-        );
-
-        // ④ auth.json 不存在（全新环境）→ 同样不报警
-        std::fs::remove_file(&auth).unwrap();
-        assert!(detect_codex_drift(&cfg, &auth).is_none());
-
-        std::fs::remove_dir_all(cfg.parent().unwrap()).ok();
-    }
-
-    #[test]
-    fn restore_removes_placeholder_only_auth_without_backup() {
-        // Q3 回归：接入前无 auth.json → 接入凭空建纯占位符文件 → 无 .bak。
-        // 还原应删除该占位符文件，让用户回到接入前「无 auth.json」态。
-        let path = temp_file("ph_auth", "auth.json");
-        std::fs::write(&path, br#"{"OPENAI_API_KEY":"synaroute-proxy"}"#).unwrap();
-
-        assert!(
-            is_placeholder_only_auth(&path),
-            "纯占位符文件应被识别"
-        );
-
-        // 含 OAuth tokens 的真实凭证绝不能被识别为占位符（防误删）。
-        let real = temp_file("real_auth", "auth.json");
-        std::fs::write(
-            &real,
-            br#"{"OPENAI_API_KEY":"synaroute-proxy","tokens":{"access_token":"x"}}"#,
-        )
-        .unwrap();
-        assert!(
-            !is_placeholder_only_auth(&real),
-            "含 tokens 的文件不得被当作纯占位符（否则会误删 OAuth 凭证）"
-        );
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
-        std::fs::remove_dir_all(real.parent().unwrap()).ok();
-    }
 
     #[test]
     fn redact_masks_oauth_tokens() {
@@ -3629,249 +3184,11 @@ tool_timeout_sec = 600
         assert!(out.contains("C:\\\\x\\\\y"), "keychain_path 不应被脱敏: {out}");
     }
 
-    /// 接入 Codex **绝不允许改动 `auth.json`**（2026-07-31 起）。
-    ///
-    /// 回归的是一个会让用户重登官方账号的真缺陷：旧实现整份重写 auth.json，
-    /// 而它的幂等守卫 `if let Some(Value::String(existing))` 对 ChatGPT OAuth 态的真实取值
-    /// `"OPENAI_API_KEY": null` **不命中**（null 是 `Value::Null` 而非 `Value::String`），
-    /// 于是直接落到整份替换分支，把 `tokens` / `auth_mode` / `last_refresh` 全抹掉。
-    /// 现在鉴权占位写进 provider 表的 `experimental_bearer_token`，auth.json 字节不动。
-    #[test]
-    fn codex_apply_writes_auth_placeholder_and_keeps_oauth_restorable() {
-        // 2026-08-02 真机回归：上一版只写 config.toml、把占位塞进 experimental_bearer_token，
-        // 结果 Codex 仍停在登录页、日志里 codex 分类一条 route 都没有。
-        // 反查 codex.exe：凭据只认 auth.json / 环境变量 / auth.credentials，
-        // 否则 `no Codex credentials were found`。而我们又写了 requires_openai_auth = true。
-        // 故必须照 cc-switch 那样配套写 auth.json。
-        //
-        // 这条测试同时锁住**代价可控**：OAuth 被换掉，但必须能原样还原。
-        let dir = std::env::temp_dir().join(format!(
-            "synaroute_codex_auth_{}_{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = dir.join("config.toml");
-        let auth = dir.join("auth.json");
-        // 真实的 ChatGPT OAuth 态：OPENAI_API_KEY 是 JSON null，旁边挂着 tokens。
-        let oauth = br#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"access_token":"eyJ.a.b","refresh_token":"rt-1"},"last_refresh":"2026-07-01T00:00:00Z"}"#;
-        std::fs::write(&auth, oauth).unwrap();
 
-        apply_codex_at(&cfg, "http://127.0.0.1:47101", Some("gpt-5.6")).unwrap();
-        apply_codex_auth_at(&auth).unwrap();
 
-        // ① auth.json 变成**纯占位**（不能是 tokens + key 混合态 —— 那会撞账号门，
-        //    见 apply_codex_auth_at 的判据）
-        assert!(
-            is_placeholder_only_auth(&auth),
-            "auth.json 必须是纯占位，实际：{}",
-            std::fs::read_to_string(&auth).unwrap()
-        );
 
-        // ② 原 OAuth 必须完整躺在备份里 —— 这是允许整份替换的前提
-        let bak = backup_path_for(&auth);
-        assert!(bak.exists(), "必须为 auth.json 留下接入前快照，否则用户登不回官方");
-        assert_eq!(
-            std::fs::read(&bak).unwrap(),
-            oauth.to_vec(),
-            "备份必须是接入前的真实 OAuth，字节级一致"
-        );
 
-        // ③ 重复接入不得把「已接入态」冲进备份（首写即锁）
-        apply_codex_auth_at(&auth).unwrap();
-        assert_eq!(
-            std::fs::read(&bak).unwrap(),
-            oauth.to_vec(),
-            "重复接入后备份仍须是最初的 OAuth"
-        );
 
-        // ④ 还原后拿回真实 OAuth，且 .bak 被清掉（下次接入重新抓新鲜快照）
-        restore_one(&auth).unwrap();
-        assert_eq!(
-            std::fs::read(&auth).unwrap(),
-            oauth.to_vec(),
-            "还原必须拿回原 ChatGPT 登录态"
-        );
-        assert!(!bak.exists(), "还原后应删除 .bak");
-
-        // ⑤ config.toml 侧仍是标准自定义 provider
-        let doc: toml::Value = std::fs::read_to_string(&cfg).unwrap().parse().unwrap();
-        let p = doc["model_providers"]["synaroute"].as_table().unwrap();
-        assert_eq!(p["requires_openai_auth"].as_bool(), Some(true), "与 cc-switch 生效样本一致");
-        assert_eq!(p["wire_api"].as_str(), Some("responses"));
-        assert_eq!(p["base_url"].as_str(), Some("http://127.0.0.1:47101/v1"));
-        assert_eq!(doc["model_provider"].as_str(), Some("synaroute"));
-        assert_eq!(doc["model"].as_str(), Some("gpt-5.6"), "默认模型应写顶层 model");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn codex_auth_apply_is_idempotent_and_never_backs_up_applied_state() {
-        // 已是接入态时再接入：不得写、更不得把占位当成「接入前快照」存进 .bak
-        // （那会让用户永久失去官方登录态 —— 还原只能拿回一个占位）。
-        let dir = std::env::temp_dir().join(format!(
-            "synaroute_codex_auth_idem_{}_{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let auth = dir.join("auth.json");
-        std::fs::write(
-            &auth,
-            format!(r#"{{"OPENAI_API_KEY":"{CODEX_AUTH_PLACEHOLDER}"}}"#),
-        )
-        .unwrap();
-
-        let msg = apply_codex_auth_at(&auth).unwrap();
-        assert!(msg.contains("已是接入态"), "应短路，实际：{msg}");
-        assert!(
-            !backup_path_for(&auth).exists(),
-            "绝不能把已接入态存成接入前快照"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn codex_auth_apply_handles_first_time_without_auth_file() {
-        // 用户从未登录过官方（无 auth.json）：接入应直接建纯占位，且不产生无意义的 .bak
-        let dir = std::env::temp_dir().join(format!(
-            "synaroute_codex_auth_new_{}_{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let auth = dir.join("auth.json");
-
-        let msg = apply_codex_auth_at(&auth).unwrap();
-        assert!(is_placeholder_only_auth(&auth), "应建出纯占位");
-        assert!(
-            !msg.contains("已备份"),
-            "本就没有登录态，不该提示已备份，实际：{msg}"
-        );
-        assert!(!backup_path_for(&auth).exists(), "无原文件则不该有备份");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// **核心防线（历史事故回归）**：真实 ChatGPT OAuth 态下接入 Codex，必须
-    /// ① 把完整 OAuth 令牌备份进 .bak，② 磁盘上的 auth.json 变为纯占位，
-    /// ③ restore_one 能把 OAuth **一字不差**拿回来。
-    ///
-    /// 这正是「一次接入就抹掉官方登录态」那个事故的核心：旧实现整份替换 auth.json，
-    /// 若备份/还原任一环断裂，用户官方账号就永久登不回来。此前只测了幂等与首次场景，
-    /// 缺这条完整往返 —— 现补上并做故障注入验证。
-    #[test]
-    fn codex_auth_apply_backs_up_oauth_and_restore_brings_it_back_verbatim() {
-        let auth = temp_file("codex_auth_oauth_roundtrip", "auth.json");
-        // 真实 ChatGPT OAuth 形态：OPENAI_API_KEY 为 null + 完整 tokens 段 + auth_mode。
-        // 字节要“难看”一点（含缩进、特定顺序），才能验证还原是**逐字节**而非“语义等价”。
-        let oauth_original = concat!(
-            "{\n",
-            "  \"OPENAI_API_KEY\": null,\n",
-            "  \"auth_mode\": \"chatgpt\",\n",
-            "  \"tokens\": {\n",
-            "    \"access_token\": \"eyJreal.access.TOKEN\",\n",
-            "    \"refresh_token\": \"rt_real_value\",\n",
-            "    \"account_id\": \"acct-123\"\n",
-            "  },\n",
-            "  \"last_refresh\": \"2026-08-02T09:00:00Z\"\n",
-            "}\n"
-        );
-        std::fs::write(&auth, oauth_original).unwrap();
-
-        // —— 接入 ——
-        let msg = apply_codex_auth_at(&auth).unwrap();
-        assert!(msg.contains("已备份"), "有 OAuth 态时必须提示已备份，实际：{msg}");
-
-        // ① 备份存在且**内容与原 OAuth 逐字节一致**（不是被序列化重排过的等价物）
-        let bak = backup_path_for(&auth);
-        assert!(bak.exists(), "接入必须备份原 OAuth 令牌");
-        assert_eq!(
-            std::fs::read_to_string(&bak).unwrap(),
-            oauth_original,
-            "备份必须是原 OAuth 的逐字节副本，否则还原后 token 形态可能失真"
-        );
-
-        // ② 磁盘上的 auth.json 已变为纯占位（Codex 才能走 bearer 鉴权而非撞账号门）
-        assert!(
-            is_placeholder_only_auth(&auth),
-            "接入后 auth.json 应为纯占位"
-        );
-
-        // —— 还原 ——
-        assert!(restore_one(&auth).unwrap(), "应从 .bak 还原");
-        // ③ OAuth 一字不差回来，且 .bak 已被清掉（下次接入重抓新鲜快照）
-        assert_eq!(
-            std::fs::read_to_string(&auth).unwrap(),
-            oauth_original,
-            "还原后必须拿回一字不差的官方登录态"
-        );
-        assert!(!bak.exists(), "还原成功后应清掉 .bak");
-
-        std::fs::remove_dir_all(auth.parent().unwrap()).ok();
-    }
-
-    /// 「首写即锁」在 Codex auth 上的体现：重复接入不得让第二次的“已接入态”
-    /// 冲掉第一次备份的真实 OAuth。否则改端口/换模型后再接入，还原只能拿回占位。
-    #[test]
-    fn codex_auth_repeated_apply_keeps_original_oauth_backup() {
-        let auth = temp_file("codex_auth_relock", "auth.json");
-        let oauth = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","tokens":{"access_token":"ORIGINAL"}}"#;
-        std::fs::write(&auth, oauth).unwrap();
-
-        // 首次接入：备份原 OAuth，磁盘变占位
-        apply_codex_auth_at(&auth).unwrap();
-        let bak = backup_path_for(&auth);
-        let bak_after_first = std::fs::read_to_string(&bak).unwrap();
-        assert!(bak_after_first.contains("ORIGINAL"), "首次应备份真实 OAuth");
-
-        // 再次接入（此时磁盘已是占位）：must be no-op，且 .bak 绝不能被占位覆盖
-        let msg = apply_codex_auth_at(&auth).unwrap();
-        assert!(msg.contains("已是接入态"), "占位态再接入应短路：{msg}");
-        assert_eq!(
-            std::fs::read_to_string(&bak).unwrap(),
-            bak_after_first,
-            ".bak 必须仍是最初的 OAuth，不能被已接入态冲掉"
-        );
-
-        // 还原仍能拿回真实 OAuth
-        restore_one(&auth).unwrap();
-        assert!(
-            std::fs::read_to_string(&auth).unwrap().contains("ORIGINAL"),
-            "还原应拿回最初的 OAuth"
-        );
-        std::fs::remove_dir_all(auth.parent().unwrap()).ok();
-    }
-
-    /// 旧版遗留清理：**旧版**接入把 auth.json 换成了纯占位，`restore` 仍要能识别并清掉它。
-    /// 这条锁的是 `is_placeholder_only_auth` 的判据（严格要求「只有一个 OPENAI_API_KEY 且值为占位」），
-    /// 保证绝不误删含 OAuth tokens 的真实凭证。
-    #[test]
-    fn legacy_placeholder_auth_is_recognized_but_real_credentials_are_not() {
-        let placeholder = temp_file("codex_auth_ph", "auth.json");
-        std::fs::write(
-            &placeholder,
-            format!(r#"{{"OPENAI_API_KEY":"{CODEX_AUTH_PLACEHOLDER}"}}"#),
-        )
-        .unwrap();
-        assert!(is_placeholder_only_auth(&placeholder), "纯占位文件应被识别为可清理");
-
-        // 含 OAuth tokens → 绝不可判为可清理（误删就是让用户重登）。
-        let oauth = temp_file("codex_auth_oauth", "auth.json");
-        std::fs::write(
-            &oauth,
-            format!(
-                r#"{{"OPENAI_API_KEY":"{CODEX_AUTH_PLACEHOLDER}","tokens":{{"access_token":"x"}}}}"#
-            ),
-        )
-        .unwrap();
-        assert!(!is_placeholder_only_auth(&oauth), "含 tokens 的文件绝不可判为可清理");
-
-        // 用户真实 api-key → 同样不可清理。
-        let real = temp_file("codex_auth_real", "auth.json");
-        std::fs::write(&real, br#"{"OPENAI_API_KEY":"sk-real-user-key"}"#).unwrap();
-        assert!(!is_placeholder_only_auth(&real), "用户真实密钥不可清理");
-    }
 
 
     #[test]
@@ -3908,6 +3225,64 @@ tool_timeout_sec = 600
         );
         // fresh 原本不存在 → 应被删除
         assert!(!fresh.exists(), "原本不存在的文件应在回滚时被删除");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 回滚必须**连副文件一起**回滚（`.synaroute.bak` / `.synaroute-created`）。
+    ///
+    /// 这条锁的是一条**数据丢失级**缺陷，完整链条见 `with_rollback` 的文档。要点：
+    /// `backup_and_write_bytes` 在首次写一个**原本不存在**的文件时会落下
+    /// `.synaroute-created` 标记；若回滚只管主文件、把标记留在盘上，那么
+    /// ① 下一次接入会因为「标记在」而跳过整块备份代码（真凭据被直接覆盖、`.bak` 从未生成），
+    /// ② 之后点还原会走标记支路 `remove_file` 把用户真凭据删掉，且那条支路不留 prerestore。
+    /// 全程静默、且不可自愈。
+    ///
+    /// 故障注入判据：把 `with_rollback` 里那两行 `tracked.push(backup_path_for/created_marker_path_for)`
+    /// 去掉 → 本测试必须变红。
+    #[test]
+    fn with_rollback_also_rolls_back_the_bak_and_created_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "synaroute_rollback_side_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 形态 A：主文件原本**不存在** → backup_and_write_bytes 会落 `.synaroute-created`。
+        let fresh = dir.join("auth.json");
+        let fresh_marker = created_marker_path_for(&fresh);
+        let result: AppResult<()> = with_rollback(std::slice::from_ref(&fresh), || {
+            backup_and_write_bytes(&fresh, b"{\"OPENAI_API_KEY\":\"placeholder\"}")?;
+            assert!(fresh_marker.exists(), "前置条件：写入时应落下新建标记");
+            Err(AppError::ToolConfig("模拟读回校验失败".into()))
+        });
+        assert!(result.is_err());
+        assert!(!fresh.exists(), "主文件应被删除");
+        assert!(
+            !fresh_marker.exists(),
+            "新建标记必须一并回滚 —— 留着它会让下一次接入跳过备份、之后的还原删掉用户真凭据"
+        );
+
+        // 形态 B：主文件原本**存在** → backup_and_write_bytes 会落 `.synaroute.bak`。
+        let existing = dir.join("config.toml");
+        let existing_bak = backup_path_for(&existing);
+        std::fs::write(&existing, b"ORIGINAL").unwrap();
+        let result: AppResult<()> = with_rollback(std::slice::from_ref(&existing), || {
+            backup_and_write_bytes(&existing, b"MODIFIED")?;
+            assert!(existing_bak.exists(), "前置条件：写入时应落下 .bak");
+            Err(AppError::ToolConfig("模拟读回校验失败".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"ORIGINAL");
+        assert!(
+            !existing_bak.exists(),
+            "回滚后 .bak 也该消失：它是「首写即锁」的接入前快照，而这次接入压根没成立。\
+             留着它会把「接入前快照」锁在一个从未生效的时刻上"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

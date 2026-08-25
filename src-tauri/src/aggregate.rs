@@ -9,6 +9,9 @@
 //!    - Phase2: 用户确认后执行修改（apply）
 
 use crate::error::{AppError, AppResult};
+use crate::aggregate_phase::{
+    decider_floor_ms, decider_phase_budget_ms, upstream_phase_budget_ms, PHASE_MIN_BUDGET_MS,
+};
 use crate::model::{
     AggregateMode, AggregateResult, AppliedChange, BrainConfig, CategoryType, Protocol,
     RequestTrace,
@@ -63,40 +66,27 @@ fn trace_for_ref(
     })
 }
 
-/// 决策者阶段的保底预算（毫秒）。
+/// 从 `keyId::modelName` 引用里取出 keyId。
 ///
-/// 整轮墙钟预算下，串行的「成员 → 压缩 → 决策者」三阶段共享同一 deadline。为避免前面
-/// 阶段（成员慢/压缩慢）把时间吃光、饿死最重要的决策者综合步骤，给决策者留一块地板：
-/// 整轮预算的 35%，绝对不低于 90s；但小预算时 90s 可能超过整轮总量，故再用 45% 上限夹住
-/// （保证成员+压缩至少还能分到 ~55%）。
+/// # 为什么这个两行函数值得存在
 ///
-/// 例：total=60000 → 35%=21000<90000，被 45%=27000 夹住 → 27000；
-///     total=257000 → 35%=89950<90000 → 90000（<45%=115650）；
-///     total=540000 → 35%=189000（>90000，<45%=243000）→ 189000；
-///     total=600000 → 35%=210000 → 210000。
-fn decider_floor_ms(total_ms: u64) -> u64 {
-    let pct35 = total_ms * 35 / 100;
-    pct35.max(90_000).min(total_ms * 45 / 100)
+/// 聚合的每一条 `append_event_full` 此前都把 `key_id` 传成 `None` —— **8 处全是**，
+/// 其中 6 处带着 usage。而 `store.rs` 的累加器键是 `(分类, key_id.unwrap_or_default())`，
+/// 于是这些消耗全部落进 `(分类, "")` 这一个桶：
+///
+/// - 用量页显示成「（系统级）」，用户看不出是哪条 Key 花的钱；
+/// - `usage_cost::rows` 拿空 keyId 查不到 Key → 取不到代表模型、也取不到计费倍率
+///   → **花费列恒为「—」**（用户报的正是这个）。
+///
+/// 而 key_id 在那 6 处**全都在作用域里**（决策者/汇总者是 `keyId::model` 引用，
+/// 成员侧有 `BrainMember.key_id`）—— 不是拿不到，是记账时扔了。
+///
+/// 有 `aggregate_usage_is_never_recorded_without_a_key` 一条源码级判据盯着这件事，
+/// 因为「记得传 key_id」是一条必然会漏的纪律，而漏掉的表现是静默的。
+fn ref_key_id(reference: &str) -> Option<&str> {
+    reference.split_once("::").map(|(key_id, _)| key_id)
 }
 
-/// 成员/压缩阶段的可用预算（毫秒）：在整轮 deadline 剩余时间里扣掉决策者地板。
-///
-/// `remaining_ms` 为此刻距整轮 deadline 的剩余毫秒。扣掉 `decider_floor` 后仍给一个最小
-/// 下限（`min_floor`，默认 5s）——即使前面阶段几乎耗尽预算，也让本阶段有机会发出请求，
-/// 略微越界由客户端超时余量兜底，好过给 0ms 必然超时。
-fn upstream_phase_budget_ms(remaining_ms: u64, decider_floor: u64, min_floor: u64) -> u64 {
-    remaining_ms.saturating_sub(decider_floor).max(min_floor)
-}
-
-/// 决策者阶段的可用预算（毫秒）：整轮剩余时间全给决策者（前面省下的它全拿），
-/// 同样给最小下限保护，避免 0ms。
-fn decider_phase_budget_ms(remaining_ms: u64, min_floor: u64) -> u64 {
-    remaining_ms.max(min_floor)
-}
-
-/// 阶段预算的最小下限（毫秒）：宁可略微越过整轮 deadline，也要让阶段有机会跑一次
-/// （客户端超时留有 +余量，见 tools.rs 的 mcp 客户端超时联动）。
-const PHASE_MIN_BUDGET_MS: u64 = 5_000;
 
 struct MemberAnswer {
     label: String,
@@ -105,6 +95,9 @@ struct MemberAnswer {
 
 /// 成员一次实际调用的元信息（构造日志 trace 用）。
 struct MemberCallMeta {
+    /// 该成员用的那条 Key 的 id。**记账用**，不进 trace 展示。
+    /// 少了它，这个成员烧的额度会落进「（系统级）」那个空 keyId 桶里（见 [`ref_key_id`]）。
+    key_id: String,
     key_name: String,
     vendor: String,
     protocol: Protocol,
@@ -202,7 +195,7 @@ pub async fn run_plan(
             store.append_event_full(
                 category,
                 "aggregate",
-                None,
+                ref_key_id(&decider_ref),
                 &format!("独答降级 · {} · {}", label_ref(store, &decider_ref), solo_used.fmt_compact()),
                 None,
                 None,
@@ -397,7 +390,7 @@ pub async fn run_apply(
         store.append_event_full(
             category,
             "aggregate",
-            None,
+            ref_key_id(&decider_ref),
             &format!("确认执行 · {} · {}", label_ref(store, &decider_ref), exec_used.fmt_compact()),
             None,
             None,
@@ -752,7 +745,7 @@ pub async fn run_mcp(
             store.append_event_full(
                 category,
                 "aggregate",
-                None,
+                ref_key_id(&decider_ref),
                 &format!(
                     "决策者返回 · {} · {latency}ms{}",
                     label_ref(store, &decider_ref),
@@ -1470,6 +1463,7 @@ async fn gather_members(
             let req_timeout = Duration::from_millis(member_budget_ms.saturating_add(5_000));
             let started = std::time::Instant::now();
             let mk_meta = |latency_ms: u64, usage: upstream::TokenUsage| MemberCallMeta {
+                key_id: key.id.clone(),
                 key_name: key.name.clone(),
                 vendor: key.vendor.clone(),
                 protocol: key.protocol,
@@ -1570,7 +1564,7 @@ async fn gather_members(
                 store.append_event_full(
                     category,
                     "aggregate",
-                    None,
+                    Some(&meta.key_id),
                     &format!(
                         "参与者成功 · {} · {}ms{}",
                         ans.label, meta.latency_ms, usage_part
@@ -1586,7 +1580,9 @@ async fn gather_members(
                 failed += 1;
                 // 失败成员的用量**必须先取出来再消费 meta**：它同样烧了额度，
                 // 工具循环跑几轮才超时更是最贵的情形，漏记会让总账偏低。
+                // key_id 同理 —— 下面那个 `meta.filter(..).map(..)` 会把 meta 整个吃掉。
                 let failed_usage = meta.as_ref().map(|m| m.usage).unwrap_or_default();
+                let failed_key_id = meta.as_ref().map(|m| m.key_id.clone());
                 total_usage.add(&failed_usage);
                 // 失败原因落日志（归「大脑聚合」分组），不再静默吞；带 trace 供展开看入参。受开关控制。
                 let trace = meta.filter(|_| trace_enabled).map(|m| RequestTrace {
@@ -1607,7 +1603,7 @@ async fn gather_members(
                 store.append_event_full(
                     category,
                     "aggregate",
-                    None,
+                    failed_key_id.as_deref(),
                     &format!(
                         "参与者失败 · {label} · {reason}{}",
                         if failed_usage.is_empty() {
@@ -1692,7 +1688,7 @@ async fn compress(
     store.append_event_full(
         category,
         "aggregate",
-        None,
+        ref_key_id(summarizer_ref),
         &format!(
             "汇总成功 · {} · {latency}ms{}",
             label_ref(store, summarizer_ref),
@@ -2038,6 +2034,106 @@ fn label_ref(store: &Arc<Store>, reference: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **带 usage 的聚合事件一律不许把 key_id 传成 `None`。**
+    ///
+    /// 这是一条源码级判据，理由是「记得传 key_id」属于必然会漏的纪律，而漏掉的表现是静默的：
+    /// `store.rs` 的累加器键是 `(分类, key_id.unwrap_or_default())`，传 None 就把这笔消耗
+    /// 塞进 `(分类, "")` 那个桶 → 用量页显示「（系统级）」、花费列恒为「—」
+    /// （用户实际报的就是这个症状，8 处 call site 全传了 None）。
+    ///
+    /// 判据做法：把本文件生产段里每个 `append_event_full(` 调用的实参块切出来，
+    /// 若它**最后一个实参不是 `None`**（= 带 usage），则第三个实参也不许是 `None`。
+    ///
+    /// 两处「本次聚合合计」是**刻意**传 None 的（汇总展示行，分项已各自记过账，
+    /// 再记一次会让金额恒为真值 2 倍），它们最后一个实参也是 None，故自动被放过。
+    ///
+    /// 故障注入判据：把任一带 usage 的站点的 key_id 改回 `None` → 本测试必须变红。
+    #[test]
+    fn aggregate_usage_is_never_recorded_without_a_key() {
+        let src = include_str!("aggregate.rs").replace("\r\n", "\n");
+        let cut = src.rfind("\n#[cfg(test)]\nmod tests").unwrap();
+        let prod = &src[..cut];
+
+        let mut offenders = Vec::new();
+        let mut rest = prod;
+        while let Some(pos) = rest.find("store.append_event_full(") {
+            rest = &rest[pos + "store.append_event_full(".len()..];
+            // 取到配对的右括号为止（实参里只有 format!/then_some 这类嵌套，计数即可）。
+            let mut depth = 1usize;
+            let mut end = 0usize;
+            for (i, ch) in rest.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let args = &rest[..end];
+            // 顶层逗号切分（跳过嵌套括号内的逗号）。
+            let mut parts: Vec<String> = Vec::new();
+            let mut cur = String::new();
+            let mut d = 0usize;
+            for ch in args.chars() {
+                match ch {
+                    '(' | '[' | '{' => {
+                        d += 1;
+                        cur.push(ch);
+                    }
+                    ')' | ']' | '}' => {
+                        d -= 1;
+                        cur.push(ch);
+                    }
+                    ',' if d == 0 => {
+                        parts.push(cur.trim().to_string());
+                        cur.clear();
+                    }
+                    _ => cur.push(ch),
+                }
+            }
+            if !cur.trim().is_empty() {
+                parts.push(cur.trim().to_string());
+            }
+            if parts.len() < 7 {
+                continue; // 解析不出 7 个实参，跳过（下面有反向判据兜底）
+            }
+            // **必须先剥掉行注释**：两处「本次聚合合计」的 `None` 前面挂着五行说明，
+            // 不剥的话那整段注释会被当成实参内容、于是「最后一个实参不是 None」判真
+            // → 判据反而把刻意为之的正确写法报成违规。第一版就是这么报了两条假警。
+            let strip = |s: &str| -> String {
+                s.lines()
+                    .map(|l| l.split("//").next().unwrap_or("").trim())
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let key_arg = strip(&parts[2]);
+            let usage_arg = strip(parts.last().unwrap());
+            let carries_usage = usage_arg != "None";
+            if carries_usage && key_arg == "None" {
+                offenders.push(format!("usage={usage_arg} 但 key_id=None"));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "以下聚合事件带着 usage 却没有 key_id，会落进「（系统级）」空桶、花费列显示「—」：{offenders:#?}"
+        );
+
+        // 反向判据：判据本身不能空转（同 `invoke-command-must-exist` 那条教训）。
+        // 本文件确实有 8 处调用，解析不到就说明上面那套切分坏了。
+        let call_count = prod.matches("store.append_event_full(").count();
+        assert!(
+            call_count >= 6,
+            "只解析到 {call_count} 处 append_event_full —— 判据在空转，先修判据"
+        );
+    }
 
     // ---- 写文件路径的安全护栏（parse_and_apply / is_safe_relative_path）----
     //
