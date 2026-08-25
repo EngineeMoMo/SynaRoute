@@ -9,6 +9,7 @@ import { navItems, type NavItem } from "@/data/nav";
 import { siteConfig } from "@/config/site";
 import { useLang, useLocalizedPath, useT } from "@/hooks/useLang";
 import { cn, externalLinkProps } from "@/lib/utils";
+import { scrollToId } from "@/lib/motion";
 
 export function Header() {
   const t = useT();
@@ -54,7 +55,7 @@ export function Header() {
   function goToHash(hash: string) {
     setMenuOpen(false);
     if (onHome) {
-      document.getElementById(hash)?.scrollIntoView({ behavior: "smooth", block: "start" });
+      scrollToId(hash);
       // 让地址栏反映当前位置，但不产生历史记录堆积
       window.history.replaceState(null, "", `${homePath}#${hash}`);
     } else {
@@ -115,11 +116,11 @@ export function Header() {
               {...externalLinkProps}
               aria-label={t("nav.github")}
               title={t("nav.github")}
-              className="hidden h-10 w-10 items-center justify-center rounded-control text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary sm:inline-flex"
+              className="hidden h-11 w-11 items-center justify-center rounded-control text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary sm:inline-flex"
             >
               <Github size={18} aria-hidden="true" />
             </a>
-            <ButtonLink to={path("download")} size="sm" className="hidden h-10 px-4 text-sm sm:inline-flex">
+            <ButtonLink to={path("download")} size="sm" className="hidden h-11 px-4 text-sm sm:inline-flex">
               <Download size={16} aria-hidden="true" />
               {t("nav.download")}
             </ButtonLink>
@@ -139,7 +140,7 @@ export function Header() {
       </Container>
 
       {menuOpen && (
-        <div className="border-t border-border bg-background lg:hidden">
+        <div className="mobile-menu-panel border-t border-border bg-background lg:hidden">
           <Container className="py-3">
             <nav className="flex flex-col gap-0.5" aria-label={t("common.openMenu")}>
               {navItems.map((i) => renderNavItem(i, true))}

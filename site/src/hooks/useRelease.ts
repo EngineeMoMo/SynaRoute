@@ -143,6 +143,27 @@ export function resolveDownload(platform: Platform, release: ReleaseInfo): Resol
   return { href: siteConfig.github.latestRelease, size: 0, isPageFallback: true };
 }
 
+/**
+ * 同平台的其它包格式 / 架构（macOS 的 Intel dmg、Linux 的 deb/rpm）。
+ *
+ * 与主下载分开取而不是塞进 `resolveDownload`：这些是**并列的补充入口**，
+ * 拿不到时应当整条不显示（而不是像主下载那样回落到 releases 页）——
+ * 一个指向发布页的「Intel」链接会让用户以为点进去有个专门的 Intel 包，
+ * 而他要在一堆资产里自己找。
+ */
+export function resolveExtraDownloads(
+  platform: Platform,
+  release: ReleaseInfo,
+): { label: string; href: string; size: number }[] {
+  if (platform.status === "coming-soon" || !platform.extraDownloads) return [];
+  return platform.extraDownloads.flatMap((extra) => {
+    const asset = release.assets.find((a) => extra.assetPattern.test(a.name));
+    return asset
+      ? [{ label: extra.labelSuffix, href: asset.url, size: asset.size }]
+      : [];
+  });
+}
+
 /** 更新日志页用：取最近若干个版本的发布说明 */
 export function useReleaseNotes(): { notes: ReleaseNote[]; loading: boolean; failed: boolean } {
   const [notes, setNotes] = useState<ReleaseNote[]>([]);

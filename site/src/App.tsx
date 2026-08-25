@@ -11,7 +11,9 @@ import {
 import { Header } from "@/components/layout/Header";
 import { Footer } from "@/components/layout/Footer";
 import { BackToTop } from "@/components/layout/BackToTop";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { detectLang, isLang } from "@/i18n";
+import { scrollToId } from "@/lib/motion";
 import { useT } from "@/hooks/useLang";
 
 import HomePage from "@/pages/HomePage";
@@ -35,7 +37,7 @@ function ScrollManager() {
     if (hash) {
       const id = hash.slice(1);
       requestAnimationFrame(() => {
-        document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+        scrollToId(id);
       });
     } else {
       window.scrollTo({ top: 0 });
@@ -67,7 +69,18 @@ function LangLayout() {
       </a>
       <Header />
       <main id="main">
-        <Outlet />
+        {/*
+          ErrorBoundary 包在 `<Outlet />` 外、`<Header>`/`<Footer>` **内**：
+          这个位置是刻意选的 —— 内容页出错时顶栏、语言切换、页脚全部保留，
+          用户还能自己导航走。包在最外层会让整站一起消失，那正是要避免的
+          （实测过：文档页一个 TypeError 让 `#root` 变空，连首页都回不来）。
+
+          `key` 绑路径：出错后切换页面必须重新尝试渲染，否则用户会卡在错误页上
+          —— ErrorBoundary 的 state 不会自己因为路由变化而重置。
+        */}
+        <ErrorBoundary key={location.pathname} label={location.pathname}>
+          <Outlet />
+        </ErrorBoundary>
       </main>
       <Footer />
       <BackToTop />

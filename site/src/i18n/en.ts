@@ -49,6 +49,10 @@ export const en: Dict = {
   "hero.descSecond":
     "When the primary key errors out, the next one takes over. It can also put several models on the same question in parallel and have a decider synthesise the answer.",
   "hero.ctaPrimary": "Download for Windows",
+  "hero.ctaFor": "Download for {platform}",
+  "hero.ctaWindows": "Download for Windows",
+  "hero.ctaOtherPlatforms": "Other platforms & architectures",
+  "hero.ctaPickPlatform": "Not your system? Pick a platform",
   "hero.ctaPrimaryMacHint": "macOS build coming soon",
   "hero.ctaSecondary": "View on GitHub",
   "hero.versionPrefix": "Current version",
@@ -132,6 +136,28 @@ export const en: Dict = {
   "features.tray.desc":
     "The tray icon reflects whether proxies are running. Its menu starts and stops each category's proxy and switches the primary key. Optional autostart launches the app minimised to the tray with Windows.",
 
+  // ---------- Four capabilities added in 0.1.30~0.1.33 ----------
+
+  "features.diag.name": "Diagnostic headers",
+  "features.diag.short": "Every response carries one pasteable line: which key served it, how many retries.",
+  "features.diag.desc":
+    "Responses include X-SynaRoute-Decision (key / model / attempts / latency on one line) plus request id, upstream status and version. No more guessing which key served a given request — just paste the line. Base URLs and keys are deliberately never included: some relays put the token in the URL path, so echoing the URL would echo the credential.",
+
+  "features.resilience.name": "Per-model lockout",
+  "features.resilience.short": "One unavailable model no longer takes the whole key down with it.",
+  "features.resilience.desc":
+    "The most common relay failure is «this key does not have that one model enabled», while every other model on it works fine. That used to trip the whole key for a minute. Now backoff is per model, keyed on the upstream real model name (keying the public alias would be bypassed by simply using another alias). Three simultaneously locked models on one key escalate to a full breaker — otherwise a key that serves nothing would sit at the front of the pool forever.",
+
+  "features.usage.name": "Usage & cost",
+  "features.usage.short": "Tokens by category and key, with spend estimated from a built-in price table.",
+  "features.usage.desc":
+    "A built-in price table for current models across vendors (including the cache-hit rates, which differ per vendor). Spend is estimated per key; if your relay gives a discount, one cost multiplier calibrates it. When an amount cannot be computed the panel says **why** instead of showing 0 — and it shows the date the price table was last verified so you can judge how much to trust the estimate.",
+
+  "features.balance.name": "Balance lookup",
+  "features.balance.short": "See how much credit is left on a relay, right on the key card.",
+  "features.balance.desc":
+    "Recognised sites work with zero configuration (endpoint matched by domain; for NewAPI-style sites the internal quota-unit ratio is read live). Unrecognised sites are probed against a few common endpoints and the one that answers is remembered. If nothing answers it says so plainly rather than passing off a quota ceiling as a balance — that would be a wrong number you would believe.",
+
   // ---------- Brain aggregation spotlight ----------
   // Only claims the app actually delivers. The "decider is required" and "tools are off
   // by default and cost more" notes are deliberate: state the cost up front.
@@ -201,6 +227,7 @@ export const en: Dict = {
   "download.recommended": "Recommended for you",
   "download.macNote": "The macOS build is in development and is not available for download yet.",
   "download.linuxNote": "No Linux build is planned.",
+  "download.otherBuilds": "Other builds:",
   "download.fallbackNote":
     "Couldn't fetch the latest release from GitHub, so the known version is shown below. You can also go straight to the releases page.",
   "download.allReleases": "See all releases",

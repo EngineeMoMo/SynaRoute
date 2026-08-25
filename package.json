@@ -19,7 +19,8 @@
     "ratchet:verify": "node scripts/verify-ratchet-update.mjs",
     "check:embedded": "node scripts/check-frontend-embedded.mjs",
     "smoke:installer": "node scripts/smoke-installer.mjs",
-    "gates": "npm run check:forbidden && npm run ratchet && npm run ratchet:verify"
+    "gates": "npm run check:forbidden && npm run check:site && npm run ratchet && npm run ratchet:verify",
+    "check:site": "node site/scripts/check-forbidden.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

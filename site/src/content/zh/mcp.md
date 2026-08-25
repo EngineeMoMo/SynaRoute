@@ -34,7 +34,7 @@ SynaRoute 内置一个 MCP（Model Context Protocol）服务器。开启后，�
 
 ```toml
 [mcp_servers.synaroute]
-url = "http://127.0.0.1:9527/mcp"   # 用设置页显示的真实地址
+url = "http://127.0.0.1:9527/mcp/codex"   # 用设置页显示的真实地址
 ```
 
 可选：在项目根目录的 `AGENTS.md` 里加一段提示词，引导 Codex 在合适场景主动调用：
@@ -56,7 +56,7 @@ url = "http://127.0.0.1:9527/mcp"   # 用设置页显示的真实地址
 {
   "mcpServers": {
     "synaroute": {
-      "url": "http://127.0.0.1:9527/mcp"
+      "url": "http://127.0.0.1:9527/mcp/claude-cli"
     }
   }
 }
@@ -92,7 +92,6 @@ url = "http://127.0.0.1:9527/mcp"   # 用设置页显示的真实地址
 |---|---|---|
 | `prompt` | 是 | 任务描述，如「审查鉴权模块的安全性」 |
 | `cwd` | 否 | 当前项目根目录的绝对路径。**强烈建议传入**，否则会用自动跟随识别到的最近活跃项目 |
-| `category` | 否 | 用哪个分类的 Key 池与聚合配置，默认 `claude-cli`，可选 `claude-cli` / `claude-desktop` / `codex` |
 | `languageHint` | 否 | 回答语言，如 `zh` / `en`，省略则跟随 prompt |
 | `images` | 否 | 要一起看的图片，**相对 `cwd` 的路径**数组。传了它必须同时传 `cwd` |
 

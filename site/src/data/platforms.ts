@@ -29,6 +29,17 @@ export interface Platform {
   assetPattern: RegExp;
   /** `navigator.userAgent` 命中该正则即认为访客在用此平台 */
   uaPattern: RegExp;
+  /**
+   * 同平台的**其它包格式 / 架构**，与主下载并列展示。
+   *
+   * 为什么需要它：一次发布里 macOS 有 aarch64 与 x64 两个 dmg、Linux 有
+   * AppImage / deb / rpm 三种。只给一个就必然有人拿错 —— 而拿错架构的 dmg
+   * 在 Mac 上报的是「已损坏，无法打开」，与真正的损坏一模一样，用户诊断不出来。
+   *
+   * **刻意不靠 UA 判架构**：Safari 在 Apple 芯片上的 UA 依然自称
+   * `Intel Mac OS X`，用 UA 判必错。并列给出、让用户自己选是唯一可靠的做法。
+   */
+  extraDownloads?: { labelSuffix: string; assetPattern: RegExp }[];
 }
 
 export const platforms: Platform[] = [
@@ -42,11 +53,31 @@ export const platforms: Platform[] = [
   },
   {
     id: "macos",
-    // 尚未构建 macOS 版本。做出来之后改这一行即可，无需改任何组件。
-    status: "coming-soon",
-    minOS: "macOS 11+",
-    assetPattern: /\.dmg$/i,
+    status: "available",
+    minOS: "macOS 11+（Apple 芯片 / Intel）",
+    // ⚠️ **必须锚定架构**：一次发布里有两个 dmg（`_aarch64.dmg` 与 `_x64.dmg`），
+    // 裸 `/\.dmg$/i` 会命中「资产列表里碰巧排在前面的那一个」——
+    // Intel Mac 用户拿到 arm64 包会直接打不开，而报错是「已损坏，无法打开」，
+    // 与真正的损坏毫无区别，用户几乎不可能自己诊断到「架构拿错了」。
+    //
+    // 这里默认给 Apple 芯片（现役 Mac 的绝大多数）；Intel 那份由下面的
+    // `extraDownloads` 并列给出，不靠 UA 猜 —— Safari 的 UA 在 Apple 芯片上
+    // 依然自称 `Intel Mac OS X`，UA 判架构必错。
+    assetPattern: /_aarch64\.dmg$/i,
     uaPattern: /mac os x|macintosh/i,
+    extraDownloads: [{ labelSuffix: "Intel", assetPattern: /_x64\.dmg$/i }],
+  },
+  {
+    id: "linux",
+    status: "available",
+    minOS: "glibc 2.31+（Ubuntu 20.04+ / Debian 11+ 等）",
+    // AppImage 免安装、发行版无关，作为默认；deb / rpm 并列给出。
+    assetPattern: /_amd64\.AppImage$/i,
+    uaPattern: /linux/i,
+    extraDownloads: [
+      { labelSuffix: "deb", assetPattern: /_amd64\.deb$/i },
+      { labelSuffix: "rpm", assetPattern: /\.x86_64\.rpm$/i },
+    ],
   },
 ];
 

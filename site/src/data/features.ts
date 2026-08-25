@@ -11,6 +11,10 @@ import {
   ScrollText,
   PackageOpen,
   PanelBottom,
+  Stethoscope,
+  ShieldOff,
+  TrendingUp,
+  Wallet,
 } from "lucide-react";
 
 /**
@@ -59,6 +63,12 @@ export const features: Feature[] = [
   { id: "logs", icon: ScrollText, i18nPrefix: "features.logs", span: "third" },
   { id: "portable", icon: PackageOpen, i18nPrefix: "features.portable", span: "third" },
   { id: "tray", icon: PanelBottom, i18nPrefix: "features.tray", span: "third" },
+  // 0.1.30~0.1.33 新增的四条。放在末尾而不是插到前面：前几条回答「为什么要装它」，
+  // 这四条回答「装了之后还有这些」——顺序本身就是一层信息。
+  { id: "diag", icon: Stethoscope, i18nPrefix: "features.diag", span: "third" },
+  { id: "resilience", icon: ShieldOff, i18nPrefix: "features.resilience", span: "third" },
+  { id: "usage", icon: TrendingUp, i18nPrefix: "features.usage", span: "third" },
+  { id: "balance", icon: Wallet, i18nPrefix: "features.balance", span: "third" },
 ];
 
 export interface Step {

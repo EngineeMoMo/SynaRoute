@@ -50,6 +50,13 @@ export const zh: Dict = {
   "hero.descSecond":
     "主 Key 报错自动换下一个；也能让多个模型并行回答同一个问题，再由决策者综合出结论。",
   "hero.ctaPrimary": "下载 Windows 版",
+  // 三个平台都已发布（v0.1.33 起同时出 exe / dmg×2 / AppImage+deb+rpm），
+  // 故主 CTA 按访客所在平台取词，而不是恒写「Windows 版」。
+  "hero.ctaFor": "下载 {platform} 版",
+  "hero.ctaWindows": "下载 Windows 版",
+  "hero.ctaOtherPlatforms": "其它平台与架构",
+  // 认错平台而没有出路 = 用户下到装不上的包，故这一条必须显眼。
+  "hero.ctaPickPlatform": "没认出你的系统？手动选择平台",
   "hero.ctaPrimaryMacHint": "macOS 版即将推出",
   "hero.ctaSecondary": "查看 GitHub",
   "hero.versionPrefix": "当前版本",
@@ -127,6 +134,30 @@ export const zh: Dict = {
   "features.tray.desc":
     "托盘图标按代理运行状态变化。右键菜单可分别启停三个分类的代理、快速切换主 Key。可选开机自启动，随系统启动时最小化到托盘。",
 
+  // ---------- 下面四条是 0.1.30~0.1.33 新增的能力 ----------
+  // 官网原先一个字都没提，而它们恰恰是目标用户（开发者）最会买单的部分。
+  // 每一条都只写软件真的能做的事，并把代价一并写出来。
+
+  "features.diag.name": "排障响应头",
+  "features.diag.short": "每个回答都带一行可粘贴的路由信息：走了哪条 Key、切了几次。",
+  "features.diag.desc":
+    "响应头里带 X-SynaRoute-Decision（key / model / attempts / latency 一行）以及请求 ID、上游状态码、版本号。出问题时不必再猜「刚才那次是走哪条 Key 的」，把这一行贴出来就够了。头里刻意不放地址与密钥 —— 有些中转站把令牌放在 URL 路径里，回显地址等于把密钥回显给客户端。",
+
+  "features.resilience.name": "单模型锁定",
+  "features.resilience.short": "某个模型不可用时只挡那一个，不再连坐整条 Key。",
+  "features.resilience.desc":
+    "中转站最常见的失败是「这条 Key 的某个模型没开通」，对它服务的其它模型完全正常。此前这类失败三次就把整条 Key 停用一分钟，把好模型一起误伤。现在按模型单独退避，锁的是上游真实模型名（锁对外名换个别名就绕过去了）。同一条 Key 上锁了三个模型才升级为整条熔断 —— 否则一条「什么都不通」的 Key 会永远赖在候选池首位。",
+
+  "features.usage.name": "用量与花费统计",
+  "features.usage.short": "按分类与 Key 统计 token，并按内置单价表估算花费。",
+  "features.usage.desc":
+    "内置各厂商在役模型的单价表（含缓存命中价逐厂商不同的那部分），按 Key 估算花费；中转站有折扣时填一个计费倍率即可校准。算不出金额时会说明**为什么**算不出，而不是显示 0 —— 界面上还标着单价表的核对日期，让你自己判断这个估算值得信几分。",
+
+  "features.balance.name": "余额查询",
+  "features.balance.short": "直接在 Key 卡片上看中转站还剩多少额度。",
+  "features.balance.desc":
+    "认得出的站点零配置就能查（按域名匹配端点，NewAPI 系还会现场读取它自己的计费单位换算比率）；认不出的站点会按序探测几个常见端点并把命中的那个记下来。查不到就如实说「这个站点没有余额接口」，不拿配额上限之类的数字冒充余额 —— 那会给出一个你会当真的错数字。",
+
   // ---------- 大脑聚合专区 ----------
   // 只写软件真的能做的事。「决策者必填」「工具调用默认关且更耗额度」这两条
   // 是刻意写进来的：先说清代价，用户装了之后不会觉得被夸大宣传骗了。
@@ -191,6 +222,7 @@ export const zh: Dict = {
   "download.recommended": "推荐给你",
   "download.macNote": "macOS 版本正在开发中，目前尚未提供下载。",
   "download.linuxNote": "暂无 Linux 版本计划。",
+  "download.otherBuilds": "其它架构 / 格式：",
   "download.fallbackNote": "无法从 GitHub 获取最新版本信息，以下为已知版本。你也可以直接前往发布页查看。",
   "download.allReleases": "查看全部历史版本",
   "download.verifyTitle": "关于安装时的系统提示",

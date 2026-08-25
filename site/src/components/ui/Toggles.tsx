@@ -17,7 +17,7 @@ export function ThemeToggle({ className }: { className?: string }) {
       aria-label={t("common.toggleTheme")}
       title={t("common.toggleTheme")}
       className={cn(
-        "inline-flex h-10 w-10 items-center justify-center rounded-control text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary",
+        "inline-flex h-11 w-11 items-center justify-center rounded-control text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary",
         className
       )}
     >
@@ -71,7 +71,7 @@ export function LangToggle({ className }: { className?: string }) {
         aria-label={t("common.toggleLang")}
         aria-haspopup="menu"
         aria-expanded={open}
-        className="inline-flex h-10 items-center justify-center gap-1.5 rounded-control px-2.5 text-sm text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary"
+        className="inline-flex h-11 items-center justify-center gap-1.5 rounded-control px-2.5 text-sm text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary"
       >
         <Languages size={18} aria-hidden="true" />
         <span className="hidden sm:inline">{LANGS.find((l) => l.value === lang)?.label}</span>
