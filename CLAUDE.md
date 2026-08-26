@@ -81,10 +81,10 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   **三道路径防线恒定生效**：拒 `..`/绝对路径 → canonicalize 后须仍在工作目录内 →
   凭据类文件一律拒读（按「模型给的名字」与「解析链接后的真实落点」**各判一次**，两次都不能省）。
   每条防线都做过故障注入验证（去掉后测试必须变红）。当前基线 **433 passed / 0 failed**
-  <br>📌 **基线口径（2026-08-23 实测）**：上面各条历史行里的 311/312/368/383/433/506/719
-  都是**当时**的数字，勿当现值。当前实测 `cargo test --lib` = **760 passed / 0 failed / 3 ignored**
-  （连跑 9 次全绿；`cargo clippy --lib --all-targets -- -D warnings` 零警告；
-  `tsc --noEmit` 干净；`npm test` 72 passed；`npm run build` 通过含颜色类零 CSS 检查；
+  <br>📌 **基线口径（2026-08-26 实测）**：上面各条历史行里的 311/312/368/383/433/506/719/760
+  都是**当时**的数字，勿当现值。当前实测 `cargo test --lib` = **805 passed / 0 failed / 3 ignored**
+  （连跑 3 次全绿；`cargo clippy --lib --all-targets -- -D warnings` 零警告；
+  `tsc --noEmit` 干净；`npm test` 110 passed / 12 文件；`npm run build` 通过含颜色类零 CSS 检查；
   `npm run gates` 全绿）。
   接手时请自己跑一遍取当前值，不要引用本文档里的历史数字当基线。
   <br>⚠️ 观察中的一次偶发：`upstream_retry_after_is_propagated_downstream` 在 2026-08-23
@@ -279,6 +279,79 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   是必然会漏的纪律」。
   <br>另加一条**跨语言**判据 `tests/mcpEndpointParity.test.ts`：前端那份地址与 Rust
   `mcp::client_url` 分叉时变红（编译器管不到这条缝，而分叉是静默的）。
+- **用户报的四条已全部修完（2026-08-26）**，逐条记结论与判据：
+  - **Codex 401 `Incorrect API key provided: synarout***roxy`** —— 真因**不是**旧注释写的
+    「provider 表被丢掉而选中项留着」。隔离 `CODEX_HOME` 实测（codex-cli 0.148.0-alpha.9）：
+    顶层 `model_provider` **键整个缺失**才会回落内置官方地址、拿 auth.json 里我们的占位符去打
+    `api.openai.com`（逐字复现了用户那句报错）；而「选中项悬空」Codex **启动即硬报错
+    `Model provider ... not found`、一个请求都不发**；`[model_providers.openai]` 想覆盖内置 id
+    直接 `reserved built-in provider IDs` 拒启动（**这条路已证伪，别再试**）。
+    <br>🔴 **决定性判据：`experimental_bearer_token` 优先于 auth.json，且 0.148 没有凭据门禁**
+    （本地探针抓 `Authorization` 头，四种组合全测过）。所以那份占位符在正常接入时**从不外发**，
+    纯粹是负债 —— **本版起不再写 `auth.json`**，接入只动 `config.toml`，
+    并在 apply/restore 时顺手**解除**旧版留下的占位符。用户的 ChatGPT 登录态从此完全不被触碰。
+    <br>2026-08-02 那条旧判据（「`requires_openai_auth=true` 必须配套 auth.json，否则停在登录页」）
+    对当前版本不成立；取舍不是赌版本，是**代价不对称**：万一某版本仍要凭据，它报的是
+    `no Codex credentials were found · Run codex login`（响亮、可自助、OAuth 完好），
+    而写占位符的代价是把假凭据发给第三方 + 一句指错方向的报错。
+    <br>另修：`obj.len() == 1` 那个占位符判据被 `codex login --with-api-key` 写出的
+    **两字段**形态击穿（失效方向是**静默放行**，三道守卫同时哑掉）；
+    `is_intact` 只查 base_url **非空**（指向第三方或已死旧端口都判「完好」→ 漂移告警永不发出）；
+    `with_rollback` **不含副文件**（`.bak`/`.synaroute-created`）→ 一条**数据丢失级**链路：
+    回滚留下 marker → 用户重新 `codex login` → 下次 apply 跳过备份 → 还原时按 marker 删文件
+    → ChatGPT 登录态永久消失且盘上无副本。漂移告警改成按形态分支（回落官方/选中他人/
+    选中项悬空/我们的表指向别处/`--profile` 旁路/遗留 `profile=` 键），
+    **每支说的都是那个形态下 Codex 实际的行为** —— 指错方向的告警比没有告警更糟。
+    <br>代码抽到 `src-tauri/src/tools/codex.rs`（tools.rs 棘轮余量为 0）。
+  - **用量统计「花费」列算不出来** —— 是两件独立的事叠在一起，**修一件用户看不到变化**：
+    ① 大脑聚合的 6 处 `append_event_full` 把 `key_id` 全传 `None`，而累加器键是
+    `(分类, key_id.unwrap_or_default())` → 全落进 `(分类, "")` 那个桶 → 用量页显示「（系统级）」、
+    查不到 Key 就取不到代表模型与倍率 → 金额恒「—」。**key_id 在那 6 处全都在作用域里**
+    （`keyId::model` 引用 / `BrainMember.key_id`），不是拿不到、是记账时扔了。已加
+    `ref_key_id` + `MemberCallMeta.key_id`，并有**源码级**判据
+    `aggregate_usage_is_never_recorded_without_a_key` 盯着（「记得传 key_id」是必然会漏的纪律）。
+    ② 单价表停在**退役价**：`("opus", 15.0, 75.0)` 是 Opus 4/4.1 的价，现役 4.5~5 是 $5/$25
+    → 全仓金额恒为真值 **3 倍**（拿用户真实 usage.json 实算过：$13772 vs $4590）；
+    `claude-fable-5` 落到裸 `claude` 的 $3 → **低估 3.3 倍**；无归一 + 裸 `contains`
+    让 `gpt-4.1-nano` 命中 `gpt-4` → 输入价**高估 100 倍**；整个 gpt-5/o 系压根不在表里（Unknown）；
+    `PricingSource::Exact` 在现实中**不可达**（内置表只有 9 条全等匹配的退役名）→ 每行都带「≈」，
+    两个视觉档位退化成一个。
+    <br>重建为 `pricing/{mod,table}.rs`：**归一（`.`/`/`/`_` → `-`）+ 最长片段命中**
+    （表序不再是语义的一部分），家族兜底行 = `FAMILY_FLAGSHIP` 显式指向的**现役旗舰**，
+    缓存价按厂商实测比例显式给值（DeepSeek 0.033×、gpt-4o 0.5×…，写死 ÷10 对多数厂商偏 2~5 倍）。
+    六条**机械不变量**各带故障注入：表序无关 / 覆盖名单不落 Unknown / 兜底=旗舰 /
+    旗舰必须在役 / 片段不跨厂商误吃 / 免费行不被家族兜底开账单。
+    <br>「—」的四种成因（聚合无归属 / Key 已删 / 无模型名 / 模型不在表）分开报，
+    **只有第三种**才给「去设默认兜底模型」那句 —— 旧文案对另三种都是假话，会把用户送去做无效操作。
+    「累计花费」那格加「＋n 行未计入」角标（此前静默丢掉无价行，标着「累计」却不是总计）。
+  - **内置厂商 6 → 33、图标 32 个真 logo**：每条 `base_url` 都做过**可证伪的探测**
+    （bogus key 打 chat 端点，**401/403 = 路由存在、404 = 不存在**）—— 比读文档可靠，
+    好几家文档自身就不自洽。坑都记在 `vendors.rs` 模块头：Groq 是 `/openai/v1` 而 DeepInfra 是
+    `/v1/openai`（恰好相反）、Fireworks 把模型名的小数点写成字母 `p`、SiliconFlow 的 `Pro/` 前缀、
+    Together 与 Novita 同款权重的 id **大小写不同**、Ark 的 `model` 很多账号要填「推理接入点 ID」、
+    讯飞要填 APIPassword 而不是 APIKey:APISecret 那一对。
+    <br>拿不到权威来源的一律 `context_window: None`（语义是「未取证」，不是「无限制」）。
+    <br>🔴 **`builtin_seed()` 只在 `vendors.is_empty()` 时注入** —— 不补迁移的话
+    「加了厂商但老用户看不到」，是个典型静默失效。已补「升级时补入新增内置项、
+    不覆盖用户改过的、不复活用户删掉的」，并有回归测试。
+    <br>深色模式下纯黑品牌（OpenAI/Kimi/xAI/Cohere/Meta）改走浅灰前景 + 深色底片，
+    不再有「看不见的图标」。
+  - **官网 Safari/iOS 15.0~15.3 整站白屏**（用户点名的「苹果浏览器」）：`marked` 用了 15 处
+    `Array.prototype.at`，那是 **15.4+** 才有的 API，而 Vite 的 build target 只降**语法**、
+    esbuild **从不补 API**。React 18 对未捕获的渲染异常会**卸载整个 root** →
+    实测比预估更糟：白屏之后**连首页也回不来**（root 已空）。修法是 polyfill + 把
+    `ErrorBoundary` 放在 `<Outlet/>` 外 / Header·Footer **内**（出错也还能自己导航走）。
+    <br>顺带把 build target 与 browserslist 写死（原先靠 Vite 默认值、会随版本漂）——
+    browserslist 一加，autoprefixer 立刻补出 **`-webkit-backdrop-filter`**，
+    此前整份 CSS 里一个都没有，也就是说 Safari < 18 的顶栏毛玻璃**从未生效**。
+  - **新增两条跨语言判据**（编译器管不到、分叉是静默的）：
+    `vendors::tests::every_vendor_id_appears_in_the_frontend_brand_keywords`（内置厂商
+    在前端认不出 → 界面退化成首字母块）与 `tests/vendorSeedParity.test.ts`（演示数据的厂商清单
+    与 Rust 分叉 → **官网截图会对外少报 27 条**，因为那些图就是从演示模式截的）。
+    后者的**边界写在测试头部**：只比 id/base_url/协议，不比预设模型 ——
+    一个部分为真的判据必须把边界写明。
+  <br>⚠️ 零一万物的关键词**刻意不收裸 `yi`**：`resolveBrand` 是子串匹配，
+  `yi` 会把 `gemini` / `claude-opus` 这类名字误判成零一万物。
 - **换机注意**：`secrets.enc` 由 DPAPI 绑账户、**不可跨机器搬运**；本文档里的绝对路径都是旧机器实测值
 - **判据取证方法**：如何反查 `claude.exe` / `codex.exe` 的字段与内嵌官方 gateway 规范
   （本轮所有「客户端认什么字段」的结论都出自此，不是文档推测）
