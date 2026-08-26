@@ -329,7 +329,7 @@ fn apply_desktop_at(
     //    build_desktop_model_entries——不做无依据的断言。
     let entries = build_desktop_model_entries(&effective, keys);
     let profile_json = build_gateway_profile(existing, endpoint, &entries);
-    backup_and_write_json(profile, &profile_json)?;
+    crate::secret::atomic_write(profile, &serde_json::to_vec_pretty(&profile_json)?)?; // 不写 .bak：判据见 desktop_apply_leaves_no_stale_backup_snapshots
 
     // 3) _meta.json：登记本档（与 cc-switch 档共存）并把 appliedId 指向本档。
     write_desktop_meta_apply(meta)?;
@@ -661,7 +661,7 @@ fn write_desktop_meta_apply(path: &Path) -> AppResult<()> {
         "appliedId".into(),
         Value::String(DESKTOP_PROFILE_ID.into()),
     );
-    backup_and_write_json(path, &root)
+    crate::secret::atomic_write(path, &serde_json::to_vec_pretty(&root)?) // 不写 .bak：判据见 desktop_apply_leaves_no_stale_backup_snapshots
 }
 
 // ---- MCP 客户端自动注册 ----
@@ -1497,7 +1497,7 @@ fn write_desktop_meta_clear_preferring(meta: &Path, prefer: Option<&str>) -> App
     }
 
     if changed {
-        backup_and_write_json(meta, &root)?;
+        crate::secret::atomic_write(meta, &serde_json::to_vec_pretty(&root)?)?; // 不写 .bak：判据见 desktop_apply_leaves_no_stale_backup_snapshots
     }
     Ok(changed)
 }
@@ -3790,6 +3790,73 @@ tool_timeout_sec = 600
     /// 为什么不用「把 threep 换成目录」：`with_rollback` 先对全部路径拍快照，
     /// 对目录 `fs::read` 会失败 → 还没进 op 就返回 Err，那个窗口压根不会打开
     /// （实测：那样注入时本测试恒绿，等于没测到）。
+    /// 桌面端接入**不得**为 gateway 档与 `_meta.json` 留下 `.synaroute.bak`。
+    ///
+    /// 这条盯的是一个真机上确实发生了的泄漏：那两处原先走 `backup_and_write_json`，
+    /// 而它是**首写即锁**语义、`.bak` 此后永不刷新；桌面端的还原走的是外科手术
+    /// （`remove_file(profile)` + 编辑 `_meta`），**不删 `.bak`** ——
+    /// 于是盘上永久留下两份陈旧快照。实测在用户机器上捞到：
+    /// `…000053796e61.json.synaroute.bak` 停在 2026-08-01、
+    /// `_meta.json.synaroute.bak` 停在 2026-07-30 且 `appliedId` 还指着早已被删的本档。
+    ///
+    /// 两重危害：① 排障时是**假现场**（我自己就把它读成过「还原失败了」）；
+    /// ② `_meta` 那份写回去正是本文件点名的死局（appliedId 指向不存在的 profile
+    /// → 桌面端拿不到 gateway 档而卡死）。今天没人读它，但留着就是埋雷。
+    ///
+    /// 这两个文件本就不需要整文件快照：gateway 档整个是我们造的（逆操作 = 删掉），
+    /// `_meta` 是与 cc-switch 共用的、只做外科手术（逆操作 = 摘掉本档那一条）。
+    #[test]
+    fn desktop_apply_leaves_no_stale_backup_snapshots() {
+        let (dir, normal, threep, profile, meta) = desktop_layout("desktop_no_bak");
+        std::fs::write(&threep, b"{}").unwrap();
+        // 预置一份 cc-switch 的既有 _meta：这一份必须在还原后仍然完好，
+        // 而它恰恰是「陈旧 .bak 被写回」会毁掉的东西。
+        // `_meta` 落在 configLibrary 子目录下，夹具里要先把它建出来。
+        std::fs::create_dir_all(meta.parent().unwrap()).unwrap();
+        std::fs::write(
+            &meta,
+            br#"{"appliedId":"cc-switch-id","entries":[{"id":"cc-switch-id","name":"CC Switch"}]}"#,
+        )
+        .unwrap();
+
+        apply_desktop_at(
+            &normal,
+            &threep,
+            &profile,
+            &meta,
+            "http://127.0.0.1:1",
+            &desktop_test_models(),
+            &[],
+        )
+        .unwrap();
+
+        assert!(
+            !backup_path_for(&profile).exists(),
+            "gateway 档不该有 .bak —— 它整个是我们造的，逆操作是删掉它"
+        );
+        assert!(
+            !backup_path_for(&meta).exists(),
+            "_meta.json 不该有 .bak —— 它与 cc-switch 共用，只做外科手术；\
+             留一份首写即锁的快照会在日后被写回时把 appliedId 指向已删的 profile"
+        );
+
+        // 重复接入同样不该凭空长出 .bak（首写即锁那条语义的反向验证）
+        apply_desktop_at(
+            &normal,
+            &threep,
+            &profile,
+            &meta,
+            "http://127.0.0.1:2",
+            &desktop_test_models(),
+            &[],
+        )
+        .unwrap();
+        assert!(!backup_path_for(&profile).exists());
+        assert!(!backup_path_for(&meta).exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn desktop_restore_rolls_back_created_markers_too() {
         let (dir, normal, threep, profile, meta) = desktop_layout("desktop_restore_marker");
