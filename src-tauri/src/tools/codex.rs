@@ -60,6 +60,35 @@ use super::{
     MCP_CLIENT_NAME, PROXY_PLACEHOLDER,
 };
 
+/// 写进 Codex `auth.json` 的 `OPENAI_API_KEY` 占位值。
+///
+/// # 为什么它和 [`PROXY_PLACEHOLDER`] 不是同一个值
+///
+/// 这一个**有可能被回显给用户**，另一个不会。桌面端 App 的登录门只认「auth.json 里有非空
+/// `OPENAI_API_KEY`」（实测：对 `codex app-server` 直发 `getAuthStatus`，只有这一种形态才返
+/// `authMethod: "apikey"`；不存在 / 只写 `auth_mode` / 空值三种都返 null → 弹登录页）。
+/// 所以这份占位符必须存在。而一旦 `model_provider` 被第三方改掉、Codex 回落官方地址，
+/// 它就会被发给**真实的 OpenAI**，换回一句 `Incorrect API key provided: ...`。
+///
+/// OpenAI 只回显**前 8 位 + 后 4~5 位**、中间打码（实测三种长度都是这个规则）。
+/// 旧值 `synaroute-proxy` 显示成 `synarout***roxy` —— 看着就像个真 key，
+/// 于是用户被那句「You can find your API key at platform.openai.com」引去查自己的密钥。
+///
+/// 现值让**可见的那两截**自己说话：显示成 `SEE-SYNA***ROUTE`，
+/// 一眼就知道该去看 SynaRoute，而不是去 OpenAI 查 key。这不是花招 ——
+/// 那句报错是这条链路上唯一必然到达用户眼前的文本，前 8 位是我们能控制的全部带宽。
+pub(super) const CODEX_AUTH_PLACEHOLDER: &str =
+    "SEE-SYNAROUTE-APP-THIS-IS-NOT-A-REAL-KEY-SYNAROUTE";
+
+/// 旧版本写过的 auth.json 占位值。**只用于识别与清理，绝不再写入。**
+///
+/// 删掉它的代价：老用户盘上那份 `synaroute-proxy` 再也认不出来 → 会被当成「用户自己的真 key」
+/// 而受到保护，于是清理与漂移告警同时哑掉，那份假 key 一直留在盘上等着被发给 OpenAI。
+/// **识别面必须比写入面宽** —— 故这里的字面量是刻意的，不能改成引用现值
+/// （`placeholder_has_a_single_source_of_truth` 那条门为此专门放过这一行）。
+pub(super) const LEGACY_CODEX_AUTH_PLACEHOLDERS: &[&str] = &["synaroute-proxy"];
+
+
 /// `~/.codex/config.toml`。
 pub(super) fn config_path() -> AppResult<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| AppError::ToolConfig("无法定位用户目录".into()))?;
@@ -69,7 +98,8 @@ pub(super) fn config_path() -> AppResult<PathBuf> {
 /// `~/.codex/auth.json`（与 config.toml 同目录）。
 ///
 /// **我们不再往这里写任何东西**（见模块头）。保留这个路径只为两件事：
-/// ① 清理旧版本 SynaRoute 留下的占位符；② 漂移检测时判断「假 key 是否仍武装着」。
+/// ① 写入让桌面端跳过登录页的占位符（见 [`apply_auth_at`]）；② 还原时解除它；
+/// ③ 漂移检测时判断「那份占位符是否正被发往错误的地址」。
 pub(super) fn auth_path() -> AppResult<PathBuf> {
     let cfg = config_path()?;
     Ok(cfg
@@ -82,15 +112,12 @@ pub(super) fn auth_path() -> AppResult<PathBuf> {
 // 接入
 // ---------------------------------------------------------------------------
 
-/// 写入 Codex 接入配置。
-///
-/// 只动 `config.toml` 一个文件，**并顺带解除旧版本留下的假凭据**。
+/// 写入 Codex 接入配置：`config.toml` + `auth.json`（后者仅在必要时，见 [`apply_auth_at`]）。
 pub(super) fn apply(endpoint: &str, default_model: Option<&str>) -> AppResult<String> {
     let path = config_path()?;
     let auth = auth_path()?;
-    // 两条路径都进 with_rollback：config.toml 是我们要写的，auth.json 是我们要**摘**的
-    // （摘除同样是写操作，失败也得能回滚）。副文件（`.bak` / `.synaroute-created`）由
-    // `with_rollback` 自己按主路径推导后一并纳入快照 —— 漏了它们会造成数据丢失级后果，
+    // 两条路径都进 with_rollback。副文件（`.bak` / `.synaroute-created`）由 `with_rollback`
+    // 自己按主路径推导后一并纳入快照 —— 漏了它们会造成数据丢失级后果，
     // 判据见 tools.rs 里 `with_rollback` 的文档。
     with_rollback(&[path.clone(), auth.clone()], || {
         let msg = apply_at(&path, endpoint, default_model)?;
@@ -111,15 +138,101 @@ pub(super) fn apply(endpoint: &str, default_model: Option<&str>) -> AppResult<St
             )));
         }
 
-        // 旧版本（≤0.1.33）接入时会把 auth.json **整份替换**成占位符。升级到本版后那份假凭据
-        // 仍留在盘上，而我们已经不需要它了 —— 留着只会在下一次漂移时被发给真实 OpenAI。
-        // 故每次接入都顺手解除一次（幂等，没有就什么都不做）。
-        let disarmed = disarm_legacy_placeholder_auth(&auth)?;
-        Ok(match disarmed {
+        let auth_msg = apply_auth_at(&auth)?;
+        Ok(match auth_msg {
             Some(note) => format!("{msg}；{note}"),
             None => msg,
         })
     })
+}
+
+/// 让桌面端 App 跳过登录页所需的最小写入。返回 `Some(说明)` 表示确实写了。
+///
+/// # 为什么这份 auth.json 无法避免（2026-08-26 实测，此前删过一次、把用户推到了登录页）
+///
+/// 桌面端 App 每隔几秒发一次 `getAuthStatus` RPC，返 `authMethod: null` 就显示
+/// 「登录 ChatGPT」页。直接对 `codex app-server` 发那个 RPC 逐形态实测：
+///
+/// | auth.json | `getAuthStatus` 返回 |
+/// |---|---|
+/// | **不存在** | `authMethod: null` → **弹登录页** |
+/// | `{"auth_mode":"apikey"}`（只有模式、无 key） | `authMethod: null` → 仍弹 |
+/// | `{"auth_mode":"apikey","OPENAI_API_KEY":""}`（空值） | `authMethod: null` → 仍弹 |
+/// | `{"OPENAI_API_KEY":"<非空>"}` | `authMethod: "apikey"` → **不弹** |
+///
+/// 即：**唯一的钥匙是「非空 `OPENAI_API_KEY`」**，没有「只声明模式」这种不放值的写法。
+/// 返回里那个 `requiresOpenaiAuth` 恒为 `true`，与我们写进 provider 表的
+/// `requires_openai_auth` **无关**（试过 false / 省略，返回不变）—— 别指望用它绕过。
+///
+/// 注意这与「请求能不能发出去」是两件事：CLI 侧有 `experimental_bearer_token` 就够了，
+/// 五种形态实测全部畅通、无凭据门禁。这份 auth.json **纯粹是为了那道 UI 门**。
+/// 上一版把两件事混为一谈，删掉它之后 CLI 照跑、而桌面端用户卡在登录页。
+///
+/// # 三条防线（因为这份假凭据确实有外发风险）
+///
+/// 它只在「`model_provider` 被第三方改掉、Codex 回落官方地址」时才会被发出去。故：
+/// 1. **只在必要时写**：已有真凭据（OAuth `tokens` 或用户自己的真 key）时**一个字节都不动** ——
+///    旧实现是无条件整份替换，一次接入就抹掉用户的 ChatGPT 登录态；
+/// 2. **占位符自解释**：那句 401 显示成 `SEE-SYNA***ROUTE`（见 `CODEX_AUTH_PLACEHOLDER`），
+///    把人指向 SynaRoute 而不是 platform.openai.com；
+/// 3. **漂移检测 + 还原时解除**：`drift_state` 常驻盯着，`restore` 摘掉它。
+fn apply_auth_at(path: &Path) -> AppResult<Option<String>> {
+    // 已经是我们的占位符 → 幂等短路。**必须有这一支**：不短路的话
+    // `backup_and_write_bytes` 会把「已接入态」当成「接入前快照」拷进 `.bak`，
+    // 此后点还原拿回来的就是那个假 key（旧实现的 `obj.len() == 1` 判据被两字段形态击穿，
+    // 正是这么漏的）。
+    if auth_carries_our_placeholder(path) {
+        return Ok(None);
+    }
+
+    // **有真凭据就别碰**。这是与旧实现最大的区别：旧版无条件整份替换，
+    // 于是一次接入就抹掉 ChatGPT OAuth 令牌（`"OPENAI_API_KEY": null` 那个幂等守卫
+    // 对 OAuth 态压根不命中）。有真凭据时 App 本来就不弹登录页，我们没有理由动它。
+    if auth_has_real_credentials(path) {
+        return Ok(None);
+    }
+
+    let body = serde_json::json!({
+        "OPENAI_API_KEY": CODEX_AUTH_PLACEHOLDER,
+        // 与 `codex login --with-api-key` 写出的形态一致（它会补这个字段）。
+        // 写上它不影响那道门（门只看 key 非空），但让盘上的文件看起来是正常形态、
+        // 而不是一个来源不明的孤立字段。
+        "auth_mode": "apikey",
+    });
+    let bytes = serde_json::to_vec_pretty(&body)
+        .map_err(|e| AppError::ToolConfig(format!("序列化 auth.json 失败: {e}")))?;
+    backup_and_write_bytes(path, &bytes)?;
+    Ok(Some(format!(
+        "已写入 {}（占位密钥，仅为让 Codex 桌面端跳过登录页；真实密钥由代理按路由 Key 注入）",
+        path.display()
+    )))
+}
+
+/// auth.json 里是否有**用户自己的**真凭据（ChatGPT OAuth 令牌，或非占位符的 API key）。
+///
+/// 判「有没有真东西」而不是判「是不是我们的」：前者决定「能不能动这个文件」，
+/// 而误判的代价是抹掉用户的登录态 —— 故这一侧要**宽**（宁可不写，也不覆盖）。
+fn auth_has_real_credentials(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    if obj.get("tokens").is_some_and(|t| !t.is_null()) {
+        return true;
+    }
+    matches!(obj.get("OPENAI_API_KEY"), Some(Value::String(v))
+        if !v.is_empty() && !is_our_placeholder_value(v))
+}
+
+/// 某个 `OPENAI_API_KEY` 取值是否是我们写的占位符（含**历史**值）。
+///
+/// 识别面必须比写入面宽：老用户盘上是 `synaroute-proxy`，只认新值会让清理与告警
+/// 同时哑掉，而那份假 key 会一直留着等被发给 OpenAI。
+fn is_our_placeholder_value(v: &str) -> bool {
+    v == CODEX_AUTH_PLACEHOLDER
+        || LEGACY_CODEX_AUTH_PLACEHOLDERS.contains(&v)
 }
 
 /// provider 表里该写的 `base_url`：Codex 按 `wire_api=responses` 调 `{base_url}/responses`，
@@ -234,8 +347,8 @@ pub(super) fn apply_at(
         .unwrap_or_default();
     Ok(format!(
         "已写入 Codex 配置：{}（model_provider={MCP_CLIENT_NAME}，base_url={base_url}，\
-         wire_api=responses{model_note}）；鉴权走 provider 表的 bearer，**未改动 auth.json**\
-         （官方 ChatGPT 登录状态原样保留）；原文件已备份",
+         wire_api=responses{model_note}）；转发鉴权走 provider 表的 bearer 占位，\
+         真实密钥由代理按路由 Key 注入；原文件已备份",
         path.display()
     ))
 }
@@ -265,7 +378,7 @@ pub(super) fn auth_carries_our_placeholder(path: &Path) -> bool {
     let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text) else {
         return false;
     };
-    matches!(obj.get("OPENAI_API_KEY"), Some(Value::String(v)) if v == PROXY_PLACEHOLDER)
+    matches!(obj.get("OPENAI_API_KEY"), Some(Value::String(v)) if is_our_placeholder_value(v))
 }
 
 /// 这份 auth.json 是否**纯粹**是我们凭空造出来的占位符文件（可以整份删掉）。
@@ -282,7 +395,7 @@ pub(super) fn auth_is_only_our_placeholder(path: &Path) -> bool {
     let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text) else {
         return false;
     };
-    if !matches!(obj.get("OPENAI_API_KEY"), Some(Value::String(v)) if v == PROXY_PLACEHOLDER) {
+    if !matches!(obj.get("OPENAI_API_KEY"), Some(Value::String(v)) if is_our_placeholder_value(v)) {
         return false;
     }
     if obj.get("tokens").is_some_and(|t| !t.is_null()) {
@@ -292,7 +405,7 @@ pub(super) fn auth_is_only_our_placeholder(path: &Path) -> bool {
         .all(|k| k == "OPENAI_API_KEY" || k == "auth_mode")
 }
 
-/// 解除旧版本留在 auth.json 里的占位符。返回 `Some(给用户看的说明)` 表示确实动了。
+/// 解除 auth.json 里的占位符（本轮写的、或旧版本留下的）。返回 `Some(说明)` 表示确实动了。
 ///
 /// 三种情形，都要留下**可回滚的现场**（`.synaroute-prerestore`），与 `restore_one` 同一纪律：
 /// - `.bak` 在（旧版接入时备份过真凭据）→ 交还真凭据，删 `.bak`；
@@ -316,7 +429,7 @@ pub(super) fn disarm_legacy_placeholder_auth(path: &Path) -> AppResult<Option<St
             tracing::warn!("解除后清理备份 {} 失败: {e}", backup.display());
         }
         return Ok(Some(format!(
-            "已从备份交还 {}（旧版本写入的占位密钥已解除，官方登录态恢复）",
+            "已从备份交还 {}（占位密钥已解除，官方登录态恢复）",
             path.display()
         )));
     }
@@ -332,7 +445,7 @@ pub(super) fn disarm_legacy_placeholder_auth(path: &Path) -> AppResult<Option<St
             }
         }
         return Ok(Some(format!(
-            "已删除 {}（旧版本凭空创建的纯占位密钥文件）",
+            "已删除 {}（接入时凭空创建的纯占位密钥文件）",
             path.display()
         )));
     }
@@ -352,7 +465,7 @@ pub(super) fn disarm_legacy_placeholder_auth(path: &Path) -> AppResult<Option<St
         .map_err(|e| AppError::ToolConfig(format!("序列化 auth.json 失败: {e}")))?;
     crate::secret::atomic_write(path, &bytes)?;
     Ok(Some(format!(
-        "已从 {} 摘除旧版本写入的占位密钥（其余字段保留）",
+        "已从 {} 摘除占位密钥（其余字段保留）",
         path.display()
     )))
 }
@@ -567,10 +680,10 @@ pub(super) fn drift_warning(state: &DriftState) -> Option<String> {
                  https://api.openai.com/v1，你的请求**没有走 SynaRoute**。";
             if *placeholder_armed {
                 format!(
-                    "{head}\n而 auth.json 里还留着旧版本 SynaRoute 写入的占位密钥，\
+                    "{head}\n而 auth.json 里还留着 SynaRoute 写入的占位密钥（它只为让桌面端跳过登录页），\
                      于是 Codex 会把它发给官方，报「Incorrect API key provided: synarout***roxy」\
                      —— **那不是你的 OpenAI 密钥有问题**。\n{FIX}\
-                     （本版 SynaRoute 已不再写 auth.json；重新启动一次即会自动解除这份占位密钥。）"
+                     （在本页点「停止」会自动摘除这份占位密钥；重新「启动」会重写正确的接入配置。）"
                 )
             } else {
                 format!("{head}\n{FIX}")
@@ -589,7 +702,7 @@ pub(super) fn drift_warning(state: &DriftState) -> Option<String> {
             );
             if *placeholder_would_be_sent {
                 format!(
-                    "{head}\n且该 provider 没有自带密钥，Codex 会把 auth.json 里旧版本 SynaRoute \
+                    "{head}\n且该 provider 没有自带密钥，Codex 会把 auth.json 里 SynaRoute \
                      写入的占位密钥发往 {dest}，那边会回「密钥无效」。\n{FIX}"
                 )
             } else {
@@ -710,18 +823,19 @@ mod tests {
 
     // ---- 接入写出的内容 ----
 
-    /// 接入**不得**创建 auth.json。
+    /// `apply_at` 只写 config.toml，**它自己不碰 auth.json**（那是 `apply_auth_at` 的事）。
     ///
-    /// 这是本轮修复的核心：那份占位符在正常接入时从不外发（bearer 优先），
-    /// 只在漂移后被发给**真实的 OpenAI**，换回一句指错方向的 401。
+    /// 两件事分开的理由：转发只需要 provider 表里的 bearer（CLI 五种形态实测全通），
+    /// 而 auth.json 纯粹是为了桌面端那道 UI 登录门。上一版把两者混为一谈、整个删掉，
+    /// 结果 CLI 照跑而桌面端用户卡在登录页。
     #[test]
-    fn apply_writes_bearer_and_never_creates_auth_json() {
-        let d = temp_dir("apply_no_auth");
+    fn apply_at_writes_config_only_and_does_not_touch_auth_json() {
+        let d = temp_dir("apply_cfg_only");
         let cfg = d.join("config.toml");
         let auth = d.join("auth.json");
 
         let msg = apply_at(&cfg, EP, Some("gpt-5.6-sol")).unwrap();
-        assert!(!auth.exists(), "接入不得创建 auth.json");
+        assert!(!auth.exists(), "apply_at 这一层不该创建 auth.json");
 
         let doc = std::fs::read_to_string(&cfg).unwrap().parse::<toml::Value>().unwrap();
         assert_eq!(doc["model_provider"].as_str(), Some("synaroute"));
@@ -735,12 +849,13 @@ mod tests {
             "env_key 会让 Codex 改从环境变量读 key，重新引入「用户手设环境变量」负担"
         );
 
-        // 成功文案不得自相矛盾：旧实现把「未改动 auth.json」与「已写入 …auth.json（鉴权占位）」
-        // 用 format! 拼进同一句给用户看 —— 同一句话既说没动又说写了。
-        assert!(msg.contains("未改动 auth.json"));
+        // 成功文案不得自相矛盾。踩过的坑：旧实现把「未改动 auth.json」与
+        // 「已写入 …auth.json（鉴权占位）」用 format! 拼进同一句给用户看 ——
+        // 同一句话既说没动又说写了。故这一层**压根不许提** auth.json 的去向，
+        // 那句话由 `apply_auth_at` 按实际做了什么来出。
         assert!(
-            !msg.contains("鉴权占位）"),
-            "不得声称写了 auth.json 占位：{msg}"
+            !msg.contains("auth.json"),
+            "config 层的文案不该断言 auth.json 的去向（它不知道）：{msg}"
         );
 
         std::fs::remove_dir_all(&d).ok();
@@ -1155,21 +1270,23 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// 接入**逐字节不动**已存在的 auth.json。
+    /// 接入**逐字节不动**已有真凭据的 auth.json（ChatGPT OAuth 令牌）。
     ///
     /// 这条替代了旧的 `codex_auth_apply_backs_up_oauth_and_restore_brings_it_back_verbatim`：
     /// 那条测的是「整份替换掉 OAuth 之后还能不能还原回来」，而现在的性质更强 ——
-    /// 压根不动它，于是「还原不回来」这个风险面整个消失。
+    /// 有真凭据时压根不动它，于是「还原不回来」这个风险面整个消失。
+    ///
+    /// 旧实现的幂等守卫 `if let Some(Value::String(existing))` 对 OAuth 态的真实取值
+    /// `"OPENAI_API_KEY": null` **不命中**（null 是 `Value::Null`），于是直接落到整份替换分支
+    /// —— 一次接入就抹掉用户的登录态。这条测试盯的就是那个洞。
     #[test]
-    fn apply_never_touches_an_existing_oauth_auth_json() {
+    fn apply_auth_never_touches_real_credentials() {
         let d = temp_dir("keep_oauth");
-        let cfg = d.join("config.toml");
         let auth = d.join("auth.json");
         let oauth = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","tokens":{"access_token":"real","refresh_token":"rt"},"last_refresh":"2026-06-25T13:01:56Z"}"#;
         write(&auth, oauth);
 
-        apply_at(&cfg, EP, None).unwrap();
-
+        assert_eq!(apply_auth_at(&auth).unwrap(), None, "有真凭据 → 什么都不做");
         assert_eq!(
             std::fs::read_to_string(&auth).unwrap(),
             oauth,
@@ -1179,7 +1296,76 @@ mod tests {
             !super::super::backup_path_for(&auth).exists(),
             "既然不动它，就不该为它建 .bak（建了反而是把真凭据复制了一份）"
         );
+
+        // 用户自己的真实 api key（非占位符）同样不许动。
+        let realkey = r#"{"OPENAI_API_KEY":"sk-userrealkey123","auth_mode":"apikey"}"#;
+        write(&auth, realkey);
+        assert_eq!(apply_auth_at(&auth).unwrap(), None);
+        assert_eq!(std::fs::read_to_string(&auth).unwrap(), realkey);
+
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 无凭据时才写占位符 —— 这是桌面端跳过登录页的唯一钥匙。
+    ///
+    /// 实测判据（对 `codex app-server` 直发 `getAuthStatus`）：只有非空 `OPENAI_API_KEY`
+    /// 才返 `authMethod: "apikey"`；不存在 / 只写 `auth_mode` / 空值三种都返 null → 弹登录页。
+    /// 上一版把这份文件整个删掉，于是桌面端用户卡在「登录 ChatGPT」页（真机报障）。
+    #[test]
+    fn apply_auth_writes_placeholder_only_when_there_is_nothing_to_preserve() {
+        let d = temp_dir("write_ph");
+        let auth = d.join("auth.json");
+
+        // ① 文件不存在 → 写占位符
+        let note = apply_auth_at(&auth).unwrap().expect("无凭据时必须写");
+        assert!(note.contains("登录页"), "文案要说明这是干什么用的：{note}");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&auth).unwrap()).unwrap();
+        assert_eq!(
+            v["OPENAI_API_KEY"].as_str(),
+            Some(super::CODEX_AUTH_PLACEHOLDER)
+        );
+        assert!(
+            !v["OPENAI_API_KEY"].as_str().unwrap().is_empty(),
+            "空值过不了那道门（实测 authMethod 返 null）"
+        );
+
+        // ② 幂等：已经是我们的占位符 → 不再写、也不把「已接入态」拷进 .bak。
+        //    这一支不可省：拷进去之后点还原拿回来的就是那个假 key。
+        assert_eq!(apply_auth_at(&auth).unwrap(), None, "第二次必须短路");
+
+        // ③ 旧版本留下的历史占位值同样算「我们的」（识别面比写入面宽）。
+        write(&auth, r#"{"OPENAI_API_KEY":"synaroute-proxy"}"#);
+        assert_eq!(
+            apply_auth_at(&auth).unwrap(),
+            None,
+            "历史占位值也要认得出来，否则会被当成用户真凭据"
+        );
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 那句 401 回显里**可见的两截**必须自己解释自己。
+    ///
+    /// OpenAI 只回显前 8 位 + 后 4~5 位（实测三种长度都是这个规则）。旧值 `synaroute-proxy`
+    /// 显示成 `synarout***roxy` —— 看着就像个真 key，于是用户被那句
+    /// 「You can find your API key at platform.openai.com」引去查自己的密钥（方向完全相反）。
+    /// 现值显示成 `SEE-SYNA***ROUTE`。
+    ///
+    /// 那句报错是这条链路上**唯一必然到达用户眼前**的文本，前 8 位是我们能控制的全部带宽。
+    #[test]
+    fn the_visible_part_of_the_placeholder_points_at_synaroute() {
+        let ph = super::CODEX_AUTH_PLACEHOLDER;
+        let head = &ph[..8];
+        let tail = &ph[ph.len() - 5..];
+        assert_eq!(head, "SEE-SYNA", "前 8 位是回显里可见的那截，必须指向 SynaRoute");
+        assert_eq!(tail, "ROUTE");
+        assert!(ph.len() > 20, "太短会让中间的打码段藏不住东西，反而像个真 key");
+        // 绝不能长得像真 key：真 key 以 `sk-` 开头。
+        assert!(!ph.starts_with("sk-"), "不许伪装成真 key 的形态");
+        // 历史值必须仍在识别清单里，否则老用户盘上那份认不出来。
+        assert!(is_our_placeholder_value("synaroute-proxy"));
+        assert!(is_our_placeholder_value(ph));
+        assert!(!is_our_placeholder_value("sk-userrealkey123"));
     }
 
     /// 占位符只有一份事实来源：Codex 的 bearer、桌面端 gateway、Claude CLI 的
@@ -1195,31 +1381,52 @@ mod tests {
         // 本仓的 .rs 是 CRLF（见 .gitattributes）。`include_str!` 给的是原始字节，
         // 不先归一行尾，下面那个 split 找不到锚点 → `prod` 变成整份文件、把测试段里的
         // 字面量也算成违规。**判据自己失效的方向必须是响亮的**：所以下面还有一条反向断言。
-        let src = include_str!("../tools.rs").replace("\r\n", "\n");
-        // 只看生产段（尾部 `#[cfg(test)] mod tests` 之前），与棘轮脚本同一口径。
-        // 用 rfind 取**最后**一处：文件中间还有若干 `#[cfg(test)]` 单项（如 REAL_CLEANUP_CALLS）。
-        let cut = src
-            .rfind("\n#[cfg(test)]\nmod tests")
-            .expect("tools.rs 尾部应有 `#[cfg(test)] mod tests`");
-        let prod = &src[..cut];
-        let offenders: Vec<&str> = prod
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !t.starts_with("//") && t.contains("\"synaroute-proxy\"")
-            })
-            // 放过唯一合法的那一行：常量自己的定义。
-            .filter(|l| !l.contains("const PROXY_PLACEHOLDER"))
-            .collect();
-        assert!(
-            offenders.is_empty(),
-            "tools.rs 生产段里仍有裸的 \"synaroute-proxy\" 字面量，必须改用 PROXY_PLACEHOLDER：{offenders:?}"
-        );
+        // **两个文件都要查**。只查 tools.rs 会留下最要紧的那条缝：占位符的全部使用点
+        // 现在都在 codex.rs 里，漏掉它等于让门在真正会出问题的地方失效。
+        let files = [
+            ("tools.rs", include_str!("../tools.rs").replace("\r\n", "\n")),
+            ("tools/codex.rs", include_str!("codex.rs").replace("\r\n", "\n")),
+        ];
+        let mut checked = 0usize;
+        for (name, src) in &files {
+            // 只看生产段（尾部 `#[cfg(test)] mod tests` 之前），与棘轮脚本同一口径。
+            // 用 rfind 取**最后**一处：文件中间还有若干 `#[cfg(test)]` 单项（如 REAL_CLEANUP_CALLS）。
+            let cut = src
+                .rfind("\n#[cfg(test)]\nmod tests")
+                .unwrap_or_else(|| panic!("{name} 尾部应有 `#[cfg(test)] mod tests`"));
+            let prod = &src[..cut];
+            let offenders: Vec<&str> = prod
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && t.contains("\"synaroute-proxy\"")
+                })
+                // 放过两处合法的：常量自己的定义，以及**历史占位值清单**。
+                // 后者必须留着字面量 —— 它的语义正是「盘上可能出现过的旧值」，
+                // 改用常量就等于让它跟着现值走，那样老用户盘上那份就再也认不出来
+                // （识别面必须比写入面宽，见 `LEGACY_CODEX_AUTH_PLACEHOLDERS`）。
+                .filter(|l| {
+                    !l.contains("const PROXY_PLACEHOLDER")
+                        && !l.contains("LEGACY_CODEX_AUTH_PLACEHOLDERS")
+                })
+                .collect();
+            assert!(
+                offenders.is_empty(),
+                "{name} 生产段里仍有裸的 \"synaroute-proxy\" 字面量，\
+                 必须改用 PROXY_PLACEHOLDER / LEGACY_CODEX_AUTH_PLACEHOLDERS：{offenders:?}"
+            );
+            checked += 1;
+        }
         // 反向判据：门不能因为「压根没找到那个字符串」而恒绿（同 `invoke-command-must-exist`
         // 那条教训 —— 解析到 0 个候选时要主动判失败）。
+        assert_eq!(checked, 2, "两个文件都要真的被查过");
         assert!(
-            prod.contains("const PROXY_PLACEHOLDER"),
+            files[0].1.contains("const PROXY_PLACEHOLDER"),
             "常量定义都找不到，说明这条判据在空转"
+        );
+        assert!(
+            files[1].1.contains("LEGACY_CODEX_AUTH_PLACEHOLDERS: &[&str]"),
+            "历史占位值清单找不到了 —— 老用户盘上那份假 key 会认不出来"
         );
         assert_eq!(PROXY_PLACEHOLDER, "synaroute-proxy");
     }
