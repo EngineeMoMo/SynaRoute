@@ -168,14 +168,46 @@ pub(super) fn apply(endpoint: &str, default_model: Option<&str>) -> AppResult<St
 /// 五种形态实测全部畅通、无凭据门禁。这份 auth.json **纯粹是为了那道 UI 门**。
 /// 上一版把两件事混为一谈，删掉它之后 CLI 照跑、而桌面端用户卡在登录页。
 ///
+/// # 为什么是「整份覆盖 + 备份」而不是「有真凭据就不碰」（2026-08-26 第二次改）
+///
+/// 上一版写的是「已有真凭据（OAuth `tokens` 或真 key）时一个字节都不动」，理由是
+/// 「有真凭据时 App 本来就不弹登录页」。**那个前提是错的** —— 真机实测：用户盘上是一份
+/// **过期的** ChatGPT OAuth（`Failed to refresh token: 你已登出或在其他账户登录`），
+/// 而它的 `getAuthStatus` 返回 `authMethod: null` → 照样弹登录页。
+///
+/// | auth.json | `getAuthStatus` |
+/// |---|---|
+/// | 过期 OAuth（`auth_mode:chatgpt` + 刷不动的 `tokens`） | `null` → **弹登录页** |
+/// | 只有非空 `OPENAI_API_KEY`（cc-switch 切中转站时写的形态） | `"apikey"` → 不弹 |
+/// | 非空 key + `auth_mode:"apikey"`（我们写的形态） | `"apikey"` → 不弹 |
+/// | 不存在 | `null` → 弹 |
+///
+/// 也就是说「保着那份 OAuth」并没有保住任何**可用**的东西 —— 它对 Codex 已经等于没有，
+/// 而代价是用户永远停在登录页。cc-switch 的做法（从它本机库取证）正是**整份覆盖**：
+/// 它的中转站档写的是 `{"OPENAI_API_KEY":"sk-…"}`，**没有** `tokens`、没有 `auth_mode:chatgpt`。
+///
+/// 所以判据从「能不能写」改成「**写之前有没有留下可回滚的副本**」：
+/// - `backup_and_write_bytes` 首写即锁地把**接入前的原件**存进 `.bak`；
+/// - `restore` / 停止代理时整份交还（`disarm_legacy_placeholder_auth` 的第一支）。
+///
+/// 这与「不碰」的区别是**可逆 vs 不可用**：覆盖是可逆的（原件在 `.bak`，用户点停止就回来），
+/// 而「不碰」换来的是一个不可用的登录页。两害相权，可逆的那个。
+///
+/// # 那条数据丢失缺陷仍然被防着（别把这次改动当成回退）
+///
+/// 上一版引入白名单是为了防「Codex 0.149 把 OAuth 挪进混淆键名 → 黑名单判否 → 覆盖后
+/// 盘上无副本」。真正致命的不是「覆盖」，是**覆盖时没留副本**。故这次保留白名单，
+/// 但把它的用途收窄到它本来该管的那件事：[`auth_is_only_our_placeholder`] 决定
+/// 「这份文件能不能**整份删掉**」（不可逆操作，必须保守）。
+/// 而「能不能覆盖」由「备份是否成功」决定 —— `backup_and_write_bytes` 失败即整个 apply 失败回滚。
+///
 /// # 三条防线（因为这份假凭据确实有外发风险）
 ///
 /// 它只在「`model_provider` 被第三方改掉、Codex 回落官方地址」时才会被发出去。故：
-/// 1. **只在必要时写**：已有真凭据（OAuth `tokens` 或用户自己的真 key）时**一个字节都不动** ——
-///    旧实现是无条件整份替换，一次接入就抹掉用户的 ChatGPT 登录态；
-/// 2. **占位符自解释**：那句 401 显示成 `SEE-SYNA***ROUTE`（见 `CODEX_AUTH_PLACEHOLDER`），
+/// 1. **占位符自解释**：那句 401 显示成 `SEE-SYNA***OUTE`（见 `CODEX_AUTH_PLACEHOLDER`），
 ///    把人指向 SynaRoute 而不是 platform.openai.com；
-/// 3. **漂移检测 + 还原时解除**：`drift_state` 常驻盯着，`restore` 摘掉它。
+/// 2. **漂移检测**：`drift_state` 常驻盯着（启动即跑 + 60s 一轮 + 系统通知）；
+/// 3. **还原时解除**：`restore` 交还原件并删 `.bak`。
 fn apply_auth_at(path: &Path) -> AppResult<Option<String>> {
     // 已经是我们的占位符 → 幂等短路。**必须有这一支**：不短路的话
     // `backup_and_write_bytes` 会把「已接入态」当成「接入前快照」拷进 `.bak`，
@@ -185,13 +217,16 @@ fn apply_auth_at(path: &Path) -> AppResult<Option<String>> {
         return Ok(None);
     }
 
-    // **有真凭据就别碰**。这是与旧实现最大的区别：旧版无条件整份替换，
-    // 于是一次接入就抹掉 ChatGPT OAuth 令牌（`"OPENAI_API_KEY": null` 那个幂等守卫
-    // 对 OAuth 态压根不命中）。有真凭据时 App 本来就不弹登录页，我们没有理由动它。
-    if auth_has_real_credentials(path) {
+    // 用户自己的**可用**真 key（非占位符、非 OAuth）→ 不碰。
+    //
+    // 这一支与 OAuth 那种情形不同：一个真实的 api key 对 Codex 是**有效**的，
+    // `getAuthStatus` 会返 `"apikey"`、本来就不弹登录页，覆盖它纯属破坏。
+    // 而过期 OAuth 是「看着在、实际等于没有」，那种才需要覆盖。
+    if auth_has_usable_api_key(path) {
         return Ok(None);
     }
 
+    let had_oauth = auth_has_oauth_tokens(path);
     let body = serde_json::json!({
         "OPENAI_API_KEY": CODEX_AUTH_PLACEHOLDER,
         // 与 `codex login --with-api-key` 写出的形态一致（它会补这个字段）。
@@ -201,29 +236,61 @@ fn apply_auth_at(path: &Path) -> AppResult<Option<String>> {
     });
     let bytes = serde_json::to_vec_pretty(&body)
         .map_err(|e| AppError::ToolConfig(format!("序列化 auth.json 失败: {e}")))?;
+    // 备份失败即上抛 → `apply` 的 with_rollback 把整轮改动回滚。
+    // 「没留下副本就绝不覆盖」这条是本函数唯一不可让的判据。
     backup_and_write_bytes(path, &bytes)?;
+    if had_oauth {
+        return Ok(Some(format!(
+            "已写入 {}（占位密钥，仅为让 Codex 桌面端跳过登录页）；\
+             原 ChatGPT 登录态已备份，点「停止」或「还原」即可交还",
+            path.display()
+        )));
+    }
     Ok(Some(format!(
         "已写入 {}（占位密钥，仅为让 Codex 桌面端跳过登录页；真实密钥由代理按路由 Key 注入）",
         path.display()
     )))
 }
 
-/// auth.json 里是否有**用户自己的**真凭据（ChatGPT OAuth 令牌，或非占位符的 API key）。
+/// auth.json 里是否有一个**可用的、属于用户自己的** API key。
 ///
-/// 判「有没有真东西」而不是判「是不是我们的」：前者决定「能不能动这个文件」，
-/// 而误判的代价是抹掉用户的登录态 —— 故这一侧要**宽**（宁可不写，也不覆盖）。
-fn auth_has_real_credentials(path: &Path) -> bool {
+/// 「可用」是关键限定：这个判据决定「要不要放弃覆盖」，而放弃覆盖的代价是用户停在登录页。
+/// 故只在覆盖**确实是破坏**时才返回 true —— 也就是那份凭据对 Codex 真的有效。
+///
+/// # 为什么 OAuth `tokens` 不算在这里
+///
+/// 一份 OAuth 可能已经**刷不动了**（用户在别处登出/换号），此时 `getAuthStatus` 返
+/// `authMethod: null`、照样弹登录页 —— 保着它没保住任何可用的东西。
+/// 而 api key 不会「过期到无法判断」：它要么被上游接受、要么被拒，Codex 侧一律返 `"apikey"`、
+/// 不弹登录页。两者性质不同，故分开判。
+///
+/// OAuth 的那份由 `.bak` 保护（覆盖前整份存档，还原时交还），见 [`apply_auth_at`]。
+fn auth_has_usable_api_key(path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
     let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text) else {
         return false;
     };
-    if obj.get("tokens").is_some_and(|t| !t.is_null()) {
-        return true;
-    }
     matches!(obj.get("OPENAI_API_KEY"), Some(Value::String(v))
         if !v.is_empty() && !is_our_placeholder_value(v))
+}
+
+/// auth.json 里是否有 ChatGPT OAuth 令牌（不论是否还能刷新）。
+///
+/// 只用于**给用户的文案**（「原登录态已备份」），不参与「能不能写」的决策 ——
+/// 那个判据在 [`auth_has_usable_api_key`]。
+///
+/// `!t.is_null()` 不能写成 `.is_some()`：登出后的形态是 `"tokens": null`，
+/// 而 `.is_some()` 对 `Value::Null` 为真 —— 那会让文案谎称「已备份登录态」而其实没有。
+fn auth_has_oauth_tokens(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    obj.get("tokens").is_some_and(|t| !t.is_null())
 }
 
 /// 某个 `OPENAI_API_KEY` 取值是否是我们写的占位符（含**历史**值）。
@@ -1270,38 +1337,71 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// 接入**逐字节不动**已有真凭据的 auth.json（ChatGPT OAuth 令牌）。
+    /// 用户自己**可用的** api key 不许动；而 OAuth 令牌**要覆盖，但必须先备份**。
     ///
-    /// 这条替代了旧的 `codex_auth_apply_backs_up_oauth_and_restore_brings_it_back_verbatim`：
-    /// 那条测的是「整份替换掉 OAuth 之后还能不能还原回来」，而现在的性质更强 ——
-    /// 有真凭据时压根不动它，于是「还原不回来」这个风险面整个消失。
+    /// 这条替代了上一版的 `apply_auth_never_touches_real_credentials` —— 那条断言
+    /// 「有 OAuth 就一个字节都不动」，而它的前提被真机证伪：用户盘上那份 OAuth 已经
+    /// **刷不动了**（`Failed to refresh token: 你已登出或在其他账户登录`），
+    /// `getAuthStatus` 返 `authMethod: null` → 照样弹登录页。
+    /// 保着它没保住任何**可用**的东西，代价是用户永远停在登录页。
     ///
-    /// 旧实现的幂等守卫 `if let Some(Value::String(existing))` 对 OAuth 态的真实取值
-    /// `"OPENAI_API_KEY": null` **不命中**（null 是 `Value::Null`），于是直接落到整份替换分支
-    /// —— 一次接入就抹掉用户的登录态。这条测试盯的就是那个洞。
+    /// 判据因此从「能不能写」改成「**写之前有没有留下可回滚的副本**」：
+    /// 覆盖是可逆的（原件在 `.bak`，点停止就交还），而「不碰」换来的是一个不可用的登录页。
     #[test]
-    fn apply_auth_never_touches_real_credentials() {
-        let d = temp_dir("keep_oauth");
+    fn apply_auth_overwrites_oauth_but_always_leaves_a_backup() {
+        let d = temp_dir("oauth_backup");
         let auth = d.join("auth.json");
         let oauth = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","tokens":{"access_token":"real","refresh_token":"rt"},"last_refresh":"2026-06-25T13:01:56Z"}"#;
         write(&auth, oauth);
 
-        assert_eq!(apply_auth_at(&auth).unwrap(), None, "有真凭据 → 什么都不做");
+        let note = apply_auth_at(&auth).unwrap().expect("过期 OAuth 必须被覆盖，否则一直弹登录页");
+        assert!(
+            note.contains("已备份"),
+            "文案必须告诉用户原登录态还在、怎么拿回来：{note}"
+        );
+
+        // 覆盖后是能过那道门的形态（非空 key）
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&auth).unwrap()).unwrap();
+        assert_eq!(v["OPENAI_API_KEY"].as_str(), Some(CODEX_AUTH_PLACEHOLDER));
+        assert!(v.get("tokens").is_none(), "覆盖后不该再留着 tokens 字段");
+
+        // **最要紧的一条**：原件逐字节在 .bak 里，还原能拿回来。
+        let bak = super::super::backup_path_for(&auth);
+        assert!(bak.exists(), "覆盖前必须留下副本 —— 没副本就绝不许覆盖");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            oauth,
+            ".bak 必须是**接入前**的原件，逐字节相同"
+        );
+
+        // 还原：交还原件、删 .bak
+        disarm_legacy_placeholder_auth(&auth).unwrap();
         assert_eq!(
             std::fs::read_to_string(&auth).unwrap(),
             oauth,
-            "接入不得改动用户的 ChatGPT 登录态"
+            "还原必须把 ChatGPT 登录态逐字节交还"
         );
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 用户自己**可用的** api key 一个字节都不许动。
+    ///
+    /// 与 OAuth 那种情形性质不同：一个真实 api key 对 Codex 是**有效**的，
+    /// `getAuthStatus` 返 `"apikey"`、本来就不弹登录页，覆盖它纯属破坏。
+    #[test]
+    fn apply_auth_never_touches_a_usable_api_key() {
+        let d = temp_dir("keep_realkey");
+        let auth = d.join("auth.json");
+        let realkey = r#"{"OPENAI_API_KEY":"sk-userrealkey123","auth_mode":"apikey"}"#;
+        write(&auth, realkey);
+
+        assert_eq!(apply_auth_at(&auth).unwrap(), None, "可用的真 key → 什么都不做");
+        assert_eq!(std::fs::read_to_string(&auth).unwrap(), realkey);
         assert!(
             !super::super::backup_path_for(&auth).exists(),
             "既然不动它，就不该为它建 .bak（建了反而是把真凭据复制了一份）"
         );
-
-        // 用户自己的真实 api key（非占位符）同样不许动。
-        let realkey = r#"{"OPENAI_API_KEY":"sk-userrealkey123","auth_mode":"apikey"}"#;
-        write(&auth, realkey);
-        assert_eq!(apply_auth_at(&auth).unwrap(), None);
-        assert_eq!(std::fs::read_to_string(&auth).unwrap(), realkey);
 
         std::fs::remove_dir_all(&d).ok();
     }
