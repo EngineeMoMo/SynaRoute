@@ -28,6 +28,7 @@ mod store;
 mod tools;
 mod tray_icon;
 mod upstream;
+mod vendors;
 mod usage_store;
 mod usage_cost;
 /// upstream 对外契约守卫。**必须放在 upstream 外面**才能真正验证可见性，
@@ -184,7 +185,6 @@ fn change_master_password(
     tracing::info!("主口令已修改，重新封装 {n} 条密钥");
     Ok(n)
 }
-
 
 /// 把某 Key 设为该分类的主 Key（优先级 0）。
 ///

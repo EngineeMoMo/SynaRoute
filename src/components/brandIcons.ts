@@ -247,6 +247,25 @@ export const BRANDS: Brand[] = [
     color: "#FF6933",
     keywords: ["baichuan", "百川"],
   },
+  {
+    key: "lingyiwanwu",
+    label: "零一万物 Yi",
+    labelEn: "01.AI / Yi",
+    group: "china",
+    color: "#00A67E",
+    // `yi` 太短，**不能**单独当关键词：它是 "gemini"/"claude-opus" 这类名字里的常见子串，
+    // 会把别家的模型误判成零一万物（`resolveBrand` 是子串匹配）。
+    // 故只收足够长、不会误伤的形态。
+    keywords: ["lingyiwanwu", "零一万物", "yi-lightning", "yi-large", "01-ai", "01.ai"],
+  },
+  {
+    key: "infini",
+    label: "无问芯穹",
+    labelEn: "Infini-AI",
+    group: "china",
+    color: "#4B5FE3",
+    keywords: ["infini", "无问芯穹"],
+  },
 
   // ---------------- 聚合 / 中转 / 托管 ----------------
   {
@@ -314,6 +333,17 @@ export const BRANDS: Brand[] = [
     color: hex("huggingface", "#FFD21E"),
     path: p("huggingface"),
     keywords: ["huggingface", "hf.co"],
+  },
+  {
+    key: "aihubmix",
+    label: "AiHubMix",
+    labelEn: "AiHubMix",
+    group: "gateway",
+    color: "#006FFB",
+    // simple-icons 没有它 → 首字母色块。它是内置厂商之一，
+    // 少这条会让厂商列表里那一项显示成一个随机哈希色的字母块
+    // （Rust 侧 `every_vendor_id_appears_in_the_frontend_brand_keywords` 会红）。
+    keywords: ["aihubmix", "inferera"],
   },
   {
     key: "azure",
