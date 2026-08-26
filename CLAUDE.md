@@ -82,7 +82,7 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   凭据类文件一律拒读（按「模型给的名字」与「解析链接后的真实落点」**各判一次**，两次都不能省）。
   每条防线都做过故障注入验证（去掉后测试必须变红）。当前基线 **433 passed / 0 failed**
   <br>📌 **基线口径（2026-08-26 实测）**：上面各条历史行里的 311/312/368/383/433/506/719/760
-  都是**当时**的数字，勿当现值。当前实测 `cargo test --lib` = **805 passed / 0 failed / 3 ignored**
+  都是**当时**的数字，勿当现值。当前实测 `cargo test --lib` = **806 passed / 0 failed / 3 ignored**
   （连跑 3 次全绿；`cargo clippy --lib --all-targets -- -D warnings` 零警告；
   `tsc --noEmit` 干净；`npm test` 110 passed / 12 文件；`npm run build` 通过含颜色类零 CSS 检查；
   `npm run gates` 全绿）。
