@@ -159,14 +159,23 @@ const GROUP_ORDER: BrandGroup[] = ["official", "china", "gateway", "local"];
  * 每项**带文字标签**（不再只有图标）。搜索同时匹配中英文名与关键词，
  * 所以输 `glm`、`智谱`、`bigmodel` 都能找到智谱。
  */
+/** 某个预设键的显示名（`undefined` = 不是预设键 / 未选择）。 */
+export function brandLabel(key: string | undefined): string | undefined {
+  if (!key) return undefined;
+  return BRANDS.find((b) => b.key === key)?.label;
+}
+
 export function BrandPresetPicker({
   value,
   onChange,
   disabled,
+  listClassName,
 }: {
   value?: string;
   onChange: (next: string | undefined) => void;
   disabled?: boolean;
+  /** 覆盖滚动区限高。内联形态要压矮（免得把保存按钮顶出屏幕），弹窗形态可以放开。 */
+  listClassName?: string;
 }) {
   const t = useT();
   const [q, setQ] = useState("");
@@ -214,8 +223,9 @@ export function BrandPresetPicker({
         )}
       </div>
 
-      {/* 限高 + 自己滚：这一块嵌在表单里，32 个品牌全展开会把保存按钮顶到屏幕外 */}
-      <div className="max-h-56 space-y-2.5 overflow-y-auto pr-1">
+      {/* 限高 + 自己滚：内联形态嵌在表单里，32 个品牌全展开会把保存按钮顶到屏幕外。
+          弹窗形态传 listClassName 放开限高（那里没有「顶出屏幕」的问题）。 */}
+      <div className={`space-y-2.5 overflow-y-auto pr-1 ${listClassName ?? "max-h-56"}`}>
         {groups.map(({ group, items }) => (
           <div key={group}>
             <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-text-muted">

@@ -17,7 +17,15 @@ export const brandPickerZh: Dict = {
   "brandPicker.group.gateway": "聚合 / 中转 / 托管",
   "brandPicker.group.local": "本机推理",
   "brandPicker.noMatch": "没有匹配「{q}」的厂商",
+  "brandPicker.title": "选择品牌图标",
+  // 触发按钮上的两行字。「自动」这一档必须显式说出来 —— 否则用户分不清
+  // 「我选了这个」与「程序按厂商名猜的」，而这两者在他改厂商时行为完全不同。
+  "brandPicker.autoCurrent": "跟随厂商自动匹配",
+  "brandPicker.change": "更改",
+  "brandPicker.auto": "改回自动匹配",
   "common.clear": "清除",
+  "common.ok": "知道了",
+  "editor.saveFailedTitle": "保存失败",
 };
 
 export const brandPickerEn: Dict = {
@@ -27,5 +35,11 @@ export const brandPickerEn: Dict = {
   "brandPicker.group.gateway": "Gateways & hosting",
   "brandPicker.group.local": "Local inference",
   "brandPicker.noMatch": "No vendor matches “{q}”",
+  "brandPicker.title": "Choose a brand icon",
+  "brandPicker.autoCurrent": "Auto (follows vendor)",
+  "brandPicker.change": "Change",
+  "brandPicker.auto": "Back to auto",
   "common.clear": "Clear",
+  "common.ok": "Got it",
+  "editor.saveFailedTitle": "Save failed",
 };

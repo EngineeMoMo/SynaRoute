@@ -4,7 +4,10 @@ import { useStore } from "@/store";
 import { useT } from "@/lib/useT";
 import { Button } from "@/components/ui/Button";
 import { Combobox } from "@/components/ui/Combobox";
-import { BrandIcon, BrandPresetPicker } from "@/components/BrandIcon";
+import { BrandIcon } from "@/components/BrandIcon";
+import { BrandPickerDialog, BrandPickerTrigger } from "@/components/BrandPickerDialog";
+import { SaveErrorDialog } from "@/components/SaveErrorDialog";
+import { MAX_COST_MULTIPLIER, isValidCostMultiplier } from "@/lib/costMultiplier";
 import type {
   BalanceQuery,
   BalanceResult,
@@ -108,31 +111,6 @@ function isValidHttpUrl(raw: string): boolean {
   }
 }
 
-/**
- * 计费倍率的上界。**必须与后端 `pricing::MAX_COST_MULTIPLIER` 同值**。
- *
- * 1000 的取法：中转站折扣实际区间是 0.1~5（常见 0.3、0.5、2），官方原价 1.0。
- * 留三个数量级余量已足够容纳任何真实定价，再大只可能是笔误。
- */
-const MAX_COST_MULTIPLIER = 1000;
-
-/**
- * 计费倍率是否可用（空串 = 未填，合法）。
- *
- * 为什么要在前端也判：后端 `estimate_cost` 对非法值**静默退回 1.0**——这个兜底是对的
- * （不能让一个笔误把整页金额算成 0），但它同时意味着用户填错时**界面上什么都不会说**：
- * 他填了「0.3折」「三折」「30%」，以为倍率生效了，用量页却按原价算，
- * 而那正是他配这个字段要解决的问题。金额差了 3 倍且无人告知，比压根不支持更糟。
- *
- * 判据与后端逐条对齐（有限、正数、不超上界），否则会出现「前端放过、后端按 1.0 算」
- * 或反之的错位。`inf` / `1e400` 都能被 `Number()` 解析成 Infinity，必须显式挡掉。
- */
-function isValidCostMultiplier(raw: string): boolean {
-  const s = raw.trim();
-  if (!s) return true; // 未填 = 用官方原价
-  const n = Number(s);
-  return Number.isFinite(n) && n > 0 && n <= MAX_COST_MULTIPLIER;
-}
 
 function defaultBalanceQuery(): BalanceQuery {
   return {
@@ -204,6 +182,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const [costMultiplier, setCostMultiplier] = useState(initial?.costMultiplier ?? "");
   /** 这条 Key 的图标覆盖（预设键或 data-URL）；undefined = 跟着厂商走。 */
   const [icon, setIcon] = useState<string | undefined>(initial?.icon);
+  const [iconPickerOpen, setIconPickerOpen] = useState(false);
   const [fetching, setFetching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -753,10 +732,18 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                   把图标记在那个共享厂商上，改一条会连带改掉其余全部。
                   故**任何厂商下都可选**（含内置），选中的值只作用于当前这条 Key；
                   留空则跟着厂商走，与旧行为一致。 */}
+              {/* 挑选器走**弹窗**而不是内联展开：内联那版把这一行撑到 ~200px 高，
+                  而右列只有一个 40px 的协议下拉可填 → 下拉右下方一大块空白（真机报障）。
+                  32 个品牌的目录（搜索 + 分组 + 滚动）与旁边的单选下拉不是同一个量级，
+                  塞进同一行必然要么挤瘦它、要么撑高整行留白。详见 BrandPickerDialog。 */}
               <div className="mt-2">
                 <div className="mb-1.5 text-[11px] text-text-muted">{t("editor.iconPresetLabel")}</div>
-                <BrandPresetPicker value={icon} onChange={setIcon} />
-                <p className="mt-1.5 text-[11px] text-text-muted">{t("editor.iconPresetHint")}</p>
+                <BrandPickerTrigger
+                  value={icon}
+                  vendorHint={vendor}
+                  fallbackLabel={name || vendor}
+                  onOpen={() => setIconPickerOpen(true)}
+                />
               </div>
             </Field>
             <Field label={t("editor.protocol")} className="w-48">
@@ -1446,13 +1433,6 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
             )}
           </div>
 
-          {/* 保存错误：后端的校验消息是多行的（如桌面端模型名不合规会附后果与修法），
-              必须 whitespace-pre-line 保留换行，否则挤成一坨没人读得下去。 */}
-          {error && (
-            <div className="whitespace-pre-line rounded-control bg-danger/10 px-3 py-2 text-xs leading-relaxed text-danger">
-              {error}
-            </div>
-          )}
         </div>
 
         {/* 底部操作 */}
@@ -1461,6 +1441,17 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
           <Button onClick={save} disabled={saving}>{saving ? t("common.saving") : t("common.save")}</Button>
         </div>
       </div>
+
+      {/* 保存错误走弹窗，不再贴在可滚动表单体的末尾（在视口外 = 「点了没反应」）。
+          判据与实现见 SaveErrorDialog。 */}
+      <SaveErrorDialog error={error} onClose={() => setError(null)} />
+
+      <BrandPickerDialog
+        open={iconPickerOpen}
+        value={icon}
+        onChange={setIcon}
+        onClose={() => setIconPickerOpen(false)}
+      />
     </div>
   );
 }
