@@ -16,7 +16,7 @@
     "src-tauri/src/upstream/sse.rs": 1247,
     "src/components/KeyEditor.tsx": 1645,
     "src/lib/i18n.ts": 1500,
-    "src/lib/mockData.ts": 977,
+    "src/lib/mockData.ts": 958,
     "src/pages/BrainPage.tsx": 1393,
     "src/pages/SettingsPage.tsx": 1900
   },
