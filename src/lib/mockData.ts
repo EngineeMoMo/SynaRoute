@@ -21,6 +21,7 @@ import type {
 } from "@/types";
 import type { UserPrefs } from "@/lib/prefs";
 import { mockUsageWithCost } from "./mockData.usage";
+import { MOCK_VENDORS } from "./mockData.vendors";
 
 const now = Date.now();
 
@@ -417,33 +418,13 @@ let settings: AppSettings = {
   mcpPort: 9527,
 };
 
-// 内置厂商种子（与后端 model.rs Vendor::builtin_seed 保持一致）
-let vendors: Vendor[] = [
-  { id: "anthropic", name: "Anthropic", defaultBaseUrl: "https://api.anthropic.com", defaultProtocol: "anthropic", builtin: true, presetModels: [
-    { realName: "claude-opus-4-5", displayName: "Claude Opus 4.5", contextWindow: 200_000 },
-    { realName: "claude-sonnet-4-5", displayName: "Claude Sonnet 4.5", contextWindow: 200_000 },
-    { realName: "claude-haiku-4-5", displayName: "Claude Haiku 4.5", contextWindow: 200_000 },
-  ] },
-  { id: "openai", name: "OpenAI", defaultBaseUrl: "https://api.openai.com/v1", defaultProtocol: "openai_responses", builtin: true, presetModels: [
-    { realName: "gpt-5.5", displayName: "GPT-5.5", contextWindow: 400_000 },
-    { realName: "gpt-5", displayName: "GPT-5", contextWindow: 400_000 },
-    { realName: "gpt-4o", displayName: "GPT-4o", contextWindow: 128_000 },
-  ] },
-  { id: "zhipu", name: "智谱 GLM", defaultBaseUrl: "https://open.bigmodel.cn/api/paas/v4", defaultProtocol: "openai_chat", builtin: true, presetModels: [
-    { realName: "glm-4.6", displayName: "GLM-4.6", contextWindow: 200_000 },
-    { realName: "glm-4.5", displayName: "GLM-4.5", contextWindow: 128_000 },
-    { realName: "glm-4.5-air", displayName: "GLM-4.5-Air", contextWindow: 128_000 },
-  ] },
-  { id: "deepseek", name: "DeepSeek", defaultBaseUrl: "https://api.deepseek.com", defaultProtocol: "openai_chat", builtin: true, presetModels: [
-    { realName: "deepseek-chat", displayName: "DeepSeek Chat", contextWindow: 128_000 },
-    { realName: "deepseek-reasoner", displayName: "DeepSeek Reasoner", contextWindow: 128_000 },
-  ] },
-  { id: "moonshot", name: "月之暗面 Kimi", defaultBaseUrl: "https://api.moonshot.cn/v1", defaultProtocol: "openai_chat", builtin: true, presetModels: [
-    { realName: "kimi-k2-0905-preview", displayName: "Kimi K2", contextWindow: 256_000 },
-    { realName: "moonshot-v1-128k", displayName: "Moonshot v1 128k", contextWindow: 128_000 },
-  ] },
-  { id: "custom", name: "自定义", defaultBaseUrl: "", defaultProtocol: "anthropic", builtin: true },
-];
+// 内置厂商种子。清单本身在 mockData.vendors.ts（与 Rust 那份有跨语言判据盯着，
+// 见该文件顶部说明）。这里只保留一个可变副本，供 upsert/delete 改动。
+//
+// ⚠️ 刻意用 `structuredClone` 而不是下面那个 `clone` 助手：`clone` 是 `const` 箭头函数、
+// 在本行之后才定义，`const` 没有提升，模块初始化时调它会直接 TDZ 报错
+// （表现是整个 mock 层 import 失败 → 演示模式整页白屏）。
+let vendors: Vendor[] = structuredClone(MOCK_VENDORS);
 
 const delay = (ms = 200) => new Promise((r) => setTimeout(r, ms));
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
