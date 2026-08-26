@@ -28,6 +28,7 @@ mod store;
 mod tools;
 mod tray_icon;
 mod upstream;
+mod usage_store;
 mod usage_cost;
 /// upstream 对外契约守卫。**必须放在 upstream 外面**才能真正验证可见性，
 /// 详见该文件的模块注释。
@@ -68,7 +69,6 @@ fn list_keys(state: tauri::State<AppState>, category_id: CategoryType) -> Vec<Pr
 fn upsert_key(state: tauri::State<AppState>, key: ProviderKey) -> AppResult<ProviderKey> {
     service::save_key(&state.store, key)
 }
-
 
 /// 桌面端对外模型名**即时**体检（UX#4），供 KeyEditor 边打字边提示。
 ///

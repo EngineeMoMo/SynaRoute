@@ -6,7 +6,7 @@ use crate::error::{AppError, AppResult};
 use crate::model::*;
 use crate::secret::{atomic_write, SecretStore};
 use parking_lot::RwLock;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 /// 检查 baseUrl 是否含路径后缀（如 `https://api.deepseek.com/anthropic` 中的 `/anthropic`）。
@@ -133,62 +133,7 @@ pub struct Store {
     usage_baseline_date: RwLock<String>,
 }
 
-/// `load_usage` 的结果。
-///
-/// 用具名结构体而不是元组：三个字段里有两个是 `i64`/`bool` 这种「位置一错就静默出错」
-/// 的类型，元组解构写反了编译器不会拦。`read_only` 尤其不能错 —— 它反了就等于
-/// 把版本门变成破坏源。
-struct UsageLoad {
-    totals: std::collections::BTreeMap<(CategoryType, String), TokenUsage>,
-    since: i64,
-    /// 磁盘上那份文件**比本程序认识的格式更新**，本次运行只读不写。
-    read_only: bool,
-    /// 已落盘的按日分桶（v2）。v1 文件读出来是空的 —— 它没有日期维度，
-    /// 那部分历史只体现在 `totals` 里，无法反推每天各花了多少（如实丢弃日维度，
-    /// 不编造一个假日期把整段历史堆到某一天）。
-    daily_buckets: Vec<crate::model::DailyUsageBucket>,
-    /// 已被 90 天滚动淘汰的桶的累计（v3）。参与 `totals`，但不进按日视图。
-    /// 见 `UsageSnapshot::retired`：没有它，累计总量每过一个 90 天就往下掉一截。
-    retired: Vec<crate::model::TokenUsageByKey>,
-}
 
-impl UsageLoad {
-    /// 「没有历史可继承，但可以正常写回」—— 全新安装 / 文件**内容已损坏**走这个。
-    ///
-    /// 注意不含「读失败」：那条走 [`Self::fresh_read_only`]，理由见那里。
-    fn fresh(now: i64) -> Self {
-        Self {
-            totals: std::collections::BTreeMap::new(),
-            since: now,
-            read_only: false,
-            daily_buckets: Vec::new(),
-            retired: Vec::new(),
-        }
-    }
-
-    /// 「没有历史可继承，且**本次不许写回**」—— 读文件失败（非 NotFound）走这个。
-    ///
-    /// 为什么必须与 [`Self::fresh`] 分开：读失败与解析失败是两件不同的事。
-    /// - **解析失败** = 内容确已损坏（断电写坏），用好数据覆盖它是对的；
-    /// - **读失败** = 文件很可能**完好无损**，只是这一瞬间打不开：Windows 上杀软扫描、
-    ///   备份程序、OneDrive 同步都会短暂独占（ERROR_SHARING_VIOLATION），ACL 抖动则是
-    ///   ACCESS_DENIED。此时若按「从零累计且允许写回」处理，60 秒后第一次 flush 就用
-    ///   空日桶把用户最多 90 天的用量历史整份覆盖掉 —— 文件本来是好的，是我们自己毁了它，
-    ///   且不可自愈（用量是纯累加值，没有别处可恢复）。
-    ///
-    /// 这与「文件版本比我新」那道门是**同一条破坏链**，只是入口不同，故复用同一套
-    /// 自我保护：本次运行照常记账（面板显示从零开始），但一个字节都不写回磁盘，
-    /// 下次启动读成功即恢复全部历史。
-    fn fresh_read_only(now: i64) -> Self {
-        Self {
-            totals: std::collections::BTreeMap::new(),
-            since: now,
-            read_only: true,
-            daily_buckets: Vec::new(),
-            retired: Vec::new(),
-        }
-    }
-}
 
 /// 用量累计的定时落盘间隔（秒）。
 ///
@@ -436,36 +381,8 @@ impl Store {
 
         let (mut config, load_failed) = Self::load_config_from_disk(&config_path)?;
 
-        // 首次运行（或老配置无 vendors）注入内置厂商种子
-        let seeded = config.vendors.is_empty();
-        if seeded {
-            config.vendors = Vendor::builtin_seed();
-        }
-
-        // 迁移：老配置的内置厂商没有 preset_models 字段（serde default 给空 vec），
-        // 从种子按 id 回填，让老用户也能用「一键导入预设模型」。仅补空、不覆盖用户已有数据。
-        let migrated_presets = if !seeded {
-            Self::backfill_builtin_presets(&mut config.vendors)
-        } else {
-            false
-        };
-
-        // 迁移：根据配置版本号执行必要的数据迁移
-        let mut needs_persist = seeded || migrated_presets;
-
-        // 版本迁移：v1 → v2（余额查询 URL 修正）
-        if config.config_version < 2 {
-            let migrated = Self::migrate_balance_query_url(&mut config.keys);
-            if migrated {
-                tracing::info!("配置迁移：v1 → v2（余额查询 URL 从 /v1/usage 改为 /user/balance）");
-            }
-            // 无论是否迁移成功，只要进入该版本门，就提升版本号并落盘，
-            // 防止版本号永久停留在 v1 导致将来 v3 迁移的时序错误
-            config.config_version = 2;
-            needs_persist = true;
-        }
-
-        // 后续版本迁移在此追加（如 config.config_version < 3 时的逻辑）
+        // 全部配置迁移收在一个函数里（`new_at` 也调它），见 `migrate_config` 的文档。
+        let needs_persist = Self::migrate_config(&mut config);
 
         let secrets = SecretStore::load(secrets_path)?;
 
@@ -473,8 +390,8 @@ impl Store {
         let initial_stamp = Self::read_disk_stamp(&config_path);
 
         // 用量累计：启动即恢复上次的累计值（周期性落盘保存下来的），失败则从零开始。
-        let usage_path = Self::usage_file_path(&config_path);
-        let usage_loaded = Self::load_usage(&usage_path);
+        let usage_path = crate::usage_store::usage_file_path(&config_path);
+        let usage_loaded = crate::usage_store::load_usage(&usage_path);
 
         // 启动时刻的基线 = 刚加载的历史总量（本次运行的增量从此开始累计）
         let baseline = usage_loaded.totals.clone();
@@ -507,6 +424,65 @@ impl Store {
         Ok(store)
     }
 
+    /// 全部配置迁移的**唯一入口**。返回「是否需要落盘」。
+    ///
+    /// # 为什么要收成一个函数
+    ///
+    /// 这些迁移原先直接写在 `Store::new` 的函数体里，而测试构造器 `new_at`
+    /// **一条都不跑** —— 于是「迁移有没有真的接上」这件事在测试里根本覆盖不到：
+    /// 单测能验 `add_new_builtin_vendors` 本身没问题，却验不出它有没有被调用。
+    /// （把调用点删掉、全套 799 条测试照旧全绿，实测过。这与 CLAUDE.md 里
+    /// `route_meta` / `handle_http` 那条「单元覆盖了函数不等于覆盖了接线」是同一个坑。）
+    ///
+    /// 收进来之后 `new` 与 `new_at` 共用同一条路径，`migrations_are_wired_into_construction`
+    /// 那条测试直接对着**构造出来的 Store** 断言。
+    ///
+    /// # 顺序有讲究
+    ///
+    /// 种子注入必须在最前（后面的迁移要在完整的厂商列表上跑）；
+    /// 版本门放最后，因为它无条件抬版本号 —— 抬早了会让同一轮里后加的迁移被跳过。
+    fn migrate_config(config: &mut AppConfig) -> bool {
+        // 首次运行（或老配置无 vendors）注入内置厂商种子
+        let seeded = config.vendors.is_empty();
+        if seeded {
+            config.vendors = Vendor::builtin_seed();
+        }
+
+        // 迁移：老配置的内置厂商没有 preset_models 字段（serde default 给空 vec），
+        // 从种子按 id 回填，让老用户也能用「一键导入预设模型」。仅补空、不覆盖用户已有数据。
+        //
+        // 同时把**种子里新增的**内置厂商补进来。没有这一步，往 `builtin_seed()` 里加厂商
+        // 就只对全新安装生效 —— 老用户（绝大多数）永远看不到，是一次典型的静默失效。
+        let (migrated_presets, added_vendors) = if !seeded {
+            let filled = Self::backfill_builtin_presets(&mut config.vendors);
+            let added = Self::add_new_builtin_vendors(&mut config.vendors);
+            if added > 0 {
+                tracing::info!("配置迁移：补入 {added} 个新增的内置厂商");
+            }
+            (filled, added)
+        } else {
+            (false, 0)
+        };
+
+        let mut needs_persist = seeded || migrated_presets || added_vendors > 0;
+
+        // 版本迁移：v1 → v2（余额查询 URL 修正）
+        if config.config_version < 2 {
+            let migrated = Self::migrate_balance_query_url(&mut config.keys);
+            if migrated {
+                tracing::info!("配置迁移：v1 → v2（余额查询 URL 从 /v1/usage 改为 /user/balance）");
+            }
+            // 无论是否迁移成功，只要进入该版本门，就提升版本号并落盘，
+            // 防止版本号永久停留在 v1 导致将来 v3 迁移的时序错误
+            config.config_version = 2;
+            needs_persist = true;
+        }
+
+        // 后续版本迁移在此追加（如 config.config_version < 3 时的逻辑）
+
+        needs_persist
+    }
+
     /// 为内置厂商回填预设模型（幂等）：仅当某内置厂商 preset_models 为空时，
     /// 按 id 从种子拷贝。返回是否有改动（用于决定是否落盘）。自定义厂商不动。
     fn backfill_builtin_presets(vendors: &mut [Vendor]) -> bool {
@@ -524,6 +500,43 @@ impl Store {
             }
         }
         changed
+    }
+
+    /// 把**种子里新增的**内置厂商补进老用户的配置。返回补进去的条数。
+    ///
+    /// # 为什么必须有这一步
+    ///
+    /// `builtin_seed()` 只在 `config.vendors.is_empty()`（全新安装）时注入。也就是说
+    /// 往种子里加厂商，**老用户永远看不到** —— 而这正是本仓反复记录的那类静默失效：
+    /// 功能加了、代码在、测试也过，但只对新装用户生效，而老用户是绝大多数。
+    ///
+    /// # 两条边界
+    ///
+    /// 1. **不覆盖同 id 的现有项**。用户可能改过内置厂商的 base_url（换了区域镜像、
+    ///    走了自己的反代），拿种子覆盖等于把他的配置冲掉。只补「一条都没有」的 id。
+    /// 2. **追加在末尾**，不重排。厂商列表的顺序用户是有感知的（他自己加的排在后面）。
+    ///
+    /// # 为什么不需要「墓碑」记录用户删掉的内置项
+    ///
+    /// 因为**内置厂商删不掉** —— `delete_vendor` 对 `builtin` 直接返 Err
+    /// 「内置厂商不可删除」，`portable.rs` 的 Replace 导入也刻意保留内置项
+    /// （见 `replace_keeps_builtin_vendors_but_clears_custom_ones`）。
+    /// 所以「不在列表里」只可能意味着「这是新增的」，不存在「被用户删过」这个歧义。
+    ///
+    /// ⚠️ **哪天允许删内置厂商了，这里必须同时加墓碑**，否则用户会发现删掉的厂商
+    /// 每次重启都回来、删都删不掉。
+    fn add_new_builtin_vendors(vendors: &mut Vec<Vendor>) -> usize {
+        let existing: std::collections::HashSet<String> =
+            vendors.iter().map(|v| v.id.clone()).collect();
+        let mut added = 0usize;
+        for s in Vendor::builtin_seed() {
+            if existing.contains(&s.id) {
+                continue;
+            }
+            vendors.push(s);
+            added += 1;
+        }
+        added
     }
 
 
@@ -1813,152 +1826,6 @@ impl Store {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// `usage.json` 的路径：与 `config.json` 同目录。
-    ///
-    /// 跟着 config 走而不是另找一个「数据目录」，是为了继承 config 已经确立的落点语义 ——
-    /// Windows 上 `%APPDATA%\SynaRoute\` 受 MSIX 虚拟化影响、mac 上是
-    /// `~/Library/Application Support/SynaRoute/`。两个文件同目录，用户备份/迁移时
-    /// 不会只带走一个。
-    /// `usage.json` 的落点：**跟着 `config.json` 走**，不是跟着日志走。
-    ///
-    /// 这是刻意的分野，别「顺手统一」：日志与 `mcp-port` 放 exe 同级是为了绕开 MSIX 的 AppData
-    /// 虚拟化（要让「用户双击启动的实例」和「包内进程启动的实例」看到同一份文件）；用量属**用户数据**，
-    /// 就该跟 `config.json`/`secrets.enc` 同域、同一套备份与导入导出边界。
-    /// 代价是它同样会被虚拟化 —— 与 config 一致，符合预期，不是缺陷。
-    fn usage_file_path(config_path: &Path) -> PathBuf {
-        config_path
-            .parent()
-            .map(|d| d.join("usage.json"))
-            .unwrap_or_else(|| PathBuf::from("usage.json"))
-    }
-
-    /// 启动时读取用量累计。
-    ///
-    /// **一律不上抛错误**：文件缺失（全新安装）、内容损坏（断电写坏）都只是「没有历史累计」，
-    /// 绝不能因为一个统计文件读不出来就让应用起不来。损坏时落 warn 并从空开始，
-    /// 下一次 flush 会用好的内容覆盖它。
-    ///
-    /// **v2 改动（2026-08-11）**：读到 v2 文件时把所有 `daily_buckets` 里的 entries
-    /// 合并进内存累加器,这样重启后历史累计不会丢。v1 文件继续按老逻辑读 `entries`。
-    fn load_usage(path: &Path) -> UsageLoad {
-        let now = chrono::Utc::now().timestamp_millis();
-        // 三种降级，**写回权限不同**（别合并成一个分支）：
-        // - 文件缺失（全新安装）：从零累计，允许写回；
-        // - 内容解析失败（断电写坏）：从零累计，允许写回 —— 用好数据覆盖坏数据是对的；
-        // - **读失败**（杀软/备份/同步盘独占、ACL 抖动）：从零累计但**禁止写回**。
-        //   文件极可能完好，只是这一瞬打不开；若允许写回，60s 后一次 flush 就用空日桶
-        //   把最多 90 天历史覆盖掉。详见 `UsageLoad::fresh_read_only`。
-        let raw = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return UsageLoad::fresh(now),
-            Err(e) => {
-                tracing::error!(
-                    "读取用量统计失败（本次从零累计，且**本次运行不写回**以免覆盖磁盘上完好的历史；\
-                     重启读取成功即恢复）: {e} · 路径={path:?}"
-                );
-                return UsageLoad::fresh_read_only(now);
-            }
-        };
-        let snap: UsageSnapshot = match serde_json::from_slice(&raw) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("用量统计文件解析失败（本次从零开始累计）: {e}");
-                return UsageLoad::fresh(now);
-            }
-        };
-        // 版本门：只认自己认识的格式。
-        //
-        // `version` 若只写不读，就是个**假的**兼容位 —— 将来把 entries 改成按日分桶后，
-        // 旧版本程序（比如用户降级、或两台机器同步了这个文件）会用旧结构去解析新文件：
-        // serde 对未知字段默认忽略、缺失字段取 default，于是**解析"成功"但内容是空的**，
-        // 紧接着下一次 flush 就用空数据把用户攒了几个月的累计覆盖掉。
-        // 宁可这一次不显示统计（返回空、且**不动原文件**），也不能销毁数据。
-        if snap.version > USAGE_SNAPSHOT_VERSION {
-            tracing::warn!(
-                "用量统计文件版本为 {}，本程序只认到 {} —— 跳过本次累计并保留原文件，\
-                 不做解析也不覆盖（避免用旧结构解析新格式后把历史清零）",
-                snap.version,
-                USAGE_SNAPSHOT_VERSION
-            );
-            // 起算时刻仍沿用文件里的：面板显示的起点是对的，只是这次没读到明细。
-            let since = if snap.since_ms > 0 { snap.since_ms } else { now };
-            // read_only = true：**必须**同时禁掉写回，否则这道门自己就是破坏源 ——
-            // 返回空 map 后第一个请求就会 mark_usage_dirty，60s 后的 flush 会拿
-            // 「空累加器 + version=1」覆写这个更高版本的文件，正好干成它要防的事。
-            return UsageLoad {
-                totals: std::collections::BTreeMap::new(),
-                since,
-                read_only: true,
-                daily_buckets: Vec::new(),
-                retired: Vec::new(),
-            };
-        }
-
-        let mut map = std::collections::BTreeMap::new();
-
-        // v3：先把「已淘汰桶的累计」垫进底。
-        //
-        // 累计总量 = retired + 各存活桶之和。没有这一段，每有一个桶过 90 天被删，
-        // 下次启动读出来的累计就少一截 —— 一个「累计用量」面板越用数字越小，
-        // 用户据此估额度会严重低估。与当年「按事件环算总量」是同症状、不同成因。
-        //
-        // **v1 的 `entries` 也归到这里**：那是「过去某段时间的累计」、没有日期维度，
-        // 与「已淘汰的桶」是同一种数据（有总量、无日维度），`retired` 正是它的归宿。
-        // 此前它只进内存累加器、不落任何桶，于是**重启一次就永久消失**
-        // （旧测试把这个损失当成既定行为记着，理由是「无从得知属于哪天」——
-        // 那个理由只否定「造一个假日期」，不构成「必须丢掉总量」）。
-        let mut retired: std::collections::BTreeMap<(CategoryType, String), TokenUsage> =
-            std::collections::BTreeMap::new();
-        for row in snap.retired.iter() {
-            retired
-                .entry((row.category_id, row.key_id.clone()))
-                .or_default()
-                .add(&row.usage);
-        }
-        // v1 兼容：`entries` 非空 = 读到的是 v1 文件（v2+ 写出时该字段恒空）。
-        for row in &snap.entries {
-            retired
-                .entry((row.category_id, row.key_id.clone()))
-                .or_default()
-                .add(&row.usage);
-        }
-        for ((cat, kid), u) in retired.iter() {
-            map.entry((*cat, kid.clone())).or_insert_with(TokenUsage::default).add(u);
-        }
-        let retired: Vec<crate::model::TokenUsageByKey> = retired
-            .into_iter()
-            .map(|((cat, kid), u)| crate::model::TokenUsageByKey {
-                category_id: cat,
-                key_id: kid,
-                usage: u,
-            })
-            .collect();
-
-        // v2：合并所有 daily_buckets 里的 entries
-        if snap.version >= 2 {
-            for bucket in &snap.daily_buckets {
-                for row in &bucket.entries {
-                    map.entry((row.category_id, row.key_id.clone()))
-                        .or_insert_with(TokenUsage::default)
-                        .add(&row.usage);
-                }
-            }
-        }
-
-        // v1 兼容：`entries` 已在上面并进 `retired` 并计入 `map`，这里不能再加一次
-        // （否则 v1 迁移那次启动的累计会翻倍）。
-
-        // since_ms 为 0 = 旧版本文件或被手工清空过，退回「现在」而不是 1970，
-        // 否则面板会显示「统计自 1970-01-01 起」这种明显错误的起始时间。
-        let since = if snap.since_ms > 0 { snap.since_ms } else { now };
-        UsageLoad {
-            totals: map,
-            since,
-            read_only: false,
-            daily_buckets: snap.daily_buckets,
-            retired,
-        }
-    }
 
     /// 标记「用量累计有未落盘的变更」。
     fn mark_usage_dirty(&self) {
@@ -3052,11 +2919,16 @@ impl Store {
         } else {
             AppConfig::default()
         };
+        // **与生产构造器跑同一套迁移**。少了这一句，测试里构造出来的 Store 与用户机器上
+        // 那个不是同一个东西 —— 于是「迁移有没有接上」这类缺陷在测试里根本看不到
+        // （实测过：删掉 `add_new_builtin_vendors` 的调用点，全套测试照旧全绿）。
+        let mut config = config;
+        let _ = Self::migrate_config(&mut config);
         let secrets = SecretStore::load(secrets_path)?;
         let initial_stamp = Self::read_disk_stamp(&config_path);
         // 与生产构造器同样恢复用量累计：测试才能覆盖「重启后累计不归零」这条判据。
-        let usage_path = Self::usage_file_path(&config_path);
-        let usage_loaded = Self::load_usage(&usage_path);
+        let usage_path = crate::usage_store::usage_file_path(&config_path);
+        let usage_loaded = crate::usage_store::load_usage(&usage_path);
         Ok(Self {
             config_path,
             config: RwLock::new(config),
@@ -3325,6 +3197,122 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **迁移真的接在构造流程上**（不只是那几个函数自己没问题）。
+    ///
+    /// 这条是补一个实测到的盲区：`upgrade_adds_new_builtin_vendors_without_touching_existing_ones`
+    /// 直接调 `Store::add_new_builtin_vendors`，于是把 `Store::new` 里那句**调用**删掉之后，
+    /// 全套 799 条测试照旧全绿 —— 而那正是缺陷本身（老用户拿不到新厂商）。
+    /// 与 CLAUDE.md 里 `route_meta` / `handle_http` 那条「单元覆盖了函数不等于覆盖了接线」同型。
+    ///
+    /// 判据对着**构造出来的 Store** 断言，而不是对着某个函数的返回值。
+    ///
+    /// 故障注入判据：把 `Self::migrate_config(&mut config)` 从 `new`/`new_at` 里去掉
+    /// → 本测试必须变红。
+    #[test]
+    fn migrations_are_wired_into_construction() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // pid + 进程内自增，不用时间戳：本机实测 timestamp_nanos 的量化粒度只有 100ns，
+        // 并发用例下撞名率很高（CLAUDE.md 里 `db_copy_path` 那条）。
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "synaroute_migrate_wired_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+
+        // 造一份**老配置**：只有种子里的第一个内置厂商，config_version 停在 v1（0）。
+        let seed = Vendor::builtin_seed();
+        let old = AppConfig {
+            config_version: 0,
+            keys: vec![],
+            brain: vec![],
+            vendors: vec![seed[0].clone()],
+            settings: AppSettings::default(),
+        };
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&old).unwrap()).unwrap();
+
+        let store = Store::new_at(config_path.clone(), dir.join("secrets.enc")).unwrap();
+        let vendors = store.list_vendors();
+
+        // ① 种子里的每一个内置厂商都在（这一条就是「老用户能不能拿到新厂商」）
+        for s in &seed {
+            assert!(
+                vendors.iter().any(|v| v.id == s.id),
+                "构造后缺少内置厂商 {} —— 迁移没接上构造流程",
+                s.id
+            );
+        }
+        // ② 版本门也跑了（v1 → v2）
+        assert_eq!(
+            store.config.read().config_version,
+            2,
+            "版本迁移没接上构造流程"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 老用户升级后必须拿到**种子里新增的**内置厂商，而已有项一个字节都不许动。
+    ///
+    /// 这条锁的是一类静默失效：`builtin_seed()` 只在 `vendors.is_empty()` 时注入，
+    /// 于是往种子里加厂商**只对全新安装生效** —— 老用户（绝大多数）永远看不到，
+    /// 而代码、测试全是绿的。
+    ///
+    /// 故障注入判据：把 `add_new_builtin_vendors` 的调用从 `Store::new` 里去掉
+    /// → 本测试必须变红。
+    #[test]
+    fn upgrade_adds_new_builtin_vendors_without_touching_existing_ones() {
+        let seed = Vendor::builtin_seed();
+        assert!(seed.len() >= 3, "种子应当有多个内置厂商，否则本测试没意义");
+
+        // 模拟老配置：只有种子里的第一个内置厂商，且用户**改过它的 base_url**
+        // （换了区域镜像 / 走自己的反代 —— 真实且常见），另有一个自定义厂商。
+        let mut mine = seed[0].clone();
+        mine.default_base_url = "https://my-mirror.example.com/v1".into();
+        mine.preset_models = vec![];
+        let custom = Vendor {
+            id: "my-relay".into(),
+            name: "我的中转".into(),
+            default_base_url: "https://relay.example.com".into(),
+            default_protocol: Protocol::Anthropic,
+            builtin: false,
+            icon: None,
+            preset_models: vec![],
+        };
+        let mut vendors = vec![mine.clone(), custom.clone()];
+
+        let added = Store::add_new_builtin_vendors(&mut vendors);
+        assert_eq!(
+            added,
+            seed.len() - 1,
+            "种子里除已有那一个之外的内置厂商都应被补进来"
+        );
+
+        // ① 用户改过的那条**原样保留**（拿种子覆盖等于把他的配置冲掉）
+        let kept = vendors.iter().find(|v| v.id == mine.id).unwrap();
+        assert_eq!(
+            kept.default_base_url, "https://my-mirror.example.com/v1",
+            "已有内置厂商的 base_url 绝不能被种子覆盖"
+        );
+        // ② 自定义厂商还在，且**顺序没被打乱**（用户对列表顺序是有感知的）
+        assert_eq!(vendors[0].id, mine.id);
+        assert_eq!(vendors[1].id, "my-relay");
+        // ③ 新增的都追加在末尾，且 id 不重复
+        let ids: Vec<&str> = vendors.iter().map(|v| v.id.as_str()).collect();
+        let uniq: std::collections::HashSet<&str> = ids.iter().copied().collect();
+        assert_eq!(uniq.len(), ids.len(), "补入后不得出现重复 id");
+        // ④ 种子里的每一个 id 现在都在
+        for s in &seed {
+            assert!(ids.contains(&s.id.as_str()), "种子厂商 {} 未被补入", s.id);
+        }
+
+        // ⑤ 幂等：再跑一次不应该再补任何东西（否则每次启动都会重复追加）
+        let again = Store::add_new_builtin_vendors(&mut vendors);
+        assert_eq!(again, 0, "第二次调用必须什么都不补（幂等）");
     }
 
     /// 迁移：老配置的内置厂商无 preset_models 时应从种子回填；自定义厂商与已有数据不动。
@@ -3870,7 +3858,7 @@ mod tests {
         let _ = store.daily_usage_buckets(); // 读一眼（旧实现若在这里抬基线就会吃掉这 10）
         assert!(store.flush_usage_if_dirty(), "这 10 必须还能落盘");
         let persisted: crate::model::UsageSnapshot = serde_json::from_slice(
-            &std::fs::read(Store::usage_file_path(&dir.join("config.json"))).unwrap(),
+            &std::fs::read(crate::usage_store::usage_file_path(&dir.join("config.json"))).unwrap(),
         )
         .unwrap();
         let on_disk: u64 = persisted
@@ -4128,7 +4116,7 @@ mod tests {
         // 结果把读失败分支改回 `fresh(now)` 后测试**依然是绿的** —— 因为目录占位
         // 让 `atomic_write` 自己也失败了，磁盘不变是 OS 挡的、与本守卫无关，
         // 于是测试因错误的理由通过。断言直接落在 `load_usage` 的返回上才有判别力。
-        let loaded = Store::load_usage(&upath);
+        let loaded = crate::usage_store::load_usage(&upath);
         assert!(
             loaded.read_only,
             "读取失败必须按只读自保：文件内容可能完好，不能用空累计覆盖它"

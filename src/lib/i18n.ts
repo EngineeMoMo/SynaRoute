@@ -3,6 +3,8 @@
 // 再回退到 key 本身，保证永远不会渲染出空串。支持 {name} 占位插值。
 
 import { usageEn, usageZh } from "./i18n.usage";
+import { brandPickerEn, brandPickerZh } from "./i18n.brandPicker";
+import { vendorEn, vendorZh } from "./i18n.vendor";
 
 export type Lang = "zh" | "en";
 
@@ -520,6 +522,7 @@ const zh: Dict = {
   "logs.title": "运行日志",
   "logs.subtitle": "按系统 / 大脑聚合 / 路由与故障转移 / 错误分组，可按类型筛选（密钥已脱敏）",
   ...usageZh,
+  ...brandPickerZh,
   "logs.empty": "暂无事件",
   "logs.searchPlaceholder": "搜索日志（Key 名、模型、错误…）",
   "logs.noMatch": "没有匹配「{q}」的日志",
@@ -756,30 +759,7 @@ const zh: Dict = {
   "settings.mcpWizardClose": "关闭",
 
   // 厂商管理
-  "vendor.title": "厂商管理",
-  "vendor.desc": "维护厂商预设。选中厂商后会自动填入其 Base URL 与协议（仍可手动修改）。",
-  "vendor.add": "新增厂商",
-  "vendor.builtin": "内置",
-  "vendor.builtinLocked": "内置厂商不可编辑或删除",
-  "vendor.name": "显示名",
-  "vendor.namePlaceholder": "如：我的中转",
-  "vendor.baseUrl": "默认 Base URL",
-  "vendor.protocol": "默认协议",
-  "vendor.icon": "图标",
-  "vendor.iconPick": "选择图标",
-  "vendor.iconClear": "清除",
-  "vendor.iconPresetLabel": "或直接选一个主流厂商图标（再点一次取消，回到自动识别）",
-  "vendor.iconHint": "可选。支持 PNG/JPG/SVG/WebP，≤256KB；不设则按厂商名/地址自动识别，识别不出用首字母占位。",
-  "vendor.iconTooLarge": "图标文件过大（上限 {max}），请换更小的图",
-  "vendor.iconReadFailed": "读取图标文件失败",
-  "vendor.edit": "编辑",
-  "vendor.delete": "删除",
-  "vendor.save": "保存",
-  "vendor.cancel": "取消",
-  "vendor.deleteConfirm": "确定删除厂商「{name}」？已使用它的 Key 不受影响。",
-  "vendor.empty": "还没有自定义厂商",
-  "vendor.errNeedName": "请填写显示名",
-  "vendor.errNeedUrl": "请填写 Base URL",
+  ...vendorZh,
 };
 
 const en: Dict = {
@@ -1273,6 +1253,7 @@ const en: Dict = {
   "logs.title": "Logs",
   "logs.subtitle": "Grouped by system / brain / routing / error (keys redacted)",
   ...usageEn,
+  ...brandPickerEn,
   "logs.empty": "No events yet",
   "logs.searchPlaceholder": "Search logs (key, model, error…)",
   "logs.noMatch": "No logs match “{q}”",
@@ -1503,30 +1484,7 @@ const en: Dict = {
   "settings.mcpWizardClose": "Close",
 
   // Vendors
-  "vendor.title": "Vendors",
-  "vendor.desc": "Manage vendor presets. Selecting a vendor auto-fills its Base URL and protocol (still editable).",
-  "vendor.add": "Add vendor",
-  "vendor.builtin": "Built-in",
-  "vendor.builtinLocked": "Built-in vendors can't be edited or deleted",
-  "vendor.name": "Display name",
-  "vendor.namePlaceholder": "e.g. My relay",
-  "vendor.baseUrl": "Default Base URL",
-  "vendor.protocol": "Default protocol",
-  "vendor.icon": "Icon",
-  "vendor.iconPick": "Choose icon",
-  "vendor.iconClear": "Clear",
-  "vendor.iconPresetLabel": "Or pick a known provider icon (click again to clear and auto-detect)",
-  "vendor.iconHint": "Optional. PNG/JPG/SVG/WebP, ≤256KB. Otherwise auto-detected from name/URL, falling back to an initial.",
-  "vendor.iconTooLarge": "Icon file too large (max {max}), pick a smaller one",
-  "vendor.iconReadFailed": "Failed to read icon file",
-  "vendor.edit": "Edit",
-  "vendor.delete": "Delete",
-  "vendor.save": "Save",
-  "vendor.cancel": "Cancel",
-  "vendor.deleteConfirm": "Delete vendor \"{name}\"? Keys already using it are unaffected.",
-  "vendor.empty": "No custom vendors yet",
-  "vendor.errNeedName": "Display name is required",
-  "vendor.errNeedUrl": "Base URL is required",
+  ...vendorEn,
 };
 
 const dicts: Record<Lang, Dict> = { zh, en };

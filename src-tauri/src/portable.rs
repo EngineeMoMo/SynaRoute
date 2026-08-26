@@ -1262,9 +1262,15 @@ mod tests {
         );
 
         // 第二步：用一个**不含厂商**的导出文件做 Replace。
+        //
+        // 注意这里要**手工清空** payload.vendors，不能指望「新建的空 Store 导出来就没有厂商」
+        // —— 新建 Store 会注入内置厂商种子（这是生产行为，`new_at` 现在也跑同一套迁移了），
+        // 所以它的导出里必然带着那些内置项。原先这条测试的前置断言之所以成立，
+        // 只是因为测试构造器当时**不跑迁移**、与生产不一致。
         let src_dir = temp_dir("bv_src");
         let src = store_at(&src_dir);
-        let file = build_export(&src, "1.0.0", None).unwrap().0;
+        let mut file = build_export(&src, "1.0.0", None).unwrap().0;
+        file.payload.vendors.clear();
         assert!(file.payload.vendors.is_empty(), "前置条件：导出文件里没有厂商");
         apply_import(&dst, &file, ImportMode::Replace, None).unwrap();
 

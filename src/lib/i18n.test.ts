@@ -3,8 +3,12 @@ import { describe, it, expect } from "vitest";
 // node 类型，用 fs 会让 `tsc --noEmit` 报 TS2307（vitest 能跑但类型检查过不去）。
 import i18nSource from "./i18n.ts?raw";
 import i18nUsageSource from "./i18n.usage.ts?raw";
+import i18nBrandPickerSource from "./i18n.brandPicker.ts?raw";
+import i18nVendorSource from "./i18n.vendor.ts?raw";
 import { translate } from "@/lib/i18n";
 import { usageEn, usageZh } from "@/lib/i18n.usage";
+import { brandPickerEn, brandPickerZh } from "@/lib/i18n.brandPicker";
+import { vendorEn, vendorZh } from "@/lib/i18n.vendor";
 
 /**
  * i18n 的两条结构性判据。**这两条浏览器里看不出来**（缺翻译只是显示成另一种语言或原始 key，
@@ -30,6 +34,15 @@ import { usageEn, usageZh } from "@/lib/i18n.usage";
 const SOURCES: { name: string; src: string }[] = [
   { name: "i18n.ts", src: i18nSource },
   { name: "i18n.usage.ts", src: i18nUsageSource },
+  { name: "i18n.brandPicker.ts", src: i18nBrandPickerSource },
+  { name: "i18n.vendor.ts", src: i18nVendorSource },
+];
+
+/** 各分片导出的运行时字典，用于校验「分片真的被展开进主词典了」。 */
+const CHUNKS: { name: string; zh: Record<string, string>; en: Record<string, string> }[] = [
+  { name: "usage", zh: usageZh, en: usageEn },
+  { name: "brandPicker", zh: brandPickerZh, en: brandPickerEn },
+  { name: "vendor", zh: vendorZh, en: vendorEn },
 ];
 
 /**
@@ -84,15 +97,20 @@ describe("i18n 结构判据", () => {
    * 对称性检查，而界面上那一整页词条会全部回退成原始 key。
    */
   it("拆出的词典分片都已接进主词典", () => {
-    for (const key of Object.keys(usageZh)) {
-      expect(translate("zh", key), `${key} 未被展开进 zh 主词典`).not.toBe(key);
+    for (const chunk of CHUNKS) {
+      for (const key of Object.keys(chunk.zh)) {
+        expect(translate("zh", key), `${chunk.name}: ${key} 未被展开进 zh 主词典`).not.toBe(key);
+      }
+      for (const key of Object.keys(chunk.en)) {
+        expect(translate("en", key), `${chunk.name}: ${key} 未被展开进 en 主词典`).not.toBe(key);
+      }
+      // 反向判据：空分片会让上面两个循环空转、测试恒绿
+      expect(Object.keys(chunk.zh).length, `${chunk.name} 分片不应为空`).toBeGreaterThan(3);
     }
-    for (const key of Object.keys(usageEn)) {
-      expect(translate("en", key), `${key} 未被展开进 en 主词典`).not.toBe(key);
-    }
-    // 反向判据：分片不能是空的（空分片会让上面两个循环空转、测试恒绿）。
-    expect(Object.keys(usageZh).length, "usage 分片不应为空").toBeGreaterThan(10);
-    expect(SOURCES.length, "SOURCES 至少含 i18n.ts 与一个分片").toBeGreaterThan(1);
+    // 每个源文件分片都要有一份对应的运行时校验（否则「拆了文件却没接进来」照旧漏掉）
+    expect(CHUNKS.length, "CHUNKS 应覆盖 SOURCES 里除 i18n.ts 之外的每个分片").toBe(
+      SOURCES.length - 1,
+    );
   });
 
   it("缺失/未知键有可预期的回退，不渲染空串", () => {
