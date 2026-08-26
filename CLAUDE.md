@@ -294,6 +294,19 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
     对当前版本不成立；取舍不是赌版本，是**代价不对称**：万一某版本仍要凭据，它报的是
     `no Codex credentials were found · Run codex login`（响亮、可自助、OAuth 完好），
     而写占位符的代价是把假凭据发给第三方 + 一句指错方向的报错。
+    <br>🔴 **`requires_openai_auth = true` 必须写，别再顺手删**（2026-08-26 用户报障后改回）：
+    本轮曾一度删掉它，理由写的是「它把 Codex 推向 auth.json 那条凭据链」—— **那个理由是错的**。
+    5 组探针实测（三种写法 × 有无 auth.json）：只要 `experimental_bearer_token` 在，
+    `true`/`false`/省略三者发出的 `Authorization` 头**逐字节相同**、都不读 auth.json，
+    也就是写它**零代价**。而不写它有代价 —— 用户报的升级公告：新版 Codex 不再允许自定义 provider
+    在 `requires_openai_auth = false` 时继承 auth.json 鉴权，报 `API_KEY_REQUIRED` / 401，
+    官方解法就是改成 `true`。那条在 0.148.0-alpha.9 上**复现不出**（`false` 仍然继承成功），
+    说明属于更新的版本 —— 正因复现不出才不能赌。三条旁证都指向 `true`：cc-switch 生成的生效配置、
+    用户自己那份能用的 `[model_providers.custom]`、官方升级公告。
+    <br>**这个字段的语义已经变过两次**（08-02 一次、08-26 一次），故它也进了 `is_intact`：
+    被外部改成 `false` 或删掉即判「不完好」→ 漂移告警会报、下一次接入自动纠正回来，
+    用户不必自己去 config.toml 手改那一行。有 `requires_openai_auth_is_written_as_true`
+    与 `intact_requires_our_endpoint_and_our_bearer` 两条测试钉住（各做过故障注入）。
     <br>另修：`obj.len() == 1` 那个占位符判据被 `codex login --with-api-key` 写出的
     **两字段**形态击穿（失效方向是**静默放行**，三道守卫同时哑掉）；
     `is_intact` 只查 base_url **非空**（指向第三方或已死旧端口都判「完好」→ 漂移告警永不发出）；

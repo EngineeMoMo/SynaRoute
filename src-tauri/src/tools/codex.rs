@@ -10,9 +10,11 @@
 //! | config.toml | auth.json | 实际 base_url | 实际 Authorization |
 //! |---|---|---|---|
 //! | 我们的 provider + `experimental_bearer_token` | 有（真 OAuth） | provider 的 base_url | `Bearer <bearer>` ——**auth.json 被忽略** |
-//! | 我们的 provider + bearer，`requires_openai_auth=true` | **无** | provider 的 base_url | `Bearer <bearer>`，**没有凭据门禁** |
-//! | 我们的 provider + bearer，`requires_openai_auth` 省略 | **无** | provider 的 base_url | `Bearer <bearer>` |
-//! | provider 表无 bearer | 有 | provider 的 base_url | `Bearer <auth.json 的 OPENAI_API_KEY>` |
+//! | bearer + `requires_openai_auth = true` | **无** | provider 的 base_url | `Bearer <bearer>`，**没有凭据门禁** |
+//! | bearer + `requires_openai_auth` 省略 | **无** | provider 的 base_url | `Bearer <bearer>`（与上一行**逐字节相同**） |
+//! | bearer + `requires_openai_auth = false` | **无** | provider 的 base_url | `Bearer <bearer>`（同上） |
+//! | provider 表无 bearer，`requires_openai_auth = false` | 有 | provider 的 base_url | `Bearer <auth.json 的 key>`（本版**仍然继承**） |
+//! | provider 表无 bearer，`requires_openai_auth = true` | 有 | provider 的 base_url | `Bearer <auth.json 的 key>` |
 //! | **顶层 `model_provider` 键整个缺失** | 有占位符 | `https://api.openai.com/v1` | `Bearer synaroute-proxy` → **401** |
 //! | `model_provider="synaroute"` 但**表缺失** | 任意 | —— | `Error: Model provider \`synaroute\` not found`，一个请求都不发 |
 //! | `[model_providers.openai]` 想覆盖内置 id | —— | —— | 启动即失败：`reserved built-in provider IDs` |
@@ -30,13 +32,24 @@
 //! 3. **内置 provider id 不可覆盖** → 「把内置 `openai` 指向本地代理来中和回落」这条路已被证伪，
 //!    别再试（Codex 启动即失败）。
 //!
+//! 另注意上表第 2~4 行：`requires_openai_auth` 的三种写法在本版**结果完全一样**。
+//! 我们仍然写 `true`，理由是零代价的版本保险，判据在 [`apply_at`] 的文档里。
+//!
 //! # 版本前提（重要）
 //!
-//! 上表测的是**用户今天在跑的那个版本**。2026-08-02 的旧判据（「`requires_openai_auth=true`
-//! 必须配套 auth.json，否则桌面端停在登录页」）当时是真机观测，Codex 后来改了行为。
-//! 故这里的取舍是**按代价不对称**定的，不是赌某个版本：万一某个 Codex 版本仍要凭据，
-//! 它报的是 `no Codex credentials were found · Run codex login`（响亮、可自助、且用户的
-//! OAuth 完好无损）；而写占位符的代价是把一个假凭据发给第三方 + 一句指错方向的报错。
+//! 上表测的是**用户今天在跑的那个版本**（0.148.0-alpha.9）。这条路上已经有**两次**
+//! 版本相关的行为漂移，都不是「当时写错了」：
+//!
+//! - 2026-08-02 的旧判据「`requires_openai_auth=true` 必须配套 auth.json，否则停在登录页」
+//!   —— 今天测：`true` + 无 auth.json 照跑，无凭据门禁。
+//! - 2026-08-26 用户报的升级公告「新版不再允许自定义 provider 在
+//!   `requires_openai_auth=false` 时自动继承 auth.json 鉴权，报 `API_KEY_REQUIRED`」
+//!   —— 今天测：上表第 5 行，`false` **仍然继承**。说明那是比本机更新的版本。
+//!
+//! 结论不是「谁对谁错」，而是**这个字段的语义会变**。故本模块的取舍一律按
+//! **代价不对称**定，不按「我测过所以就这样」：万一某版本 `true` 仍要凭据，它报的是
+//! `no Codex credentials were found · Run codex login`（响亮、可自助、OAuth 完好）；
+//! 而写占位符 / 漏掉那个字段的代价是把假凭据发给第三方 + 一句指错方向的报错。
 
 use crate::error::{AppError, AppResult};
 use serde_json::Value;
@@ -117,17 +130,40 @@ fn expected_base_url(endpoint: &str) -> String {
 
 /// 可测入口：写入指定 config.toml。
 ///
-/// 写的四个字段各有判据：
+/// 写的五个字段各有判据：
 /// - `model_provider = "synaroute"` 选中我们；
 /// - `[model_providers.synaroute].base_url = {endpoint}/v1`；
 /// - `wire_api = "responses"`（Codex 的 Responses 形态）；
 /// - `experimental_bearer_token` = 占位符 —— 代理侧剥掉入站鉴权头、按路由 Key 注入真实密钥，
 ///   故此值只需非空。它是 `ModelProviderInfo` 的正式字段（codex.exe 符号表可见）。
+/// - `requires_openai_auth = true` —— 见下。
 ///
-/// **刻意不写的两个字段**：
-/// - `requires_openai_auth`：它是「走 OpenAI 凭据门禁」的开关，而我们不是 OpenAI。
-///   写 true 会把 Codex 推向 auth.json / 环境变量那条凭据链，正是要摆脱的那条。
-/// - `env_key`：那会要求用户手设环境变量。
+/// # `requires_openai_auth = true` 是**保险**，不是需求（2026-08-26 用户报障后改回）
+///
+/// 本轮曾一度把它删掉，理由是「它把 Codex 推向 auth.json 那条凭据链，而我们要摆脱那条」。
+/// **那个理由是错的**，实测矩阵（0.148.0-alpha.9，本地探针抓 `Authorization` 头，
+/// 三种写法 × 有无 auth.json 共 5 组）显示：只要 `experimental_bearer_token` 在，
+/// `true` / `false` / 省略**三者结果逐字节相同** —— 一律发 `Bearer <占位符>`、
+/// 无凭据门禁、也不去读 auth.json。也就是说写它**不花任何代价**。
+///
+/// 而不写它有代价：用户报了一条**版本升级公告**级的现场信息 —— 新版 Codex 不再允许自定义
+/// provider 在 `requires_openai_auth = false` 时自动继承 auth.json 的鉴权，
+/// 症状是 `API_KEY_REQUIRED` / `401 Unauthorized`，官方给的解法就是把它改成 `true`。
+/// 那条在本机装的 0.148 上**复现不出来**（实测 `false` + 无 bearer + 有 auth.json 仍然继承成功），
+/// 说明它属于比本机更新的版本 —— 但正因为复现不出，才更不能赌。
+///
+/// 三条旁证都指向 `true`：cc-switch 生成的生效配置是 `true`；用户自己那份能正常工作的
+/// `[model_providers.custom]` 也是 `true`；官方升级公告要求 `true`。
+///
+/// **代价不对称**（这才是决策依据，不是赌版本）：
+/// - 万一某版本 `true` + 无 auth.json 会卡凭据门禁 → 报
+///   `no Codex credentials were found · Run codex login`：响亮、可自助、OAuth 完好；
+/// - 万一某版本不写它就不给鉴权 → 报 `API_KEY_REQUIRED` / 401：正是用户这一整轮在追的那个
+///   看不懂的错误。
+///
+/// 有 `requires_openai_auth_is_written_as_true` 一条测试钉住它，别再顺手删。
+///
+/// **刻意仍不写 `env_key`**：那会让 Codex 改从环境变量读 key，重新引入「用户手设环境变量」负担。
 ///
 /// 幂等：序列化结果与磁盘一致时 `backup_and_write_bytes` 短路（不备份不写），
 /// 故重复接入不会把已接入的 config 当成「接入前快照」拷进 `.bak`。
@@ -181,10 +217,11 @@ pub(super) fn apply_at(
         "experimental_bearer_token".into(),
         toml::Value::String(PROXY_PLACEHOLDER.to_string()),
     );
-    // 旧版本写过 `requires_openai_auth = true`，升级后必须**主动删掉**：留着它，Codex 会继续
-    // 走 OpenAI 凭据门禁，于是「不写 auth.json」这件事的收益就被抵消了（老用户静默保持旧行为，
-    // 而这类「只对新用户生效的修复」是本仓反复踩过的坑）。
-    entry.remove("requires_openai_auth");
+    // `requires_openai_auth = true`：实测它对我们**完全无副作用**（bearer 在场时，
+    // true/false/省略三者发出去的 Authorization 头逐字节相同、都不读 auth.json），
+    // 而新版 Codex 对 `false` 的自定义 provider 会拒绝继承鉴权、报 `API_KEY_REQUIRED`。
+    // 零代价的保险，写上。完整判据见本函数的文档注释。
+    entry.insert("requires_openai_auth".into(), toml::Value::Boolean(true));
     providers_table.insert(MCP_CLIENT_NAME.to_string(), toml::Value::Table(entry));
 
     let serialized =
@@ -371,7 +408,15 @@ pub(super) fn is_intact(path: &Path, endpoint: &str) -> bool {
         .get("experimental_bearer_token")
         .and_then(|b| b.as_str())
         .is_some_and(|s| s == PROXY_PLACEHOLDER);
-    url_ok && bearer_ok
+    // `requires_openai_auth` 被改成 false（或删掉）也算不完好：新版 Codex 对 `false` 的
+    // 自定义 provider 不再继承鉴权，报 `API_KEY_REQUIRED` / 401。把它纳入完好性判据，
+    // 这类改动才会被漂移检测发现、并被下一次接入自动纠正回来；
+    // 否则用户只能自己去 config.toml 里手改那一行（那正是他现在被迫做的事）。
+    let auth_flag_ok = t
+        .get("requires_openai_auth")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    url_ok && bearer_ok && auth_flag_ok
 }
 
 /// 漂移形态。文案按形态分支，因为**每种形态下 Codex 的实际行为不同**，
@@ -665,9 +710,9 @@ mod tests {
 
     // ---- 接入写出的内容 ----
 
-    /// 接入**不得**创建 auth.json，且 provider 表里不得有 `requires_openai_auth`。
+    /// 接入**不得**创建 auth.json。
     ///
-    /// 这两条是本轮修复的核心：那份占位符在正常接入时从不外发（bearer 优先），
+    /// 这是本轮修复的核心：那份占位符在正常接入时从不外发（bearer 优先），
     /// 只在漂移后被发给**真实的 OpenAI**，换回一句指错方向的 401。
     #[test]
     fn apply_writes_bearer_and_never_creates_auth_json() {
@@ -686,8 +731,8 @@ mod tests {
         assert_eq!(p["wire_api"].as_str(), Some("responses"));
         assert_eq!(p["experimental_bearer_token"].as_str(), Some(PROXY_PLACEHOLDER));
         assert!(
-            p.get("requires_openai_auth").is_none(),
-            "requires_openai_auth 会把 Codex 推回 OpenAI 凭据门禁，正是要摆脱的那条"
+            p.get("env_key").is_none(),
+            "env_key 会让 Codex 改从环境变量读 key，重新引入「用户手设环境变量」负担"
         );
 
         // 成功文案不得自相矛盾：旧实现把「未改动 auth.json」与「已写入 …auth.json（鉴权占位）」
@@ -701,12 +746,33 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// 老用户升级：provider 表里遗留的 `requires_openai_auth = true` 必须被**主动删掉**。
-    /// 不删的话老用户静默保持旧行为 —— 「只对新用户生效的修复」是本仓反复踩过的坑。
+    /// `requires_openai_auth` 必须写成 `true`，**且升级老配置时也要补上**。
+    ///
+    /// 本轮曾一度删掉它（理由是「它把 Codex 推向 auth.json 那条凭据链」）——
+    /// 那个理由被实测证伪：bearer 在场时 true/false/省略三者发出的 Authorization 头
+    /// **逐字节相同**，都不读 auth.json。也就是说写它零代价。
+    ///
+    /// 而不写它有代价：新版 Codex 对 `requires_openai_auth = false` 的自定义 provider
+    /// 不再继承鉴权，报 `API_KEY_REQUIRED` / `401 Unauthorized`，官方解法就是改成 `true`。
+    /// 那正是用户这一整轮在追的那类看不懂的 401。
+    ///
+    /// 这条测试的存在意义就是**别再顺手删它**。
     #[test]
-    fn apply_strips_legacy_requires_openai_auth() {
-        let d = temp_dir("strip_roa");
+    fn requires_openai_auth_is_written_as_true() {
+        let d = temp_dir("roa_true");
         let cfg = d.join("config.toml");
+
+        // ① 全新写入
+        apply_at(&cfg, EP, None).unwrap();
+        let doc = std::fs::read_to_string(&cfg).unwrap().parse::<toml::Value>().unwrap();
+        assert_eq!(
+            doc["model_providers"]["synaroute"]["requires_openai_auth"].as_bool(),
+            Some(true),
+            "缺了它，新版 Codex 会报 API_KEY_REQUIRED / 401"
+        );
+
+        // ② 老配置里被写成 false（或被别的工具改成 false）→ 必须被纠正成 true。
+        //    这一支是「只对新用户生效的修复」那个坑的防线：老用户不重装也要拿到修复。
         write(
             &cfg,
             "model_provider = \"synaroute\"\n\
@@ -714,14 +780,16 @@ mod tests {
              name = \"SynaRoute\"\n\
              base_url = \"http://127.0.0.1:1/v1\"\n\
              wire_api = \"responses\"\n\
-             requires_openai_auth = true\n",
+             requires_openai_auth = false\n",
         );
         apply_at(&cfg, EP, None).unwrap();
         let doc = std::fs::read_to_string(&cfg).unwrap().parse::<toml::Value>().unwrap();
-        assert!(
-            doc["model_providers"]["synaroute"].get("requires_openai_auth").is_none(),
-            "遗留的 requires_openai_auth 必须被删掉"
+        assert_eq!(
+            doc["model_providers"]["synaroute"]["requires_openai_auth"].as_bool(),
+            Some(true),
+            "false 必须被纠正成 true"
         );
+
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -789,6 +857,30 @@ mod tests {
         // 选中别人
         write(&cfg, "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://x/v1\"\n");
         assert!(!is_intact(&cfg, EP));
+
+        // `requires_openai_auth` 被改成 false → 新版 Codex 报 API_KEY_REQUIRED / 401。
+        // 必须判不完好，否则漂移检测看不见它、下一次接入也不会把它纠正回来，
+        // 用户只能自己去 config.toml 里手改那一行。
+        write(
+            &cfg,
+            &format!(
+                "model_provider = \"synaroute\"\n\
+                 [model_providers.synaroute]\nbase_url = \"{EP}/v1\"\n\
+                 experimental_bearer_token = \"synaroute-proxy\"\n\
+                 requires_openai_auth = false\n"
+            ),
+        );
+        assert!(!is_intact(&cfg, EP), "requires_openai_auth = false → 不完好");
+        // 整个键被删掉，同理
+        write(
+            &cfg,
+            &format!(
+                "model_provider = \"synaroute\"\n\
+                 [model_providers.synaroute]\nbase_url = \"{EP}/v1\"\n\
+                 experimental_bearer_token = \"synaroute-proxy\"\n"
+            ),
+        );
+        assert!(!is_intact(&cfg, EP), "requires_openai_auth 缺失 → 不完好");
 
         std::fs::remove_dir_all(&d).ok();
     }
