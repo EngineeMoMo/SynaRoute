@@ -29,8 +29,17 @@ const BACKUP_SUFFIX: &str = "synaroute.bak";
 /// Codex 专属接入逻辑（判据密度最高的一端，单独成模块）。
 ///
 /// 子模块能访问 `tools` 的私有项（Rust 的可见性是「定义模块及其后代」），
-/// 故 `backup_and_write_bytes` / `with_rollback` / `read_preview_text` 等**无需放宽可见性**。
+/// 故 `read_preview_text` 等**无需放宽可见性**。
 pub(crate) mod codex;
+
+/// 写入 / 备份 / 回滚 / 还原这一层。抽出来的判据见该模块头。
+mod fsops;
+
+use fsops::{
+    backup_and_write_bytes, backup_and_write_json, backup_path_for, created_marker_path_for,
+    prerestore_path_for, read_json_or_empty, restore_one, with_rollback,
+    write_json_without_locking_snapshot, write_without_locking_snapshot,
+};
 
 /// 写进客户端配置的**鉴权占位值**。代理剥掉入站鉴权头、按路由 Key 注入真实密钥，
 /// 故此值只需非空以让客户端走 bearer 鉴权流程，代理侧不校验它。
@@ -889,7 +898,7 @@ fn register_mcp_claude_at(path: &Path, mcp_url: &str, timeout_ms: u64) -> AppRes
         MCP_CLIENT_NAME.to_string(),
         json_http_mcp(mcp_url, timeout_ms),
     );
-    backup_and_write_json(path, &root)?;
+    write_json_without_locking_snapshot(path, &root)?;
     Ok((
         format!("已注册 MCP 到 Claude：{}（{mcp_url}），重启客户端生效", path.display()),
         true,
@@ -994,7 +1003,7 @@ fn register_mcp_claude_desktop_at(path: &Path, exe_path: &str) -> AppResult<(Str
     }
 
     servers_obj.insert(MCP_CLIENT_NAME.to_string(), desired);
-    backup_and_write_json(path, &root)?;
+    write_json_without_locking_snapshot(path, &root)?;
     Ok((
         format!(
             "已注册 MCP 到 Claude 桌面端（stdio）：{}，重启桌面端生效",
@@ -1020,7 +1029,7 @@ fn unregister_mcp_claude_at(path: &Path) -> AppResult<(String, bool)> {
     if !removed {
         return Ok(("Claude 未注册 synaroute，无需移除".into(), false));
     }
-    backup_and_write_json(path, &root)?;
+    write_json_without_locking_snapshot(path, &root)?;
     Ok((format!("已从 Claude 移除 MCP：{}", path.display()), true))
 }
 
@@ -1111,7 +1120,7 @@ fn register_mcp_codex_at(path: &Path, exe_path: &str) -> AppResult<(String, bool
 
     let serialized =
         toml::to_string_pretty(&doc).map_err(|e| AppError::ToolConfig(e.to_string()))?;
-    backup_and_write_bytes(path, serialized.as_bytes())?;
+    write_without_locking_snapshot(path, serialized.as_bytes())?;
     Ok((
         format!("已接入大脑聚合到 Codex（stdio）：{}，重启 Codex 生效", path.display()),
         true,
@@ -1144,253 +1153,8 @@ fn unregister_mcp_codex_at(path: &Path) -> AppResult<(String, bool)> {
     }
     let serialized =
         toml::to_string_pretty(&doc).map_err(|e| AppError::ToolConfig(e.to_string()))?;
-    backup_and_write_bytes(path, serialized.as_bytes())?;
+    write_without_locking_snapshot(path, serialized.as_bytes())?;
     Ok((format!("已从 Codex 移除 MCP：{}", path.display()), true))
-}
-
-// ---- 通用：备份 + 原子写 ----
-
-fn read_json_or_empty(path: &Path) -> AppResult<Value> {
-    if path.exists() {
-        let raw = std::fs::read_to_string(path)?;
-        if raw.trim().is_empty() {
-            Ok(Value::Object(Default::default()))
-        } else {
-            serde_json::from_str(&raw)
-                .map_err(|e| AppError::ToolConfig(format!("解析 {} 失败: {e}", path.display())))
-        }
-    } else {
-        Ok(Value::Object(Default::default()))
-    }
-}
-
-/// 备份原文件（若存在），然后原子写入新 JSON
-fn backup_and_write_json(path: &Path, value: &Value) -> AppResult<()> {
-    let data = serde_json::to_vec_pretty(value)?;
-    backup_and_write_bytes(path, &data)
-}
-
-fn backup_and_write_bytes(path: &Path, data: &[u8]) -> AppResult<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // 幂等：新内容与磁盘现有内容完全一致时，不备份也不写盘（连 .bak 的存在性判定都不必做）。
-    if path.exists() {
-        if let Ok(current) = std::fs::read(path) {
-            if current == data {
-                return Ok(());
-            }
-        }
-    }
-    // 规则1：改写前备份原文件，但**首写即锁**——`.bak` 已存在就绝不覆盖。
-    //
-    // 为什么不能只靠「内容相等」守卫（数据丢失级教训）：那条守卫只挡住「重复接入且内容逐字节
-    // 相同」这一种。真实场景里重复接入的内容几乎总会变——改代理端口、可服务模型列表变化、
-    // 升级换目录导致 MCP 的 command 路径变化——于是守卫不命中，第二次接入就把**已接入态**
-    // 拷进 `.bak`，冲掉用户接入前的原始快照。此后点「还原」拿回的是「已接入 v1」，
-    // 官方 config / ChatGPT OAuth 登录再也回不来（CLI 与 Codex 的 restore 直接读 `.bak`）。
-    //
-    // 首写即锁后，`.bak` 恒为「SynaRoute 第一次动这个文件之前」的内容，重复接入多少次都不变质。
-    // 配套：`restore_one` 还原成功后删掉 `.bak`（见该函数），让下一轮接入重新抓一份新鲜快照，
-    // 否则锁死的旧快照会在「接入→还原→改配置→再接入→再还原」时把用户改动覆盖回很久以前。
-    // 「锁」只在两者都还没锁过时才可能上锁，且**互斥**——上了哪一把就不会再上另一把。
-    //
-    // 这一点必须严格保证：若已经锁了 marker（首次接入时文件不存在），此后 SynaRoute 自己
-    // 把文件从无写到有，`path.exists()` 就会变真。若这时只看 `path.exists()` 决定走
-    // 「备份」分支，会把 SynaRoute 自己写的内容当成「原始快照」拷进 `.bak`——
-    // 于是磁盘上 marker 与 `.bak` 同时存在，`restore_one` 只看 `.bak`（判断顺序在它之前），
-    // 就会把文件「还原」成 SynaRoute 自己写的版本，而不是删除它。凭空新建的文件从此永远
-    // 「还原」不回「不存在」这个真实的原始状态。
-    let backup = backup_path_for(path);
-    let marker = created_marker_path_for(path);
-    if !backup.exists() && !marker.exists() {
-        if path.exists() {
-            std::fs::copy(path, &backup)?;
-        } else {
-            // 文件接入前**根本不存在**（如未装 settings.json 的 Claude CLI 用户、只走
-            // ChatGPT 登录从未生成过 config.toml 的 Codex 用户）：没有「原内容」可备份，
-            // 落一个空标记代替 `.bak`，供 `restore_one` 判定「这份文件是我凭空造出来的，
-            // 该整份删掉」而非「无备份、之前就没接入过」。少这一步的后果：`restore_one`
-            // 因 `.bak` 不存在直接判定「无需还原」，文件却原样留在盘上、指着一个已经
-            // 无人监听的本地端口——客户端从此永久连不上，卸载之后连能改它的界面都没有了。
-            std::fs::write(&marker, b"")?;
-        }
-    }
-    // 规则2：原子写
-    crate::secret::atomic_write(path, data)
-}
-
-/// 多文件写入的整体回滚（借鉴 cc-switch 的 with_rollback）。
-///
-/// 场景：一次接入要动多个文件（如 Codex 的 config.toml + auth.json）。若中途某步失败，
-/// 已写的文件会留下「半配置」状态。此辅助先对每个目标文件拍快照（内容 or「原本不存在」），
-/// 执行闭包；闭包返回 Err 时把所有文件恢复到执行前的状态，避免部分写入。
-///
-/// 快照失败（无法读原文件）直接返回错误、不执行闭包——宁可不写，也不在无法回滚时冒险。
-///
-/// # 副文件（`.synaroute.bak` / `.synaroute-created`）**必须一并纳入**
-///
-/// 这不是洁癖，是一条数据丢失级缺陷的修复。`backup_and_write_bytes` 除了写主文件，还会
-/// 「首写即锁」地落下 `.bak` 或 `.synaroute-created` 标记。若只回滚主文件，标记会**留在盘上**，
-/// 而它的语义是「这份文件是 SynaRoute 凭空造出来的、还原时该整份删掉」。于是：
-///
-/// 1. 机器上本无 `~/.codex/auth.json`（只走 ChatGPT 登录的新装机）→ 首次接入落下标记；
-/// 2. 读回校验失败（正是「Codex 正在运行并重写 config.toml」那个已知场景）→ 回滚删掉
-///    auth.json，**标记留着**；
-/// 3. 用户随后 `codex login` 拿回真 OAuth；
-/// 4. 下一次接入：`!backup.exists() && !marker.exists()` 因标记在而为假 → 整块备份代码被跳过，
-///    真 OAuth 被直接覆盖、`.bak` 从未生成；
-/// 5. 点还原 → 走标记支路 `remove_file` → 用户的 ChatGPT 登录态**永久消失，盘上一份副本都没有**。
-///
-/// 全程静默。故快照集必须是「主文件 + 它的两个副文件」的闭包。
-fn with_rollback<T>(
-    paths: &[PathBuf],
-    op: impl FnOnce() -> AppResult<T>,
-) -> AppResult<T> {
-    // 主文件 + 副文件一起纳入。副文件按主路径推导，调用方无需（也不该）自己列举 ——
-    // 让调用方记得列会漏，而漏掉的表现是静默的。
-    let mut tracked: Vec<PathBuf> = Vec::with_capacity(paths.len() * 3);
-    for p in paths {
-        tracked.push(p.clone());
-        tracked.push(backup_path_for(p));
-        tracked.push(created_marker_path_for(p));
-    }
-
-    // 拍快照：Some(bytes)=原内容；None=原本不存在（回滚时应删除）。
-    let mut snapshots: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::with_capacity(tracked.len());
-    for p in &tracked {
-        let snap = if p.exists() {
-            Some(std::fs::read(p).map_err(|e| {
-                AppError::ToolConfig(format!("回滚快照失败(读 {}): {e}", p.display()))
-            })?)
-        } else {
-            None
-        };
-        snapshots.push((p.clone(), snap));
-    }
-
-    match op() {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            // 尽力回滚：逐个恢复原状。回滚本身的错误不覆盖原始错误，仅告警。
-            for (p, snap) in &snapshots {
-                let restored = match snap {
-                    Some(bytes) => crate::secret::atomic_write(p, bytes),
-                    // 原本不存在 → 删除。文件本就不在时 `remove_file` 会报 NotFound，
-                    // 那不是错误（回滚的目标状态已达成），不该刷一条误导性告警。
-                    None if !p.exists() => Ok(()),
-                    None => std::fs::remove_file(p).map_err(AppError::from),
-                };
-                if let Err(re) = restored {
-                    tracing::warn!("接入写入失败后回滚 {} 出错: {re}", p.display());
-                }
-            }
-            Err(e)
-        }
-    }
-}
-
-/// 还原前保留现场用的后缀：`<原名>.synaroute-prerestore`。
-///
-/// 存在的理由：`.bak` 是**首写即锁**的「接入前快照」，可能已是几个月前的内容，而用户在
-/// 那之后往同一文件里写了大量自有配置（Claude Code 每点一次「don't ask again」就往
-/// `permissions.allow` 追加一条，还有 hooks / statusLine / 自定义 env；Codex 那边是
-/// `[mcp_servers.*]` / `[profiles.*]` / 项目信任项）。还原是**整文件覆盖**，这些改动会
-/// 一次性消失，而原先连一份副本都不留 —— 卸载场景尤其致命：能重建它的应用同时也被删了。
-/// 留这一份就把「不可逆」变成「可回滚」，与项目「改配置前必先备份」的硬规则一致。
-const PRERESTORE_SUFFIX: &str = "synaroute-prerestore";
-
-/// 某文件对应的 `.synaroute.bak` 备份路径。
-fn backup_path_for(path: &Path) -> PathBuf {
-    path.with_extension(match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.{BACKUP_SUFFIX}"),
-        None => BACKUP_SUFFIX.to_string(),
-    })
-}
-
-/// 某文件「还原前现场」的保留路径。
-fn prerestore_path_for(path: &Path) -> PathBuf {
-    path.with_extension(match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.{PRERESTORE_SUFFIX}"),
-        None => PRERESTORE_SUFFIX.to_string(),
-    })
-}
-
-/// 「接入前该文件根本不存在」的标记后缀：`<原名>.synaroute-created`。
-///
-/// 与 `.bak`（有原内容可还原）互斥、二选一——见 [`backup_and_write_bytes`] 的写入侧。
-const CREATED_MARKER_SUFFIX: &str = "synaroute-created";
-
-/// 某文件对应的「凭空新建」标记路径。
-fn created_marker_path_for(path: &Path) -> PathBuf {
-    path.with_extension(match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.{CREATED_MARKER_SUFFIX}"),
-        None => CREATED_MARKER_SUFFIX.to_string(),
-    })
-}
-
-/// 从 `.synaroute.bak` 还原单个文件；无 `.bak` 也无「凭空新建」标记则返回 false（跳过，不报错）。
-///
-/// **覆盖前先把当前内容另存一份** `.synaroute-prerestore`（见 [`PRERESTORE_SUFFIX`]）：
-/// `.bak` 是首写即锁的旧快照，整文件写回会抹掉用户此后所有自有配置，而卸载路径上
-/// 这一步之后应用就没了，没有任何界面能帮用户找回。留一份即可回滚。
-/// 保留失败**不阻断还原**（还原本身是用户要的），只告警——但会跳过删 `.bak`，
-/// 保证任意时刻盘上至少有一份副本。
-///
-/// 还原成功后**删除 `.bak`**：与 `backup_and_write_bytes` 的「首写即锁」配套。
-/// 备份既已交还给目标文件，就该让下一轮接入重新抓一份新鲜的「接入前快照」——否则被锁死的旧
-/// 快照会在「接入 → 还原 → 用户改配置 → 再接入 → 再还原」时把用户改动覆盖回很久以前的状态。
-/// 副作用（可接受且语义准确）：连点两次还原，第二次会返回「无备份，无需还原」。
-/// 删除失败只告警不上抛：还原本身已成功，不该因清理失败把成功报成失败。
-///
-/// **无 `.bak` 但有「凭空新建」标记**：说明这份文件是 SynaRoute 首次接入时从零建出来的，
-/// 接入前的「原状」就是「不存在」。直接删掉整个文件即是精确还原——不是「整文件回滚到某个
-/// 旧版本」，而是「回到那个版本原本没有这份文件」的状态。这一支必须存在：没有它，
-/// 未装过 `~/.claude/settings.json` 的 Claude CLI 用户、只走 ChatGPT 登录从未生成过
-/// `~/.codex/config.toml` 的 Codex 用户，停止/还原/卸载三条路径都会因为「无 .bak」直接
-/// 判定「无需还原」而放过这份文件——它会原样留在盘上、永久指向一个已经没人监听的本地端口，
-/// 客户端从此连不上，且卸载之后连能改它的界面都没有了。
-fn restore_one(path: &Path) -> AppResult<bool> {
-    let backup = backup_path_for(path);
-    if !backup.exists() {
-        let marker = created_marker_path_for(path);
-        if !marker.exists() {
-            return Ok(false);
-        }
-        // 凭空新建的文件：删除即是还原。删除失败保留标记（下次还能再试），
-        // 成功才清标记——与 `.bak` 分支「还原成功才清理凭据」同一条纪律。
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
-        if let Err(e) = std::fs::remove_file(&marker) {
-            tracing::warn!("还原后清理新建标记 {} 失败: {e}", marker.display());
-        }
-        return Ok(true);
-    }
-    let data = std::fs::read(&backup)?;
-
-    // 保留现场：目标文件存在才需要留（不存在意味着没什么会被覆盖）。
-    let mut kept_scene = true;
-    if path.exists() {
-        if let Err(e) = std::fs::copy(path, prerestore_path_for(path)) {
-            kept_scene = false;
-            tracing::warn!(
-                "还原前保留现场失败 {}: {e}（将保留 .bak 不删，确保仍有副本可回滚）",
-                path.display()
-            );
-        }
-    }
-
-    crate::secret::atomic_write(path, &data)?;
-
-    // 现场没留住就不删 `.bak`：宁可下次还原报「无备份」，也不能出现
-    // 「旧快照已删、当前内容已被覆盖」这种两头皆空的状态。
-    if kept_scene {
-        if let Err(e) = std::fs::remove_file(&backup) {
-            tracing::warn!("还原后清理备份 {} 失败: {e}", backup.display());
-        }
-    }
-    Ok(true)
 }
 
 
@@ -2157,9 +1921,69 @@ mod tests {
         dir.join(name)
     }
 
+    /// MCP 注册/注销**不得**锁住「接入前快照」。
+    ///
+    /// # 这条测试锁的是一个用户机器上实证过的缺陷
+    ///
+    /// `.bak` 是**首写即锁**的，语义是「SynaRoute 第一次动这个文件之前」。而 MCP 注册
+    /// 原先也走 `backup_and_write_bytes`，于是那个时间点被悄悄提前到「因为**任何**理由
+    /// 第一次碰这个文件之前」—— 开大脑聚合开关通常发生在点「启动」之前。
+    ///
+    /// 后果（用户 `~/.codex/config.toml.synaroute.bak` 实测）：`.bak` 停在 8-16，里面带着
+    /// 一个早已废弃的 `[mcp_servers.synaroute] url = "http://127.0.0.1:9527/mcp"`
+    /// （HTTP 形态、端口已死）；此后 SynaRoute 自己又改过 config.toml，`.bak` 却因已上锁没更新。
+    /// 点一次「还原」就把这份陈旧快照**整份写回**，而界面显示「已从备份还原」= 成功。
+    ///
+    /// 故障注入判据：把 MCP 的两个写点改回 `backup_and_write_bytes` → 本测试必须变红。
     #[test]
-    fn claude_register_writes_http_entry_and_is_idempotent() {
-        let path = temp_file("claude_reg", ".claude.json");
+    fn mcp_registration_does_not_lock_the_apply_snapshot() {
+        let cfg = temp_file("mcp_no_lock", "config.toml");
+        let bak = backup_path_for(&cfg);
+        let marker = created_marker_path_for(&cfg);
+
+        // 用户原有配置
+        let original = "model = \"gpt-5.6-sol\"\n\n[features]\njs_repl = false\n";
+        std::fs::write(&cfg, original).unwrap();
+
+        // ① 注册 MCP（= 开大脑聚合开关）：**不得**产生 .bak / 不得落「凭空新建」标记
+        register_mcp_codex_at(&cfg, "C:/nonexistent/synaroute.exe").unwrap();
+        assert!(
+            !bak.exists(),
+            "MCP 注册不得锁住「接入前快照」—— 它的逆操作是精确的 remove(mcp_servers.synaroute)，用不着整文件快照"
+        );
+        assert!(!marker.exists(), "MCP 注册不得落「凭空新建」标记");
+        let after_mcp = std::fs::read_to_string(&cfg).unwrap();
+        assert!(after_mcp.contains("mcp_servers"), "MCP 项本身要写进去");
+
+        // ② 接入（真正的「接入」）：此刻才该抓快照，且快照必须是**含 MCP 的当前内容**
+        codex::apply_at(&cfg, "http://127.0.0.1:47101", None).unwrap();
+        assert!(bak.exists(), "接入必须抓一份接入前快照");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            after_mcp,
+            "快照必须是「接入前」的真实内容（含用户已开的 MCP），不是「碰这个文件之前」"
+        );
+
+        // ③ 还原：回到「有 MCP、没有 model_providers.synaroute」这个真实的接入前状态
+        let restored = restore_one(&cfg).unwrap();
+        assert!(restored);
+        let back = std::fs::read_to_string(&cfg).unwrap();
+        assert!(back.contains("mcp_servers"), "还原不得把用户已开的 MCP 一起抹掉");
+        assert!(
+            !back.contains("[model_providers.synaroute]"),
+            "还原要撤掉的是接入配置：{back}"
+        );
+        assert!(back.contains("js_repl"), "用户其余配置段必须原样保留");
+
+        // ④ 注销 MCP 同样不锁快照（此时 .bak 已被 restore_one 删掉，若注销去锁就会重新造一份陈旧快照）
+        unregister_mcp_codex_at(&cfg).unwrap();
+        assert!(!bak.exists(), "MCP 注销同样不得锁快照");
+
+        std::fs::remove_dir_all(cfg.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn claude_register_writes_http_entry_and_is_idempotent() {        let path = temp_file("claude_reg", ".claude.json");
         let url = "http://127.0.0.1:9527/mcp";
 
         // 首次注册：写盘
