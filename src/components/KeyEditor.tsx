@@ -723,28 +723,6 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                   {vendorMissing && <option value={vendor}>{vendor}</option>}
                 </select>
               </div>
-              {/* 图标预设：**写这条 Key 自己的 `icon`**，不写厂商。
-                  原设计写厂商，被真机否掉了：绝大多数中转站 Key 选的厂商就是内置的
-                  「自定义」，而内置厂商只读 → 界面显示「图标不可修改」，
-                  而这恰恰是最需要选图标的场景（真机原话：「自定义时是需要能选预设图标，
-                  你设置的不能更改 不对」）。
-                  另一层理由：「自定义」下会挂很多条指向不同站点的 Key，
-                  把图标记在那个共享厂商上，改一条会连带改掉其余全部。
-                  故**任何厂商下都可选**（含内置），选中的值只作用于当前这条 Key；
-                  留空则跟着厂商走，与旧行为一致。 */}
-              {/* 挑选器走**弹窗**而不是内联展开：内联那版把这一行撑到 ~200px 高，
-                  而右列只有一个 40px 的协议下拉可填 → 下拉右下方一大块空白（真机报障）。
-                  32 个品牌的目录（搜索 + 分组 + 滚动）与旁边的单选下拉不是同一个量级，
-                  塞进同一行必然要么挤瘦它、要么撑高整行留白。详见 BrandPickerDialog。 */}
-              <div className="mt-2">
-                <div className="mb-1.5 text-[11px] text-text-muted">{t("editor.iconPresetLabel")}</div>
-                <BrandPickerTrigger
-                  value={icon}
-                  vendorHint={vendor}
-                  fallbackLabel={name || vendor}
-                  onOpen={() => setIconPickerOpen(true)}
-                />
-              </div>
             </Field>
             <Field label={t("editor.protocol")} className="w-48">
               <select
@@ -762,6 +740,31 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
               </select>
             </Field>
           </div>
+
+          {/* 图标预设**自成一行、占满宽度**。
+              放在「厂商 / 协议」那一行的左列里过不去：那一行是 `flex gap-3`，左列 `flex-1`、
+              右列是固定 `w-48` 的协议下拉。触发器被框在左列宽度内，而右列下方没东西可填
+              → 触发器右边空出一块（真机报障「厂商后面没有自适应」）。
+              挪出来之后触发器的 `w-full` 才真的等于抽屉宽度，那块空白随之消失。
+
+              图标写的是**这条 Key 自己的 `icon`**，不写厂商。原设计写厂商，被真机否掉了：
+              绝大多数中转站 Key 选的厂商就是内置的「自定义」，而内置厂商只读 →
+              界面显示「图标不可修改」，而这恰恰是最需要选图标的场景（真机原话：
+              「自定义时是需要能选预设图标，你设置的不能更改 不对」）。
+              另一层理由：「自定义」下会挂很多条指向不同站点的 Key，把图标记在那个共享厂商上，
+              改一条会连带改掉其余全部。故任何厂商下都可选，选中值只作用于当前这条 Key。
+
+              挑选器走**弹窗**而不是内联展开：内联那版把整行撑到 ~200px 高，
+              32 个品牌的目录（搜索 + 分组 + 滚动）与旁边的单选下拉不是同一个量级。
+              详见 BrandPickerDialog。 */}
+          <Field label={t("editor.iconPresetLabel")}>
+            <BrandPickerTrigger
+              value={icon}
+              vendorHint={vendor}
+              fallbackLabel={name || vendor}
+              onOpen={() => setIconPickerOpen(true)}
+            />
+          </Field>
 
           {/* 推断结果与当前选择不一致 → 提示 + 一键采纳。不强改，因为用户可能确实知道
               自己在做什么（例如中转商把 Anthropic 协议挂在 /v1 这种非标准路径下）。 */}
