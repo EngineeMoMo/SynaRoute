@@ -38,40 +38,12 @@ const SCAN = [
 ];
 const SKIP_DIRS = new Set(["node_modules", "target", "dist", "testdata"]);
 
-/**
- * 尾部 `#[cfg(test)] mod tests {` 的起始行号（1-based）；没有则返回 null。
- *
- * ⚠️ **可见性修饰符必须一起认**（`pub(crate) mod tests`）。跨模块复用测试夹具时会用到它
- * （diagnostics.rs 就借 service.rs 的 `temp_store` / `key`，避免夹具抄两份后各自漂移）。
- * 第一版只认裸 `mod tests`，于是给测试模块加一个 `pub(crate)` 就让这里返回 null、
- * 整份文件被当成生产段 —— service.rs 一下从 1608 报到 2478。
- *
- * 那次的失效方向恰好是**响亮的**（多算行数 → 门变红），所以被立刻发现；
- * 但同一个盲区若出现在别处就可能是反的，故这里按「可选修饰符」写全，别再收窄。
- */
-export function testModStartLine(src) {
-  const lines = src.split("\n");
-  const MOD_TESTS = /^\s{0,4}(pub(\([^)]*\))?\s+)?mod tests\b/;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (MOD_TESTS.test(lines[i])) {
-      // 往上找紧邻的 `#[cfg(test)]`（允许中间夹注释行）
-      for (let j = i - 1; j >= 0 && j >= i - 8; j--) {
-        const t = lines[j].trim();
-        if (t === "" || t.startsWith("//")) continue;
-        if (/^#\[cfg\(test\)\]$/.test(t)) return j + 1;
-        break;
-      }
-    }
-  }
-  return null;
-}
-
-/** 一个文件的「生产段」行数。 */
-export function prodLines(src) {
-  const cut = testModStartLine(src);
-  const lines = src.split("\n");
-  return cut === null ? lines.length : cut - 1;
-}
+// 「生产段 / 测试段」切分判据的实现与踩坑记录都在 lib/rust-source.mjs。
+// 它同时被 check-forbidden.mjs 使用 —— 抄第二份必然漂移（已经发生过一次：
+// 那边曾是只认裸 `mod tests` 的收窄版，会把测试段当成生产段去扫）。
+// 仍然 re-export，因为已有调用方按 `check-ratchet.mjs` 的名字导入。
+import { testModStartLine, prodLines } from "./lib/rust-source.mjs";
+export { testModStartLine, prodLines };
 
 function walk(dir, ext, skip, acc = []) {
   if (!existsSync(dir)) return acc;

@@ -427,7 +427,7 @@ npm run audit:release
 | **棘轮** | `npm run ratchet` | 现状不理想但可接受，只要求**不变坏** |
 | **棘轮防作弊** | `npm run ratchet:verify` | 基线只准往好的方向动；抬高必须附理由 |
 
-### 策略门现有三条
+### 策略门现有五条
 
 - `no-hardcoded-local-paths` —— 把「禁止硬编码本机路径」这条既有铁律变成机械判据。
   **只查生产段的非注释行**（`.rs` 排除尾部 `#[cfg(test)] mod tests`）。第一版裸 grep
@@ -466,6 +466,56 @@ npm run audit:release
   [`secrets/README.md`](secrets/README.md)。原先那份只记了一次换钥，**漏记的正好是泄露的那把**，
   导致排查时误判成「泄露的是现役钥」。换钥必须同步更新那张表。
   现役 `7A46ECB8087DE26F` 未泄露 —— **未泄露就不要换**，换一次就再甩掉一批收不到更新的用户。
+- `version-must-be-consistent`（2026-08-27 新增）—— 版本号必须处处一致。
+  <br>🔴 **本条修的是上面那句「三处版本号一致」本身就是错的**：实际有**四个**文件、
+  **五处**字段带版本号，而第四个（`package-lock.json` 的 `.version` 与
+  `.packages[""].version`）没人管 —— 实测它停在 **0.1.33**，其余三处已是 0.1.39，
+  落后 6 个版本、零告警。危害不在构建（Tauri 不读 lock 的 version，
+  `npm ci` 也只对账依赖、不看顶层版本），而在**取证**：排查「应用到底报了哪个版本」时
+  仓库里同时存在两个答案，却没有东西指出哪个权威。这一轮就是这么多花了一趟。
+  <br>**为什么 `tauri.conf.json` 与 `Cargo.toml` 必须一并查**：它们是**两个不同的版本来源**。
+  `package_info().version`（`get_app_version` / `check_for_updates` / 诊断导出）取自
+  `tauri.conf.json` 的 `version`（tauri-codegen `context.rs:273`，该字段缺失时才回落
+  `CARGO_PKG_VERSION`），Windows VERSIONINFO 的 FileVersion 取自**同一字段**
+  （tauri-build `lib.rs:632`）；而 `x-synaroute-version` 响应头取自 `CARGO_PKG_VERSION`
+  即 `Cargo.toml`。两者一旦漂移，exe 属性页与响应头会给出两个版本且**不报错**。
+  <br>**刻意不查 `Cargo.lock`**：cargo 每次构建自己会对齐它，收进来只会让
+  「刚 bump 完还没构建」这个正常中间态变红，是纯摩擦。
+  <br>同规则 2/3 的教训，**解析到少于 5 处就主动判失败** —— 文件改名或字段挪走会让
+  「全部一致」静默退化成「一个都没查」。三条注入均验证变红：lock 退回 0.1.33 /
+  `tauri.conf.json` 与 `Cargo.toml` 互不一致 / 删掉 `packages[""]` 让字段数掉到 4。
+  <br>修 lock 用 `npm install --package-lock-only`，别手改。
+- `updater-must-read-system-proxy`（2026-08-27 新增）—— 应用内更新必须保留读 Windows
+  系统代理的能力。
+  <br>🔴 **这个能力此前是「偶然」得来的，而一旦失去是静默的**：`reqwest` **无条件**调
+  `hyper-util` 的 `Matcher::from_system()`（`reqwest-0.13.4/src/proxy.rs:517`，无 feature 门控），
+  而真正读注册表 `ProxyEnable`/`ProxyServer` 那段被 `hyper-util` 的
+  `client-proxy-system` feature 门控（`matcher.rs:245` 与 `:663`）。
+  本仓从未显式要求过那个 feature —— 是 `Cargo.toml` 写了
+  `hyper-util = { features = ["full"] }` 恰好把它带进来的。
+  谁为瘦身收窄 `full`，**双击启动**的实例就再也读不到系统代理
+  （它不继承任何 shell 的 `HTTP_PROXY`）→ 国内用户「检查更新」全部超时，
+  而编译、测试、其余门**都不报错**。
+  <br>判据两条：① `Cargo.toml` 的 hyper-util 含 `full` 或显式含 `client-proxy-system`；
+  ② `Cargo.lock` 里 hyper-util **只有一个版本** —— feature 是按包并集的，
+  出现第二个版本时第一条会「绿着但能力已失」，这是本判据唯一的盲区，故一并钉住。
+  两条都做过故障注入（收窄 features / 伪造第二个版本）。
+  <br>⚠️ **注入手法上又踩了同一个坑**：伪造第二个版本那次「注入后仍绿」，
+  第一反应该是怀疑注入本身 —— `Cargo.lock` 是 **CRLF**，而我的注入脚本用 LF 搜索串，
+  `String.replace` 静默没匹配、压根没改到文件。判据自己用的是 `\r?\n`，是对的。
+  同 CLAUDE.md 里 `db_copy_path` 与 `sed 多行模式` 那两条：**注入不变红时先怀疑注入没生效**。
+
+### 顺带修掉的一处判据漂移（2026-08-27）
+
+`check-forbidden.mjs` 与 `check-ratchet.mjs` 各自写了一份「测试段起始行」判据，
+且**已经漂移**：ratchet 那份认 `pub(crate) mod tests`（注释里记着代价：
+第一版收窄导致 service.rs 从 1608 报到 2478），而 forbidden 那份是收窄版。
+<br>在 forbidden 里那个盲区的失效方向是**隐蔽的**：测试段被当成生产段去扫，
+于是测试夹具里的假路径会被 `no-hardcoded-local-paths` 报成违规 ——
+正是该文件注释开头记的第一个判据坑。当时没报，只是因为那些夹具里恰好没有 `C:\Users`。
+<br>已抽到 [`scripts/lib/rust-source.mjs`](scripts/lib/rust-source.mjs) 做单一事实来源。
+**别直接 `import` 另一个门脚本**：`check-ratchet.mjs` 一被导入就跑完整棘轮并打印，
+于是策略门的输出里混进棘轮的输出、检查还跑了两遍（第一版就是这样，已改为纯模块）。
 
 ### 棘轮：为什么只数「生产段」
 

@@ -20,6 +20,12 @@
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, sep } from "node:path";
 import { scanRepo } from "./lib/secret-scan.mjs";
+// 🔴 「测试段起始行」判据从共享模块导入，**不要**在这里再写一份。
+// 本文件原先自带一份收窄版（只认裸 `mod tests`，漏掉 `pub(crate) mod tests`），
+// 与 check-ratchet.mjs 那份已经漂移。在**本文件**里那个盲区的失效方向是隐蔽的：
+// 测试段会被当成生产段去扫，于是测试夹具里的假路径会被 no-hardcoded-local-paths
+// 报成违规 —— 正是下面注释开头记的第一个判据坑。现在没报，只是因为那些夹具里恰好没有 `C:\Users`。
+import { testModStartLine } from "./lib/rust-source.mjs";
 
 const SKIP_DIRS = new Set(["node_modules", "target", "dist", ".git"]);
 
@@ -33,21 +39,6 @@ function walk(dir, ext, acc = []) {
     }
   }
   return acc;
-}
-
-/** 尾部 `#[cfg(test)] mod tests {` 的起始行号（1-based）；没有则 null。与 check-ratchet.mjs 同源判据。 */
-function testModStartLine(src) {
-  const lines = src.split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (!/^\s{0,4}mod tests\b/.test(lines[i])) continue;
-    for (let j = i - 1; j >= 0 && j >= i - 8; j--) {
-      const t = lines[j].trim();
-      if (t === "" || t.startsWith("//")) continue;
-      if (/^#\[cfg\(test\)\]$/.test(t)) return j + 1;
-      break;
-    }
-  }
-  return null;
 }
 
 /**
@@ -225,6 +216,180 @@ const pass = (name, detail) => console.log(`✅ ${name}${detail ? ` —— ${det
           ? `，${stats.ciphertext.length} 份密文 × 候选口令共试解 ${stats.gpgChecks} 次均失败`
           : `，${stats.ciphertext.length} 份密文未试解（仓库里没有候选口令可试）`;
     pass("no-secrets-in-tracked-files", `扫过 ${stats.scanned} 个文件、${stats.b64Runs} 段 base64${cross}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 规则 4：版本号必须处处一致
+// ---------------------------------------------------------------------------
+{
+  const WHY =
+    "      CLAUDE.md 写的是「三处版本号一致」，但实际有**四个**文件带版本号，\n" +
+    "      而第四个（package-lock.json）没人管：2026-08-27 实测它停在 0.1.33，\n" +
+    "      其余三处已是 0.1.39 —— 落后 6 个版本，没有任何告警。\n" +
+    "      危害不在构建（Tauri 不读 lock 的 version，npm ci 也只对账依赖、不看顶层版本），\n" +
+    "      而在**取证**：排查「应用到底报了哪个版本」时，仓库里同时存在两个答案，\n" +
+    "      却没有任何东西指出哪个是权威的。这一轮就是这么多花了一趟。";
+
+  // 🔴 为什么 tauri.conf.json 必须与 Cargo.toml 一致（两者是**不同**的版本来源）：
+  //   - `package_info().version`（get_app_version / check_for_updates / 诊断导出）
+  //     取自 tauri.conf.json 的 `version`（tauri-codegen context.rs:273；
+  //     该字段缺失时才回落 env!("CARGO_PKG_VERSION")）；
+  //   - Windows VERSIONINFO 的 FileVersion/ProductVersion 取自**同一字段**
+  //     （tauri-build lib.rs:632）；
+  //   - 而 `x-synaroute-version` 响应头取自 CARGO_PKG_VERSION，即 Cargo.toml。
+  // 两处一旦漂移，exe 属性页与响应头会给出两个不同的版本，且**不会有任何报错**。
+  //
+  // 刻意**不**查 Cargo.lock：cargo 每次构建会自己把它对齐，
+  // 收进来只会让「刚 bump 完还没构建」这个正常中间态变红，是纯摩擦。
+  const readVersions = () => {
+    const json = (p) => JSON.parse(readFileSync(p, "utf8"));
+    const cargoToml = () => {
+      // 只取 [package] 段的 version —— 不能裸 grep /^version/，
+      // 那会在将来有人加 [workspace.package] 或依赖段时抓错行。
+      const lines = readFileSync("src-tauri/Cargo.toml", "utf8").split("\n");
+      let inPackage = false;
+      for (const line of lines) {
+        const t = line.trim();
+        if (/^\[.*\]$/.test(t)) {
+          inPackage = t === "[package]";
+          continue;
+        }
+        if (!inPackage) continue;
+        const m = t.match(/^version\s*=\s*"([^"]+)"/);
+        if (m) return m[1];
+      }
+      return undefined;
+    };
+    return [
+      ["package.json", ".version", () => json("package.json").version],
+      ["package-lock.json", ".version", () => json("package-lock.json").version],
+      ["package-lock.json", '.packages[""].version', () => json("package-lock.json").packages[""].version],
+      ["src-tauri/tauri.conf.json", ".version", () => json("src-tauri/tauri.conf.json").version],
+      ["src-tauri/Cargo.toml", "[package] version", cargoToml],
+    ];
+  };
+
+  const EXPECTED_FIELDS = 5;
+  const found = [];
+  const unreadable = [];
+  for (const [file, field, read] of readVersions()) {
+    let v;
+    try {
+      v = read();
+    } catch (e) {
+      unreadable.push(`      ${file} ${field}  读不出来：${e.message}`);
+      continue;
+    }
+    if (typeof v !== "string" || !v) {
+      unreadable.push(`      ${file} ${field}  缺失或不是字符串（拿到 ${JSON.stringify(v)}）`);
+      continue;
+    }
+    found.push({ file, field, v });
+  }
+
+  // 🔴 同规则 2/3：解析不到预期数量的字段就**主动判失败**。
+  // 文件被改名/字段被挪走会让「全部一致」退化成「一个都没查」，而那是静默的。
+  if (found.length < EXPECTED_FIELDS) {
+    fail(
+      "version-must-be-consistent",
+      `      只解析到 ${found.length}/${EXPECTED_FIELDS} 个版本字段 —— 解析器与仓库结构脱节了，\n` +
+        "      本检查已形同虚设，必须先修解析器再谈通过。\n" +
+        unreadable.join("\n")
+    );
+  } else {
+    const distinct = [...new Set(found.map((f) => f.v))];
+    if (distinct.length > 1) {
+      fail(
+        "version-must-be-consistent",
+        `${WHY}\n` +
+          `      发现 ${distinct.length} 个不同的版本号：${distinct.join(" / ")}\n` +
+          found.map((f) => `      ${f.v.padEnd(10)} ← ${f.file} ${f.field}`).join("\n") +
+          "\n\n      修法：先确定权威值（通常是 package.json），再同步其余；\n" +
+          "      package-lock.json 用 `npm install --package-lock-only`，不要手改。"
+      );
+    } else {
+      pass("version-must-be-consistent", `${found.length} 处版本号一致（${distinct[0]}）`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 规则 5：应用内更新必须保留「读 Windows 系统代理」的能力
+// ---------------------------------------------------------------------------
+{
+  const WHY =
+    "      应用内更新要访问 github.com。国内用户普遍靠系统代理上网，而**双击启动**的进程\n" +
+    "      不会继承任何 shell 里的 HTTP_PROXY/HTTPS_PROXY —— 于是能不能读 Windows\n" +
+    "      注册表里的系统代理设置，直接决定「检查更新」是通还是超时。\n" +
+    "      🔴 而这个能力是**偶然**得来的，且一旦失去是**静默**的：\n" +
+    "      reqwest 无条件调 hyper-util 的 Matcher::from_system()（reqwest-0.13.4/src/proxy.rs:517），\n" +
+    "      但读注册表那段被 hyper-util 的 `client-proxy-system` feature 门控\n" +
+    "      （hyper-util-0.1.20/src/client/proxy/matcher.rs:245 与 :663）。\n" +
+    "      本仓从未显式要求过这个 feature —— 它是 `hyper-util = { features = [\"full\"] }`\n" +
+    "      恰好把它带进来的。谁为瘦身把 full 收窄，更新功能就对一大批用户失效，\n" +
+    "      而编译、测试、门全都不会报错。";
+
+  const CARGO_TOML = "src-tauri/Cargo.toml";
+  const CARGO_LOCK = "src-tauri/Cargo.lock";
+  const problems = [];
+  let checked = 0;
+
+  if (!existsSync(CARGO_TOML) || !existsSync(CARGO_LOCK)) {
+    problems.push(`      找不到 ${CARGO_TOML} 或 ${CARGO_LOCK} —— 解析器与仓库结构脱节`);
+  } else {
+    const toml = readFileSync(CARGO_TOML, "utf8");
+    // 只认非注释行上的 hyper-util 依赖声明
+    const line = toml
+      .split("\n")
+      .find((l) => /^\s*hyper-util\s*=/.test(l) && !l.trim().startsWith("#"));
+    if (!line) {
+      problems.push(
+        "      Cargo.toml 里找不到 hyper-util 依赖声明 —— 要么被删了（那更新代理能力已经没了），\n" +
+          "        要么写法变了导致本判据空转。两种都必须人工看一眼。"
+      );
+    } else {
+      checked++;
+      const feats = (line.match(/features\s*=\s*\[([^\]]*)\]/) || [, ""])[1];
+      const has =
+        /["']full["']/.test(feats) || /["']client-proxy-system["']/.test(feats);
+      if (!has) {
+        problems.push(
+          `      ${CARGO_TOML} 的 hyper-util 既没有 "full" 也没有 "client-proxy-system"：\n` +
+            `        ${line.trim()}\n` +
+            '        → 收窄了 features 就必须显式写上 "client-proxy-system"。'
+        );
+      }
+    }
+
+    // 第二道：feature 是**按包**并集的，只有当 hyper-util 在依赖树里只有一个版本时,
+    // 本仓 features=["full"] 才能影响到 reqwest 实际链接的那一份。
+    // 出现第二个版本时上面那条会「仍然为绿而能力已失」—— 这是本判据唯一的盲区，故一并钉住。
+    const lock = readFileSync(CARGO_LOCK, "utf8");
+    const versions = [
+      ...lock.matchAll(/^name = "hyper-util"\r?\nversion = "([^"]+)"/gm),
+    ].map((m) => m[1]);
+    if (versions.length === 0) {
+      problems.push("      Cargo.lock 里没有 hyper-util —— 解析器坏了或依赖已移除");
+    } else if (versions.length > 1) {
+      problems.push(
+        `      Cargo.lock 里有 ${versions.length} 个 hyper-util 版本（${versions.join(", ")}）。\n` +
+          "        feature 是按包并集的，多版本时本仓的 features=[\"full\"] 可能落在\n" +
+          "        reqwest 实际链接的那一份之外 → 上面那条判据会「绿着但能力已失」。\n" +
+          "        请统一版本，或改为显式验证 reqwest 那一侧的 feature。"
+      );
+    } else {
+      checked++;
+    }
+  }
+
+  if (problems.length) {
+    fail("updater-must-read-system-proxy", `${WHY}\n${problems.join("\n")}`);
+  } else {
+    pass(
+      "updater-must-read-system-proxy",
+      `hyper-util 带 client-proxy-system 且依赖树里仅一个版本（${checked}/2 项判据均命中）`
+    );
   }
 }
 

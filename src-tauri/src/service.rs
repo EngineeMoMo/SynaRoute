@@ -1433,24 +1433,13 @@ pub(crate) struct UpdateCheckResult {
     pub(crate) error: Option<String>,
 }
 
-/// 把 updater 的原始英文错误翻成可行动的中文。
-pub(crate) fn friendly_updater_error(raw: &str) -> String {
-    let lower = raw.to_ascii_lowercase();
-    if lower.contains("could not fetch a valid release json")
-        || lower.contains("404")
-        || lower.contains("not found")
-    {
-        return format!(
-            "无法拉取更新清单 latest.json（常见原因：GitHub 仓库为私有，\
-             公开 URL 返回 404；或尚未上传 Release 资产）。\
-             请把 Release 资产放到可匿名访问的地址，或将仓库设为公开。原始错误: {raw}"
-        );
-    }
-    if lower.contains("signature") || lower.contains("minisign") {
-        return format!("更新包签名校验失败（公钥与发版签名不匹配）。原始错误: {raw}");
-    }
-    format!("检查更新失败: {raw}")
-}
+// updater 错误文案的分流实现。用 `#[path]` 而不是把 service.rs 目录化：
+// 后者是 docs/15 P2-7 明确「刻意未做」的大 diff 项，而这里只需要一个落点 ——
+// 本文件生产段顶着棘轮基线（1454/1454，余量 0），新增判据放不进来。
+// 对外仍是 `service::friendly_updater_error`，故 lib.rs 的三个调用点一行都不用改。
+#[path = "updater_msg.rs"]
+pub(crate) mod updater_msg;
+pub(crate) use updater_msg::friendly_updater_error;
 
 #[cfg(test)]
 pub(crate) mod tests {
