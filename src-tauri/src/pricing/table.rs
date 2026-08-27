@@ -181,6 +181,12 @@ pub(crate) const PRICING_TABLE: &[Row] = &[
     rc("chat-latest", Vendor::OpenAi, 5.00, 30.00, 0.50),
     // o 系：缓存命中是 0.25×~0.5×，不是 0.1×
     rc("o1-pro", Vendor::OpenAi, 150.00, 600.00, 15.00),
+    // `o1-mini` 必须**显式列出**，否则它按最长片段落到下面那行 `o1` 上 → $15/$60，
+    // 而真实价是 $1.10/$4.40（**13.6 倍高估**，且 tag 是 Exact、界面不打 ≈）。
+    // 这与本轮修掉的 `gpt-4.1-nano → gpt-4`（输入价 100 倍）是同一个机制：
+    // 「短片段是长名字的前缀」时，缺一行就等于继承贵档的价。
+    // 它已不在官方现行价表上（故 retired），价取自下线前的公开价。
+    retired(rc("o1-mini", Vendor::OpenAi, 1.10, 4.40, 0.55)),
     rc("o1", Vendor::OpenAi, 15.00, 60.00, 7.50),
     rc("o3-pro", Vendor::OpenAi, 20.00, 80.00, 2.00),
     rc("o3-mini", Vendor::OpenAi, 1.10, 4.40, 0.55),

@@ -139,8 +139,52 @@ fn lookup_row(model: &str) -> Option<&'static Row> {
     }
     PRICING_TABLE
         .iter()
-        .filter(|row| n.contains(row.frag))
+        .filter(|row| fragment_matches(row.frag, &n))
         .max_by_key(|row| (row.frag.len(), row.frag))
+}
+
+/// 片段是否命中模型名 —— 带**版本边界**判据。
+///
+/// # 为什么不能是裸 `contains`
+///
+/// 「以数字结尾的片段」同时是它自己后续小版本的前缀，于是最长命中会把**未来的小版本**
+/// 钉死在最老的那个兄弟行上，而不是落到家族兜底（= 现役旗舰价）。实测三处：
+///
+/// | 模型名 | 裸 contains 命中 | 价 | 旗舰价 |
+/// |---|---|---|---|
+/// | `gpt-5.6` | `gpt-5` | $1.25/$10 | `gpt-5.6-sol` $4/$20（**2.1× 低**）|
+/// | `glm-5.9` | `glm-5` | $1.00/$3.20 | `glm-5.3` $1.40/$4.40 |
+/// | `gpt-4.5` | `gpt-4`（**`live: false`**）| $30/$60 | —— |
+///
+/// 而这三条的 `PricingSource` 都是 `Exact` → 界面**不打 `≈`**，用户看到一个自信的错数字。
+/// 偏低尤其糟（模块头写明「宁可偏高」）：它让人不知不觉超支。
+/// Claude 侧天然免疫 —— 那边家族行是具体行的**前缀**（`claude-opus` ⊂ `claude-opus-5`），
+/// 方向恰好相反；GPT/GLM 是倒过来的，所以才只在这两族暴露。
+///
+/// # 判据
+///
+/// 片段以数字结尾、且模型名里紧跟 `-<数字>` 时，这一处出现**不算命中**（那是更晚的小版本）。
+/// 其余一律照旧，故这些必须不受影响（都在下面的测试里）：
+/// `gpt-4` ↛ `gpt-4-1-nano` 但 → `gpt-4o` / `gpt-4-turbo`；`o1` → `o1-mini`；
+/// `deepseek-v4` → `deepseek-v4-pro`；`glm-4` → `glm-4-plus`。
+///
+/// 同一片段在名字里出现多次时逐处试（`from` 往后推），只要有一处是有效命中就算命中。
+fn fragment_matches(frag: &str, normalized: &str) -> bool {
+    let ends_with_digit = frag.as_bytes().last().is_some_and(u8::is_ascii_digit);
+    let mut from = 0usize;
+    while let Some(rel) = normalized[from..].find(frag) {
+        let at = from + rel;
+        let rest = &normalized[at + frag.len()..];
+        // 「更晚的小版本」= 片段以数字结尾，且后面紧跟 `-` 再跟一个数字
+        let is_later_minor = ends_with_digit
+            && rest.as_bytes().first() == Some(&b'-')
+            && rest.as_bytes().get(1).is_some_and(u8::is_ascii_digit);
+        if !is_later_minor {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
 }
 
 /// 按模型名查单价。
@@ -304,10 +348,13 @@ mod tests {
             let forward = estimate_cost(&usage, Some(m), None);
             // 用同一条规则重算一遍，但**倒序**扫表。结果必须逐条相同。
             let n = normalize(m);
+            // **必须复用 `fragment_matches`**，不能写成裸 `n.contains(row.frag)`：
+            // 那样这条测试比的就不是「同一规则的两个扫表方向」，而是「两套不同规则」，
+            // 于是任何对匹配规则的改动都会让它变红 —— 一条会误报的判据等于噪音。
             let rev = PRICING_TABLE
                 .iter()
                 .rev()
-                .filter(|row| n.contains(row.frag))
+                .filter(|row| fragment_matches(row.frag, &n))
                 .max_by_key(|row| (row.frag.len(), row.frag))
                 .map(|row| ModelPricing::from_row(row).calculate_cost_nano(&usage, 1.0));
             assert_eq!(forward.0, rev, "模型 {m} 的结果依赖了表的顺序");
@@ -407,10 +454,20 @@ mod tests {
             let n = normalize(m);
             let hit = PRICING_TABLE
                 .iter()
-                .filter(|row| n.contains(row.frag))
-                .max_by_key(|row| row.frag.len());
+                .filter(|row| fragment_matches(row.frag, &n))
+                .max_by_key(|row| (row.frag.len(), row.frag));
             let Some(hit) = hit else { continue };
             // 名字里含厂商强特征词时，命中的行必须属于那个厂商。
+            //
+            // ⚠️ **这张表原先漏掉了 OpenAI / o 系 / codex / Mistral / Cohere / 开放权重**，
+            // 也就是说表里最大的那一族（OpenAI 约 35 行，Codex 分类就跑在它上面）
+            // 完全不在判据覆盖内。实测两处真窟窿在当时都是绿的：
+            // 加一行 `("codex-mini", Cohere)` 会吃掉 `gpt-5.1-codex-mini` 与 `codex-mini-latest`；
+            // 加一行 `("3-70b-instruct", Zhipu)` 会吃掉 `llama-3.3-70b-instruct`。
+            //
+            // 🔴 **顺序在这里是语义的一部分**（`find` 取首个命中）：开放权重的三条必须排在
+            // 裸 `gpt` 之前 —— `gpt-oss-120b` 合法地属于 `OpenWeight`，
+            // 把 `("gpt", OpenAi)` 提前会让它误报。
             let expect = [
                 ("claude", table::Vendor::Anthropic),
                 ("gemini", table::Vendor::Google),
@@ -423,6 +480,24 @@ mod tests {
                 ("minimax", table::Vendor::MiniMax),
                 ("hunyuan", table::Vendor::Tencent),
                 ("sonar", table::Vendor::Perplexity),
+                // ---- 以下是本轮补的（原先这一段整个缺失）----
+                // 开放权重三条**必须在裸 gpt 之前**，理由见上。
+                ("gpt-oss", table::Vendor::OpenWeight),
+                ("llama", table::Vendor::OpenWeight),
+                ("gemma", table::Vendor::OpenWeight),
+                ("nemotron", table::Vendor::OpenWeight),
+                ("codex", table::Vendor::OpenAi),
+                ("gpt", table::Vendor::OpenAi),
+                ("chat-latest", table::Vendor::OpenAi),
+                ("o1", table::Vendor::OpenAi),
+                ("o3", table::Vendor::OpenAi),
+                ("o4", table::Vendor::OpenAi),
+                ("mistral", table::Vendor::Mistral),
+                ("ministral", table::Vendor::Mistral),
+                ("codestral", table::Vendor::Mistral),
+                ("command", table::Vendor::Cohere),
+                ("seed-", table::Vendor::ByteDance),
+                ("hy", table::Vendor::Tencent),
             ]
             .iter()
             .find(|(kw, _)| n.contains(kw))
@@ -508,6 +583,44 @@ mod tests {
         // ⑤ 整族 Unknown：Codex 用的那些名字必须有价。
         assert_eq!(estimate_cost(&one_m, Some("gpt-5.6-sol"), None).0, Some(4_000_000_000));
         assert_eq!(estimate_cost(&one_m, Some("gpt-5.4-mini"), None).0, Some(750_000_000));
+
+        // ⑥ **13.6× 高估**：`o1-mini` 缺行 → 按最长片段落到 `o1`（$15/$60）。
+        //    与 ③ 的 `gpt-4.1-nano → gpt-4` 同一机制：短片段是长名字的前缀，缺一行就继承贵档。
+        assert_eq!(
+            estimate_cost(&one_m, Some("o1-mini"), None).0,
+            Some(1_100_000_000),
+            "o1-mini = $1.10/MTok，不是 o1 的 $15"
+        );
+
+        // ⑦ **未来小版本不许钉在最老的兄弟行上**（`fragment_matches` 的版本边界判据）。
+        //    这三条此前都是 `Exact` → 界面不打 `≈`，用户看到一个自信的错数字。
+        //    偏低尤其糟：它让人不知不觉超支（模块头写明「宁可偏高」）。
+        let flagship_gpt = estimate_cost(&one_m, Some("gpt-5.6-sol"), None).0;
+        for future in ["gpt-5.6", "gpt-5.7", "gpt-5.9"] {
+            assert_eq!(
+                estimate_cost(&one_m, Some(future), None).0,
+                flagship_gpt,
+                "{future} 应落到 gpt 家族兜底（= 现役旗舰价），而不是 gpt-5 那行的 $1.25"
+            );
+        }
+        let flagship_glm = estimate_cost(&one_m, Some("glm-5.3"), None).0;
+        assert_eq!(
+            estimate_cost(&one_m, Some("glm-5.9"), None).0,
+            flagship_glm,
+            "glm-5.9 应落到 glm 家族兜底，而不是 glm-5 那行"
+        );
+        // 而**现役的裸代号本身**必须仍按它自己那行算（这条防止上面的修法过头）
+        assert_eq!(
+            estimate_cost(&one_m, Some("gpt-5"), None).0,
+            Some(1_250_000_000),
+            "gpt-5 自己仍在役，必须按 $1.25 算"
+        );
+        // 退役行不得成为未来小版本的事实兜底：`gpt-4.5` 曾落到 live:false 的 gpt-4（$30）
+        assert_ne!(
+            estimate_cost(&one_m, Some("gpt-4.5"), None).0,
+            Some(30_000_000_000),
+            "gpt-4.5 不该继承已退役的 gpt-4 行"
+        );
     }
 
     /// `Exact` 与 `Family` 必须都是**可达**的档位。
@@ -610,3 +723,4 @@ mod tests {
         );
     }
 }
+
