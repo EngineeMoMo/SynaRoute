@@ -14,7 +14,6 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
-use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
@@ -27,10 +26,11 @@ use tokio::task::JoinHandle;
 
 /// 响应体类型：可能是完整缓冲体（Full）或流式体（StreamBody），统一装箱为 BoxBody。
 /// 流式路径用于同协议 SSE 透传（stream:true），缓冲路径用于非流式 / 跨协议。
-type ResBody = BoxBody<Bytes, std::io::Error>;
+#[path = "lan_guard.rs"] pub(crate) mod lan_guard; // 入站鉴权；来由见该文件模块注释
+pub(crate) type ResBody = BoxBody<Bytes, std::io::Error>;
 
 /// 把完整字节体装箱为 ResBody（Full 的错误类型是 Infallible，用 `match` 消解）。
-fn full_body(body: Bytes) -> ResBody {
+pub(crate) fn full_body(body: Bytes) -> ResBody {
     Full::new(body).map_err(|never| match never {}).boxed()
 }
 
@@ -284,6 +284,7 @@ impl ProxyManager {
         let settings = self.store.get_settings();
         let lan = settings.lan_exposure;
         let host = if lan { [0, 0, 0, 0] } else { [127, 0, 0, 1] };
+        if lan { lan_guard::ensure_token(&self.store); } // 先备好令牌+落事件，否则用户看不到它
 
         // 粘滞固定端口：首选端口取配置里该分类的值（缺省用分类表里的 default_port）。
         // 从首选端口起在 [preferred, preferred+FALLBACK_RANGE] 内逐个尝试，绑上即用；
@@ -330,15 +331,14 @@ impl ProxyManager {
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
-                        let Ok((stream, _)) = accepted else { break };
+                        // peer 是局域网鉴权的唯一依据，**别再丢回 `_`** —— 丢了就只能放行所有人。
+                        let Ok((stream, peer)) = accepted else { break };
                         let io = TokioIo::new(stream);
                         let store = store.clone();
                         let gate_key = gate_key.clone();
                         let mut conn_shutdown = shutdown_rx.clone();
                         tokio::spawn(async move {
-                            let svc = service_fn(move |req| {
-                                handle_request(store.clone(), category, gate_key.clone(), req)
-                            });
+                            let svc = lan_guard::guarded(store, category, gate_key, peer);
                             let conn = hyper::server::conn::http1::Builder::new()
                                 .serve_connection(io, svc);
                             tokio::pin!(conn);
@@ -446,7 +446,7 @@ impl ProxyManager {
 /// 收成一个出口后，漏掉这件事在结构上做不到：inner 返回什么，都会经过这里。
 ///
 /// `gate_key`：本次请求所属「代理实例 + 分类」的短路窗口键（见 [`all_failed_gate`]）。
-async fn handle_request(
+pub(crate) async fn handle_request(
     store: Arc<Store>,
     category: CategoryType,
     gate_key: String,
@@ -3138,6 +3138,8 @@ const MAX_RETRY_AFTER_SECS: i64 = 300;
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 生产段已改走 lan_guard::guarded（那层负责鉴权），故 service_fn 只剩测试在用。
+    use hyper::service::service_fn;
     use crate::model::UserPrefs;
     use crate::model::{CategoryType, HealthState, KeyParams, Protocol, ProviderKey};
     use crate::store::Store;

@@ -214,6 +214,29 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   <br>另：`status_code=502, upstream HTTP 400:` 这个格式**不是 SynaRoute 也不是 cc-switch 输出的**
   （前者全仓搜不到，后者格式是 `上游错误 (429): {...}`，已读其 proxy_request_logs 11869 行核对），
   那是中转站自己网关的日志行。
+- 🔴 **局域网暴露的额度白嫖已堵（2026-08-27，docs/14 §20.8 唯一的安全级缺陷）**：
+  `lan_exposure` 一开就绑 `0.0.0.0`，而转发路径把下游的 `authorization`/`x-api-key`
+  **原样剥掉**再换上真实 Key —— 剥之前**从不校验**。于是同网段任何人打
+  `http://<内网IP>:47100/v1/messages` 就能拿用户的付费 Key 跑一趟，无需任何凭据。
+  实现在 [`lan_guard.rs`](src-tauri/src/lan_guard.rs)（挂在 `proxy` 模块下）。
+  <br>**判据：只对非 loopback 强制令牌。** 本机放行不是省事 —— 要求本机也带令牌就得同步改
+  **三份**客户端配置（CLI/桌面端/Codex），漏一份的表现是「接入完成但一直 401」，
+  用户无从判断是配置还是代理坏了。
+  <br>**令牌存 `secrets.enc` 不存 `config.json`**：① `AppSettings` 的字段会被前端批量
+  `saveSettings` 覆盖（白名单漏键 → `#[serde(default)]` 补空串），而在这里失效方向是
+  「鉴权静默失效」；② 主口令锁定时 `SecretStore::get` 返 `Err`，本模块把 Err 当拒绝，
+  于是锁定态**自动 fail closed**，不用多写一行。
+  <br>令牌在 `ProxyManager::start` 开局域网时就生成并**落一条带明文令牌的事件** ——
+  那是本阶段用户唯一的获取通道（设置页 UI 未做，`settings.lanDesc` 已改成指向日志页）。
+  有测试同时钉住「生成」与「可见」：只生成不落事件的表现是「怎么配都 401 而日志里什么都没有」。
+  <br>🔴 **11 条测试里只有一条能抓住最要紧的那个注入**：把 `accept` 的 `peer` 丢回 `_`
+  并给 guard 传硬编码 loopback（= 缺陷本体，所有来源都被当本机），**其余 10 条全绿**。
+  抓住它的是源码级判据 `accept_must_pass_the_real_peer_into_the_guard`。
+  同 `route_meta` 那条教训：**覆盖了判定函数与分发函数 ≠ 覆盖了两者之间的接线**。
+  四条注入（接线退回 / verdict 恒放行 / 无令牌退化为放行 / 不落事件）均验证变红。
+  <br>**零棘轮抬高**（7 个相关文件余量全是 0）：把 `service_fn` 那 3 行换成 1 行
+  `lan_guard::guarded(...)` 调用、并把只剩测试在用的 `service_fn` import 移进测试段，
+  省出的行数正好抵掉 `#[path]` 挂载（写成单行）与 `ensure_token` 那一行。
 - **刻意不修的项**（别当成遗漏重复劳动）：SmartScreen 签名告警、`retrieval.rs` 的 `cwd` 白名单、
   请求日志存明文对话（默认关闭）
 - **自有诊断响应头已上线（2026-08-23，借鉴 OmniRoute 的 `X-OmniRoute-*`）**：
