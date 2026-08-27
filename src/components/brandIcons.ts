@@ -351,7 +351,20 @@ export const BRANDS: Brand[] = [
     labelEn: "Azure OpenAI",
     group: "gateway",
     color: "#0078D4",
-    keywords: ["azure", "openai.azure.com", "cognitiveservices"],
+    // 🔴 `azure-openai` 必须显式列出（它就是内置厂商的 id）。
+    // `resolveBrand` 取**最长**命中，而 `openai`（6）比 `azure`（5）长 ——
+    // 少了这一条，「Azure OpenAI」那一行会渲染成 **OpenAI 的绿色花瓣 logo**。
+    // 内置厂商 `icon: None`，界面走的正是这条启发式，所以是用户直接看得见的错。
+    // 判据见 brandIcons.test.ts 里由 33 条厂商 id **自动生成**的那组用例。
+    // `azure-openai` = 厂商 id；`azure openai` = 显示名里的写法（**空格**，不是连字符）。
+    // 两种都要收：界面有些地方传 `vendor.id` 当 hint、有些地方传 `vendor.name`。
+    keywords: [
+      "azure-openai",
+      "azure openai",
+      "azure",
+      "openai.azure.com",
+      "cognitiveservices",
+    ],
   },
   {
     key: "bedrock",
