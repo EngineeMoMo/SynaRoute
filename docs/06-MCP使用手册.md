@@ -174,7 +174,8 @@ Claude Code 支持在 `.claude/settings.json` 里配置 hooks。示例：当输�
 MCP 调用会记录到：
 
 - SynaRoute「运行日志」页（类型标 `mcp`）
-- 软件安装目录下的 `logs/YYYY-MM-DD.jsonl`（或设置里自定义的日志目录）
+- 软件安装目录下的 `logs/YYYY-MM-DD.jsonl`（或设置里自定义的日志目录）。
+  单个文件写满 16MB 会滚出 `YYYY-MM-DD.1.jsonl`、`.2.jsonl`，同一天的内容按序号先后排列
 
 每条记录含：时间、工作目录、参与者数、检索文件数、耗时、成功/失败。
 
