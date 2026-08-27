@@ -38,11 +38,22 @@ const SCAN = [
 ];
 const SKIP_DIRS = new Set(["node_modules", "target", "dist", "testdata"]);
 
-/** 尾部 `#[cfg(test)] mod tests {` 的起始行号（1-based）；没有则返回 null。 */
+/**
+ * 尾部 `#[cfg(test)] mod tests {` 的起始行号（1-based）；没有则返回 null。
+ *
+ * ⚠️ **可见性修饰符必须一起认**（`pub(crate) mod tests`）。跨模块复用测试夹具时会用到它
+ * （diagnostics.rs 就借 service.rs 的 `temp_store` / `key`，避免夹具抄两份后各自漂移）。
+ * 第一版只认裸 `mod tests`，于是给测试模块加一个 `pub(crate)` 就让这里返回 null、
+ * 整份文件被当成生产段 —— service.rs 一下从 1608 报到 2478。
+ *
+ * 那次的失效方向恰好是**响亮的**（多算行数 → 门变红），所以被立刻发现；
+ * 但同一个盲区若出现在别处就可能是反的，故这里按「可选修饰符」写全，别再收窄。
+ */
 export function testModStartLine(src) {
   const lines = src.split("\n");
+  const MOD_TESTS = /^\s{0,4}(pub(\([^)]*\))?\s+)?mod tests\b/;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (/^mod tests\b/.test(lines[i]) || /^\s{0,4}mod tests\b/.test(lines[i])) {
+    if (MOD_TESTS.test(lines[i])) {
       // 往上找紧邻的 `#[cfg(test)]`（允许中间夹注释行）
       for (let j = i - 1; j >= 0 && j >= i - 8; j--) {
         const t = lines[j].trim();

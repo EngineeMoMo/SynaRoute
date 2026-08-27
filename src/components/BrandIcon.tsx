@@ -1,203 +1,124 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
+import { Search, X } from "lucide-react";
+import { useT } from "@/lib/useT";
+import { useStore } from "@/store";
+import {
+  BRANDS,
+  getBrand,
+  isNearBlack,
+  isPresetBrand,
+  resolveBrand,
+  type Brand,
+  type BrandGroup,
+} from "@/components/brandIcons";
+
+export { isPresetBrand } from "@/components/brandIcons";
 
 /**
- * 品牌图标：按 vendor id / 名称 / 模型名匹配内置 SVG logo。
- * 未知厂商回退为名称首字母的配色圆形占位（参考 ccswitch 风格）。
+ * 品牌图标：按 vendor id / 名称 / 模型名匹配内置 logo，未知厂商回退首字母色块。
  *
- * 图标为简化单色路径，通过 currentColor 上色，随品牌配色变化。
+ * 注册表（键、显示名、主色、path、匹配词）在 `brandIcons.ts`；本文件只管**画**。
+ * 19 个品牌的 path 来自 simple-icons（CC0，见 `brandIcons.generated.ts`），
+ * 其余走首字母兜底 —— 刻意不画「看起来像但其实不是」的假 logo。
  */
 
-type BrandKey =
-  | "anthropic"
-  | "openai"
-  | "deepseek"
-  | "zhipu"
-  | "moonshot"
-  | "gemini"
-  | "qwen"
-  | "mistral";
+interface BrandIconProps {
+  /** vendor id、厂商名或模型名，任一即可用于推断品牌 */
+  hint?: string;
+  /** 无法推断品牌时，用于生成首字母占位的显示名 */
+  fallbackLabel?: string;
+  /**
+   * 用户**显式指定**的图标，两种形态（与 cc-switch 的 `icon` 列同一模型）：
+   * - **预设键**（`"anthropic"`、`"zhipu"`…）→ 渲染内置品牌 logo；
+   * - **data-URL**（`data:image/png;base64,…`）→ 渲染上传的自定义图片。
+   *
+   * 两者都**优先于**启发式匹配 —— 显式选择必须胜过程序的猜测，否则用户会发现「选了没用」。
+   */
+  iconUrl?: string;
+  size?: number;
+  className?: string;
+}
 
-/**
- * 可供用户**显式挑选**的内置品牌清单（厂商管理页的图标选择器用）。
- *
- * ## 为什么需要「显式挑选」，而不是只靠自动匹配
- *
- * `resolveBrand` 按 vendor id / 名称 / 模型名做启发式匹配，覆盖了大多数情况。但中转站
- * 的名字千奇百怪（「小明API」「林夕公益站」「百倍」），猜不中时只能退化成首字母色块 ——
- * 用户明知这是个 Claude 中转，却没有任何地方能告诉程序。cc-switch 给了这个入口，我们没有。
- *
- * ## 与 cc-switch 的存储形态对齐（从其本机库取证，非推测）
- *
- * 读 `~/.cc-switch/cc-switch.db` 的 `providers` 表可见：`icon` 列存的是**预设键字符串**
- * （`anthropic`、`openai`），配套 `icon_color` 存品牌色（`#D4915D`、`#00A67E`），
- * **不是** data-URL。故我们沿用同一模型：`Vendor.icon` 既可放 data-URL（自定义上传），
- * 也可放这里的预设键 —— 字段类型无需改动（本就是 `Option<String>`），
- * 靠 `isPresetBrand` 在渲染时区分两者。
- *
- * 显示名用中文常用叫法而非厂商英文全称：用户是在「我这个 Key 是哪家的」这个语境下选的。
- */
-export const PRESET_BRANDS: { key: BrandKey; label: string }[] = [
-  { key: "anthropic", label: "Anthropic / Claude" },
-  { key: "openai", label: "OpenAI / GPT" },
-  { key: "deepseek", label: "DeepSeek 深度求索" },
-  { key: "zhipu", label: "智谱 GLM" },
-  { key: "moonshot", label: "月之暗面 Kimi" },
-  { key: "qwen", label: "通义千问 Qwen" },
-  { key: "gemini", label: "Google Gemini" },
-  { key: "mistral", label: "Mistral" },
-];
+export function BrandIcon({ hint, fallbackLabel, iconUrl, size = 18, className }: BrandIconProps) {
+  // 深色模式下近黑品牌色要提亮，否则等于没有图标（详见 brandIcons.ts 的 isNearBlack）。
+  const theme = useStore((s) => s.theme);
+  const dark = useIsDark(theme);
 
-/**
- * 内置品牌预设的**挑选器**（厂商管理页与 Key 编辑器共用一份实现）。
- *
- * 抽出来的理由不是「省几行」：两处各写一遍必然漂移 —— 一边加了新品牌、另一边没加，
- * 或者「再点一次取消选择」这条交互只有一边有。而这两个入口对用户是同一件事
- * （「告诉程序这个站是哪家的」），行为不一致比少一个入口更让人困惑。
- *
- * `value` 为预设键时高亮那一个；为 data-URL（用户上传的自定义图标）或 undefined 时全不高亮。
- * 点已高亮的那个 = 取消选择，回到自动匹配（`onChange(undefined)`）。
- */
-export function BrandPresetPicker({
-  value,
-  onChange,
-  disabled,
-}: {
-  value?: string;
-  onChange: (next: string | undefined) => void;
-  disabled?: boolean;
-}) {
+  // 显式预设键最高优先：用户挑了就按他挑的画，不再让启发式插手。
+  const explicit = isPresetBrand(iconUrl) ? getBrand(iconUrl) : undefined;
+  const brand = useMemo(
+    () => explicit ?? resolveBrand(hint) ?? resolveBrand(fallbackLabel),
+    [explicit, hint, fallbackLabel],
+  );
+
+  // 自定义上传图标（data-URL）：仅当它**不是**预设键时才走 <img>。
+  // 预设键不是 URL，塞进 src 会被浏览器当相对路径去请求、渲染成碎图标。
+  if (iconUrl && !explicit) {
+    return (
+      <span
+        className={`inline-flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-surface-hover ${className ?? ""}`}
+        style={{ width: size, height: size }}
+        title={hint ?? fallbackLabel}
+      >
+        <img src={iconUrl} alt="" width={size} height={size} className="h-full w-full object-cover" />
+      </span>
+    );
+  }
+
+  if (brand?.path) {
+    const color = dark && isNearBlack(brand.color) ? "#E4E4E7" : brand.color;
+    return (
+      <span
+        className={`inline-flex shrink-0 items-center justify-center rounded-full ${className ?? ""}`}
+        style={{
+          width: size,
+          height: size,
+          color,
+          // 底色用品牌色的 10% alpha。近黑品牌在深色下已经提亮成浅灰，
+          // 再叠一层浅底会糊成一片 —— 那时改用中性底。
+          background: dark && isNearBlack(brand.color) ? "rgb(255 255 255 / 0.08)" : `${brand.color}1a`,
+        }}
+        title={brand.label}
+      >
+        <svg width={size * 0.62} height={size * 0.62} viewBox="0 0 24 24" aria-hidden="true">
+          <path fill="currentColor" d={brand.path} />
+        </svg>
+      </span>
+    );
+  }
+
+  // 有品牌但没有 logo（simple-icons 未收录）→ 用**品牌色**的首字母块，
+  // 而不是随机哈希色：至少颜色是对的，视觉上仍能把同一家认出来。
+  const label = brand?.label ?? fallbackLabel ?? hint ?? "?";
+  const bg = brand ? brand.color : fallbackColor(label);
   return (
-    <div className="flex flex-wrap gap-1.5">
-      {PRESET_BRANDS.map((b) => {
-        const active = value === b.key;
-        return (
-          <button
-            key={b.key}
-            type="button"
-            title={b.label}
-            aria-label={b.label}
-            aria-pressed={active}
-            disabled={disabled}
-            onClick={() => onChange(active ? undefined : b.key)}
-            className={`flex h-9 w-9 items-center justify-center rounded-control border transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
-              active
-                ? "border-primary bg-primary/12"
-                : "border-border hover:border-primary/50 hover:bg-surface-hover"
-            }`}
-          >
-            <BrandIcon iconUrl={b.key} fallbackLabel={b.label} size={20} />
-          </button>
-        );
-      })}
-    </div>
+    <span
+      className={`inline-flex shrink-0 items-center justify-center rounded-full font-semibold text-white ${className ?? ""}`}
+      style={{
+        width: size,
+        height: size,
+        // 近黑品牌在深色模式下提亮一档，否则字母块与背景糊在一起
+        background: dark && isNearBlack(bg) ? "#3F3F46" : bg,
+        fontSize: size * 0.5,
+      }}
+      title={label}
+    >
+      {initial(label)}
+    </span>
   );
 }
 
-/** 某个字符串是否是内置预设键（而非用户上传的 data-URL）。 */
-export function isPresetBrand(v: string | undefined): v is BrandKey {
-  return !!v && PRESET_BRANDS.some((b) => b.key === v);
-}
-
-/**
- * 每个品牌的主色（用于图标底色 tint）。
- *
- * anthropic / openai / gemini 三个取自 **cc-switch 本机库实测值**
- * （2026-08-22 读 `~/.cc-switch/cc-switch.db` 的 `providers.icon_color`，非猜色）：
- * 它给内置官方模板存的就是这三个值，与 `icon` 预设键配对。对齐它们的好处是
- * 从 cc-switch 导入过来的档在两个程序里看起来是同一个东西 —— 否则用户会以为导错了。
- *
- * 其余品牌 cc-switch 没有内置模板（实测它 20 条 provider 里只有那 3 条有 icon_color），
- * 保持本项目自取的官方品牌色。
- *
- * 刻意**不引入 `icon_color` 字段**让用户自定义颜色：颜色是跟着预设键走的内置常量，
- * 加一个可编辑字段等于多一个「配了没生效」的面（用户上传自定义图标时颜色本就不参与）。
- */
-const BRAND_COLOR: Record<BrandKey, string> = {
-  anthropic: "#D4915D", // cc-switch 实测值
-  openai: "#00A67E", // cc-switch 实测值（不是纯黑）
-  deepseek: "#4D6BFE",
-  zhipu: "#3859FF",
-  moonshot: "#000000",
-  gemini: "#4285F4", // cc-switch 实测值（Google 蓝）
-  qwen: "#615CED",
-  mistral: "#FA520F",
-};
-
-/** 内置品牌 SVG（24x24 viewBox，路径用 fill=currentColor 上色） */
-const BRAND_SVG: Record<BrandKey, JSX.Element> = {
-  // Anthropic —— 星芒标记
-  anthropic: (
-    <path
-      fill="currentColor"
-      d="M13.83 4h-2.9L5.3 20h2.98l1.15-3.16h5.99L16.57 20h2.98L13.83 4Zm-3.5 10.2 2.05-5.63 2.05 5.63h-4.1Z"
-    />
-  ),
-  // OpenAI —— 花瓣环
-  openai: (
-    <path
-      fill="currentColor"
-      d="M21.55 10.02a5.42 5.42 0 0 0-.47-4.45 5.5 5.5 0 0 0-5.92-2.63A5.42 5.42 0 0 0 11.07 1a5.5 5.5 0 0 0-5.24 3.8A5.42 5.42 0 0 0 2.2 7.43a5.5 5.5 0 0 0 .68 6.44 5.42 5.42 0 0 0 .47 4.45 5.5 5.5 0 0 0 5.92 2.63A5.42 5.42 0 0 0 12.93 23a5.5 5.5 0 0 0 5.24-3.8 5.42 5.42 0 0 0 3.63-2.63 5.5 5.5 0 0 0-.68-6.44 5.4 5.4 0 0 0-.57-.11Zm-8.1 11.3a4.07 4.07 0 0 1-2.62-.95l.13-.07 4.35-2.51a.71.71 0 0 0 .36-.62v-6.13l1.84 1.06v5.07a4.1 4.1 0 0 1-4.06 4.15Zm-8.73-3.73a4.07 4.07 0 0 1-.49-2.74l.13.08 4.35 2.51a.71.71 0 0 0 .72 0l5.31-3.06v2.12l-4.4 2.54a4.1 4.1 0 0 1-5.6-1.5ZM3.57 8.14a4.07 4.07 0 0 1 2.13-1.79v5.16a.71.71 0 0 0 .36.62l5.31 3.06-1.84 1.06-4.35-2.51a4.1 4.1 0 0 1-1.62-5.6Zm15.11 3.51-5.31-3.07 1.84-1.06 4.35 2.51a4.1 4.1 0 0 1-.63 7.39v-5.16a.71.71 0 0 0-.25-.61Zm1.83-2.75-.13-.08-4.35-2.51a.71.71 0 0 0-.72 0L10.4 9.37V7.25l4.4-2.54a4.1 4.1 0 0 1 6.09 4.25Zm-11.56 3.8-1.84-1.06V6.57a4.1 4.1 0 0 1 6.72-3.15l-.13.07L9.32 5.99a.71.71 0 0 0-.36.62v5.09Zm1-2.15L12.24 9.4l2.5 1.44v2.88l-2.5 1.44-2.5-1.44v-2.87Z"
-    />
-  ),
-  // DeepSeek —— 鲸鱼曲线（简化）
-  deepseek: (
-    <path
-      fill="currentColor"
-      d="M22 5.5c-.5-.25-.72.23-1.02.47-.1.08-.2.19-.28.29-.72.77-1.56 1.28-2.66 1.22-1.6-.1-2.97.4-4.18 1.63-.26-1.5-1.11-2.4-2.4-2.98a15.6 15.6 0 0 1-1.75-.98c-.44-.3-.53-.63-.28-1.08.06-.11.13-.22.18-.33.13-.3.13-.56-.07-.72-.2-.16-.44-.09-.66.03-.9.5-1.24 1.35-1.28 2.33-.02.53.03 1.06.06 1.58.06 1.24.62 2.17 1.65 2.87.28.19.31.38.22.66-.16.55-.36 1.09-.53 1.64-.11.35-.27.42-.63.28a5.5 5.5 0 0 1-2.63-2.16c-.55-.84-1.05-1.7-1.75-2.42-.17-.17-.34-.36-.55-.48-.44-.26-.83-.07-.91.44-.06.36.07.68.24.99.38.66.83 1.27 1.28 1.88.34.46.28.65-.24.9l-.1.05c-.5.24-.55.53-.19.94.68.78 1.53 1.32 2.53 1.62 1.15.35 2.32.42 3.5.16.55-.12.55-.12.7.44l.03.11c.29 1.05.86 1.94 1.85 2.5.44.24.9.35 1.4.32.24-.01.4-.14.4-.4 0-.13-.02-.27-.05-.4-.1-.5-.32-.95-.7-1.3-.14-.14-.3-.28-.3-.5 0-.15.1-.28.25-.34.4-.15.8-.27 1.2-.42 1.94-.72 3.24-2.05 3.66-4.13.28-1.36.15-2.7-.32-4.02-.06-.17-.1-.35-.02-.53.28-.62.28-1.24.05-1.87-.06-.16-.06-.35.02-.51.15-.3.28-.61.27-.97 0-.28-.15-.4-.42-.28Z"
-    />
-  ),
-  // 智谱 GLM —— Z 字形
-  zhipu: (
-    <path fill="currentColor" d="M5 5h14v2.4L9.2 18.6H19V21H5v-2.4L14.8 7.4H5V5Z" />
-  ),
-  // Kimi / Moonshot —— 月牙
-  moonshot: (
-    <path
-      fill="currentColor"
-      d="M13.5 3a9 9 0 1 0 7.5 14 7 7 0 0 1-7.5-11 7 7 0 0 1 3.1-2.6A9 9 0 0 0 13.5 3Z"
-    />
-  ),
-  // Gemini —— 四角星
-  gemini: (
-    <path
-      fill="currentColor"
-      d="M12 2c.4 4.7 3.3 7.6 8 8-4.7.4-7.6 3.3-8 8-.4-4.7-3.3-7.6-8-8 4.7-.4 7.6-3.3 8-8Z"
-    />
-  ),
-  // Qwen —— 双线
-  qwen: (
-    <path
-      fill="currentColor"
-      d="M7 4h3l4.5 8L19 4h-3l-3 5.3L10 4H7Zm0 16h3l-1.5-2.6L7 20Zm7-8 4.5 8h-3L11 12h3Z"
-    />
-  ),
-  // Mistral —— 网格
-  mistral: (
-    <path
-      fill="currentColor"
-      d="M4 4h4v4H4V4Zm12 0h4v4h-4V4ZM4 10h4v4H4v-4Zm6 0h4v4h-4v-4Zm6 0h4v4h-4v-4ZM4 16h4v4H4v-4Zm12 0h4v4h-4v-4Z"
-    />
-  ),
-};
-
-/** 按 vendor id、厂商名或模型名启发式推断品牌 */
-function resolveBrand(hint: string | undefined): BrandKey | null {
-  if (!hint) return null;
-  const s = hint.toLowerCase();
-  const match: [BrandKey, string[]][] = [
-    ["anthropic", ["anthropic", "claude"]],
-    ["openai", ["openai", "gpt", "o1", "o3", "o4", "chatgpt"]],
-    ["deepseek", ["deepseek"]],
-    ["zhipu", ["zhipu", "glm", "bigmodel", "智谱"]],
-    ["moonshot", ["moonshot", "kimi", "月之暗面"]],
-    ["gemini", ["gemini", "google"]],
-    ["qwen", ["qwen", "通义", "千问", "dashscope", "aliyun"]],
-    ["mistral", ["mistral", "mixtral"]],
-  ];
-  for (const [brand, keys] of match) {
-    if (keys.some((k) => s.includes(k))) return brand;
-  }
-  return null;
+/** 当前是否深色（`theme` 可能是 `system`，那就问系统）。 */
+function useIsDark(theme: string): boolean {
+  return useMemo(() => {
+    if (theme === "dark") return true;
+    if (theme === "light") return false;
+    return (
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-color-scheme: dark)").matches
+    );
+  }, [theme]);
 }
 
 /** 名称首字母（英文取首字母，中文取首字） */
@@ -215,75 +136,133 @@ function fallbackColor(label: string): string {
   return FALLBACK_COLORS[h % FALLBACK_COLORS.length];
 }
 
-interface BrandIconProps {
-  /** vendor id、厂商名或模型名，任一即可用于推断品牌 */
-  hint?: string;
-  /** 无法推断品牌时，用于生成首字母占位的显示名 */
-  fallbackLabel?: string;
-  /**
-   * 用户**显式指定**的图标，两种形态（与 cc-switch 的 `icon` 列同一模型，见 `PRESET_BRANDS`）：
-   * - **预设键**（`"anthropic"`、`"zhipu"`…）→ 渲染内置品牌 SVG，等于「我就要用这家的图标」；
-   * - **data-URL**（`data:image/png;base64,…`）→ 渲染上传的自定义图片。
-   *
-   * 两者都**优先于**启发式匹配 —— 显式选择必须胜过程序的猜测，否则用户会发现「选了没用」。
-   */
-  iconUrl?: string;
-  size?: number;
-  className?: string;
+// ---------------------------------------------------------------------------
+// 挑选器
+// ---------------------------------------------------------------------------
+
+const GROUP_ORDER: BrandGroup[] = ["official", "china", "gateway", "local"];
+
+/**
+ * 内置品牌的**挑选器**（厂商管理页与 Key 编辑器共用一份实现）。
+ *
+ * 抽出来共用的理由不是「省几行」：两处各写一遍必然漂移 —— 一边加了新品牌、另一边没加，
+ * 或者「再点一次取消选择」这条交互只有一边有。而这两个入口对用户是同一件事
+ * （「告诉程序这个站是哪家的」），行为不一致比少一个入口更让人困惑。
+ *
+ * # 为什么从「一排色块」改成「搜索 + 分组」
+ *
+ * 上一版是把全部预设平铺成一排 9×9 方块。8 个时还能扫一眼找到，
+ * 现在是 32 个，平铺后在一个约 360px 宽的表单里要折成四五行、且只能靠 hover
+ * 看 title 才知道哪个是哪个 —— 等于逼用户逐个悬停。
+ *
+ * 现在：一个搜索框 + 按「国际原厂 / 国内原厂 / 聚合中转 / 本机」分四段，
+ * 每项**带文字标签**（不再只有图标）。搜索同时匹配中英文名与关键词，
+ * 所以输 `glm`、`智谱`、`bigmodel` 都能找到智谱。
+ */
+/** 某个预设键的显示名（`undefined` = 不是预设键 / 未选择）。 */
+export function brandLabel(key: string | undefined): string | undefined {
+  if (!key) return undefined;
+  return BRANDS.find((b) => b.key === key)?.label;
 }
 
-export function BrandIcon({ hint, fallbackLabel, iconUrl, size = 18, className }: BrandIconProps) {
-  // 显式预设键最高优先：用户挑了就按他挑的画，不再让启发式插手。
-  const explicitBrand = isPresetBrand(iconUrl) ? iconUrl : null;
-  const brand = useMemo(
-    () => explicitBrand ?? resolveBrand(hint) ?? resolveBrand(fallbackLabel),
-    [explicitBrand, hint, fallbackLabel],
-  );
+export function BrandPresetPicker({
+  value,
+  onChange,
+  disabled,
+  listClassName,
+}: {
+  value?: string;
+  onChange: (next: string | undefined) => void;
+  disabled?: boolean;
+  /** 覆盖滚动区限高。内联形态要压矮（免得把保存按钮顶出屏幕），弹窗形态可以放开。 */
+  listClassName?: string;
+}) {
+  const t = useT();
+  const [q, setQ] = useState("");
 
-  // 自定义上传图标（data-URL）：仅当它**不是**预设键时才走 <img>。
-  // 预设键不是 URL，塞进 src 会被浏览器当相对路径去请求、渲染成碎图标；
-  // 它已在上面并进 `brand`，由下面的内置 SVG 分支渲染。
-  if (iconUrl && !explicitBrand) {
-    return (
-      <span
-        className={`inline-flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-surface-hover ${className ?? ""}`}
-        style={{ width: size, height: size }}
-        title={hint ?? fallbackLabel}
-      >
-        <img src={iconUrl} alt="" width={size} height={size} className="h-full w-full object-cover" />
-      </span>
-    );
-  }
+  const groups = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    const match = (b: Brand) =>
+      !needle ||
+      b.key.includes(needle) ||
+      b.label.toLowerCase().includes(needle) ||
+      b.labelEn.toLowerCase().includes(needle) ||
+      b.keywords.some((k) => k.includes(needle));
+    return GROUP_ORDER.map((g) => ({
+      group: g,
+      items: BRANDS.filter((b) => b.group === g && match(b)),
+    })).filter((x) => x.items.length > 0);
+  }, [q]);
 
-  if (brand) {
-    return (
-      <span
-        className={`inline-flex shrink-0 items-center justify-center rounded-full ${className ?? ""}`}
-        style={{
-          width: size,
-          height: size,
-          color: BRAND_COLOR[brand],
-          background: `${BRAND_COLOR[brand]}1a`, // 10% alpha 底色
-        }}
-        title={hint ?? fallbackLabel}
-      >
-        <svg width={size * 0.68} height={size * 0.68} viewBox="0 0 24 24" aria-hidden="true">
-          {BRAND_SVG[brand]}
-        </svg>
-      </span>
-    );
-  }
-
-  // 未知品牌：首字母配色圆形
-  const label = fallbackLabel ?? hint ?? "?";
-  const color = fallbackColor(label);
   return (
-    <span
-      className={`inline-flex shrink-0 items-center justify-center rounded-full font-semibold text-white ${className ?? ""}`}
-      style={{ width: size, height: size, background: color, fontSize: size * 0.5 }}
-      title={label}
-    >
-      {initial(label)}
-    </span>
+    <div className="space-y-2">
+      <div className="relative">
+        <Search
+          size={13}
+          className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-text-muted"
+          aria-hidden="true"
+        />
+        <input
+          type="text"
+          value={q}
+          disabled={disabled}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder={t("brandPicker.search")}
+          aria-label={t("brandPicker.search")}
+          className="w-full rounded-control border border-border bg-surface py-1.5 pl-7 pr-7 text-xs text-text-primary placeholder:text-text-muted focus:border-primary focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+        />
+        {q && (
+          <button
+            type="button"
+            onClick={() => setQ("")}
+            aria-label={t("common.clear")}
+            className="absolute right-1.5 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-text-muted hover:text-text-primary"
+          >
+            <X size={12} aria-hidden="true" />
+          </button>
+        )}
+      </div>
+
+      {/* 限高 + 自己滚：内联形态嵌在表单里，32 个品牌全展开会把保存按钮顶到屏幕外。
+          弹窗形态传 listClassName 放开限高（那里没有「顶出屏幕」的问题）。 */}
+      <div className={`space-y-2.5 overflow-y-auto pr-1 ${listClassName ?? "max-h-56"}`}>
+        {groups.map(({ group, items }) => (
+          <div key={group}>
+            <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-text-muted">
+              {t(`brandPicker.group.${group}`)}
+            </div>
+            <div className="flex flex-wrap gap-1">
+              {items.map((b) => {
+                const active = value === b.key;
+                return (
+                  <button
+                    key={b.key}
+                    type="button"
+                    title={b.label}
+                    aria-pressed={active}
+                    disabled={disabled}
+                    // 点已选中的 = 取消选择，回到自动匹配
+                    onClick={() => onChange(active ? undefined : b.key)}
+                    className={`inline-flex min-h-7 items-center gap-1.5 rounded-control border px-1.5 py-1 text-[11px] transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                      active
+                        ? "border-primary bg-primary/12 text-text-primary"
+                        : "border-border text-text-secondary hover:border-primary/50 hover:bg-surface-hover"
+                    }`}
+                  >
+                    <BrandIcon iconUrl={b.key} fallbackLabel={b.label} size={16} />
+                    <span className="max-w-[9rem] truncate">{b.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+        {groups.length === 0 && (
+          <p className="py-3 text-center text-[11px] text-text-muted">
+            {t("brandPicker.noMatch", { q })}
+          </p>
+        )}
+      </div>
+    </div>
   );
 }

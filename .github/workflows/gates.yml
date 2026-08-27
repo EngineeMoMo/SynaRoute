@@ -35,6 +35,12 @@ jobs:
       - name: 硬规则（policy）
         run: npm run check:forbidden
 
+      # 官网策略门。**独立一条**是因为主仓那三道门的扫描根只有 src-tauri/src 与 src，
+      # site/ 一直在它们之外 —— 于是官网上「文档教用户配一个已被修掉的地址」
+      # 这类静默缺陷没有任何机械判据。它不需要 site 的 node_modules（只读源码文本）。
+      - name: 官网硬规则（policy）
+        run: npm run check:site
+
       # 体积/计数棘轮：只准降
       - name: 棘轮（不得变坏）
         run: npm run ratchet

@@ -6,6 +6,7 @@ import { footerNav } from "@/data/nav";
 import { siteConfig } from "@/config/site";
 import { useLocalizedPath, useT } from "@/hooks/useLang";
 import { externalLinkProps } from "@/lib/utils";
+import { scrollToId } from "@/lib/motion";
 
 export function Footer() {
   const t = useT();
@@ -17,7 +18,7 @@ export function Footer() {
   // 与顶栏同样的锚点处理：不在首页时先回首页
   function goToHash(hash: string) {
     if (location.pathname === homePath) {
-      document.getElementById(hash)?.scrollIntoView({ behavior: "smooth", block: "start" });
+      scrollToId(hash);
     } else {
       navigate(`${homePath}#${hash}`);
     }
@@ -45,14 +46,14 @@ export function Footer() {
                       <button
                         type="button"
                         onClick={() => goToHash(item.hash!)}
-                        className="text-sm text-text-secondary transition-colors hover:text-text-primary"
+                        className="inline-flex min-h-11 items-center text-sm text-text-secondary transition-colors hover:text-text-primary"
                       >
                         {t(item.labelKey)}
                       </button>
                     ) : (
                       <Link
                         to={path(item.path!)}
-                        className="text-sm text-text-secondary transition-colors hover:text-text-primary"
+                        className="inline-flex min-h-11 items-center text-sm text-text-secondary transition-colors hover:text-text-primary"
                       >
                         {t(item.labelKey)}
                       </Link>
@@ -73,14 +74,14 @@ export function Footer() {
             <a
               href={siteConfig.github.url}
               {...externalLinkProps}
-              className="inline-flex items-center gap-1.5 text-xs text-text-secondary transition-colors hover:text-text-primary"
+              className="inline-flex min-h-11 items-center gap-1.5 text-xs text-text-secondary transition-colors hover:text-text-primary"
             >
               <Github size={14} aria-hidden="true" />
               GitHub
             </a>
             <a
               href={`mailto:${siteConfig.author.email}`}
-              className="inline-flex items-center gap-1.5 text-xs text-text-secondary transition-colors hover:text-text-primary"
+              className="inline-flex min-h-11 items-center gap-1.5 text-xs text-text-secondary transition-colors hover:text-text-primary"
             >
               <Mail size={14} aria-hidden="true" />
               {siteConfig.author.email}
@@ -88,7 +89,7 @@ export function Footer() {
             <a
               href={siteConfig.author.url}
               {...externalLinkProps}
-              className="inline-flex items-center gap-1.5 text-xs text-text-secondary transition-colors hover:text-text-primary"
+              className="inline-flex min-h-11 items-center gap-1.5 text-xs text-text-secondary transition-colors hover:text-text-primary"
             >
               <Github size={14} aria-hidden="true" />
               {t("footer.authorSite", { name: siteConfig.author.name })}

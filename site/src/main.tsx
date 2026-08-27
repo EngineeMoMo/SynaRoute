@@ -1,3 +1,5 @@
+// **必须是第一个 import**：垫片要在任何依赖（marked 等）求值之前执行。
+import "./lib/legacyPolyfills";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";

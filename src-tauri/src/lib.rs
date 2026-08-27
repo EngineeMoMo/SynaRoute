@@ -3,10 +3,12 @@
 
 mod agent_tools;
 mod aggregate;
+mod aggregate_phase;
 mod balance;
 mod ccswitch;
 mod codegraph;
 mod crypto;
+mod diagnostics;
 mod error;
 mod events;
 mod health;
@@ -24,7 +26,11 @@ mod route_meta;
 mod secret;
 mod store;
 mod tools;
+mod tray_icon;
 mod upstream;
+mod vendors;
+mod usage_store;
+mod usage_cost;
 /// upstream 对外契约守卫。**必须放在 upstream 外面**才能真正验证可见性，
 /// 详见该文件的模块注释。
 #[cfg(test)]
@@ -64,7 +70,6 @@ fn list_keys(state: tauri::State<AppState>, category_id: CategoryType) -> Vec<Pr
 fn upsert_key(state: tauri::State<AppState>, key: ProviderKey) -> AppResult<ProviderKey> {
     service::save_key(&state.store, key)
 }
-
 
 /// 桌面端对外模型名**即时**体检（UX#4），供 KeyEditor 边打字边提示。
 ///
@@ -180,7 +185,6 @@ fn change_master_password(
     tracing::info!("主口令已修改，重新封装 {n} 条密钥");
     Ok(n)
 }
-
 
 /// 把某 Key 设为该分类的主 Key（优先级 0）。
 ///
@@ -563,9 +567,17 @@ async fn apply_tool_config(
 
 /// 只读预览：当前分类对应工具的配置路径 + 磁盘原文（token 脱敏）。
 /// Claude CLI / 桌面 / Codex 路径与格式完全不同，前端按 category 展示，禁止混用字段名。
+///
+/// 需要 `state`：Codex 的漂移检测要拿「该分类当前应当生效的端点」比对 provider 表里的
+/// base_url（见 `tools::codex::is_intact`）—— 只查非空是不够的，指着一个已死的旧端口
+/// 会被判成接入完好而永不告警。
 #[tauri::command]
-fn get_tool_config_preview(category_id: CategoryType) -> AppResult<tools::ToolConfigPreview> {
-    tools::preview(category_id)
+fn get_tool_config_preview(
+    state: tauri::State<AppState>,
+    category_id: CategoryType,
+) -> AppResult<tools::ToolConfigPreview> {
+    let endpoint = service::expected_endpoint(&state.store, &state.proxy, category_id);
+    tools::preview(category_id, &endpoint)
 }
 
 #[tauri::command]
@@ -632,60 +644,21 @@ fn get_daily_usage(state: tauri::State<AppState>) -> Vec<crate::model::DailyUsag
     state.store.daily_usage_buckets()
 }
 
-/// 带成本估算的用量行（用量页表格用）。
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UsageCostRow {
-    category_id: CategoryType,
-    key_id: String,
-    /// Key 的可读名（keyId 是 uuid，用户认不出）。Key 已删除时为 None。
-    key_name: Option<String>,
-    usage: crate::model::TokenUsage,
-    /// 估算成本（纳美元）。`None` = 没有可用单价，界面显示「—」而不是 0。
-    cost_nano: Option<u64>,
-    /// 单价来源，界面据此标注精度（exact / family / unknown）。
-    pricing_source: crate::pricing::PricingSource,
-    /// 实际生效的倍率（回显用户填的值，空则为 "1.0"）。
-    multiplier: String,
+/// 按「分类 × Key」聚合的用量 **+ 成本估算**。行构造与「为什么算不出」的成因判定
+/// 都在 [`crate::usage_cost`]（那边是可测的纯逻辑，这里只做 IPC 边界）。
+#[tauri::command]
+fn get_usage_with_cost(state: tauri::State<AppState>) -> Vec<crate::usage_cost::UsageCostRow> {
+    crate::usage_cost::rows(&state.store)
 }
 
-/// 按「分类 × Key」聚合的用量 **+ 成本估算**。
+/// 内置单价表的**核对日期**（`YYYY-MM-DD`）。
 ///
-/// 成本按 Key 而非按模型估算：用量累加器的键不含模型名（见
-/// `pricing::estimate_cost` 的文档）。代表模型取该 Key 的
-/// `default_model`，没配则取模型列表首个。
+/// 界面要显示它：这张表是人工核对各厂商定价页得来的，会随时间变旧，而变旧的表现是
+/// 金额悄悄偏离真实账单。给用户一个日期，他就能自己判断「这个估算值得信几分」，
+/// 而不是把它当账单。
 #[tauri::command]
-fn get_usage_with_cost(state: tauri::State<AppState>) -> Vec<UsageCostRow> {
-    let rows = state.store.token_usage_by_key();
-    rows.into_iter()
-        .map(|r| {
-            let key = state.store.get_key(&r.key_id);
-            // 代表模型：优先用户配的兜底模型，否则模型列表首个。
-            let hint = key.as_ref().and_then(|k| {
-                k.default_model
-                    .clone()
-                    .or_else(|| k.models.first().map(|m| m.real_name.clone()))
-            });
-            let mult = key
-                .as_ref()
-                .and_then(|k| k.cost_multiplier.clone())
-                .unwrap_or_else(|| "1.0".into());
-            let (cost_nano, pricing_source) = crate::pricing::estimate_cost(
-                &r.usage,
-                hint.as_deref(),
-                Some(&mult),
-            );
-            UsageCostRow {
-                category_id: r.category_id,
-                key_id: r.key_id,
-                key_name: key.as_ref().map(|k| k.name.clone()),
-                usage: r.usage,
-                cost_nano,
-                pricing_source,
-                multiplier: mult,
-            }
-        })
-        .collect()
+fn get_pricing_table_date() -> &'static str {
+    crate::pricing::PRICE_TABLE_VERIFIED_ON
 }
 
 /// 某分类「最近一次失败」（error/failover），供分类页顶部常驻提示条用（UX#11）。
@@ -942,8 +915,6 @@ fn get_app_version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
-
-
 #[tauri::command]
 async fn check_for_updates(app: tauri::AppHandle) -> AppResult<service::UpdateCheckResult> {
     use tauri_plugin_updater::UpdaterExt;
@@ -1044,7 +1015,7 @@ async fn export_diagnostics(
 ) -> AppResult<Option<String>> {
     use tauri_plugin_dialog::DialogExt;
 
-    let env = service::DiagnosticsEnv {
+    let env = diagnostics::DiagnosticsEnv {
         app_version: app.package_info().version.to_string(),
         exe_path: std::env::current_exe()
             .map(|p| p.display().to_string())
@@ -1054,13 +1025,13 @@ async fn export_diagnostics(
             .map(|c| (*c, state.proxy.is_running(*c), state.proxy.port_of(*c)))
             .collect(),
     };
-    let report = service::build_diagnostics_report(&state.store, &env);
+    let report = diagnostics::build_diagnostics_report(&state.store, &env);
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
         .set_title("保存 SynaRoute 诊断报告")
-        .set_file_name(service::diagnostics_file_name())
+        .set_file_name(diagnostics::diagnostics_file_name())
         .add_filter("文本文件", &["txt"])
         .save_file(move |p| {
             let _ = tx.send(p);
@@ -1604,6 +1575,7 @@ pub fn run() {
             get_usage_since,
             get_daily_usage,
             get_usage_with_cost,
+            get_pricing_table_date,
             query_key_balance,
             show_main_window_cmd,
             recent_failure,
@@ -1877,88 +1849,6 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<ta
     Ok(menu)
 }
 
-/// 托盘 tooltip：附带当前 Codex 选定模型，让用户悬停即知当前用哪个（无需展开菜单）。
-fn tray_tooltip(app: &tauri::AppHandle) -> String {
-    let state = app.state::<AppState>();
-    let settings = state.store.get_settings();
-
-    // 运行状态必须在 tooltip 里：macOS 的菜单栏图标是 template（单色、由系统按深浅色填色），
-    // 拿不到颜色也拿不到透明度，`stopped_tray_icon` 那套「彩色=运行 / 灰度=停止」在 mac 上
-    // 完全失效（见 `apply_tray_icon`）。若状态只由图标表达，mac 用户将无处可看。
-    //
-    // Windows 上图标仍然分两态，这里的文本是冗余的 —— 但冗余无害，且两平台同一份文本
-    // 省掉一处平台分叉。
-    let running: Vec<&str> = CategoryType::ALL
-        .iter()
-        .filter(|c| state.proxy.is_running(**c))
-        .map(|c| c.display_name())
-        .collect();
-    let status = if running.is_empty() {
-        "已停止".to_string()
-    } else {
-        format!("运行中: {}", running.join(" / "))
-    };
-
-    match settings.active_models.get(&CategoryType::Codex) {
-        Some(m) if !m.trim().is_empty() => format!("SynaRoute · {status} · Codex: {m}"),
-        _ => format!("SynaRoute · {status}"),
-    }
-}
-
-/// 重建托盘菜单 + 刷新 tooltip（Tauri 托盘菜单静态构建，数据变动后须显式重建）。
-/// 把 RGBA8 像素就地灰度化并降不透明度，用于派生「已停止」态托盘图标。
-///
-/// 返回是否成功：长度不是 4 的整数倍即判失败并**不做任何修改**（宁可两态同图标，
-/// 也不要因错位画出花屏）。
-///
-/// 灰度用感知亮度权重（0.299/0.587/0.114）而非三通道均值——均值会让偏蓝的图标看起来
-/// 比实际更亮。alpha 乘 0.55 让它明显「淡下去」，即使用户系统主题下灰度对比不明显，
-/// 也能靠透明度分辨。
-///
-/// 仅非 macOS 使用（mac 上托盘图标是 template，见 `apply_tray_icon`）。
-#[cfg(not(target_os = "macos"))]
-fn desaturate_rgba_in_place(rgba: &mut [u8]) -> bool {
-    if rgba.is_empty() || rgba.len() % 4 != 0 {
-        return false;
-    }
-    for px in rgba.chunks_exact_mut(4) {
-        let lum = (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32)
-            .round()
-            .clamp(0.0, 255.0) as u8;
-        px[0] = lum;
-        px[1] = lum;
-        px[2] = lum;
-        px[3] = (px[3] as f32 * 0.55).round().clamp(0.0, 255.0) as u8;
-    }
-    true
-}
-
-/// 「已停止」状态的托盘图标：由打包图标灰度化 + 降不透明度派生。
-///
-/// **为什么派生而不是加一份 png 资源**：图标是 `tauri.conf.json` 里配的、打包时嵌入的，
-/// 日后换图标只会换那一份。若另存一张「灰色版」，换图标时必然忘记同步，托盘就会出现
-/// 「运行时是新图标、停止时是旧图标」的割裂。从运行时拿到的 RGBA 现场派生，永远自动对齐。
-///
-/// 结果缓存（`OnceLock`）：托盘每次重建都会取一次，而源图标在进程内恒定。
-///
-/// macOS 不用它：那边图标走 template（系统按深浅色填色），派生灰度版渲染结果与原图无异。
-#[cfg(not(target_os = "macos"))]
-fn stopped_tray_icon(app: &tauri::AppHandle) -> Option<tauri::image::Image<'static>> {
-    static CACHED: std::sync::OnceLock<Option<(Vec<u8>, u32, u32)>> = std::sync::OnceLock::new();
-    let cached = CACHED.get_or_init(|| {
-        let src = app.default_window_icon()?;
-        let (w, h) = (src.width(), src.height());
-        let mut rgba = src.rgba().to_vec();
-        if !desaturate_rgba_in_place(&mut rgba) {
-            return None;
-        }
-        Some((rgba, w, h))
-    });
-    cached
-        .as_ref()
-        .map(|(rgba, w, h)| tauri::image::Image::new_owned(rgba.clone(), *w, *h))
-}
-
 /// 按「是否有任一分类的代理在运行」给托盘换图标（FR-022：托盘图标反映代理运行状态）。
 ///
 /// 判据是**任一**在跑而非全部：托盘只有一个图标，而三个分类各自独立启停。用户关心的是
@@ -1991,7 +1881,7 @@ fn apply_tray_icon(app: &tauri::AppHandle, tray: &tauri::tray::TrayIcon) {
         let icon = if any_running {
             app.default_window_icon().cloned()
         } else {
-            stopped_tray_icon(app).or_else(|| app.default_window_icon().cloned())
+            tray_icon::stopped_tray_icon(app).or_else(|| app.default_window_icon().cloned())
         };
         if let Some(icon) = icon {
             let _ = tray.set_icon(Some(icon));
@@ -2004,7 +1894,7 @@ fn rebuild_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     if let Some(tray) = app.tray_by_id("main") {
         let menu = build_tray_menu(app)?;
         tray.set_menu(Some(menu))?;
-        let _ = tray.set_tooltip(Some(tray_tooltip(app)));
+        let _ = tray.set_tooltip(Some(tray_icon::tray_tooltip(app)));
         apply_tray_icon(app, &tray);
     }
     Ok(())
@@ -2026,7 +1916,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let tray = TrayIconBuilder::with_id("main")
         .icon(initial_icon)
         .menu(&menu)
-        .tooltip(tray_tooltip(app))
+        .tooltip(tray_icon::tray_tooltip(app))
         .on_menu_event(|app, event| {
             let id = event.id.as_ref();
             match id {
@@ -2325,34 +2215,4 @@ mod tests {
         }
     }
 
-    /// 「已停止」图标的派生：必须真的变灰、真的变淡，且不改尺寸。
-    /// 直接测像素变换本身（不依赖 AppHandle，单测里拿不到真实图标）。
-    ///
-    /// 随被测函数一起门控：mac 上托盘图标走 template，不存在灰度派生这条路。
-    #[test]
-    #[cfg(not(target_os = "macos"))]
-    fn stopped_icon_derivation_greys_out_and_fades() {
-        // 一个 2×1 的图：纯红不透明 + 纯蓝半透明。
-        let mut rgba = vec![255u8, 0, 0, 255, 0, 0, 255, 128];
-        assert!(desaturate_rgba_in_place(&mut rgba));
-
-        // 像素 1：红 → 亮度 0.299*255 ≈ 76，三通道相等
-        assert_eq!(&rgba[0..3], &[76, 76, 76], "必须灰度化为三通道相等");
-        assert_eq!(rgba[3], 140, "alpha 应乘 0.55（255*0.55≈140）");
-        // 像素 2：蓝 → 亮度 0.114*255 ≈ 29
-        assert_eq!(&rgba[4..7], &[29, 29, 29]);
-        assert_eq!(rgba[7], 70, "半透明像素也按同比例变淡（128*0.55≈70）");
-    }
-
-    /// 像素数据长度非法时必须原样返回、不做部分修改——宁可两态同图标，也不要画出花屏。
-    #[test]
-    #[cfg(not(target_os = "macos"))]
-    fn stopped_icon_derivation_rejects_malformed_pixel_data() {
-        let mut odd = vec![1u8, 2, 3]; // 不是 4 的整数倍
-        assert!(!desaturate_rgba_in_place(&mut odd));
-        assert_eq!(odd, vec![1, 2, 3], "失败时不得留下半改状态");
-
-        let mut empty: Vec<u8> = vec![];
-        assert!(!desaturate_rgba_in_place(&mut empty));
-    }
 }

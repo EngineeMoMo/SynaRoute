@@ -250,49 +250,14 @@ pub struct Vendor {
 }
 
 impl Vendor {
-    /// 内置厂商种子（首次运行注入）。
+    /// 内置厂商种子（首次运行注入 + 升级时补入新增项）。
+    ///
+    /// 数据表在 [`crate::vendors`] —— 那边每条 base_url 都做过可证伪的探测取证
+    /// （401/403 = 路由存在、404 = 不存在），且记着各家的 404 陷阱。
+    /// 这里只留一层转发：调用点很多（store 的两处迁移、portable、若干测试），
+    /// 改成 `crate::vendors::builtin_seed()` 要动一片，收益为零。
     pub fn builtin_seed() -> Vec<Vendor> {
-        let mk = |id: &str, name: &str, url: &str, proto: Protocol, models: Vec<PresetModel>| Vendor {
-            id: id.into(),
-            name: name.into(),
-            default_base_url: url.into(),
-            default_protocol: proto,
-            builtin: true,
-            icon: None,
-            preset_models: models,
-        };
-        // 预设模型的 context_window 取各家公开文档常见值；名称随厂商更新可能变，用户仍可手改/拉取。
-        let pm = |real: &str, disp: &str, ctx: u32| PresetModel {
-            real_name: real.into(),
-            display_name: Some(disp.into()),
-            context_window: Some(ctx),
-        };
-        vec![
-            mk("anthropic", "Anthropic", "https://api.anthropic.com", Protocol::Anthropic, vec![
-                pm("claude-opus-4-5", "Claude Opus 4.5", 200_000),
-                pm("claude-sonnet-4-5", "Claude Sonnet 4.5", 200_000),
-                pm("claude-haiku-4-5", "Claude Haiku 4.5", 200_000),
-            ]),
-            mk("openai", "OpenAI", "https://api.openai.com/v1", Protocol::OpenaiResponses, vec![
-                pm("gpt-5.5", "GPT-5.5", 400_000),
-                pm("gpt-5", "GPT-5", 400_000),
-                pm("gpt-4o", "GPT-4o", 128_000),
-            ]),
-            mk("zhipu", "智谱 GLM", "https://open.bigmodel.cn/api/paas/v4", Protocol::OpenaiChat, vec![
-                pm("glm-4.6", "GLM-4.6", 200_000),
-                pm("glm-4.5", "GLM-4.5", 128_000),
-                pm("glm-4.5-air", "GLM-4.5-Air", 128_000),
-            ]),
-            mk("deepseek", "DeepSeek", "https://api.deepseek.com", Protocol::OpenaiChat, vec![
-                pm("deepseek-chat", "DeepSeek Chat", 128_000),
-                pm("deepseek-reasoner", "DeepSeek Reasoner", 128_000),
-            ]),
-            mk("moonshot", "月之暗面 Kimi", "https://api.moonshot.cn/v1", Protocol::OpenaiChat, vec![
-                pm("kimi-k2-0905-preview", "Kimi K2", 256_000),
-                pm("moonshot-v1-128k", "Moonshot v1 128k", 128_000),
-            ]),
-            mk("custom", "自定义", "", Protocol::Anthropic, vec![]),
-        ]
+        crate::vendors::builtin_seed()
     }
 }
 

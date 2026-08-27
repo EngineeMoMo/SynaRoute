@@ -1,8 +1,14 @@
 import { useEffect, useState } from "react";
-import { Download, Apple, Monitor, Clock } from "lucide-react";
+import { Download, Apple, Monitor, Clock, Terminal } from "lucide-react";
 import { platforms, detectPlatform, type Platform, type PlatformId } from "@/data/platforms";
-import { resolveDownload, useLatestRelease, type ReleaseInfo } from "@/hooks/useRelease";
-import { useT } from "@/hooks/useLang";
+import {
+  resolveDownload,
+  resolveExtraDownloads,
+  useLatestRelease,
+  type ReleaseInfo,
+} from "@/hooks/useRelease";
+import { Link } from "react-router-dom";
+import { useLocalizedPath, useT } from "@/hooks/useLang";
 import { siteConfig } from "@/config/site";
 import { ButtonExternal } from "@/components/ui/Button";
 import { cn, externalLinkProps, formatBytes } from "@/lib/utils";
@@ -10,7 +16,7 @@ import { cn, externalLinkProps, formatBytes } from "@/lib/utils";
 const PLATFORM_ICON: Record<PlatformId, typeof Monitor> = {
   windows: Monitor,
   macos: Apple,
-  linux: Monitor,
+  linux: Terminal,
 };
 
 /** 访客所在平台。放 state 里而不是直接调用，是因为它依赖 navigator，首帧要保持稳定。 */
@@ -23,19 +29,30 @@ function useDetectedPlatform(): PlatformId | null {
 /**
  * Hero 区的主下载按钮。
  *
- * 对 Mac 访客的处理是这里最要紧的一点：**不能**默认推 Windows 包让人下完才发现装不上。
- * 检测到 macOS 时按钮直接说明「macOS 版即将推出」且不可点，下面另给 Windows 的入口。
+ * **按访客所在平台给包**，而不是恒推 Windows。三个平台都已发布（v0.1.33 起
+ * 同时出 exe / dmg×2 / AppImage+deb+rpm），恒推 Windows 会让 Mac 与 Linux 访客
+ * 下完才发现装不上 —— 而这一屏是绝大多数人唯一会点的下载入口。
+ *
+ * 检测不出平台（或该平台尚未发布）时回落到 Windows，并在按钮下方给出
+ * 「其它平台」入口，任何情况下都不把人堵死。
  */
 export function HeroDownloadButton() {
   const t = useT();
+  const path = useLocalizedPath();
   const { release } = useLatestRelease();
   const detected = useDetectedPlatform();
 
   const windows = platforms.find((p) => p.id === "windows")!;
   const detectedPlatform = detected ? platforms.find((p) => p.id === detected) : undefined;
-  const isUnavailablePlatform = detectedPlatform?.status === "coming-soon";
 
-  if (isUnavailablePlatform && detectedPlatform) {
+  // 该平台已发布 → 用它；未发布或认不出 → 回落 Windows
+  const target =
+    detectedPlatform && detectedPlatform.status === "available" ? detectedPlatform : windows;
+  const dl = resolveDownload(target, release);
+  const isFallbackPlatform = target.id !== detected;
+
+  // 检测到的平台确实还没发布（当前三个平台都发布了，这一支是给将来新增平台留的）
+  if (detectedPlatform && detectedPlatform.status === "coming-soon") {
     const win = resolveDownload(windows, release);
     return (
       <div className="flex flex-col items-center gap-2 sm:items-start">
@@ -47,21 +64,38 @@ export function HeroDownloadButton() {
           <a
             href={win.href}
             {...externalLinkProps}
-            className="text-sm text-primary underline underline-offset-4 hover:opacity-80"
+            className="inline-flex min-h-6 items-center text-sm text-primary underline underline-offset-4 hover:opacity-80"
           >
-            {t("hero.ctaPrimary")}
+            {t("hero.ctaWindows")}
           </a>
         )}
       </div>
     );
   }
 
-  const win = resolveDownload(windows, release);
   return (
-    <ButtonExternal href={win.href ?? siteConfig.github.latestRelease} size="xl" className="w-full sm:w-auto">
-      <Download size={19} aria-hidden="true" />
-      {t("hero.ctaPrimary")}
-    </ButtonExternal>
+    <div className="flex flex-col items-center gap-2 sm:items-start">
+      <ButtonExternal
+        href={dl.href ?? siteConfig.github.latestRelease}
+        size="xl"
+        className="w-full sm:w-auto"
+      >
+        <Download size={19} aria-hidden="true" />
+        {t("hero.ctaFor", { platform: t(`platform.${target.id}.name`) })}
+      </ButtonExternal>
+      {/* 平台判断可能错（UA 会被改、也有人替别人下载）→ 永远留一条「其它平台」的出路。
+          这一条不是装饰：认错平台而没有出路 = 用户下到装不上的包。
+
+          用 `Link` + `useLocalizedPath` 而不是裸 `<a href>`：裸 a 会整页重载
+          （首屏白一下、丢掉 sessionStorage 里的 release 缓存），而且语言前缀得自己拼 ——
+          从 `document.documentElement.lang` 取会在语言切换后与当前路由不一致。 */}
+      <Link
+        to={path("download")}
+        className="inline-flex min-h-6 items-center text-sm text-text-secondary underline underline-offset-4 hover:text-text-primary"
+      >
+        {isFallbackPlatform ? t("hero.ctaPickPlatform") : t("hero.ctaOtherPlatforms")}
+      </Link>
+    </div>
   );
 }
 
@@ -109,6 +143,7 @@ export function PlatformCard({
   const t = useT();
   const Icon = PLATFORM_ICON[platform.id];
   const dl = resolveDownload(platform, release);
+  const extras = resolveExtraDownloads(platform, release);
   const soon = platform.status === "coming-soon";
 
   return (
@@ -177,6 +212,27 @@ export function PlatformCard({
       {soon && (
         <p className="mt-3 text-[13px] leading-relaxed text-text-secondary">
           {platform.id === "macos" ? t("download.macNote") : t("download.linuxNote")}
+        </p>
+      )}
+
+      {/* 其它架构 / 包格式，与主下载并列。
+          macOS 一次发布有 aarch64 与 x64 两个 dmg、Linux 有 AppImage/deb/rpm ——
+          只给一个就必然有人拿错，而拿错架构的 dmg 在 Mac 上报的是「已损坏，无法打开」，
+          与真正的损坏一模一样，用户几乎不可能自己诊断出来。 */}
+      {extras.length > 0 && (
+        <p className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-text-secondary">
+          <span className="text-text-muted">{t("download.otherBuilds")}</span>
+          {extras.map((x) => (
+            <a
+              key={x.label}
+              href={x.href}
+              {...externalLinkProps}
+              className="inline-flex min-h-6 items-center text-primary underline underline-offset-4 hover:opacity-80"
+            >
+              {x.label}
+              {x.size > 0 && <span className="ml-1 text-text-muted">({formatBytes(x.size)})</span>}
+            </a>
+          ))}
         </p>
       )}
     </div>

@@ -1,7 +1,7 @@
 {
   "name": "synaroute",
   "private": true,
-  "version": "0.1.33",
+  "version": "0.1.39",
   "type": "module",
   "description": "SynaRoute - 智能 API Key 路由代理与配置管理桌面软件",
   "scripts": {
@@ -19,7 +19,8 @@
     "ratchet:verify": "node scripts/verify-ratchet-update.mjs",
     "check:embedded": "node scripts/check-frontend-embedded.mjs",
     "smoke:installer": "node scripts/smoke-installer.mjs",
-    "gates": "npm run check:forbidden && npm run ratchet && npm run ratchet:verify"
+    "gates": "npm run check:forbidden && npm run check:site && npm run ratchet && npm run ratchet:verify",
+    "check:site": "node site/scripts/check-forbidden.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

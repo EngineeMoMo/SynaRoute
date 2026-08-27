@@ -6,10 +6,11 @@
   "description": "SynaRoute 官网（独立于桌面应用的静态站点）",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build && node scripts/check-opacity.mjs && node scripts/postbuild.mjs",
+    "build": "tsc && vite build && node scripts/check-opacity.mjs && node scripts/postbuild.mjs && node scripts/check-forbidden.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "icons": "node scripts/gen-favicon.mjs && node scripts/gen-og.mjs"
+    "icons": "node scripts/gen-favicon.mjs && node scripts/gen-og.mjs",
+    "check": "node scripts/check-forbidden.mjs"
   },
   "dependencies": {
     "class-variance-authority": "^0.7.1",
@@ -31,5 +32,15 @@
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.2",
     "vite": "^5.4.11"
-  }
+  },
+  "browserslist": [
+    "defaults",
+    "safari >= 15",
+    "ios_saf >= 15",
+    "chrome >= 87",
+    "firefox >= 78",
+    "edge >= 88",
+    "not dead",
+    "not op_mini all"
+  ]
 }

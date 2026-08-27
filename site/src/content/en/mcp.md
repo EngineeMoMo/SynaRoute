@@ -34,7 +34,7 @@ Edit `~/.codex/config.toml` (on Windows, `C:\Users\<you>\.codex\config.toml`) an
 
 ```toml
 [mcp_servers.synaroute]
-url = "http://127.0.0.1:9527/mcp"   # use the real address from the settings page
+url = "http://127.0.0.1:9527/mcp/codex"   # use the real address from the settings page
 ```
 
 Optional: add a line to your project's `AGENTS.md` so Codex reaches for it at the right moments:
@@ -57,7 +57,7 @@ Add this to your project's `.claude/settings.json` (or the user-level `~/.claude
 {
   "mcpServers": {
     "synaroute": {
-      "url": "http://127.0.0.1:9527/mcp"
+      "url": "http://127.0.0.1:9527/mcp/claude-cli"
     }
   }
 }
@@ -93,7 +93,6 @@ Optional: configure a hook so prompts containing "review" or "refactor" nudge to
 |---|---|---|
 | `prompt` | Yes | The task, e.g. "review the security of the auth module" |
 | `cwd` | No | Absolute path to the current project root. **Strongly recommended** — without it, the most recently active project detected by auto-follow is used |
-| `category` | No | Which category's key pool and aggregation config to use. Defaults to `claude-cli`; also `claude-desktop` or `codex` |
 | `languageHint` | No | Answer language, e.g. `zh` / `en`. Omit to follow the prompt |
 | `images` | No | Images to look at, as paths **relative to `cwd`**. Requires `cwd` to be passed as well |
 

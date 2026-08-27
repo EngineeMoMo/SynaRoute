@@ -2,6 +2,10 @@
 // 设计：扁平 key（如 "nav.settings"），zh 为基准语言；缺失的 en 词条回退到 zh，
 // 再回退到 key 本身，保证永远不会渲染出空串。支持 {name} 占位插值。
 
+import { usageEn, usageZh } from "./i18n.usage";
+import { brandPickerEn, brandPickerZh } from "./i18n.brandPicker";
+import { vendorEn, vendorZh } from "./i18n.vendor";
+
 export type Lang = "zh" | "en";
 
 export const LANGS: { value: Lang; label: string }[] = [
@@ -517,38 +521,8 @@ const zh: Dict = {
   // 日志
   "logs.title": "运行日志",
   "logs.subtitle": "按系统 / 大脑聚合 / 路由与故障转移 / 错误分组，可按类型筛选（密钥已脱敏）",
-  "usage.title": "用量统计",
-  "usage.subtitle": "按分类与 Key 聚合的 token 消耗与花费估算（跨重启累计）",
-  "usage.refresh": "刷新",
-  "usage.loading": "加载中…",
-  "usage.empty": "暂无用量记录（有转发流量后这里会出现数据）",
-  "usage.input": "输入",
-  "usage.output": "输出",
-  "usage.cacheRead": "缓存读取",
-  "usage.total": "合计",
-  "usage.colCategory": "分类",
-  "usage.colKey": "Key",
-  "usage.systemLevel": "（系统级）",
-  "usage.since": "统计起点",
-  "usage.sinceHint": "每分钟自动保存一次（仅在有新消耗时写盘），意外退出最多丢 1 分钟",
-  // 第⑤批：金额与趋势
-  //
-  // 前三格显示的是 **token 数**（不是钱），故标签带单位后缀 —— 四格并排且第四格是金额，
-  // 不写单位的话「今日 1.2M」很容易被读成 120 万美元。
-  "usage.today": "今日 token",
-  "usage.thisWeek": "近 7 日 token",
-  "usage.thisMonth": "近 30 日 token",
-  "usage.estCost": "累计花费（估算）",
-  "usage.trend7d": "近 7 日 token 消耗",
-  "usage.colCost": "花费",
-  "usage.estimateHint":
-    "按内置官方单价 × 你填的计费倍率估算，不是账单。中转站实际计价可能不同；可在 Key 编辑器里调整「计费倍率」校准。",
-  "usage.costExactHint": "按官方单价表计算，倍率 {multiplier}",
-  "usage.costFamilyHint":
-    "该模型不在内置单价表里，按模型家族名（opus / sonnet / glm 等）估算，倍率 {multiplier}。偏差可能较大。",
-  "usage.costUnknownHint":
-    "无法估算：这条 Key 没有可识别的模型名。在 Key 里设置「默认兜底模型」或拉取模型列表后即可估算。",
-  "usage.unpricedHint": "有 {n} 条 Key 无法估算花费（模型名不在单价表中，金额列显示「—」）。",
+  ...usageZh,
+  ...brandPickerZh,
   "logs.empty": "暂无事件",
   "logs.searchPlaceholder": "搜索日志（Key 名、模型、错误…）",
   "logs.noMatch": "没有匹配「{q}」的日志",
@@ -785,30 +759,7 @@ const zh: Dict = {
   "settings.mcpWizardClose": "关闭",
 
   // 厂商管理
-  "vendor.title": "厂商管理",
-  "vendor.desc": "维护厂商预设。选中厂商后会自动填入其 Base URL 与协议（仍可手动修改）。",
-  "vendor.add": "新增厂商",
-  "vendor.builtin": "内置",
-  "vendor.builtinLocked": "内置厂商不可编辑或删除",
-  "vendor.name": "显示名",
-  "vendor.namePlaceholder": "如：我的中转",
-  "vendor.baseUrl": "默认 Base URL",
-  "vendor.protocol": "默认协议",
-  "vendor.icon": "图标",
-  "vendor.iconPick": "选择图标",
-  "vendor.iconClear": "清除",
-  "vendor.iconPresetLabel": "或直接选一个主流厂商图标（再点一次取消，回到自动识别）",
-  "vendor.iconHint": "可选。支持 PNG/JPG/SVG/WebP，≤256KB；不设则按厂商名/地址自动识别，识别不出用首字母占位。",
-  "vendor.iconTooLarge": "图标文件过大（上限 {max}），请换更小的图",
-  "vendor.iconReadFailed": "读取图标文件失败",
-  "vendor.edit": "编辑",
-  "vendor.delete": "删除",
-  "vendor.save": "保存",
-  "vendor.cancel": "取消",
-  "vendor.deleteConfirm": "确定删除厂商「{name}」？已使用它的 Key 不受影响。",
-  "vendor.empty": "还没有自定义厂商",
-  "vendor.errNeedName": "请填写显示名",
-  "vendor.errNeedUrl": "请填写 Base URL",
+  ...vendorZh,
 };
 
 const en: Dict = {
@@ -1301,37 +1252,8 @@ const en: Dict = {
 
   "logs.title": "Logs",
   "logs.subtitle": "Grouped by system / brain / routing / error (keys redacted)",
-  "usage.title": "Usage",
-  "usage.subtitle": "Token consumption and estimated spend by category and key (cumulative across restarts)",
-  "usage.refresh": "Refresh",
-  "usage.loading": "Loading…",
-  "usage.empty": "No usage yet (data appears after forwarding traffic)",
-  "usage.input": "Input",
-  "usage.output": "Output",
-  "usage.cacheRead": "Cache read",
-  "usage.total": "Total",
-  "usage.colCategory": "Category",
-  "usage.colKey": "Key",
-  "usage.systemLevel": "(system)",
-  "usage.since": "Counting since",
-  "usage.sinceHint": "Saved every minute (only when there is new usage); an unexpected exit loses at most 1 minute",
-  // Batch ⑤: cost & trend
-  // First three cards show **token counts**, not money — the unit suffix matters
-  // because the fourth card in the same row is a dollar amount.
-  "usage.today": "Today (tokens)",
-  "usage.thisWeek": "Last 7d (tokens)",
-  "usage.thisMonth": "Last 30d (tokens)",
-  "usage.estCost": "Est. spend",
-  "usage.trend7d": "Token usage, last 7 days",
-  "usage.colCost": "Cost",
-  "usage.estimateHint":
-    "Estimated from built-in list prices × your cost multiplier — not a bill. Providers may price differently; adjust the multiplier in the key editor to calibrate.",
-  "usage.costExactHint": "From the built-in price table, multiplier {multiplier}",
-  "usage.costFamilyHint":
-    "This model isn't in the built-in price table; estimated from its family name (opus / sonnet / glm …), multiplier {multiplier}. May deviate significantly.",
-  "usage.costUnknownHint":
-    "Can't estimate: no recognizable model name for this key. Set a default fallback model or fetch the model list to enable estimation.",
-  "usage.unpricedHint": "{n} key(s) can't be priced (model not in the price table); their cost shows as \"—\".",
+  ...usageEn,
+  ...brandPickerEn,
   "logs.empty": "No events yet",
   "logs.searchPlaceholder": "Search logs (key, model, error…)",
   "logs.noMatch": "No logs match “{q}”",
@@ -1562,30 +1484,7 @@ const en: Dict = {
   "settings.mcpWizardClose": "Close",
 
   // Vendors
-  "vendor.title": "Vendors",
-  "vendor.desc": "Manage vendor presets. Selecting a vendor auto-fills its Base URL and protocol (still editable).",
-  "vendor.add": "Add vendor",
-  "vendor.builtin": "Built-in",
-  "vendor.builtinLocked": "Built-in vendors can't be edited or deleted",
-  "vendor.name": "Display name",
-  "vendor.namePlaceholder": "e.g. My relay",
-  "vendor.baseUrl": "Default Base URL",
-  "vendor.protocol": "Default protocol",
-  "vendor.icon": "Icon",
-  "vendor.iconPick": "Choose icon",
-  "vendor.iconClear": "Clear",
-  "vendor.iconPresetLabel": "Or pick a known provider icon (click again to clear and auto-detect)",
-  "vendor.iconHint": "Optional. PNG/JPG/SVG/WebP, ≤256KB. Otherwise auto-detected from name/URL, falling back to an initial.",
-  "vendor.iconTooLarge": "Icon file too large (max {max}), pick a smaller one",
-  "vendor.iconReadFailed": "Failed to read icon file",
-  "vendor.edit": "Edit",
-  "vendor.delete": "Delete",
-  "vendor.save": "Save",
-  "vendor.cancel": "Cancel",
-  "vendor.deleteConfirm": "Delete vendor \"{name}\"? Keys already using it are unaffected.",
-  "vendor.empty": "No custom vendors yet",
-  "vendor.errNeedName": "Display name is required",
-  "vendor.errNeedUrl": "Base URL is required",
+  ...vendorEn,
 };
 
 const dicts: Record<Lang, Dict> = { zh, en };
