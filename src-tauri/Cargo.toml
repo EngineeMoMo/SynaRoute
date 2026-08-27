@@ -1,6 +1,6 @@
 [package]
 name = "synaroute"
-version = "0.1.40"
+version = "0.1.41"
 description = "SynaRoute - 智能 API Key 路由代理与配置管理"
 authors = ["SynaRoute"]
 edition = "2021"

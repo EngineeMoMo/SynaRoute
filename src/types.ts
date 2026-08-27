@@ -509,7 +509,12 @@ export interface AppSettings {
   logDir?: string;
   mcpEnabled?: boolean; // 内置 MCP 服务器：开启即随应用启动
   mcpPort?: number; // MCP 服务器端口（默认 9527，占用时自动向上找空闲端口）
-  upstreamRetryEnabled?: boolean; // 上游临时错误（502/503/504/429/连接失败）自动重试（默认开）
+  // 上游临时错误（502/503/504/429/连接失败）自动重试。默认开。
+  // 🔴 **作用域只有大脑聚合**（aggregate.rs:1687），转发热路径 proxy.rs 对它零引用 ——
+  // 转发侧的等价能力是故障转移换 Key（且 429/5xx 刻意不计熔断）。
+  // 🔴 **前端没有任何 UI 渲染它**，所以它恒为默认值；留着字段是因为聚合确实在读。
+  // 想给它加开关前先读 docs/19 §6.2：在转发路径实现同 Key 重试会与失败预算纠缠。
+  upstreamRetryEnabled?: boolean;
   healthProbeRealCompletion?: boolean; // 健康探测用真实补全请求（默认关，消耗少量额度）
   healthProbeTestMessages?: string[]; // 真实补全探测的测试消息全局列表：每次探测随机取一条，留空回退内置 "hi"
   aggregateTraceEnabled?: boolean; // 大脑聚合详细快照：开启后落盘成员答案/汇总/决策者入参出参（默认关，避免大 IO）

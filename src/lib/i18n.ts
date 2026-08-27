@@ -407,7 +407,7 @@ const zh: Dict = {
   "brain.textOnlyNotice":
     "已支持图片与工具调用。图片：客户端调 synaroute_ai 时传 images（相对 cwd 的路径），最多 4 张、单张 5MB，仅 png/jpg/gif/webp，且参与者模型需支持图片。工具调用默认关闭，需在下方「工具调用」里开启。",
   "brain.enableTitle": "启用大脑聚合",
-  "brain.enableDesc": "开启后该分类请求走聚合流程，而非普通故障转移",
+  "brain.enableDesc": "控制本分类的 synaroute_ai 工具能否调用（关闭时调用会报错）。普通转发不受影响，始终走多 Key 故障转移",
   "brain.mcpConnectTitle": "接入到客户端",
   "brain.mcpConnectDesc": "把大脑聚合写入 {client} 的配置，客户端重启后即可调用 synaroute_ai",
   "brain.mcpConnected": "已接入",
@@ -1138,7 +1138,7 @@ const en: Dict = {
   "brain.textOnlyNotice":
     "Images and tool calls are supported now. Images: pass `images` (paths relative to cwd) when the client calls synaroute_ai — up to 4 files, 5MB each, png/jpg/gif/webp only, and the participant models must accept image input. Tool calls are off by default; turn them on under “Tool calls” below.",
   "brain.enableTitle": "Enable brain aggregation",
-  "brain.enableDesc": "When on, requests in this category go through aggregation instead of plain failover",
+  "brain.enableDesc": "Controls whether this category's synaroute_ai tool can be called (calls fail when off). Plain forwarding is unaffected and always uses multi-key failover",
   "brain.mcpConnectTitle": "Connect to client",
   "brain.mcpConnectDesc": "Write brain aggregation into {client}'s config; restart the client to call synaroute_ai",
   "brain.mcpConnected": "Connected",
