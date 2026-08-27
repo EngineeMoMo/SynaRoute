@@ -10,7 +10,7 @@
     "src-tauri/src/proxy.rs": 3137,
     "src-tauri/src/secret.rs": 1126,
     "src-tauri/src/service.rs": 1443,
-    "src-tauri/src/store.rs": 2956,
+    "src-tauri/src/store.rs": 2938,
     "src-tauri/src/tools.rs": 1909,
     "src-tauri/src/upstream/convert.rs": 1690,
     "src-tauri/src/upstream/sse.rs": 1247,

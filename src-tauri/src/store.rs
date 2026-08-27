@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 #[path = "data_dir.rs"] // 挂载理由与 SYNAROUTE_DATA_DIR 的来由都在该文件模块注释
 pub(crate) mod data_dir;
+#[path = "log_rotate.rs"] // 日志体积上限与滚动切分；两级上限的理由见该文件模块注释
+pub(crate) mod log_rotate;
 
 /// 检查 baseUrl 是否含路径后缀（如 `https://api.deepseek.com/anthropic` 中的 `/anthropic`）。
 ///
@@ -285,12 +287,12 @@ fn cleanup_old_logs_in(dir: &std::path::Path) -> usize {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        // 只认写线程产出的 `YYYY-MM-DD.jsonl`；别的文件（用户自己放的、旧版遗留的
-        // events.jsonl）一律不碰 —— 删错文件比留着旧日志严重得多。
-        let Some(date_str) = name.strip_suffix(".jsonl") else { continue };
-        let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") else {
-            continue;
-        };
+        // 只认写线程产出的 `YYYY-MM-DD.jsonl` 与 `YYYY-MM-DD.N.jsonl`；别的文件
+        // （用户自己放的、旧版遗留的 events.jsonl）一律不碰 —— 删错文件比留着旧日志严重得多。
+        //
+        // 🔴 判据收在 `log_rotate::parse_name`：原先这里是 `strip_suffix(".jsonl")` 再
+        // 按 `%Y-%m-%d` 解析，而 `"2026-08-27.1"` 解析**失败** → 滚动分片永不被清理。
+        let Some((date, _idx)) = log_rotate::parse_name(name) else { continue };
         if date < cutoff {
             match std::fs::remove_file(entry.path()) {
                 Ok(()) => removed += 1,
@@ -793,10 +795,8 @@ impl Store {
         std::thread::Builder::new()
             .name("synaroute-log-writer".into())
             .spawn(move || {
-                use std::io::Write;
-                // 当前打开的 (目录, 日期, writer)。跨天或换目录才重开。
-                let mut open: Option<(std::path::PathBuf, String, std::io::BufWriter<std::fs::File>)> =
-                    None;
+                // 当前打开的文件。跨天或换目录才重开；体积上限与滚动切分在 OpenLog 内部。
+                let mut open: Option<log_rotate::OpenLog> = None;
 
                 // 收到 Line 后不立即 flush，而是尽量把已到达的连续几条一起写完再 flush 一次
                 // （高频转发时能把多次 flush 合成一次）。空闲时靠 recv_timeout 兜底 flush。
@@ -806,8 +806,8 @@ impl Store {
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
                         // 所有发送端已析构（进程退出）→ 收尾 flush 后结束线程。
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            if let Some((_, _, w)) = open.as_mut() {
-                                let _ = w.flush();
+                            if let Some(o) = open.as_mut() {
+                                o.flush();
                             }
                             break;
                         }
@@ -817,17 +817,12 @@ impl Store {
                             let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
                             // 需要重开文件？（首次 / 跨天 / 用户改了日志目录）
                             let need_reopen = match &open {
-                                Some((d, dt, _)) => d != &dir || dt != &date,
+                                Some(o) => o.dir != dir || o.date != date,
                                 None => true,
                             };
                             if need_reopen {
-                                if let Some((_, _, w)) = open.as_mut() {
-                                    let _ = w.flush();
-                                }
-                                if let Err(e) = std::fs::create_dir_all(&dir) {
-                                    tracing::warn!("创建日志目录失败: {e}");
-                                    open = None;
-                                    continue;
+                                if let Some(o) = open.as_mut() {
+                                    o.flush();
                                 }
                                 // 跨天/换目录这一刻顺手清理过期日志。
                                 //
@@ -837,16 +832,8 @@ impl Store {
                                 // 挂在这里而不是另起定时器：跨天正是新文件出现、旧文件刚过期的
                                 // 时刻，判据天然对齐，且最多一天一次（换目录时多一次，可忽略）。
                                 cleanup_old_logs_in(&dir);
-                                let path = dir.join(format!("{date}.jsonl"));
-                                match std::fs::OpenOptions::new().create(true).append(true).open(&path)
-                                {
-                                    Ok(f) => {
-                                        open = Some((
-                                            dir.clone(),
-                                            date.clone(),
-                                            std::io::BufWriter::new(f),
-                                        ))
-                                    }
+                                match log_rotate::OpenLog::open(dir.clone(), date.clone()) {
+                                    Ok(o) => open = Some(o),
                                     Err(e) => {
                                         tracing::warn!("打开日志文件失败: {e}");
                                         open = None;
@@ -854,28 +841,23 @@ impl Store {
                                     }
                                 }
                             }
-                            if let Some((_, _, w)) = open.as_mut() {
-                                // 正文与换行拼成同一 buffer 一次写出：既省一次系统调用，也与
-                                // 历史教训一致（旧的 writeln! 会拆成两次写，多线程下产生粘行）。
-                                // 单写者模型下已不会交错，但一次写出仍是更好的默认。
-                                let mut buf = line.into_bytes();
-                                buf.push(b'\n');
-                                if let Err(e) = w.write_all(&buf) {
-                                    tracing::warn!("写入日志文件失败: {e}");
-                                }
+                            if let Some(o) = open.as_mut() {
+                                // 体积上限与滚动切分在 OpenLog 内部（单文件 16MB → 滚序号；
+                                // 当天超 16 个文件 → 删当天最旧的，保最近的）。
+                                o.write_line(line);
                             }
                         }
                         Some(LogCmd::Flush(ack)) => {
-                            if let Some((_, _, w)) = open.as_mut() {
-                                let _ = w.flush();
+                            if let Some(o) = open.as_mut() {
+                                o.flush();
                             }
                             let _ = ack.send(());
                         }
                         // 200ms 空闲：把 BufWriter 里攒的内容落盘，保证「刚发生的事很快能在
                         // 日志文件里看到」（排障时用户会直接 tail 这个文件）。
                         None => {
-                            if let Some((_, _, w)) = open.as_mut() {
-                                let _ = w.flush();
+                            if let Some(o) = open.as_mut() {
+                                o.flush();
                             }
                         }
                     }
