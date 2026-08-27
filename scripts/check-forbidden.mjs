@@ -25,7 +25,7 @@ import { scanRepo } from "./lib/secret-scan.mjs";
 // 与 check-ratchet.mjs 那份已经漂移。在**本文件**里那个盲区的失效方向是隐蔽的：
 // 测试段会被当成生产段去扫，于是测试夹具里的假路径会被 no-hardcoded-local-paths
 // 报成违规 —— 正是下面注释开头记的第一个判据坑。现在没报，只是因为那些夹具里恰好没有 `C:\Users`。
-import { testModStartLine } from "./lib/rust-source.mjs";
+import { testModStartLine, inspectableLines as sliceLines } from "./lib/rust-source.mjs";
 
 const SKIP_DIRS = new Set(["node_modules", "target", "dist", ".git"]);
 
@@ -45,31 +45,6 @@ function walk(dir, ext, acc = []) {
  * 一个文件里「值得检查」的行：生产段（.rs 排除尾部测试模块）里的**非注释**行。
  * 返回 [{ n, text }]（n 为 1-based 行号）。
  */
-function inspectableLines(file) {
-  const src = readFileSync(file, "utf8");
-  const lines = src.split("\n");
-  const cut = file.endsWith(".rs") ? testModStartLine(src) : null;
-  const limit = cut === null ? lines.length : cut - 1;
-  const out = [];
-  let inBlockComment = false;
-  for (let i = 0; i < limit; i++) {
-    const raw = lines[i];
-    const t = raw.trim();
-    if (inBlockComment) {
-      if (t.includes("*/")) inBlockComment = false;
-      continue;
-    }
-    if (t.startsWith("/*")) {
-      if (!t.includes("*/")) inBlockComment = true;
-      continue;
-    }
-    // 行注释（Rust `//` `///` `//!`、TS `//`）与块注释续行 `*`
-    if (t.startsWith("//") || t.startsWith("*")) continue;
-    // 行尾注释也剥掉（避免「代码后面跟一句举例说明路径」被判违规）
-    out.push({ n: i + 1, text: raw.replace(/\/\/.*$/, "") });
-  }
-  return out;
-}
 
 const RUST = walk("src-tauri/src", /\.rs$/);
 const TS = walk("src", /\.(ts|tsx)$/);
@@ -99,7 +74,7 @@ const pass = (name, detail) => console.log(`✅ ${name}${detail ? ` —— ${det
   const files = [...RUST, ...TS].filter((f) => !SKIP_FILES.has(f));
   const hits = [];
   for (const f of files) {
-    for (const { n, text } of inspectableLines(f)) {
+    for (const { n, text } of sliceLines(readFileSync(f, "utf8"), f)) {
       if (RE.test(text)) hits.push(`      ${f}:${n}  ${text.trim().slice(0, 110)}`);
     }
   }
@@ -434,7 +409,7 @@ const pass = (name, detail) => console.log(`✅ ${name}${detail ? ` —— ${det
       // 「❌ 已证伪的修法：env: { APPDATA: <临时目录> }」注释命中而报假警 ——
       // 与本文件顶部记的第一个判据坑（把文档示例与测试夹具报成违规）一模一样。
       // 判据说的是「代码里别这么写」，那就只能看代码。
-      const scriptCode = inspectableLines(SCRIPT)
+      const scriptCode = sliceLines(readFileSync(SCRIPT, "utf8"), SCRIPT)
         .map((l) => l.text)
         .join("\n");
       if (/env\s*:\s*\{[^}]*\bAPPDATA\s*:/.test(scriptCode)) {

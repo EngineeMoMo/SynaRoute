@@ -23,6 +23,8 @@ mod retrieval;
 /// 转发诊断响应头（`X-SynaRoute-*`）。独立成模块而不是塞进 proxy.rs：
 /// 那份「头里允许携带什么」的清单需要一个显眼的落脚点，且 proxy.rs 已经 5300+ 行。
 mod route_meta;
+#[path = "usage_commands.rs"] // 用量面板的 IPC 命令；抽出理由见该文件模块注释
+mod usage_commands;
 mod secret;
 mod store;
 mod tools;
@@ -620,45 +622,18 @@ fn list_all_events(state: tauri::State<AppState>) -> Vec<EventLogEntry> {
     state.store.list_all_events()
 }
 
-/// 按「分类 × Key」聚合的 token 用量（用量统计面板）。
+/// 读局域网接入令牌，供设置页显示 / 复制（B5）。**只读，不生成** ——
+/// 生成点只有一个（开局域网时的 `ensure_token`），理由见 `lan_guard::read_lan_token_from`。
 #[tauri::command]
-fn get_token_usage(state: tauri::State<AppState>) -> Vec<crate::model::TokenUsageByKey> {
-    state.store.token_usage_by_key()
+fn get_lan_token(state: tauri::State<AppState>) -> Result<Option<String>, String> {
+    crate::proxy::lan_guard::read_lan_token_from(&state.store)
 }
 
-/// 用量累计的**起算时刻**（毫秒）。面板拿它显示「自 X 起累计」。
-///
-/// 它是首次开始累计的时间、跨重启保留，不是本次启动时间 —— 面板若写「自本次启动」
-/// 而数据其实是跨重启累计的，用户会以为统计漏了。
+/// 重新生成局域网接入令牌（B5）。**破坏性**：旧令牌立即失效，
+/// 已配好的局域网客户端会开始 401，故前端必须先让用户确认。
 #[tauri::command]
-fn get_usage_since(state: tauri::State<AppState>) -> i64 {
-    state.store.usage_since_ms()
-}
-
-/// 按日分桶的用量（最近 90 天），供「今日 / 本周 / 近 7 日趋势」。
-///
-/// 不含尚未 flush 的增量（最多落后 60s）：面板把这份历史与 `get_token_usage`
-/// 的实时总量配合使用，故这点延迟不会让「今日」看起来停滞。
-#[tauri::command]
-fn get_daily_usage(state: tauri::State<AppState>) -> Vec<crate::model::DailyUsageBucket> {
-    state.store.daily_usage_buckets()
-}
-
-/// 按「分类 × Key」聚合的用量 **+ 成本估算**。行构造与「为什么算不出」的成因判定
-/// 都在 [`crate::usage_cost`]（那边是可测的纯逻辑，这里只做 IPC 边界）。
-#[tauri::command]
-fn get_usage_with_cost(state: tauri::State<AppState>) -> Vec<crate::usage_cost::UsageCostRow> {
-    crate::usage_cost::rows(&state.store)
-}
-
-/// 内置单价表的**核对日期**（`YYYY-MM-DD`）。
-///
-/// 界面要显示它：这张表是人工核对各厂商定价页得来的，会随时间变旧，而变旧的表现是
-/// 金额悄悄偏离真实账单。给用户一个日期，他就能自己判断「这个估算值得信几分」，
-/// 而不是把它当账单。
-#[tauri::command]
-fn get_pricing_table_date() -> &'static str {
-    crate::pricing::PRICE_TABLE_VERIFIED_ON
+fn regenerate_lan_token(state: tauri::State<AppState>) -> Result<String, String> {
+    crate::proxy::lan_guard::regenerate_lan_token_in(&state.store)
 }
 
 /// 某分类「最近一次失败」（error/failover），供分类页顶部常驻提示条用（UX#11）。
@@ -1571,11 +1546,13 @@ pub fn run() {
             switch_to_official,
             list_events,
             list_all_events,
-            get_token_usage,
-            get_usage_since,
-            get_daily_usage,
-            get_usage_with_cost,
-            get_pricing_table_date,
+            get_lan_token,
+            regenerate_lan_token,
+            usage_commands::get_token_usage,
+            usage_commands::get_usage_since,
+            usage_commands::get_daily_usage,
+            usage_commands::get_usage_with_cost,
+            usage_commands::get_pricing_table_date,
             query_key_balance,
             show_main_window_cmd,
             recent_failure,

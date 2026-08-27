@@ -14,7 +14,7 @@
     "src-tauri/src/agent_tools.rs": 1117,
     "src-tauri/src/aggregate.rs": 2033,
     "src-tauri/src/balance.rs": 1088,
-    "src-tauri/src/lib.rs": 2099,
+    "src-tauri/src/lib.rs": 2076,
     "src-tauri/src/model.rs": 2067,
     "src-tauri/src/proxy.rs": 3126,
     "src-tauri/src/secret.rs": 1126,
@@ -25,9 +25,8 @@
     "src-tauri/src/upstream/sse.rs": 1247,
     "src/components/KeyEditor.tsx": 1624,
     "src/lib/i18n.ts": 1475,
-    "src/lib/mockData.ts": 958,
     "src/pages/BrainPage.tsx": 1393,
-    "src/pages/SettingsPage.tsx": 1900
+    "src/pages/SettingsPage.tsx": 1850
   },
   "counters": {
     "bare_persist_calls": 3

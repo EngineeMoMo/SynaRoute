@@ -12,6 +12,7 @@
 // 搜不到就是真的没生成。判错的可能性只剩「这个类根本不是颜色类」，而那不影响结论
 // —— 不生成 CSS 的类名本来就都该被看一眼。
 import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { inspectableLines } from "./lib/rust-source.mjs";
 import { join, sep } from "node:path";
 
 const DIST = "dist/assets";
@@ -44,9 +45,12 @@ const escapeForCss = (cls) => cls.replace(/[/:]/g, (c) => `\\${c}`);
 
 const missing = new Map();
 for (const f of walk("src")) {
-  readFileSync(f, "utf8")
-    .split("\n")
-    .forEach((line, i) => {
+  // 🔴 **剥注释后再扫**：判据说「代码里别这么写」，就只能看代码。
+  // 原先逐行裸扫，于是一句「别用 `bg-surface-subtle`，它不存在」的**注释本身**
+  // 被报成「写了但不生效」—— 把坑记进注释这个动作恰好触发了那个坑的判据。
+  // 判据收在 lib/rust-source.mjs（与 check-forbidden 共用，别再抄第二份）。
+  inspectableLines(readFileSync(f, "utf8"), f)
+    .forEach(({ n: lineNo, text: line }) => {
       for (const m of line.matchAll(RE)) {
         // **带变体前缀的类名整体**去查（`dark:bg-gray-100` 在 CSS 里是 `.dark\:bg-gray-100`）。
         // 早先剥掉前缀只查基础类，会把「只在 dark 下用到」的类误报成零 CSS ——
@@ -54,7 +58,7 @@ for (const f of walk("src")) {
         const cls = m[0];
         if (css.includes(`.${escapeForCss(cls)}`)) continue; // 生成了，正常
         if (!missing.has(cls)) missing.set(cls, []);
-        missing.get(cls).push(`${f.split(sep).join("/")}:${i + 1}`);
+        missing.get(cls).push(`${f.split(sep).join("/")}:${lineNo}`);
       }
     });
 }

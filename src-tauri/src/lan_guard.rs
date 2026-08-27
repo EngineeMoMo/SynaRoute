@@ -121,7 +121,8 @@ pub(crate) fn ensure_token(store: &Arc<Store>) {
 /// （比如老用户升级上来、配置里 `lan_exposure` 本就是 true）会变成一个静默的空洞，
 /// 而这里的 `None → Deny` 虽然安全，用户却只看到 401 而不知道令牌是什么。
 ///
-/// 事件是用户**唯一**能看到令牌的地方（本阶段还没做设置页 UI），故它必须带上明文令牌。
+/// 事件里必须带明文令牌。设置页现在也能看/复制（B5，见 `read_lan_token_from`），
+/// 但事件仍是**跨时间**的那份留存 —— 用户关掉窗口、或事后才想起要配另一台机器时靠它。
 /// 那条事件写进请求日志里 —— 与「日志里不许出现上游密钥」不冲突：这不是上游密钥，
 /// 它只能用来访问本机代理，且用户必须能抄到它才能把局域网客户端配起来。
 fn token_or_create(store: &Arc<Store>) -> Option<String> {
@@ -147,6 +148,55 @@ fn token_or_create(store: &Arc<Store>) -> Option<String> {
         ),
     );
     Some(token)
+}
+
+/// 读当前令牌，供设置页显示 / 复制（B5）。
+///
+/// 🔴 **只读，绝不生成** —— 与 [`token_or_create`] 的分工是本函数存在的全部理由。
+/// 若读一下就生成，那么「打开设置页」这个纯查看动作会给一个**没开局域网**的用户
+/// 凭空造出一条密钥库条目；更糟的是它会走到「已有令牌」分支之外去，
+/// 把 `ensure_token` 的单一生成点变成两个。
+///
+/// 🔴 **锁定态返 `Err` 而不是 `Ok(None)`** —— 这两者在界面上必须长得不一样：
+/// `Ok(None)` = 「还没有令牌」→ UI 引导用户去生成；而主口令锁着时其实**可能已有令牌**，
+/// 把它显示成「还没有」会让用户点下「重新生成」，于是**所有已配好的局域网客户端立刻 401**。
+/// 同 `SecretStore::get` 在锁定态返 Err 的那条刻意行为（CLAUDE.md 有记）。
+/// ⚠️ **各分支里只许返回值，不许再取锁**：`match` 的 scrutinee 是
+/// `store.secrets.read()` 的临时 guard，它在**整个 match 期间存活** ——
+/// 在分支里取 `.write()` 会 RwLock 自锁、当场挂死（写这个功能的注入验证时踩过，
+/// 一条测试挂了十分钟才发现不是「注入无效」而是「进程挂死」）。
+pub(crate) fn read_lan_token_from(store: &Arc<Store>) -> Result<Option<String>, String> {
+    match store.secrets.read().get(TOKEN_ID) {
+        Ok(Some(t)) if !t.is_empty() => Ok(Some(t.to_string())),
+        Ok(_) => Ok(None),
+        Err(_) => Err("密钥库当前不可读（主口令已锁定？解锁后再查看令牌）".into()),
+    }
+}
+
+/// 重新生成令牌（B5）。**破坏性**：旧令牌立即失效，已配好的局域网客户端会开始 401。
+///
+/// 落一条带新令牌的事件：与 `token_or_create` 同一个理由 —— 那是令牌在界面之外
+/// **唯一**的留存处。这里还多一层价值：用户若关掉对话框忘了抄，日志里还能找回来。
+/// 事件文案里必须点明「旧的已失效」，否则用户不知道要去更新客户端。
+pub(crate) fn regenerate_lan_token_in(store: &Arc<Store>) -> Result<String, String> {
+    // 先确认库可写再动手：锁定态下直接返错，别落一条「已生成」的事件却没真写进去。
+    read_lan_token_from(store)?;
+    let token = new_token();
+    store
+        .secrets
+        .write()
+        .set(TOKEN_ID, &token)
+        .map_err(|e| format!("写入密钥库失败：{e}"))?;
+    store.append_event(
+        crate::model::CategoryType::ClaudeCli,
+        "config",
+        None,
+        &format!(
+            "已**重新生成**「局域网暴露」接入令牌：{token} —— \
+             旧令牌立即失效，请更新所有局域网客户端的 API Key；本机客户端不受影响。"
+        ),
+    );
+    Ok(token)
 }
 
 /// 生成令牌。两个 uuid v4 拼接（去掉连字符）= 64 个十六进制字符、约 244 位熵。
@@ -364,7 +414,7 @@ mod tests {
 
     /// 🔴 `ensure_token` 必须生成令牌**并把明文写进一条事件**。
     ///
-    /// 那条事件是本阶段用户**唯一**能拿到令牌的通道（还没做设置页 UI）。
+    /// 那条事件是令牌的**跨时间留存**（设置页也能看，但关掉就没了）。
     /// 只生成不落事件的话，表现是「局域网怎么配都 401，而日志里什么都没有」——
     /// 静默且无从排查。故这条同时钉住「生成」与「可见」。
     #[test]
@@ -403,6 +453,132 @@ mod tests {
         assert_eq!(again, token, "ensure_token 不得重新生成");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 🔴 设置页读令牌**绝不能顺手生成**（B5）。
+    ///
+    /// 生成点只有一个（开局域网时的 `ensure_token`）。若读也生成，那么「打开设置页」
+    /// 这个纯查看动作会给一个**没开局域网**的用户凭空造出密钥库条目，
+    /// 且把单一生成点变成两个 —— 而两个生成点意味着「谁先跑」决定用户看到哪个值。
+    #[test]
+    fn read_lan_token_from_never_creates_one() {
+        let (store, dir) = crate::service::tests::temp_store("lan_read_pure");
+
+        assert_eq!(read_lan_token_from(&store), Ok(None), "干净库应返 None");
+        assert!(
+            store.secrets.read().get(TOKEN_ID).unwrap().is_none(),
+            "读了一次之后库里仍不该有令牌"
+        );
+        // 再读一次：若第一次偷偷生成了，这次就会返 Some
+        assert_eq!(read_lan_token_from(&store), Ok(None), "第二次读仍应是 None");
+
+        ensure_token(&store);
+        let created = store.secrets.read().get(TOKEN_ID).unwrap().unwrap().to_string();
+        assert_eq!(
+            read_lan_token_from(&store),
+            Ok(Some(created)),
+            "生成之后读回的必须是同一个值"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 🔴 **锁定态必须返 `Err`，绝不能退化成 `Ok(None)`。**
+    ///
+    /// 这是本功能最危险的失效方向：`Ok(None)` 在界面上是「还没有令牌」，
+    /// 于是用户点「重新生成」—— 而库里其实**已经有**令牌，
+    /// 结果**所有已配好的局域网客户端立刻 401**，且用户完全不知道自己刚做了什么。
+    ///
+    /// ⚠️ 这条是补上来的：原先只有 `read_lan_token_from_never_creates_one` 一条，
+    /// 它用的是**未锁定**的库，于是把 `Err(_) => Err(..)` 改成 `Err(_) => Ok(None)`
+    /// **照样全绿** —— 锁定那条分支压根没被跑到。
+    /// 同 CLAUDE.md 那条教训：注入不变红时先怀疑用例没压到那个分支。
+    #[test]
+    fn a_locked_vault_reports_an_error_not_an_absent_token() {
+        let (store, dir) = crate::service::tests::temp_store("lan_locked");
+        ensure_token(&store);
+        let existing = store.secrets.read().get(TOKEN_ID).unwrap().unwrap().to_string();
+
+        store.secrets.write().enable_master_password("TestPass123").unwrap();
+        store.secrets.write().lock();
+        assert!(store.secrets.read().is_locked(), "夹具应处于锁定态");
+
+        let got = read_lan_token_from(&store);
+        assert!(
+            got.is_err(),
+            "锁定态必须返 Err；返 Ok(None) 会被界面显示成「还没有令牌」→ 用户重生成 → 已配客户端全部 401。实得 {got:?}"
+        );
+        // 且必须**没有**把已有令牌抹掉（读是只读的）
+        store.secrets.write().unlock("TestPass123").unwrap();
+        assert_eq!(
+            read_lan_token_from(&store),
+            Ok(Some(existing)),
+            "解锁后原令牌应还在"
+        );
+
+        // 重生成在锁定态也必须失败，而不是写出一个读不回来的值
+        store.secrets.write().lock();
+        assert!(
+            regenerate_lan_token_in(&store).is_err(),
+            "锁定态不该能重生成 —— 那会落一条「已生成」的事件却没真写进去"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 重新生成必须**换掉**令牌、并落一条说明「旧的已失效」的事件。
+    ///
+    /// 返回旧值（看着像成功、其实没换）是最坏的失败形态：用户以为轮换过了，
+    /// 而泄露的那个令牌仍然有效。
+    #[test]
+    fn regenerating_replaces_the_token_and_leaves_an_audit_event() {
+        let (store, dir) = crate::service::tests::temp_store("lan_regen");
+        ensure_token(&store);
+        let old = store.secrets.read().get(TOKEN_ID).unwrap().unwrap().to_string();
+
+        let new = regenerate_lan_token_in(&store).expect("应成功");
+
+        assert_ne!(new, old, "必须真的换掉，返回旧值等于轮换没生效");
+        assert_eq!(new.len(), 64);
+        assert_eq!(
+            read_lan_token_from(&store),
+            Ok(Some(new.clone())),
+            "落盘的必须是新值"
+        );
+
+        let events = store.list_all_events();
+        let hit = events
+            .iter()
+            .find(|e| e.detail.contains("重新生成") && e.detail.contains(&new))
+            .expect("应落一条带新令牌的事件 —— 用户关掉对话框后还能从日志找回");
+        assert!(
+            hit.detail.contains("失效"),
+            "必须点明旧令牌已失效，否则用户不知道要更新客户端: {}",
+            hit.detail
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 🔴 **接线判据：两个命令必须在 `generate_handler!` 里注册。**
+    ///
+    /// 上面两条测试直接调 `read_lan_token_from` / `regenerate_lan_token_in`，
+    /// 于是**忘了注册命令它们照样全绿** —— 而那时前端一点就报
+    /// `Command get_lan_token not found`，设置页整块功能不可用。
+    /// 策略门 `invoke-command-must-exist` 查的是「前端调的命令存在」这个方向，
+    /// 而这里漏的是同一条缝的另一头（Rust 侧写了函数但没进注册表）。
+    #[test]
+    fn lan_token_commands_must_be_registered() {
+        let prod = crate::proxy::custom_headers::production_slice(include_str!("lib.rs"));
+        let handler = &prod[prod
+            .find("tauri::generate_handler![")
+            .expect("注册宏还在吧")..];
+        for cmd in ["get_lan_token", "regenerate_lan_token"] {
+            assert!(
+                handler.contains(cmd),
+                "{cmd} 没进 generate_handler! —— 前端一点就 command not found"
+            );
+        }
     }
 
     /// 🔴 **源码级判据：`accept` 拿到的对端地址必须真的传进 `guarded`。**

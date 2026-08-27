@@ -227,7 +227,7 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   「鉴权静默失效」；② 主口令锁定时 `SecretStore::get` 返 `Err`，本模块把 Err 当拒绝，
   于是锁定态**自动 fail closed**，不用多写一行。
   <br>令牌在 `ProxyManager::start` 开局域网时就生成并**落一条带明文令牌的事件** ——
-  那是本阶段用户唯一的获取通道（设置页 UI 未做，`settings.lanDesc` 已改成指向日志页）。
+  设置页现在也能看/复制/重生成（B5，`LanSection.tsx`）；事件仍保留，它是**跨时间**的那份留存。
   有测试同时钉住「生成」与「可见」：只生成不落事件的表现是「怎么配都 401 而日志里什么都没有」。
   <br>🔴 **11 条测试里只有一条能抓住最要紧的那个注入**：把 `accept` 的 `peer` 丢回 `_`
   并给 guard 传硬编码 loopback（= 缺陷本体，所有来源都被当本机），**其余 10 条全绿**。
@@ -282,6 +282,29 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   `settings.failoverBudget.*` 这 17 条也报成死键，而它们是 `t(\`前缀.${变量}\`)` 拼出来的，
   删了界面会显示原始 key。正确判据是**先穷举全仓所有动态拼 key 的前缀**（只有 7 种），
   再逐条核实功能是否还在。同「别用 i18n 占位文案当演示数据判据」那一类。
+- **局域网令牌的设置页 UI 已做（2026-08-27，docs/14 §21.1 B5）**：补的是**已上线功能的缺口**
+  —— 局域网鉴权 v0.1.41 就发了，而在此之前用户拿令牌只能「去日志页搜『接入令牌』」。
+  实现在 [`LanSection.tsx`](src/components/LanSection.tsx)（开关 + 令牌面板收在一起）
+  + `lan_guard::{read_lan_token_from, regenerate_lan_token_in}` + 两个 IPC 命令。
+  <br>🔴 **两条刻意行为**：① **读令牌只读、绝不生成** —— 生成点只有一个
+  （开局域网时的 `ensure_token`），若读也生成，「打开设置页」这个纯查看动作会给没开
+  局域网的用户凭空造出密钥库条目，且把单一生成点变成两个。
+  ② **锁定态返 `Err`，不能退化成 `Ok(None)`** —— 后者在界面上是「还没有令牌」，
+  于是用户点「重新生成」，而库里其实**已经有**令牌 → **所有已配好的局域网客户端立刻 401**，
+  且用户不知道自己刚做了什么。这是本功能最危险的失效方向，专有一条测试盯着。
+  <br>⚠️ **那条测试是补上来的**：原先只有一条用**未锁定**库的用例，于是把
+  `Err(_) => Err(..)` 改成 `Err(_) => Ok(None)` **照样全绿** —— 锁定分支压根没被跑到。
+  同「注入不变红时先怀疑用例没压到那个分支」那条。6 条注入最终全部变红。
+  <br>**零抬高，三个基线反而降**：`lib.rs` 抽出 `usage_commands.rs`（腾 38 行）、
+  `mockData.ts` 抽出 `mockData.events.ts`（腾 162 行）、`SettingsPage.tsx` 抽出
+  `ToggleRow.tsx`（腾 54 行）。
+  <br>⚠️ **抽 `ToggleRow` 顺带断了一个循环依赖**：第一版让 `LanSection` 从
+  `SettingsPage` 导入 `ToggleRow`，而 `SettingsPage` 又导入 `LanSection` ——
+  React 组件在模块循环里可能在求值时还是 undefined，是会偶发、难查的那类故障。
+  <br>⚠️ **`read_lan_token_from` 的 `match` 分支里不许再取锁**：scrutinee 是
+  `store.secrets.read()` 的临时 guard，它在整个 match 期间存活，分支里取 `.write()`
+  会 RwLock 自锁、当场挂死。写注入验证时踩过，一条测试挂了十分钟才发现
+  **不是「注入无效」而是「进程挂死」**。注入脚本因此加了每条超时。
 - **刻意不修的项**（别当成遗漏重复劳动）：SmartScreen 签名告警、`retrieval.rs` 的 `cwd` 白名单、
   请求日志存明文对话（默认关闭）
 - **自有诊断响应头已上线（2026-08-23，借鉴 OmniRoute 的 `X-OmniRoute-*`）**：

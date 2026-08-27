@@ -3,8 +3,9 @@ import { useEffect, useState, useRef } from "react";
 import { useStore } from "@/store";
 import { api } from "@/lib/bridge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
-import { Switch } from "@/components/ui/Switch";
 import { Button } from "@/components/ui/Button";
+import { LanSection } from "@/components/LanSection";
+import { ToggleRow } from "@/components/ToggleRow";
 import { useT } from "@/lib/useT";
 import { LANGS } from "@/lib/i18n";
 import { openLogDir } from "@/lib/openLogDir";
@@ -24,7 +25,7 @@ import type {
 import {
   // 别名 SettingsIcon：与本页组件名 SettingsPage 不冲突，但直接叫 Settings 容易看混
   Settings as SettingsIcon,
-  Sun, Moon, Monitor, ShieldCheck, KeyRound, Languages, ScrollText,
+  Sun, Moon, Monitor, ShieldCheck, Languages, ScrollText,
   Activity, RefreshCw, FolderOpen, Info, Plug, BookOpen, Copy, Check, X, Brain, MousePointerClick, MessageSquareDot, Timer,
   Download, Upload, AlertTriangle, type LucideIcon,
 } from "lucide-react";
@@ -290,10 +291,14 @@ export function SettingsPage() {
     void api
       .setLanExposure(v)
       .then((restarted) => {
-        useStore.setState({ settings: { ...prev, lanExposure: v } });
-        if (restarted > 0) {
-          showToast("success", t("settings.lanRestarted", { n: restarted }));
-        }
+        // 上面那次 setSettings 只改**页面局部** state，这里同步全局 store。
+        // ⚠️ 必须用**函数式**更新：原先写的是 `{ settings: { ...prev, lanExposure: v } }`，
+        // 而 `prev` 是旧快照 —— 这期间别处对 settings 的改动会被整份覆盖回去，
+        // 正是 CLAUDE.md 记的那条 P0（切主题把刚关掉的开机自启动装回系统）的成因。
+        useStore.setState((st) => ({
+          settings: st.settings ? { ...st.settings, lanExposure: v } : st.settings,
+        }));
+        if (restarted > 0) showToast("success", t("settings.lanRestarted", { n: restarted }));
       })
       .catch((e) => {
         console.error("setLanExposure failed", e);
@@ -622,13 +627,13 @@ export function SettingsPage() {
                 </Button>
               </div>
             )}
-            <ToggleRow
-              icon={KeyRound}
-              title={t("settings.lanTitle")}
-              desc={t("settings.lanDesc")}
-              checked={settings?.lanExposure ?? false}
-              onChange={handleToggleLan}
-              danger
+            {/* 开关与令牌面板收在一个组件里：它们是一件事（开了才有令牌可配），
+                分开写就得把 `lanExposure` 传两遍、且谁都可能忘记同步显示条件。 */}
+            <LanSection
+              enabled={settings?.lanExposure ?? false}
+              onToggle={handleToggleLan}
+              t={t}
+              onToast={showToast}
             />
 
             {/* 孤儿密钥清理（UX#19 / P2-3）。
@@ -1222,61 +1227,6 @@ function WizardCode({ text }: { text: string }) {
   );
 }
 
-function ToggleRow({
-  icon: Icon,
-  title,
-  desc,
-  cost,
-  checked,
-  onChange,
-  danger,
-  disabled,
-  badge,
-}: {
-  icon?: LucideIcon;
-  title: string;
-  desc: string;
-  /**
-   * 开启这个开关要付出的代价（UX#15）。
-   *
-   * 与 `desc` 分开是因为两者用途不同：`desc` 讲「它是什么」，`cost` 讲「开了会怎样」。
-   * **常驻显示**（不是只在开着时才显示）——关着的时候用户正是要靠这句判断该不该开；
-   * 但**开着时转成 warning 色**，因为那时这句话的作用变成了「排障完记得关掉」。
-   */
-  cost?: string;
-  checked: boolean;
-  onChange: (v: boolean) => void;
-  danger?: boolean;
-  disabled?: boolean;
-  badge?: string;
-}) {
-  return (
-    <div className={`flex items-start justify-between gap-4 ${disabled ? "opacity-60" : ""}`}>
-      <div className="flex gap-2.5">
-        {Icon && <Icon size={16} className={`mt-0.5 shrink-0 ${danger ? "text-danger" : "text-text-secondary"}`} />}
-        <div>
-          <div className="flex items-center gap-2 text-sm font-medium text-text-primary">
-            {title}
-            {badge && (
-              <span className="rounded-full border border-border px-1.5 py-0.5 text-[10px] font-normal text-text-muted">
-                {badge}
-              </span>
-            )}
-          </div>
-          <div className="text-xs text-text-muted">{desc}</div>
-          {cost && (
-            <div
-              className={`mt-1 text-[11px] leading-relaxed ${checked ? "text-warning" : "text-text-muted"}`}
-            >
-              {cost}
-            </div>
-          )}
-        </div>
-      </div>
-      <Switch checked={checked} onCheckedChange={onChange} disabled={disabled} />
-    </div>
-  );
-}
 
 /** 导出配置弹窗：先选「是否含密钥」，含则要求设口令并二次确认。 */
 function ExportDialog({

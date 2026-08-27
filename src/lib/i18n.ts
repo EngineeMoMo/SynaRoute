@@ -5,7 +5,7 @@
 import { usageEn, usageZh } from "./i18n.usage";
 import { brandPickerEn, brandPickerZh } from "./i18n.brandPicker";
 import { vendorEn, vendorZh } from "./i18n.vendor";
-import { customHeadersEn, customHeadersZh } from "./i18n.customHeaders";
+import { fieldsEn, fieldsZh } from "./i18n.fields";
 
 export type Lang = "zh" | "en";
 
@@ -511,7 +511,7 @@ const zh: Dict = {
   "logs.subtitle": "按系统 / 大脑聚合 / 路由与故障转移 / 错误分组，可按类型筛选（密钥已脱敏）",
   ...usageZh,
   ...brandPickerZh,
-  ...customHeadersZh,
+  ...fieldsZh,
   "logs.empty": "暂无事件",
   "logs.searchPlaceholder": "搜索日志（Key 名、模型、错误…）",
   "logs.noMatch": "没有匹配「{q}」的日志",
@@ -600,7 +600,7 @@ const zh: Dict = {
   "master.passwordTooShort": "主口令至少 8 位",
   "master.passwordMismatch": "两次输入的主口令不一致",
   "settings.lanTitle": "允许局域网访问代理",
-  "settings.lanDesc": "默认仅本机 127.0.0.1 可访问。开启后局域网设备也能连，但必须带「接入令牌」才放行（本机客户端不受影响）。令牌在日志页搜「接入令牌」即可看到，把它填进客户端的 API Key",
+  "settings.lanDesc": "默认仅本机 127.0.0.1 可访问。开启后局域网设备也能连，但必须带「接入令牌」才放行（本机客户端不受影响）。令牌就在下方，可直接复制。",
   "settings.lanRestarted": "已按新设置重启 {n} 个正在运行的代理（端口不变，客户端无需改配置）",
   "settings.orphanTitle": "检测到 {n} 条可清理的旧密钥",
   "settings.orphanDesc": "这些密钥在密钥库里还留着，但配置里已经没有对应的 Key（通常是删过 Key 或做过 Replace 导入）。留着只占空间、不影响使用；清理是不可逆操作，故交由你决定。",
@@ -1229,7 +1229,7 @@ const en: Dict = {
   "logs.subtitle": "Grouped by system / brain / routing / error (keys redacted)",
   ...usageEn,
   ...brandPickerEn,
-  ...customHeadersEn,
+  ...fieldsEn,
   "logs.empty": "No events yet",
   "logs.searchPlaceholder": "Search logs (key, model, error…)",
   "logs.noMatch": "No logs match “{q}”",
@@ -1317,7 +1317,7 @@ const en: Dict = {
   "master.passwordTooShort": "Master password must be at least 8 characters",
   "master.passwordMismatch": "The two master passwords don't match",
   "settings.lanTitle": "Allow LAN access to proxy",
-  "settings.lanDesc": "By default only 127.0.0.1 can connect. When on, LAN devices can also reach the proxy but must present an access token (local clients are unaffected). Find the token in the Logs page by searching for 接入令牌, then put it in the client's API key field",
+  "settings.lanDesc": "By default only 127.0.0.1 can connect. When on, LAN devices can also reach the proxy but must present an access token (local clients are unaffected). The token is shown below and can be copied directly.",
   "settings.lanRestarted": "Restarted {n} running proxy(ies) with the new setting (same port, no client change needed)",
   "settings.orphanTitle": "{n} leftover API key(s) detected",
   "settings.orphanDesc": "These secrets are still in the vault but the keys they belonged to are gone from your config (deleted keys, or a Replace import). They are harmless — they just take up space and are never used for routing.",

@@ -46,3 +46,45 @@ export function prodLines(src) {
   const lines = src.split("\n");
   return cut === null ? lines.length : cut - 1;
 }
+
+/**
+ * 一个文件里**该被判据扫的行**：剥掉注释，`.rs` 再剥掉尾部测试段。
+ * 返回 `{ n, text }`（`n` 是 1-based 行号，供报错时定位）。
+ *
+ * 🔴 **为什么必须剥注释**：判据说「代码里别这么写」，就只能看代码。本仓已经因此
+ * 报过两次假警：
+ * - 策略门 `data-dir-env-name-must-match` 第一版命中的是脚本自己那段
+ *   「❌ 已证伪的修法」**注释**；
+ * - `check-tailwind-tokens.mjs` 原先逐行裸扫，于是一句
+ *   「别用 `bg-surface-subtle`，它不存在」的注释**本身**被报成「写了但不生效」。
+ *
+ * 第二次那个尤其讽刺：把坑记进注释这个动作，恰好触发了那个坑的判据。
+ *
+ * @param {string} src 文件内容
+ * @param {string} file 文件路径（只用来判断是否 `.rs`）
+ */
+export function inspectableLines(src, file = "") {
+  const lines = src.split("\n");
+  const cut = file.endsWith(".rs") ? testModStartLine(src) : null;
+  const limit = cut === null ? lines.length : cut - 1;
+  const out = [];
+  let inBlockComment = false;
+  for (let i = 0; i < limit; i++) {
+    const raw = lines[i];
+    const t = raw.trim();
+    if (inBlockComment) {
+      if (t.includes("*/")) inBlockComment = false;
+      continue;
+    }
+    if (t.startsWith("/*") || t.startsWith("{/*")) {
+      // JSX 注释 `{/* … */}` 也要剥 —— 它在 .tsx 里就是注释，却不以 `/*` 开头。
+      if (!t.includes("*/")) inBlockComment = true;
+      continue;
+    }
+    // 行注释（Rust `//` `///` `//!`、TS `//`）与块注释续行 `*`
+    if (t.startsWith("//") || t.startsWith("*")) continue;
+    // 行尾注释也剥掉（避免「代码后面跟一句举例说明」被判违规）
+    out.push({ n: i + 1, text: raw.replace(/\/\/.*$/, "") });
+  }
+  return out;
+}

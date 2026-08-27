@@ -215,6 +215,13 @@ export const api = {
   listAllEvents: () =>
     call<EventLogEntry[]>("list_all_events", undefined, () => mockBridge.listAllEvents()),
 
+  /** 读局域网接入令牌（B5）。**只读不生成**；主口令锁定时后端返 Err。 */
+  getLanToken: () =>
+    call<string | null>("get_lan_token", undefined, () => mockBridge.getLanToken()),
+
+  /** 重新生成局域网接入令牌（B5）。**破坏性**：旧令牌立即失效，调用前须让用户确认。 */
+  regenerateLanToken: () =>
+    call<string>("regenerate_lan_token", undefined, () => mockBridge.regenerateLanToken()),
   /** 按「分类 × Key」聚合的 token 用量（用量统计面板）。 */
   getTokenUsage: () =>
     call<TokenUsageByKey[]>("get_token_usage", undefined, () => mockBridge.tokenUsage()),
