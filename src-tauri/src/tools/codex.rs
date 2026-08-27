@@ -1411,6 +1411,66 @@ mod tests {
     /// 实测判据（对 `codex app-server` 直发 `getAuthStatus`）：只有非空 `OPENAI_API_KEY`
     /// 才返 `authMethod: "apikey"`；不存在 / 只写 `auth_mode` / 空值三种都返 null → 弹登录页。
     /// 上一版把这份文件整个删掉，于是桌面端用户卡在「登录 ChatGPT」页（真机报障）。
+    /// **坏掉的 auth.json 也必须能原样拿回来** —— 覆盖 ⇄ 还原是逐字节互逆的。
+    ///
+    /// 为什么专门测这个形态：三个谓词（`auth_carries_our_placeholder` /
+    /// `auth_has_usable_api_key` / `auth_is_only_our_placeholder`）全都以
+    /// 「能解析成 JSON 对象」为前提，解析失败时**一律返 false**。于是半截 JSON 会落进
+    /// `apply_auth_at` 的最后一支（覆盖），而那正是唯一会动用户文件的分支 ——
+    /// 也就是说这个形态走的是风险最高的那条路，却不在任何一条既有用例的覆盖里。
+    ///
+    /// 半截 JSON 不是假想：Codex 自己写 auth.json 时崩溃/断电就会留下这个。
+    /// 里面可能有用户的真 key（本例就是），一旦被覆盖而无法交还，那是数据丢失。
+    ///
+    /// 安全的根据不在谓词，而在 `backup_and_write_bytes` 用 `fs::copy` 备份**原始字节**
+    /// （不经 JSON 解析），且那一步失败即 `?` 上抛 → `apply` 的 with_rollback 整轮回滚。
+    #[test]
+    fn a_malformed_auth_json_survives_apply_and_restore_byte_for_byte() {
+        let d = temp_dir("malformed_roundtrip");
+        let auth = d.join("auth.json");
+        // 半截 JSON + **一段非 UTF-8 字节**，且里面带着用户的真 key。
+        //
+        // 那段 `\xFF\xFE` 不是为了好看：只用「半截 JSON」测不出东西 ——
+        // 它虽然不是合法 JSON，却是合法 UTF-8，于是「按字符串备份」也能原样往返，
+        // 故障注入照样绿（我第一版就是这么写的，注入后仍绿才发现判据是空的）。
+        // 掺进非 UTF-8 字节之后，`read_to_string` 会失败，
+        // 「`fs::copy` 备份原始字节」与「按字符串备份」才真的可区分。
+        let mut broken_vec = b"{\"OPENAI_API_KEY\":\"sk-userreal\",\"auth_mo".to_vec();
+        broken_vec.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x80]);
+        let broken: &[u8] = &broken_vec;
+        std::fs::write(&auth, broken).unwrap();
+
+        // 三个谓词对它全部返 false（这是它落进「覆盖」分支的原因，先把前提钉住）
+        assert!(!auth_carries_our_placeholder(&auth));
+        assert!(!auth_has_usable_api_key(&auth), "解析失败 → 看不出里面有真 key");
+        assert!(!auth_is_only_our_placeholder(&auth));
+
+        assert!(apply_auth_at(&auth).unwrap().is_some(), "应当覆盖");
+        let bak = super::super::backup_path_for(&auth);
+        assert!(bak.exists(), "覆盖前必须留下 .bak —— 否则那把真 key 就永久没了");
+        assert_eq!(
+            std::fs::read(&bak).unwrap(),
+            broken,
+            "备份必须是**原始字节**（fs::copy，不经 JSON 解析）"
+        );
+        assert!(auth_carries_our_placeholder(&auth), "覆盖后是我们的占位符");
+
+        // 逆操作：逐字节交还
+        assert!(disarm_legacy_placeholder_auth(&auth).unwrap().is_some());
+        assert_eq!(
+            std::fs::read(&auth).unwrap(),
+            broken,
+            "还原必须逐字节等于原件（哪怕它是坏的 —— 修不修由用户决定，不由我们代劳）"
+        );
+        assert!(!bak.exists(), "交还后删掉 .bak（首写即锁的配套）");
+        assert!(
+            prerestore_path_for(&auth).exists(),
+            "改写前留下的现场副本要在（可回滚）"
+        );
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     #[test]
     fn apply_auth_writes_placeholder_only_when_there_is_nothing_to_preserve() {
         let d = temp_dir("write_ph");
@@ -1531,3 +1591,4 @@ mod tests {
         assert_eq!(PROXY_PLACEHOLDER, "synaroute-proxy");
     }
 }
+
