@@ -1,7 +1,7 @@
 import { Github } from "lucide-react";
 import { Container } from "@/components/ui/Section";
 import { ButtonExternal } from "@/components/ui/Button";
-import { HeroDownloadButton, PlatformBadges } from "@/components/DownloadUI";
+import { HeroDownloadButton, HeroPlatformLink, PlatformBadges } from "@/components/DownloadUI";
 import { Screenshot } from "@/components/ui/Screenshot";
 import { heroScreenshot } from "@/data/screenshots";
 import { siteConfig } from "@/config/site";
@@ -54,12 +54,20 @@ export function Hero() {
             {t("hero.descSecond")}
           </p>
 
+          {/* 这一行**只放两个按钮**，「其它平台」链接单独一行。
+              原先链接嵌在主按钮组件内部（同一个 flex-col），把这一行撑到 88px 高，
+              而本行是 items-center → 56px 的「查看 GitHub」被垂直居中、比主按钮低 16px，
+              两个并排按钮就此错开。详见 DownloadUI.tsx 里 HeroDownloadButton 上方的注释。 */}
           <div className="animate-fade-up mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row">
             <HeroDownloadButton />
             <ButtonExternal href={siteConfig.github.url} variant="outline" size="xl" className="w-full sm:w-auto">
               <Github size={19} aria-hidden="true" />
               {t("hero.ctaSecondary")}
             </ButtonExternal>
+          </div>
+
+          <div className="animate-fade-up mt-3 flex justify-center">
+            <HeroPlatformLink />
           </div>
 
           <div className="mt-6 flex flex-col items-center gap-3">

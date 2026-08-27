@@ -1,7 +1,7 @@
 import { Github } from "lucide-react";
 import { Container } from "@/components/ui/Section";
 import { ButtonExternal } from "@/components/ui/Button";
-import { HeroDownloadButton, PlatformBadges } from "@/components/DownloadUI";
+import { HeroDownloadButton, HeroPlatformLink, PlatformBadges } from "@/components/DownloadUI";
 import { LogoMark } from "@/components/ui/Logo";
 import { siteConfig } from "@/config/site";
 import { useLatestRelease } from "@/hooks/useRelease";
@@ -27,12 +27,19 @@ export function FinalCTA() {
           </h2>
           <p className="mt-3 text-base text-text-secondary">{t("cta.desc")}</p>
 
+          {/* 与 Hero 同构，故同样只放两个按钮 —— 那处 16px 垂直错位在这里也存在过。
+              「其它平台」链接必须一并保留：这是最后一个转化点，
+              认错平台而没有出路 = 用户下到装不上的包。 */}
           <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
             <HeroDownloadButton />
             <ButtonExternal href={siteConfig.github.url} variant="outline" size="xl" className="w-full sm:w-auto">
               <Github size={19} aria-hidden="true" />
               {t("common.viewGithub")}
             </ButtonExternal>
+          </div>
+
+          <div className="mt-3 flex justify-center">
+            <HeroPlatformLink />
           </div>
 
           <div className="mt-6 flex flex-col items-center gap-2">
