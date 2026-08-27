@@ -295,11 +295,11 @@ pub(crate) async fn set_lan_exposure(
 // ==== Key 与密钥 ====
 /// 保存（新增/更新）一条 Key。
 ///
-/// 校验项：
-/// 1. 桌面端不合规的对外模型名必须在源头拦下（见 [`reject_desktop_key_with_unusable_model_names`]）
-/// 2. 检查 baseUrl 路径后缀 + 余额查询配置的组合问题（见 [`warn_base_url_path_suffix_if_needed`]）
+/// 校验项：桌面端不合规的对外模型名、自定义请求头里的保留字段（这两条**拒绝落盘** ——
+/// 静默忽略会让人以为生效了）、baseUrl 路径后缀（[`warn_base_url_path_suffix_if_needed`]，只告警）。
 pub(crate) fn save_key(store: &Store, key: ProviderKey) -> AppResult<ProviderKey> {
     reject_desktop_key_with_unusable_model_names(&key)?;
+    crate::proxy::custom_headers::reject_reserved(&key).map_err(AppError::Invalid)?;
     warn_base_url_path_suffix_if_needed(store, &key);
     store.upsert_key(key)
 }

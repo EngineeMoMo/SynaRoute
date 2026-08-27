@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 /// 响应体类型：可能是完整缓冲体（Full）或流式体（StreamBody），统一装箱为 BoxBody。
 /// 流式路径用于同协议 SSE 透传（stream:true），缓冲路径用于非流式 / 跨协议。
 #[path = "lan_guard.rs"] pub(crate) mod lan_guard; // 入站鉴权；来由见该文件模块注释
+#[path = "custom_headers.rs"] pub(crate) mod custom_headers; // headers_json 接线 + 保留字段判据
 pub(crate) type ResBody = BoxBody<Bytes, std::io::Error>;
 
 /// 把完整字节体装箱为 ResBody（Full 的错误类型是 Infallible，用 `match` 消解）。
@@ -60,7 +61,8 @@ const PROXY_PORT_FALLBACK_RANGE: u16 = 20;
 /// 顺序不能变：
 /// 1. 先透传下游客户端头（UA / x-app / x-stainless-*），让中转商识别为真实客户端；
 /// 2. `anthropic-beta` 单独算（1M 上下文要按**落点模型**追加特性），故上一步跳过原值、这里统一设；
-/// 3. **鉴权头最后设**，确保覆盖掉下游可能带来的同名头（鉴权必须用本 Key 的密钥）。
+/// 3. 本 Key 的 `headers_json` 自定义头（保留字段已被 `custom_headers` 滤掉）；
+/// 4. **鉴权头最后设**，确保覆盖掉下游或自定义头可能带来的同名头（鉴权必须用本 Key 的密钥）。
 ///
 /// ⚠️ **超时不在这里设**：流式与非流式的超时语义刻意不同（流式只约束探头阶段、不掐已建立的
 /// SSE 流），必须留在各自调用点。见 `try_stream_to_key` 与 `forward_to_key` 的相应注释。
@@ -80,6 +82,11 @@ fn apply_upstream_headers(
     }
     if let Some(b) = &beta {
         rb = rb.header("anthropic-beta", b.as_str());
+    }
+    // 本 Key 的自定义头（headers_json）。位置刻意在**鉴权之前**：这样用户即使绕过保存
+    // 校验（手改 config.json）填了 authorization，下面那行也会把它盖回真实 Key。
+    for (h, v) in custom_headers::headers_for(key) {
+        rb = rb.header(h, v);
     }
     // 鉴权与版本头都走 Protocol 的**穷举**能力方法：加第 4 种协议时编译器会点出这里要改，
     // 而不是静默按「非 Anthropic 即 OpenAI」发错误的头。
@@ -520,7 +527,7 @@ async fn handle_request_inner(
         .iter()
         .filter_map(|(name, val)| {
             let n = name.as_str().to_ascii_lowercase();
-            if is_stripped_header(&n) {
+            if custom_headers::is_reserved(&n) {
                 return None;
             }
             val.to_str().ok().map(|v| (n, v.to_string()))
@@ -2647,26 +2654,8 @@ fn effective_beta_header(
     }
 }
 
-fn is_stripped_header(name: &str) -> bool {
-    matches!(
-        name,
-        "authorization"
-            | "x-api-key"
-            | "anthropic-version" // 用 Key 协议对应的版本头
-            | "host"
-            | "content-length"
-            | "content-type"
-            | "accept-encoding"
-            | "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-    )
-}
+// 「哪些头是代理自有的」已移到 `custom_headers::is_reserved` —— 它同时是自定义头的
+// 黑名单，两个用途必须共用一份清单（否则加新头时只改一处，另一处静默成洞）。
 
 /// 上游返回某状态码时，是否该「计入熔断」（惩罚该 Key）。
 ///

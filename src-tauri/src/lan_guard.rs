@@ -416,8 +416,9 @@ mod tests {
     /// accept 处没把对端丢给 `_`；且 `guarded(` 的实参里出现 `peer`。
     #[test]
     fn accept_must_pass_the_real_peer_into_the_guard() {
-        let src = include_str!("proxy.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        // 用共用判据取生产段：朴素的 split 会被中间的 #[cfg(test)] 单项截断，
+        // 而下面那条是**否定**断言 —— 截断即空洞通过（判据变绿、缺陷仍在）。
+        let prod = crate::proxy::custom_headers::production_slice(include_str!("proxy.rs"));
         assert!(
             !prod.contains("let Ok((stream, _)) = accepted"),
             "accept 又把对端地址丢成 `_` 了 —— 那样 guard 只能看到一个假 peer"

@@ -426,8 +426,8 @@ mod tests {
     /// **单元覆盖了组件 ≠ 覆盖了调用它的那条线。**
     #[test]
     fn the_log_writer_thread_must_go_through_openlog() {
-        let src = include_str!("store.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        // 同 lan_guard：否定断言下，被截断的生产段会让判据空洞通过。
+        let prod = crate::proxy::custom_headers::production_slice(include_str!("store.rs"));
         assert!(
             prod.contains("log_rotate::OpenLog::open("),
             "写线程必须用 OpenLog::open 开文件（体积起点/续写序号都在里面）"
