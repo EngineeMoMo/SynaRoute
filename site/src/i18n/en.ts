@@ -237,6 +237,17 @@ export const en: Dict = {
   "download.updateTitle": "About updates",
   "download.updateDesc":
     "The app checks for updates itself and prompts you in-app, so you don't need to come back here to download new versions.",
+  // The line above is **false** for anyone still on v0.1.23 or earlier — their in-app updater
+  // is permanently broken, and the app's own "up to date" / signature-error message doesn't say
+  // what to do. This page is the only channel that reaches them (they receive no updates, so they
+  // never see the improved error copy we ship in newer builds).
+  "download.updateLegacyTitle": "If you are on v0.1.23 or earlier",
+  "download.updateLegacyDesc":
+    "In-app updates no longer work on those versions: the update signing key was rotated, and the public key " +
+    "baked into older builds cannot verify newer signatures — so it will keep reporting a verification failure " +
+    "or stay on the old version no matter how many times you retry. Download the installer from this page and " +
+    "install over your existing copy once; updates will work normally afterwards. Your settings, keys and usage " +
+    "history live in the system application-data directory and are not affected by reinstalling.",
 
   // ---------- Steps ----------
   "steps.title": "Four steps to get going",

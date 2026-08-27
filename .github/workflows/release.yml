@@ -31,7 +31,25 @@ jobs:
               repo: context.repo.repo,
               tag_name: `v${process.env.PACKAGE_VERSION}`,
               name: `SynaRoute v${process.env.PACKAGE_VERSION}`,
-              body: 'See the assets to download this version and install.',
+              // 说明里必须带「v0.1.23 及更早请手动重装」那一段。
+              // 官网下载页也有同样一条，但那两条渠道触达的是不同的人 ——
+              // 从 Release 页直接下包的人根本不会经过官网。
+              // 而这批用户是**收不到任何应用内更新**的（换钥导致旧公钥验不过新签名），
+              // 也就永远看不到我们在新版里改好的那句错误文案。这是少数能触达他们的地方。
+              body: [
+                'Download the installer for your platform from the assets below.',
+                '',
+                '---',
+                '',
+                '**Already using SynaRoute?** In-app update works normally from v0.1.26 onward.',
+                '',
+                '**If you are on v0.1.23 or earlier**, in-app updates no longer work on your build:',
+                'the update signing key was rotated, and the public key baked into those versions',
+                'cannot verify newer signatures — it will keep failing verification or stay on the old',
+                'version no matter how many times you retry. Install this release over your existing',
+                'copy once and updates will work normally afterwards. Your settings, keys and usage',
+                'history live in the system application-data directory and are not affected.',
+              ].join('\n'),
               draft: true,
               prerelease: false
             })
