@@ -393,6 +393,63 @@ const pass = (name, detail) => console.log(`✅ ${name}${detail ? ` —— ${det
   }
 }
 
+// ---------------------------------------------------------------------------
+// 规则 6：数据目录隔离的环境变量名两侧必须一致
+// ---------------------------------------------------------------------------
+{
+  const WHY =
+    "      smoke:installer 靠 SYNAROUTE_DATA_DIR 把冒烟实例与用户真实配置隔开。\n" +
+    "      这个变量名是**跨语言契约**：Rust 侧 data_dir.rs 读它，脚本侧 spawn 时传它。\n" +
+    "      🔴 分叉的表现是**静默的、且方向是「门变绿」** —— 传了一个产品不认的变量,\n" +
+    "      产品就按老路径读**用户真实的** %APPDATA%\\SynaRoute\\config.json，\n" +
+    "      于是冒烟实例会拿真实配置启动、自动开代理并改写 ~/.claude/settings.json,\n" +
+    "      指向一个随后被 kill 的临时端口 ——「起了没还原」不自愈。\n" +
+    "      （keys=0 那条判据会拦住它，但那是最后一道；这里让分叉在改动当时就红。）";
+
+  const RUST = "src-tauri/src/data_dir.rs";
+  const SCRIPT = "scripts/smoke-installer.mjs";
+  const problems = [];
+  if (!existsSync(RUST) || !existsSync(SCRIPT)) {
+    problems.push(`      找不到 ${RUST} 或 ${SCRIPT} —— 解析器与仓库结构脱节`);
+  } else {
+    const rustSrc = readFileSync(RUST, "utf8");
+    const m = rustSrc.match(/ENV_OVERRIDE\s*:\s*&str\s*=\s*"([A-Z0-9_]+)"/);
+    if (!m) {
+      problems.push(`      ${RUST} 里没解析到 ENV_OVERRIDE 常量 —— 判据空转了，先修解析器`);
+    } else {
+      const name = m[1];
+      const script = readFileSync(SCRIPT, "utf8");
+      // 脚本必须在 spawn 的 env 里传这个名字。只查名字出现过不够 ——
+      // 注释里提到它也会命中，故要求它出现在 `名字:` 形态（对象字面量的键）。
+      const asKey = new RegExp(`\\b${name}\\s*:`).test(script);
+      if (!asKey) {
+        problems.push(
+          `      ${RUST} 用的是 ${name}，但 ${SCRIPT} 没有以 \`${name}:\` 形态把它传给子进程。\n` +
+            "        （只在注释里出现不算 —— 判据要的是真的写进了 spawn 的 env。）"
+        );
+      }
+      // 反向：脚本里若还留着已废弃的 APPDATA 覆盖写法，那是已证伪的路子，别复活。
+      //
+      // ⚠️ 必须**剥掉注释**再匹配。第一版直接对全文 test，当场被自己那段
+      // 「❌ 已证伪的修法：env: { APPDATA: <临时目录> }」注释命中而报假警 ——
+      // 与本文件顶部记的第一个判据坑（把文档示例与测试夹具报成违规）一模一样。
+      // 判据说的是「代码里别这么写」，那就只能看代码。
+      const scriptCode = inspectableLines(SCRIPT)
+        .map((l) => l.text)
+        .join("\n");
+      if (/env\s*:\s*\{[^}]*\bAPPDATA\s*:/.test(scriptCode)) {
+        problems.push(
+          `      ${SCRIPT} 又在给子进程传 APPDATA —— 那条路已实测证伪：\n` +
+            "        dirs::data_dir() 走 Win32 已知文件夹 API，不读该变量。"
+        );
+      }
+    }
+  }
+
+  if (problems.length) fail("data-dir-env-name-must-match", `${WHY}\n${problems.join("\n")}`);
+  else pass("data-dir-env-name-must-match", "Rust 侧 ENV_OVERRIDE 与冒烟脚本传的变量名一致");
+}
+
 if (failed) {
   console.log(`\n❌ ${failed} 条硬规则未通过。这些判据没有基线可冻结 —— 只能修。`);
   process.exit(1);

@@ -8,6 +8,8 @@ use crate::secret::{atomic_write, SecretStore};
 use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::time::SystemTime;
+#[path = "data_dir.rs"] // 挂载理由与 SYNAROUTE_DATA_DIR 的来由都在该文件模块注释
+pub(crate) mod data_dir;
 
 /// 检查 baseUrl 是否含路径后缀（如 `https://api.deepseek.com/anthropic` 中的 `/anthropic`）。
 ///
@@ -371,9 +373,7 @@ impl Store {
     }
 
     pub fn init() -> AppResult<Self> {
-        let data_dir = dirs::data_dir()
-            .ok_or_else(|| AppError::Other("无法定位数据目录".into()))?
-            .join("SynaRoute");
+        let data_dir = data_dir::app_data_dir()?;
         std::fs::create_dir_all(&data_dir)?;
 
         let config_path = data_dir.join("config.json");

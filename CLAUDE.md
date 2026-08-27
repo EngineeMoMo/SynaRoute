@@ -432,7 +432,10 @@ npm run audit:release
 | **棘轮** | `npm run ratchet` | 现状不理想但可接受，只要求**不变坏** |
 | **棘轮防作弊** | `npm run ratchet:verify` | 基线只准往好的方向动；抬高必须附理由 |
 
-### 策略门现有五条
+### 策略门现有六条
+
+> 第六条 `data-dir-env-name-must-match` 的来由与踩坑记在本文档
+> 「产物门」一节里 `SYNAROUTE_DATA_DIR` 那条下面，不在这里重复。
 
 - `no-hardcoded-local-paths` —— 把「禁止硬编码本机路径」这条既有铁律变成机械判据。
   **只查生产段的非注释行**（`.rs` 排除尾部 `#[cfg(test)] mod tests`）。第一版裸 grep
@@ -572,7 +575,17 @@ Rust 测试是**同文件内联**的。若按整文件行数冻结，「补一�
 `HKCU\…\Uninstall\SynaRoute` 并可能关掉你正在用的实例，于是可能顶掉你自己那份安装的
 卸载入口。CI 上无此顾虑（一次性环境），故 CI 里不需要这个参数。
 
-🔴 **`smoke:installer` 目前只能在 CI 跑，本机一律红** —— 这是 2026-08-23 第一次真跑时
+🟡 **`smoke:installer` 本机可跑了（2026-08-27），但需要你先退出正在跑的实例** ——
+数据目录隔离已实现（下面那条原「待办」已做完），**但实测发现第二道障碍**：
+产品用了 `tauri-plugin-single-instance`，已有实例在跑时冒烟实例**启动即退出**、
+连自检行都不写（实测只留下一个 0 字节的 jsonl）。
+不拦的话本门表现为「等 boot 超时」，而那个错误长得跟「产物坏了、起不来」一模一样，
+会把人送去查安装包 —— 故脚本加了 `assertNoRunningInstance()`，在**安装之前**就判定并说清楚
+（装完再发现起不来，注册表项已经写下去了）。
+
+下面这段是隔离做出来之前的历史记录，保留因为那两条实测判据仍然有效：
+
+🔴 **`smoke:installer` 曾只能在 CI 跑，本机一律红** —— 这是 2026-08-23 第一次真跑时
 发现的：那条自检行报 `配置=%APPDATA%\SynaRoute\config.json · keys=13`，
 **冒烟实例读的是用户真实配置**。而真实配置里 `proxyRunningCategories` 非空，
 于是它开机会自动启动代理并顺带写工具配置（起=写、停=还原）。
@@ -591,11 +604,30 @@ config.json 13 keys 完好）。慢一点、或那条分类是 claude-cli，就�
 `SHGetKnownFolderPath(FOLDERID_RoamingAppData)` 这个已知文件夹 API，**不读 `APPDATA`
 环境变量**，改了照样 `keys=13`。
 
-<br>✅ **待办（未做）**：生产侧加一个 `SYNAROUTE_DATA_DIR` 环境变量覆盖
-（`store.rs:429` 那处 `dirs::data_dir()`），同 OmniRoute 的 `DATA_DIR`
-—— 它的 `check-pack-boot.mjs` 正是靠这个隔离，注释写着 "DATA_DIR isolated"。
-那是一处生产代码改动 + 回归测试，刻意没塞进 v0.1.32 那次发版
-（发版当口往产物里加新的路径解析分支，风险与收益不匹配）。做完之后本机就能跑这个门了。
+<br>✅ **已做完（2026-08-27）**：生产侧的 `SYNAROUTE_DATA_DIR` 覆盖在
+[`src-tauri/src/data_dir.rs`](src-tauri/src/data_dir.rs)（同 OmniRoute 的 `DATA_DIR`，
+它的 `check-pack-boot.mjs` 注释写着 "DATA_DIR isolated"）。
+挂载用 `#[path]` 挂在 `store.rs` 下 —— 因为 `store.rs` 与 `lib.rs` 棘轮余量都是 0，
+而目录化是 docs/15 P2-7 刻意未做的大 diff。**零棘轮抬高**：`app_data_dir()` 自己返回
+`AppResult` 并把 `SynaRoute` 子目录拼好，于是 `Store::init` 里那三行收成一行，
+正好抵掉模块声明的两行。
+<br>**实测验证**（不装包、直接跑产物 exe）：日志报
+`配置文件不存在,使用默认空配置: "…\Temp\sr-iso-1274\config.json"`，
+隔离目录里生成了 config.json，而真实 `%APPDATA%\SynaRoute\config.json`
+mtime 与 keys 数（14）**均未变**。
+<br>**空串必须视为未设置**：CI 里 `env: { SYNAROUTE_DATA_DIR: "" }` 是常见写法，
+当成有效值会把配置写到**进程当前工作目录**的相对路径 —— 比读到真实配置更糟
+（产物目录里凭空多出一份密钥库，没人会想到去那里找）。有注入验证。
+<br>**变量名是跨语言契约**，已加第 6 条策略门 `data-dir-env-name-must-match`：
+Rust 侧 `ENV_OVERRIDE` 与 `smoke-installer.mjs` 里 spawn 传的名字必须一致。
+分叉的失效方向是**门变绿** —— 传一个产品不认的变量，产品就按老路径读真实配置。
+<br>⚠️ 那条门的第一版**报了假警**：它对脚本全文 grep `env: { APPDATA:`，
+命中的是脚本自己那段「❌ 已证伪的修法」**注释**。与本文件顶部记的第一个判据坑同类，
+已改为先剥注释（复用 `inspectableLines`）。**判据说「代码里别这么写」，就只能看代码。**
+<br>⚠️ **注入验证踩了个新坑**：恢复注入时用了 `cp -p`（保留 mtime），
+于是 cargo 认为源码未变、**沿用了注入版的编译产物**，全量跑出现一条假红。
+`cp -p` 对 `tauri.conf.json` 那类「不想触发重建」的文件是对的，
+对参与编译的 `.rs` 文件恰恰是错的 —— 恢复后要 `touch` 一下。
 
 ## 其他硬规则
 
