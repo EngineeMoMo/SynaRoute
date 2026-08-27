@@ -8,6 +8,8 @@ import { BrandIcon } from "@/components/BrandIcon";
 import { BrandPickerDialog, BrandPickerTrigger } from "@/components/BrandPickerDialog";
 import { SaveErrorDialog } from "@/components/SaveErrorDialog";
 import { MAX_COST_MULTIPLIER, isValidCostMultiplier } from "@/lib/costMultiplier";
+import { CostMultiplierField } from "@/components/CostMultiplierField";
+import { CustomHeadersField } from "@/components/CustomHeadersField";
 import type {
   BalanceQuery,
   BalanceResult,
@@ -180,6 +182,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const [probing, setProbing] = useState(false);
   // 计费倍率（如 "0.3" = 官方价三折）。存字符串，避免 0.1+0.2 那类浮点显示。
   const [costMultiplier, setCostMultiplier] = useState(initial?.costMultiplier ?? "");
+  const [headersJson, setHeadersJson] = useState(initial?.headersJson ?? "");
   /** 这条 Key 的图标覆盖（预设键或 data-URL）；undefined = 跟着厂商走。 */
   const [icon, setIcon] = useState<string | undefined>(initial?.icon);
   const [iconPickerOpen, setIconPickerOpen] = useState(false);
@@ -532,6 +535,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
           }
         : undefined,
     costMultiplier: costMultiplier.trim() || undefined,
+    headersJson: headersJson.trim() || undefined,
     icon,
   });
 
@@ -1411,27 +1415,8 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
 
                 {/* 计费倍率：与余额查询无关，但同属「钱」这一类，放一起用户好找。
                     即使不开余额查询也能配（用量页靠它算金额）。 */}
-                <Field label={t("balance.multiplier")}>
-                  <input
-                    className={`${inputCls} font-mono ${
-                      isValidCostMultiplier(costMultiplier) ? "" : "border-danger focus:ring-danger"
-                    }`}
-                    value={costMultiplier}
-                    placeholder="1.0"
-                    onChange={(e) => setCostMultiplier(e.target.value)}
-                  />
-                  {isValidCostMultiplier(costMultiplier) ? (
-                    <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
-                      {t("balance.multiplierHint")}
-                    </p>
-                  ) : (
-                    // 后端对非法值静默退回 1.0（不让笔误把金额算成 0），所以这里必须说出来：
-                    // 否则用户填了「三折」「30%」以为生效了，用量页却按原价算，金额差 3 倍而无人告知。
-                    <p className="mt-1 text-[11px] leading-relaxed text-danger">
-                      {t("balance.multiplierInvalid", { max: String(MAX_COST_MULTIPLIER) })}
-                    </p>
-                  )}
-                </Field>
+                <CostMultiplierField value={costMultiplier} onChange={setCostMultiplier} t={t} />
+                <CustomHeadersField value={headersJson} onChange={setHeadersJson} t={t} />
               </div>
             )}
           </div>

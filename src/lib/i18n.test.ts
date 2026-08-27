@@ -5,10 +5,12 @@ import i18nSource from "./i18n.ts?raw";
 import i18nUsageSource from "./i18n.usage.ts?raw";
 import i18nBrandPickerSource from "./i18n.brandPicker.ts?raw";
 import i18nVendorSource from "./i18n.vendor.ts?raw";
+import i18nCustomHeadersSource from "./i18n.customHeaders.ts?raw";
 import { translate } from "@/lib/i18n";
 import { usageEn, usageZh } from "@/lib/i18n.usage";
 import { brandPickerEn, brandPickerZh } from "@/lib/i18n.brandPicker";
 import { vendorEn, vendorZh } from "@/lib/i18n.vendor";
+import { customHeadersEn, customHeadersZh } from "@/lib/i18n.customHeaders";
 
 /**
  * i18n 的两条结构性判据。**这两条浏览器里看不出来**（缺翻译只是显示成另一种语言或原始 key，
@@ -36,6 +38,7 @@ const SOURCES: { name: string; src: string }[] = [
   { name: "i18n.usage.ts", src: i18nUsageSource },
   { name: "i18n.brandPicker.ts", src: i18nBrandPickerSource },
   { name: "i18n.vendor.ts", src: i18nVendorSource },
+  { name: "i18n.customHeaders.ts", src: i18nCustomHeadersSource },
 ];
 
 /** 各分片导出的运行时字典，用于校验「分片真的被展开进主词典了」。 */
@@ -43,6 +46,7 @@ const CHUNKS: { name: string; zh: Record<string, string>; en: Record<string, str
   { name: "usage", zh: usageZh, en: usageEn },
   { name: "brandPicker", zh: brandPickerZh, en: brandPickerEn },
   { name: "vendor", zh: vendorZh, en: vendorEn },
+  { name: "customHeaders", zh: customHeadersZh, en: customHeadersEn },
 ];
 
 /**
