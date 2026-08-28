@@ -204,6 +204,41 @@ pub(crate) fn production_slice(src: &str) -> &str {
     &src[..cut]
 }
 
+/// 生产段里**只剩代码的那部分**：先取 [`production_slice`]，再逐行剥掉 `//` 系注释
+/// （含 `///` 文档注释与 `//!` 模块注释）。
+///
+/// 🔴 **凡是「代码里必须/不许出现某个字面量」的判据都得用这个，不能用 `production_slice`。**
+///
+/// 本仓已经因为这个栽过三次，前两次记在 CLAUDE.md 里
+/// （`data-dir-env-name-must-match` 第一版命中脚本自己注释里那段「❌ 已证伪的修法」；
+/// `userPrefsParity` 裸 grep `...rest` 命中 `prefs.ts` 注释里**警告不要用 `...rest`** 的句子）。
+///
+/// 第三次是 `proxy_listen` 的 `only_v6_must_be_set_explicitly`：模块注释里写着
+/// 「为什么 v6 socket 必须显式 `set_only_v6(true)`」，于是把**那行代码整个删掉**、
+/// 判据**照样绿** —— 注释替代码把断言满足了。注入实测确认（11 条注入里唯一没红的一条）。
+///
+/// 两个方向都会坏，且都很隐蔽：
+/// - 肯定断言（`contains(好形态)`）→ 注释里提到就算通过，**代码没了也不报**；
+/// - 否定断言（`!contains(坏形态)`）→ 注释里举反例就算违规，**代码是对的却报红**。
+///
+/// **判据说「代码里别这么写」，就只能看代码。**
+///
+/// 剥法刻意从简（按行找 `//`，不解析字符串字面量里的 `//`）：
+/// 代价是含 `//` 的字符串（如 `"https://x"`）会被误截。这对本类判据无害 ——
+/// 它们找的都是 `foo(` / `bar::baz` 这类标识符形态，不是 URL；
+/// 而要真去解析 Rust 词法，这个helper 的复杂度会超过它守护的东西。
+#[cfg(test)]
+pub(crate) fn production_code_only(src: &str) -> String {
+    production_slice(src)
+        .lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

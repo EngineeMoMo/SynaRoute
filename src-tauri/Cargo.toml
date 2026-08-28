@@ -81,6 +81,11 @@ parking_lot = "0.12"
 url = "2"
 # 作用域守卫：确保即使提前返回也执行清理代码（用于余额查询并发控制的标记清理）
 scopeguard = "1"
+# 代理监听 socket 要显式设 IPV6_V6ONLY（见 proxy_listen.rs 模块注释：Windows/macOS 默认 1、
+# Linux 默认 0，不设的话 Linux 上 v6 绑定会与 v4 撞 EADDRINUSE 并**静默**退化成 v4-only）。
+# tokio 不暴露这个选项。socket2 **本就在依赖树里**（tokio/hyper-util 间接引入，且只有一个
+# 版本），加直接依赖只多一条依赖边、零新增 crate —— 同 libc / security-framework-sys 的取舍。
+socket2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 # Windows DPAPI 免口令加密

@@ -74,9 +74,23 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
     let _ = writeln!(r, "- 配置文件：{}", store.config_path_display());
     let _ = writeln!(r, "- 日志目录：{}", store.effective_log_dir().display());
     let _ = writeln!(r, "- 丢弃日志条数（队列满/磁盘慢）：{}", store.log_dropped_count());
+    // 第二条丢日志路径，必须单独打。合成一个数字会让排障方向丢失（写得太慢 ≠ 压根写不了），
+    // 而**不打**它则让上面那行在盘满时读 0 —— 那是最坏的：日志正在丢而报告说没丢。
+    let _ = writeln!(
+        r,
+        "- 丢弃日志条数（打不开文件，如盘满/目录不可写）：{}",
+        crate::store::log_rotate::open_failed_line_count()
+    );
     // 状态推送也可能丢（队列满）。丢了不影响正确性——前端 30s 兜底轮询会追上——
     // 但「界面偶尔慢半拍」的排障线索就在这个数字里，必须能被问到。
     let _ = writeln!(r, "- 丢弃状态推送数（队列满）：{}", crate::events::dropped_count());
+    // 局域网被拒次数。事件按 IP 去重（防扫描器刷屏），故**只有这个数字**能回答
+    // 「有没有人在反复撞令牌」—— 打 1 次和打 50 万次在事件里长得一模一样。
+    // 只在非 0 时打：绝大多数用户压根没开局域网，多一行恒 0 的数字是噪音。
+    let denied = crate::proxy::lan_guard::denied_count();
+    if denied > 0 {
+        let _ = writeln!(r, "- 局域网请求被拒次数（未带正确令牌）：{denied}");
+    }
     let _ = writeln!(r);
 
     let _ = writeln!(r, "## 代理状态");
