@@ -79,6 +79,35 @@ fn active_model_lock_count(health: &HealthState, now: i64) -> usize {
     health.model_locks.values().filter(|l| l.until > now).count()
 }
 
+/// 「退避档位的记忆」在锁到期后还值得保留多久。超过即视为陈旧，可以扫掉。
+///
+/// 取 2× [`MODEL_LOCK_MAX_MS`]（1 小时）：锁窗最长 30 分钟，若一个模型在锁到期之后
+/// 又过了同样长的时间都没再失败过，那条 `fail_count` 表达的「它最近不太行」已经不成立。
+/// 取值偏大是刻意的 —— 扫早了会把退避档位打回第一档，
+/// 而那正是 [`decay_model_lock`] 注释里「成功即删」要避免的高频白打上游。
+const MODEL_LOCK_STALE_AFTER_MS: i64 = MODEL_LOCK_MAX_MS * 2;
+
+/// 扫掉**早已到期**的模型锁条目，返回扫掉几条。
+///
+/// 🔴 为什么需要它：条目只在「该模型成功一次」时才被 [`decay_model_lock`] 删除
+/// （减半到 0）。而一条「什么模型都 404」的 Key 上，用户每换一个模型名就多一条记录，
+/// **成功永远不会发生**，于是那些条目一条都不会被回收 —— 它们随
+/// `HealthState` 一起进 `config.json`，而健康态每次落盘都要整份序列化。
+/// 是单调增长的持久化状态，方向上永不自愈。
+///
+/// 判据刻意**不是**「到期就扫」：`fail_count` 是退避阶梯的记忆，
+/// 到期的下一秒就扫掉会让「每隔几分钟失败一次」的模型永远停在第一档 120s。
+/// 故只扫「到期且已过 [`MODEL_LOCK_STALE_AFTER_MS`]」的那些。
+///
+/// 对 [`model_lock_active`] 与 [`active_model_lock_count`] 都**无语义影响**：
+/// 两者只看 `until > now`，而被扫掉的条目早已不满足。
+fn sweep_stale_model_locks(h: &mut HealthState, now: i64) -> usize {
+    let before = h.model_locks.len();
+    h.model_locks
+        .retain(|_, l| l.until > now - MODEL_LOCK_STALE_AFTER_MS);
+    before - h.model_locks.len()
+}
+
 /// 把一次「上游明确表示这条 Key 不提供这个模型」计入**模型级**锁定。
 ///
 /// 与 [`record_live_failure`] 的差别是作用域：这里**绝不动** `fail_count` / `breaker_until`
@@ -98,6 +127,14 @@ pub fn record_model_unavailable(store: &Arc<Store>, key_id: &str, real_model: &s
     // 与 record_live_failure 同样走 mutate_health：read-modify-write 必须在同一个写锁内，
     // 否则并发下两次失败会读到同一份 fail_count 各自 +1 写回，退避档位失准。
     let _ = store.mutate_health(key_id, |h| {
+        // 顺手扫掉早已陈旧的条目。挂在这里而不是另起定时器：这是**唯一**会让这张表
+        // 变大的地方，判据天然对齐，且已经持有写锁（不额外加一次 read-modify-write）。
+        //
+        // 必须在 `entry()` 之前（之后扫会把刚插入的那条误伤 —— 它的 `until` 还是 0）。
+        // 这一条**不需要测试守**：`entry()` 借着 `h`，在它之后调 `sweep(h, ..)`
+        // 直接 E0499 编译不过。故顺序由借用检查器保证，写测试反而是把一条硬保证
+        // 降级成软保证（实测确认：把它挪到 entry() 之后，编译即失败）。
+        sweep_stale_model_locks(h, now);
         let entry = h
             .model_locks
             .entry(real_model.to_string())
@@ -1279,6 +1316,96 @@ mod tests {
              否则一条「什么都 404」的 Key 会永远赖在候选池首位"
         );
         assert!(!is_candidate(&h));
+    }
+
+    /// 🔴 **早已陈旧的模型锁必须被回收**，否则是单调增长的持久化状态。
+    ///
+    /// 条目只在「该模型成功一次」时才被 `decay_model_lock` 删掉。而一条「什么模型都 404」
+    /// 的 Key 上成功**永远不会发生** —— 用户每换一个模型名就多一条，全部随 `HealthState`
+    /// 进 `config.json`，而健康态每次落盘都整份序列化。方向上永不自愈。
+    ///
+    /// 判据同时钉住两个方向，缺一个这条就没意义：
+    /// - 早已陈旧的（超 `MODEL_LOCK_STALE_AFTER_MS`）必须被扫掉；
+    /// - **刚到期不久的必须留着** —— `fail_count` 是退避阶梯的记忆，扫早了会让
+    ///   「每隔几分钟失败一次」的模型永远停在第一档 120s，正是 `decay_model_lock`
+    ///   注释里「成功即删」要避免的高频白打上游。
+    #[test]
+    fn stale_model_locks_are_swept_but_recently_expired_ones_are_kept() {
+        let store = temp_store();
+        store.upsert_key(key("k")).unwrap();
+        let now = Utc::now().timestamp_millis();
+
+        let _ = store.mutate_health("k", |h| {
+            // 早已陈旧：到期时间在「now - 陈旧阈值」之前
+            h.model_locks.insert(
+                "ancient".into(),
+                crate::model::ModelLock {
+                    until: now - MODEL_LOCK_STALE_AFTER_MS - 60_000,
+                    fail_count: 4,
+                },
+            );
+            // 刚到期不久：退避记忆仍有价值
+            h.model_locks.insert(
+                "just-expired".into(),
+                crate::model::ModelLock { until: now - 60_000, fail_count: 3 },
+            );
+            true
+        });
+
+        // 触发一次记账（扫描挂在这里 —— 这是唯一会让表变大的地方）
+        record_model_unavailable(&store, "k", "fresh");
+
+        let h = store.get_key("k").unwrap().health;
+        assert!(
+            !h.model_locks.contains_key("ancient"),
+            "早已陈旧的条目必须被回收，否则 config.json 单调增长"
+        );
+        assert!(
+            h.model_locks.contains_key("just-expired"),
+            "刚到期的必须留着 —— 扫早了会把退避档位打回第一档"
+        );
+        assert_eq!(
+            h.model_locks["just-expired"].fail_count, 3,
+            "留下的条目不该被改动"
+        );
+        // 本次要锁的模型当然要在表里。这条是顺带确认，不是「扫描顺序」的判据 ——
+        // 那个顺序由借用检查器保证（把 sweep 挪到 entry() 之后是 E0499，编译不过）。
+        assert!(h.model_locks.contains_key("fresh"), "本次要锁的模型必须在表里");
+        assert!(h.model_locks["fresh"].until > now, "新锁应当生效");
+    }
+
+    /// 扫描**不得**改变升级阀门的结论。
+    ///
+    /// 两者的口径必须保持独立：阀门只数 `until > now`，而扫描只删「到期且已很久」的。
+    /// 若哪天把扫描判据放宽成「到期就删」，这条会连同上面那条一起变红。
+    #[test]
+    fn sweeping_does_not_change_the_escalation_verdict() {
+        let now = Utc::now().timestamp_millis();
+        let mut h = HealthState::default();
+        for (name, until) in [
+            ("live1", now + 60_000),
+            ("live2", now + 60_000),
+            // ⚠️ 这条**必须在**：没有它，把判据放宽成「到期就删」时本条测试照样绿
+            // （活锁计数确实没变），而上面那条注释声称的「会一起变红」就是句假话。
+            // 写这条测试时第一版正是这样，靠故障注入 B 才发现。
+            ("just-expired", now - 60_000),
+            ("ancient", now - MODEL_LOCK_STALE_AFTER_MS - 1),
+        ] {
+            h.model_locks
+                .insert(name.into(), crate::model::ModelLock { until, fail_count: 1 });
+        }
+        let before = active_model_lock_count(&h, now);
+        let swept = sweep_stale_model_locks(&mut h, now);
+        assert_eq!(swept, 1, "只该扫掉那条陈旧的（刚到期的不算）");
+        assert!(
+            h.model_locks.contains_key("just-expired"),
+            "刚到期的条目必须留着 —— 它的 fail_count 是退避阶梯的记忆"
+        );
+        assert_eq!(
+            active_model_lock_count(&h, now),
+            before,
+            "活锁计数不得因扫描而变化 —— 变了说明扫到了仍生效的条目"
+        );
     }
 
     /// 升级阀门只数**仍然生效**的锁，不数已过期的残留条目。

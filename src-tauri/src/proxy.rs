@@ -19,15 +19,14 @@ use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 /// 响应体类型：可能是完整缓冲体（Full）或流式体（StreamBody），统一装箱为 BoxBody。
 /// 流式路径用于同协议 SSE 透传（stream:true），缓冲路径用于非流式 / 跨协议。
 #[path = "lan_guard.rs"] pub(crate) mod lan_guard; // 入站鉴权；来由见该文件模块注释
 #[path = "custom_headers.rs"] pub(crate) mod custom_headers; // headers_json 接线 + 保留字段判据
+#[path = "proxy_listen.rs"] pub(crate) mod proxy_listen; // 粘滞端口 + 双栈绑定；来由见该文件模块注释
 pub(crate) type ResBody = BoxBody<Bytes, std::io::Error>;
 
 /// 把完整字节体装箱为 ResBody（Full 的错误类型是 Infallible，用 `match` 消解）。
@@ -290,39 +289,19 @@ impl ProxyManager {
         }
         let settings = self.store.get_settings();
         let lan = settings.lan_exposure;
-        let host = if lan { [0, 0, 0, 0] } else { [127, 0, 0, 1] };
         if lan { lan_guard::ensure_token(&self.store); } // 先备好令牌+落事件，否则用户看不到它
 
-        // 粘滞固定端口：首选端口取配置里该分类的值（缺省用分类表里的 default_port）。
-        // 从首选端口起在 [preferred, preferred+FALLBACK_RANGE] 内逐个尝试，绑上即用；
-        // 全被占才报错提示改端口。避免早期「bind 0 随机端口」导致每次重启端口漂移、
-        // 客户端追不上（config 只在客户端启动时读一次）。
+        // 粘滞固定端口 + 双栈绑定，判据都在 `proxy_listen`（含「为什么 v6 必须 only_v6」）。
+        // 端口粘滞的理由：客户端配置只在它自己启动时读一次，端口漂移会让它追不上。
         let preferred = settings
             .proxy_ports
             .get(&category)
             .copied()
             .unwrap_or(category.meta().default_port);
-        let end = preferred.saturating_add(PROXY_PORT_FALLBACK_RANGE);
-        let mut listener = None;
-        let mut last_err = String::new();
-        for candidate in preferred..=end {
-            match TcpListener::bind(SocketAddr::from((host, candidate))).await {
-                Ok(l) => {
-                    listener = Some(l);
-                    break;
-                }
-                Err(e) => last_err = format!("{candidate}: {e}"),
-            }
-        }
-        let listener = listener.ok_or_else(|| {
-            AppError::Proxy(format!(
-                "端口 {preferred}~{end} 全部被占用（最后错误 {last_err}）。请在设置里换一个端口。"
-            ))
-        })?;
-        let port = listener
-            .local_addr()
-            .map_err(|e| AppError::Proxy(e.to_string()))?
-            .port();
+        let bound = proxy_listen::bind_sticky(lan, preferred, PROXY_PORT_FALLBACK_RANGE)
+            .await
+            .map_err(AppError::Proxy)?;
+        let port = bound.port;
         // 端口粘滞：实际绑定端口若与首选不同（回退了），写回配置作为下次首选，避免每次都回退漂移。
         if settings.proxy_ports.get(&category).copied() != Some(port) {
             let _ = self.store.set_proxy_port(category, port);
@@ -337,7 +316,7 @@ impl ProxyManager {
             let mut loop_shutdown = accept_shutdown;
             loop {
                 tokio::select! {
-                    accepted = listener.accept() => {
+                    accepted = proxy_listen::accept_either(&bound) => {
                         // peer 是局域网鉴权的唯一依据，**别再丢回 `_`** —— 丢了就只能放行所有人。
                         let Ok((stream, peer)) = accepted else { break };
                         let io = TokioIo::new(stream);
@@ -3129,6 +3108,9 @@ mod tests {
     use super::*;
     // 生产段已改走 lan_guard::guarded（那层负责鉴权），故 service_fn 只剩测试在用。
     use hyper::service::service_fn;
+    // 同理：生产段的端口绑定已收进 proxy_listen，这两个只剩测试在用（各处自己起临时监听）。
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
     use crate::model::UserPrefs;
     use crate::model::{CategoryType, HealthState, KeyParams, Protocol, ProviderKey};
     use crate::store::Store;

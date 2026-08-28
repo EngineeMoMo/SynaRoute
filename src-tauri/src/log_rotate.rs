@@ -33,6 +33,52 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// 因**打不开日志文件**而丢掉的行数。
+///
+/// 🔴 这是第二条丢日志路径，而它此前**不计数**：`Store::append_log_line` 的 `try_send`
+/// 队列满会计进 `log_dropped`，但写线程里 `OpenLog::open` 失败时走的是
+/// `open = None; continue;` —— 那一行直接没了。
+///
+/// 危害不在丢几行，而在**诊断报告把 `log_dropped_count` 当成「是否丢过日志」的权威答案**
+/// 打印出来。于是盘满 / 目录不可写时，日志在丢而那个数字读 0 ——
+/// 属本仓自己那套分类里的「界面撒谎」，且排障时会把人引向完全错误的方向
+/// （「日志没丢，那就是没记？」）。
+///
+/// 放在本模块而不是 `Store` 里：写线程是 `spawn_log_writer` 里的静态闭包、拿不到 `&self`，
+/// 而 `store.rs` 的棘轮余量是 0。进程级 static 与 `log_dropped` 的
+/// 「每进程一个 Store」语义一致。
+static OPEN_FAILED_LINES: AtomicU64 = AtomicU64::new(0);
+
+/// 记一次「因打不开文件而丢行」。**由写线程在 `OpenLog::open` 失败时调用。**
+///
+/// 调用点那一行没有注释，理由写在这里 —— `store.rs` 的棘轮余量是 0，而本文件有余量。
+/// 那个分支原本只 `tracing::warn!` 一句就 `continue`，**那一行日志就此无声消失**：
+/// 危害不在丢几行，而在诊断报告只打 `log_dropped_count` 一个数字，
+/// 用户与排障者都拿它当「是否丢过日志」的答案 —— 盘满时它读 0 而日志正在丢。
+///
+/// 告警按量级点发（1/100/200…），同 `Store::append_log_line` 的取舍 ——
+/// 磁盘僵死时告警本身不能变成刷屏源。原来那句 `warn!` 已并入这里，故调用点不必再打。
+pub(crate) fn note_open_failed_line() {
+    let n = OPEN_FAILED_LINES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 100 == 0 {
+        tracing::warn!("打开日志文件失败，累计丢弃 {n} 条（磁盘可能已满或目录不可写）");
+    }
+}
+
+/// 因打不开日志文件而丢掉的行数。诊断报告**单独打一行**，不与
+/// `Store::log_dropped_count`（队列满）相加。
+///
+/// 分开的两个理由：
+/// - 成因与处置都不同 —— 写得太慢（等等看）vs 压根写不了（去看磁盘和权限）。
+///   合成一个数字会让排障的人拿不到方向。
+/// - 本计数是**进程级** static（写线程拿不到 `&Store`），而 `log_dropped` 是每 Store 一份。
+///   并进去会让「本 Store 没丢过日志」这类断言被同进程其它测试污染 ——
+///   本仓 `flush_logs_drains_the_queue` 当场就红了（加这条时实际踩到）。
+pub(crate) fn open_failed_line_count() -> u64 {
+    OPEN_FAILED_LINES.load(Ordering::Relaxed)
+}
 
 /// 单个日志文件的字节上限。超过即滚到下一个序号。
 ///
@@ -113,6 +159,8 @@ pub(crate) struct OpenLog {
     /// 已写字节数。**以 append 打开时的文件实际长度为起点**，不是从 0 起 ——
     /// 否则重启一次就把上限重置了，而「重启后继续写同一个文件」正是常态。
     size: u64,
+    /// 是否已经放弃滚动（见 [`Self::give_up_rolling`]）。只为「告警发一次」服务。
+    roll_failed: bool,
     w: BufWriter<File>,
 }
 
@@ -132,7 +180,7 @@ impl OpenLog {
         let path = dir.join(file_name(&date, idx));
         let f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
         let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-        Ok(Self { dir, date, idx, size, w: BufWriter::new(f) })
+        Ok(Self { dir, date, idx, size, roll_failed: false, w: BufWriter::new(f) })
     }
 
     /// 写一行（含换行）。必要时先滚动到下一个文件。
@@ -158,11 +206,23 @@ impl OpenLog {
     ///
     /// 全程 best-effort：滚不动就继续写当前文件（宁可超出上限，也不能让写日志
     /// 把转发流程搞挂）。同 `cleanup_old_logs_in` 的取舍。
+    ///
+    /// 🔴 **滚不动时必须让 `size` 退出「已达上限」状态**，否则每写一行都会再进来一次
+    /// —— 而本函数开头就是 `existing_indices()` → `read_dir`。开着请求日志的转发热路径上
+    /// 那是**每条日志一次目录扫描**。
+    ///
+    /// 讽刺的地方在于触发条件：`open` 失败最典型的成因就是**盘满**，
+    /// 而盘满正是本模块存在的理由。也就是说不处理这条，本模块会在它要解决的那个场景里
+    /// 变成性能悬崖。故失败时把 `size` 归零并只告警一次 —— 语义是「这个文件不再受
+    /// 上限约束」，宁可超出上限（盘满时本来也写不进去）也不做无用的重试。
     fn roll(&mut self) {
         let _ = self.w.flush();
         let next = self.idx + 1;
         let Ok(date) = chrono::NaiveDate::parse_from_str(&self.date, "%Y-%m-%d") else {
-            return; // 日期形态不对（不该发生）：不滚，继续写当前文件
+            // 日期形态不对（不该发生）：不滚，继续写当前文件。
+            // 同下面 open 失败那条 —— 必须退出「已达上限」状态，否则每行重试一次。
+            self.give_up_rolling("日志文件名里的日期解析失败");
+            return;
         };
 
         // 越过当天配额 → 删最旧的，保最近的（滑窗）。
@@ -204,7 +264,26 @@ impl OpenLog {
                 self.w = BufWriter::new(f);
                 tracing::info!("日志文件已滚动到 {}", path.display());
             }
-            Err(e) => tracing::warn!("滚动日志文件到 {} 失败: {e}", path.display()),
+            Err(e) => {
+                self.give_up_rolling(&format!("打开 {} 失败: {e}", path.display()));
+            }
+        }
+    }
+
+    /// 放弃滚动：把 `size` 退出「已达上限」状态，继续写当前文件。
+    ///
+    /// 见 [`Self::roll`] 的说明 —— 不归零的话每写一行都会重扫一次目录。
+    /// 告警只发一次（`roll_failed`），否则盘满时告警本身就是刷屏源
+    /// （同 `append_log_line` 里按量级点告警的取舍）。
+    fn give_up_rolling(&mut self, why: &str) {
+        self.size = 0;
+        if !self.roll_failed {
+            self.roll_failed = true;
+            tracing::warn!(
+                "日志滚动失败（{why}）：已放弃对 {} 的体积限制，将继续写入当前文件。\
+                 常见成因是磁盘已满或目录不可写。",
+                self.dir.display()
+            );
         }
     }
 
@@ -414,6 +493,90 @@ mod tests {
         assert!(left.contains(&"2026-08-27.jsonl".to_string()), "今天的第 0 个还在配额内");
         assert!(left.contains(&"2026-08-27.1.jsonl".to_string()));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 🔴 **滚不动时必须退出「已达上限」状态**，否则每写一行都重扫一次目录。
+    ///
+    /// 判据不看日志、不看耗时（两者都不稳），而是看 `size` 这个决定性的内部状态：
+    /// 只要它仍 ≥ 上限，`write_line` 下一次就必然再进 `roll()` → `existing_indices()`
+    /// → `read_dir`。开着请求日志的转发热路径上那是每条日志一次目录扫描，
+    /// 而触发条件（盘满 / 目录不可写）**正是本模块存在的理由**。
+    ///
+    /// 造「滚不动」的手法：把日期设成解析不出来的形态。它走的是 `roll()` 里
+    /// 第一个 `return` 分支，与 `open` 失败那条共用 `give_up_rolling`
+    /// —— 用它是因为「让 OpenOptions::open 确定性失败」在各平台上手法不一致
+    /// （Windows 上目录占名、只读属性、句柄独占各有差异），而这条分支稳定可控。
+    #[test]
+    fn giving_up_on_a_roll_stops_rescanning_the_directory_every_line() {
+        let dir = tmp("roll_giveup");
+        let mut log = OpenLog::open(dir.clone(), "2026-08-27".into()).unwrap();
+        // 日期形态不对 → roll() 走不下去
+        log.date = "not-a-date".into();
+        log.size = FILE_MAX_BYTES;
+
+        log.write_line("first-after-cap".into());
+        assert_eq!(
+            log.size,
+            "first-after-cap\n".len() as u64,
+            "滚不动后 size 必须已退出「已达上限」状态（否则下一行又扫一次目录）"
+        );
+        assert!(log.roll_failed, "应记下已放弃，供告警只发一次");
+
+        // 再写几行都不该再触发滚动尝试（size 远低于上限）
+        for _ in 0..3 {
+            log.write_line("more".into());
+        }
+        assert!(log.size < FILE_MAX_BYTES);
+        log.flush();
+        // 内容仍完整落在当前文件里 —— 放弃滚动不等于放弃写入。
+        let s = std::fs::read_to_string(dir.join("2026-08-27.jsonl")).unwrap();
+        assert!(s.contains("first-after-cap") && s.contains("more"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 🔴 **打不开日志文件而丢掉的行必须被计数。**
+    ///
+    /// 这是第二条丢日志路径，此前不计数：`append_log_line` 的 `try_send` 队列满会计
+    /// `log_dropped`，而写线程里 `OpenLog::open` 失败时 `open = None; continue;`
+    /// —— 那一行无声消失。
+    ///
+    /// 危害不在丢几行，而在**诊断报告把 `log_dropped_count` 当权威答案打印**：
+    /// 盘满时它读 0 而日志正在丢，排障的人会得出「日志没丢」这个反向结论。
+    #[test]
+    fn lines_dropped_because_the_file_could_not_be_opened_are_counted() {
+        let before = open_failed_line_count();
+        note_open_failed_line();
+        note_open_failed_line();
+        assert_eq!(
+            open_failed_line_count(),
+            before + 2,
+            "打不开文件丢掉的行必须计数，否则诊断报告会在盘满时报 0"
+        );
+    }
+
+    /// 🔴 **接线判据**：这条计数必须真的被写线程喂、并真的出现在诊断报告里。
+    ///
+    /// 上面那条只验证了计数器自己会加。而「加了但没人调」或「调了但报告不打」
+    /// 照样让排障者以为没丢过日志 —— 同本仓反复踩的那类接线盲区
+    /// （单元覆盖了组件 ≠ 覆盖了调用它的那条线）。
+    ///
+    /// ⚠️ 判据刻意**不要求**它并进 `log_dropped_count`：那两条成因与处置都不同
+    /// （写得太慢 vs 压根写不了），合成一个数字会让排障拿不到方向。
+    /// 且并进去会让进程级 static 污染「本 Store 没丢过日志」这类断言 ——
+    /// `flush_logs_drains_the_queue` 当场就红了（加这条时实际踩到）。
+    #[test]
+    fn the_open_failure_count_is_fed_by_the_writer_and_shown_in_diagnostics() {
+        let store_src = crate::proxy::custom_headers::production_slice(include_str!("store.rs"));
+        assert!(
+            store_src.contains("log_rotate::note_open_failed_line()"),
+            "写线程 open 失败分支必须调 note_open_failed_line，否则计数恒 0"
+        );
+        let diag_src =
+            crate::proxy::custom_headers::production_slice(include_str!("diagnostics.rs"));
+        assert!(
+            diag_src.contains("open_failed_line_count()"),
+            "诊断报告必须打这个数字 —— 不打的话「是否丢过日志」在盘满时答错"
+        );
     }
 
     /// 🔴 **接线判据**：写线程必须真的走 [`OpenLog`]，而不是自己开文件裸写。

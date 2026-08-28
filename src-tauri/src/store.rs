@@ -757,7 +757,7 @@ impl Store {
         }
     }
 
-    /// 已丢弃的日志条数（可观测性：静默丢日志是本项目最忌讳的形态，必须能被问到）。
+    /// 因**队列满**丢弃的日志条数。另一条路径见 [`log_rotate::open_failed_line_count`]。
     pub fn log_dropped_count(&self) -> u64 {
         self.log_dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -834,8 +834,8 @@ impl Store {
                                 cleanup_old_logs_in(&dir);
                                 match log_rotate::OpenLog::open(dir.clone(), date.clone()) {
                                     Ok(o) => open = Some(o),
-                                    Err(e) => {
-                                        tracing::warn!("打开日志文件失败: {e}");
+                                    Err(_) => {
+                                        log_rotate::note_open_failed_line();
                                         open = None;
                                         continue;
                                     }
