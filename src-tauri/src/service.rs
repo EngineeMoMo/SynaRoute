@@ -97,7 +97,7 @@ pub(crate) async fn apply_tool_config(
     let endpoint = format!("http://127.0.0.1:{port}");
     // 三端写入字段语义不同（禁止混写）：
     // - Claude CLI：取首个写 env.ANTHROPIC_MODEL + 顶层 model（对外名；策略 A 不写 DEFAULT_*）
-    // - Codex：取首个写 config.toml 的 model（OpenAI 形态，无 ANTHROPIC_*）
+    // - Codex：整份写进 model_catalog_json 那份模型目录；顶层 model 仅在缺失/不可服务时才写
     // - 桌面端：整份写进 gateway 档的 inferenceModels（3p 部署模式）
     let keys = store.enabled_keys_sorted(category);
     let models = crate::proxy::discoverable_models(&keys);
@@ -1475,6 +1475,7 @@ pub(crate) mod tests {
             protocol: Protocol::Anthropic,
             has_secret: true,
             enabled: true,
+            allow_in_aggregate: false,
             priority: 0,
             headers_json: None,
             params: KeyParams::default(),

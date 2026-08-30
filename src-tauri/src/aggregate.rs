@@ -1406,8 +1406,8 @@ async fn gather_members(
                 };
             };
             let label = format!("{} / {}", key.name, model);
-            // 禁用的 Key 不参与聚合（此前遗漏此判断，导致禁用 Key 仍被调用）。
-            if !key.enabled {
+            // 禁用**且未开「允许大脑聚合使用」**的 Key 不参与聚合（那条开关的语义就是「不进路由池但可参与聚合」）。
+            if !key.enabled && !key.allow_in_aggregate {
                 return MemberOutcome::SkippedDisabled { label };
             }
             // 大脑聚合：成员固定 Key，不做故障转移换 Key。
@@ -1639,7 +1639,7 @@ async fn gather_members(
                     category,
                     "aggregate",
                     None,
-                    &format!("参与者已禁用，跳过 · {label}（在分类页重新启用后才会参与聚合）"),
+                    &format!("参与者已禁用，跳过 · {label}（在分类页重新启用，或在该 Key 的卡片上勾选「允许大脑聚合使用」）"),
                 );
             }
         }
@@ -1965,15 +1965,15 @@ async fn call_ref(
     let key = store
         .get_key(key_id)
         .ok_or_else(|| AppError::NotFound(key_id.into()))?;
-    // 禁用的 Key 不发任何请求：用户禁用常因欠费/出问题（想止损），而决策者请求
-    // 内嵌全部成员答案、是整轮最重的一笔。成员路径早已跳过禁用 Key（gather_members
-    // 注释自认「此前遗漏此判断」是缺陷），这里必须同口径 —— 否则用户在 Key 页禁用
-    // 决策者后聚合照常烧它的额度，界面日志无任何提示，正是最忌讳的静默失效。
-    // 错误文案点明去哪修（换决策者/汇总者，或重新启用该 Key）。
-    if !key.enabled {
+    // 禁用**且未开「允许大脑聚合使用」**的 Key 不发任何请求：用户禁用常因欠费/出问题
+    // （想止损），而决策者请求内嵌全部成员答案、是整轮最重的一笔。判据与 gather_members 同口径
+    // —— 否则用户在 Key 页禁用决策者后聚合照常烧它的额度，界面日志无任何提示，正是最忌讳的
+    // 静默失效。文案点明三条出路（含那条开关）：只说「已禁用」会把人送去做无效操作。
+    if !key.enabled && !key.allow_in_aggregate {
         return Err(AppError::Invalid(format!(
             "Key「{}」已被禁用，无法作为决策者/汇总者调用。\
-             请到「大脑聚合」页换一条启用中的 Key，或到分类页重新启用它。",
+             三条出路：换一条启用中的 Key、到分类页重新启用它，\
+             或在分类页那条 Key 的卡片上勾选「允许大脑聚合使用」（只在已禁用时显示，语义是「不进路由池但可参与聚合」）。",
             key.name
         )));
     }
@@ -2774,6 +2774,7 @@ mod tests {
             protocol: Protocol::Anthropic,
             has_secret: true,
             enabled: true,
+            allow_in_aggregate: false,
             priority: 0,
             headers_json: None,
             params: crate::model::KeyParams::default(),
@@ -2799,6 +2800,64 @@ mod tests {
             icon: None,
             health: crate::model::HealthState::default(),
         }
+    }
+
+    /// 🔴 「允许大脑聚合使用」的两侧语义 —— 此前**整个新字段零测试覆盖**，
+    /// 把判据改回裸 `!key.enabled` 全套 926 条照样全绿。
+    ///
+    /// 语义：`enabled` 管「进不进故障转移池」，而聚合**不走故障转移**（成员固定 Key）。
+    /// 用户禁用一条 Key 常常正是因为它的模型名与主 Key 不重叠、进池会让故障转移 404，
+    /// 而那条 Key 本身是好的、有额度的。
+    #[tokio::test]
+    async fn a_disabled_key_can_still_be_a_decider_when_allowed_in_aggregate() {
+        let (store, dir) = crate::service::tests::temp_store("agg_allow");
+
+        // ① 禁用 + 未开开关 → 必须拒，且文案要指向那个勾选框（不能只说「重新启用」，
+        //    重新启用会把当初禁用它的那个 404 带回主链路）。
+        let mut k = test_key("http://127.0.0.1:1");
+        k.enabled = false;
+        store.upsert_key(k.clone()).unwrap();
+        let err = call_ref(&store, "k1::claude-sonnet-4-5", "hi", 5_000)
+            .await
+            .expect_err("禁用且未开允许聚合的 Key 不该被调用");
+        let msg = err.to_string();
+        assert!(msg.contains("已被禁用"), "{msg}");
+        assert!(
+            msg.contains("允许大脑聚合使用") && msg.contains("卡片"),
+            "报错必须指向真正能改那个开关的界面：{msg}"
+        );
+
+        // ② 禁用 + 开了开关 → 不该再被这道门挡住（后面会因连不上上游而失败，那是另一回事）。
+        k.allow_in_aggregate = true;
+        store.upsert_key(k).unwrap();
+        let out = call_ref(&store, "k1::claude-sonnet-4-5", "hi", 5_000).await;
+        if let Err(e) = &out {
+            let m = e.to_string();
+            assert!(
+                !m.contains("已被禁用"),
+                "开了「允许大脑聚合使用」就不该再被禁用门挡住：{m}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 🔴 成员路径与决策者/汇总者路径必须**同一个判据**。
+    ///
+    /// 上面那条只覆盖 `call_ref`（决策者/汇总者）。成员路径在 `gather_members` 里，
+    /// 要真跑一轮才走到，故这里用源码级判据钉住「两处都是 `!enabled && !allow_in_aggregate`」
+    /// —— 分叉的表现是静默的：开关在一侧生效、另一侧照旧跳过，而用户只看到
+    /// 「结果面板少一位专家」。
+    #[test]
+    fn both_aggregate_gates_use_the_same_predicate() {
+        let src = std::fs::read_to_string("src/aggregate.rs").unwrap();
+        let prod = crate::proxy::custom_headers::production_code_only(&src);
+        assert_eq!(
+            prod.matches("!key.enabled && !key.allow_in_aggregate").count(),
+            2,
+            "成员（gather_members）与决策者/汇总者（call_ref）两道门必须同口径，\
+             且只该有这两处"
+        );
     }
 
     /// 建一个带一个源文件的临时工作目录 + 对应的 ToolEnv。

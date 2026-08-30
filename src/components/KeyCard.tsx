@@ -7,6 +7,7 @@ import { Tooltip } from "@/components/ui/Tooltip";
 import { HealthBadge } from "@/components/HealthBadge";
 import { BrandIcon } from "@/components/BrandIcon";
 import { type ProviderKey, protocolLabel } from "@/types";
+import { api } from "@/lib/bridge";
 import { useStore } from "@/store";
 import { formatRelativeTime } from "@/lib/utils";
 import { balanceFingerprint, formatBalanceAmount, usedPercent } from "@/lib/balance";
@@ -45,6 +46,7 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast,
   const toggleKey = useStore((s) => s.toggleKey);
   const deleteKey = useStore((s) => s.deleteKey);
   const checkHealth = useStore((s) => s.checkHealth);
+  const loadCategory = useStore((s) => s.loadCategory);
   const moveKey = useStore((s) => s.moveKey);
   const setPrimaryKey = useStore((s) => s.setPrimaryKey);
   const vendors = useStore((s) => s.vendors);
@@ -79,16 +81,22 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast,
   // 而不是继续显示旧配置查出来的那条错误（看着像「改了没生效」）。
   const fingerprint = balanceFingerprint(k);
 
+  // 「能不能自动打上游」的口径：启用中，**或**已勾选「允许大脑聚合使用」。
+  // 后者不是顺手加的 —— 那样的 Key 正在被聚合真实调用、正在烧额度，而余额显示存在的
+  // 全部意义就是别让用户看着一个过期数字。原先只认 `enabled` 的理由（「禁用常因欠费/
+  // 出问题，自动请求既烧额度又可能触发限流」）在这条 Key 上已经不成立：它本来就在被打。
+  // ⚠️ 健康探测仍只对 `enabled` 发（后端口径，本轮不动）—— 故这类 Key 的健康状态会停在
+  // 「未知」。那是已知的不对称，写在这里免得下一个人以为是 bug。
+  const canAutoQuery = k.enabled || !!k.allowInAggregate;
+
   React.useEffect(() => {
-    // `k.enabled` 门：已禁用的 Key **不自动**打上游（用户禁用常因欠费/出问题，自动请求
-    // 既烧额度又可能触发限流；健康探测对禁用 Key 同样不发，这里保持同一约定）。
     // 手动点刷新按钮不受此门限制 —— 用户主动要看时仍可查。
-    if (!balanceEnabled || !k.enabled) return;
+    if (!balanceEnabled || !canAutoQuery) return;
     // 是否真的发请求由 store 判定（指纹 + TTL + 并发去重），这里只管声明「该有值」。
     // 判定逻辑放 store 而不是这里，是因为 StrictMode 下本 effect 会跑两次，
     // 只有在 store 里同步读写那面旗才拦得住重复请求。
     void refreshBalance(k.id, fingerprint);
-  }, [k.id, balanceEnabled, k.enabled, fingerprint, refreshBalance]);
+  }, [k.id, balanceEnabled, canAutoQuery, fingerprint, refreshBalance]);
 
   /**
    * 余额自动轮询（对齐 cc-switch 的 `autoQueryInterval`）。
@@ -102,8 +110,11 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast,
    * 2. **`force: false`**：仍然过 store 的指纹 + TTL 判定。轮询只是「到点了去问一下」，
    *    真正要不要打上游由 store 决定 —— 否则用户把间隔设成 1 分钟就是每分钟一次真实上游
    *    请求，而余额几乎不会那么快变。
-   * 3. **窗口不可见时停表**（`usePolling` 自带）：余额查询打的是真实上游、消耗额度，
-   *    最小化到托盘后还在后台定时烧额度是用户不会预期的。
+   * 3. **窗口不可见时前台停表**（`usePolling` 自带）：余额查询打的是真实上游、消耗额度。
+   *    ⚠️ 这条**不再等于「最小化到托盘后一次都不查」** —— 2026-08-30 起后端的余额闸门
+   *    （`health::balance_gate`）会为**代理运行中的分类**在后台按同一间隔刷新，因为路由要用
+   *    新鲜值判「这条 Key 是不是已经欠费」。它同样尊重 `0 = 不自动查`，所以那个设置仍然是
+   *    「一个字节都不往上游发」的总开关。
    */
   const autoIntervalMs = React.useMemo(() => {
     const min = k.balanceQuery?.autoIntervalMin ?? 0;
@@ -119,7 +130,7 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast,
     // 网络往返远小于它），奇数次 tick 正常放行。后端缓存同样留了 10% 余量（get_balance_cache）。
     () => void refreshBalance(k.id, fingerprint, false, autoIntervalMs * 0.9),
     autoIntervalMs,
-    balanceEnabled && k.enabled,
+    balanceEnabled && canAutoQuery,
   );
 
   const balance = balanceEntry?.result;
@@ -361,6 +372,38 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast,
             onCheckedChange={(v) => void toggleKey(k.id, v)}
             aria-label={t("key.enableAria")}
           />
+          {/* 🔴 只在「已禁用」时出现的第二个开关：`enabled` 管「进不进故障转移池」，而
+              大脑聚合**不走故障转移**（按 keyId::model 精确调用）。用户禁用一条 Key 常常
+              正是因为它的模型名与主 Key 不重叠、进池会让故障转移 404 —— 那条 Key 本身
+              是好的、有额度的。开了它，聚合的成员/决策者/汇总者列表里就能选到它。
+              启用状态下不显示：那时它本来就能参与，多一个开关只会让人以为有从属关系。
+              🔴 走**专用 IPC** 而不是 upsertKey：后者是整份替换，只沿用库里的 health 与
+              cachedBalance 两项，会把后端刚探测到的余额端点顶回旧值。理由全文见
+              `store/key_flags.rs`；`tests/allowInAggregateWrite.test.ts` 钉住这一行。 */}
+          {!k.enabled && (
+            <label className="flex cursor-pointer items-center gap-1.5 text-[11px] text-text-muted">
+              <input
+                type="checkbox"
+                checked={!!k.allowInAggregate}
+                onChange={async (e) => {
+                  // 🔴 失败必须可见。本文件其余写操作都走 store action，而那些 action 一律
+                  // 「回滚 + 弹 toast，禁止静默吞掉」（见 store.ts `toggleKey` 的注释）。
+                  // 这里直调 IPC，同一条纪律就得自己兑现 —— 否则表现是「勾了一下、
+                  // 什么也没发生」：勾选态由 `k.allowInAggregate` 驱动，重载后自己弹回去，
+                  // 而用户拿不到任何线索（主口令锁定、落盘失败都会走到这里）。
+                  try {
+                    await api.setKeyAllowInAggregate(k.id, e.target.checked);
+                  } catch (err) {
+                    showToast("error", String((err as Error)?.message ?? err));
+                    return;
+                  }
+                  await loadCategory(k.categoryId);
+                }}
+                className="h-3.5 w-3.5 accent-primary"
+              />
+              {t("key.allowInAggregate")}
+            </label>
+          )}
           {confirmingDelete ? (
             <div className="flex items-center gap-1">
               <Button

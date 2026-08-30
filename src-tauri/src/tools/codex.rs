@@ -55,6 +55,10 @@ use crate::error::{AppError, AppResult};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+#[path = "codex_catalog.rs"]
+pub(crate) mod codex_catalog;
+pub(crate) use codex_catalog::select_model; // 应用内选 Codex 模型；两个调用点在 lib.rs
+
 use super::{
     backup_and_write_bytes, prerestore_path_for, read_preview_text, with_rollback,
     MCP_CLIENT_NAME, PROXY_PLACEHOLDER,
@@ -112,15 +116,21 @@ pub(super) fn auth_path() -> AppResult<PathBuf> {
 // 接入
 // ---------------------------------------------------------------------------
 
-/// 写入 Codex 接入配置：`config.toml` + `auth.json`（后者仅在必要时，见 [`apply_auth_at`]）。
-pub(super) fn apply(endpoint: &str, default_model: Option<&str>) -> AppResult<String> {
+/// 写入 Codex 接入配置：`config.toml` + 模型目录 + `auth.json`（后者仅在必要时，见 [`apply_auth_at`]）。
+pub(super) fn apply(
+    endpoint: &str,
+    models: &[String],
+    keys: &[crate::model::ProviderKey],
+) -> AppResult<String> {
     let path = config_path()?;
     let auth = auth_path()?;
-    // 两条路径都进 with_rollback。副文件（`.bak` / `.synaroute-created`）由 `with_rollback`
+    // 目录文件也进回滚集：指针与文件必须同进同退，写了指针而文件不在会让 Codex 启动即报错。
+    let catalog = codex_catalog::catalog_path()?;
+    // 三条路径都进 with_rollback。副文件（`.bak` / `.synaroute-created`）由 `with_rollback`
     // 自己按主路径推导后一并纳入快照 —— 漏了它们会造成数据丢失级后果，
     // 判据见 tools.rs 里 `with_rollback` 的文档。
-    with_rollback(&[path.clone(), auth.clone()], || {
-        let msg = apply_at(&path, endpoint, default_model)?;
+    with_rollback(&[path.clone(), auth.clone(), catalog.clone()], || {
+        let msg = apply_at(&path, endpoint, models, keys, &catalog)?;
 
         // **写完立刻读回校验**，且校验的是「身份」不是「存在」（见 `is_intact`）。
         //
@@ -351,7 +361,9 @@ fn expected_base_url(endpoint: &str) -> String {
 pub(super) fn apply_at(
     path: &Path,
     endpoint: &str,
-    default_model: Option<&str>,
+    models: &[String],
+    keys: &[crate::model::ProviderKey],
+    catalog_file: &Path,
 ) -> AppResult<String> {
     let content = if path.exists() {
         std::fs::read_to_string(path)?
@@ -377,11 +389,9 @@ pub(super) fn apply_at(
         toml::Value::String(MCP_CLIENT_NAME.to_string()),
     );
 
-    // 默认模型（借鉴 cc-switch）：写顶层 model，让 Codex 启动即有模型、无需 /model 手选。
-    // 解析不出时**不动**用户已有的 model 字段（避免清空）。
-    if let Some(m) = default_model.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        table.insert("model".to_string(), toml::Value::String(m.to_string()));
-    }
+    // 模型目录 + 顶层 `model` 的处理整段收在 `codex_catalog::wire_into`（它们是一件事，
+    // 且 codex.rs 的棘轮余量只有 35 行）。它决定「写不写指针」与「要不要覆盖已有的 model」。
+    codex_catalog::wire_into(table, models, keys, catalog_file)?;
 
     let providers = table
         .entry("model_providers".to_string())
@@ -407,11 +417,7 @@ pub(super) fn apply_at(
     let serialized =
         toml::to_string_pretty(&doc).map_err(|e| AppError::ToolConfig(e.to_string()))?;
     backup_and_write_bytes(path, serialized.as_bytes())?;
-    let model_note = default_model
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|m| format!("，默认模型={m}"))
-        .unwrap_or_default();
+    let model_note = codex_catalog::apply_note(models);
     Ok(format!(
         "已写入 Codex 配置：{}（model_provider={MCP_CLIENT_NAME}，base_url={base_url}，\
          wire_api=responses{model_note}）；转发鉴权走 provider 表的 bearer 占位，\
@@ -596,7 +602,16 @@ pub(super) fn is_intact(path: &Path, endpoint: &str) -> bool {
         .get("requires_openai_auth")
         .and_then(|b| b.as_bool())
         .unwrap_or(false);
-    url_ok && bearer_ok && auth_flag_ok
+    // 模型目录的指针：**只在它已经指向我们的文件时**要求那份文件真的存在。
+    // 指向用户自己的目录（或压根没指针）不影响完好性 —— 那是他的选择，我们不认领。
+    // 为什么要判「文件存在」：指针在而文件不在 = Codex 启动即报错，而那是最响亮也最难归因的
+    // 失效（用户刚在 SynaRoute 里点了接入，然后 Codex 起不来）。纳入完好性判据后，
+    // 漂移检测会报出来、下一次接入自动补回文件。
+    let catalog_ok = match doc.get("model_catalog_json").and_then(|v| v.as_str()) {
+        Some(p) if codex_catalog::pointer_is_ours(p) => Path::new(p).is_file(),
+        _ => true,
+    };
+    url_ok && bearer_ok && auth_flag_ok && catalog_ok
 }
 
 /// 漂移形态。文案按形态分支，因为**每种形态下 Codex 的实际行为不同**，
@@ -625,6 +640,9 @@ pub(super) enum DriftState {
     ProfileShadowed { profiles: Vec<String> },
     /// 顶层遗留 `profile = "..."` 老写法 → 当前 Codex **整份配置加载失败**。
     LegacyProfileKeyBreaksLoad { profile: String },
+    /// `model_catalog_json` 指向我们的目录文件，但那个文件不在了 → Codex **启动即报错**。
+    /// 优先级高于所有 provider 形态：那些顶多让请求走错地方，这一支是整个客户端起不来。
+    CatalogFileMissing { path: String },
 }
 
 /// 判定漂移形态。`applied` = 我们是否认为自己处于已接入态（由调用方按 `.bak`/运行态给出）。
@@ -658,6 +676,17 @@ pub(super) fn drift_state(
     let doc = std::fs::read_to_string(cfg_path)
         .ok()
         .and_then(|t| t.parse::<toml::Value>().ok());
+    // 目录文件缺失优先报：其余形态顶多让请求走错地方，这一支是 Codex 整个起不来。
+    // 不单独判一支的代价是落进 `OurTablePointsElsewhere`，而那句告警会说「我们的表指向别处」
+    // 并把**我们自己的**地址回显给用户 —— 指错方向的告警比没有告警更糟。
+    if let Some(p) = doc
+        .as_ref()
+        .and_then(|d| d.get("model_catalog_json"))
+        .and_then(|v| v.as_str())
+        .filter(|p| codex_catalog::pointer_is_ours(p) && !Path::new(p).is_file())
+    {
+        return DriftState::CatalogFileMissing { path: p.to_string() };
+    }
     let selected = doc
         .as_ref()
         .and_then(|d| d.get("model_provider"))
@@ -777,6 +806,8 @@ pub(super) fn drift_warning(state: &DriftState) -> Option<String> {
             }
         }
 
+        DriftState::CatalogFileMissing { path } => codex_catalog::missing_catalog_warning(path),
+
         DriftState::SelectionDangling => format!(
             "Codex 配置自相矛盾：顶层 `model_provider` 选中的 provider 在 \
              `[model_providers.*]` 里不存在。此时 Codex **启动即报错** \
@@ -830,9 +861,11 @@ pub(super) fn preview(endpoint: &str) -> AppResult<super::ToolConfigPreview> {
     let state = drift_state(&cfg, &auth, endpoint, believed_applied(&cfg));
     Ok(super::ToolConfigPreview {
         category_id: crate::model::CategoryType::Codex,
-        summary: "Codex：只写 ~/.codex/config.toml（model_provider=synaroute、\
-                  [model_providers.synaroute] 含 base_url/wire_api/bearer 占位、可选顶层 model）。\
-                  **不写 auth.json**，官方 ChatGPT 登录态原样保留。不写任何 ANTHROPIC_*。"
+        summary: "Codex：写 ~/.codex/config.toml（model_provider=synaroute、\
+                  [model_providers.synaroute] 含 base_url/wire_api/bearer 占位、可选顶层 model）\
+                  与 ~/.codex/synaroute-model-catalog.json（模型目录，还原时整份删除）。\
+                  auth.json **仅在无可用凭据 / OAuth 已过期时**才写占位并备份原件，\
+                  其余情况原样保留官方 ChatGPT 登录态。不写任何 ANTHROPIC_*。"
             .into(),
         mcp_registered: super::is_mcp_registered(crate::model::CategoryType::Codex),
         takeover_warning: drift_warning(&state),
@@ -843,6 +876,7 @@ pub(super) fn preview(endpoint: &str) -> AppResult<super::ToolConfigPreview> {
                 format: "toml".into(),
                 content: cfg_content,
             },
+            codex_catalog::file_preview()?,
             super::ToolConfigFilePreview {
                 path: auth.display().to_string(),
                 exists: auth_exists,
@@ -901,7 +935,7 @@ mod tests {
         let cfg = d.join("config.toml");
         let auth = d.join("auth.json");
 
-        let msg = apply_at(&cfg, EP, Some("gpt-5.6-sol")).unwrap();
+        let msg = apply_at(&cfg, EP, &["gpt-5.6-sol".to_string()], &[], &cfg.with_extension("catalog.json")).unwrap();
         assert!(!auth.exists(), "apply_at 这一层不该创建 auth.json");
 
         let doc = std::fs::read_to_string(&cfg).unwrap().parse::<toml::Value>().unwrap();
@@ -928,6 +962,163 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
+    /// 接入必须让**指针与目录文件同时到位**。写了指针而文件不在 = Codex 启动即报错，
+    /// 而用户刚做的动作是「在 SynaRoute 里点了接入」，归因方向完全错。
+    ///
+    /// 顺带钉住 `is_intact`：把文件删掉之后它必须判「不完好」，否则漂移告警永不发出、
+    /// 下一次接入也不会把文件补回来。
+    #[test]
+    fn apply_wires_the_catalog_pointer_and_the_file_together() {
+        let d = temp_dir("catalog_wire");
+        let cfg = d.join("config.toml");
+        let cat = d.join("synaroute-model-catalog.json");
+
+        let msg = apply_at(&cfg, EP, &["claude-opus-4-8".to_string()], &[], &cat).unwrap();
+        // 🔴 注入验证抓出来的盲区：把 apply_at 里那句 `apply_note` 换成空串，原先**没有任何**
+        // 测试变红 —— 而目录是「只在 Codex 启动时加载」，少了这句提示，用户加条 Key 之后
+        // Codex 菜单不变，那个现象跟「功能没生效」一模一样。
+        assert!(
+            msg.contains("重启"),
+            "接入消息必须带「要重启 Codex」那句话：{msg}"
+        );
+        let doc = std::fs::read_to_string(&cfg)
+            .unwrap()
+            .parse::<toml::Value>()
+            .unwrap();
+        assert_eq!(
+            doc["model_catalog_json"].as_str(),
+            Some(cat.to_string_lossy().as_ref()),
+            "指针必须指向我们生成的目录文件"
+        );
+        assert!(cat.is_file(), "目录文件必须真的写出来");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cat).unwrap()).unwrap();
+        assert_eq!(parsed["models"][0]["slug"], serde_json::json!("claude-opus-4-8"));
+        assert!(is_intact(&cfg, EP), "刚写完必须完好");
+
+        // 目录文件被外部删掉（清理工具、杀软、用户手删）→ 必须判不完好。
+        std::fs::remove_file(&cat).unwrap();
+        assert!(
+            !is_intact(&cfg, EP),
+            "指针在而文件不在 = Codex 起不来，这是最需要被漂移检测抓住的形态"
+        );
+
+        // 指向**用户自己**的目录时，文件在不在都不该影响我们的完好性判定。
+        std::fs::write(
+            &cfg,
+            format!(
+                "model_provider = \"synaroute\"\n\
+                 model_catalog_json = \"{}/his-own.json\"\n\
+                 [model_providers.synaroute]\n\
+                 base_url = \"{}\"\n\
+                 experimental_bearer_token = \"{PROXY_PLACEHOLDER}\"\n\
+                 requires_openai_auth = true\n",
+                d.to_string_lossy().replace('\\', "/"),
+                expected_base_url(EP)
+            ),
+        )
+        .unwrap();
+        assert!(
+            is_intact(&cfg, EP),
+            "用户自己的目录路径我们不认领，也不因它不存在就判自己不完好"
+        );
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 🔴 第 6 次盯同一类接线盲区（前五：`mcp::handle_http` / `route_meta` /
+    /// `lan_guard` 的 peer / `log_rotate` 的写线程 / `custom_headers` 的保存 payload）。
+    ///
+    /// 上面那条测试直接调 `apply_at`，所以**把 tools.rs 的分发改成
+    /// `codex::apply(endpoint, &[], &[])` 它照样全绿** —— 而那正是缺陷本身：
+    /// 目录永远为空 → `can_build` 为假 → 一个模型都不写、指针也不落，
+    /// 用户看到的就是「功能完全没生效」，且没有任何报错。
+    #[test]
+    fn tools_apply_must_pass_the_real_models_and_keys_into_codex() {
+        let src = std::fs::read_to_string("src/tools.rs").unwrap();
+        let prod = crate::proxy::custom_headers::production_code_only(&src);
+        let line = prod
+            .lines()
+            .find(|l| l.contains("codex::apply("))
+            .expect("tools.rs 的生产段里必须有 codex::apply 的分发点");
+        assert!(
+            line.contains("models") && line.contains("keys"),
+            "分发点必须把真实的 models 与 keys 传进去，实际是：{line}"
+        );
+    }
+
+    /// 🔴 目录文件缺失必须独立成一支，且**优先于所有 provider 形态**。
+    ///
+    /// 不单独判的话它会落进 `OurTablePointsElsewhere`，那句告警说的是「我们的表指向别处」
+    /// 并把**我们自己的**端点回显给用户 —— 用户会去查端口、查中转站，而真实原因是
+    /// Codex 压根起不来。本仓记过多次：指错方向的告警比没有告警更糟。
+    #[test]
+    fn a_missing_catalog_file_is_reported_as_itself_not_as_a_provider_drift() {
+        let d = temp_dir("catalog_drift");
+        let cfg = d.join("config.toml");
+        let auth = d.join("auth.json");
+        let cat = d.join("synaroute-model-catalog.json");
+        let missing = DriftState::CatalogFileMissing {
+            path: cat.to_string_lossy().into_owned(),
+        };
+
+        apply_at(&cfg, EP, &["claude-opus-4-8".to_string()], &[], &cat).unwrap();
+        assert_eq!(drift_state(&cfg, &auth, EP, true), DriftState::Intact);
+
+        std::fs::remove_file(&cat).unwrap();
+        let state = drift_state(&cfg, &auth, EP, true);
+        assert_eq!(
+            state, missing,
+            "provider 配置一切正常，只是目录文件丢了 —— 不能报成 provider 漂移"
+        );
+
+        let msg = drift_warning(&state).expect("这一支必须出告警");
+        assert!(
+            msg.contains("接入"),
+            "必须给出那一句能解决问题的操作（重新接入），否则用户只能去猜：{msg}"
+        );
+        assert!(
+            msg.contains("启动") || msg.contains("打不开"),
+            "必须说清是「Codex 起不来」而不是「请求失败」：{msg}"
+        );
+        assert!(
+            !msg.contains("指向别处") && !msg.contains("没有走本地代理"),
+            "不许复用 provider 漂移那套文案，那会把人送去查端口：{msg}"
+        );
+
+        // 指向**用户自己**的目录、且那个文件也不存在，同时 config 因**别的**原因不完好
+        // （这里用端口漂移）→ 必须报那个真实原因，不能报成目录缺失。
+        //
+        // ⚠️ 这个场景是第三版才写对的。前两版分别错在：① 用 `assert_ne!(state, missing)`
+        // 比的是「那个特定值」，而注入后返回的是 `CatalogFileMissing { path: his-own.json }`
+        // ——不等，照样绿；② 只把文件名换成 his-own.json 而没让 config 变得不完好，
+        // 于是 `is_intact` 仍为真、直接 `return Intact`，**压根走不到被注入的那段**。
+        // 同本仓「注入不变红时先怀疑用例没压到那个分支」那条。
+        std::fs::write(
+            &cfg,
+            format!(
+                "model_provider = \"synaroute\"\n\
+                 model_catalog_json = \"{}/his-own.json\"\n\
+                 [model_providers.synaroute]\n\
+                 base_url = \"http://127.0.0.1:9999/v1\"\n\
+                 experimental_bearer_token = \"{PROXY_PLACEHOLDER}\"\n\
+                 requires_openai_auth = true\n",
+                d.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                drift_state(&cfg, &auth, EP, true),
+                DriftState::OurTablePointsElsewhere { .. }
+            ),
+            "用户自己的目录路径我们不认领：这里的真实问题是端口漂移，\
+             报成「目录文件不见了」会让他去重新接入而端口问题依旧"
+        );
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     /// `requires_openai_auth` 必须写成 `true`，**且升级老配置时也要补上**。
     ///
     /// 本轮曾一度删掉它（理由是「它把 Codex 推向 auth.json 那条凭据链」）——
@@ -945,7 +1136,7 @@ mod tests {
         let cfg = d.join("config.toml");
 
         // ① 全新写入
-        apply_at(&cfg, EP, None).unwrap();
+        apply_at(&cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         let doc = std::fs::read_to_string(&cfg).unwrap().parse::<toml::Value>().unwrap();
         assert_eq!(
             doc["model_providers"]["synaroute"]["requires_openai_auth"].as_bool(),
@@ -964,7 +1155,7 @@ mod tests {
              wire_api = \"responses\"\n\
              requires_openai_auth = false\n",
         );
-        apply_at(&cfg, EP, None).unwrap();
+        apply_at(&cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         let doc = std::fs::read_to_string(&cfg).unwrap().parse::<toml::Value>().unwrap();
         assert_eq!(
             doc["model_providers"]["synaroute"]["requires_openai_auth"].as_bool(),
@@ -987,7 +1178,7 @@ mod tests {
              [model_providers.custom]\nname = \"别人\"\nbase_url = \"https://x.example/v1\"\n\
              [mcp_servers.synaroute]\ncommand = \"x.exe\"\n",
         );
-        apply_at(&cfg, EP, None).unwrap();
+        apply_at(&cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         let doc = std::fs::read_to_string(&cfg).unwrap().parse::<toml::Value>().unwrap();
         assert_eq!(doc["disable_response_storage"].as_bool(), Some(true));
         assert_eq!(doc["features"]["js_repl"].as_bool(), Some(false));
@@ -1005,7 +1196,7 @@ mod tests {
         let d = temp_dir("intact");
         let cfg = d.join("config.toml");
 
-        apply_at(&cfg, EP, None).unwrap();
+        apply_at(&cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         assert!(is_intact(&cfg, EP), "刚写完必须完好");
 
         // 端口漂移：非空但不是我们
@@ -1211,7 +1402,7 @@ mod tests {
         let auth = d.join("auth.json");
 
         // ① 完好 → 不报警
-        apply_at(&cfg, EP, None).unwrap();
+        apply_at(&cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         assert_eq!(drift_state(&cfg, &auth, EP, true), DriftState::Intact);
         assert!(drift_warning(&DriftState::Intact).is_none());
 
@@ -1300,7 +1491,7 @@ mod tests {
         let auth = d.join("auth.json");
 
         // `<name>.config.toml` 存在 → `codex --profile name` 完全忽略 config.toml
-        apply_at(&cfg, EP, None).unwrap();
+        apply_at(&cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         write(&d.join("mine.config.toml"), "model = \"x\"\n");
         let s = drift_state(&cfg, &auth, EP, true);
         assert_eq!(s, DriftState::ProfileShadowed { profiles: vec!["mine".into()] });
@@ -1327,7 +1518,7 @@ mod tests {
         let d = temp_dir("profile_intact");
         let cfg = d.join("config.toml");
         let auth = d.join("auth.json");
-        apply_at(&cfg, EP, None).unwrap();
+        apply_at(&cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         assert_eq!(drift_state(&cfg, &auth, EP, true), DriftState::Intact);
         write(&d.join("work.config.toml"), "model = \"x\"\n");
         assert!(

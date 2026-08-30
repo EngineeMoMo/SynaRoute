@@ -173,13 +173,13 @@ export function BrainPage() {
     update({ members: config.members.filter((m) => !(m.keyId === keyId && m.modelName === model)) });
   };
 
-  // 一键快速配置：把当前分类所有启用 Key 各取首个模型加为成员，并自动选第一个作决策者。
-  // 解决空白配置无从下手的门槛——用户点一下即得可用配置，再按需微调。
-  // 已有配置时不覆盖决策者/成员，只补齐缺的（幂等、不破坏用户已调的选择）。
+  // 一键快速配置：可参与聚合的 Key 各取首个模型加为成员，并自动选第一个作决策者。
+  // 解决空白配置无从下手的门槛；已有配置时只补齐缺的（幂等，不覆盖用户已调的选择）。
   const quickFill = () => {
     if (!config) return;
-    // 候选：启用且有已知模型的 Key（没拉到模型的没法自动选，跳过）。
-    const usable = keys.filter((k) => k.enabled && k.models.length > 0);
+    // 候选：能参与聚合且有已知模型的 Key。口径必须含 `allowInAggregate` ——「全部禁用 + 勾了
+    // 允许聚合」正是该开关设想的典型用法，只认 enabled 会报「请先启用」而它其实已经可用。
+    const usable = keys.filter((k) => (k.enabled || k.allowInAggregate) && k.models.length > 0);
     if (usable.length === 0) {
       showToast("error", t("brain.quickFillNoKeys"));
       return;
@@ -330,11 +330,11 @@ export function BrainPage() {
                         >
                           <BrandIcon hint={k?.vendor ?? m.modelName} fallbackLabel={k?.name} iconUrl={k?.icon ?? vendorIcon(k?.vendor)} size={20} />
                           <div className="min-w-0 flex-1">
-                            <div className="truncate text-xs font-medium text-text-primary">{k?.name ?? m.keyId}</div>
+                            {/* 🔴 禁用标识：聚合会**静默跳过**禁用成员，而此前只有「添加时」的选择器带它（2026-08-29 真实踩坑：两个成员实际只有一个参与） */}
+                            <div className="truncate text-xs font-medium text-text-primary">{k && !k.enabled && !k.allowInAggregate ? `${k.name}${t("brain.keyDisabledSuffix")}` : (k?.name ?? m.keyId)}</div>
                             {k && k.models.length > 0 ? (
-                              // 就地改模型：下拉选该 Key 的模型（含当前值，若是手动加的也保底可见）
-                              // 提示要点明「改完要保存」——本页所有改动都只进内存，
-                              // 不说清会有人改完直接关页面，然后以为功能坏了。
+                              // 就地改模型：下拉选该 Key 的模型（含当前值，手动加的也保底可见）。
+                              // 提示要点明「改完要保存」——本页改动只进内存，不说清会有人改完就关页面。
                               <Tooltip content={t("brain.memberModelTip")} side="right">
                                 <select
                                   value={m.modelName}
@@ -826,7 +826,7 @@ function MemberPicker({
                 {/* 禁用的 Key 必须带标识：聚合运行时会跳过禁用成员（gather_members），
                     选择器里若与启用的长得一样，用户会加进来一个「永远不参与」的成员，
                     结果面板少一位专家还查不出原因。 */}
-                {key.enabled ? key.name : `${key.name}${t("brain.keyDisabledSuffix")}`}
+                {key.enabled || key.allowInAggregate ? key.name : `${key.name}${t("brain.keyDisabledSuffix")}`}
               </option>
             ))}
           </select>
@@ -957,7 +957,7 @@ function KeyModelSelect({
               <option key={key.id} value={key.id}>
                 {/* 同 MemberPicker：禁用 Key 带标识 —— 决策者/汇总者路径对禁用 Key 直接报错
                     （call_ref 的 enabled 检查），选了它整轮聚合会失败。 */}
-                {key.enabled ? key.name : `${key.name}${t("brain.keyDisabledSuffix")}`}
+                {key.enabled || key.allowInAggregate ? key.name : `${key.name}${t("brain.keyDisabledSuffix")}`}
               </option>
             ))}
           </select>

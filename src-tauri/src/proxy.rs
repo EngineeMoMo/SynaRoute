@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 #[path = "lan_guard.rs"] pub(crate) mod lan_guard; // 入站鉴权；来由见该文件模块注释
 #[path = "custom_headers.rs"] pub(crate) mod custom_headers; // headers_json 接线 + 保留字段判据
 #[path = "proxy_listen.rs"] pub(crate) mod proxy_listen; // 粘滞端口 + 双栈绑定；来由见该文件模块注释
+#[path = "model_choice.rs"] mod model_choice; // 客户端发的名字 vs 应用内选的；来由见该文件模块注释
 pub(crate) type ResBody = BoxBody<Bytes, std::io::Error>;
 
 /// 把完整字节体装箱为 ResBody（Full 的错误类型是 Infallible，用 `match` 消解）。
@@ -527,13 +528,10 @@ async fn handle_request_inner(
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
-    // 应用内「对外模型名」覆盖（借鉴 EchoBird）：某些客户端（如 Codex）模型菜单是内置固定
-    // 清单、拉不到中转的真实模型，用户在本应用内选定的模型经此覆盖客户端发来的模型名。
-    // 每请求实时读 get_settings，改选即时生效、免重启客户端。空/未选时透传客户端原值。
-    // 覆盖后的名字仍走下游各 Key 的 resolve_model（映射→三档→原生→兜底），故多 Key 故障转移不受影响。
-    let requested_model = store
-        .active_model_of(category)
-        .unwrap_or(client_model);
+    // 应用内「对外模型名」的取舍：Codex 现在能从我们写的模型目录里**自己选**，故它发来的
+    // 可服务名字优先；CLI/桌面端的名字是客户端按任务调度出来的，仍按应用内选项强制。
+    // 完整判据（含为什么分类不同）在 `model_choice` 的模块注释里。
+    let requested_model = model_choice::pick(&store, category, client_model);
 
     // 下游是否要求流式（Claude Code / Codex 默认 stream:true）。
     let wants_stream = req_json
@@ -899,6 +897,9 @@ async fn handle_request_inner(
         };
         let started = std::time::Instant::now();
         let next = candidates.get(i + 1);
+        // 上一候选若因思考块签名被拒 → 就地摘掉再给本候选用。刻意放在**共享前段**而不是某条失败
+        // 分支里：失败分支有三条（流式非 2xx / 非流式非 2xx / 连接层），挂一条必然漏掉另两条。
+        crate::upstream::rectify_thinking_signature(&last_err, &mut req_json, &store, category, key);
         // 故障转移日志：写清「谁失败（客户端要什么/实际打的什么）→ 转给谁」，避免只写「尝试下一个」看不出链路。
         let log_failover = |store: &Arc<Store>,
                             failed: &ProviderKey,
@@ -1060,11 +1061,9 @@ async fn handle_request_inner(
                     if retry_after.is_none() && !all_failed_is_hard_error(false, last_status) {
                         saw_transient_without_hint = true;
                     }
-                    // 上游给了状态码 → 这次失败不是本地配置错误。必须复位 config_error，
-                    // 否则前一个候选的 Invalid（缺 maxOutputTokens 等）会**粘住**这个标志：
-                    // 「配置错 Key 优先 + 后续 Key 撞 429/5xx」时尾部会被判成硬错误，
-                    // 原样回状态码、跳过短路窗口与 Retry-After —— 正是 529 设计要防的重试风暴。
-                    // 契约同尾部注释：按「最后一次失败的性质」分流（config_error 必须只反映最后一次）。
+                    // 上游给了状态码 → 非本地配置错误，必须复位 config_error：否则前一候选的 Invalid
+                    // （缺 maxOutputTokens 等）会**粘住**它，「配置错 Key 优先 + 后续撞 429/5xx」时尾部
+                    // 被判成硬错误、跳过短路窗口与 Retry-After（529 要防的重试风暴）。只反映最后一次失败。
                     config_error = false;
                     // 分层记账放在 log_request **之前**：那一行会 move 掉 `real_model`，
                     // 而模型锁的键就是它。（此前顺序相反，加分层时才发现。）
@@ -1219,8 +1218,7 @@ async fn handle_request_inner(
                 if outcome.retry_after.is_none() && !all_failed_is_hard_error(false, last_status) {
                     saw_transient_without_hint = true;
                 }
-                // 复位理由同流式 HttpError 分支：上游有状态码 → 非本地配置错误，
-                // config_error 必须只反映最后一次失败的性质，不能被前一候选的 Invalid 粘住。
+                // 复位理由同流式 HttpError 分支（config_error 只反映最后一次失败的性质）。
                 config_error = false;
                 // 解构取走三个 String，消掉三次 clone（本分支对 outcome 的最后一次使用）。
                 // 必须放在 `resp_cow` 用完之后：它借用了 `outcome.bytes`。
@@ -1639,7 +1637,7 @@ enum StreamAttempt {
 /// - 不设总超时（长回答会被 30s 掐断），仅设连接超时；流本身靠客户端断开或上游结束收尾。
 /// - 先 send() 探状态码：非 2xx 缓冲错误体返回 HttpError（首字节未发，切换安全）；
 ///   2xx 则用 bytes_stream() 逐块转发，content-type 沿用上游真实值（保 text/event-stream）。
-/// - 仅在下游协议与 Key 协议一致时调用（无需跨协议转换），跨协议 SSE 翻译属已知限制。
+/// - 仅在下游协议与 Key 协议一致时调用；跨协议走另一条流（`SseTranslator` + `sse_error`）。
 // 参数多但每个都是这条转发链必需的运行时上下文（store/分类写日志、key/path/body/model 定位请求、
 // headers 透传客户端身份）。抽成 struct 只是换个地方传同样的东西，还要动全部调用点 ——
 // 与 `Store::append_event_full`、`aggregate::run_member_turns` 同样的取舍。
@@ -1881,7 +1879,7 @@ async fn try_stream_to_key(
             // 不再自己拼 detail —— detail 由流开始时那条同步日志负责，补记只往里补用量。
             let req_model2 = requested_model.to_string();
 
-            let byte_stream = resp.bytes_stream().map(move |chunk| {
+            let byte_stream = crate::upstream::guard_stream_idle(resp.bytes_stream()).map(move |chunk| {
                 // 闭包持有守卫；闭包被 drop → 守卫 Drop → 通知补记任务。
                 let _ = &end_guard;
                 match chunk {
@@ -1933,11 +1931,10 @@ async fn try_stream_to_key(
                 // fail_count 清零，使随后的失败补记永远只能把它从 0 加到 1、够不到熔断阈值
                 // （该 Key 永不熔断 → 客户端反复重打同一条坏 Key，正是熔断要止住的风暴）。
                 // 用尾窗判错：终止性 error 事件必落在流末 8KB 内。
-                if crate::upstream::sse_stream_errored(&tail_sse) {
-                    health::record_live_failure(&store2, &key_id2);
-                } else {
-                    health::record_live_success(&store2, &key_id2, Some(&real_model2));
-                }
+                // 走 `record_stream_end` 而不是自己写二选一：失败时**还要落一条可见事件**，
+                // 否则日志页只剩开流那一刻写下的「路由成功」（见该函数文档）。
+                let errored = crate::upstream::sse_stream_errored(&tail_sse);
+                health::record_stream_end(&store2, category2, &key_id2, &req_model2, &real_model2, errored);
                 if let Some(u) = crate::upstream::extract_usage_from_sse(&merged) {
                     // 补记进**流开始时已写下的那一行**，不新追加一条。
                     // 再 append 一条同 collapse key 的事件会被折叠逻辑当成「又发生了一次」：
@@ -1967,7 +1964,7 @@ async fn try_stream_to_key(
                 custom_tools,
                 search_tools,
             );
-            let upstream = resp.bytes_stream();
+            let upstream = crate::upstream::guard_stream_idle(resp.bytes_stream());
 
             // 用量补记三要素（与同协议分支同一套定位口径：分类 + key + collapse_key）。
             // 跨协议这条路**不用**尾窗 + `extract_usage_from_sse`：翻译器边收边转，尾窗里
@@ -2033,20 +2030,21 @@ async fn try_stream_to_key(
                 /// 开流，早记成功会清零 fail_count 让后续失败补记永远够不到熔断阈值。
                 /// 此前**跨协议这条路连失败检测都没有**（翻译器丢掉 error 后照常冲刷 completed，
                 /// 下游拿到一条「成功完成的空回答」，健康态也被记成功）。
+                /// 与同协议分支共用 `record_stream_end`：失败时那条可见事件两条路都要落，
+                /// 各写一遍二选一必然漏掉一条（本仓已栽 10 次的接线盲区）。
                 fn record_health(&mut self) {
                     if self.health_recorded {
                         return;
                     }
                     self.health_recorded = true;
-                    if self.saw_upstream_error() {
-                        health::record_live_failure(&self.store, &self.key_id);
-                    } else {
-                        health::record_live_success(
-                            &self.store,
-                            &self.key_id,
-                            Some(&self.real_model),
-                        );
-                    }
+                    health::record_stream_end(
+                        &self.store,
+                        self.category,
+                        &self.key_id,
+                        &self.req_model,
+                        &self.real_model,
+                        self.saw_upstream_error(),
+                    );
                 }
 
                 /// 流终止时把翻译器累积的用量补进「流开始时已写下的那一行」。
@@ -2108,12 +2106,12 @@ async fn try_stream_to_key(
                             }
                             st.finished = true;
                             // **上游流内报过 error 时不冲刷收尾事件**：`finish()` 会发
-                            // `response.completed` / `message_stop` / `[DONE]`，而 error 事件本身
-                            // 已被翻译器丢弃 —— 两者叠加会让下游拿到一条「状态 completed、内容为空
-                            // 或被截断」的**假成功**，用户看到的是「模型什么都没说」而不是上游过载。
-                            // 不发终止符，下游客户端会如实报「流未正常结束」，方向至少是对的。
-                            // （更好的做法是翻成下游协议的 error 事件，需在 sse.rs 六个方向各加一条，
-                            //  属独立改动，见 docs 待办。）
+                            // `response.completed` / `message_stop`，叠在错误之后就是一条自相
+                            // 矛盾的「completed 且内容为空」的**假成功**，客户端多半以后者为准。
+                            // 这道门刻意比 `sse_error` 的判据**更宽**（原始尾窗认任何非 null 的
+                            // `error` 字段，翻译器只认对象/字符串）—— 那一小块差集里没有它就会
+                            // 退回假成功。代价是 Chat 下游此时也拿不到 `[DONE]`：错误本身已经发
+                            // 出去了，缺一个终止符远好于一条假成功。
                             if st.saw_upstream_error() {
                                 return None;
                             }
@@ -2896,16 +2894,16 @@ fn compose_hard_error_body(last_status: Option<u16>, last_err: &str) -> String {
 /// 而 SynaRoute 会在 Key 之间做故障转移 —— 上一轮由 Key A（中转站 A → 某后端账号）签的
 /// 思考块，这一轮若落到 Key B，B 验不了 A 的签名，直接 400。
 ///
-/// **SynaRoute 自己不碰签名**（已逐处核对：同协议直通只改顶层 `model`/采样/`max_tokens`；
-/// 跨协议只把 `thinking.budget_tokens` 映射成 `reasoning.effort`；响应侧从不伪造 thinking 块，
-/// 全仓生产代码里没有一处构造 `"type":"thinking"`）。所以这不是转换丢字段，
+/// **SynaRoute 从不伪造签名**（响应侧无一处构造 `"type":"thinking"`）。所以这不是转换丢字段，
 /// 而是「同一段历史换了上游」这件事本身在 Anthropic 侧不被允许。
+/// ⚠️ 但「我们完全不碰思考块」这句自 2026-08-30 起**不再成立**：命中本错误后
+/// `upstream::thinking_rectify` 会把历史里的思考块摘掉、并把顶层 `thinking` 关掉再让后续候选重试。
 ///
 /// 故给出三条真正能解决的动作，而不是让用户去猜那句 coral 异常。
 fn annotate_known_upstream_error(upstream_err: &str) -> Option<&'static str> {
-    // 判据用**两种**写法各自匹配：`reason` 字段是机器码（最稳），message 是人类文案
-    // （部分中转站只透传 message、丢掉 reason）。任一命中即可。
-    let hit = upstream_err.contains("THINKING_SIGNATURE_INVALID")
+    // 三种写法各自匹配：机器码 `reason`（最稳）、人类文案 message（部分中转站只透传它）、
+    // 以及整流没覆盖的后继形态 `Expected …redacted_thinking`（它不含 signature，漏了就零说明）。
+    let hit = upstream_err.contains("THINKING_SIGNATURE_INVALID") || upstream_err.contains("redacted_thinking")
         || (upstream_err.contains("thinking") && upstream_err.contains("signature"));
     if !hit {
         return None;
@@ -2918,7 +2916,7 @@ fn annotate_known_upstream_error(upstream_err: &str) -> Option<&'static str> {
          • **开一个新会话**（最快：历史里没有旧签名就不会再撞）；\n\
          • 把这个会话**固定在一条 Key** 上（分类页里只启用一条，或把它设为主 Key 且暂时停用其余）；\n\
          • 或在客户端**关掉扩展思考**（没有思考块就没有签名要验）。\n\
-         注：SynaRoute 不改写思考块，也不会伪造签名 —— 转发时它是原样透传的。",
+         注：SynaRoute 从不伪造签名；本轮已自动摘除思考块并降级为不开思考后重试（日志页「故障转移」组有记录），仍失败才报到这里。",
     )
 }
 
@@ -3862,6 +3860,7 @@ mod tests {
             protocol: Protocol::Anthropic,
             has_secret: true,
             enabled: true,
+            allow_in_aggregate: false,
             priority,
             headers_json: None,
             params: KeyParams::default(),

@@ -118,9 +118,20 @@ fn is_loopback_peer(ip: &std::net::IpAddr) -> bool {
 /// 定长时间比较。避免用 `==` 逐字节短路，让攻击者靠响应时间差逐位试出令牌。
 ///
 /// 长度不同也要走完循环 —— 提前 `return false` 会把长度泄露出去。
+///
+/// # 🔴 长度差异必须压成布尔，不能把异或值截断成 `u8`
+///
+/// 第一版写的是 `(a.len() ^ b.len()) as u8` —— `usize ^ usize` 再 `as u8` **只保留低 8 位**，
+/// 于是长度差恰好是 256 的倍数时，长度差异被**整个丢掉**（`32 ^ 288 == 256`，截断后是 0）。
+/// 此后只要逐字节比较也全 0（短的那边超出部分取 0，长的那边补 `\0`），函数就返回 true ——
+/// 也就是「真令牌 + 256 个 NUL 后缀」会被判为相等。
+///
+/// 实际不可利用（HTTP 头值不允许 NUL，且攻击者得先知道真令牌），但这是判据在边界上
+/// 静默失效，正是本仓最在意的那一类。有 `length_difference_survives_any_multiple_of_256`
+/// 一条测试钉住。
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
-    let mut diff = (a.len() ^ b.len()) as u8;
+    let mut diff = u8::from(a.len() != b.len());
     for i in 0..a.len().max(b.len()) {
         diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
     }
@@ -623,6 +634,33 @@ mod tests {
         assert!(!constant_time_eq("", "tok"));
         assert!(constant_time_eq("tok", "tok"));
         assert!(constant_time_eq("", ""));
+    }
+
+    /// 🔴 长度差恰好是 **256 的倍数**时也必须判不等。
+    ///
+    /// 上面那条用的长度差都是个位数，所以第一版实现
+    /// `let mut diff = (a.len() ^ b.len()) as u8;` **照样全绿** —— 而 `usize ^ usize`
+    /// 再 `as u8` 只保留低 8 位：`3 ^ 259 == 256`，截断后是 **0**，长度差异被整个丢掉。
+    /// 此后逐字节比较也全 0（短的那边超出部分取 0，长的那边补 `\0`），函数返回 **true**，
+    /// 也就是「真令牌 + 256 个 NUL 后缀」被判为相等。
+    ///
+    /// 实际不可利用（HTTP 头值不允许 NUL，且攻击者得先知道真令牌），但这是判据在边界上
+    /// 静默失效 —— 正是本仓最在意的那一类，而它只在「长度差刚好越过 256」时暴露。
+    #[test]
+    fn length_difference_survives_any_multiple_of_256() {
+        for pad in [256usize, 512, 768] {
+            let forged = format!("tok{}", "\0".repeat(pad));
+            assert_eq!(
+                ("tok".len() ^ forged.len()) as u8,
+                0,
+                "这个 pad 必须真的让旧实现的 as u8 截断成 0，否则本用例压不到那个边界"
+            );
+            assert!(
+                !constant_time_eq("tok", &forged),
+                "长度差 {pad}（256 的倍数）时必须判不等"
+            );
+            assert!(!constant_time_eq(&forged, "tok"), "反向也一样");
+        }
     }
 
     /// 令牌 id 不能与真实 Key 的 id 空间相撞。

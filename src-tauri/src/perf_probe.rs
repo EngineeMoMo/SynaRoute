@@ -78,6 +78,7 @@ fn bench_key(id: &str, base_url: &str) -> ProviderKey {
         protocol: Protocol::Anthropic,
         has_secret: true,
         enabled: true,
+        allow_in_aggregate: false,
         priority: 0,
         headers_json: None,
         params: KeyParams::default(),

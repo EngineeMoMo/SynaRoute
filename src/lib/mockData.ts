@@ -316,6 +316,14 @@ export const mockBridge = {
       if (k) k.enabled = enabled;
     }
   },
+  // 与后端 store::key_flags 同口径：只翻这一位，别的字段一个都不碰。
+  async setKeyAllowInAggregate(keyId: string, allow: boolean) {
+    await delay();
+    for (const cat of Object.keys(store) as CategoryType[]) {
+      const k = store[cat].find((x) => x.id === keyId);
+      if (k) k.allowInAggregate = allow;
+    }
+  },
 
   // 与后端 Store::set_primary_key 同规则：目标提到队首，整列重编号为连续 0,1,2…
   // 浏览器预览态也要能看到「设为主」的效果，否则 npm run dev 下点了没反应像坏了。
@@ -730,6 +738,11 @@ export const mockBridge = {
   async getLanToken(): Promise<string | null> {
     await delay();
     return settings.lanExposure ? "0".repeat(32) + "f".repeat(32) : null;
+  },
+  /** 预览里没有真的 `~/.codex/config.toml`，恒 null（= 状态条不显示那一格）。 */
+  async getCodexConfigModel(): Promise<string | null> {
+    await delay();
+    return null;
   },
   async regenerateLanToken(): Promise<string> {
     await delay();

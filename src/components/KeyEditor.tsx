@@ -505,11 +505,11 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     // 「未配置密钥」，且无对账路径修正。后端 save_secret 的设计就是「写库成功后才置位」
     // （service.rs），这里预置 true 等于从载荷侧绕过那道防线。
     hasSecret: initial?.hasSecret ?? false,
-    // 新建默认**启用**：与 cc-switch 导入同口径（用户主动新建的 Key 就是要用的）。
-    // 原先默认 false，而首启向导第②步只看「已有 N 条 Key」就放行 → 第③步接入后
-    // enabled_keys_sorted 为空、每个请求都没有候选 Key；桌面端更糟，报的是
-    // 「需要至少一个可服务模型」，把用户引向「没配模型」这个完全错误的方向。
+    // 新建默认**启用**：与 cc-switch 导入同口径。原先默认 false，而首启向导第②步只看
+    // 「已有 N 条 Key」就放行 → 第③步接入后 enabled_keys_sorted 为空、每个请求都没有候选；
+    // 桌面端更糟，报「需要至少一个可服务模型」，把用户引向「没配模型」这个完全错误的方向。
     enabled: initial?.enabled ?? true,
+    allowInAggregate: initial?.allowInAggregate, // 必须透传：入口在 Key 卡片上，漏了则保存一次就被静默清掉（有 parity 判据钉住）
     priority: initial?.priority ?? 999,
     params: { ...initial?.params, temperature, timeoutMs: typeof timeoutMs === "number" && timeoutMs >= 1000 ? timeoutMs : undefined },
     models,

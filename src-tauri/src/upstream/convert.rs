@@ -158,13 +158,13 @@ fn effort_to_thinking_budget(effort: &str, max_tokens: u64) -> Option<u64> {
         "xhigh" => 32768,
         _ => return None, // 未知档位：不擅自开思考
     };
-    // Anthropic 要求 thinking.budget_tokens < max_tokens，且要给最终回答留空间。
-    // 取 max_tokens 的一半为上限钳制；若 max_tokens 过小（<2048）则不开思考。
-    if max_tokens < 2048 {
+    // Anthropic 硬约束：`budget_tokens >= 1024` 且 **< max_tokens** → max_tokens > 1024 即可开。
+    // 旧门槛 `< 2048` 是从「cap 取一半后不低于 1024」反推的实现细节，于是 [1025, 2047] 区间明明
+    // 能开却**静默不开思考**；改后最坏是回答被截断，而截断可见（`was_truncated`）。同「最大单次输出」那条。
+    if max_tokens <= 1024 {
         return None;
     }
-    let cap = max_tokens / 2;
-    Some(base.min(cap).max(1024))
+    Some(base.min(max_tokens / 2).max(1024).min(max_tokens - 1))
 }
 
 /// 消费 `openai_to_anthropic` 暂存的 `_pending_effort`，在 max_tokens 补齐后补打 thinking。
@@ -1694,6 +1694,48 @@ mod tests {
     use crate::upstream::testfix::*;
     use crate::model::Protocol;
     use serde_json::json;
+
+    /// 🔴 `max_tokens ∈ [1025, 2047]` 时**必须**开思考。
+    ///
+    /// 旧实现的门槛是 `max_tokens < 2048 → return None`，那个 2048 不是官方约束，
+    /// 而是从「`cap = max_tokens/2` 之后不低于 1024」反推出来的实现细节。
+    /// Anthropic 的硬约束只有两条：`budget_tokens >= 1024` 且 **< max_tokens**。
+    ///
+    /// 旧门槛的失效形态是本仓最忌讳的那类：用户选了 `high`，请求正常返回、行为毫无变化，
+    /// 而日志里没有任何线索指向「那一档被丢掉了」。改后最坏是回答被截断，
+    /// 而截断是**可见的**（`is_truncated_response` → `was_truncated`）。
+    /// 同「最大单次输出」那条反转:**静默错比响亮错更糟**。
+    #[test]
+    fn a_small_max_tokens_still_gets_thinking_as_long_as_it_is_legal() {
+        // 边界：1024 不行（budget 至少 1024，而它必须 < max_tokens）
+        assert_eq!(effort_to_thinking_budget("high", 1024), None);
+        assert_eq!(effort_to_thinking_budget("high", 512), None);
+
+        // 1025 起就该开 —— 旧实现在这里静默返回 None
+        for mt in [1025u64, 1500, 2047] {
+            let got = effort_to_thinking_budget("high", mt)
+                .unwrap_or_else(|| panic!("max_tokens={mt} 时本可开思考却返回 None"));
+            assert!(got >= 1024, "不得低于 Anthropic 硬下限：{got}");
+            assert!(got < mt, "必须 < max_tokens 否则上游 400：budget={got} max={mt}");
+        }
+
+        // 宽裕时仍按档位给递增预算，且给回答留一半
+        assert_eq!(effort_to_thinking_budget("low", 64_000), Some(2048));
+        assert_eq!(effort_to_thinking_budget("high", 64_000), Some(16384));
+        assert_eq!(
+            effort_to_thinking_budget("xhigh", 64_000),
+            Some(32_000),
+            "xhigh 的基准 32768 被 max_tokens 的一半（32000）钳住 —— 留一半给回答是刻意的"
+        );
+        assert_eq!(
+            effort_to_thinking_budget("xhigh", 8_000),
+            Some(4000),
+            "预算被 max_tokens 的一半钳住"
+        );
+        // 未知档位与 minimal 仍不开
+        assert_eq!(effort_to_thinking_budget("minimal", 64_000), None);
+        assert_eq!(effort_to_thinking_budget("max", 64_000), None);
+    }
 
     /// 结构化输出约束必须跨协议**双向**保留，且 `json_schema` 的包裹层要正确摊平/包回。
     ///

@@ -8,10 +8,10 @@ use crate::secret::{atomic_write, SecretStore};
 use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::time::SystemTime;
-#[path = "data_dir.rs"] // 挂载理由与 SYNAROUTE_DATA_DIR 的来由都在该文件模块注释
-pub(crate) mod data_dir;
-#[path = "log_rotate.rs"] // 日志体积上限与滚动切分；两级上限的理由见该文件模块注释
-pub(crate) mod log_rotate;
+// 三个子模块都挂在这里，因为它们要调私有的 mutate_and_persist / 解析数据目录；各自的挂载理由写在对应文件的模块注释里。
+#[path = "data_dir.rs"] pub(crate) mod data_dir;
+#[path = "log_rotate.rs"] pub(crate) mod log_rotate;
+#[path = "key_flags.rs"] pub(crate) mod key_flags;
 
 /// 检查 baseUrl 是否含路径后缀（如 `https://api.deepseek.com/anthropic` 中的 `/anthropic`）。
 ///
@@ -2230,15 +2230,13 @@ impl Store {
         })
     }
 
-    /// 路由候选：一次读锁内完成「筛分类+启用 → 按优先级排序 → 剔除熔断中」，
-    /// **只对最终入选者克隆**。返回 (候选列表, 是否触发了全熔断兜底)。
+    /// 路由候选：一次读锁内完成「筛分类+启用 → 排序（余额耗尽的后移，组内按优先级）→
+    /// 剔除熔断中」，**只对最终入选者克隆**。返回 (候选列表, 是否触发了全熔断兜底)。
     ///
-    /// 为什么不直接用 `enabled_keys_sorted` + `health::select_candidates`：那条路径要克隆
-    /// **两轮全量启用 Key**——`enabled_keys_sorted` 先 `.cloned()` 一遍（在筛选与排序**之前**
-    /// 就已克隆），`select_candidates` 拿到 Vec 后又 `.cloned()` 一遍。每个 `ProviderKey` 带
-    /// `models` / `mappings` 两个 Vec，6 条 Key × 各 30 个 ModelInfo 时单请求要克隆约 180 个
-    /// ModelInfo 两轮。功能无误但纯浪费，且**随 Key 数与模型数线性放大**——形成「配得越全
-    /// 越慢」这种反直觉的性能曲线。
+    /// 为什么不用 `enabled_keys_sorted` + `health::select_candidates`：那条路径克隆**两轮全量
+    /// 启用 Key**（前者在筛选排序**之前**就 `.cloned()`，后者拿到 Vec 后再 `.cloned()`）。
+    /// `ProviderKey` 带 `models`/`mappings` 两个 Vec，6 条 Key × 各 30 个 ModelInfo 就是单请求
+    /// 克隆约 180 个 ModelInfo 两轮 —— 纯浪费，且**随 Key 数与模型数线性放大**（配得越全越慢）。
     ///
     /// 兜底语义与 `health::select_candidates` **必须保持一致**：全部熔断时忽略熔断窗口、
     /// 原样返回全部启用 Key（熔断本为「多 Key 快速切换」而设，无处可切时不应自杀成 503）。
@@ -2255,13 +2253,15 @@ impl Store {
         requested_model: &str,
     ) -> (Vec<ProviderKey>, bool) {
         let cfg = self.config.read();
-        // 先按引用收集（零克隆），排序也只动指针。
+        // 先按引用收集（零克隆），排序也只动指针。排序键把「余额已确定耗尽」摆在 `priority`
+        // **之前**（`bool: Ord`，false 在前）→ 耗尽的整体后移、组内仍按优先级，且兜底那条路
+        // 继承同一顺序（**降级不剔除**，全耗尽时仍有候选）。判据全文见 `health::balance_gate`。
         let mut enabled: Vec<&ProviderKey> = cfg
             .keys
             .iter()
             .filter(|k| k.category_id == category && k.enabled)
             .collect();
-        enabled.sort_by_key(|k| k.priority);
+        enabled.sort_by_key(|k| (crate::health::balance_gate::is_exhausted(k), k.priority));
 
         // 未熔断、且本次要的模型没被锁的优先。
         // `is_candidate_for_model` 是纯函数（只读 HealthState + 当前时间），锁内调用安全。
@@ -2997,6 +2997,7 @@ mod tests {
             protocol: Protocol::Anthropic,
             has_secret: false,
             enabled: true,
+            allow_in_aggregate: false,
             priority,
             headers_json: None,
             params: KeyParams::default(),

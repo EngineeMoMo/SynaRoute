@@ -1,6 +1,11 @@
 //! 健康检查与熔断（FR-011 / FR-012）。
 //! 混合策略（arch-decisions §6）：主动探测 + 缓存 + 熔断态派生。
 
+/// 弹性第三层：余额闸门（B4）。挂在这里的理由写在它的模块头 —— 一句话：本文件是它唯一的
+/// 刷新发起方，而 `store.rs`/`lib.rs`/`proxy.rs` 三个"自然家"棘轮余量都是 0。
+#[path = "balance_gate.rs"]
+pub(crate) mod balance_gate;
+
 use crate::model::{HealthState, HealthStatus};
 use crate::store::Store;
 use crate::upstream;
@@ -327,7 +332,69 @@ pub fn record_live_failure(store: &Arc<Store>, key_id: &str) {
             "Key 已熔断",
             &format!("「{name}」连续失败，已暂停使用 60 秒。其他 Key 将自动接管。"),
         );
+        // 🔴 事件是**必须**的，不是通知的附赠：系统通知可能被用户或系统静音（免打扰、
+        // 焦点助手），而排障时唯一可回溯的地方是日志页。上面那句注释此前写着
+        // 「发系统通知 + 记一条告警事件」而代码只做了前半 —— 于是按注释去日志页搜
+        // 「熔断」什么都搜不到。模型级锁定那一层（本文件上方）一直有事件，Key 级反倒没有。
+        // 折叠键按 Key：同一条 Key 反复进出熔断只占一行带 ×N，不挤 MAX_EVENTS 环。
+        store.append_event_collapsible(
+            store.get_key(key_id).map(|k| k.category_id).unwrap_or_default(),
+            "warning",
+            Some(key_id),
+            &format!(
+                "{name} 已熔断，暂停使用 {}s（连续失败达阈值；其它 Key 自动接管）",
+                BREAKER_COOLDOWN_MS / 1000
+            ),
+            None,
+            Some(format!("breaker:{key_id}")),
+        );
     }
+}
+
+/// 流末统一记账：健康态 **+ 一条用户看得见的失败事件**。
+///
+/// # 🔴 为什么必须有这个函数（而不是让调用方各写一遍二选一）
+///
+/// 流式转发的日志行是在**拿到 200 响应头那一刻**写下的（`proxy::log_success`，kind
+/// `route` → 日志页「路由」绿组），延迟记的是到响应头的耗时。而流内失败（Anthropic 过载
+/// 中途发 error 事件、或本仓的静默超时判定卡死）只纠正了**健康记账**，那一行日志
+/// **没人回头改** —— `backfill_usage_for_collapsed_event` 只补 token 用量。
+///
+/// 于是用户在客户端看到报错、回到日志页看到这条请求是「成功 · 200 · 1.2s」，
+/// 而它真实卡了 180 秒。排障者据此得出「代理这边没问题」，正是本仓最忌讳的
+/// 「排障时看到的是假现场」。前两次失败连系统通知都没有（要攒到熔断阈值才弹）。
+///
+/// **刻意不去改那一行**：日志文件（`*.jsonl`）已经把「成功」那行写出去了，改内存里的副本
+/// 会造出「界面说失败、文件说成功」两个平行事实 —— 本仓在 MSIX 那次惨案上吃够了平行宇宙。
+/// 那一行本身**不是假话**（上游确实回了 200 并开了流），缺的是「后来怎么了」。
+/// 故这里**追加**一条 `error` 级事件（→ 日志页红色「错误」组），两行合起来才是完整时间线。
+///
+/// 折叠键按 (Key, 对外模型名)：一条反复流内失败的 Key 只占一行带 ×N，不挤 `MAX_EVENTS` 环。
+pub fn record_stream_end(
+    store: &Arc<Store>,
+    category: crate::model::CategoryType,
+    key_id: &str,
+    requested_model: &str,
+    real_model: &str,
+    errored: bool,
+) {
+    if !errored {
+        record_live_success(store, key_id, Some(real_model));
+        return;
+    }
+    record_live_failure(store, key_id);
+    let name = store.key_name(key_id).unwrap_or_else(|| key_id.to_string());
+    store.append_event_collapsible(
+        category,
+        "error",
+        Some(key_id),
+        &format!(
+            "{name} · {requested_model} · 流内失败：上游先回 200 开了流，随后在流里发了 error \
+             事件（或流被判定静默卡死）。上面那条「路由成功」记的是开流那一刻，不是最终结果。"
+        ),
+        None,
+        Some(format!("streamfail:{key_id}:{requested_model}")),
+    );
 }
 
 /// 把一次「实时转发成功」计入熔断器：解除熔断、标记 Up、让 `fail_count` **减半**，
@@ -600,6 +667,7 @@ mod tests {
             protocol: Protocol::Anthropic,
             has_secret: true,
             enabled: true,
+            allow_in_aggregate: false,
             priority: 0,
             headers_json: None,
             params: KeyParams::default(),
@@ -715,6 +783,7 @@ mod tests {
                     protocol: crate::model::Protocol::Anthropic,
                     has_secret: true,
                     enabled: true,
+                    allow_in_aggregate: false,
                     priority: i as i32,
                     headers_json: None,
                     params: crate::model::KeyParams::default(),
@@ -786,6 +855,7 @@ mod tests {
                 protocol: Protocol::Anthropic,
                 has_secret: false,
                 enabled,
+                allow_in_aggregate: false,
                 priority: prio,
                 headers_json: None,
                 params: KeyParams::default(),
@@ -873,6 +943,7 @@ mod tests {
                 protocol: Protocol::Anthropic,
                 has_secret: false,
                 enabled: true,
+                allow_in_aggregate: false,
                 priority: 0,
                 headers_json: None,
                 params: KeyParams::default(),
@@ -1007,6 +1078,7 @@ mod tests {
             protocol: Protocol::Anthropic,
             has_secret: false,
             enabled: true,
+            allow_in_aggregate: false,
             priority: 0,
             headers_json: None,
             params: KeyParams::default(),
@@ -1090,6 +1162,91 @@ mod tests {
             tripped,
             "「三次里坏两次」的 Key 必须最终熔断；若这里恒不熔断，说明 record_live_success \
              又回到了清零语义 —— 那条洞正是本测试存在的原因"
+        );
+
+        // 🔴 熔断必须在**日志页**留痕，不能只发系统通知。
+        //
+        // 那句注释此前写着「发系统通知 + 记一条告警事件」而代码只做了前半 ——
+        // 于是排障者按注释去日志页搜「熔断」什么都搜不到；而系统通知可能被免打扰/
+        // 焦点助手静音，此时这次熔断在应用里**完全不可见**（模型级锁定那一层一直有事件，
+        // Key 级反倒没有，两层可见性不对称）。
+        let hit = store
+            .list_all_events()
+            .into_iter()
+            .find(|e| e.detail.contains("已熔断"))
+            .expect("熔断跃迁必须落一条事件");
+        assert_eq!(hit.kind, "warning", "熔断是告警级，不是普通 failover");
+        assert_eq!(hit.key_id.as_deref(), Some("k"));
+    }
+
+    /// 🔴 流内失败必须在日志页留下一条**红色**记录。
+    ///
+    /// 流式的日志行是在拿到 200 响应头那一刻写下的（kind `route` → 绿色「路由」组），
+    /// 延迟记的是到响应头的耗时。此前流内失败只纠正健康记账，那一行**没人回头改** ——
+    /// 于是用户在客户端看到报错、回到日志页看到「成功 · 200 · 1.2s」，
+    /// 而它真实卡了 180 秒。排障者据此判定「代理这边没问题」。
+    #[test]
+    fn a_stream_that_fails_mid_flight_leaves_a_visible_error_row() {
+        let store = temp_store();
+        store.upsert_key(key("k")).unwrap();
+
+        // 正常结束：一条 error 事件都不许落，否则每条正常流式请求都在「错误」组里冒一行。
+        record_stream_end(&store, CategoryType::ClaudeCli, "k", "claude-opus-4-8", "glm-4.6", false);
+        assert!(
+            store.list_all_events().iter().all(|e| e.kind != "error"),
+            "正常结束不许落错误事件"
+        );
+
+        record_stream_end(&store, CategoryType::ClaudeCli, "k", "claude-opus-4-8", "glm-4.6", true);
+        let ev = store.list_all_events();
+        let hit = ev.iter().find(|e| e.kind == "error").expect(
+            "流内失败必须落一条 error 事件（→ 日志页红色「错误」组）—— 否则整条请求在界面上\
+             只剩开流那一刻写下的「路由成功」",
+        );
+        assert_eq!(hit.key_id.as_deref(), Some("k"));
+        assert!(hit.detail.contains("流内失败"), "{}", hit.detail);
+        // 带**对外**模型名：那是用户在客户端看到的名字，上游真实名他不认识。
+        assert!(hit.detail.contains("claude-opus-4-8"), "{}", hit.detail);
+        assert_eq!(
+            store.get_key("k").unwrap().health.fail_count,
+            1,
+            "健康记账仍要照记（这一半此前是对的，别改坏）"
+        );
+
+        // 折叠：反复流内失败只占一行带 ×N，不挤 MAX_EVENTS 环。
+        record_stream_end(&store, CategoryType::ClaudeCli, "k", "claude-opus-4-8", "glm-4.6", true);
+        let errs: Vec<_> = store
+            .list_all_events()
+            .into_iter()
+            .filter(|e| e.kind == "error")
+            .collect();
+        assert_eq!(errs.len(), 1, "同 Key 同模型的连续流内失败应折叠成一条");
+        assert_eq!(errs[0].repeat, 2, "折叠后要带次数，否则量级看不出来");
+    }
+
+    /// 🔴 接线判据：**两条**流式出口都必须走 `record_stream_end`。
+    ///
+    /// 上面那条只测函数本身 —— 把 proxy.rs 任一处改回「自己写二选一 `record_live_*`」
+    /// 它照样全绿，而那正是「流内失败在日志页看不见」这个缺陷本身。
+    /// 同协议直通与跨协议翻译是两条独立的流末路径，各写一遍必然漏掉一条
+    /// （本仓已栽 10 次的接线盲区）。
+    #[test]
+    fn both_streaming_exits_must_record_through_record_stream_end() {
+        let src = std::fs::read_to_string("src/proxy.rs").unwrap();
+        let prod = crate::proxy::custom_headers::production_code_only(&src);
+        assert_eq!(
+            prod.matches("record_stream_end(").count(),
+            2,
+            "同协议直通与跨协议翻译两条流末路径都要走它"
+        );
+        // 流式路径不许自己记成功。历史缺陷（实测复现过）：拿到 2xx 响应头就同步
+        // `record_live_success` 清零 fail_count，于是「流内报错补记失败」永远只能把它
+        // 从 0 加到 1、够不到熔断阈值 → 该 Key 永不熔断、客户端无限重试同一条坏 Key。
+        // 生产段里 `record_live_success` 只该剩**非流式**成功分支那一处。
+        assert_eq!(
+            prod.matches("record_live_success(").count(),
+            1,
+            "只有非流式成功分支能直接记成功；流式一律走 record_stream_end（流末才知道结果）"
         );
     }
 

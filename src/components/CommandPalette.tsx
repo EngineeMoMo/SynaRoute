@@ -119,10 +119,15 @@ export function CommandPalette({ onClose, onNavigate, onEditKey, onAddKey }: Pro
       const proxyResults = await Promise.allSettled(CATEGORIES.map((c) => api.getProxyState(c)));
       if (!alive) return;
       setAllKeys(
-        CATEGORIES.map((cat, i) => ({
-          cat,
-          keys: keyResults[i].status === "fulfilled" ? keyResults[i].value : [],
-        })),
+        CATEGORIES.map((cat, i) => {
+          // 先存局部变量再判 status —— 不能写成 `keyResults[i].status === "fulfilled"
+          // ? keyResults[i].value : []`：那样两次索引在 TS 看来是两个不同的表达式，
+          // 类型收窄不生效，`.value` 在联合类型 `PromiseSettledResult` 上压根不存在
+          //（实测：临时开 `noUncheckedIndexedAccess` 时报 TS2339）。运行时没问题，
+          // 但同一个函数里下面那段已经是正确写法，两种写法并存迟早被抄错的那一种带走。
+          const r = keyResults[i];
+          return { cat, keys: r?.status === "fulfilled" ? r.value : [] };
+        }),
       );
       const px: Partial<Record<CategoryType, ProxyState>> = {};
       CATEGORIES.forEach((cat, i) => {

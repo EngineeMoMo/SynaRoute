@@ -505,6 +505,7 @@ fn import_rows(
             has_secret: false,
             // 导入即启用：用户是主动勾选的，默认可用符合预期；不想用可在列表里关。
             enabled: true,
+            allow_in_aggregate: false,
             priority: next_priority,
             headers_json: None,
             params: KeyParams::default(),

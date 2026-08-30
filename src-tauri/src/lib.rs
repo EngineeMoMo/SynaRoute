@@ -23,8 +23,7 @@ mod retrieval;
 /// 转发诊断响应头（`X-SynaRoute-*`）。独立成模块而不是塞进 proxy.rs：
 /// 那份「头里允许携带什么」的清单需要一个显眼的落脚点，且 proxy.rs 已经 5300+ 行。
 mod route_meta;
-#[path = "usage_commands.rs"] // 用量面板的 IPC 命令；抽出理由见该文件模块注释
-mod usage_commands;
+#[path = "usage_commands.rs"] mod usage_commands; // 用量面板的 IPC 命令；抽出理由见该文件模块注释
 mod secret;
 mod store;
 mod tools;
@@ -45,9 +44,7 @@ mod workdirs;
 use error::AppResult;
 use mcp::McpManager;
 use model::*;
-use parking_lot::Mutex;
 use proxy::ProxyManager;
-use std::collections::HashSet;
 use std::sync::Arc;
 use store::Store;
 use tauri::Manager;
@@ -57,8 +54,6 @@ pub struct AppState {
     store: Arc<Store>,
     proxy: Arc<ProxyManager>,
     mcp: Arc<McpManager>,
-    /// 正在查询余额的 Key ID 集合（并发控制，防止同一 Key 被重复查询）
-    balance_queries_in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
 // ============ 配置管理命令 ============
@@ -95,9 +90,8 @@ fn delete_key(state: tauri::State<AppState>, key_id: String) -> AppResult<()> {
 /// 注意：这会把明文返回给前端 WebView，仅用于本地单机自管密钥场景。
 #[tauri::command]
 fn reveal_secret(state: tauri::State<AppState>, key_id: String) -> AppResult<Option<String>> {
-    // 这里必须解出 Zeroizing：返回值要过 IPC 序列化给前端。
-    // 到这一步「明文进 WebView」已是该命令的既定语义（供编辑器眼睛查看），
-    // Zeroizing 保护的是**后端内部**那份副本的驻留时长。
+    // 这里必须解出 Zeroizing：返回值要过 IPC 序列化给前端。到这一步「明文进 WebView」
+    // 已是该命令的既定语义（供编辑器眼睛查看），Zeroizing 保护的是**后端内部**那份副本的驻留时长。
     Ok(state.store.secrets.read().get(&key_id)?.map(|s| s.to_string()))
 }
 
@@ -110,8 +104,8 @@ fn save_secret(state: tauri::State<AppState>, key_id: String, secret: String) ->
 ///
 /// 编排（含「启用时为何要补一次探测」的完整理由）在 [`service::toggle_key`]。
 /// 这里只负责它无法做的那件事：用 `AppHandle` 取 store 的 `Arc` 送进 `spawn`
-/// （不能把 `tauri::State` 跨 await 送进去），并让探测**异步跑、不阻塞返回**
-/// —— 它最长可达 8s，同步等待会让用户点一下开关就看到界面明显卡顿。
+/// （不能把 `tauri::State` 跨 await 送进去），并让探测**异步跑、不阻塞返回** ——
+/// 它最长可达 8s，同步等待会让用户点一下开关就看到界面明显卡顿。
 #[tauri::command]
 fn toggle_key(
     app: tauri::AppHandle,
@@ -294,184 +288,6 @@ async fn fetch_models_draft(
 async fn check_health(state: tauri::State<'_, AppState>, key_id: String) -> AppResult<()> {
     health::check_one(&state.store, &key_id).await;
     Ok(())
-}
-
-/// 查询某个 Key 的上游余额。
-///
-/// **不返回 Err 而是把失败装进 `BalanceResult.error`**：余额查不到是常态
-/// （站点没这接口、路径填错、网络抖动），而 IPC 层的 Err 在前端会变成一个
-/// 抛出的异常、需要 try/catch 才不炸掉整个面板。用值表达失败让前端能在
-/// 卡片上就地显示原因（方案 §2.1「失败必须可见」）。
-///
-/// 真正的 `Err` 只留给「Key 不存在」这种调用方用错了的情况。
-///
-/// # 参数
-/// - `force`: 为 `true` 时跳过缓存检查，强制查询上游（编辑器「测试查询」按钮使用）
-#[tauri::command]
-async fn query_key_balance(
-    state: tauri::State<'_, AppState>,
-    key_id: String,
-    force: Option<bool>,
-) -> AppResult<crate::model::BalanceResult> {
-    let force = force.unwrap_or(false);
-
-    // 先检查缓存：未过期直接返回，避免短时间内重复查询上游
-    // force=true 时跳过缓存检查（编辑器「测试查询」需要立即看到新值）
-    if !force {
-        if let Some(cached) = state.store.get_balance_cache(&key_id) {
-            tracing::debug!(
-                "余额缓存命中: key={} remaining={:?} age={}s",
-                key_id,
-                cached.remaining,
-                (chrono::Utc::now().timestamp_millis() - cached.queried_at) / 1000
-            );
-            return Ok(cached);
-        }
-    }
-
-    // 并发控制：如果该 Key 正在被查询，直接拒绝
-    {
-        let mut in_flight = state.balance_queries_in_flight.lock();
-        if in_flight.contains(&key_id) {
-            tracing::debug!("余额查询已在进行中，拒绝重复请求: key={}", key_id);
-            // **标记为瞬时**：这次压根没打上游，不代表任何结论。不标的话前端会把它
-            // 当真失败写进缓存，卡片被一条假错误钉住整个 TTL（最长 5 分钟），
-            // 而真正在跑的那次查询结果反被这条后到的伪失败盖掉。
-            return Ok(crate::model::BalanceResult::transient(
-                "该 Key 的余额查询正在进行中，请稍候",
-            ));
-        }
-        in_flight.insert(key_id.clone());
-    }
-
-    // 使用 scopeguard 确保无论成功或失败都移除标记
-    let key_id_for_guard = key_id.clone();
-    let in_flight_clone = state.balance_queries_in_flight.clone();
-    let _guard = scopeguard::guard((), move |_| {
-        in_flight_clone.lock().remove(&key_id_for_guard);
-    });
-
-    let Some(key) = state.store.get_key(&key_id) else {
-        return Err(crate::error::AppError::NotFound(key_id));
-    };
-    let Some(cfg) = key.balance_query.clone() else {
-        let reason = "该 Key 未配置余额查询";
-        state.store.append_event(
-            key.category_id,
-            // 失败用已登记的 warning（橙、归「错误」组）：中文 kind 前端认不出，会兜底成绿色「路由成功」
-            "warning",
-            Some(&key_id),
-            &format!("查询失败：{}", reason),
-        );
-        return Ok(crate::model::BalanceResult::failed(reason));
-    };
-
-    // 主口令锁定时取不到密钥：如实说明是「锁着」，不是「余额接口坏了」。
-    if state.store.secrets.read().is_locked() {
-        let reason = "密钥库已锁定，请先用主口令解锁";
-        state.store.append_event(
-            key.category_id,
-            // 失败用已登记的 warning（橙、归「错误」组）：中文 kind 前端认不出，会兜底成绿色「路由成功」
-            "warning",
-            Some(&key_id),
-            &format!("查询失败：{}", reason),
-        );
-        return Ok(crate::model::BalanceResult::failed(reason));
-    }
-
-    // 允许用另一条密钥查余额（部分站点的计费面板与转发端点不同域、各用各的凭证）。
-    let secret_key = cfg.api_key_ref.as_deref().unwrap_or(&key_id);
-    let secret = state.store.secrets.read().get(secret_key).ok().flatten();
-    let Some(secret) = secret else {
-        let reason = "未配置密钥";
-        state.store.append_event(
-            key.category_id,
-            // 失败用已登记的 warning（橙、归「错误」组）：中文 kind 前端认不出，会兜底成绿色「路由成功」
-            "warning",
-            Some(&key_id),
-            &format!("查询失败：{}", reason),
-        );
-        return Ok(crate::model::BalanceResult::failed(reason));
-    };
-
-    // 记录请求开始时间，用于计算响应时长
-    let start = std::time::Instant::now();
-
-    // 执行查询并记录结果
-    let result = crate::balance::query_balance(&key, &cfg, &secret).await;
-
-    let elapsed_ms = start.elapsed().as_millis();
-
-    // 构造请求 URL（用于日志诊断）
-    let base = cfg
-        .base_url_override
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&key.base_url);
-    let access_token = cfg.access_token.as_deref().unwrap_or("");
-    let user_id = cfg.user_id.as_deref().unwrap_or("");
-    // 脱敏：apiKey 与 accessToken 都换成 ***。{{accessToken}} 是占位符体系明文支持的
-    // URL 写法（部分面板把 token 放 query 参数），原样展开会把面板 token 明文写进
-    // 运行日志（可见、可导出、可截图）—— 此前只遮了 apiKey，与本行注释自己的声明矛盾。
-    let token_masked = if access_token.is_empty() { "" } else { "***" };
-    let url_for_log = crate::balance::expand_placeholders(&cfg.url, base, "***", token_masked, user_id);
-
-    // 记录查询结果到运行日志（成功与失败都记，满足「失败必须可见」原则）
-    // 格式：状态 | 耗时 | URL | 详情
-    let detail = if let Some(ref err) = result.error {
-        format!("❌ 查询失败 | {}ms | {} | {}", elapsed_ms, url_for_log, err)
-    } else if let Some(remaining) = result.remaining {
-        format!(
-            "✅ 查询成功 | {}ms | {} | 余额 {} {}{}{}",
-            elapsed_ms,
-            url_for_log,
-            remaining,
-            result.unit.as_deref().unwrap_or("USD"),
-            result.total.map(|t| format!(" / 总额 {}", t)).unwrap_or_default(),
-            if result.is_valid == Some(false) { " · 已失效" } else { "" }
-        )
-    } else {
-        format!("⚠️ 查询成功但未取到余额值 | {}ms | {}", elapsed_ms, url_for_log)
-    };
-
-    state.store.append_event(
-        key.category_id,
-        // kind 必须用**前端登记过的**英文标识：曾经这里写中文 "余额"，前端 TYPE_META 没有该键，
-        // 于是走 `?? TYPE_META.route` 兜底 → 余额**查询失败**被渲染成绿色「路由成功」，
-        // 且在「错误」筛选里查不到（用户完全看不见失败）。现在按结果分流：
-        // 失败 → warning（橙、归「错误」组）；成功 → balance（信息态、归「系统」组）。
-        if result.error.is_some() { "warning" } else { "balance" },
-        Some(&key_id),
-        &detail,
-    );
-
-    // 探测命中的端点写回配置：此后每次只发 1 个请求，不再重跑整条探测链。
-    //
-    // 只在**真探测过且命中**时才有值（见 `BalanceResult::resolved_url_template`）。
-    // 走 `set_balance_query_url` 而非整份 upsert：那会把打开编辑器那一刻的旧快照写回去，
-    // 顺带清掉运行中的熔断与余额缓存（`upsert_key` 的守卫只保这两项，其余字段照覆盖）。
-    // 失败只记日志：地址没记住的代价是下次再探测一遍，而让一次成功的查询报错是更糟的。
-    if let Some(ref tpl) = result.resolved_url_template {
-        match state.store.set_balance_query_url(&key_id, tpl) {
-            Ok(true) => state.store.append_event(
-                key.category_id,
-                "config",
-                Some(&key_id),
-                &format!("余额查询地址已自动记住：{tpl}（此后不再逐个试探端点）"),
-            ),
-            Ok(false) => {}
-            Err(e) => tracing::warn!("记住余额查询地址失败（key={key_id}，下次会重新探测）: {e}"),
-        }
-    }
-
-    // 更新缓存（成功和失败都缓存，避免对失败端点短时间内重复轰炸）
-    // 缓存写入失败只记日志，不阻止查询结果返回（缓存是优化手段，不是核心目标）
-    if let Err(e) = state.store.update_balance_cache(&key_id, result.clone()) {
-        tracing::warn!("余额缓存写入失败（key={}, 不影响本次查询）: {}", key_id, e);
-    }
-
-    Ok(result)
 }
 
 // ============ 大脑聚合命令 ============
@@ -806,7 +622,7 @@ async fn set_active_model(
     category_id: CategoryType,
     model: String,
 ) -> AppResult<()> {
-    state.store.set_active_model(category_id, &model)?;
+    crate::tools::codex::select_model(&state.store, category_id, &model)?;
     // 主窗口下拉改选后，同步刷新托盘子菜单的勾选态（托盘菜单静态构建，需主动重建）。
     let _ = rebuild_tray(&app);
     Ok(())
@@ -1427,6 +1243,10 @@ pub fn run() {
         });
     }
 
+    // 余额闸门的数据源（B4）。线程与节奏都收在模块里；**刻意独立一趟**的三条理由
+    // （关掉探测会一起停 / 周期被探测间隔牵着走 / 吃掉那一轮的 timeout 预算）见其文档。
+    health::balance_gate::spawn_background(store.clone());
+
     tauri::Builder::default()
         // 单实例：再次启动时聚焦已有窗口，避免开多个进程（必须最先注册）
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -1446,7 +1266,6 @@ pub fn run() {
             store,
             proxy,
             mcp,
-            balance_queries_in_flight: Arc::new(Mutex::new(HashSet::new())),
         })
         .setup(|app| {
             build_tray(app.handle())?;
@@ -1529,6 +1348,7 @@ pub fn run() {
             save_secret,
             reveal_secret,
             toggle_key,
+            store::key_flags::set_key_allow_in_aggregate,
             scan_ccswitch,
             import_from_ccswitch,
             fetch_models,
@@ -1553,7 +1373,8 @@ pub fn run() {
             usage_commands::get_daily_usage,
             usage_commands::get_usage_with_cost,
             usage_commands::get_pricing_table_date,
-            query_key_balance,
+            tools::codex::codex_catalog::get_codex_config_model,
+            health::balance_gate::query_key_balance,
             show_main_window_cmd,
             recent_failure,
             get_event_trace,
@@ -1907,16 +1728,14 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 }
                 _ if id.starts_with(TRAY_MODEL_PREFIX) => {
                     // model::<名> → 切 Codex 当前对外模型（空名=跟随客户端透传）。
-                    // 复用 set_active_model：每请求实时重读，切换即时生效、免重启 Codex。
+                    // 走 codex::select_model：它同时写 config.toml 的 `model`，否则模型目录
+                    // 上线后 `model_choice::pick` 会尊重 Codex 发来的名字 → 托盘点了没反应。
                     let model = id.strip_prefix(TRAY_MODEL_PREFIX).unwrap_or("");
                     let state = app.state::<AppState>();
-                    if let Err(e) = state.store.set_active_model(CategoryType::Codex, model) {
-                        state.store.append_event(
-                            CategoryType::Codex,
-                            "error",
-                            None,
-                            &format!("托盘切换模型失败: {e}"),
-                        );
+                    let cat = CategoryType::Codex;
+                    if let Err(e) = crate::tools::codex::select_model(&state.store, cat, model) {
+                        let msg = format!("托盘切换模型失败: {e}");
+                        state.store.append_event(cat, "error", None, &msg);
                         return;
                     }
                     let shown = if model.is_empty() { "跟随客户端（透传）" } else { model };
@@ -1924,7 +1743,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                         CategoryType::Codex,
                         "config",
                         None,
-                        &format!("托盘切换 Codex 模型 → {shown}（即时生效）"),
+                        &format!("托盘切换 Codex 模型 → {shown}（新会话生效）"),
                     );
                     // 重建菜单以刷新勾选与 tooltip。
                     let _ = rebuild_tray(app);

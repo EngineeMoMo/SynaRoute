@@ -84,6 +84,77 @@ pub(crate) fn category_from_argv<I: IntoIterator<Item = String>>(
 // 复用与 HTTP 完全相同的 dispatch（initialize / tools/list / tools/call / ping），
 // 只是传输层换成标准输入输出。通知（无 id）不回响应，与 HTTP 语义一致。
 
+/// stdio 子进程的诊断日志。**刻意不经 `Store`**。
+///
+/// # 为什么必须有它
+///
+/// 这一跳此前**零可观测性**：主应用记「我返回了结果」（`mcp` 事件带完整 trace），
+/// Codex 记「我收到空」，而中间这个进程什么都不说。2026-08-29 那次排查就卡在这里 ——
+/// 超时（Codex 300s / 转发 600s / 聚合 600s）、MCP 注册、`content` 为空三种假设
+/// 逐一被排除后，剩下的候选全在本进程内，而现有日志一条都覆盖不到。
+///
+/// 子进程不碰 `Store` 是刻意的（见 [`run_stdio`]：被 MSIX 客户端拉起会继承包身份，
+/// 读 `%APPDATA%` 被虚拟化），所以这里直接写 **exe 同级 `logs/`** ——
+/// 与主应用那条「启动自检」用的是同一个已验证的非虚拟化通道。
+///
+/// 🔴 **macOS 必须另走一支**，理由与 [`super::mcp_port_file_path`] 一字不差：
+/// `current_exe()` 在 `SynaRoute.app/Contents/MacOS/` 下，写进去会被 updater 的整包替换
+/// 清掉、让 codesign 的 sealed resources 校验失败、在只读卷上直接写失败。
+/// 而 macOS 压根没有 AppData 虚拟化，`~/Library/Application Support/` 对主应用与
+/// stdio 子进程是同一份。第一版照搬了 exe 同级 —— **两个方向都静默**：mac 上日志进包内
+/// 或写不出，Windows 上装在 Program Files 且同级不可写时一行都不写，
+/// 而排障者按文档以为「这一跳已经有日志了」，去找一个永远不存在的文件。
+///
+/// # 三条刻意行为
+///
+/// - **单独一个文件**（不进 `YYYY-MM-DD.jsonl`）：那个文件由主应用的写线程独占、
+///   并靠自己的体积记账做滚动分片（`log_rotate`），第二个追加者会把那份记账搞乱。
+///   （不是「多进程写同一文件必然撕裂」—— 本文件自己就被多个 stdio 子进程共写，
+///   每次 tool call 只 2~3 行短行，实践上够用。）
+/// - **超过上限就整份重写**，不做滚动：`log_rotate::cleanup_old_logs_in` 按 `%Y-%m-%d`
+///   解析文件名，这个名字解析不出来 → **永不被保留期清理**，不自己设上限就是无界增长。
+/// - **绝不记 prompt / 响应正文**：只记 method、字节数、耗时、每一步的成败。
+///   正文已经在主应用的 trace 里（那里有脱敏与体积上限），这里再写一份等于绕过它们
+///   —— 而这个文件落在 exe 同级、不受保留期管、用户会直接贴出来（同 2026-08-27
+///   那次令牌泄露的三个「用户会分享出去的地方」之一）。有判据盯着，见测试段。
+fn diag(line: &str) {
+    /// 1 MB 足够放下几千次调用的诊断行；到顶整份重写，不滚动（见函数文档）。
+    const CAP: u64 = 1024 * 1024;
+    let Some(dir) = diag_dir() else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("mcp-stdio.log");
+    let over = std::fs::metadata(&path).map(|m| m.len() > CAP).unwrap_or(false);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let row = format!("{stamp} pid={} {line}\n", std::process::id());
+    use std::io::Write as _;
+    let opened = if over {
+        std::fs::File::create(&path)
+    } else {
+        std::fs::OpenOptions::new().create(true).append(true).open(&path)
+    };
+    if let Ok(mut f) = opened {
+        let _ = f.write_all(row.as_bytes());
+    }
+}
+
+/// 诊断日志目录。平台分支与 [`super::mcp_port_file_path`] **必须保持一致** ——
+/// 两者是同一个「stdio 子进程与主应用要读写同一份文件」的问题，分叉就等于其中一个走错地方。
+pub(crate) fn diag_dir() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(dirs::data_dir()?.join("SynaRoute").join("logs"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some(std::env::current_exe().ok()?.parent()?.join("logs"))
+    }
+}
+
 /// stdio MCP 主循环：逐行读 stdin 的 JSON-RPC 请求，处理后把响应逐行写 stdout。
 /// 阻塞直到 stdin 关闭（客户端结束子进程时）。返回后进程应退出。
 ///
@@ -99,32 +170,106 @@ pub(crate) fn category_from_argv<I: IntoIterator<Item = String>>(
 ///
 /// 分类身份来自**自己的 argv**（注册时写死，见 [`CATEGORY_FLAG_PREFIX`]）。在这里读一次、
 /// 整个进程生命周期不变 —— 一个 stdio 子进程只属于一个客户端。
+/// 这一行是不是一条**带 id 的 `ping`**？是则返回它的 id。
+///
+/// 只给「转发进行中插进来的行」用（见 [`run_stdio`] 里那个 `select!`）。刻意不在这里
+/// 做完整解析与留痕：非 ping 的行会原样排队，由主循环按它自己那套流程处理并留痕，
+/// 否则同一行会被记两遍 `recv`。
+fn ping_id(line: &str) -> Option<Value> {
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("method").and_then(Value::as_str) != Some("ping") {
+        return None;
+    }
+    v.get("id").cloned().filter(|i| !i.is_null())
+}
+
+/// 写一条响应给客户端。返回 `false` = 管道已不可用，调用方该收尾退出。
+///
+/// 抽成函数是因为**两处**要写：主循环，以及转发进行中即时回的那条 `ping`。
+async fn write_resp(stdout: &mut tokio::io::Stdout, resp: &Value, method: &str) -> bool {
+    use tokio::io::AsyncWriteExt;
+    let mut out = serde_json::to_vec(resp).unwrap_or_default();
+    out.push(b'\n');
+    let bytes = out.len();
+    if let Err(e) = stdout.write_all(&out).await {
+        diag(&format!("write_all FAILED method={method} bytes={bytes}: {e}"));
+        return false;
+    }
+    // 🔴 `flush` 的错误此前是 `let _ =` 吞掉的。`write_all` 只保证进了缓冲区，
+    // **真正让对方看见的是 flush** —— 吞掉它的失效形态正是「我们以为发出去了、
+    // 对方什么也没收到」，也就是 2026-08-29 那次「三次调用都返回空」的候选根因之一。
+    if let Err(e) = stdout.flush().await {
+        diag(&format!("flush FAILED method={method} bytes={bytes}: {e}"));
+        return false;
+    }
+    if method == "tools/call" {
+        diag(&format!("sent method={method} bytes={bytes}"));
+    }
+    true
+}
+
 pub async fn run_stdio() {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     // 只读一次：本进程的身份是固定的。取不到 = 客户端配置是旧版（尚未被重写），
     // 此时转发到哨兵段，由服务端在「桌面端 / Codex」之间精确兜底并落一条可见事件。
     let caller = category_from_argv(std::env::args());
 
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
+    // 🔴 进程启动就留一行。没有它，「日志文件是空的」在四种成因间完全无法区分：
+    // 子进程压根没被客户端拉起 / 拉起了但客户端一个字节都没发 / logs 目录不可写 /
+    // 握手那行 JSON 没解析成。而「文件里什么都没有」正是 2026-08-29 那次卡住的形态。
+    // 同时记下认出的分类 —— 这一跳唯一有历史的静默失效维度就是「认成了 claude-cli」。
+    diag(&format!("start caller={caller:?}"));
+
+    // 🔴 stdin 交给一个独立任务读，主循环只从 channel 取整行。
+    //
+    // 为什么不能在主循环里直接 `select!` 一个 `read_line`：`AsyncBufReadExt::read_line`
+    // **不是 cancel-safe** 的 —— 转发先完成时那个 future 被 drop，已经读进缓冲的半行就丢了，
+    // 而丢半行等于把 JSON-RPC 流撕开（此后每一行都解析失败，表现是「工具突然全坏」）。
+    // `mpsc::Receiver::recv` 才是 cancel-safe 的，故把「读」隔离进任务、只在 channel 上 select。
+    //
+    // 容量 64 是背压：客户端灌得太快时读任务自己阻塞在 send 上，不会把行无界堆进内存。
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(tokio::io::stdin());
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf).await {
+                Ok(0) | Err(_) => break, // EOF / 读错误：客户端关了管道
+                Ok(_) => {}
+            }
+            if tx.send(buf.clone()).await.is_err() {
+                break; // 主循环已退出，没人收了
+            }
+        }
+    });
+
     let mut stdout = tokio::io::stdout();
-    let mut line = String::new();
+    // 转发进行中到达、且**不该抢先回答**的请求：排队等本次调用结束（见下面 select 的注释）。
+    let mut pending: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
     loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break, // EOF：客户端关闭了管道，退出循环 → 进程结束
-            Ok(_) => {}
-            Err(_) => break,
-        }
+        // 先消化排队的，再去 channel 取新的 —— 否则「转发期间攒下的请求」会被后到的插队。
+        let line = match pending.pop_front() {
+            Some(l) => l,
+            None => match rx.recv().await {
+                Some(l) => l,
+                None => break, // stdin 已关且队列已空 → 进程该退出
+            },
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         let msg: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
-            Err(_) => continue, // 非法 JSON：忽略该行（无 id 无从回错）
+            // 非法 JSON：忽略该行（无 id 无从回错）。**只记长度不记内容** —— 这条 continue
+            // 此前完全无痕，而「握手那行没解析成」就藏在这里。
+            Err(_) => {
+                diag(&format!("bad json, {} bytes ignored", trimmed.len()));
+                continue;
+            }
         };
 
         let id = msg.get("id").cloned();
@@ -135,6 +280,9 @@ pub async fn run_stdio() {
         }
         let id = id.unwrap();
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
+        // 收到即记，与下面的 `sent` 配成一对。两者的时间差把「一次 tools/call 有多长」
+        // 以及「期间排了几条请求」暴露出来。
+        diag(&format!("recv method={method}"));
 
         let resp = match super::local_static_response(method, &params) {
             // 握手/列举/心跳/资源探测：本地静态响应（与 HTTP dispatch 共用同一表），
@@ -142,18 +290,63 @@ pub async fn run_stdio() {
             Some(Ok(result)) => super::rpc_ok(id, result),
             Some(Err((code, msg))) => super::rpc_error(id, code, &msg),
             // tools/call：转发到运行中主应用（持有真实配置）。
-            None => match forward_tool_call_to_main(&params, caller).await {
-                Ok(value) => super::rpc_ok(id, value),
-                Err(msg) => super::rpc_ok(id, super::tool_error_content(&msg)),
-            },
+            None => {
+                let t0 = std::time::Instant::now();
+                let fwd = forward_tool_call_to_main(&params, caller);
+                tokio::pin!(fwd);
+                // 🔴 转发期间**继续读 stdin**，但只即时回 `ping`。
+                //
+                // 主循环此前在这里一动不动最长 600s：客户端的 keepalive ping 排在队里得不到
+                // 回应，于是它认为 MCP server 已死 → 断开或杀掉子进程，用户看到的正是
+                // 「工具不可用 / 返回空」，而那恰恰是本轮要归因的症状。
+                //
+                // **刻意只放 ping 过去**，其余请求一律排队：让两个 `tools/call` 并发跑是
+                // 另一件事（两轮聚合同时烧额度、响应还会乱序，而客户端未必都容得下乱序），
+                // 而 `ping` 是纯本地静态回答、零副作用。范围最小、收益最大。
+                let mut stdin_open = true;
+                let r = loop {
+                    tokio::select! {
+                        res = &mut fwd => break res,
+                        got = rx.recv(), if stdin_open => match got {
+                            // stdin 关了也要把这次转发跑完并写出去（写失败会在下面收尾）。
+                            // 必须置 false：否则 recv 立刻再返 None，这里就成了忙等。
+                            None => stdin_open = false,
+                            Some(l) => match ping_id(&l) {
+                                Some(pid) => {
+                                    diag("recv method=ping (转发进行中，即时回)");
+                                    if !write_resp(&mut stdout, &super::rpc_ok(pid, json!({})), "ping").await {
+                                        stdin_open = false;
+                                    }
+                                }
+                                None => pending.push_back(l),
+                            },
+                        },
+                    }
+                };
+                let ms = t0.elapsed().as_millis();
+                match r {
+                    Ok(value) => {
+                        // 刻意**不**在这里记结果长度：那要把整个结果再序列化一遍，而失败时
+                        // 会显示成 `0` —— 与「返回空」这个正在查的症状撞车。长度统一由
+                        // `sent` 那行的 `bytes` 给（它是真正写出去的字节数）。
+                        diag(&format!("forward ok method={method} {ms}ms"));
+                        super::rpc_ok(id, value)
+                    }
+                    Err(msg) => {
+                        // 转发失败会变成一段可读的工具错误文本发回客户端（不是空）——
+                        // 记一行是为了让「客户端显示了错误」与「客户端显示了空」在日志里可分辨。
+                        diag(&format!("forward err method={method} {ms}ms: {msg}"));
+                        super::rpc_ok(id, super::tool_error_content(&msg))
+                    }
+                }
+            }
         };
-        let mut out = serde_json::to_vec(&resp).unwrap_or_default();
-        out.push(b'\n');
-        if stdout.write_all(&out).await.is_err() {
+        // 写失败即退出循环：管道已经不可用，继续读下一条请求只会攒出更多无人收的响应。
+        if !write_resp(&mut stdout, &resp, method).await {
             break;
         }
-        let _ = stdout.flush().await;
     }
+    diag("stdio loop ended (stdin EOF or write error)");
 }
 
 /// 把 stdio 收到的 `tools/call` 转发到运行中主应用的 HTTP MCP。
@@ -270,6 +463,168 @@ async fn probe_mcp_alive(port: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔴 `flush` 的错误**不许被吞**，而且这一跳必须有可观测性。
+    ///
+    /// 背景：2026-08-29 那次「三次调用 `synaroute_ai` 都返回空」查到最后卡在本进程 ——
+    /// 超时（Codex 300s / 转发 600s / 聚合 600s）、MCP 注册、`content` 为空三种假设
+    /// 全部排除后，剩下的候选都在这里，而当时**一条日志都没有**。
+    ///
+    /// `write_all` 只保证进缓冲区，真正让对方看见的是 `flush`；原实现
+    /// `let _ = stdout.flush().await;` 把它的错误丢了 —— 失效形态正是
+    /// 「我们以为发出去了、对方什么也没收到」。
+    #[test]
+    fn the_flush_error_must_not_be_swallowed_and_the_hop_must_be_observable() {
+        let src = std::fs::read_to_string("src/mcp/stdio.rs").unwrap();
+        let prod = crate::proxy::custom_headers::production_code_only(&src);
+        assert!(
+            !prod.contains("let _ = stdout.flush()"),
+            "flush 的错误不许用 `let _ =` 吞掉 —— 那是「以为发出去了、对方没收到」的成因"
+        );
+        assert!(
+            prod.contains("stdout.flush().await") && prod.contains("flush FAILED"),
+            "flush 必须处理错误并留痕"
+        );
+        assert!(
+            prod.contains("write_all FAILED"),
+            "write_all 失败也要留痕，否则与 flush 失败在日志里无从分辨"
+        );
+        assert!(
+            prod.contains("forward ok") && prod.contains("forward err"),
+            "转发的成败与耗时必须记 —— 主应用侧只知道自己返回了，分辨不出客户端有没有收到"
+        );
+    }
+
+    /// 🔴 诊断日志**绝不带正文**，而且判据必须按**整个调用表达式**判、不能按行。
+    ///
+    /// 正文（prompt / 聚合结果）已经在主应用的 trace 里，那里有脱敏与体积上限；
+    /// 在这里再写一份等于绕过两者，而这个文件还落在 exe 同级、不受保留期管、
+    /// 用户会直接贴出来（同 2026-08-27 那次令牌泄露的三个「用户会分享出去的地方」之一）。
+    ///
+    /// ⚠️ **第一版按行扫，而文件里唯一的多行 `diag` 调用整个逃出了扫描范围**（实测注入：
+    /// 在那个多行调用的续行里塞一个 `prompt=…` 照样全绿）。同本仓「判据存在 ≠ 判对了维度」
+    /// 那条。现在按「从 `diag(` 扫到分号」取整段。
+    ///
+    /// 另加两条：`println!`/`print!` 一律禁 —— **stdout 是 JSON-RPC 协议信道**，
+    /// 往里写一个字节就会让客户端的 MCP「握不上手 / 工具是空壳」，而这类症状最难归因到
+    /// 一句调试打印上；而且本模式下 tracing **没有 subscriber**（`lib.rs` 里 stdio 早退
+    /// 排在 tracing init 之前），`warn!` 是空操作 —— 想在这里排障只能用 `diag`。
+    #[test]
+    fn the_diag_log_never_carries_prompt_or_response_text() {
+        let src = std::fs::read_to_string("src/mcp/stdio.rs").unwrap();
+        let prod = crate::proxy::custom_headers::production_code_only(&src);
+        let mut calls = 0usize;
+        let mut rest = prod.as_str();
+        while let Some(at) = rest.find("diag(") {
+            rest = &rest[at + 5..];
+            let end = rest.find(';').unwrap_or(rest.len());
+            let expr = &rest[..end];
+            calls += 1;
+            for banned in ["prompt", "arguments", "text", "analysis", "params", "content"] {
+                assert!(
+                    !expr.contains(banned),
+                    "诊断调用不许携带 `{banned}`（正文只该进主应用的 trace）：{}",
+                    expr.trim()
+                );
+            }
+        }
+        // 解析到太少就主动判失败：调用形态一变（比如包一层 helper），
+        // 上面那个循环会静默退化成「什么都没查」。同 `invoke-command-must-exist` 那条门。
+        assert!(calls >= 6, "只扫到 {calls} 处 diag 调用，判据多半已失效");
+        for banned in ["println!", "print!"] {
+            assert!(
+                !prod.contains(banned),
+                "stdout 是 JSON-RPC 协议信道，`{banned}` 会直接污染它（本模式下也没有 tracing subscriber，排障只能用 diag）"
+            );
+        }
+        // 上限必须在：这个文件名解析不出日期，`cleanup_old_logs_in` 永不清理它。
+        assert!(
+            prod.contains("const CAP:") && prod.contains("File::create"),
+            "必须有体积上限并在到顶时整份重写，否则是无界增长"
+        );
+        // macOS 必须另走一支：exe 同级在 .app bundle 内部（updater 整包替换会清掉、
+        // codesign 校验会失败、只读卷直接写失败）。平台分支与 mcp_port_file_path 同源。
+        assert!(
+            prod.contains("target_os = \"macos\"") && prod.contains("dirs::data_dir()"),
+            "diag_dir 必须有 macOS 分支，否则 mac 上日志写进 app 包内部或压根写不出"
+        );
+        // 🔴 接线判据：可观测性存在于磁盘上但到不了排障者手上，等于没有。
+        // 用户交出来的是诊断报告和 `logs/*.jsonl` —— 这个文件必须在报告里点名，
+        // 否则没人知道去 tail 它（也没有任何界面/文档提到它）。删掉那行不会有别的东西变红。
+        let diagnostics = std::fs::read_to_string("src/diagnostics.rs").unwrap();
+        let dprod = crate::proxy::custom_headers::production_code_only(&diagnostics);
+        assert!(
+            dprod.contains("mcp-stdio.log") && dprod.contains("stdio::diag_dir()"),
+            "诊断报告必须打出 mcp-stdio.log 的路径 —— 且要用 diag_dir()，\
+             不能拿 effective_log_dir 拼（用户改过 logDir 时那是另一个目录）"
+        );
+    }
+
+    /// 🔴 转发进行中只有 `ping` 能插队，而且 stdin 必须由独立任务读。
+    ///
+    /// 两条不变量，各对应一个真实故障：
+    ///
+    /// ① **`read_line` 不许出现在 `select!` 的分支里** —— 它**不是 cancel-safe** 的：
+    ///    转发先完成时那个 future 被 drop，已读进缓冲的半行就丢了，而丢半行等于把
+    ///    JSON-RPC 流撕开（此后每一行都解析失败，表现是「工具突然全坏」）。
+    ///    故生产段里 `read_line` 只该出现**一次**：在那个专职读 stdin 的任务里。
+    ///
+    /// ② **非 ping 的请求必须排队，不许即时回答**：让两个 `tools/call` 并发跑是另一件事
+    ///    （两轮聚合同时烧额度、响应还会乱序，而客户端未必都容得下乱序）。
+    #[test]
+    fn only_ping_may_jump_the_queue_and_stdin_must_be_read_by_a_task() {
+        let src = std::fs::read_to_string("src/mcp/stdio.rs").unwrap();
+        let prod = crate::proxy::custom_headers::production_code_only(&src);
+        assert_eq!(
+            prod.matches("read_line(").count(),
+            1,
+            "read_line 不是 cancel-safe 的，只许在专职读 stdin 的任务里出现一次 —— \
+             放进 select! 分支会在转发先完成时丢掉半行，把 JSON-RPC 流撕开"
+        );
+        // 更直接的一刀：那唯一一次必须排在 `select!` **之前**（= 在读任务里，
+        // 而不是在 select 的某条分支里）。只查次数的话，「把读任务删掉、改在分支里读」
+        // 仍然是 1 次、判据会绿。
+        let last_read = prod.rfind("read_line(").expect("上面刚断言过存在");
+        let select_at = prod.find("tokio::select!").expect("找不到 select! —— 判据失去参照物");
+        assert!(
+            last_read < select_at,
+            "read_line 只能出现在 select! 之前的读任务里，不许出现在 select 分支中"
+        );
+        assert!(
+            prod.contains("tokio::select!") && prod.contains("rx.recv(), if stdin_open"),
+            "转发期间必须继续从 channel 取行（否则客户端 keepalive ping 排队超时，\
+             它会认为 MCP server 已死并杀掉子进程）"
+        );
+        assert!(
+            prod.contains("pending.push_back(l)"),
+            "非 ping 的请求必须排队等本次 tools/call 结束，不许并发抢答"
+        );
+        // `if stdin_open` 那个门是防忙等的：recv 返回 None 后不置 false，select 会立刻
+        // 再次拿到 None，这个 loop 就变成 100% CPU 空转。
+        assert!(
+            prod.contains("None => stdin_open = false"),
+            "stdin 关闭后必须停掉那条 select 分支，否则是忙等"
+        );
+    }
+
+    /// `ping_id` 只认「带 id 的 ping」。判错的两个方向都有代价：
+    /// 认漏了 → keepalive 仍然排队（回到缺陷本身）；认多了 → 别的请求被回成空对象。
+    #[test]
+    fn ping_id_recognizes_exactly_the_pings_that_need_an_answer() {
+        assert_eq!(ping_id(r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#), Some(json!(7)));
+        assert_eq!(
+            ping_id(r#"{"jsonrpc":"2.0","id":"abc","method":"ping","params":{}}"#),
+            Some(json!("abc"))
+        );
+        // 通知形态的 ping（无 id）不需要响应 —— 回一条反而是协议错误
+        assert_eq!(ping_id(r#"{"jsonrpc":"2.0","method":"ping"}"#), None);
+        assert_eq!(ping_id(r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#), None);
+        // 别的方法一律排队，不许在这里被当成 ping 回掉
+        assert_eq!(ping_id(r#"{"id":1,"method":"tools/call"}"#), None);
+        assert_eq!(ping_id(r#"{"id":1,"method":"tools/list"}"#), None);
+        assert_eq!(ping_id("not json"), None);
+        assert_eq!(ping_id(""), None);
+    }
 
     /// 🔴 本轮的核心不变量：桌面端与 Codex 的 stdio args **必须不同**。
     ///

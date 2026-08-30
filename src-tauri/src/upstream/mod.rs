@@ -25,6 +25,10 @@ mod endpoint;
 mod probe;
 mod session;
 mod sse;
+mod stream_idle;
+/// 上游因思考签名验不过而拒绝时的请求整流。放在 `upstream` 而不是 `proxy` 下：
+/// 它修的是「上游对请求体的兼容性要求」，与协议适配同一类事（cc-switch 也放在代理层）。
+mod thinking_rectify;
 mod tools_meta;
 mod usage;
 mod util;
@@ -45,6 +49,8 @@ pub use completion::text_completion;
 pub use discovery::fetch_models;
 pub use probe::{health_probe, health_probe_real};
 pub use sse::{sse_direction, SseTranslator};
+pub(crate) use stream_idle::guard as guard_stream_idle;
+pub(crate) use thinking_rectify::rectify_on_signature_error as rectify_thinking_signature;
 pub use convert::{
     apply_pending_thinking, convert_request_owned, convert_response_ext, strip_pending_effort,
 };
@@ -55,6 +61,39 @@ pub use session::{
 };
 pub use endpoint::join_endpoint;
 pub use usage::{extract_usage, extract_usage_from_sse, with_usage, TokenUsage};
+
+/// 上游给的 `tool_calls[].index` → 我们内部的槽位下标。**越界返回 `None`，调用方必须跳过。**
+///
+/// # 🔴 为什么必须有上限：这是一条上游可触发的内存耗尽
+///
+/// `sse.rs` 的 Chat 增量累积写的是 `while self.tool_calls.len() <= idx { push(...) }` ——
+/// 也就是**上游响应里一个整数直接决定我们分配多少内存**。上游发
+/// `{"index": 4294967295}` 就能让我们 push 40 亿个 `(String, String, String)`
+/// （每个至少 72 字节 → 数百 GB），进程当场被 OOM 杀掉。
+///
+/// 这不是理论情形：用户接的是**第三方中转站**，那正是这条链路上不可信的一方，
+/// 而本仓在别处已经对上游做过同类防护（`TAIL_WINDOW_BYTES` / `REQ_LOG_CAP`）。
+///
+/// # 为什么是「跳过」而不是「钳制到上限」
+///
+/// 钳制会把不同 index 的增量挤进同一个槽，拼出一个**参数被拼接错的工具调用** ——
+/// 那比丢掉一条增量糟得多（客户端会拿着错参数真的去执行）。
+///
+/// 上限 256 远宽于现实：OpenAI 并行工具调用实测不超过几十个。越界只警告一次
+/// （同 `log_rotate::give_up_rolling` 的做法）—— 它每个 chunk 都可能触发，
+/// 刷屏会把真正有用的日志挤掉。
+pub(crate) fn tool_slot(index: Option<&serde_json::Value>) -> Option<usize> {
+    const MAX_TOOL_SLOTS: u64 = 256;
+    let idx = index.and_then(serde_json::Value::as_u64).unwrap_or(0);
+    if idx >= MAX_TOOL_SLOTS {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!("上游返回的 tool_call index={idx} 超出上限，已忽略该增量");
+        }
+        return None;
+    }
+    Some(idx as usize)
+}
 
 /// 判断上游非流式响应体里是否出现截断信号。
 ///
@@ -325,8 +364,75 @@ mod sse_golden;
 
 #[cfg(test)]
 mod tests {
-    
+
     use super::testfix::*;
+
+    /// 🔴 `proxy.rs` 那两处 `expect("…必然已收集")` 成立的**唯一依据**，钉住它的来源。
+    ///
+    /// 审查时确认过：它们**当前不会 panic** —— `tool_sets` 是
+    /// `sse_dir.map(|_| …)` 出来的，`Option::map` 的语义已经保证「`sse_dir` 是 Some ⟹
+    /// `tool_sets` 是 Some」；`resp_tool_sets` 同理由 `(downstream != key.protocol).then(…)`
+    /// 派生，与使用它的那个分支条件是同一个判断。Rust 只是不知道两个 `Option` 的关联。
+    ///
+    /// 也就是说风险不在今天，而在**日后有人把生成条件改成别的** —— 那时 `expect` 会
+    /// panic 在转发热路径上（那一个请求整个挂掉）。
+    ///
+    /// 用类型把两者绑成一个 `Option<(dir, sets)>` 能让编译器保证，但那是重构、
+    /// 而 `proxy.rs` 棘轮余量为 0，且不该紧挨着一次未做的真机验证做（同 docs/15 那四项
+    /// 「刻意未做」的理由）。这条判据用零成本换到同样的保护：改了派生方式就变红。
+    #[test]
+    fn the_two_sse_invariants_must_stay_derived_not_assumed() {
+        let src = std::fs::read_to_string("src/proxy.rs").unwrap();
+        let prod = crate::proxy::custom_headers::production_code_only(&src);
+        assert!(
+            prod.contains("let tool_sets = sse_dir.map("),
+            "tool_sets 必须由 sse_dir.map 派生 —— 那是 expect(\"sse_dir 为 Some 时…\") \
+             成立的唯一依据。改成别的条件就得同时把那个 expect 换成真正的错误处理"
+        );
+        assert!(
+            prod.contains("let resp_tool_sets = (downstream != key.protocol).then("),
+            "resp_tool_sets 必须由「跨协议」这同一个条件派生 —— 那是它那处 expect 的唯一依据"
+        );
+    }
+
+    /// 🔴 上游给的 `tool_calls[].index` 曾经直接决定我们分配多少内存
+    /// （`while self.tool_calls.len() <= idx { push(...) }`）。
+    /// 一个 `{"index": 4294967295}` 就是 40 亿个三元组 → 进程被 OOM 杀掉。
+    /// 用户接的是第三方中转站，那正是这条链路上不可信的一方。
+    #[test]
+    fn a_huge_tool_index_from_upstream_is_refused_not_allocated() {
+        use serde_json::json;
+        let slot = super::tool_slot;
+        assert_eq!(slot(Some(&json!(0))), Some(0));
+        assert_eq!(slot(Some(&json!(255))), Some(255), "现实用量远低于上限");
+        assert_eq!(slot(Some(&json!(256))), None, "到上限就拒，不钳制");
+        assert_eq!(slot(Some(&json!(u32::MAX))), None);
+        assert_eq!(slot(Some(&json!(u64::MAX))), None);
+        assert_eq!(slot(None), Some(0), "缺字段按 0，与原行为一致");
+        assert_eq!(slot(Some(&json!("3"))), Some(0), "非数字按 0，同上");
+        assert_eq!(slot(Some(&json!(-1))), Some(0), "负数 as_u64 取不到 → 0");
+    }
+
+    /// 🔴 接线判据：`sse.rs` 的两个 `Vec` 扩容点必须真的经过 `tool_slot`。
+    ///
+    /// 上面那条只测函数本身 —— 把 sse.rs 改回
+    /// `tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize` 它照样绿，
+    /// 而那正是那条内存耗尽路径本身。
+    #[test]
+    fn the_streaming_accumulators_must_go_through_tool_slot() {
+        let src = std::fs::read_to_string("src/upstream/sse.rs").unwrap();
+        let prod = crate::proxy::custom_headers::production_code_only(&src);
+        assert_eq!(
+            prod.matches("super::tool_slot(").count(),
+            2,
+            "Chat 增量累积有两处，都必须走上限判据"
+        );
+        assert!(
+            !prod.contains("as_u64().unwrap_or(0) as usize"),
+            "不许绕过 tool_slot 直接把上游整数当下标用"
+        );
+    }
+
     use crate::model::Protocol;
     
 

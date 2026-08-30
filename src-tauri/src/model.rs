@@ -240,8 +240,7 @@ pub struct Vendor {
     pub default_protocol: Protocol,
     #[serde(default)]
     pub builtin: bool,
-    /// 自定义图标（data-URL，如 `data:image/png;base64,...`）。
-    /// 内置厂商为 None（走前端品牌图标启发式）；自定义厂商可选上传。
+    /// 自定义图标（data-URL）。内置厂商为 None（走前端品牌图标启发式）；自定义厂商可选上传。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     /// 内置预设模型清单：上游不暴露模型接口时供一键导入。自定义厂商默认空。
@@ -399,6 +398,12 @@ pub struct ProviderKey {
     pub has_secret: bool,
     #[serde(default)]
     pub enabled: bool,
+    /// 「允许大脑聚合使用」：**`enabled=false` 也能当聚合的成员/决策者/汇总者**。分开的理由 ——
+    /// `enabled` 管「进不进故障转移池」，而**聚合不走故障转移**（`aggregate.rs`：「成员固定 Key，
+    /// 不做故障转移换 Key」）；用户禁用常正是因为模型名与主 Key 不重叠、进池会 404，而那条 Key
+    /// 本身是好的。默认 false = 保持原行为（「禁用常因欠费想止损」那条保护仍在），要用就显式开。
+    #[serde(default)]
+    pub allow_in_aggregate: bool,
     #[serde(default)]
     pub priority: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1730,12 +1735,10 @@ pub struct AppSettings {
     /// 徒增磁盘 IO；状态行（参与者成功/失败、汇总/决策者返回）不受此开关影响，始终记录。
     #[serde(default)]
     pub aggregate_trace_enabled: bool,
-    /// 各分类当前选定的「对外模型名」（key=分类字符串，value=对外模型名）。
-    /// 借鉴 EchoBird：某些客户端（如 Codex）的模型菜单是内置固定清单、拉不到中转的真实模型，
-    /// 故在本应用内选模型，代理转发时用此值覆盖客户端发来的模型名，再走 resolve_model 解析。
-    /// 每请求实时读取（get_settings），改选即时生效、免重启客户端。
-    /// 后端自管字段：由专用命令 set_active_model 更新，不随通用 save_settings 的陈旧快照覆盖
-    /// （与 mcp_* 字段同一保全策略）。
+    /// 各分类当前选定的「对外模型名」（key=分类字符串，value=对外模型名）。借鉴 EchoBird：
+    /// 客户端菜单拉不到中转真实模型时，在本应用内选、转发时覆盖。⚠️ **Codex 已不再是那种客户端**
+    /// （我们会写它的 `model_catalog_json`），故它发来的可服务名字优先、本字段退成兜底 ——
+    /// 取舍见 `proxy::model_choice::pick`。后端自管字段（专用命令更新，不随 save_settings 覆盖）。
     #[serde(default, deserialize_with = "de_category_map")]
     pub active_models: std::collections::BTreeMap<CategoryType, String>,
     /// 托盘「Codex 模型」快切子菜单开关。开启后右键托盘可直接切换 Codex 当前对外模型，
@@ -1750,13 +1753,10 @@ pub struct AppSettings {
     // **旧配置里残留这两个键是安全的**：本结构没有 `deny_unknown_fields`，
     // serde 会直接忽略它们（`legacy_floating_fields_are_ignored_on_load` 钉住）。
     // 不要为了「清理」去写迁移代码删键 —— 那是一次无收益的整份重写风险。
-    /// 各分类的「默认推理强度」（key=分类字符串，value=effort 档位 low/medium/high/xhigh）。
-    /// 缘由：Codex Desktop 对自定义 provider 不下发 reasoning.effort（只发 reasoning.summary），
-    /// 客户端 UI 设的强度传不到上游。故在此配一个默认值，转发时若下游 body 无 effort 就注入，
-    /// 让 Codex→Claude(thinking)/Chat(reasoning_effort) 的推理强度能真正生效。
-    /// 仅在下游为 Responses(Codex) 且上游非原生 Responses 时注入（OpenAI 官方 Responses 直通不碰）。
-    /// 后端自管字段：由专用命令 set_active_effort 更新，不随通用 save_settings 的陈旧快照覆盖
-    /// （与 active_models / mcp_* 同一保全策略）。空/未配 = 不注入，保持现状。
+    /// 各分类的「默认推理强度」（effort 档位 low/medium/high/xhigh）。缘由：Codex 只对
+    /// `supported_reasoning_levels` 非空的模型下发档位，而未知模型走 fallback、该字段恒为 `[]`。
+    /// ⚠️ **我们现在会声明档位**（`tools::codex::codex_catalog`），故本字段退成兜底：
+    /// `inject_default_effort` 见 body 已带 effort 就不覆盖。后端自管字段；空/未配 = 不注入。
     #[serde(default, deserialize_with = "de_category_map")]
     pub active_efforts: std::collections::BTreeMap<CategoryType, String>,
     /// 各分类代理的「首选监听端口」（key=分类字符串，value=端口）。
@@ -2190,6 +2190,7 @@ mod tests {
             protocol: Protocol::Anthropic,
             has_secret: true,
             enabled: true,
+            allow_in_aggregate: false,
             priority: 0,
             headers_json: None,
             params: KeyParams::default(),

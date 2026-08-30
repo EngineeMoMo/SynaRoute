@@ -1,7 +1,9 @@
+import * as React from "react";
 import { Button } from "@/components/ui/Button";
 import { StatusBarPicker } from "@/components/ui/StatusBarPicker";
 import { Tooltip } from "@/components/ui/Tooltip";
 import type { ProxyState } from "@/types";
+import { api } from "@/lib/bridge";
 import { useStore } from "@/store";
 import { useT } from "@/lib/useT";
 import { discoverableModels, routingPrimaryKey } from "@/lib/modelSets";
@@ -28,6 +30,27 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
   const activeModel = useStore((s) => s.settings?.activeModels?.[s.activeCategory] ?? "");
   const activeEffort = useStore((s) => s.settings?.activeEfforts?.[s.activeCategory] ?? "");
   const t = useT();
+
+  /**
+   * Codex 自己 `config.toml` 里那个模型（只读回显）。
+   *
+   * 为什么要它：上面那个下拉是**兜底**（`activeModels`），而 Codex 会把用户在 `/model` 里的
+   * 选择写回 config.toml，且 `model_choice::pick` 对 Codex **优先尊重客户端发来的可服务名字**。
+   * 于是「在这里选了 b、在 Codex 里改成 a」之后下拉一直显示 b 而每条请求走的是 a ——
+   * 界面用权威口吻说了一个不生效的值。把真实值并列摆出来，用户一眼看出谁在生效。
+   *
+   * 只在 Codex 分类拉；`null` = 没接入 / 不是我们接入的 config，此时那一格不渲染。
+   */
+  const [codexModel, setCodexModel] = React.useState<string | null>(null);
+  const refreshCodexModel = React.useCallback(() => {
+    if (activeCategory !== "codex") {
+      setCodexModel(null);
+      return;
+    }
+    // 失败即当「读不到」：这是纯展示，弹错会为一格回显打扰用户。
+    void api.getCodexConfigModel().then(setCodexModel).catch(() => setCodexModel(null));
+  }, [activeCategory]);
+  React.useEffect(refreshCodexModel, [refreshCodexModel, proxy?.status]);
 
   const enabledKeys = keys.filter((k) => k.enabled);
   const enabledCount = enabledKeys.length;
@@ -68,6 +91,9 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
   const onPickModel = (m: string) => {
     void setActiveModel(activeCategory, m).then((ok) => {
       if (!ok) return;
+      // 切完重读一次 config.toml：`select_model` 会把它一起写进去，不重读的话旁边那格
+      // 「Codex 当前」会停在旧值 —— 那正是这一格要消除的现象。
+      void refreshCodexModel();
       showToast(
         "success",
         m ? t("proxy.modelSwitched", { name: m }) : t("proxy.modelSwitchedAuto"),
@@ -191,6 +217,16 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
             ]}
             onChange={onPickModel}
           />
+          {/* Codex 自己那个（只读）。刻意只在**与兜底不同**时才出现：相同时多一格纯噪音，
+              而不同时它就是「谁在生效」的答案 —— pick 对 Codex 优先尊重客户端发来的名字。 */}
+          {codexModel && codexModel !== activeModel && (
+            <Tooltip content={t("category.activeModelHint")} side="bottom">
+              <div className="flex shrink-0 items-center gap-1 text-[11px] text-text-muted">
+                <span>{t("category.codexCurrentModel")}</span>
+                <span className="font-mono text-text-secondary">{codexModel}</span>
+              </div>
+            </Tooltip>
+          )}
           <StatusBarPicker
             label={t("category.effortTitle")}
             title={t("category.effortHint")}

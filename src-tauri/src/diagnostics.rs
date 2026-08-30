@@ -91,6 +91,15 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
     if denied > 0 {
         let _ = writeln!(r, "- 局域网请求被拒次数（未带正确令牌）：{denied}");
     }
+    // MCP stdio 子进程的诊断日志。**必须在报告里点名，否则这份新增的可观测性到不了
+    // 排障者手上**：用户交出来的是诊断报告和 `logs/*.jsonl`，而它既不在其中、
+    // 也不在任何界面/文档里；更糟的是上面那行「日志目录」在用户改过 logDir 时指向别处。
+    // 只在文件存在时打（同 denied_count 的取舍：恒 0/恒不存在的一行是噪音）。
+    if let Some(p) = crate::mcp::stdio::diag_dir().map(|d| d.join("mcp-stdio.log")) {
+        if let Ok(m) = std::fs::metadata(&p) {
+            let _ = writeln!(r, "- MCP stdio 子进程日志：{}（{} 字节）", p.display(), m.len());
+        }
+    }
     let _ = writeln!(r);
 
     let _ = writeln!(r, "## 代理状态");
@@ -115,12 +124,18 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
         for k in keys {
             let _ = writeln!(
                 r,
-                "- [{}] {} | 协议={:?} | 优先级={} | 启用={} | 有密钥={} | 状态={:?} 失败计数={} 熔断至={:?} 延迟={:?}ms | 模型数={} 映射数={}",
+                "- [{}] {} | 协议={:?} | 优先级={} | 启用={} | 允许聚合={} | 余额={} | 有密钥={} | 状态={:?} 失败计数={} 熔断至={:?} 延迟={:?}ms | 模型数={} 映射数={}",
                 k.id,
                 k.name,
                 k.protocol,
                 k.priority,
                 k.enabled,
+                // 必须打：否则「一条显示已禁用的 Key 为什么在消耗额度 / 出现在聚合日志里」
+                // 这个问题，摘要行给出的答案是「它是禁用的」—— 指向完全错误的方向。
+                k.allow_in_aggregate,
+                // 同上一条的理由：余额闸门会把「已耗尽」的 Key 降到候选池末尾，而候选顺序
+                // 在界面上压根没有呈现。没有这一位，「这条 Key 为什么最后才被用」无从解释。
+                crate::health::balance_gate::verdict_label(&k),
                 k.has_secret,
                 k.health.status,
                 k.health.fail_count,

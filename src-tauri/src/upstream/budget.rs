@@ -550,6 +550,7 @@ mod tests {
             protocol,
             has_secret: true,
             enabled: true,
+            allow_in_aggregate: false,
             priority: 0,
             headers_json: None,
             params: KeyParams::default(),

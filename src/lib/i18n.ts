@@ -60,10 +60,9 @@ const zh: Dict = {
   "balance.sectionTitle": "余额查询与计费",
   "balance.on": "已启用",
   "balance.enable": "启用余额查询",
-  // 文案只承诺**已实现**的能力。这句历经两版：最早写「显示在 Key 卡片与快捷面板上」
-  // 是空头承诺（当时没有任何展示位，用户开了开关到处找不到余额）；随后改成只提
-  // 「测试查询」。现在卡片展示已落地，故补回卡片那半句 —— 但**仍不提快捷面板/悬浮窗**，
-  // 那里确实还没接。改这句前先确认对应展示位真的存在。
+  // 文案只承诺**已实现**的能力：最早写「显示在 Key 卡片与快捷面板上」是空头承诺（当时没有任何
+  // 展示位），随后改成只提「测试查询」；卡片展示已落地故补回那半句，但**仍不提快捷面板/悬浮窗**。
+  // 改这句前先确认对应展示位真的存在。
   "balance.enableHint":
     "从中转站的计费接口读取剩余额度，配好后显示在这条 Key 的卡片上。各站接口不统一，先用预设模板试，不行再手填取值路径；配好后用下面的「测试查询」验证。",
   "balance.template": "预设模板",
@@ -93,7 +92,7 @@ const zh: Dict = {
   "balance.authNone": "不认证",
   "balance.timeout": "超时（秒）",
   "balance.interval": "自动查询间隔（分钟）",
-  "balance.intervalHint": "设为 0 关闭自动查询；设为 N 则每 N 分钟查询一次上游余额。窗口不可见时不查。",
+  "balance.intervalHint": "设为 0 关闭自动查询（此时余额也不参与路由）；设为 N 则每 N 分钟查询一次上游余额。代理运行中的分类即使窗口不可见也会在后台按同一间隔刷新。",
   "balance.remainingPath": "取值路径（选填）",
   "balance.remainingPathPlaceholder": "如 data.balance",
   "balance.remainingPathHint":
@@ -216,16 +215,16 @@ const zh: Dict = {
     "代理监听的本机地址。点「启动」时会自动写进客户端配置，通常不用手动填。",
   "proxy.stopTip":
     "停止代理并还原客户端配置（连 MCP 大脑聚合一起停）。只想切回官方、但保留大脑聚合，用左边的「切官方」。",
-  // 状态条快切（UX#6 / UX#8）。「即时生效、无需重启客户端」这句要反复出现——
-  // 用户默认以为改了配置就得重启客户端，不说清就不敢在会话中途切。
+  // 状态条快切（UX#6 / UX#8）。生效时机必须写进文案。🔴 三类各不相同：主 Key **即时**；
+  // Codex 模型是**新会话**（它在 session init 读 config.toml）；推理强度是**兜底**（Codex 自己会下发档位）。
   "proxy.primaryKey": "主 Key",
   "proxy.primaryKeyHint": "故障转移最先使用这条。切换即时生效，无需重启客户端。",
   "proxy.primaryKeyNone": "无启用的 Key",
   "proxy.primaryKeySwitched": "已切换主 Key：{name}（即时生效，无需重启客户端）",
-  "proxy.modelSwitched": "已切换当前模型：{name}（即时生效，无需重启 Codex）",
-  "proxy.modelSwitchedAuto": "已改为跟随客户端透传（即时生效，无需重启 Codex）",
-  "proxy.effortSwitched": "已切换推理强度：{name}（即时生效，无需重启 Codex）",
-  "proxy.effortSwitchedOff": "已关闭推理强度注入（即时生效，无需重启 Codex）",
+  "proxy.modelSwitched": "已切换当前模型：{name}（新会话生效：Codex 每次新会话初始化时读取，无需重启）",
+  "proxy.modelSwitchedAuto": "已改为跟随客户端透传（新会话生效，无需重启 Codex）",
+  "proxy.effortSwitched": "兜底推理强度已改为：{name}（客户端自己下发了档位时以客户端为准）",
+  "proxy.effortSwitchedOff": "已关闭兜底推理强度注入（客户端自己下发的档位不受影响）",
   "proxy.configAppliedTitle": "配置已写入",
   "proxy.configAppliedDesc": "已自动将代理端点写入 {tool} 的配置文件。请退出并重启 {tool} 客户端，以使新配置生效。",
   "proxy.stop": "停止",
@@ -243,10 +242,8 @@ const zh: Dict = {
   "common.refresh": "刷新",
 
   // 健康状态
-  "health.breaking": "● 熔断中",
   "health.breakingRemain": "● 熔断中·剩{sec}秒",
   "health.up": "● 可用",
-  "health.down": "● 不可用",
   "health.downProbe": "● 探测不可达",
   "health.downProbeTitle": "健康探测连不上（连接层错误）。注意：这不代表停用——只要未被实时请求熔断，该 Key 仍会被尝试路由，实际可用性以真实请求为准。",
   "health.checking": "● 检查中…",
@@ -301,11 +298,12 @@ const zh: Dict = {
   "category.empty": "还没有配置任何 Key",
   "category.addFirst": "添加第一个 Key",
   "category.activeModel": "当前模型",
-  "category.activeModelHint": "Codex 的模型菜单是内置固定清单、拉不到中转模型，请在此选择实际使用的模型（即时生效，免重启）",
+  "category.activeModelHint": "此处选的是**兜底**模型：Codex 自己菜单里选的可服务模型优先（SynaRoute 已把清单写进它的模型目录），仅在客户端没选或选了不可服务的名字时才用这里的值；新会话生效",
+  "category.codexCurrentModel": "Codex 当前", // 只读回显它的 config.toml；来由见 codex_catalog::current_config_model
   "category.activeModelAuto": "跟随客户端（透传）",
   "category.activeModelEmpty": "先添加并启用 Key 才有可选模型",
   "category.effortTitle": "推理强度",
-  "category.effortHint": "Codex 对第三方 provider 不下发推理强度，在此配置默认强度，转发时补入并映射到上游（Claude→思考预算 / OpenAI 系→reasoning_effort）。选“关”则不注入、保持现状。",
+  "category.effortHint": "此处是**兜底**档位：SynaRoute 已把档位写进 Codex 的模型目录，Codex 自己下发档位时以它为准；仅在客户端没下发时才注入这里的值（Claude→思考预算 / OpenAI 系→reasoning_effort）。选“关”则不注入。",
   "category.effort.off": "关",
   "category.effort.low": "低",
   "category.effort.medium": "中",
@@ -411,7 +409,7 @@ const zh: Dict = {
   "brain.membersTitle": "参与成员（并行解答）",
   "brain.quickFill": "一键配置",
   "brain.quickFillHint": "自动把已启用 Key 各取首个模型加为成员，并选第一个作决策者，免去逐个手选。填好后点保存生效。",
-  "brain.quickFillNoKeys": "没有可用的 Key（需已启用且已拉取到模型）。请先在分类页添加并启用 Key。",
+  "brain.quickFillNoKeys": "没有可用的 Key（需已拉取到模型，且已启用或已勾选「允许大脑聚合使用」）。请先在分类页添加 Key。",
   "brain.quickFillDone": "已填充 {n} 个成员 + 决策者，请点保存生效",
   "brain.noKeys": "当前分类（{category}）暂无 Key，请先在对应分类页添加",
   "brain.decisionTitle": "决策与汇总",
@@ -445,7 +443,7 @@ const zh: Dict = {
   "brain.join": "加入",
   "brain.addMember": "添加成员",
   "brain.pickKeyPlaceholder": "选择 Key…",
-  "brain.keyDisabled": "已禁用",
+  "key.allowInAggregate": "允许大脑聚合使用",
   "brain.keyDisabledSuffix": "（已禁用）",
   "brain.checkKeyHealth": "检测",
   "brain.keyNoModels": "该 Key 暂无模型，可手动输入模型名加入",
@@ -461,7 +459,6 @@ const zh: Dict = {
   "brain.activeMinutesAgo": "{n} 分钟前活跃",
   "brain.activeHoursAgo": "{n} 小时前活跃",
   "brain.activeDaysAgo": "{n} 天前活跃",
-  "brain.retrieval": "文件检索",
   "brain.retrievalTitle": "启用文件知识检索",
   "brain.retrievalDesc": "从工作目录中自动检索与需求相关的文件，注入参与者和决策者的上下文",
   "brain.maxContextTokens": "检索内容 Token 上限",
@@ -621,7 +618,7 @@ const zh: Dict = {
   "settings.aggTraceTitle": "记录大脑聚合详情",
   "settings.aggTraceDesc": "开启后，大脑聚合每一步都完整记录：喂给各参与者的入参与其完整答案、汇总产物、决策者入参与最终回答，可在运行日志里展开查看。默认关（这些内容可达数十万字符，持续开启会增大磁盘写入）",
   "settings.trayModelTitle": "托盘快切 Codex 模型",
-  "settings.trayModelDesc": "开启后，右键系统托盘图标即可直接切换 Codex 当前使用的模型，免打开主窗口，切换即时生效。候选与 Codex 分类的可用模型一致。默认开",
+  "settings.trayModelDesc": "开启后，右键系统托盘图标即可直接切换 Codex 当前使用的模型，免打开主窗口，切换在新会话生效。候选与 Codex 分类的可用模型一致。默认开",
   "settings.healthTitle": "定时健康检查间隔",
   "settings.healthDesc": "后台每隔一段时间自动探测所有 Key 的可用性（up/down）与延迟，并据此驱动故障转移。默认 60 秒。选“关”则停止定时探测（转发时仍按实际结果驱动故障转移）。",
   "settings.health.0": "关",
@@ -649,9 +646,8 @@ const zh: Dict = {
   "settings.logOpenDir": "打开日志目录",
   "settings.logOpened": "已打开：{dir}",
   "settings.diagExport": "导出诊断报告",
-  // 拆成三段是为了让中间那句真的**渲染成粗体**。这里没有 Markdown 渲染器，
-  // 整句里写 `**…**` 只会让用户看到一对字面星号——偏偏这句是决定用户敢不敢把
-  // 报告发出去的那句，不能显示成排版故障。
+  // 拆成三段是为了让中间那句真的**渲染成粗体**。这里没有 Markdown 渲染器，整句里写 `**…**`
+  // 只会让用户看到一对字面星号 —— 偏偏这句是决定用户敢不敢把报告发出去的那句，不能显示成排版故障。
   "settings.diagDesc": "诊断报告用于报障：包含版本、路径、各 Key 健康状态、脱敏后的配置与最近事件摘要。",
   "settings.diagDescNoSecrets": "不含任何密钥，也不含对话正文",
   "settings.diagDescTail": "——保存后可自行打开核对再发出。",
@@ -819,7 +815,7 @@ const en: Dict = {
   "balance.authNone": "None",
   "balance.timeout": "Timeout (s)",
   "balance.interval": "Auto-refresh interval (minutes)",
-  "balance.intervalHint": "Set to 0 to disable auto-refresh; set to N to query balance every N minutes. No queries when window is hidden.",
+  "balance.intervalHint": "Set to 0 to disable auto-refresh (balance then takes no part in routing); set to N to query balance every N minutes. Categories with a running proxy are also refreshed in the background at the same interval, even when the window is hidden.",
   "balance.remainingPath": "Value path (optional)",
   "balance.remainingPathPlaceholder": "e.g. data.balance",
   "balance.remainingPathHint":
@@ -949,13 +945,13 @@ const en: Dict = {
   "proxy.primaryKeySwitched":
     "Primary key switched to {name} — effective immediately, no client restart needed",
   "proxy.modelSwitched":
-    "Active model switched to {name} — effective immediately, no need to restart Codex",
+    "Active model switched to {name} — effective on the next Codex session (it reads this at session init), no restart needed",
   "proxy.modelSwitchedAuto":
-    "Switched to follow-client passthrough — effective immediately, no need to restart Codex",
+    "Switched to follow-client passthrough — effective on the next Codex session, no restart needed",
   "proxy.effortSwitched":
-    "Reasoning effort switched to {name} — effective immediately, no need to restart Codex",
+    "Fallback reasoning effort set to {name} — the client wins when it sends its own level",
   "proxy.effortSwitchedOff":
-    "Reasoning-effort injection turned off — effective immediately, no need to restart Codex",
+    "Fallback reasoning-effort injection turned off — levels the client sends are unaffected",
   "proxy.configAppliedTitle": "Config Applied",
   "proxy.configAppliedDesc": "The proxy endpoint has been written to {tool}'s configuration. Please quit and restart {tool} to apply the new settings.",
   "proxy.stop": "Stop",
@@ -972,10 +968,8 @@ const en: Dict = {
   "toolConfig.copy": "Copy content",
   "common.refresh": "Refresh",
 
-  "health.breaking": "● Tripped",
   "health.breakingRemain": "● Tripped·{sec}s left",
   "health.up": "● Up",
-  "health.down": "● Down",
   "health.downProbe": "● Probe unreachable",
   "health.downProbeTitle": "Health probe couldn't connect (network-level error). Note: this does NOT disable the key — as long as it isn't tripped by live requests, it's still tried for routing. Real requests are the source of truth for availability.",
   "health.checking": "● Checking…",
@@ -1024,11 +1018,12 @@ const en: Dict = {
   "category.empty": "No keys configured yet",
   "category.addFirst": "Add your first key",
   "category.activeModel": "Active model",
-  "category.activeModelHint": "Codex's model menu is a fixed built-in list and can't see relayed models. Pick the model to actually use here (takes effect immediately, no restart).",
+  "category.activeModelHint": "This is the **fallback** model: a serviceable model picked in Codex own menu wins (SynaRoute writes its model catalog); this value is used only when the client sends none or an unserviceable one. Effective on the next session.",
+  "category.codexCurrentModel": "Codex now",
   "category.activeModelAuto": "Follow client (passthrough)",
   "category.activeModelEmpty": "Add and enable a key first to get selectable models",
   "category.effortTitle": "Reasoning effort",
-  "category.effortHint": "Codex doesn't send reasoning effort to custom providers, so its in-app setting has no effect. Set it here and SynaRoute injects it per request (maps to Anthropic thinking / Chat reasoning_effort). Off = don't inject (upstream default).",
+  "category.effortHint": "This is the **fallback** level: SynaRoute writes the levels into Codex model catalog, so a level sent by the client wins; this value is injected only when the client sends none (maps to Anthropic thinking / Chat reasoning_effort). Off = don't inject.",
   "category.effort.off": "Off",
   "category.effort.low": "Low",
   "category.effort.medium": "Medium",
@@ -1129,7 +1124,7 @@ const en: Dict = {
   "brain.membersTitle": "Members (parallel answering)",
   "brain.quickFill": "Quick setup",
   "brain.quickFillHint": "Auto-add the first model of each enabled Key as a member and pick the first as decider, skipping manual selection. Click Save to apply.",
-  "brain.quickFillNoKeys": "No usable Key (must be enabled with fetched models). Add and enable a Key on the category page first.",
+  "brain.quickFillNoKeys": "No usable Key (needs fetched models, and either enabled or allowed in brain aggregation). Add a Key on the category page first.",
   "brain.quickFillDone": "Filled {n} members + decider. Click Save to apply.",
   "brain.noKeys": "No keys in this category ({category}) — add them on the category page first",
   "brain.decisionTitle": "Decision & summary",
@@ -1163,14 +1158,13 @@ const en: Dict = {
   "brain.join": "Add",
   "brain.addMember": "Add member",
   "brain.pickKeyPlaceholder": "Select a key…",
-  "brain.keyDisabled": "disabled",
+  "key.allowInAggregate": "Allow in brain aggregation",
   "brain.keyDisabledSuffix": " (disabled)",
   "brain.checkKeyHealth": "Check",
   "brain.keyNoModels": "This key has no models yet — type a model name to include it",
 
   "brain.workDir": "Working Directory",
   "brain.workDirPlaceholder": "e.g. E:\\projects\\my-app",
-  "brain.retrieval": "File Retrieval",
   "brain.retrievalTitle": "Enable file retrieval",
   "brain.retrievalDesc": "Auto-search for relevant files in the working directory and inject them as context for members",
   "brain.maxContextTokens": "Max context tokens",
@@ -1336,7 +1330,7 @@ const en: Dict = {
   "settings.aggTraceTitle": "Log brain aggregation details",
   "settings.aggTraceDesc": "When on, every step of brain aggregation is fully recorded: the prompt fed to each member and its full answer, the summarizer output, the decider's input and final answer — expandable in Logs. Off by default (these can reach hundreds of thousands of characters; leaving it on increases disk writes)",
   "settings.trayModelTitle": "Quick-switch Codex model from tray",
-  "settings.trayModelDesc": "When on, right-click the system tray icon to switch the model Codex currently uses — no need to open the main window, takes effect immediately. Candidates match the Codex category's available models. On by default",
+  "settings.trayModelDesc": "When on, right-click the system tray icon to switch the model Codex currently uses — no need to open the main window; effective on the next Codex session. Candidates match the Codex category's available models. On by default",
   "settings.healthTitle": "Health-check interval",
   "settings.healthDesc": "How often enabled keys are probed in the background for availability and latency. Off = stop scheduled probing (failover still reacts to live results during forwarding).",
   "settings.health.0": "Off",

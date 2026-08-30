@@ -82,6 +82,13 @@ export interface DesktopModelNameReport {
   protocol: Protocol;
   hasSecret: boolean; // 是否已配置密钥（密钥本身不下发前端，NFR-006）
   enabled: boolean;
+  /**
+   * 「允许大脑聚合使用」：`enabled=false` 也能当聚合的成员/决策者/汇总者。
+   * `enabled` 管「进不进故障转移池」，而聚合不走故障转移 —— 用户禁用一条 Key 常常正是
+   * 因为模型名与主 Key 不重叠、进池会让故障转移 404，而那条 Key 本身是好的。
+   * 默认 false（后端 `#[serde(default)]`），老配置读进来即此值 = 保持原行为。
+   */
+  allowInAggregate?: boolean;
   priority: number; // 故障转移优先级，越小越优先（FR-010）
   headersJson?: string; // 自定义请求头（JSON 字符串）
   params: KeyParams;

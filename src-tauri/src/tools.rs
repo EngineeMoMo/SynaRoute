@@ -72,11 +72,11 @@ const DESKTOP_META_FILE: &str = "_meta.json";
 
 /// 将某分类的代理端点写入对应目标工具配置。返回人类可读的结果说明。
 ///
-/// `models`：当前分类「主 Key」的可服务对外名列表（与 `/v1/models` 口径一致，有序）。
-/// `keys`：该分类按优先级排序的启用 Key。仅桌面端用到——从中推导每条模型的能力断言
-/// （`supports1m` 按 `contextWindow` 判定等，见 `build_desktop_model_entries`）。
+/// `models`：`discoverable_models` 口径 —— 多 Key 取**交集**，空则回退主 Key 超集。有序。
+/// `keys`：按优先级排序的启用 Key。**桌面端与 Codex 都用**：前者推导能力断言，后者推导
+/// `supported_reasoning_levels` 与 `context_window` —— 传空切片会让 Codex 的档位选择器消失。
 /// - **Claude CLI only**：取首个写 env.ANTHROPIC_MODEL + 顶层 `model`；并清除三档 DEFAULT_* 残留。
-/// - **Codex only**：取首个写 config.toml 顶层 `model`（Responses 形态，与 Claude 字段无关）。
+/// - **Codex only**：整份写进 `model_catalog_json` 模型目录；顶层 `model` **仅在缺失/不可服务时**写。
 /// - **桌面端**：整份列表写进 gateway 档的 `inferenceModels`（切 3p 部署模式，见 apply_claude_desktop）。
 pub fn apply(
     category: CategoryType,
@@ -87,7 +87,7 @@ pub fn apply(
     let first = models.first().map(String::as_str);
     match category {
         CategoryType::ClaudeCli => apply_claude_cli(endpoint, first),
-        CategoryType::Codex => codex::apply(endpoint, first),
+        CategoryType::Codex => codex::apply(endpoint, models, keys),
         CategoryType::ClaudeDesktop => apply_claude_desktop(endpoint, models, keys),
     }
 }
@@ -1192,7 +1192,7 @@ pub fn restore(category: CategoryType) -> AppResult<String> {
     // 停在「假 key 摘不掉、config 也没还原」这个两头皆输的状态。
     let mut deferred: Option<AppError> = None;
     if category == CategoryType::Codex {
-        match codex::auth_path().and_then(|p| codex::disarm_legacy_placeholder_auth(&p)) {
+        match codex::codex_catalog::restore_side_files() {
             Ok(Some(note)) => restored.push(note),
             Ok(None) => {}
             Err(e) => deferred = Some(e),
@@ -1205,7 +1205,7 @@ pub fn restore(category: CategoryType) -> AppResult<String> {
         Err(e) => {
             if let Some(prev) = deferred {
                 return Err(AppError::ToolConfig(format!(
-                    "还原 Codex 配置失败：解除占位凭据 {prev}；还原 {} 失败 {e}",
+                    "还原 Codex 配置失败：副文件处理 {prev}；还原 {} 失败 {e}",
                     path.display()
                 )));
             }
@@ -1215,8 +1215,8 @@ pub fn restore(category: CategoryType) -> AppResult<String> {
 
     if let Some(e) = deferred {
         return Err(AppError::ToolConfig(format!(
-            "已还原 {}，但解除旧版本写入的占位凭据失败：{e}。\
-             请手动检查 ~/.codex/auth.json 里是否还有 `{PROXY_PLACEHOLDER}`。",
+            "已还原 {}，但副文件处理失败：{e}（错误自带路径 —— 可能是 auth.json 的占位凭据\
+             没解除，也可能是模型目录没删掉；auth.json 里那个占位符是 `{PROXY_PLACEHOLDER}`）。",
             path.display()
         )));
     }
@@ -1956,7 +1956,7 @@ mod tests {
         assert!(after_mcp.contains("mcp_servers"), "MCP 项本身要写进去");
 
         // ② 接入（真正的「接入」）：此刻才该抓快照，且快照必须是**含 MCP 的当前内容**
-        codex::apply_at(&cfg, "http://127.0.0.1:47101", None).unwrap();
+        codex::apply_at(&cfg, "http://127.0.0.1:47101", &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         assert!(bak.exists(), "接入必须抓一份接入前快照");
         assert_eq!(
             std::fs::read_to_string(&bak).unwrap(),
@@ -3172,6 +3172,7 @@ tool_timeout_sec = 600
             protocol: Protocol::Anthropic,
             has_secret: true,
             enabled: true,
+            allow_in_aggregate: false,
             priority: 0,
             headers_json: None,
             params: KeyParams::default(),

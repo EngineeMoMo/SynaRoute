@@ -831,8 +831,10 @@ fn format_markdown(prompt: &str, res: &aggregate::McpAggregateResult, elapsed_ms
         ));
     }
     if res.members_skipped_disabled > 0 {
+        // 出路必须给两条：「重新启用」会让这条 Key 回到故障转移池，把当初禁用它的那个
+        // 404 带回主链路 —— 只说这一条等于把用户指去做一个已知有害的操作。
         md.push_str(&format!(
-            "> 注：{} 个成员因所属 Key 已停用而跳过。\n\n",
+            "> 注：{} 个成员因所属 Key 已停用而跳过（在分类页重新启用，或在该 Key 的卡片上勾选「允许大脑聚合使用」）。\n\n",
             res.members_skipped_disabled
         ));
     }

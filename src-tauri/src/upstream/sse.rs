@@ -24,8 +24,10 @@ use super::tools_meta::{
 // 逐块喂入上游字节，按行切分缓冲不完整行，解析 `data: {json}`，产出下游协议的 SSE 文本。
 //
 // 能力边界（已在方案中说清）：Chat 上游只会产出「文本增量 / tool_call 增量 / finish / usage」，
-// 故翻译器覆盖这几类并重组为对应 Responses 事件；Responses 独有的 reasoning_summary /
-// image / code_interpreter 等事件因 Chat 源头无数据而不出现——这是能力上限，非遗漏。
+// 故覆盖这几类并重组；Responses 独有的 reasoning_summary / image / code_interpreter 等因
+// Chat 源头无数据而不出现 —— 能力上限，非遗漏。
+
+#[path = "sse_error.rs"] mod sse_error; // 上游流内 error 的跨协议翻译；来由见该文件模块注释
 
 /// SSE 流的跨协议翻译方向。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,9 +185,7 @@ impl SseTranslator {
     /// **缓冲的是字节而不是字符串**，且只对**完整行**解码 —— 这一点是必须的，不是风格问题。
     /// 原先写的是 `buf.push_str(&String::from_utf8_lossy(chunk))`：对每一块入参各自解码。
     /// 而上游是流式的，一个 3 字节的中文字符完全可能被 TCP 分段切开、分两次 push 进来，
-    /// 逐块解码时前后两半各自都是非法 UTF-8、各自被替换成 U+FFFD，
-    /// 于是用户看到的回答里凭空出现「」。
-    ///
+    /// 逐块解码时前后两半各自都是非法 UTF-8、各自被替换成 U+FFFD，用户看到的回答里凭空出现「」。
     /// 按完整行解码则安全：SSE 协议保证上游按行发 JSON，行内必然是完整的 UTF-8 序列。
     /// 回归测试见 `sse_multibyte_text_survives_arbitrary_chunk_boundaries`。
     pub fn push(&mut self, chunk: &[u8]) -> String {
@@ -210,8 +210,7 @@ impl SseTranslator {
     /// 给**跨协议流式的用量采集**用。同协议直通那条路走的是「尾窗缓存 + 事后
     /// `extract_usage_from_sse`」，跨协议这条路不能照搬：翻译器边收边转，尾窗里躺的是
     /// 已经**转换过**的下游格式，字段名与上游未必一致。而翻译器本来就得读懂上游 usage
-    /// 才能翻译（见 `input_tokens` / `output_tokens` 的写入点），所以直接问它最准，
-    /// 也省一份缓冲。
+    /// 才能翻译（见 `input_tokens` / `output_tokens` 的写入点），所以直接问它最准，也省一份缓冲。
     ///
     /// 判 0 而非判「有没有见过 usage 事件」：token 数为 0 的成功请求实际不存在，
     /// 而多记一个字段去区分「没给」和「给了 0」不值当。
@@ -259,6 +258,8 @@ impl SseTranslator {
             };
         }
         let json: Value = serde_json::from_str(data).ok()?;
+        // 必须排在六方向分派**之前**（那六个函数一个都不读 `error`）。有判据钉住这个顺序。
+        if let Some(t) = self.translate_upstream_error(&json) { return Some(t); }
         match self.dir {
             SseDirection::ChatToResponses => Some(self.chat_chunk_to_responses(&json)),
             SseDirection::ResponsesToChat => Some(self.responses_event_to_chat(&json)),
@@ -309,7 +310,7 @@ impl SseTranslator {
         // tool_call 增量：按 index 累积 name/arguments
         if let Some(tcs) = delta.and_then(|d| d.get("tool_calls")).and_then(|t| t.as_array()) {
             for tc in tcs {
-                let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let Some(idx) = super::tool_slot(tc.get("index")) else { continue };
                 while self.tool_calls.len() <= idx {
                     self.tool_calls.push((String::new(), String::new(), String::new()));
                 }
@@ -631,7 +632,7 @@ impl SseTranslator {
         // tool_call 增量：按 index 累积 (id, name, arguments)，与 chat_chunk_to_responses 同构。
         if let Some(tcs) = delta.and_then(|d| d.get("tool_calls")).and_then(|t| t.as_array()) {
             for tc in tcs {
-                let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let Some(idx) = super::tool_slot(tc.get("index")) else { continue };
                 while self.tool_calls.len() <= idx {
                     self.tool_calls.push((String::new(), String::new(), String::new()));
                 }
@@ -1166,7 +1167,6 @@ impl SseTranslator {
     /// 产出完整三段：`content_block_start`（带 id/name）+ `content_block_delta`
     /// （`input_json_delta` 承载 arguments JSON）+ `content_block_stop`。同时记住
     /// `stop_reason` 要改成 `tool_use`（见 [`SseTranslator::emit_anthropic_stop`]）。
-    ///
     /// 工具名还原：Responses item 可能把名字拆成 `{name, namespace}` 两字段（Codex 范式），
     /// 而 Anthropic 下游客户端认的是**全名**，故用 [`join_namespaced_tool_name`] 拼回。
     fn emit_anthropic_tool_block(&mut self, item: &Value) -> String {

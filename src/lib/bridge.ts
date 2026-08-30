@@ -120,6 +120,13 @@ export const api = {
   toggleKey: (keyId: string, enabled: boolean) =>
     call<void>("toggle_key", { keyId, enabled }, () => mockBridge.toggleKey(keyId, enabled)),
 
+  // 「允许大脑聚合使用」这一位。**刻意不走 upsertKey**：那是整份替换，会把后端刚探测到的
+  // 余额端点（`balance_query.url`）用卡片的旧快照顶回去。理由全文见 `store/key_flags.rs`。
+  setKeyAllowInAggregate: (keyId: string, allow: boolean) =>
+    call<void>("set_key_allow_in_aggregate", { keyId, allow }, () =>
+      mockBridge.setKeyAllowInAggregate(keyId, allow),
+    ),
+
   // 设为该分类的主 Key（优先级 0，其余顺延）。重排规则在后端 Store::set_primary_key，
   // 因为托盘快切（FR-022）与界面共用同一套规则，前端不再自己算。
   // 返回是否真的改了（已是主则 false）。
@@ -222,6 +229,15 @@ export const api = {
   /** 重新生成局域网接入令牌（B5）。**破坏性**：旧令牌立即失效，调用前须让用户确认。 */
   regenerateLanToken: () =>
     call<string>("regenerate_lan_token", undefined, () => mockBridge.regenerateLanToken()),
+  /**
+   * Codex 的 `config.toml` 里当前那个顶层 `model`（**只读回显**）。
+   *
+   * 状态条那个下拉显示的是 `activeModels`（兜底），而 Codex 自己也能选、且它选的优先 ——
+   * 两个值并列摆出来才看得出谁在生效。`null` = 没接入 / 不是我们接入的 / 没有那个键。
+   */
+  getCodexConfigModel: () =>
+    call<string | null>("get_codex_config_model", undefined, () => mockBridge.getCodexConfigModel()),
+
   /** 按「分类 × Key」聚合的 token 用量（用量统计面板）。 */
   getTokenUsage: () =>
     call<TokenUsageByKey[]>("get_token_usage", undefined, () => mockBridge.tokenUsage()),
