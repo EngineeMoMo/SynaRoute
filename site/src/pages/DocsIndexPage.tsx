@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import { BookOpen, ArrowRight } from "lucide-react";
+import { ArrowRight } from "lucide-react";
 import { Container } from "@/components/ui/Section";
 import { docs } from "@/data/docs";
 import { useSeo } from "@/hooks/useSeo";
@@ -25,31 +25,38 @@ export default function DocsIndexPage() {
         </header>
 
         <ul className="mt-10 space-y-4">
-          {docs.map((doc) => (
-            <li key={doc.slug}>
-              <Link
-                to={path(`docs/${doc.slug}`)}
-                className="group flex items-start gap-4 rounded-card border border-border bg-surface p-6 shadow-card transition-shadow hover:shadow-card-hover"
-              >
-                <span className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-control bg-primary/12 text-primary">
-                  <BookOpen size={19} aria-hidden="true" />
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="flex items-center gap-2 text-base font-semibold text-text-primary">
-                    {t(`${doc.i18nPrefix}.title`)}
-                    <ArrowRight
-                      size={16}
-                      aria-hidden="true"
-                      className="text-text-muted transition-transform duration-250 group-hover:translate-x-0.5"
-                    />
+          {docs.map((doc) => {
+            const Icon = doc.icon;
+            return (
+              <li key={doc.slug}>
+                <Link
+                  to={path(`docs/${doc.slug}`)}
+                  // hover 两条通道（阴影 + 描边），深色下阴影本来就弱
+                  className="group flex items-start gap-4 rounded-card border border-border bg-surface p-6 shadow-card transition-all hover:border-border-strong hover:shadow-card-hover"
+                >
+                  <span className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-control bg-primary/12 text-primary">
+                    <Icon size={20} aria-hidden="true" />
                   </span>
-                  <span className="mt-1.5 block text-sm leading-relaxed text-text-secondary">
-                    {t(`${doc.i18nPrefix}.desc`)}
+                  <span className="min-w-0 flex-1">
+                    {/* 箭头靠 `ml-auto` 钉在右端。原先它紧跟标题文字，于是三张卡的
+                        箭头横坐标随标题长短各不相同，排成一列锯齿；而卡片右侧
+                        近一半是空的，那个位置本来就该给它。 */}
+                    <span className="flex items-center gap-2 text-base font-semibold text-text-primary">
+                      {t(`${doc.i18nPrefix}.title`)}
+                      <ArrowRight
+                        size={16}
+                        aria-hidden="true"
+                        className="ml-auto shrink-0 text-text-secondary transition-transform duration-250 group-hover:translate-x-0.5"
+                      />
+                    </span>
+                    <span className="mt-1.5 block text-sm leading-relaxed text-text-secondary">
+                      {t(`${doc.i18nPrefix}.desc`)}
+                    </span>
                   </span>
-                </span>
-              </Link>
-            </li>
-          ))}
+                </Link>
+              </li>
+            );
+          })}
         </ul>
       </div>
     </Container>

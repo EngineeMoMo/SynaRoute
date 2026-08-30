@@ -109,16 +109,34 @@ try {
         deviceScaleFactor: 1,
         mobile: false,
       });
+      /**
+       * 🔴 主题必须在**页面加载之前**写进 localStorage。
+       *
+       * 原先这里是加载完再 `document.documentElement.classList.toggle('dark')` ——
+       * 那只改了 CSS，而 `useTheme` 的主题状态是模块级的、只在模块初始化时读一次
+       * （`readInitialTheme`）。于是 React 侧仍然是 `light`，Hero / Screenshots /
+       * BrainSpotlight 三处**拍到的是浅色产品截图**，配在深色页面上 ——
+       * 也就是这个脚本存在的目的（核对深色排版）恰好是它拍不准的那一项。
+       * 所以先访问一次拿到同源上下文，写 localStorage，再重新导航。
+       */
+      await cdp.send("Page.navigate", { url: BASE + p.path });
+      await sleep(1200);
+      await cdp.evaluate(`localStorage.setItem('synaroute-site-theme', ${JSON.stringify(theme)})`);
       await cdp.send("Page.navigate", { url: BASE + p.path });
       // 等 React 挂载 + 首屏图片
       for (let i = 0; i < 60; i++) {
         if (await cdp.evaluate(`!!document.querySelector('#brain')`)) break;
         await sleep(250);
       }
-      await cdp.evaluate(`document.documentElement.classList.toggle('dark', ${theme === "dark"})`);
-      // 让所有 reveal 动画立即完成、懒加载图片全部进入加载：滚到底再回顶
+      // 让所有 reveal 动画立即完成、懒加载图片全部进入加载：滚到底再回顶。
+      // ⚠️ 加的类是 `reveal-in`（styles.css 里那个），不是 `is-visible` ——
+      // 后者是个**不存在的类名**，加了什么都不会发生。此前它一直「看起来能用」
+      // 只是因为下面那趟滚动顺带触发了 IntersectionObserver。
       await cdp.evaluate(`(async () => {
-        document.querySelectorAll('.reveal').forEach(e => e.classList.add('is-visible'));
+        document.querySelectorAll('.reveal').forEach(e => {
+          e.style.animationDelay = '0ms';
+          e.classList.add('reveal-in');
+        });
         document.querySelectorAll('img[loading="lazy"]').forEach(i => i.loading = 'eager');
         const h = document.body.scrollHeight;
         for (let y = 0; y < h; y += 600) { window.scrollTo(0, y); await new Promise(r => setTimeout(r, 60)); }

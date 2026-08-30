@@ -20,10 +20,12 @@ export function Hero() {
   return (
     <section className="relative overflow-hidden pt-28 sm:pt-32 lg:pt-36">
       {/* 背景装饰：一团很淡的主色光晕。刻意只有一处、无动画 ——
-          模板第 7.2 节禁止大面积高饱和渐变，这里只用来把视线引向首屏中部 */}
+          模板第 7.2 节禁止大面积高饱和渐变，这里只用来把视线引向首屏中部。
+          0.14 → 0.18：全站唯一一处色彩深度，原值在 #FAFAFA 上几乎看不出来，
+          而它承担的正是「首屏不是一张白纸」这件事。仍远低于「大面积高饱和」。 */}
       <div
         aria-hidden="true"
-        className="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[520px] bg-[radial-gradient(60%_60%_at_50%_0%,rgb(var(--primary)/0.14),transparent_70%)]"
+        className="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[520px] bg-[radial-gradient(60%_60%_at_50%_0%,rgb(var(--primary)/0.18),transparent_70%)]"
       />
 
       <Container>
@@ -47,10 +49,14 @@ export function Hero() {
             <span className={lockWrap}>{t("hero.titleTail")}</span>
           </h1>
 
-          <p className="animate-fade-up mx-auto mt-6 max-w-2xl text-balance text-base leading-relaxed text-text-secondary sm:text-lg">
+          {/* 层级：引导句用 primary，补充句用 secondary。
+              原先两段都是 secondary，于是标题之下是 4~5 行同色同字重的灰字 ——
+              styles.css 顶部自己定的「引导句 primary / 说明 secondary」阶梯
+              恰恰没用在首屏这最该有层级的地方。字号不动，只换颜色与间距。 */}
+          <p className="animate-fade-up mx-auto mt-6 max-w-2xl text-balance text-base leading-relaxed text-text-primary sm:text-lg">
             {t("hero.desc")}
           </p>
-          <p className="animate-fade-up mx-auto mt-3 max-w-xl text-balance text-sm leading-relaxed text-text-secondary sm:text-[15px]">
+          <p className="animate-fade-up mx-auto mt-4 max-w-xl text-balance text-sm leading-relaxed text-text-secondary sm:text-[15px]">
             {t("hero.descSecond")}
           </p>
 
@@ -70,17 +76,25 @@ export function Hero() {
             <HeroPlatformLink />
           </div>
 
-          <div className="mt-6 flex flex-col items-center gap-3">
-            <PlatformBadges className="justify-center" />
+          {/* 平台徽标与版本号收成**一行**。
+              原先是三层堆叠（其它平台链接 / 三个平台徽标 / 当前版本），
+              加上上面那条链接一共四层字号相近的小字挂在主按钮下面，
+              视觉上是一坨、谁也不突出。徽标与版本号本就是同一类元信息，合并即可。 */}
+          <div className="mt-6 flex flex-wrap items-center justify-center gap-x-4 gap-y-2">
+            <PlatformBadges />
+            <span aria-hidden="true" className="hidden h-3.5 w-px bg-border sm:block" />
             <p className="text-xs text-text-secondary">
               {t("hero.versionPrefix")} <span className="font-mono">{release.version}</span>
             </p>
           </div>
         </div>
 
-        {/* 主截图：首屏不滚动就能看到一部分，把「这是个什么软件」直接摆出来 */}
+        {/* 主截图：首屏不滚动就能看到一部分，把「这是个什么软件」直接摆出来。
+            宽度与下方所有卡片网格共用 1136px（原先是 max-w-5xl=1024，于是页面上
+            出现了 1136 / 1024 / 896 三条纵向基准线，其中 1024 只服务这一个元素）。
+            海拔用最高那一档 —— 它是整页唯一「浮在页面之上」的主视觉。 */}
         <div className="animate-fade-up mt-14 sm:mt-16">
-          <div className="mx-auto max-w-5xl overflow-hidden rounded-card border border-border bg-surface shadow-card-hover">
+          <div className="overflow-hidden rounded-card border border-border bg-surface shadow-raised">
             <Screenshot
               src={theme === "dark" ? heroScreenshot.dark : heroScreenshot.light}
               alt={t("hero.screenshotAlt")}

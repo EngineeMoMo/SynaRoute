@@ -39,7 +39,12 @@ export const en: Dict = {
   "nav.github": "GitHub",
 
   // ---------- Hero ----------
-  "hero.badge": "Windows desktop app · Runs entirely on your machine",
+  // ⚠️ Was "Windows desktop app · …" while macOS and Linux have shipped since
+  // v0.1.33 (all three entries in data/platforms.ts are `available`, and the
+  // download section on the same page shows three downloadable cards).
+  // The platform list belongs to PlatformBadges right below; this badge only
+  // claims the three things we can point at in code.
+  "hero.badge": "Desktop app · Runs entirely on your machine · No account",
   // Split in two so the zh build can lock each half with whitespace-nowrap — see zh.ts.
   // English must NOT be locked (measured: one half alone needs 325px at a 320px viewport).
   "hero.titleLead": "Many keys backing each other up, ",
@@ -151,12 +156,26 @@ export const en: Dict = {
   "features.usage.name": "Usage & cost",
   "features.usage.short": "Tokens by category and key, with spend estimated from a built-in price table.",
   "features.usage.desc":
-    "A built-in price table for current models across vendors (including the cache-hit rates, which differ per vendor). Spend is estimated per key; if your relay gives a discount, one cost multiplier calibrates it. When an amount cannot be computed the panel says **why** instead of showing 0 — and it shows the date the price table was last verified so you can judge how much to trust the estimate.",
+    "A built-in price table for current models across vendors (including the cache-hit rates, which differ per vendor). Spend is estimated per key; if your relay gives a discount, one cost multiplier calibrates it. When an amount cannot be computed the panel says why instead of showing 0 — and it shows the date the price table was last verified so you can judge how much to trust the estimate.",
 
   "features.balance.name": "Balance lookup",
   "features.balance.short": "See how much credit is left on a relay, right on the key card.",
   "features.balance.desc":
     "Recognised sites work with zero configuration (endpoint matched by domain; for NewAPI-style sites the internal quota-unit ratio is read live). Unrecognised sites are probed against a few common endpoints and the one that answers is remembered. If nothing answers it says so plainly rather than passing off a quota ceiling as a balance — that would be a wrong number you would believe.",
+
+  // ---------- Two more, covering 0.1.41~0.1.42 ----------
+  // Adding them also satisfies a layout constraint: `third` must be a multiple of 6
+  // (both the 2-column sm grid and the 3-column lg grid have to come out even).
+  // With 10 entries the desktop grid left one orphan card. See data/features.ts.
+  "features.lan.name": "LAN sharing",
+  "features.lan.short": "Optionally let other devices on your network use this machine's proxy — with a token.",
+  "features.lan.desc":
+    "By default it listens on loopback only. Turn LAN sharing on and other devices on the same network can connect, but anything that is not this machine has to present an access token. The token is shown, copied and regenerated from the settings page; logs and diagnostic reports keep only its first 8 characters, so a log you paste somewhere cannot give your credit away. The listener binds IPv4 and IPv6 together, so you don't get «some machines connect, some don't».",
+
+  "features.codexModels.name": "Codex model picker",
+  "features.codexModels.short": "Puts non-GPT models into Codex's own model menu.",
+  "features.codexModels.desc":
+    "Connecting Codex also writes a model catalog for it to read, so the models you configured — including non-GPT names like Claude or GLM — show up in its model menu, with reasoning-effort levels attached. Those levels are derived from the upstream protocol: vendors that only have a thinking on/off switch deliberately get none, because changing the level in Codex would do nothing for them. Changing the model list needs Codex restarted once.",
 
   // ---------- Brain aggregation spotlight ----------
   // Only claims the app actually delivers. The "decider is required" and "tools are off
@@ -299,14 +318,20 @@ export const en: Dict = {
 
   // ---------- FAQ ----------
   "faq.title": "Frequently asked questions",
+  // FAQ was the only one of the seven SectionTitle blocks without a lead line,
+  // leaving 48px of empty space between the heading and the accordion.
+  "faq.subtitle": "The ten questions people actually ask. Every answer describes what the app really does.",
 
   "faq.q1": "Does it cost anything?",
   "faq.a1":
     "No. There's no account to create, no paid tier and no usage cap. You bring your own API keys from whichever vendors you use.",
 
   "faq.q2": "Which operating systems are supported?",
+  // ⚠️ This used to say "Windows only … a macOS build is in development … no Linux
+  // build planned", while all three platforms have shipped since v0.1.33 and the
+  // download section on the same page offers all three. Rewritten to match reality.
   "faq.a2":
-    "Windows only right now (Windows 10 1809 and later). A macOS build is in development and will be offered here once it's ready. There's no Linux build planned.",
+    "Windows, macOS and Linux. Windows 10 (1809) and later; macOS 11+ with separate dmg builds for Apple silicon and Intel; Linux ships as AppImage, deb and rpm and needs glibc 2.31+. The download section highlights the build for your system, and every other platform and architecture stays visible next to it.",
 
   "faq.q3": "Where are my data and keys stored?",
   "faq.a3":
@@ -340,7 +365,11 @@ export const en: Dict = {
     "Editing config by hand points you at one vendor at a time, and when it breaks you have to notice and edit again. SynaRoute puts a local proxy in front so requests hand off between keys automatically, while giving you visual management, health checks and request logs.",
 
   // ---------- Final CTA ----------
-  "cta.title": "Let your keys cover for each other, and your models think together",
+  // Split in two, same reason as hero.titleLead/Tail. English does NOT get
+  // whitespace-nowrap (see Hero.tsx) — the split only exists so the Chinese
+  // half can be locked; English still wraps naturally with text-balance.
+  "cta.titleLead": "Let your keys cover for each other, ",
+  "cta.titleTail": "and your models think together",
   "cta.desc": "Free, entirely local, no account needed.",
 
   // ---------- Footer ----------
@@ -389,6 +418,9 @@ export const en: Dict = {
   "changelog.loadFailedHint":
     "This is usually a network issue or API rate limiting. You can read the releases page directly instead.",
   "changelog.empty": "No releases yet.",
+  // For releases that have nothing left once the per-release boilerplate is
+  // stripped. A sentence rather than an em dash — a dash reads like a load failure.
+  "changelog.noNotes": "No separate release notes were written for this version.",
   "changelog.viewOnGithub": "View this release on GitHub",
 
   // ---------- Privacy ----------

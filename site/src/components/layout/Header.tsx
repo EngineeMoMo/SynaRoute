@@ -110,7 +110,12 @@ export function Header() {
             <LangToggle />
             <ThemeToggle />
 
-            {/* GitHub 与下载比普通导航项更突出（模板第 6.1 节要求） */}
+            {/* GitHub 与下载比普通导航项更突出（模板第 6.1 节要求）。
+                🔴 下载按钮**刻意不是实心主色**：那样它与 Hero 的主 CTA 同色同级，
+                首屏一眼看到两个等权重的「下载」，而下载区那一屏又会同时出现四个
+                实心主色块。全站实心主色收敛到三处（Hero 主 CTA / 下载卡按钮 /
+                最终 CTA），顶栏降一档 —— secondary 仍明显比 ghost 的导航项突出，
+                满足上面那条要求。 */}
             <a
               href={siteConfig.github.url}
               {...externalLinkProps}
@@ -120,7 +125,12 @@ export function Header() {
             >
               <Github size={18} aria-hidden="true" />
             </a>
-            <ButtonLink to={path("download")} size="sm" className="hidden h-11 px-4 text-sm sm:inline-flex">
+            <ButtonLink
+              to={path("download")}
+              variant="secondary"
+              size="sm"
+              className="hidden h-11 px-4 text-sm sm:inline-flex"
+            >
               <Download size={16} aria-hidden="true" />
               {t("nav.download")}
             </ButtonLink>

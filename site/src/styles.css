@@ -34,6 +34,10 @@
     --surface: 255 255 255; /* #FFFFFF */
     --surface-hover: 244 244 245; /* #F4F4F5 */
     --border: 228 228 231; /* #E4E4E7 */
+    /* 「描边再重一档」。用途只有一个：可点卡片的 hover 态 —— 阴影是一条通道，
+       描边是第二条，深色下第一条本来就弱（见 .dark 里那段），两条都给才不会
+       出现「hover 了但看不出来」。 */
+    --border-strong: 212 212 216; /* #D4D4D8 */
     --text-primary: 24 24 27; /* #18181B */
     /* 比桌面应用的 #71717A 略深一档（应用里是 4.83:1，刚够 4.5 只剩 0.33 余量）。
        官网有若干带色底纹的区块（primary/8 的徽标与流程框、warning/8 的风险条、
@@ -48,10 +52,26 @@
     --primary-foreground: 255 255 255;
     /* 实心按钮/徽标的底色。浅色下与 --primary 同值；深色下见 .dark 的说明。 */
     --primary-solid: 109 94 247;
+    /* 渐变/强调的深端。**必须定义**：共享的 tailwind.config.js 早就注册了
+       `primary.deep → rgb(var(--primary-deep))`，而官网这份变量块此前没有它 ——
+       任何人写 `to-primary-deep` 都会生成一条 `var(--primary-deep)` 未定义的声明，
+       表现是「整条 background/color 直接失效」，而 check-opacity.mjs 只扫透明度
+       修饰符、压根不进那个集合，抓不到。值与桌面应用 src/styles.css 一致。 */
+    --primary-deep: 88 72 228; /* #5848E4，白字 6.07:1 */
     --success: 34 197 94;
     --warning: 245 158 11;
     --danger: 239 68 68;
     --info: 59 130 246;
+
+    /* ---- 海拔（两档）----
+       原先只有 `0 1px 2px rgba(0,0,0,.04)` 一档，实测在 #FFF-on-#FAFAFA 上
+       几乎看不见（两色本身只差 1.04:1），于是全站 30 余处 `hover:shadow-card-hover`
+       实际上没有可感反馈。这里分成两档并加第二段扩散，让「静止」与「抬起」拉开。
+       深色版见 .dark —— 那边不能沿用同一组值，理由写在那里。 */
+    --shadow-card: 0 1px 2px rgb(24 24 27 / 0.05), 0 1px 3px rgb(24 24 27 / 0.04);
+    --shadow-card-hover: 0 2px 4px rgb(24 24 27 / 0.05), 0 10px 24px rgb(24 24 27 / 0.09);
+    /* 最高一档：只给「浮在页面之上」的东西 —— Hero 主图、截图、灯箱、下拉面板 */
+    --shadow-raised: 0 4px 10px rgb(24 24 27 / 0.05), 0 18px 44px rgb(24 24 27 / 0.11);
   }
 
   .dark {
@@ -60,6 +80,7 @@
     --surface: 24 24 27; /* #18181B */
     --surface-hover: 35 35 41; /* #232329 */
     --border: 39 39 42; /* #27272A */
+    --border-strong: 63 63 70; /* #3F3F46 —— 同 :root，深色下它是 hover 的主通道 */
     --text-primary: 250 250 250; /* #FAFAFA */
     --text-secondary: 161 161 170; /* #A1A1AA */
     --text-muted: 82 82 91; /* #52525B —— 见文件顶部：不可用于文字 */
@@ -71,10 +92,27 @@
        提亮是为了「主色当文字/图标画在近黑底上」那种用法，与「白字压在主色块上」诉求相反。
        故按钮底色单独一档，取比品牌色略深的值 → 白字 5.1:1。浅色模式两者同值，观感不变。 */
     --primary-solid: 99 85 242; /* #6355F2 */
+    /* 渐变/强调的深端，同 :root 的说明。深色下比 --primary 略深即可。 */
+    --primary-deep: 104 92 240; /* #685CF0 */
     --success: 34 197 94;
     --warning: 245 158 11;
     --danger: 239 68 68;
     --info: 59 130 246;
+
+    /* ---- 海拔（深色版）----
+       🔴 深色下**不能沿用浅色那组值**：`rgba(0,0,0,.04)` 压在 #0E0E11 上算出来是
+       #0D0D10，与底色差 0.6/255 —— 等于一条 CSS 都没写。实测全站 30 余处
+       `hover:shadow-card-hover` 在深色模式下没有任何可见变化，也就是深色下卡片
+       **完全没有 hover 反馈**。
+       修法是把黑影同时加深、加大：0.55 的黑压在 #0E0E11 上是 #060607，差 8/255，
+       在 #18181B 的卡片旁边是能看出来的一圈暗环。
+       **刻意不用 inset 顶部高光**：Hero 主图、截图、灯箱这些容器都是
+       `overflow-hidden` + 一张铺满的 <img>，inset 阴影画在背景之上、内容之下，
+       会被图片整个盖住 —— 那正是最需要海拔的几个元素。边框提亮由
+       `--border-strong` 承担（下面那条）。 */
+    --shadow-card: 0 1px 2px rgb(0 0 0 / 0.4);
+    --shadow-card-hover: 0 2px 6px rgb(0 0 0 / 0.45), 0 12px 28px rgb(0 0 0 / 0.55);
+    --shadow-raised: 0 4px 12px rgb(0 0 0 / 0.5), 0 20px 52px rgb(0 0 0 / 0.6);
   }
 
   * {
@@ -199,7 +237,13 @@
     }
   }
 
-  /* ---- Markdown 正文排版（文档页与更新日志共用）---- */
+  /* ---- Markdown 正文排版（文档页、更新日志、条款页共用）----
+
+     字号四档：h1 30px / h2 20px / h3 17px / h4 15px（正文也是 15px）。
+     🔴 h4 原先是 `text-sm`（14px）—— **比它管辖的正文还小 1px**，于是「小节标题」
+     在视觉上反而比内容更弱。文档页「常见问题」那六个问句、更新日志里的
+     `#### 本版新增` 全中。h3 也从 `text-base`（16px，与正文只差 1px）提到 17px，
+     四档才真的是四档。层级同时靠字重与颜色，不只靠字号。 */
   .prose-doc {
     @apply text-[15px] leading-7 text-text-secondary;
   }
@@ -213,10 +257,16 @@
     @apply mt-10 scroll-mt-24 border-b border-border pb-2 text-xl font-semibold text-text-primary;
   }
   .prose-doc h3 {
-    @apply mt-8 scroll-mt-24 text-base font-semibold text-text-primary;
+    @apply mt-8 scroll-mt-24 text-[17px] font-semibold text-text-primary;
   }
   .prose-doc h4 {
-    @apply mt-6 scroll-mt-24 text-sm font-semibold text-text-primary;
+    @apply mt-6 scroll-mt-24 text-[15px] font-semibold text-text-primary;
+  }
+  /* 标题与**紧跟其后**的第一段收紧：原先一律 mt-4，于是标题上方 24~40px、
+     下方也 16px，「标题属于下面这段」这个归属关系全靠字重撑着。改成 8px 后
+     上下比例约 3:1，扫视时一眼看出分组。 */
+  .prose-doc :is(h2, h3, h4) + * {
+    @apply mt-2;
   }
   .prose-doc p {
     @apply leading-7;
@@ -253,8 +303,20 @@
   .prose-doc pre code {
     @apply bg-transparent p-0 text-text-primary;
   }
+  /* 引用块。**默认中性**：同一个紫色底原先同时承担「前置要求 / 顺带一提 /
+     需真机验证」三种语义，而紫色又是链接色 —— 读者分不出哪一种，也分不清
+     里面有没有链接。真正需要警示的那一类由 useMarkdown 打上 `.is-warn`
+     （按首个 <strong> 的措辞判定），只有它用暖色。
+     内边距原先 pl-4 / pr-3 / py-2 三个值互不相等，一并收成对称的 px-4 py-3。 */
   .prose-doc blockquote {
-    @apply border-l-2 border-primary/40 bg-primary/8 py-2 pl-4 pr-3 text-text-secondary;
+    @apply rounded-r-control border-l-2 border-border bg-surface-hover px-4 py-3 text-text-secondary;
+  }
+  /* `/40` 而不是 `/50`：与 Security 区那条风险横幅（`border-warning/40`）同一档，
+     而且 `scripts/check-opacity.mjs` 是按「类名有没有出现在产物 CSS 里」核对的 ——
+     只在 `@apply` 里用过的档位不会生成同名工具类，会被它报成缺失
+     （`@apply` 里写错档位本来就会让构建直接失败，所以那一侧不需要这条判据兜）。 */
+  .prose-doc blockquote.is-warn {
+    @apply border-warning/40 bg-warning/8;
   }
   .prose-doc hr {
     @apply my-8 border-border;
@@ -262,17 +324,31 @@
   .prose-doc img {
     @apply rounded-control border border-border;
   }
-  /* 表格在窄屏必须能横向滚，否则会把整页撑宽 */
+  /* 表格在窄屏必须能横向滚，否则会把整页撑宽。
+     外框交给 .table-wrap（圆角 + 描边），单元格只留横线 —— 原先每个 td/th
+     都带四边框，是全站唯一的直角全网格线块，与其它一切圆角卡片格格不入。 */
   .prose-doc .table-wrap {
-    @apply -mx-1 overflow-x-auto px-1;
+    @apply my-6 overflow-x-auto rounded-control border border-border;
   }
   .prose-doc table {
     @apply w-full min-w-[36rem] border-collapse text-sm;
   }
   .prose-doc th {
-    @apply border border-border bg-surface-hover px-3 py-2 text-left font-semibold text-text-primary;
+    @apply border-b border-border bg-surface-hover px-3 py-2 text-left font-semibold text-text-primary;
   }
   .prose-doc td {
-    @apply border border-border px-3 py-2 align-top;
+    @apply border-b border-border px-3 py-2 align-top;
+  }
+  .prose-doc tbody tr:last-child td {
+    @apply border-b-0;
+  }
+  /* 表格里的行内 code 不许在任意位置断开。
+     全局那条 `overflow-wrap: anywhere`（上面 code 的说明）在 375px 的段落里是对的，
+     但表格列宽被压到约 144px 时它会把 `http://127.0.0.1:<端口>` 与
+     `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` 这类整体断成两截 —— 而表格
+     本来就能横向滚，不需要靠断字来适配宽度。 */
+  .prose-doc :is(th, td) code {
+    overflow-wrap: normal;
+    white-space: nowrap;
   }
 }

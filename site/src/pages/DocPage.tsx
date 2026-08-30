@@ -37,8 +37,15 @@ export default function DocPage() {
 
   return (
     <Container className="py-28 sm:py-32">
-      <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_15rem] lg:gap-12">
-        <article className="min-w-0">
+      {/*
+        🔴 列宽收成「正文 640 + 目录 240 + 间距 48 = 928」并整体居中。
+        原先是 `[minmax(0,1fr)_15rem]`，于是正文列有 848px 宽、而正文自己又被
+        `max-w-prose` 限到 583px —— **同一列限了两次**，中间恒定空出约 313px；
+        更糟的是页脚「查看原文」与上下篇卡片没被限，它们铺到 848px，
+        于是同一列里出现三条不同的右端。现在只限一次，附属块自动与正文同宽。
+      */}
+      <div className="mx-auto max-w-[58rem] lg:grid lg:grid-cols-[minmax(0,40rem)_15rem] lg:gap-12">
+        <article className="min-w-0 max-w-prose lg:max-w-none">
           <Link
             to={path("docs")}
             className="inline-flex items-center gap-1.5 text-sm text-text-secondary transition-colors hover:text-text-primary"
@@ -48,7 +55,7 @@ export default function DocPage() {
           </Link>
 
           {/* 内容来源是仓库内自己写的 Markdown，且已过 DOMPurify 清洗（见 useMarkdown） */}
-          <div className="prose-doc mt-6 max-w-prose" dangerouslySetInnerHTML={{ __html: html }} />
+          <div className="prose-doc mt-6" dangerouslySetInnerHTML={{ __html: html }} />
 
           <footer className="mt-12 border-t border-border pt-6">
             <a
@@ -68,7 +75,10 @@ export default function DocPage() {
         {toc.length > 1 && (
           <nav aria-label={t("docs.onThisPage")} className="hidden lg:block">
             <div className="sticky top-24">
-              <p className="text-xs font-semibold uppercase tracking-wide text-text-muted">
+              {/* 去掉 `uppercase`：这个词在中文下完全无效，而 en 下把它变成
+                  全大写小字又与全站其它小标题不是一套。text-muted 提到 secondary
+                  —— 它是导航栏的标题，承载信息。 */}
+              <p className="text-xs font-semibold tracking-wide text-text-secondary">
                 {t("docs.onThisPage")}
               </p>
               <ul className="mt-3 space-y-1.5 border-l border-border">
@@ -101,27 +111,32 @@ function DocPager({ slug }: { slug: string }) {
   const next = i >= 0 && i < docs.length - 1 ? docs[i + 1] : null;
   if (!prev && !next) return null;
 
+  /*
+   * 🔴 用 flex + justify-between，**不再用两列网格 + 空占位**。
+   * 原先只有「下一篇」时会渲染一个 `<span />` 占住左列、next 再 `sm:col-start-2`
+   * 靠右 —— 于是文档链的第一篇末尾是「左边一个空格子、右边一张卡」，
+   * 而最后一篇（只有 prev）末尾是「左边一张卡、右边空一半」。两头都是孤卡。
+   * flex 下只有一张时它自然占据自己那一侧，没有空占位。
+   */
   return (
-    <div className="mt-10 grid gap-4 border-t border-border pt-8 sm:grid-cols-2">
-      {prev ? (
+    <div className="mt-10 flex flex-col gap-4 border-t border-border pt-8 sm:flex-row sm:justify-between">
+      {prev && (
         <Link
           to={path(`docs/${prev.slug}`)}
-          className="rounded-card border border-border bg-surface p-4 transition-shadow hover:shadow-card-hover"
+          className="rounded-card border border-border bg-surface p-4 transition-all hover:border-border-strong hover:shadow-card-hover sm:max-w-[calc(50%-0.5rem)]"
         >
-          <span className="text-xs text-text-muted" aria-hidden="true">
+          <span className="text-xs text-text-secondary" aria-hidden="true">
             ←
           </span>
           <span className="mt-1 block text-sm font-medium text-text-primary">{t(`${prev.i18nPrefix}.title`)}</span>
         </Link>
-      ) : (
-        <span />
       )}
       {next && (
         <Link
           to={path(`docs/${next.slug}`)}
-          className="rounded-card border border-border bg-surface p-4 text-right transition-shadow hover:shadow-card-hover sm:col-start-2"
+          className="rounded-card border border-border bg-surface p-4 transition-all hover:border-border-strong hover:shadow-card-hover sm:ml-auto sm:max-w-[calc(50%-0.5rem)] sm:text-right"
         >
-          <span className="text-xs text-text-muted" aria-hidden="true">
+          <span className="text-xs text-text-secondary" aria-hidden="true">
             →
           </span>
           <span className="mt-1 block text-sm font-medium text-text-primary">{t(`${next.i18nPrefix}.title`)}</span>

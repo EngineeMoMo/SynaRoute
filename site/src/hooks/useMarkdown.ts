@@ -84,14 +84,49 @@ export function useMarkdown(source: string, options: MarkdownOptions = {}): Rend
 
     const raw = marked.parse(source, { renderer, async: false, gfm: true, breaks: false }) as string;
 
-    const html = DOMPurify.sanitize(raw, {
+    const clean = DOMPurify.sanitize(raw, {
       ADD_ATTR: ["target", "rel", "id"],
       // 站内文档不需要任何脚本/样式/表单元素
       FORBID_TAGS: ["script", "style", "iframe", "form", "input", "button"],
     });
 
-    return { html, toc };
+    return { html: markWarningQuotes(clean), toc };
   }, [source, headingOffset]);
+}
+
+/**
+ * 给「真的是警示」的引用块打上 `.is-warn`。
+ *
+ * 背景：`.prose-doc blockquote` 原先一律是紫色底（`bg-primary/8` + 主色左边框），
+ * 而文档里这个语法同时承担三种语义 —— 前置要求、顺带一提、需真机验证 —— 读者
+ * 分不出哪一种；紫色又正好是链接色，连「里面有没有链接」都要多看一眼。
+ * 现在默认中性，只有这里命中的那些走暖色。
+ *
+ * 判据取首个 `<strong>` 的措辞（文档里的写法就是 `> **前置要求**：…`）。
+ * 在**清洗之后**用 DOM API 加类，而不是在 marked 的 renderer 里拼字符串：
+ * renderer 拿到的是 token 树，要自己再跑一遍 parser 才能得到内层 HTML。
+ *
+ * 整段包 try/catch 并原样返回：这个函数只负责「更好看」，
+ * 它出任何问题都不该把三个页面的正文变成空白。
+ */
+const WARN_LEAD = /注意|警告|警示|风险|前置|必须|切勿|不要|⚠|Note|Warning|Caution|Prerequisite|Risk/i;
+
+function markWarningQuotes(html: string): string {
+  try {
+    if (typeof DOMParser === "undefined" || !html.includes("<blockquote")) return html;
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    let touched = false;
+    for (const bq of Array.from(doc.querySelectorAll("blockquote"))) {
+      const lead = bq.querySelector("strong")?.textContent ?? "";
+      if (lead && WARN_LEAD.test(lead)) {
+        bq.classList.add("is-warn");
+        touched = true;
+      }
+    }
+    return touched ? doc.body.innerHTML : html;
+  } catch {
+    return html;
+  }
 }
 
 /** 文档正文里的外链在新标签打开，且必须带安全属性 */

@@ -19,7 +19,9 @@ export const navItems: NavItem[] = [
   { id: "brain", labelKey: "nav.brain", hash: "brain" },
   { id: "features", labelKey: "nav.features", hash: "features" },
   { id: "screenshots", labelKey: "nav.screenshots", hash: "screenshots" },
-  { id: "download", labelKey: "nav.download", path: "download" },
+  // ⚠️ 这里**刻意没有「下载」**：顶栏右侧已经有一个指向同一个 /download 的
+  // 按钮，两者同 key、同目标、在同一条 64px 里相距约 580px —— 同一个词出现两次
+  // 只会让人怀疑它们不是一回事。下载入口保留在右侧按钮与页脚，不进导航列表。
   { id: "docs", labelKey: "nav.docs", path: "docs" },
   { id: "changelog", labelKey: "nav.changelog", path: "changelog" },
 ];

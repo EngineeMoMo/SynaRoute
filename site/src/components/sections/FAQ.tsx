@@ -13,7 +13,7 @@ export function FAQ() {
 
   return (
     <Section id="faq">
-      <SectionTitle title={t("faq.title")} />
+      <SectionTitle title={t("faq.title")} subtitle={t("faq.subtitle")} />
       <Accordion items={items} className="mx-auto mt-12 max-w-3xl" />
     </Section>
   );

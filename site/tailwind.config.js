@@ -46,13 +46,45 @@ export default {
          * 见 styles.css 里 --primary-solid 的注释。
          */
         "primary-solid": "rgb(var(--primary-solid) / <alpha-value>)",
+        /** 描边再重一档，只用于可点卡片的 hover。见 styles.css 里 --border-strong。 */
+        "border-strong": "rgb(var(--border-strong) / <alpha-value>)",
+      },
+
+      /**
+       * 🔴 覆盖应用那份的 `boxShadow`（**不是**去改应用的 —— 桌面应用共用它，
+       * 且它那两档在应用的信息密集型界面里是合适的）。
+       *
+       * 官网这边必须覆盖，因为应用那两档在官网上等于不存在：
+       * - 浅色：`rgba(0,0,0,.04)` 的 1px 投影压在 #FFF-on-#FAFAFA 上（两色本身
+       *   只差 1.04:1），肉眼看不出卡片有没有抬起；
+       * - 深色：黑影压在 #0E0E11 上算出来差 0.6/255，**一条 CSS 都没写**，
+       *   于是全站 30 余处 `hover:shadow-card-hover` 在深色下毫无反馈。
+       *
+       * 改成读 CSS 变量，两个主题各给一组（值与理由在 styles.css）。
+       * 类名保持 `shadow-card` / `shadow-card-hover` 不变 —— 30 余处调用点
+       * 不用动，自动升级；新增的 `shadow-raised` 只给「浮在页面之上」的元素。
+       *
+       * 判据：`npm run build` 后 dist CSS 里 `.shadow-card` 的值应是
+       * `var(--shadow-card)`，且 styles.css 的 `:root` 与 `.dark` 里都能搜到它。
+       */
+      boxShadow: {
+        card: "var(--shadow-card)",
+        "card-hover": "var(--shadow-card-hover)",
+        raised: "var(--shadow-raised)",
       },
 
       maxWidth: {
         // 正文主容器宽度：模板建议 1120~1280，取中间值兼顾大屏留白与信息密度
         content: "1200px",
-        // 文档正文单列宽度，避免长行影响阅读
-        prose: "72ch",
+        /**
+         * 文档 / 条款正文的单列宽度。
+         *
+         * 🔴 原先是 `72ch`，而 `ch` 是**相对所在元素字号**的单位 —— 同一个
+         * `max-w-prose` 在条款页（16px 上下文）解析成 625px、在文档页
+         * （`.prose-doc` 的 15px）解析成 583px，两页拿到两个不同的行宽而
+         * 类名一模一样。改成固定值，两页真正一致。
+         */
+        prose: "640px",
       },
       fontSize: {
         // Hero 主标题：桌面 56px / 移动 36px（由响应式类切换），行高压紧显紧凑
@@ -67,7 +99,15 @@ export default {
          * 30px 下同一段是 271px，装得下。
          */
         "hero-xs": ["1.875rem", { lineHeight: "1.2", letterSpacing: "-0.02em" }],
-        "section-title": ["2rem", { lineHeight: "1.25", letterSpacing: "-0.01em" }],
+        /**
+         * 区块标题（`sm` 以上）。
+         *
+         * 原先是 `2rem` —— 只比 `text-3xl`（30px）大 2px，而且它自带
+         * `letterSpacing: -0.01em`，**反向覆盖**了调用点显式写的 `tracking-tight`
+         * （-0.025em），于是「响应式放大」实际上只放大 2px 还把字距放松了。
+         * 现在 36px + -0.025em：既真的放大一档，也与 tracking-tight 同向。
+         */
+        "section-title": ["2.25rem", { lineHeight: "1.2", letterSpacing: "-0.025em" }],
       },
       keyframes: {
         // 进入视口的轻微淡入上移，位移刻意只有 12px —— 幅度再大就成了干扰动画

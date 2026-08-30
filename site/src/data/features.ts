@@ -15,6 +15,8 @@ import {
   ShieldOff,
   TrendingUp,
   Wallet,
+  Network,
+  SlidersHorizontal,
 } from "lucide-react";
 
 /**
@@ -45,9 +47,18 @@ export interface Feature {
   /**
    * 在 Bento 网格里占据的宽度。
    *
-   * **两个 `half` + 六个 `third` 是刻意凑的整数**：half 走两列一行、third 走三列两行，
-   * 每一行都排满。加功能时要么成对加 half、要么按三个一组加 third，否则最后一行会
-   * 剩一个孤零零的卡片（视觉上像是没做完）。
+   * 🔴 **`third` 的数量必须是 6 的倍数**，`half` 必须是偶数。
+   *
+   * 为什么是 6 而不是 3：small 网格是 `sm:grid-cols-2 lg:grid-cols-3`，
+   * 两档都要排满，所以数量得同时被 2 和 3 整除。
+   *
+   * 这条约束原先写的是「六个 third」并只说了三列那一档 —— 0.1.30~0.1.33 加了
+   * 四条 third（变成 10 条）之后它就破了，而**注释不是判据**，没有任何东西报错：
+   * 桌面端最后一行只剩「余额查询」一张孤卡、右侧空掉约 770×255px，
+   * 看起来像是漏排了。本轮补到 12 条并把约束写准。
+   *
+   * ⚠️ 只在 `lg` 那一档才看得出来（<640px 单列、640~1023px 两列都排得满），
+   * 所以自测时窗口不拉到 1024 以上是发现不了的。
    *
    * 大脑聚合不在这个列表里 —— 它有独立的 `BrainSpotlight` 区块，别再往这儿加一份。
    */
@@ -69,6 +80,10 @@ export const features: Feature[] = [
   { id: "resilience", icon: ShieldOff, i18nPrefix: "features.resilience", span: "third" },
   { id: "usage", icon: TrendingUp, i18nPrefix: "features.usage", span: "third" },
   { id: "balance", icon: Wallet, i18nPrefix: "features.balance", span: "third" },
+  // 0.1.41~0.1.42 的两条，官网此前一个字都没提。补上它们同时把 third 凑回 12
+  //（6 的倍数，见上面 span 的说明）。
+  { id: "lan", icon: Network, i18nPrefix: "features.lan", span: "third" },
+  { id: "codexModels", icon: SlidersHorizontal, i18nPrefix: "features.codexModels", span: "third" },
 ];
 
 export interface Step {

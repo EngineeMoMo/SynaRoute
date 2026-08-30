@@ -6,7 +6,8 @@ export function GettingStarted() {
   const t = useT();
 
   return (
-    <Section id="getting-started">
+    // tight 节奏：这一段是「下载完之后怎么用」，与上面的下载区是同一件事的延续
+    <Section id="getting-started" rhythm="tight">
       <SectionTitle title={t("steps.title")} subtitle={t("steps.subtitle")} />
 
       <ol className="mx-auto mt-12 max-w-3xl">

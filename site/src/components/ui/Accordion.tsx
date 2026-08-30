@@ -15,12 +15,22 @@ export interface AccordionEntry {
  * 需要控制展开动画与「同时展开多条」，<details> 两者都不好做。
  * 键盘可达性由 button 天然保证（Enter/Space 都能触发）。
  *
- * 排版上刻意每条独立成卡片（不是一整块里用分隔线切开）：十条问题堆在一个大框里时，
- * 每行只有一条细线，扫视起来是一片密集的横线，看不出条目边界。独立卡片 + 间距后
- * 每条是一个可点的对象，展开的那条还能靠边框高亮出来。
+ * ## 排版：一体化列表（此前是十张独立卡片）
+ *
+ * 旧写法是「每条独立成卡 + 12px 间距」，注释里的理由是「十条堆在一个大框里时，
+ * 每行只有一条细线，扫视起来是一片密集的横线，看不出条目边界」。
+ * **那个顾虑是对的，但它针对的是「矮行 + 细线」这种组合。** 实际效果是另一头的
+ * 问题：十个等大的圆角白盒子连成约 790px 的同构横条，与页面上其余卡片网格
+ * 完全同权重，读起来像「又一组功能卡」而不是一份可扫的问题清单。
+ *
+ * 现在的解法同时避开两头：
+ * - 一个外框 + 分隔线（不是十个盒子）→ 它是一份清单，不再是一组卡片；
+ * - 行高给到 68px 以上（py-5，比原来的 py-4 更高）→ 不会变成「密集的横线」；
+ * - 展开的那条整行换底色 + 编号变实心主色 → 状态比原先靠边框变色更明确。
+ *
+ * 默认全收起：十条问题若展开第一条，首屏会被一段长答案占掉，反而看不清有哪些问题。
  */
 export function Accordion({ items, className }: { items: AccordionEntry[]; className?: string }) {
-  // 默认全收起：十条问题若展开第一条，首屏会被一段长答案占掉，反而看不清有哪些问题
   const [openIds, setOpenIds] = useState<string[]>([]);
   const baseId = useId();
 
@@ -29,19 +39,18 @@ export function Accordion({ items, className }: { items: AccordionEntry[]; class
   }
 
   return (
-    <div className={cn("space-y-3", className)}>
+    <div
+      className={cn(
+        "divide-y divide-border overflow-hidden rounded-card border border-border bg-surface shadow-card",
+        className
+      )}
+    >
       {items.map((item, i) => {
         const open = openIds.includes(item.id);
         const btnId = `${baseId}-${item.id}-btn`;
         const panelId = `${baseId}-${item.id}-panel`;
         return (
-          <div
-            key={item.id}
-            className={cn(
-              "overflow-hidden rounded-card border bg-surface transition-colors",
-              open ? "border-primary/40 shadow-card" : "border-border hover:border-text-muted/40"
-            )}
-          >
+          <div key={item.id} className={cn("transition-colors", open && "bg-surface-hover")}>
             <h3>
               <button
                 id={btnId}
@@ -49,7 +58,7 @@ export function Accordion({ items, className }: { items: AccordionEntry[]; class
                 aria-expanded={open}
                 aria-controls={panelId}
                 onClick={() => toggle(item.id)}
-                className="flex w-full items-start gap-4 px-5 py-4 text-left transition-colors hover:bg-surface-hover sm:px-6 sm:py-5"
+                className="flex w-full items-start gap-4 px-5 py-5 text-left transition-colors hover:bg-surface-hover sm:px-6"
               >
                 {/* 编号：给十条问题一个可指认的序号，答复用户时能说「第 6 条」 */}
                 <span

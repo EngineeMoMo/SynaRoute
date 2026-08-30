@@ -204,11 +204,11 @@ export function PlatformCard({
       <div className="flex items-center gap-3">
         <span
           className={cn(
-            "inline-flex h-11 w-11 items-center justify-center rounded-control",
+            "inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-control",
             soon ? "bg-surface-hover text-text-secondary" : "bg-primary/12 text-primary"
           )}
         >
-          <Icon size={22} aria-hidden="true" />
+          <Icon size={20} aria-hidden="true" />
         </span>
         <div>
           <h3 className="text-base font-semibold text-text-primary">{t(`platform.${platform.id}.name`)}</h3>
@@ -233,7 +233,11 @@ export function PlatformCard({
         )}
       </dl>
 
-      <div className="mt-6">
+      {/* 🔴 `mt-auto` 把「按钮 + 其它架构」整块钉到卡片底部。
+          三张卡在网格里等高拉伸，而 `minOS` 一行的长短决定了上半部分的高度
+          （Linux 那句要折两行）→ 不钉的话三个下载按钮落在三个不同的高度上。
+          钉到底部后按钮对齐，参差只剩在信息区内部 —— 一处参差比三处错位好读。 */}
+      <div className="mt-auto pt-6">
         {dl.href ? (
           <ButtonExternal href={dl.href} size="lg" className="w-full">
             <Download size={18} aria-hidden="true" />
@@ -259,10 +263,18 @@ export function PlatformCard({
       {/* 其它架构 / 包格式，与主下载并列。
           macOS 一次发布有 aarch64 与 x64 两个 dmg、Linux 有 AppImage/deb/rpm ——
           只给一个就必然有人拿错，而拿错架构的 dmg 在 Mac 上报的是「已损坏，无法打开」，
-          与真正的损坏一模一样，用户几乎不可能自己诊断出来。 */}
-      {extras.length > 0 && (
-        <p className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-text-secondary">
-          <span className="text-text-muted">{t("download.otherBuilds")}</span>
+          与真正的损坏一模一样，用户几乎不可能自己诊断出来。
+
+          🔴 这一段**始终占位**（没有 extras 时渲染一个等高的空行）：三张卡在网格里
+          等高拉伸，而 Windows 没有 extras → 它的按钮下面凭空空出 37~61px，偏偏它
+          又是带「推荐给你」角标的那张。占位后三张卡的按钮落在同一水平线上。
+
+          字色从 text-muted 提到 text-secondary：这里是转化页，而 text-muted 在
+          浅色下 2.56:1、深色下 2.20:1 —— 体积数字与「其它架构」标签都读不清，
+          而拿错架构的 dmg 报的是「已损坏」，用户根本诊断不出原因。 */}
+      {extras.length > 0 ? (
+        <p className="mt-3 flex min-h-6 flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-text-secondary">
+          <span>{t("download.otherBuilds")}</span>
           {extras.map((x) => (
             <a
               key={x.label}
@@ -271,10 +283,14 @@ export function PlatformCard({
               className="inline-flex min-h-6 items-center text-primary underline underline-offset-4 hover:opacity-80"
             >
               {x.label}
-              {x.size > 0 && <span className="ml-1 text-text-muted">({formatBytes(x.size)})</span>}
+              {x.size > 0 && <span className="ml-1 text-text-secondary">({formatBytes(x.size)})</span>}
             </a>
           ))}
         </p>
+      ) : (
+        // `min-h-6` 必须与上面那一行的实际高度一致（那行的高度由链接的 `min-h-6` 决定）。
+        // 给 min-h-5 会差 4px —— 三个按钮就差着 4px 对不齐，比不占位好但仍然看得出。
+        <p aria-hidden="true" className="mt-3 min-h-6 text-[13px]" />
       )}
     </div>
   );
@@ -288,7 +304,11 @@ export function PlatformGrid({ className }: { className?: string }) {
 
   return (
     <div className={className}>
-      <div className="grid gap-5 sm:grid-cols-2">
+      {/* 🔴 `lg:grid-cols-3` 是必须的：三个平台放两列，第三张（Linux）从 640px 到
+          2560px **永远**独占一行、右半边全空，而它旁边就是本页最重要的转化区。
+          三档都排满：<640 单列、640~1023 两列（最后一行空一个，但那一档卡片够宽、
+          两列已是上限）、≥1024 三列。 */}
+      <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
         {platforms.map((p) => (
           <PlatformCard
             key={p.id}

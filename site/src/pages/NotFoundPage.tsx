@@ -33,7 +33,9 @@ export default function NotFoundPage() {
       </div>
 
       <nav className="mt-10" aria-label={t("docs.title")}>
-        <p className="text-xs uppercase tracking-wide text-text-muted">{t("docs.title")}</p>
+        {/* 去掉 uppercase（对中文完全无效）、muted 提到 secondary —— 它是这一组
+            链接的标题，承载信息 */}
+        <p className="text-xs font-semibold tracking-wide text-text-secondary">{t("docs.title")}</p>
         <ul className="mt-3 flex flex-wrap justify-center gap-x-5 gap-y-2">
           {docs.map((d) => (
             <li key={d.slug}>

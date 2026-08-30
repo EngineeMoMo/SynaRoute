@@ -23,7 +23,11 @@ export function BackToTop() {
       title={t("common.backToTop")}
       onClick={scrollToTop}
       className={cn(
-        "fixed bottom-5 right-5 z-40 inline-flex h-11 w-11 items-center justify-center rounded-full border border-border bg-surface text-text-secondary shadow-card-hover transition-all duration-250 hover:text-text-primary",
+        // <640px 缩一档并往角落收：44px 的圆钮固定在 bottom-5 right-5 时会压住
+        // 移动端那些 `w-full` 主按钮的右端 —— 两者都可点，指头落在重叠处
+        // 究竟触发哪一个取决于层级，不该让用户去猜。
+        // 海拔用 raised —— 它是真的浮在页面之上的东西。
+        "fixed bottom-4 right-3 z-40 inline-flex h-10 w-10 items-center justify-center rounded-full border border-border bg-surface text-text-secondary shadow-raised transition-all duration-250 hover:border-border-strong hover:text-text-primary sm:bottom-5 sm:right-5 sm:h-11 sm:w-11",
         show ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-3 opacity-0"
       )}
     >

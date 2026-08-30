@@ -30,19 +30,30 @@ export function Security() {
     <Section id="security">
       <SectionTitle title={t("security.title")} subtitle={t("security.subtitle")} />
 
-      <div className="mt-12 grid gap-5 md:grid-cols-2 lg:grid-cols-3">
+      {/* 首断点用 `sm` 而不是 `md`：同页其余卡片网格（Benefits / Features / 截图）
+          全是 `sm:grid-cols-2`，只有这一处等到 768px 才分两列 → 640~767px 这段
+          自上而下会在「两列 / 一列 / 两列」之间来回跳。六条走两列仍是 3 行排满。 */}
+      <div className="mt-12 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
         {facts.map((item, i) => {
           const Icon = item.icon;
           return (
             <Reveal key={item.id} delay={i * 50} className="h-full">
-              <div className="flex h-full flex-col rounded-card border border-border bg-surface p-6 shadow-card">
+              {/* 补上 hover 反馈：这一节的卡片与 Features 同款，却是全页唯一
+                  一组悬停时毫无变化的卡片。 */}
+              <div className="flex h-full flex-col rounded-card border border-border bg-surface p-6 shadow-card transition-shadow hover:shadow-card-hover">
                 <div className="flex items-center gap-3">
                   <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-control bg-surface-hover text-text-secondary">
                     <Icon size={18} aria-hidden="true" />
                   </span>
                   <h3 className="text-base font-semibold text-text-primary">{t(`${item.i18nPrefix}.title`)}</h3>
                 </div>
-                <p className="mt-3 text-sm leading-relaxed text-text-secondary">{t(`${item.i18nPrefix}.desc`)}</p>
+                {/* `lg:min-h` 把等高拉伸留下的底部空洞收掉：三列并排时同一行里
+                    最长的一条约 5 行、最短的 3 行，短的那两张卡底部会空出
+                    70~90px。min-h 是**下限**不是上限 —— 文案变长卡片照样会长，
+                    不会截断。 */}
+                <p className="mt-3 text-sm leading-relaxed text-text-secondary lg:min-h-[7rem]">
+                  {t(`${item.i18nPrefix}.desc`)}
+                </p>
               </div>
             </Reveal>
           );

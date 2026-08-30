@@ -61,7 +61,9 @@ export class ErrorBoundary extends Component<Props, State> {
         <p className="mt-3 text-sm leading-relaxed text-text-secondary">
           可能是浏览器版本较旧。请尝试刷新，或升级到较新版本的 Safari / Chrome / Edge。
           <br />
-          <span className="text-text-muted">
+          {/* 英文那句用 secondary 而不是 muted：muted 在浅色下 2.56:1、深色下
+              2.20:1，而这一屏的读者恰恰是「页面坏了正在找线索」的人。 */}
+          <span className="text-text-secondary">
             This page failed to render — try refreshing, or use a newer browser.
           </span>
         </p>

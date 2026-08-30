@@ -27,7 +27,9 @@ export function prefersReducedMotion(): boolean {
 
 /**
  * 该用哪种滚动行为。全站**所有** JS 滚动都要经过它，不许直接写
- * `behavior: "smooth"` —— 有一条策略门（`scripts/check-reduced-motion.mjs`）盯着这件事，
+ * `behavior: "smooth"` —— 有一条策略门盯着这件事
+ * （`scripts/check-forbidden.mjs` 的 `reduced-motion-must-go-through-motion-helper`；
+ * 这里原先写的脚本名是 `check-reduced-motion.mjs`，仓库里没有那个文件），
  * 因为「记得查一下偏好」是四个调用点各自要记的纪律，而漏掉的表现是静默的
  * （对不开这个设置的人毫无差别，所以自测时永远看不出来）。
  */

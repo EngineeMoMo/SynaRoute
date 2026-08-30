@@ -165,7 +165,122 @@ const bad = (name, hits, how) => {
 }
 
 // ---------------------------------------------------------------------------
-// 5) 反向判据：门不能空转
+// 5) i18n 的**值**里不许出现 Markdown 语法
+// ---------------------------------------------------------------------------
+//
+// 文案是 `{t(key)}` 直接塞进 <p> 的纯文本 —— 全站没有任何地方把 i18n 值过一遍
+// Markdown。于是 `**为什么**` 会把四个星号原样印在正文中间。
+//
+// 这不是假想：`features.usage.desc` 中英两版都这么写着上线了，而且我在修它的
+// 同一次改动里**又在新写的 `features.lan.desc` 里犯了一遍**（几分钟内重复同一个
+// 错误）——这正说明它需要一条机械判据，而不是一句「注意别写 Markdown」。
+//
+// 🔴 必须先剥注释：两个文件的头部注释里就有 `**没有 LICENSE 文件**`、
+// 正文注释里有 `` `third` `` 这样的反引号。不剥的话这条门第一次跑就报 6 处假警。
+// 本仓已在别处栽过三次同类（`data-dir-env-name-must-match` 命中自己注释里
+// 「❌ 已证伪的修法」、`userPrefsParity` 裸 grep 命中警告文案、
+// `only_v6_must_be_set_explicitly` 被模块注释满足）——**判据说「文案里别这么写」，
+// 就只能看文案本身。**
+{
+  /** 剥掉 // 行注释与 /* *\/ 块注释，只留代码 */
+  const stripComments = (src) =>
+    src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+
+  // 逐条列出来而不是一个大正则：报错时能直接说清是哪一种语法
+  const BANNED = [
+    { re: /\*\*/, what: "Markdown 粗体 **…**（会原样显示星号）" },
+    { re: /`/, what: "Markdown 行内代码反引号（会原样显示反引号）" },
+    { re: /\]\(/, what: "Markdown 链接 [文字](地址)（会原样显示方括号与圆括号）" },
+  ];
+
+  const hits = [];
+  let valuesScanned = 0;
+  for (const name of ["zh.ts", "en.ts"]) {
+    const file = join(SRC, "i18n", name);
+    const code = stripComments(readFileSync(file, "utf8"));
+    // 所有双引号字符串；紧跟 `:` 的是键，跳过，其余是值
+    for (const m of code.matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
+      const after = code.slice(m.index + m[0].length).match(/^\s*(.)/);
+      if (after && after[1] === ":") continue;
+      valuesScanned += 1;
+      for (const b of BANNED) {
+        if (b.re.test(m[1])) {
+          hits.push(`${name}  ${b.what}\n     ${m[1].slice(0, 70)}…`);
+          break;
+        }
+      }
+    }
+  }
+
+  // 反向判据：解析到的值太少说明正则坏了（键数在 240 上下，值数应与之同量级）
+  if (valuesScanned < 200) {
+    bad("no-markdown-in-i18n-values", [`只解析出 ${valuesScanned} 个文案值 —— 判据在空转`], "先修脚本的正则");
+  } else if (hits.length) {
+    bad(
+      "no-markdown-in-i18n-values",
+      hits,
+      "i18n 的值是纯文本渲染的：删掉标记，或把要强调的部分拆成独立 key 用 font-medium 排版",
+    );
+  } else {
+    ok("no-markdown-in-i18n-values", `查过 ${valuesScanned} 个文案值（已剥注释）`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 6) 首页网格的「排满整数行」约束
+// ---------------------------------------------------------------------------
+//
+// README 有一张约束表，但它一直只是文档 —— 而 `features.ts` 的 `third` 从 6 涨到
+// 10 之后那条约束就破了：桌面三列下最后一行只剩一张孤卡、右边空掉约 770×255px，
+// 看起来像漏排了。破约当时没有任何东西报错，注释本身也跟着过时了。
+//
+// 判据落到数量本身：
+// - `third` 网格是 `sm:grid-cols-2 lg:grid-cols-3` → 数量必须同时被 2 和 3 整除（6 的倍数）
+// - `half` 网格是 `md:grid-cols-2` → 必须是偶数
+// - `Security` 的 facts 是 `sm:grid-cols-2 lg:grid-cols-3` → 同样是 6 的倍数
+//   （它今天是 6，README 里唯一还成立的那条；顺手钉住，别让它变成第二个 features）
+{
+  const hits = [];
+  const countOf = (src, re) => [...src.matchAll(re)].length;
+
+  const featuresSrc = readFileSync(join(SRC, "data", "features.ts"), "utf8");
+  // ⚠️ 必须锚定条目末尾那个 `}`：第一版写成 /span:\s*"half"/ 时，
+  // **类型声明那一行** `span: "half" | "third";` 也被数进去了 → half 报 3、门直接假红。
+  // 同本仓记过多次的那类坑：判据被「长得像但不是」的东西满足/污染。
+  const third = countOf(featuresSrc, /span:\s*"third"\s*\}/g);
+  const half = countOf(featuresSrc, /span:\s*"half"\s*\}/g);
+  if (third === 0 || half === 0) {
+    hits.push(`features.ts 只数出 half=${half} / third=${third} —— 判据在空转，先修正则`);
+  } else {
+    if (third % 6 !== 0) {
+      hits.push(
+        `features.ts 的 third=${third}，不是 6 的倍数 → lg 三列下最后一行剩 ${3 - (third % 3)} 个空位`,
+      );
+    }
+    if (half % 2 !== 0) hits.push(`features.ts 的 half=${half}，不是偶数 → md 两列下留一个空位`);
+  }
+
+  const securitySrc = readFileSync(join(SRC, "components", "sections", "Security.tsx"), "utf8");
+  const facts = countOf(securitySrc, /i18nPrefix:\s*"security\./g);
+  if (facts === 0) {
+    hits.push("Security.tsx 一条 fact 都没数到 —— 判据在空转，先修正则");
+  } else if (facts % 6 !== 0) {
+    hits.push(`Security.tsx 的 facts=${facts}，不是 6 的倍数（风险提示不算在网格里）`);
+  }
+
+  if (hits.length) {
+    bad(
+      "home-grids-must-fill-whole-rows",
+      hits,
+      "成对/成组加条目把数量凑回整数行；实在凑不到就先改网格列数，别留孤卡",
+    );
+  } else {
+    ok("home-grids-must-fill-whole-rows", `features half=${half} / third=${third}，security facts=${facts}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 7) 反向判据：门不能空转
 // ---------------------------------------------------------------------------
 if (code.length < 20 || markdown.length < 5) {
   console.log(

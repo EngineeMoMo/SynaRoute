@@ -18,8 +18,11 @@ const TARGETS = [
   { sel: "#benefits", id: "02-benefits" },
   { sel: "#brain", id: "03-brain" },
   { sel: "#features", id: "04-features" },
-  { sel: "#security", id: "05-security" },
-  { sel: "#faq", id: "06-faq" },
+  { sel: "#screenshots", id: "05-screenshots" },
+  { sel: "#download", id: "06-download" },
+  { sel: "#getting-started", id: "07-steps" },
+  { sel: "#security", id: "08-security" },
+  { sel: "#faq", id: "09-faq" },
 ];
 
 const CHROME = [
@@ -76,11 +79,20 @@ try {
   await cdp.send("Page.enable");
   await cdp.send("Runtime.enable");
   await cdp.send("Emulation.setDeviceMetricsOverride", { width: W, height: H, deviceScaleFactor: 1, mobile: false });
+  // 🔴 主题必须在**加载前**写进 localStorage —— 直接 toggle `<html class="dark">`
+  // 只改 CSS，而 useTheme 的状态是模块级、只在初始化时读一次，React 侧仍是 light，
+  // 于是深色截图里配的是浅色产品截图。理由详见 review-shots.mjs 里同一处的注释。
+  await cdp.send("Page.navigate", { url: `${BASE}/${lang}` });
+  await sleep(1200);
+  await cdp.evaluate(`localStorage.setItem('synaroute-site-theme', ${JSON.stringify(theme)})`);
   await cdp.send("Page.navigate", { url: `${BASE}/${lang}` });
   for (let i = 0; i < 60; i++) { if (await cdp.evaluate(`!!document.querySelector('#brain')`)) break; await sleep(250); }
-  await cdp.evaluate(`document.documentElement.classList.toggle('dark', ${theme === "dark"})`);
+  // 加 `reveal-in`（不是 `is-visible` —— 那是个不存在的类名，加了什么都不会发生）
   await cdp.evaluate(`(async () => {
-    document.querySelectorAll('.reveal').forEach(e => e.classList.add('is-visible'));
+    document.querySelectorAll('.reveal').forEach(e => {
+      e.style.animationDelay = '0ms';
+      e.classList.add('reveal-in');
+    });
     document.querySelectorAll('img[loading="lazy"]').forEach(i => i.loading = 'eager');
     const h = document.body.scrollHeight;
     for (let y = 0; y < h; y += 600) { window.scrollTo(0, y); await new Promise(r => setTimeout(r, 50)); }
@@ -90,6 +102,15 @@ try {
   await sleep(500);
 
   for (const tg of TARGETS) {
+    // 选择器找不到时**说清是哪一个**再跳过，而不是让 `querySelector(...).getBoundingClientRect`
+    // 抛一个光秃秃的 "Uncaught" 把整个脚本带走 —— 区块 id 改名时那条报错完全指不出方向。
+    if (tg.sel) {
+      const found = await cdp.evaluate(`!!document.querySelector('${tg.sel}')`);
+      if (!found) {
+        console.log(`  ⚠ 跳过 ${tg.id}：页面里没有 ${tg.sel}（区块 id 改了？）`);
+        continue;
+      }
+    }
     await cdp.evaluate(
       tg.sel
         ? `window.scrollTo(0, document.querySelector('${tg.sel}').getBoundingClientRect().top + window.scrollY - 8)`
