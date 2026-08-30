@@ -232,6 +232,23 @@ for(const r of rows){
 
 ### 结论一：工具承载形态由「Codex 侧配的模型名」决定，与真实上游无关
 
+> 🔴 **勘误（2026-08-28，实现 Codex 模型目录时取证）**：这个结论**只在没有模型目录时成立**，
+> 而且「模型名」不是根因。真正决定形态的是 `ModelInfo.tool_mode`，官方内置基底
+> （`codex-rs/models-manager/models.json`，10 条）实测：
+>
+> | slug | `tool_mode` | 对应下表哪一列 |
+> |---|---|---|
+> | `gpt-5.6-sol` / `-terra` / `-luna` | `"code_mode_only"` | `additional_tools` + exec 沙箱 |
+> | `gpt-5.5` / `5.4` / `5.4-mini` / `5.2` | **`null`**（= `ToolMode::Direct`） | 顶层 `tools` |
+>
+> 下表按名字分出的两组，与这张表一一对应 —— 名字之所以「决定」形态，是因为 Codex 按 slug
+> 去查元数据，查不到就落 `model_info_from_slug` 的 fallback（`tool_mode: None`）。
+> `claude-opus-4-7` 那 18 条走顶层 `tools`，正是走了 fallback。
+>
+> **现在我们写模型目录（`tools/codex_catalog.rs`），也就是自己声明 `tool_mode`** ——
+> 形态从「受模型名支配」变成**显式声明**，我们一律发 `null`（顶层 `tools`，也就是本节
+> 实测过工具与 MCP 全通的那条形态）。完整判据见 CLAUDE.md「Codex 模型目录已实现」那条。
+
 900 条大请求按模型名统计：
 
 | Codex 侧模型名 | `additional_tools` + exec 沙箱 | 顶层 `tools` |

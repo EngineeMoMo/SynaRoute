@@ -95,11 +95,13 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   **三道路径防线恒定生效**：拒 `..`/绝对路径 → canonicalize 后须仍在工作目录内 →
   凭据类文件一律拒读（按「模型给的名字」与「解析链接后的真实落点」**各判一次**，两次都不能省）。
   每条防线都做过故障注入验证（去掉后测试必须变红）。当前基线 **433 passed / 0 failed**
-  <br>📌 **基线口径（2026-08-27 实测）**：上面各条历史行里的 311/312/368/383/433/506/719/760/806
-  都是**当时**的数字，勿当现值。当前实测 `cargo test --lib` = **881 passed / 0 failed / 4 ignored**
-  （连跑 3 次全绿；`cargo clippy --lib --all-targets -- -D warnings` 零警告；
-  `tsc --noEmit` 干净；`npm test` 133 passed / 17 文件；`npm run gates` 全绿，
-  **零棘轮抬高**）。
+  <br>📌 **基线口径（2026-08-30 实测）**：上面各条历史行里的 311/312/368/383/433/506/719/760/806/911
+  都是**当时**的数字，勿当现值。当前实测 `cargo test --lib` = **941 passed / 0 failed / 6 ignored**
+  （`cargo clippy --lib --all-targets -- -D warnings` 零警告；`tsc --noEmit` 干净；
+  `npm test` **143 passed / 20 文件**；`npm run gates` 全绿，**零棘轮抬高**，
+  且 `lib.rs` 2076→2074、`proxy.rs` 3105→3103 两项**下调**）。
+  🔴 **B4 落地后（同日）**：`cargo test --lib` = **953 passed / 0 failed / 6 ignored**，
+  `lib.rs` 基线进一步下调到 **1907**（余额查询实现搬进 `balance_gate`）。
   接手时请自己跑一遍取当前值，不要引用本文档里的历史数字当基线。
   <br>⚠️ 观察中的一次偶发：`upstream_retry_after_is_propagated_downstream` 在 2026-08-23
   的一次全量跑里红过一次，此后连跑 9 次未复现，单独跑也稳定绿。尚未定性
@@ -113,9 +115,14 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   除 neutral 外的全部彩色变体），一直是「有边框有字色、独独没底色」而无人发现。
   已在 `tailwind.config.js` 补进 8 / 12 两档（不是把类名改成 /10，要保住设计稿原值）。
   判据：`npm run build` 后 `dist/assets/*.css` 里能搜到 `.bg-warning\/8`。
-  <br>**刻意未做**（别当遗漏）：P2-1 `upstream/` 目录化、P2-7 `service.rs` 抽出、
-  P2-8 `CategoryType` 查表化、`AppSettings` 拆 `UserPrefs`/`RuntimeState` —— 四项都是
-  纯结构调整、零用户可感收益，却是 diff 最大 / 风险最高的，不该紧挨着一次远程真机测试做
+  <br>🔴 **勘误（2026-08-30 复核）**：这里原先写「**刻意未做**（别当遗漏）：P2-1 `upstream/`
+  目录化、P2-7 `service.rs` 抽出、P2-8 `CategoryType` 查表化、`AppSettings` 拆
+  `UserPrefs`/`RuntimeState`」—— 那句写于 08-04，而 **docs/15 第三批已在 08-06 把四项全部补做**
+  （标题原文「含原先『刻意不做』的四项」）。逐条代码取证：`src-tauri/src/upstream/` 是目录、
+  18 个文件（`upstream.rs` 单文件已不存在）；`service.rs` 在（棘轮冻 1443）；
+  `model.rs:34` 有 `CategoryMeta` + `:97` 的 `meta()` 唯一穷举 match；`model.rs:1910` 有
+  `UserPrefs`（**刻意偏离原方案**：只收窄入参类型，没物理拆 struct）。
+  留着那句话的代价是具体的 —— 谁照它动手，会去做四件已经做完的重构。
 - **尚未开发的功能：已全部做完**（FR-001~027 逐条核过，无遗留项、无第二个静默失效开关）。
   docs/13「非 GPT 主 Key 支持 Codex 工具」也**已闭环**：从 Codex 自己的日志库
   （`~/.codex/logs_2.sqlite`）取证到 opus 主 Key 下 **9/9 次调用全走 `exec`**、
@@ -427,8 +434,731 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   `store.secrets.read()` 的临时 guard，它在整个 match 期间存活，分支里取 `.write()`
   会 RwLock 自锁、当场挂死。写注入验证时踩过，一条测试挂了十分钟才发现
   **不是「注入无效」而是「进程挂死」**。注入脚本因此加了每条超时。
+- **Codex 模型目录已实现（2026-08-28）**：让**非 GPT 模型出现在 Codex 自己的模型选择器里**，
+  并让「思考强度」档位由我们声明、由 Codex UI 真实呈现。实现在
+  [`codex_catalog.rs`](src-tauri/src/tools/codex_catalog.rs)（`#[path]` 挂 `tools/codex.rs` 下，
+  理由同 `lan_guard`/`log_rotate`：`codex.rs` 余量只剩 35 行）。
+  <br>**官方机制是 `model_catalog_json`**（config.toml 的键，官方文档原文
+  "Optional path to a JSON model catalog (applied on startup only)"），文件 schema 就是
+  HTTP `/models` 端点那同一个类型（`ModelsManagerConfig.model_catalog: Option<ModelsResponse>`）。
+  cc-switch 从 v3.16.0 就走这条（生成 `cc-switch-model-catalog.json`），codexloom / moon-bridge /
+  cloudpods aiproxy 也都是。
+  <br>🔴 **两条通道互斥，不能都做**：`StaticModelsManager::raw_model_catalog` 把
+  `_refresh_strategy` 与 `_http_client_factory` 整个丢弃、`refresh_if_new_etag` 是空实现
+  → **配了目录就永不联网**。选本地文件而非改 `/v1/models` 响应的理由：① 那条路会写
+  `~/.codex/models_cache.json`，而它是**全局单文件、无 provider 维度**（只有一份
+  `fetched_at`/`etag`/`client_version`），「切回官方后会不会读到我们的列表」没有字段能保证；
+  ② 要改 `proxy.rs`（余量 0）。代价是改模型列表要重启一次 Codex（同
+  `rewrite_registered_clients` 那条已知代价）。
+  <br>**顺带解释了此前那个 workaround 的根因**：`active_efforts` 的注释写「Codex Desktop 对
+  自定义 provider 不下发 `reasoning.effort`」—— 因为 Codex 只对
+  `supported_reasoning_levels` 非空的模型显示并下发档位，而未知模型走 fallback metadata、
+  那个字段是 `[]`。声明了档位，UI 就变成真的，`active_efforts` 退回成兜底。
+  <br>**四条实测判据**（codex-cli 0.150.0-alpha.8，隔离 `CODEX_HOME` + `codex debug models`）：
+  `base_instructions` 或 `model_messages.instructions_template` **至少有一个**（都省 →
+  **Codex 启动即报错、完全起不来**）；目录是 **full replacement**（只放我们 2 条 → 官方 10 条
+  全消失）；非 GPT 名字**不被过滤**（`claude-opus-4-8` 原样保留，与 Claude 桌面端那个 `sD()`
+  完全不同，**不需要** `claude-synaroute-` 前缀）；`minimal_client_version` 是**字符串**
+  （官方单测里那个数组 `[0,99,0]` 已过时）。官方 `priority` 占 **1~43**，故我们从 50 起。
+  <br>🔴 **`supported_in_api` 必须为 `true`**：`ModelPreset::filter_by_auth` 是
+  `chatgpt_mode || supported_in_api`，而我们走 `experimental_bearer_token` →
+  `chatgpt_mode = false`。给 false 的表现是模型**静默从选择器里消失**。
+  <br>🔴 **档位按 `ProviderKey.protocol` 推导，不猜模型名**：Anthropic 上游 →
+  `convert.rs` 自己算 `thinking.budget_tokens`（**生效由我们保证**）；原生 Responses → 原样透传；
+  **Chat Completions → 不声明**。cc-switch 用 22 家预设换来的结论：只有「思考开关」的供应商
+  （Kimi/GLM/Qwen/MiniMax/MiMo/SiliconFlow）**在 Codex 里调档位不会有任何效果**。
+  口径是**交集**（一条 Chat 备用 Key 就让整组不声明）—— 同 `models_for_apply` 那条
+  「超集口径 → 故障转移后必然 404」。
+  <br>**声明的档位只有 `low/medium/high/xhigh`**，与官方 `gpt-5.5` 一字不差。**不含 `max`/`ultra`**：
+  `effort_to_thinking_budget` 对它们走 `_ => return None` = 不开思考，声明它等于
+  「用户选了最高档反而完全不思考」，方向最坏的界面撒谎。有源码级判据钉住
+  （用 `production_code_only` 剥注释 —— 本仓已三次栽在「注释里的字面量满足了断言」上）。
+  <br>**`tool_mode` 把 docs/13 那 900 条统计对上了官方名字**：官方基底实测
+  `gpt-5.6-*` = `"code_mode_only"`（exec 沙箱那 241 条）、`gpt-5.5`/`5.4`/`5.2` = **`null`**
+  （顶层 tools 那 73 条）。`claude-opus-4-7` 那 18 条走的就是 `null` 形态，我们一律发 `null`。
+  也就是说工具承载形态从「受模型名支配」变成**我们显式声明**。
+  <br>🔴 **基线是「Codex 今天对未知模型用的那份 fallback metadata」，不是官方 GPT 条目**。
+  逐字段对着 `model_info_from_slug` 抄，**只改四项**（`visibility` none→list、
+  档位 []→四档、`priority` 99→50+i、`context_window` 恒 272000→有取证时用真实值）。
+  **刻意没改**：`apply_patch_tool_type` 保持 `null`（fallback 就是 None，也就是说非 GPT 模型
+  今天**没有** apply_patch 工具、一直用 shell 改文件；给 `"freeform"` 是新增一个未验证的工具，
+  而本轮判据是「不退化」不是「顺手增强」）、`include_skills/plugin/apps_usage_instructions`
+  全 `false`（⚠️ `include_apps_usage_instructions` 在 `ModelInfo` 里是
+  `#[serde(default = "default_true")]`，**省略它会变成 true**，那就悄悄开了一个 fallback 下
+  关着的开关）、`truncation_policy` 用 **bytes** 不是 tokens（官方 GPT 条目用 tokens，
+  fallback 用 `bytes(10_000)`，抄错这一个键会改变工具输出的截断行为）。
+  <br>🔴 **顶层 `model` 改成「已有值且仍可服务就不覆盖」**：`get_default_model` 开头是
+  `if let Some(model) = model { return model }` —— **config.toml 的 `model` 一旦有值就赢**，
+  目录里的 `isDefault` 根本不参与，而 Codex 会把用户在 `/model` 里的选择写回这个键。
+  旧实现无条件写，于是每次接入（改端口/Key 变动都会触发重写）都把用户刚选的模型冲掉。
+  cc-switch 修过同一条。第三支是「已有值但不在列表里 → 换成首个」，不换的话 Codex 会拿一个
+  我们服务不了的名字去请求。
+  <br>**空模型列表既不写目录也不写指针**：`{"models":[]}` 会让 Codex 对着空列表挑默认模型
+  （行为未验证），而用户在菜单里一个都选不到 —— 比回落官方条目糟得多。真实成因是
+  「无启用 Key」或「多 Key 交集为空」。
+  <br>**不认领用户自己的 `model_catalog_json`**：判据只有文件名（`pointer_is_ours`）。
+  cc-switch 为此修过一条（#6087）—— 它早期版本无条件把指针指向自己的文件、丢弃用户路径，
+  而且**改过的指针不会被还原**，只能发公告让用户手动指回去。
+  <br>**漂移新增一支 `CatalogFileMissing`，优先于所有 provider 形态**：不单独判会落进
+  `OurTablePointsElsewhere`，那句告警说「我们的表指向别处」并把**我们自己的**端点回显给用户
+  —— 而真实情况是 Codex 一启动就报 `failed to parse model_catalog_json` 然后退出。
+  「指错方向的告警比没有告警更糟」那条。
+  <br>🔴 **系统提示词内嵌了官方 `prompt.md` 逐字节副本**（20903 字节，Apache-2.0，
+  声明在 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)）。我第一版写的是 ~1 KB 自撰提示词，
+  理由「含 based on GPT-5 的错误陈述 + 许可风险 + 版本漂移」——**前两条是错的**：那句在
+  `DEFAULT_PERSONALITY_HEADER` 常量里，`prompt.md` 全文零 `GPT` 字样、模型中性；
+  openai/codex 是 Apache-2.0，逐字再分发合法。真正推翻它的是
+  `model_info_from_slug`：**今天**没有目录时 Codex 给未知模型填的就是
+  `instructions_template: Some(BASE_INSTRUCTIONS)`，而那就是 `prompt.md`，
+  里面有 `# Tool Guidelines` / `## Shell commands` / `## update_plan` 三节工具契约。
+  换成短的 = **静默削弱现有工具调用能力**，正是本功能要保住的东西。
+  <br>⚠️ 我那条「短一点是安全的」推断的破法值得记：旁证是 `codex debug prompt-input`
+  ——`input[]` 里那条 9965 字符的 developer 消息由 Codex 自己注入（skills/escalation/sandbox），
+  与本常量无关。**那个观察对，但结论跳了一步**：Responses API 的 `instructions` 是
+  **顶层字段**，压根不在 `input[]` 里，那条探针从头到尾没看见过本常量。
+  用「看不到差异」当「没有差异」，是本仓记过多次的那类假绿。
+  <br>**16 条故障注入全部验证变红**，另有一条 `#[ignore]` 端到端用**真实 codex 二进制**
+  校验（`catalog_is_accepted_by_the_real_codex_binary`，实测解析出 2 条、顺序正确）：
+  源码级判据只证明「调用点在」，它证明「Codex 真的读得懂」。
+  <br>⚠️ **探针准备**：Desktop 包内那份 `codex.exe` 在
+  `C:\Program Files\WindowsApps\OpenAI.Codex_*\app\resources\` 下带 ACL、**不能直接执行**，
+  要先 `cp` 出来（307 MB）。跑法：
+  `SYNAROUTE_CODEX_PROBE=<path> cargo test --lib catalog_is_accepted_by_the_real_codex -- --ignored`。
+  <br>🔴 **注入脚本自己踩了「恒绿的门」那个坑**：第一版用
+  `cargo test --lib <fn_name> -- --exact`，而 `--exact` 要求完整路径，只给函数名匹配到
+  **0 个测试**、cargo 返回成功 → **14 条注入全部报「仍绿」**。已改为解析
+  `test result: ok. N passed` 并在 `N == 0` 时判脚本失败。同 `invoke-command-must-exist`
+  那条门「解析到 0 个就主动判失败」的教训 —— 只是这次栽在验证脚本上。
+  <br>⚠️ **两条我自己写松的用例**（都是注入不变红才发现的）：① 判「不报某一支」时写成
+  `assert_ne!(state, 那个特定值)`，而注入后返回的是同一变体但 `path` 不同的值 —— 不等、照样绿，
+  应该 `matches!` 判变体；② 更根本的一条：那个场景里 `is_intact` 仍为真、直接
+  `return Intact`，**压根走不到被注入的那段** —— 必须让 config 因**别的**原因不完好
+  （用了端口漂移）才压得到。同「注入不变红时先怀疑用例没压到那个分支」那条。
+  <br>**零棘轮抬高**：`tools.rs` 两处都是**一行换一行**（分发点改传参、还原点改函数名），
+  目录生成 / 顶层 `model` 决策 / 告警文案全收在新模块（`wire_into`、`missing_catalog_warning`），
+  `codex.rs` 净增 16 行（898/900，**余量只剩 2** —— 下次动它必须先腾）。
+  当前基线 `cargo test --lib` = **907 passed / 0 failed / 5 ignored**，clippy 干净，
+  `npm run gates` 全绿，`tsc --noEmit` 干净。
+  <br>📌 **仍未验证（真机才能闭环）**：接入后在 Codex Desktop 里①菜单是否真的列出非 GPT 模型、
+  ②档位选择器是否出现且切换生效、③工具与 MCP 是否与今天一样正常（尤其 `tool_search` 那条
+  MCP 延迟检索链，docs/13 §11 有取证基线可对照）。
+  <br>✅ **①②已真机验证通过（2026-08-28，用户截图为证）**：接入后重开 Codex Desktop，
+  模型菜单列出了目录里的 **8 条**，其中 **`5.3 Codex Spark`（`gpt-5.3-codex-spark`）
+  在官方基底里根本不存在**（用户日志里就是 `Unknown model … fallback`）——
+  它只可能来自我们的目录，这是决定性证据；同时官方 visible 的 `gpt-5.2` **消失了**，
+  full replacement 在 UI 层面也确认。右侧面板出现「推理强度：高」，**②档位选择器成立**。
+  <br>🔴 **我此前那句「cc-switch 那句『Codex app 不支持多模型选择』已过时」——
+  结论是对的，但当时的依据（asar 静态取证）不足以支撑它，中途一度撤回过。
+  现在有实测了。** 教训不是「猜对了就行」，而是：**没有第三方印证时，
+  静态取证只能提出假设，不能下结论** —— 那句话该等到今天才写。
+  <br>⚠️ **一处偏差，尚未定性**：目录 9 条里 **`codex-auto-review` 没有出现在菜单**。
+  我们给它 `visibility: "list"`，而官方基底给的是 `"hide"`。说明 **Desktop 前端在
+  `visibility` 之外还有一层过滤**（疑似按 slug 硬编码排除 auto-review 这类内部模型）。
+  对本功能无害（那本来就不该让用户选），但它意味着**「声明 list 就一定显示」不成立**，
+  日后若发现某个模型莫名不显示，先查这一层。
+  <br>③（工具与 MCP）仍未验 —— 那要代理在跑 + 真发一轮请求。
+  <br>📌 顺带在真实数据上印证了 D4 那条修复：用户原本 `model = "gpt-5.3-codex-spark"`，
+  它在可服务列表里 → `wire_into` **保留了它**，没改成列表首个。
+  <br>📌 另一个观察：Desktop 把 slug `gpt-5.3-codex-spark` 显示成 **「5.3 Codex Spark」**，
+  而我们给的 `display_name` 就是 slug 原文 —— 说明**前端对显示名做了美化**（去 `gpt-` 前缀、
+  连字符转空格、词首大写），`display_name` 可能没被直接采用。非 GPT 名字会被显示成什么样
+  尚未观察（`claude-opus-4-8` → ？），不影响功能但会影响用户能否一眼认出。
+  <br>🔴 **收尾时抓出一条自己漏掉的、会让功能一半失效的缺陷**：`proxy.rs` 那行
+  `active_model_of(category).unwrap_or(client_model)` 是**无条件覆盖** —— 用户在 Codex 菜单里
+  选了模型、Codex 如实发过来，代理又把它换成应用内选的那个。「选择器做出来了、选了不算」，
+  而且静默（日志里显示的是覆盖后的名字）。计划表 D4 里列了这条，实现时只做了
+  `config.toml` 顶层 `model` 那一半 —— **那是 Codex 启动时读的默认值，和转发时的覆盖是两条
+  独立路径**。已收进 [`model_choice.rs`](src-tauri/src/model_choice.rs)（挂 `proxy` 下）。
+  <br>**判据按分类分支，因为两类客户端发模型名的动机根本不同**：Codex 是**用户在菜单里选**
+  → 可服务就尊重、`active_models` 退成兜底；CLI/桌面端是**客户端按任务自动发**
+  （haiku 干杂活、opus 干重活，三档映射存在的全部理由）→ 保持强制语义。
+  在 CLI 那边也改成「可服务就尊重」会让 `active_models` 变成死字段：它发的三档名几乎总是
+  可服务的，于是覆盖永不发生、用户设的「全部走 opus」静默失效。
+  <br>**对照：`active_efforts` 没有这个问题** —— `inject_default_effort` 里写着
+  「已带 effort（无论 Codex 何时开始下发）→ 尊重下游」，写它的人预见到了这一天。
+  <br>顺带修掉两条**过时注释**（本仓最在意的那类分叉）：`active_models` 的「某些客户端
+  （如 Codex）模型菜单是内置固定清单」已不成立；`active_efforts` 的「Codex Desktop 对自定义
+  provider 不下发 effort」已被本轮改变，且它那句「仅在上游非原生 Responses 时注入」
+  **早就与代码不符**（`inject_default_effort` 里 `let _ = upstream;`）。
+  <br>本条 4 条注入全部变红，含一条**源码级接线判据**（`the_forwarding_path_must_go_through_pick`）
+  —— 前四条单测都直接调 `pick`，把 `proxy.rs` 那行改回去它们照样全绿，那正是缺陷本身。
+  这是第 7 次撞同一类接线盲区。**`proxy.rs` 反而 3105→3103，基线已下调。**
+  <br>⚠️ **两处仍是「界面撒谎」，需要产品决策**：① 托盘「Codex 模型」快切子菜单
+  （`tray_model_switch_enabled` 默认开）—— 修完之后它对「Codex 发来可服务名字」的场景无效，
+  而接入 catalog 后那是常态，也就是**能点、几乎永远没反应**；② 前端没有任何
+  「改了模型列表要重启 Codex」的提示，而 `model_catalog_json` 官方注明
+  "applied on startup only"，用户加个 Key 后菜单不变、无从知道原因。
+  <br>✅ **上面那两条已闭环（同日）**：
+  <br>**①** 应用内选模型（主窗口下拉 + 托盘子菜单）改走
+  `tools::codex::select_model` —— 它**同时**写 `config.toml` 的顶层 `model` 与
+  `active_models`，两处指向同一个模型，故不会出现「托盘说切到 A、实际走 B」
+  （同托盘代理启停那条「起=写、停=还原」的纪律）。
+  <br>关键事实：`model` **不是** `model_catalog_json` 那种 "applied on startup only" ——
+  `get_default_model` 在每次 session 初始化时读它，**新开一个会话就生效**，不必重启 Codex。
+  托盘事件文案已从「即时生效」改成「新会话生效」。
+  <br>三条刻意行为：没接入过就只写兜底（不凭空造 `config.toml`）；`model_provider` 不是
+  synaroute 就一个字节都不动（用户可能正用 cc-switch 或官方登录）；空串（「跟随客户端透传」）
+  **不动** `config.toml`（那个选项的语义就是「不干预」，删掉 `model` 键会连带清掉用户在
+  Codex 菜单里的选择）。
+  <br>🔴 **我第一版把 category 写死成 Codex，会让 CLI/桌面端的模型下拉静默失效** ——
+  `set_active_model` 命令是收 `category_id` 的。抓住它的是 clippy 的
+  `unused variable: category_id`，不是任何测试。分派现在收在 `select_model` 里
+  （非 Codex 只转发 `set_active_model`），刻意不放 `lib.rs`：两个入口分两处写必然漂移。
+  <br>**②** 提示落在**接入成功消息**里（`codex_catalog::apply_note`），**零前端改动** ——
+  那条消息同时进「接入结果提示」与事件流（改端口 / Key 变动触发的客户端配置重写也落它），
+  是这句话唯一必须落地的地方。`SettingsPage.tsx` / `KeyEditor.tsx` / `i18n.ts` 三个顶格文件
+  一行都没动。顺带把 `apply_at` 里那 4 行 `model_note` 收成 1 行，**给 `codex.rs` 腾回 3 行余量**。
+  <br>**本轮 9 条注入，7 条按预期变红，另两条各有结论**：
+  <br>🔴 「`apply_at` 不再用 `apply_note`」**仍绿 = 真盲区** —— 没有任何测试检查过
+  `apply_at` 返回的消息内容，把提示整段拿掉照样全绿。已在
+  `apply_wires_the_catalog_pointer_and_the_file_together` 里补 `msg.contains("重启")`。
+  <br>「`config.toml` 不存在时凭空造一份」**仍绿 = 判据重叠，不是盲区**：文件不存在时读出空串、
+  parse 成空表、`model_provider` 取不到 → `ours` 为假 → 同样早退。两道门重叠已写进注释，
+  门**保留**（早退的语义是「没接入过就不碰」，不该依赖另一道门的副作用成立）。
+  同 CLAUDE.md 里 `B64_MIN_RUN` 那条「注入不变红先怀疑判据本身重复」。
+  <br>⚠️ **源码级判据第一版报了假阳性**：查 `set_active_model(` 命中的是 `lib.rs` 里那个
+  **同名 tauri 命令的定义行** `async fn set_active_model(`。已改为查带点的调用形态
+  `.set_active_model(`。这是本仓第四次栽在「判据说别这么写、却没只看调用」上。
+  <br>⚠️ **全量跑偶发红过一次**，根因不是功能：新加的测试临时目录用 `pid + 纳秒`，
+  而本机 `timestamp_nanos` 量化粒度**只有 100ns**，同进程并发的两条用例撞到同一个目录、
+  互删对方文件。已加进程内自增序号（同 `ccswitch::db_copy_path` 那条的修法），
+  连跑 4 次全绿。
+  <br>**棘轮两项下调**：`lib.rs` 2076→2074、`proxy.rs` 3105→3103。
+  <br>**收尾审查又修出 5 条（2026-08-28）**，前两条有回归测试 + 注入验证：
+  <br>🔴 **切模型抢走了「接入前快照」**：`select_model_at` 原走 `backup_and_write_bytes`
+  （首写即锁），于是「接入前」这个时间点被提前到「因为切一次模型而第一次碰 config.toml 之前」
+  —— 与 `write_without_locking_snapshot` 文档里记的那次真实事故**完全同类**
+  （MCP 注册抢走 `.bak`，还原时把一份陈旧全量配置整份写回）。复现路径：接入过又还原过
+  （`.bak` 已删）→ config.toml 里又出现我们的 provider（cc-switch 存的档 / 手改）→ 切一次模型。
+  已改走 `write_without_locking_snapshot`：切模型不是接入，也不需要快照（还原时
+  `config.toml` 整份从 `.bak` 恢复，`model` 键随之回到接入前的值）。
+  <br>🔴 **写 config.toml 与写 `active_models` 的顺序反了**：原先先落兜底口径，于是客户端配置
+  写失败（Codex 正占着文件 / 权限不足，真实会发生）时托盘显示已切到 A、Codex 仍用 B ——
+  **正是这个函数存在的目的所要消除的那个现象**。已改成「先写客户端配置、成功后才动兜底」。
+  <br>`model_choice::pick` 判据用 trim 后的形态、返回却是原串 → 带空白的名字判得出、
+  却路由不到（`resolve_model` 拿到的是另一个字符串）。已返回归一后的值。
+  <br>两处**注释过度承诺**，按实际收窄：`context_window_across_keys` 说「所有启用 Key 上都成立」
+  ——实际只有**填过** `context_window` 的 Key 参与取最小值，没填的 Key 可能更小（取证缺失的
+  固有限制，失效方向是上游 400、响亮）；`restore_side_files` 说「都汇总上报」——**不早退**是真的，
+  **都上报**只做到「第一个错误 + 已完成项」。
+  <br>**全局机械扫查（生产段、剥注释）结论**：`unwrap` 20 处（11 在 `perf_probe` 的
+  `#[ignore]` 探针里，其余是「常量头值」或「前面刚判过 `is_none` 就 return」）、`expect` 21 处
+  （启动路径失败即崩 + 常量必然合法 + 2 处不变量断言）—— **无缺陷**。
+  密钥泄露维度：敏感词 × 输出汇的交集只剩 2 处，都是 `format!("Bearer {secret}")` 构造鉴权头
+  （必须的），**没有任何密钥进日志/事件/错误消息的路径**。
+  <br>⚠️ **建议级（未改）**：`proxy.rs:1961` / `:2551` 那两处 `expect("…必然已收集")` 依赖
+  人工维护的跨语句不变量（`sse_dir` 与 `tool_sets` 是「同一个条件」），破了就 panic 在转发
+  热路径上。用类型把两者绑成一个 `Option<(dir, sets)>` 可让编译器保证，但那是重构、
+  且 `proxy.rs` 余量为 0。
+  <br>🔴 **我那个一次性扫查脚本自己被字面量污染了**：第一版自写「找 `#[cfg(test)] mod tests`」
+  的最小实现，而 `codex.rs` 测试段里有一条源码级判据的**字符串字面量**
+  `"\n#[cfg(test)]\nmod tests"` —— 切断点被推后 800 行，79 个 `unwrap` 里大半是测试代码的
+  假命中。改用项目自己的 `scripts/lib/rust-source.mjs` 后降到 20 处。
+  这是本仓第 **5** 次同类（前四：`data-dir-env-name-must-match`、`userPrefsParity`、
+  `only_v6_must_be_set_explicitly`、`check-tailwind-tokens`）。**别再自己写第二份测试段判据。**
+  当前基线 **907 passed / 0 failed / 5 ignored**（连跑 2 次），累计 **32 条注入**全部有结论；
+  `npm test` 133 passed / 17 文件，`tsc --noEmit` 干净。
+  <br>**把「建议级」与「只统计没细看」的维度全部做完，又修出两条真缺陷（2026-08-28）**：
+  <br>🔴 **局域网令牌的常量时间比较有边界失效**：`lan_guard::constant_time_eq` 第一版写的是
+  `let mut diff = (a.len() ^ b.len()) as u8;` —— `usize ^ usize` 再 `as u8` **只保留低 8 位**，
+  于是长度差恰好是 **256 的倍数**时长度差异被整个丢掉（`3 ^ 259 == 256`，截断后为 0）。
+  此后逐字节比较也全 0（短的那边超出部分取 0），函数返回 **true** ——「真令牌 + 256 个 NUL
+  后缀」被判为相等。实际不可利用（HTTP 头值不允许 NUL，且攻击者得先知道真令牌），
+  但这是判据在边界上静默失效。已改为 `u8::from(a.len() != b.len())`（仍不提前 return，
+  不泄露长度）。⚠️ **原有那条测试的长度差全是个位数，所以它一直是绿的** ——
+  新加的 `length_difference_survives_any_multiple_of_256` 里专门断言了「这个 pad 必须真的让
+  旧实现截断成 0」，防止用例又压不到边界。
+  <br>🔴 **上游一个整数能让我们分配数百 GB**：`sse.rs` 的 Chat 增量累积是
+  `while self.tool_calls.len() <= idx { push((String,String,String)) }`，而 `idx` 直接来自
+  上游响应的 `tool_calls[].index`。上游发 `{"index": 4294967295}` → 40 亿个三元组
+  （每个 ≥72 字节）→ 进程被 OOM 杀掉。**用户接的是第三方中转站，那正是这条链路上不可信的
+  一方**，而本仓在别处已对上游做过同类防护（`TAIL_WINDOW_BYTES` / `REQ_LOG_CAP`）。
+  已收进 `upstream::tool_slot`（上限 256、越界**拒绝**而非钳制 —— 钳制会把不同 index 的增量
+  挤进同一个槽，拼出参数错乱的工具调用，比丢一条增量糟得多；警告只发一次）。
+  <br>**同文件另外 4 处 `idx` 不受影响**：`771/804/917/955` 用作 `HashMap`/`HashSet` 的**键**，
+  单条目、无放大。判断依据是「用途」不是「来源」。
+  <br>**全维度扫查结论**（生产段、剥注释）：`panic!/unreachable!` 3 处（1 处有前置分派、
+  2 处在 golden 测试基建里）、`unsafe` 10 处（8 处 Windows 路径 API + 2 处 DPAPI，
+  **`CryptProtectData`/`CryptUnprotectData` 的返回值都用 `?` 处理了**，失败时提前返回、
+  不会走到 `from_raw_parts` 读野指针 —— 无缺陷）、窄化 `as` 33 处（除上面两条外均有
+  `clamp`/`min`/`saturating_*` 守着）、常量下标 13 处（`workdirs.rs` 有 `len() >= 3` 短路、
+  `service.rs` 有 `issues.is_empty()` 早退、`tray_icon.rs` 是 RGBA chunk —— 全部安全）。
+  <br>🔴 **我这一轮两次栽在自写脚本上，都值得记**：① 一次性扫查脚本自写测试段判据，
+  被 `codex.rs` 里那条源码级判据的**字符串字面量**污染（详见上一段）；② 想用
+  `node -e` 加正则 `replace(/mod tests \{\n/, …)` 把一段测试挪进 `mod tests`，
+  **匹配到了错误位置、把 `upstream/mod.rs` 整个改坏**（幸好它是 tracked 的，
+  `git checkout` 恢复后用 Edit 重做）。**改大文件一律用精确字符串匹配的编辑工具，
+  别用正则 replace** —— 它没有唯一性检查，出错时是静默的。
+  <br>当前基线 **910 passed / 0 failed / 5 ignored**（连跑 2 次），累计 **36 条注入**全部有结论；
+  clippy 干净、`npm run gates` 全绿、零棘轮抬高（`sse.rs` 两处都是一行换一行）。
+  <br>**收尾把两项漏账补上（同日）**：
+  <br>① **前端也做了同等的模式扫查**（64 个源文件，剥注释）：`as any` / `as unknown as`
+  **0 处**、`dangerouslySetInnerHTML`/`innerHTML=`/`eval` **0 处**、
+  `localStorage`/`sessionStorage` **0 处**（不往浏览器存任何东西）。9 处 `[0]` 下标与 2 处
+  非空断言**逐个核过守卫，全部安全** —— `CategoryPage.tsx:372` 那处一度被我判成缺陷，
+  实际上函数第一行就有 `if (enabledKeys.length < 2) return []`（我漏看了）。
+  <br>📌 **建议（未做）**：`tsconfig.json` 有 `strict: true` 但没开
+  `noUncheckedIndexedAccess`，所以 `arr[0]` 在类型上被当成 `T` 而非 `T | undefined` ——
+  全仓那 9 处守卫全靠人工。开它能让编译器保证，代价是会冒出大量新报错要逐处处理。
+  <br>② **`proxy.rs` 那两处 `expect("…必然已收集")` 复核结论：不是缺陷。**
+  `tool_sets` 是 `sse_dir.map(|_| …)` 出来的，`Option::map` 的语义**已经保证**
+  「`sse_dir` 是 Some ⟹ `tool_sets` 是 Some」；`resp_tool_sets` 同理由
+  `(downstream != key.protocol).then(…)` 派生，与用它的分支条件是同一个判断。
+  Rust 只是不知道两个 `Option` 的关联，所以今天**不会** panic。
+  <br>风险在「日后有人改掉派生方式」。用类型绑成 `Option<(dir, sets)>` 能让编译器保证，
+  但那是重构、`proxy.rs` 余量为 0、且不该紧挨着一次未做的真机验证做（同 docs/15 那四项
+  「刻意未做」的理由）。改用零成本的机械判据钉住**来源**：
+  `the_two_sse_invariants_must_stay_derived_not_assumed`，改掉派生方式就变红（已注入验证）。
+  <br>当前基线 **911 passed / 0 failed / 5 ignored**（连跑 2 次），累计 **37 条注入**全部有结论。
+  <br>**`noUncheckedIndexedAccess` 实测过了，结论是「刻意不开」（2026-08-28）**：
+  临时打开跑 `tsc`，**45 处报错 / 13 个文件**（测试 15 + `mockData` 10 + 生产代码 20）。
+  逐处核过 —— **没有一个是真 bug**，全部是「运行时有守卫或数学保证、类型系统看不出」：
+  模运算下标（`FALLBACK_COLORS[h % len]`、`THEME_ORDER[(i+1) % len]`，即使 `indexOf` 返 -1 也落 0）、
+  正则匹配成功后的捕获组（`m[1]`）、`Record<联合类型, T>` 索引、以及前置的
+  `length < 2 → return` / `filter(models.length > 0)` / `if (!trimmed) return "?"`。
+  <br>不开的理由：零当前缺陷，而 45 处里大半只能加 `!` —— **那是把编译器保证换回人工保证**，
+  没有收益；测试与 `mockData` 占 25 处纯噪音。它属于 docs/15 那类「大 diff、零用户可感收益」。
+  <br>**但顺带修了它指出的一处真实写法问题**：`CommandPalette.tsx` 里
+  `keyResults[i].status === "fulfilled" ? keyResults[i].value : []` —— **两次索引在 TS 看来是
+  两个不同的表达式**，类型收窄不生效，`.value` 在联合类型 `PromiseSettledResult` 上压根不存在
+  （开了选项后报 TS2339，不是下标问题）。运行时没问题，但同一个函数里**下面那段已经是
+  正确写法**（`const r = proxyResults[i]` 再判 status），两种写法并存迟早被抄错的那一种带走。
+  已统一成局部变量形式。
+
+- **流式「静默超时」已实现（2026-08-30）**：此前只有整体超时（`client::key_timeout`），
+  管不住这一种形态 —— **上游先回 200、SSE 流开起来，然后中途停住不再吐字节**。连接还活着、
+  没有错误，于是我们干等到总超时或对端网关掐断。用户 08-29 的日志里就是一条
+  `Anthropic HTTP 524`、耗时 **259 秒**，那 259 秒里我们既没切 Key 也没告诉用户任何事。
+  实现在 [`stream_idle.rs`](src-tauri/src/upstream/stream_idle.rs)（挂 `upstream` 下），
+  抄的是 cc-switch 那张表里的第二档「流式静默超时 180s，数据块之间的最大间隔」。
+  <br>🔴 **超时了必须注入一个 SSE `error` 事件，不能直接结束流**：直接 `return None`
+  下游看到的是「流正常结束」→ `log_success` 坐实成功、清 `fail_count`、解除短路窗口，
+  也就是**把一次失败静默记成成功**。注入之后两条现成路径同时接管
+  （`sse_stream_errored` 认出它 → `record_live_failure`；客户端本就要处理 Anthropic 的
+  `error` 事件）。这个模块因此**零新增契约** —— 它把「静默卡死」翻译成一种系统里
+  已经会正确处理的失败。
+  <br>⚠️ **那句文案只在同协议 Anthropic 直通时到得了用户眼前**：跨协议走 `SseTranslator`，
+  而翻译器认不出这条 error、会整个丢掉，此时注入只承担「让流末判成失败」那一半
+  （熔断记账仍正确），下游看到的是「流意外结束」。上游返非 SSE（少数中转站对流式回 JSON）
+  或带 gzip 时同理。两种情形下响应体本来就已截断，故危害限于「提示失效」。
+  **模块头写明了这条边界** —— 第一版声称「客户端会看到一句明确的报错」，那是过度承诺。
+  <br>**记账口径刻意按 Key 级罚**（`record_live_failure`），而上游自己回 502/524 是**不罚**的。
+  同一场网关故障谁先到就决定罚不罚 —— 取舍理由：200 之后首字节已发出、已无故障转移余地，
+  熔断是此时唯一的保护。代价是链路慢的 Key 连撞三次（每次 180s）会被停 60s。
+  <br>**180s 不做成可配、也不给禁用开关**：cc-switch 那张表分首字节（90s）与静默（180s）
+  两档并允许填 0 禁用，我们**合并成这一个**（首字节也吃它）。理由是这个数字要么远大于
+  正常间隔（没人需要调），要么调小了会误杀长思考。
+  <br>3 条测试，含一条**源码级接线判据**（`both_streaming_exits_must_go_through_the_idle_guard`，
+  要求 `guard_stream_idle(resp.bytes_stream())` 恰好出现 **2** 次 —— 同协议直通与跨协议翻译
+  两条流式出口都得套上）。这是本仓第 9 次盯同一类接线盲区。
+  <br>⚠️ 顺手修掉一条**自己写的恒真断言**：`assert!(text.contains("50") || text.contains('0'))`
+  —— 50ms 超时下 `as_secs()` 为 0，而任何十进制里都可能有 0，那条 `||` 恒成立。
+  已改为断言真实秒数。**「随便含个数字就算过」不是判据。**
+
+- **扩展思考签名整流已实现（2026-08-30）**：`THINKING_SIGNATURE_INVALID` 的成因定性
+  （故障转移的固有代价）一直是对的，但当时只考虑了「换不换 Key」这一个维度，给出的三条出路
+  全是让**用户**动手。cc-switch 的 `thinking_rectifier.rs` 走的是第三条：**把验不过的那部分
+  从请求里摘掉再试**。实现在
+  [`thinking_rectify.rs`](src-tauri/src/upstream/thinking_rectify.rs)。
+  <br>它还揭示了一个我们完全没覆盖的情形：**有些第三方渠道压根不接受 `signature` 字段**
+  （报 `extra inputs are not permitted`）。三个场景各对应一类真实上游，判据是大小写无关的
+  子串匹配（这些文案由各家上游自己拼，只有 Anthropic 给了机器码），脆但失效方向是**退回现状**。
+  <br>**落点不是「同一个 Key 重打一次」**，而是就地改 `req_json` 让后续候选受益 ——
+  `proxy.rs` 的候选循环把它借给每个候选（`Cow::Borrowed`，只在最后一个才 `take`），
+  所以整流是**一行接线**，不用在流式与非流式两条路径里各插一段重试。
+  <br>🔴 **那一行挂在候选循环的共享前段，不挂进失败分支**：失败分支有**三条**
+  （流式非 2xx / 非流式非 2xx / 连接层），第一版只挂了流式那条 →
+  `stream:false` 的客户端完全得不到自愈，而那是静默的。判据因此**钉住位置**而不只钉「调了」
+  （`the_rectifier_must_be_wired_into_the_shared_prologue`：调用必须排在
+  `if wants_stream && can_stream(key) {` 之前，且只有一处）。第 10 次同类接线盲区。
+  <br>🔴 **三条「修一个 400 换来另一个 400」的坑，全都必须一起处理**（都在
+  `strip_thinking_blocks` 的函数文档里，各有测试 + 注入验证）：
+  ① **摘干净了就必须把顶层 `thinking` 一起关掉** —— 留着 `thinking:{type:"enabled"}` 换来
+  `Expected \`thinking\` or \`redacted_thinking\`, but found \`text\``（续接工具调用的
+  assistant 消息必须以思考块开头）；② **留下的思考块不许摘它的 `signature`** ——
+  那个字段在思考块里是**必填**的，摘掉换来 `…signature: Field required`；
+  ③ **还剩块时不许关顶层 `thinking`** ——「关着思考却带着思考块」是我们没取证的组合，
+  不拿真实上游试。这三条错法的共同特征是**换来的那条错误不含 `signature` 字样**，
+  既不命中本模块判据、也不命中 `annotate_known_upstream_error` → 用户拿到一句零说明的英文，
+  **比整流之前更糟**（之前至少有三条出路的提示）。
+  <br>⚠️ 第一版就同时踩了 ① 和 ②：②尤其讽刺 —— 模块头专门写了「删完会空的消息整条不动，
+  免得把一个 400 换成另一个 400」这条边界，而**同一个函数的第二个循环无条件摘 signature、
+  把这条边界自己击穿了**。原有那条测试的夹具里恰好没给 signature，所以一直是绿的。
+  <br>**已知限制（两条，写在模块头免得被当 bug 重查）**：只有一个候选时不会自愈；
+  「思考块独占整条 assistant 消息」这一形态仍不自愈（见 ②③）。
+  <br>事件落 `failover` 而非 `config`：这是「为什么第一条 400、第二条却好了」的唯一解释，
+  排障的人在「故障转移」分组里找它，落进「系统」组等于藏起来。
+  <br>⚠️ `rectify_on_signature_error` 本身**曾零覆盖** —— 把落事件那 8 行整段删掉 5 条测试全绿。
+  已补一条同时钉住「429 不许触发整流（否则每次上游报错都白丢一轮思考上下文）」与
+  「命中时必须留痕、且 kind 是 failover」。**6 条注入全部验证变红。**
+
+- **`allow_in_aggregate`（「允许大脑聚合使用」）已实现（2026-08-30）**：`enabled` 管
+  「进不进故障转移池」，而**大脑聚合不走故障转移**（按 `keyId::model` 精确调用）。
+  用户禁用一条 Key 常常**正是**因为它的模型名与主 Key 不重叠、进池会让故障转移 404 ——
+  那条 Key 本身是好的、有额度的。新字段让它仍能当聚合的成员/决策者/汇总者。
+  入口在 **Key 卡片**上（`KeyCard.tsx`，且只在该 Key 已禁用时渲染 —— 启用状态下多一个
+  开关只会让人以为有从属关系）。`#[serde(default)]` = 老配置读进来保持原行为。
+  <br>🔴 **本轮最重的一条缺陷：保存一次 Key 就把它清成 false。** `KeyEditor` 的
+  `buildDraftKey()` 里没有这个字段，而保存走整份 upsert；更糟的是点一下「测试查询」
+  （`:423`）也 upsert。用户勾好 → 聚合正常 → 之后为**任何**别的原因打开编辑器点保存，
+  开关自己消失，下一轮聚合那位成员又被静默跳过，而他确信自己开过。方向上永不自愈。
+  <br>已补 [tests/providerKeyDraftParity.test.ts](tests/providerKeyDraftParity.test.ts)
+  做**双向**判据：从 `model.rs` 抽 `ProviderKey` 字段名，每个字段要么在 `buildDraftKey` 里、
+  要么在 `upsert_key` 的「运行态沿用库里现值」清单里（那份清单也从 Rust 源码抽）。
+  于是 Rust 加字段忘了同步前端 → 红；后端把某字段改成运行态沿用却没同步 → 红。
+  另一条查「草稿里有 Rust 不认识的键」—— serde 默认忽略未知字段，**拼错一个键名不报错**，
+  那个设置永远存不进去。⚠️ 判据第一版只认 `key: value` 形态，把 `vendor`/`protocol`/
+  `models`/`icon` 四个 **ES 简写**字段误报成缺失。
+  <br>🔴 **不要**改成在 `upsert_key` 的运行态清单里保它 —— 那个 checkbox 本身就是走
+  `upsertKey` 写的，那样会把开关变成一个永远写不进去的 no-op，比现在更糟。
+  <br>**四处「指错方向的提示」一起改掉**：`call_ref` 的报错、`gather_members` 的跳过事件、
+  `mcp.rs` 聚合结果里那句「N 个成员因所属 Key 已停用而跳过」原先都只说「重新启用」——
+  而重新启用会让这条 Key 回到故障转移池、把当初禁用它的那个 404 带回主链路，
+  **等于把用户指去做一个已知有害的操作**，而他手里有一个代价为零的选项。
+  第四处是 BrainPage 的「一键快速配置」：口径只认 `enabled`，于是「全部 Key 已禁用 +
+  已勾选允许聚合」（这个开关设想的典型用法）下它报「没有可用的 Key、请先启用」，
+  而手动逐条添加完全可用。
+  <br>⚠️ **我第一版把出路写成「在 Key 编辑器里打开」—— 那里根本没有这个开关。**
+  已补 [tests/aggregateDisabledKeyHint.test.ts](tests/aggregateDisabledKeyHint.test.ts)：
+  **双向**判据（开关搬到哪个界面，文案就必须说哪个界面），并覆盖上面三条 Rust 文案。
+  <br>🔴 **那条判据自己踩了「判对了维度」这一条**：第一版按「文件里提到 `allowInAggregate`」
+  判宿主，而修 KeyEditor 那个缺陷**必须**在它里面加一行纯透传 → 判据会翻脸要求文案写
+  「编辑器」，**催着人把用户送进空房间**。已改为要求同一行上既有字段、又有控件绑定形态。
+  <br>余额自动查询的口径也改成 `enabled || allowInAggregate`：那样的 Key 正在被聚合真实调用、
+  正在烧额度，而余额显示存在的全部意义就是别让用户看着一个过期数字。
+  **健康探测仍只对 `enabled` 发**（后端口径，本轮不动）→ 这类 Key 健康状态停在「未知」，
+  已知的不对称，写在代码注释里。诊断报告的 Key 摘要行加了「允许聚合=」那一位 ——
+  否则「一条显示已禁用的 Key 为什么在消耗额度」这个问题，摘要行给的答案是「它是禁用的」。
+  <br>**测试**：整个新语义原先**零覆盖**（把判据改回裸 `!key.enabled` 全套 926 条全绿）。
+  已补一条行为用例（`call_ref` 两侧 + 报错文案）与一条源码级判据
+  （两道门必须同口径、且只有两处）。4 条注入全部变红。
+
+- **MCP stdio 这一跳补上可观测性（2026-08-30）**：桌面端与 Codex 的 MCP 走 stdio 子进程
+  （`--mcp-stdio` + `--mcp-category=<分类>`），而这一跳此前**零可观测性** ——
+  主应用记「我返回了结果」，Codex 记「我收到空」，中间这个进程什么都不说。
+  08-29 那次排查（三次调 `synaroute_ai` 都返回空）就卡在这里：超时、MCP 注册、
+  `content` 为空三种假设逐一排除后，剩下的候选全在本进程内，而现有日志一条都覆盖不到。
+  <br>🔴 **`flush` 的错误此前是 `let _ =` 吞掉的**。`write_all` 只保证进了缓冲区，
+  **真正让对方看见的是 flush** —— 吞掉它的失效形态正是「我们以为发出去了、对方什么也没收到」，
+  也就是那次症状的候选根因之一。现在失败即留痕并退出循环（管道已不可用，继续读只会攒出
+  更多无人收的响应）。`write_all` 失败也单独留痕：不然两者在日志里无从分辨。
+  <br>诊断日志走 **exe 同级 `logs/mcp-stdio.log`**（不经 `Store` —— 子进程被 MSIX 客户端
+  拉起会继承包身份，读 `%APPDATA%` 被虚拟化）。三条刻意行为：单独一个文件（`*.jsonl`
+  由主应用写线程独占并维护滚动分片的体积记账，第二个追加者会把那份记账搞乱）、
+  超过 1 MB 整份重写（这个文件名 `cleanup_old_logs_in` 解析不出日期 → **永不被保留期清理**，
+  不自己设上限就是无界增长）、**绝不记 prompt / 响应正文**（正文已在主应用 trace 里，
+  那里有脱敏与体积上限；这个文件落在 exe 同级、不受保留期管、用户会直接贴出来）。
+  <br>🔴 **macOS 必须另走一支**，理由与 `mcp_port_file_path` 一字不差：`current_exe()` 在
+  `SynaRoute.app/Contents/MacOS/` 下，写进去会被 updater 的整包替换清掉、让 codesign 的
+  sealed resources 校验失败、在只读卷上直接写失败。第一版照搬了 exe 同级 ——
+  **两个方向都静默**（mac 上进包内或写不出；Windows 装在 Program Files 且同级不可写时
+  一行都不写），而排障者按文档以为「这一跳已经有日志了」，去找一个永远不存在的文件。
+  <br>**记了什么**：`start caller=…`（进程启动就一行 —— 没有它，「文件是空的」在
+  「子进程没被拉起 / 客户端一个字节都没发 / 目录不可写 / 握手那行 JSON 没解析成」
+  四种成因间完全无法区分，而那正是 08-29 卡住的形态）、`recv method=…` 与 `sent bytes=…`
+  配成一对（两者时间差把「主循环严格串行、一次 tools/call 期间不读 stdin」暴露出来）、
+  `forward ok/err` 带耗时、非法 JSON 那条 continue（**只记长度不记内容**）。
+  <br>**刻意去掉了 `result_bytes`**：它为记一个长度把整个结果再序列化一遍，而序列化失败会
+  显示成 `0` —— 与「返回空」这个正在查的症状撞车。长度统一由 `sent` 那行给（真正写出去的字节数）。
+  <br>🔴 **可观测性到不了排障者手上就等于没有**：这个文件此前全仓只出现在写入点一处 ——
+  诊断报告不打、docs 不提、UI 不提，而报告里那行「日志目录」在用户改过 `logDir` 时指向别处。
+  已在 `diagnostics.rs` 打出完整路径 + 字节数（只在文件存在时打），并有源码级判据钉住这条接线。
+  <br>⚠️ **「诊断行绝不带正文」那条判据第一版按行扫，而文件里唯一的多行 `diag` 调用整个逃出了
+  扫描范围**（注入实测仍绿）。已改为按「从 `diag(` 扫到分号」取整段，并加一条正向断言
+  「必须扫到 ≥6 处调用」——否则调用形态一变，判据会静默退化成什么都没查。
+  <br>同一条判据里加了 `!println!` / `!print!`：**stdout 是 JSON-RPC 协议信道**，
+  往里写一个字节就会让 MCP「握不上手 / 工具是空壳」，而这类症状最难归因到一句调试打印上；
+  而且本模式下 tracing **没有 subscriber**（stdio 早退排在 tracing init 之前），
+  `warn!` 是空操作 —— 想在这里排障只能用 `diag`。3 条注入全部变红。
+  <br>📌 **主循环严格串行这条已部分闭环**（详见本文档「那四项」②）：一次 `tools/call` 期间
+  （最长 600s）完全不读 stdin，于是客户端 keepalive 的 ping 得不到回应 → 认为 MCP server
+  已死 → 断开或杀子进程。现在 **`ping` 会被即时回答**（读隔离进独立任务，只在 cancel-safe 的
+  `recv` 上 select；`read_line` 不是 cancel-safe，直接 select 它会丢半行、把 JSON-RPC 流撕开）。
+  **仍未做的是真正的并发 `tools/call`**：要给 stdout 加一把 mutex，且得先取证客户端容不容得下
+  乱序响应。新加的 `recv`/`sent` 时间差正是为了先把它定性。
+
+- **本轮收尾审查（2026-08-30）另修出 8 条，逐条记判据**：
+  - 🔴 **流式请求在流内失败后，日志页那一行仍然显示「成功」**（本轮唯一一条「排障时看到的是
+    假现场」，而且它比静默超时更广 —— 任何流内 error 都这样，Anthropic 过载中途发 error
+    是最常见形态）。流式的日志行在**拿到 200 响应头那一刻**就写下（`log_success`，kind
+    `route` → 日志页绿色「路由」组），延迟记的是到响应头的耗时；流末虽然按
+    `sse_stream_errored` 把**健康记账**纠正成失败，那一行**没人回头改**
+    （`backfill_usage_for_collapsed_event` 只补 token 用量）。于是用户在客户端看到报错、
+    回到日志页看到「成功 · 200 · 1.2s」，而它真实卡了 180 秒 —— 排障者据此判定
+    「代理这边没问题」。前两次失败连系统通知都没有（要攒到熔断阈值才弹）。
+    <br>**刻意不去改那一行**：`*.jsonl` 已经把「成功」那行写出去了，改内存副本会造出
+    「界面说失败、文件说成功」两个平行事实（MSIX 那次惨案上吃够了平行宇宙）。
+    那一行本身**不是假话**（上游确实回了 200 并开了流），缺的是「后来怎么了」。
+    故**追加**一条 `error` 级可折叠事件（→ 红色「错误」组），两行合起来才是完整时间线。
+    <br>收在 `health::record_stream_end`：两条流末路径（同协议直通 / 跨协议翻译）原先各写
+    一遍「二选一」，改成都调它 —— 各写一遍必然漏掉一条（第 11 次同类接线盲区）。
+    判据钉住 `record_stream_end(` 恰好 **2** 处，且生产段里 `record_live_success(` 只剩 **1** 处
+    （非流式成功分支）—— 后者同时把那条历史缺陷「拿到 2xx 就同步记成功→该 Key 永不熔断」
+    变成机械的。**`proxy.rs` 反而省出 4 行**（5 行二选一收成 1 行调用），棘轮零抬高。
+    <br>📌 **副产品**：原先列为「刻意未做」的「静默超时时在应用侧再落一条事件」**已由此顺带闭环** ——
+    静默超时注入的就是一条 SSE `error` 事件，`sse_stream_errored` 认得它（有测试钉住），
+    于是它自然走到这条新事件上，不需要给 `stream_idle::guard` 传 `&Arc<Store>`。
+    ⚠️ 已知边界：事件文案**不区分**「上游自己发的 error」与「我们判定的静默卡死」
+    （两者处置不同：等/换 Key vs 查网络与中转网关）。要分辨看客户端收到的那句错误文案，
+    或 `logs/*.jsonl` 里的原始尾窗。
+  - 🔴 **`[1025, 2047]` 这段 max_tokens 静默不开思考**：`effort_to_thinking_budget` 的门槛
+    `max_tokens < 2048` 不是官方约束，而是从「`cap = max_tokens/2` 之后不低于 1024」
+    反推出来的**实现细节**。Anthropic 的硬约束只有 `budget_tokens >= 1024` 且 `< max_tokens`。
+    旧门槛的失效形态最忌讳：用户选了 `high`，请求正常返回、行为毫无变化，日志里零线索。
+    改后最坏是回答被截断，而截断**可见**（`was_truncated`）—— 同「最大单次输出」那条反转：
+    **静默错比响亮错更糟**。⚠️ 已知边界：流式直通下 `was_truncated` 恒为 None，
+    那种情形只能靠客户端看 `stop_reason`。
+  - 🔴 **`.gitattributes` 没管 `.md`，「20903 字节逐字节副本」在下一次 clone 就不成立**：
+    本机 `core.autocrlf=true`，而 `codex_base_instructions.md`（内嵌的官方 `prompt.md`，
+    Apache-2.0）没有任何 attribute → 提交后新克隆得到 **CRLF = 21178 字节**，
+    `THIRD_PARTY_NOTICES.md` 里那个可核对的字节数当场变成假话，`include_str!` 嵌进二进制的
+    也不再是原文。已加 `-text`（不是 `text eol=lf`：这份文件的价值全在「一个字节都不改」），
+    并把断言从 `tpl.len() > 1000` 换成 `assert_eq!(…, 20903)`。同 `.gitattributes` 里
+    那句注释记的 SSE 夹具事故是**同一个坑**。
+  - 🔴 **「还原时删掉我们凭空造的目录文件」这半没有任何判据**：注入（`restore_side_files`
+    里不再调 `restore_one`）后 **922 条全绿、clippy 也干净**；另一种更粗的注入（`tools.rs`
+    那行退回旧写法）只被 `dead_code` 挡住，而那道门对「函数还在被调、里面那半被改坏」完全无效。
+    残留是**惰性**的：指针随 `config.toml` 的 `.bak` 一起消失，文件不报错、永不自愈 ——
+    用户 `.codex` 目录里从此多一份约 190 KB 的死文件。已加源码级判据（两侧各一条）。
+  - 🔴 **两条写着 🔴 的字段纪律没有机械判据**：`include_apps_usage_instructions`
+    在 `ModelInfo` 里是 `#[serde(default = "default_true")]`（**省略即变成 true**，
+    悄悄打开一个 fallback 下关着的开关），`truncation_policy` 的 mode 必须是 **bytes** 不是
+    tokens（抄错这一个键会改变工具输出的截断行为）。注入实测：同时删一行 + 改一个值，
+    **922 条全绿** —— `REQUIRED_KEYS` 不含前者，而它含的后者只按**存在性**检查、不看值。
+    正是「判据存在 ≠ 判对了维度」。已把前者列进 `REQUIRED_KEYS`（`validate` 也随之拦住），
+    并对两者各加一条**值**断言。
+  - 🔴 **Key 级熔断在应用里完全不可见**：`record_live_failure` 那句注释写着
+    「发系统通知 **+ 记一条告警事件**」，而代码只做了前半。系统通知可能被免打扰/焦点助手静音，
+    此时这次熔断**一点痕迹都没有**；而模型级锁定那一层一直有事件 —— 两层可见性不对称。
+    已补一条 `warning` 级可折叠事件（折叠键按 Key，反复进出熔断只占一行带 ×N）。
+    ⚠️ 注入时踩了个坑：第一版脚本按「文件里第一个 `append_event_collapsible`」下刀，
+    删的是**模型锁**那条，红的是别的用例 —— 换成按 `"warning"` 定位才验到。
+  - **用户可见文案与代码分叉两处**：① `annotate_known_upstream_error` 返回给客户端的说明
+    仍写着「SynaRoute 不改写思考块 —— 转发时它是原样透传的」，而本轮起我们就是在改写它 ——
+    同一次故障里日志页说「已自动摘除思考块」、错误说明说「我们不改写」，用户据此排除了
+    「代理动过请求」这个方向，而那恰好是真相。顺带把判据加了一支
+    `redacted_thinking`（整流没覆盖的后继形态不含 `signature` 字样，漏了就零说明）。
+    ② 「工具配置预览」对用户说「Codex：**只写** ~/.codex/config.toml……**不写 auth.json**」，
+    而本轮新增了一个凭空创建的文件、`files` 列表也不含它；而且「不写 auth.json」本来就与
+    `apply_auth_at` 矛盾（无凭据/OAuth 过期两种形态下会整份覆盖并备份）。
+    预览面板是用户核对「SynaRoute 动了我哪些文件」的**唯一**界面。已如实改写并补上那一条
+    `files` 条目 —— **刻意不给正文**（目录约 190 KB = 9 条 × 20 KB 提示词，
+    塞进每次预览的 IPC 载荷毫无价值），只给条目数与字节数。
+  - **三处过时注释按事实收窄**：`can_build` 把「多 Key 交集为空」列为空列表成因，
+    而 `discoverable_models` 在交集为空时**刻意回退主 Key 的超集**、永不返回空
+    （代价随之而来且是已知的：目录里可能有备用 Key 服务不了的条目）；
+    `tools::apply` / `service::apply_tool_config` 仍写「`keys` 仅桌面端用到」
+    「Codex 取首个写顶层 `model`」，而本轮起 `keys` 决定 Codex 的
+    `supported_reasoning_levels`（**传空切片 = 档位选择器悄悄消失**）、`models` 整份进目录、
+    顶层 `model` 只在缺失/不可服务时才写；`i18n.test.ts` 的文档头声称「两条结构性判据」，
+    而第二条（JSX 不得硬编码中文）**全仓没有任何实现** —— 读到「有判据」的人就不会再自己查。
+  - **三处「Codex 现在会自己发」带来的界面撒谎**：本轮起 Codex 会自己下发模型名与思考档位，
+    于是状态条切模型的 toast 仍写「即时生效」是错的（托盘那半已改成「新会话生效」、
+    状态条这半漏了 —— `get_default_model` 在**每次 session 初始化**时读 `config.toml`）；
+    推理强度那个控件在 Anthropic/Responses Key 池上退成**兜底**，而 hint 还告诉用户
+    「Codex 那边没有效果，在此配才生效」—— 方向完全相反的指路。已把 zh/en 共 12 处文案
+    与 `inject_default_effort` 的注释一起改准。
+  <br>📌 **那四项「刻意未做」已全部做完（2026-08-30 同日）**，逐条记结论 ——
+  其中②的**范围被刻意收窄**，别当成没做完：
+  - **① 跨协议流内 error 翻译**（[`sse_error.rs`](src-tauri/src/upstream/sse_error.rs)，
+    `#[path]` 挂 `sse.rs` 下，理由同 `lan_guard`：`sse.rs` 冻结在 1247、余量为 0）。
+    洞比原描述大：`SseTranslator` 的六个方向函数**没有一个读 `error`**，于是跨协议流式下
+    上游 200 之后在流内报错 → 错误被丢掉 → `finish()` 照常冲刷 `response.completed` /
+    `message_stop` → **下游拿到一条「成功完成的空回答」**。健康记账那一半早修过了
+    （`record_health` 用原始尾窗判错），**给下游的呈现**一直没修。
+    <br>🔴 **落在 `process_line` 而不是流末**：终止性错误一到就该转给下游，客户端才能立刻停；
+    而流末那条路（`finish()`）**只在正常终止时走到**，连接被对端掐断时压根不执行。
+    <br>🔴 **发了错误必须抑制随后的收尾事件**，否则下游先收到「失败」再收到
+    `response.completed`，两条自相矛盾而客户端多半以后者为准 —— 又变回「成功的空回答」。
+    **不新增字段**：`started` 已经是那个闩（两个收尾函数开头都是 `if !self.started { return 空 }`）。
+    Chat 下游刻意例外 —— OpenAI 的约定是 `data: {"error":…}` 之后仍发 `[DONE]`。
+    <br>顺带闭环了 `stream_idle` 的已知限制：它注入的就是一条 Anthropic 形态的 error 事件，
+    走的正是这条新路径。**那个模块头里「跨协议下这句文案到不了用户眼前」已按事实改写** ——
+    留着就是本仓最在意的过时注释。仍到不了的只剩「上游返的压根不是 SSE」（gzip / 少数中转站
+    对流式请求回 JSON），而那时响应体本来就已截断。6 条测试，含源码级
+    `process_line_must_check_for_errors_before_dispatching`。
+  - **② stdio 转发期间不再无视 stdin**（`mcp/stdio.rs`）。原计划写的是「主循环改成
+    per-request spawn」，实际**刻意只做了 ping**：
+    <br>🔴 **`read_line` 不是 cancel-safe** —— 在主循环里直接 `select!` 一个 `read_line`，
+    转发先完成时那个 future 被 drop，**已经读进缓冲的半行就丢了**，而丢半行等于把 JSON-RPC
+    流撕开（此后每一行都解析失败，表现是「工具突然全坏」）。故把「读」隔离进独立任务，
+    只在 cancel-safe 的 `mpsc::Receiver::recv` 上 select，容量 64 兼作背压。
+    <br>🔴 **只放 `ping` 抢先回答，其余一律排队**：让两个 `tools/call` 并发是另一件事
+    （两轮聚合同时烧额度、响应还会乱序而客户端未必容得下），而 `ping` 是纯本地静态回答、
+    零副作用。原先主循环在这里一动不动最长 **600s**，客户端 keepalive 得不到回应 →
+    认为 MCP server 已死 → 断开或杀子进程，用户看到的正是「工具不可用 / 返回空」。
+    <br>**原计划挂的那个前提（「先验证客户端在 tool 调用进行中是否真的发 ping 且带超时」）
+    是被取舍掉的、不是忘了**：客户端不发 ping 时即时回 ping 的成本为零，而不回的代价是 600s
+    静默 —— 代价不对称，那就直接做安全的那一半。
+    <br>两个坑写在代码里：`pending` 队列**先消化再取新的**（否则转发期间攒下的请求被后到的插队）；
+    stdin 关了必须置 `stdin_open = false`，否则 `recv` 立刻再返 None → **忙等**。
+  - **③ 状态条并列回显 Codex 自己的 `model`**（`codex_catalog::current_config_model`
+    + `get_codex_config_model`，命令放在 `codex_catalog.rs` 而不是 `lib.rs` —— 余量为 0）。
+    **不是把下拉改成显示真实值，而是把两个值并列摆出来**（且**只在两者不同时**才多出那一格
+    —— 相同时它是纯噪音，不同时它才是「谁在生效」的答案）：下拉是**兜底**（`active_models`），
+    而 Codex 会把用户在 `/model` 里的选择写回 `config.toml`、`model_choice::pick` 对 Codex
+    又**优先尊重客户端发来的可服务名字**。只显示一个，在「这里选 b、Codex 里改成 a」
+    这个完全正常的序列之后必然说谎。函数**只读**；`None` 的四种情形（取不到路径 / 读不出 /
+    不是我们接入的 config / 没有 `model` 键）都不报错 —— 最常见的一种是「用户根本没接入 Codex」。
+  - **④ 「允许大脑聚合使用」改走专用 IPC**（[`key_flags.rs`](src-tauri/src/key_flags.rs)，
+    `#[path]` 挂 **`store`** 下 —— `mutate_and_persist` 是 `crate::store` 私有的、只有子模块
+    调得到；用它而不是裸 `self.persist()`（后者被棘轮计数，且让内存领先磁盘）。
+    <br>竞态本身**可自愈**（下次查余额重跑一遍探测链），真正的理由是**方向**：一位开关没道理
+    携带 20+ 个陈旧字段，而下一个后端自管字段未必自愈。`upsert_key` 是整份替换、只沿用库里的
+    `health` 与 `cached_balance`，于是点一下就把后端刚探测到的 `balance_query.url` 顶回旧值
+    —— 那个字段正是「su2api 全查回 10000 USD」的修复所在。
+    <br>🔴 **别改成把它加进 `upsert_key` 的运行态沿用清单**（上文那条 🔴）：checkbox 本身就是走
+    `upsertKey` 写的，那样会让开关变成永远写不进去的 no-op。
+    <br>Key 不存在返 `NotFound` 而**不是**静默成功：卡片可能握着一份已被删掉的 Key 的快照，
+    静默成功的表现是「勾上了、刷新后自己弹回去」而用户拿不到任何线索。
+    <br>Rust 侧**刻意保留了「对照的另一半」**：同一个用例里再用旧快照 `upsert_key` 一次、
+    断言 url 被顶回 `""`。那是这个模块为什么存在的**可执行**证据，失败消息写明
+    「这条变红意味着 `upsert_key` 现在保护了该字段，本模块的存在要重新讨论」。
+    <br>`the_command_must_be_registered_in_the_handler_list` 用 `include_str!("lib.rs")` 钉住注册：
+    策略门 `invoke-command-must-exist` 只查**正向**（前端调的名字在 Rust 有 `#[tauri::command]`），
+    反向（写了命令却没进 `generate_handler!`）**只在用户点到那个 checkbox 时炸**。
+    <br>跨语言那条 [tests/allowInAggregateWrite.test.ts](tests/allowInAggregateWrite.test.ts)
+    是第 **12** 次盯同一类接线盲区：`key_flags.rs` 的两条行为用例**直调函数**，把 KeyCard 那行
+    改回 `api.upsertKey({ ...k, allowInAggregate })` 它们照样全绿 —— 而那正是缺陷本体。
+    判据先断言 checkbox 锚点还在（否则「没有 upsertKey」是空洞的绿），**边界也写明**：
+    `KeyEditor` 保存整个 Key 照旧走 `upsertKey`（那本来就是整份替换的正当场合）。
+    <br>**零棘轮抬高**：`store.rs`（2938）与 `lib.rs`（2074）余量都是 0，靠把既有两处
+    `#[path]` 挂载的注释压成单行腾出，两个文件**净零**。5 条注入全部变红。
+  <br>⚠️ **本轮两条新教训，都是「我自己的验证工具骗了我」**：
+  <br>① **注入脚本自己踩了 CLAUDE.md 里记过的 `cp -p` 坑**：恢复时先
+  `const now = new Date()` 再 `execSync`，然后 `utimesSync(file, now, now)` ——
+  注入版的编译产物生成在那个时间戳**之后**，于是 cargo 判定源码未变、沿用了**注入版**的二进制。
+  症状极具迷惑性：`a_vanished_key_is_reported_not_silently_accepted` 单独跑也红
+  （`called Result::unwrap_err() on an Ok value`），而 grep 源码明明还是
+  `None => Err(AppError::NotFound(...))`。`touch` 两个文件后 941 全绿。
+  **为避开那个坑而写的脚本，把那个坑又引了回来** —— 时间戳只能往后拨，别往回对齐。
+  <br>② **`| tail -1` 会把你正要拿来当证据的输出吃掉**：一次全量跑红了，而
+  `for i in 1 2; do cargo test --lib 2>&1 | tail -1; done` 只打出
+  `error: test failed, to rerun pass --lib` —— **用例名不可恢复**。此后 9 次全量全绿，
+  且原样重跑那条命令**一个字都不打**、退出码 0。**你依赖其输出当证据的那次运行，不要接 `tail`。**
+  <br>📌 **仍然刻意未做**（别当遗漏）：stdio 主循环真正的并发 `tools/call`
+  —— 要给 stdout 加一把 mutex，且**得先取证客户端容不容得下乱序响应**；
+  上面②新加的 `recv`/`sent` 时间差正是为定性它准备的。
+  <br>当前基线：`cargo test --lib` **941 passed / 0 failed / 6 ignored**、
+  `npm test` **143 passed / 20 文件**、clippy 干净、`tsc --noEmit` 干净、
+  `npm run gates` 全绿、**零棘轮抬高**。
+
+
+- **余额参与路由已实现（2026-08-30，docs/14 §21.1 B4 —— B 层至此清空）**：实现在
+  [`balance_gate.rs`](src-tauri/src/balance_gate.rs)，`#[path]` 挂 **`health`** 下
+  （`store.rs`/`lib.rs`/`proxy.rs` 三个"自然家"余量都是 0，而它与另两层弹性确实同族）。
+  <br>它的作用**不是防止失败**（失败早已被故障转移兜住），而是**别等失败才知道**：
+  欠费 Key 上游回 **429** 时 `TRANSIENT_4XX` 刻意不计熔断（那条规则是对的），
+  代价是它永远留在候选池首位、**每个请求白耗一次往返**；回 402/403 则是连撞三次熔断 60s、
+  放回来再撞三次 —— **周期性反复白打**。用熔断表达一个永不自愈的故障本身就是错的抽象。
+  <br>🔴 **三条判据边界，每条对应一种误伤**（模块头有全文，各有测试 + 注入）：
+  ① **只认「确定耗尽」，不设阈值** —— 跨厂商比绝对数字不可靠（Kimi 的 `available_balance`
+  与 Novita 那个同名 camelCase 字段量纲都不同），百分比要 `total` 而上游给了才有；
+  `remaining <= 0` 是唯一跨厂商成立的判据。② **查不到 ≠ 为零** —— `!ok`/`None`/`transient`
+  一律 Unknown、不降级，与 `KeyCard` 那句「若写 `?? 0` 就会把『取不到』渲染成『余额 0』」
+  同口径。③ **降级不剔除** —— 排序键 `(is_exhausted, priority)`，兜底那条路继承同一顺序；
+  硬剔除会在余额数据本身错时把好 Key **完全屏蔽**（静默误伤），全判耗尽时更会让用户
+  「一条都用不了」。
+  <br>🔴 **数据源必须先搬后端，那是一半工作量**：余额此前**前端驱动**（唯一入口是 IPC，
+  调用方只有 `KeyCard` 的 effect/轮询，而 `usePolling` 窗口不可见就停表），加上
+  `cached_balance` 带 `#[serde(skip)]`（纯内存、重启即清空）—— 托盘常驻用户在请求到达时的
+  余额认知**通常是空的**。现在 `check_all_categories` 每轮顺带调 `refresh_due`。
+  <br>⚠️ **后台刷新刻意受三重约束**（它反转了一个刻意决定，不该反转得更多）：
+  `KeyCard` 写着「窗口不可见时停表：余额查询打真实上游、消耗额度，最小化到托盘后还在后台
+  烧额度是用户不会预期的」。故只在①该 Key 余额查询已启用 ②用户**已明确开启自动查询**
+  （`auto_interval_min > 0`；`0` 的语义就是「不自动查」，后台替他查 = 界面撒谎 + 悄悄烧额度）
+  ③该分类**代理正在跑**（不跑就不路由）三条同时成立时刷，周期用用户自己设的值
+  （含 1 分钟下限与 90% 余量，同前端口径）。
+  <br>📌 **由此而来的已知代价，写明免得当 bug 查**：**没开自动查询的用户，本闸门只在一次
+  手动查询后的 TTL 内起作用。** 另一条路（后台无条件查）要违反用户的明确设置。
+  <br>🔴 **实现中抓出一条自己写的判据顺序错误**：第一版把 `!r.ok → Unknown` 排在
+  `is_valid == Some(false) → Exhausted` 之前，而 `balance.rs:525` 在「上游声明账号不可用**且**
+  没给余额数字」时返回的正是 `failed(why)` + `is_valid = Some(false)`（即 `ok == false`）——
+  **最可靠的那个信号**被当成「我们这侧查询失败」丢掉了。`BalanceResult` 的字段文档专门把
+  `error`（我们这侧的失败）与 `is_valid`（上游明说号废了）分开过，判据不能再把它们混起来。
+  <br>🔴 **主 Key 徽标口径刻意不受影响**：`enabled_keys_sorted` 是「用户配置的优先级顺序」
+  这一事实的来源（徽标/托盘/状态条都用它），余额耗尽是**运行态**、不该改写配置视图 ——
+  与熔断的处理完全一致（`candidates_for` 剔除熔断中的 Key，`enabled_keys_sorted` 不）。
+  让徽标跟着余额跳的表现是「用户什么都没改，主 Key 自己换了一条」。有反向判据盯着。
+  <br>**顺带把 170 行查询实现从 `lib.rs` 搬进本模块**（`query_and_record` 是唯一实现，
+  IPC 命令与后台刷新都走它）：抄一份会让「事件 kind 分流 / 探测地址回写 / 缓存写入」
+  三条各带踩坑记录的步骤裂成两份，并发去重集合也会裂开（故它改成模块内进程级 static，
+  不再挂 `AppState` —— 后台刷新拿不到 `AppState`）。
+  <br>耗尽落一条**可折叠 warning**（不落这层对用户完全不可见：候选顺序界面上压根没呈现），
+  且**只在结论刚变化时落**；诊断报告 Key 摘要行加了「余额=」那一位。
+  <br>**12 条测试、10 条注入全部变红**，含 4 条源码级接线判据（第 13 次同类盲区）。
+  **零棘轮抬高，`lib.rs` 反而 2076 → 1907。**
+  <br>⚠️ **注入 ⑧ 第一次仍绿**：判据写成「事件条数不变」，而那条事件**可折叠** ——
+  同 collapse key 再 append 会折进原来那条（`repeat` 变 2），`len()` 恒为 1。已改为断言
+  `repeat`。同那条教训：**注入不变红时先怀疑判据压根没压到那个维度。**
+  <br>🔴 **B4 自己造出两处「界面/注释与代码分叉」，都已修** —— 这类由自己的改动带出来的分叉
+  最容易漏，因为写的时候脑子里是新行为、旁边那段旧文字读起来也还通顺：
+  ① **用户可见文案** `balance.intervalHint` 写着「窗口不可见时不查」，后台刷新之后那是**假的**
+  （已改成如实说明，并把「0 = 余额也不参与路由」这个隐含依赖明说出来）；
+  ② `KeyCard.tsx` 那条「最小化到托盘后还在后台烧额度是用户不会预期的」（已保留原意 +
+  写明后端会为运行中的分类刷、且 `0` 仍是「一个字节都不发」的总开关）。
+  <br>**顺带清掉 3 条死文案**（zh/en 共 6 行，`i18n.ts` 基线 1475 → **1469**）。
+  🔴 其中 `health.down`（「● 不可用」）**不只是死键、留着有害**：HealthBadge 刻意改用了橙色的
+  「● 探测不可达」+ 一句「仍会被路由」，注释原文是「避免用户以为这个 Key 已彻底停用」——
+  把那个旧词留在字典里等于给下一个人留了一个**看起来正好合用**的错误文案。
+  找死键照旧要先穷举**动态拼 key 的前缀**（当前 7 个），否则会误报 `t(\`前缀.${变量}\`)` 那类。
+  <br>🔴 **全链路审查（docs/08 第 A6 轮）又从 B4 自己身上修出三条，两条是高风险**：
+  <br>① **判据顺序错**（同上文那条，审查时才补的注入）；
+  <br>② 🔴 **后台刷新搭错了车**：第一版挂在 `health::check_all_categories` 里，而那趟车
+  ⓐ 在 `health_check_interval_secs == 0`（用户关掉定时探测）时整轮 `continue` ——
+  余额刷新**跟着一起停**，而它依赖的是**另一个**设置（`auto_interval_min`），
+  两个无关设置的隐式耦合且失效静默；ⓑ 周期被探测间隔牵着走（探测 3600s + 余额 5 分钟
+  = 实际一小时才刷，用户设的数字静默失效）；ⓒ 整轮套 `timeout(period)`，余额查询吃掉探测
+  预算后打出的是「**健康探测**一轮未完成」——一条指错方向的告警。
+  **`lib.rs` 里 `flush_usage_if_dirty` 当初正是为 ⓐⓑ 同一理由才独立起了一趟线程**
+  （注释原文「用量的丢失窗口不该被探测设置牵着走」）—— 同一个理由在这里同样成立，
+  而我把它当成「现成的车」搭了上去。已改为 `balance_gate::spawn_background` 独立一趟、
+  固定 60s 检查节奏（真正的查询周期仍由用户的 `auto_interval_min` 决定）。
+  判据同时钉住**正反两面**：`lib.rs` 必须有那一行，`health.rs` **不许**再出现 `refresh_due(`。
+  <br>③ 🔴 **事件环洪水**：后台每轮每条 Key 无条件落一条事件，而 `MAX_EVENTS` 只有 **500**
+  且与路由/故障转移共用。**折叠救不了这里** —— `append_event_collapsible` 只合并**紧邻**的
+  上一条，多条 Key 在同一轮里彼此穿插、跨轮压根挨不上。6 条 Key × 用户设的 1 分钟
+  = 360 条/小时，一个多小时把整环冲干净（缺陷分类法第 7 类）。此前受「用户得开着那个分类页」
+  天然限速，**改成后台刷新才让它成为可能** —— 这是「把一个前台动作搬到后台」时要专门想的一类
+  后果。已加 `Trigger::{User,Background}`：后台只在**结论变化**时落，用户主动查时照旧每次落。
+  <br>**教训**：搬一个动作到后台，要问的不只是「它还对不对」，而是**「它原先被什么天然限速，
+  那个限速消失后谁会被淹」**。
+  <br>顺带把 `query_key_balance` 这个 IPC 命令也搬进 `balance_gate`（同 `key_flags` /
+  `codex_catalog` 的既有做法：命令跟着实现走），`lib.rs` 基线因此 1907 → **1895**。
+- **「还有什么没做完」这一问查出 5 处文档/注释与代码分叉（2026-08-30 收尾）**。功能面没有新缺陷
+  （FR 全绿、无 TODO/FIXME、前端无恒 `disabled` 控件、`AppSettings` 23 个字段里只有
+  `upstreamRetryEnabled` 无 UI 且是刻意的），但**指路信息**有 5 处已经过期 ——
+  本仓把这类算缺陷，因为照着它动手的人会做无用功或查错方向：
+  - 🔴 **`proxy.rs` 流末那段注释指向一个已经做完的待办**：原文写「error 事件本身已被翻译器
+    丢弃……更好的做法是翻成下游协议的 error 事件，需在 sse.rs 六个方向各加一条，属独立改动，
+    见 docs 待办」。`sse_error.rs` 已经把那件事做了。已改写成这道门**今天**的真实作用：
+    它刻意比 `sse_error` 的判据**更宽**（`saw_upstream_error` 用原始尾窗、认任何**非 null**
+    的 `error` 字段；翻译器只认对象/字符串），差集里没有它就会退回「假成功」。
+  - 🔴 **`sse_error` 模块头那句「Chat 下游仍发 `[DONE]`」在生产路径上不成立**：那是翻译器
+    这一层的事实（`finish()` 对 Chat 无条件返回它），而 `proxy.rs` 上面那道更宽的门先
+    `return None`、压根不调 `finish()`。**两者都不改**——门的价值（堵假成功）远大于一个
+    终止符；改的是那句话，并在测试里写明「本断言守的是这一层不主动抑制它，不是用户一定收到」。
+    这是「单元覆盖了组件 ≠ 覆盖了调用它的那条线」的**注释版**：组件说得对，链路把它废掉了。
+  - 🔴 **`proxy.rs:1640` 写着「跨协议 SSE 翻译属已知限制」** —— 跨协议翻译早就有了
+    （`SseTranslator` + 本轮的 `sse_error`），那句话会让人以为整条能力不存在。
+  - 🔴 **「P2-1/P2-7/P2-8 + `AppSettings` 拆分刻意不做」是一次文档回归**：docs/15 第三批
+    **2026-08-06 已全部补做**（标题原文「含原先『刻意不做』的四项」），docs/14 §12.4 也记对了；
+    而 08-27 整理待办清单时又从更早的来源转述回「刻意不做」，于是 CLAUDE.md、docs/14 §21.3、
+    **`ratchet.json` 的 `$rule`** 三处同时说着已经做完的事还没做。代码取证：`upstream/` 是
+    18 个文件的目录（`upstream.rs` 单文件已不存在）、`service.rs` 在、`model.rs:34/:97`
+    有 `CategoryMeta`+`meta()`、`:1910` 有 `UserPrefs`。**教训：「刻意不做」清单每次转述都必须
+    重新对代码验一遍** —— 它比普通过时注释更贵，因为它的用途就是指挥别人不要动手/去动手。
+  - **「17 个冻结文件」在四处文档里都是错的**（实际 **16** —— `mockData.ts` 抽出
+    `mockData.events.ts` 后降到 819 行、已掉出 `frozen`）。同类还有 `i18n.ts` 的「241×2」
+    （实际中英各 **621** 条）、`bridge.ts` 的「74 处」、`lib.rs` 的「79 个命令」。
+    这些数字**判据自己都会打印**：`npm run ratchet` 报冻结条数、
+    `invoke-command-must-exist` 报「78 个调用 / 83 个命令」。已把文档改成指向门而不是抄数字。
+    <br>⚠️ **别用 `grep -c '#\[tauri::command\]'` 数命令**：它把注释里提到这个属性的行也算进去
+    （`key_flags.rs` 测试段就有一处），实测比门多 1 个。门用的是「行首必须是该属性」+ 去重成
+    `Set`，那才是对的口径。
 - **刻意不修的项**（别当成遗漏重复劳动）：SmartScreen 签名告警、`retrieval.rs` 的 `cwd` 白名单、
   请求日志存明文对话（默认关闭）
+
 - **自有诊断响应头已上线（2026-08-23，借鉴 OmniRoute 的 `X-OmniRoute-*`）**：
   `X-SynaRoute-Decision`（`key=… ; model=… ; attempts=… ; latency_ms=…` 一行可粘贴）
   + `-Key` / `-Key-Id` / `-Model` / `-Attempts` / `-Latency-Ms` / `-Upstream-Status`
@@ -749,8 +1479,10 @@ Rust 测试是**同文件内联**的。若按整文件行数冻结，「补一�
 故 `.rs` 只数尾部 `#[cfg(test)] mod tests` 之前的行。判据有对应注入验证：
 只在测试段加 50 行必须**仍绿**。
 
-当前基线在 `config/quality/ratchet.json`：17 个冻结文件、新文件上限 900 行、
+当前基线在 `config/quality/ratchet.json`：**16 个**冻结文件、新文件上限 900 行、
 1 项计数（`bare_persist_calls: 3`，对上 docs/14 勘误里那条）。
+🔴 **本文档此前写「17 个」，那是错的** —— `frozen` 一直是 16 条（`git show HEAD` 核对过），
+而门自己每次都打印真实条数。**判据自己会报数时，别在文档里另抄一份。**
 
 ### 🔴 想抬高一个上限时的规矩
 
@@ -868,8 +1600,9 @@ Rust 侧 `ENV_OVERRIDE` 与 `smoke-installer.mjs` 里 spawn 传的名字必须�
   但**它指向的风险是真的**（当时全仓无任何按体积限日志的代码）——
   ✅ **已实现并发布**（v0.1.42）：`log_rotate.rs` 两级上限，见本文档「日志体积上限」那条。
   定的值是 256 MB/天，不是那个凭空的 100MB。
-  <br>顺带更正：生产段超 900 行的是 **17 个**文件（旧版只数了 Rust，漏掉 5 个前端文件），
-  与 `ratchet.json` 的 `frozen` 条目数一致。
+  <br>顺带更正：生产段超 900 行的是 **16 个**文件（旧版只数了 Rust，漏掉前端那几个），
+  与 `ratchet.json` 的 `frozen` 条目数一致 —— 这个数字**由门自己打印**，
+  2026-08-30 复核时发现文档里抄的「17」两处都是错的。
 - [docs/01-需求规格说明书.md](docs/01-需求规格说明书.md)
   <br>⚠️ 每条只有一两句话、**没有验收判据**，故「FR-001~027 逐条核过」只说明功能点存在，
   不说明功能做对了 —— 本轮修的每个缺陷都不在那 27 条里。见 docs/19 §4 末。
