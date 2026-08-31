@@ -33,10 +33,17 @@ const POOL_RS = readFileSync(join(ROOT, "src-tauri", "src", "model_pool.rs"), "u
  * 本仓已 5 次栽在「注释里的字面量满足了断言」上（`data-dir-env-name-must-match` /
  * `userPrefsParity` / `only_v6_must_be_set_explicitly` / `check-tailwind-tokens` /
  * 一个一次性扫查脚本）。判据说「代码里别这么写」，就只能看代码。
+ *
+ * 🔴 **先归一行尾**：`.rs` 不在 `.gitattributes` 的管辖里，仓库存 LF 而
+ * `core.autocrlf=true`（本机就是）会让**下一次 clone / checkout** 得到 CRLF。那时
+ * `indexOf("#[cfg(test)]\nmod tests")` 静默匹配不到 → 切不掉测试段 → 下面那条「交集残留
+ * 形态」判据会扫到测试段里 `!src.contains("backup_sets")` 的**字符串字面量**并报假警。
+ * 同 CLAUDE.md 里 `codex_base_instructions.md` 的 20903 字节与 `Cargo.lock` 那两条坑。
  */
 function prodOnly(src: string): string {
-  const cut = src.indexOf("#[cfg(test)]\nmod tests");
-  return (cut >= 0 ? src.slice(0, cut) : src)
+  const normalized = src.replace(/\r\n/g, "\n");
+  const cut = normalized.indexOf("#[cfg(test)]\nmod tests");
+  return (cut >= 0 ? normalized.slice(0, cut) : normalized)
     .split("\n")
     .map((line) => {
       const i = line.indexOf("//");
