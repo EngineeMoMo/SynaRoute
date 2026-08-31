@@ -552,6 +552,8 @@ pub(super) fn wire_into(
     keys: &[ProviderKey],
     catalog_file: &Path,
 ) -> AppResult<()> {
+    // 与目录同一次写盘：它是 config.toml 顶层表上的另一个键，分两次写只会多一次备份+落盘。
+    disable_remote_compaction(table);
     if can_build(models) {
         write_catalog_at(catalog_file, models, keys)?;
         table.insert(
@@ -711,14 +713,65 @@ fn select_model_at(
 /// 动作(重启一次 Codex)压根没人告诉他。这条消息同时进接入结果提示与事件流(重写客户端
 /// 配置那条链路也落它),所以它是这句提示唯一必须落地的地方 —— 不需要动任何前端文件。
 pub(super) fn apply_note(models: &[String]) -> String {
+    // 「远端压缩已关」这句无条件说，且措辞对两种情形都成立（我们没覆盖用户显式设的值）——
+    // 不说的话用户不知道我们动过他的 Codex 功能开关，而那是个会影响他行为的事实。
+    let compaction = "；顺带关掉了 Codex 的远端自动压缩（它绕过本代理直打官方、会报 401；\
+                      你显式设过的值不动）";
     match models.first() {
         Some(m) => format!(
             "，模型目录 {} 条（首个 {m}）—— 目录只在 Codex 启动时加载，\
-             之后改了模型列表要重启一次 Codex 才会看到",
+             之后改了模型列表要重启一次 Codex 才会看到{compaction}",
             models.len()
         ),
-        None => "，当前无可服务模型，故未写模型目录".to_string(),
+        None => format!("，当前无可服务模型，故未写模型目录{compaction}"),
     }
+}
+
+/// Codex 平台功能里唯一会**绕过 `model_provider`** 的那个开关。
+const REMOTE_COMPACTION_FLAG: &str = "remote_compaction_v2";
+
+/// 在 `[features]` 里关掉 `remote_compaction_v2`；返回「这次是否真的写了」。
+///
+/// # 🔴 为什么替用户关（2026-08-31 第二次撞上后改的决策）
+///
+/// `remote compaction v2`（自动压缩历史）**不读 `model_provider`** —— 它无条件打
+/// `api.openai.com` 并取 `auth.json` 的凭据，而那里是我们写的占位符 → 每次触发自动压缩都收到
+/// `401 Incorrect API key provided: SEE-SYNA***OUTE`。**接入完好时照样发生**，
+/// `drift_state` 结构上测不到它（config 里没有任何异常信号）。
+///
+/// 原决策是「刻意不替用户写」，理由是「它是 Codex 的功能开关、不是接入所需」。
+/// 代价对比推翻了它：
+///
+/// | 做法 | 代价 |
+/// |---|---|
+/// | 不写 | 接入状态下每次自动压缩必然 401，报错文案用户看不懂。**已发生两次** |
+/// | 写 | 用户若**绕过「还原」**手改 config 切回官方登录，这行会留着 → 远端压缩静默关着 |
+///
+/// 后者可感知度低（降级到 Codex 自己的本地压缩兜底），且只在「绕过还原」这一条路径上成立
+/// —— 走正常还原时 `config.toml` 整份从 `.bak` 恢复，这行随之消失（同 `model` 键的机制）。
+///
+/// # 🔴 已有值一律不覆盖，包括显式 `true`
+///
+/// 那是用户的明确意图（他要远端压缩，且大概知道自己在做什么）。覆盖它就是
+/// 「替用户改掉他明确设过的东西」—— 同 cc-switch #6087 抢用户 `model_catalog_json`
+/// 指针那条教训。只在**这个键不存在**时才写。
+///
+/// # `[features]` 不是表时不碰
+///
+/// 用户手写坏了（写成 `features = 1` 之类）是他的问题，而我们强行替换成表会改变整份 config
+/// 的语义、且下次他打开文件会发现自己写的东西没了。
+fn disable_remote_compaction(table: &mut toml::value::Table) -> bool {
+    let features = table
+        .entry("features".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+    let Some(features) = features.as_table_mut() else {
+        return false;
+    };
+    if features.contains_key(REMOTE_COMPACTION_FLAG) {
+        return false;
+    }
+    features.insert(REMOTE_COMPACTION_FLAG.to_string(), toml::Value::Boolean(false));
+    true
 }
 
 /// 目录文件缺失时的告警文案。
@@ -1079,6 +1132,71 @@ mod tests {
         // 已知值仍要生效，别被兜底值盖掉。
         let e = one(&["m"], &[big]);
         assert_eq!(e["context_window"], json!(1_000_000));
+    }
+
+    /// 🔴 接入时必须把 `remote_compaction_v2` 关掉 —— 那是 Codex 唯一会**绕过
+    /// `model_provider`** 的平台功能，开着就会把我们 auth.json 里的占位符发给真实 OpenAI
+    /// （用户 2026-08-31 两次实报 `401 Incorrect API key provided: SEE-SYNA***OUTE`）。
+    ///
+    /// 四种输入形态各验一次：无 `[features]` 表 / 有表但无该键 / 显式 `false` / 显式 `true`。
+    #[test]
+    fn remote_compaction_is_disabled_without_clobbering_an_explicit_choice() {
+        let flag = |t: &toml::value::Table| {
+            t.get("features")
+                .and_then(|f| f.as_table())
+                .and_then(|f| f.get(REMOTE_COMPACTION_FLAG))
+                .and_then(toml::Value::as_bool)
+        };
+
+        // ① 压根没有 [features] 表 → 建表并写 false。
+        let mut fresh = toml::value::Table::new();
+        assert!(disable_remote_compaction(&mut fresh), "新建时应报「写了」");
+        assert_eq!(flag(&fresh), Some(false));
+
+        // ② 已有 [features] 表、无该键 → 加进**同一张表**，其余键一个都不能丢。
+        let mut existing: toml::value::Table =
+            toml::from_str("[features]\ngoals = true\njs_repl = false\n").unwrap();
+        assert!(disable_remote_compaction(&mut existing));
+        assert_eq!(flag(&existing), Some(false));
+        let f = existing.get("features").unwrap().as_table().unwrap();
+        assert_eq!(f.get("goals").and_then(toml::Value::as_bool), Some(true), "别动别的开关");
+        assert_eq!(f.get("js_repl").and_then(toml::Value::as_bool), Some(false));
+
+        // ③ 已是 false → 幂等，返回 false 让调用方知道这次没动。
+        let mut already: toml::value::Table =
+            toml::from_str("[features]\nremote_compaction_v2 = false\n").unwrap();
+        assert!(!disable_remote_compaction(&mut already), "已有值不该再写");
+        assert_eq!(flag(&already), Some(false));
+
+        // ④ 🔴 显式 true **不许覆盖** —— 用户的明确意图（同 cc-switch #6087 抢指针那条教训）。
+        let mut opted_in: toml::value::Table =
+            toml::from_str("[features]\nremote_compaction_v2 = true\n").unwrap();
+        assert!(!disable_remote_compaction(&mut opted_in));
+        assert_eq!(flag(&opted_in), Some(true), "用户显式开的远端压缩必须保留");
+    }
+
+    /// `[features]` 被用户写成非表时不碰它 —— 强行替换会改变整份 config 的语义。
+    #[test]
+    fn a_malformed_features_key_is_left_alone() {
+        let mut weird: toml::value::Table = toml::from_str("features = 1\n").unwrap();
+        assert!(!disable_remote_compaction(&mut weird));
+        assert_eq!(weird.get("features").and_then(toml::Value::as_integer), Some(1));
+    }
+
+    /// 🔴 接线判据：`wire_into` 必须调它。
+    ///
+    /// 上面两条用例都直接调 `disable_remote_compaction`，把 `wire_into` 里那一行删掉它们
+    /// 照样全绿 —— 而那正是缺陷本体（接入完好却每次自动压缩都 401）。
+    #[test]
+    fn wire_into_must_disable_remote_compaction() {
+        let src =
+            crate::proxy::custom_headers::production_code_only(include_str!("codex_catalog.rs"));
+        let at = src.find("pub(super) fn wire_into").expect("函数改名了，请同步本判据");
+        let end = src[at..].find("\n}").map(|i| at + i).unwrap_or(src.len());
+        assert!(
+            src[at..end].contains("disable_remote_compaction(table)"),
+            "wire_into 必须关掉远端压缩 —— 漏掉它的表现是「接入完好却每次压缩都 401」"
+        );
     }
 
     /// 🔴 空模型列表既不写目录也不写指针。
