@@ -61,6 +61,14 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
   React.useEffect(refreshCodexModel, [refreshCodexModel, proxy?.status]);
   usePolling(refreshCodexModel, 5000, activeCategory === "codex");
 
+  /**
+   * Codex 自己在用的模型与应用内那个兜底**不一致** —— 也就是「下拉里那个不生效」。
+   *
+   * 抽成一个名字而不是内联两次条件：下拉的 label 与旁边那格必须**同进同退**，
+   * 各写一遍就会出现「标了未生效却没有那一格」或反过来，而那比不标更让人困惑。
+   */
+  const codexOverrides = Boolean(codexModel && codexModel !== activeModel);
+
   const enabledKeys = keys.filter((k) => k.enabled);
   const enabledCount = enabledKeys.length;
   const running = proxy?.status === "running";
@@ -215,7 +223,12 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
         <>
           <div className="h-4 w-px bg-border" />
           <StatusBarPicker
-            label={t("category.activeModel")}
+            label={
+              // ⚠ 前缀（纯符号，不新增文案键）：两值分歧时下拉里那个**不生效**，
+              // 而用户的心智是「下拉 = 当前模型」—— 2026-08-31 用户实报「Codex 换了模型、
+              // 软件里还显示旧的」，根因就是这个主次颠倒：下拉醒目而实际值挤在旁边 11px 灰字里。
+              codexOverrides ? `⚠ ${t("category.activeModel")}` : t("category.activeModel")
+            }
             title={t("category.activeModelHint")}
             value={activeModel}
             placeholder={t("category.activeModelAuto")}
@@ -227,12 +240,15 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
             onChange={onPickModel}
           />
           {/* Codex 自己那个（只读）。刻意只在**与兜底不同**时才出现：相同时多一格纯噪音，
-              而不同时它就是「谁在生效」的答案 —— pick 对 Codex 优先尊重客户端发来的名字。 */}
-          {codexModel && codexModel !== activeModel && (
+              而不同时它就是「谁在生效」的答案 —— pick 对 Codex 优先尊重客户端发来的名字。
+              🔴 样式必须醒目（warning badge）：第一版是 11px 灰字，用户完全没看到它，
+              仍然按下拉的值判断「当前模型」并报成刷新缺陷。透明度只能用标度内的值
+              （8 / 12 / 40 都在 tailwind.config.js 里），写 /15 会一条 CSS 都不生成。 */}
+          {codexOverrides && (
             <Tooltip content={t("category.activeModelHint")} side="bottom">
-              <div className="flex shrink-0 items-center gap-1 text-[11px] text-text-muted">
+              <div className="flex shrink-0 items-center gap-1 rounded-control border border-warning/40 bg-warning/12 px-2 py-0.5 text-[11px] text-warning">
                 <span>{t("category.codexCurrentModel")}</span>
-                <span className="font-mono text-text-secondary">{codexModel}</span>
+                <span className="font-mono font-medium">{codexModel}</span>
               </div>
             </Tooltip>
           )}

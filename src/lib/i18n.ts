@@ -299,7 +299,7 @@ const zh: Dict = {
   "category.addFirst": "添加第一个 Key",
   "category.activeModel": "当前模型",
   "category.activeModelHint": "此处选的是**兜底**模型：Codex 自己菜单里选的可服务模型优先（SynaRoute 已把清单写进它的模型目录），仅在客户端没选或选了不可服务的名字时才用这里的值；新会话生效",
-  "category.codexCurrentModel": "Codex 当前", // 只读回显它的 config.toml；来由见 codex_catalog::current_config_model
+  "category.codexCurrentModel": "Codex 实际在用", // 只读回显它的 config.toml；来由见 codex_catalog::current_config_model
   "category.activeModelAuto": "跟随客户端（透传）",
   "category.activeModelEmpty": "先添加并启用 Key 才有可选模型",
   "category.effortTitle": "推理强度",
@@ -1019,7 +1019,7 @@ const en: Dict = {
   "category.addFirst": "Add your first key",
   "category.activeModel": "Active model",
   "category.activeModelHint": "This is the **fallback** model: a serviceable model picked in Codex own menu wins (SynaRoute writes its model catalog); this value is used only when the client sends none or an unserviceable one. Effective on the next session.",
-  "category.codexCurrentModel": "Codex now",
+  "category.codexCurrentModel": "Codex is using",
   "category.activeModelAuto": "Follow client (passthrough)",
   "category.activeModelEmpty": "Add and enable a key first to get selectable models",
   "category.effortTitle": "Reasoning effort",
