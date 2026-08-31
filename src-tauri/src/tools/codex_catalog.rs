@@ -220,8 +220,7 @@ fn effort_survives_all_keys(keys: &[&ProviderKey]) -> bool {
         })
 }
 
-/// **有可能服务 `name` 这个对外名**的那些 Key（`model_pool::may_serve` 口径 ——
-/// 「确定认识」或「没配模型信息、会原样透传」，不含「会被换成兜底模型」的那些）。
+/// **确定认识 `name` 这个对外名**的那些 Key（`model_pool::serves_natively` 口径）。
 ///
 /// # 🔴 为什么这两维必须按模型算，不能拿全池算
 ///
@@ -232,15 +231,19 @@ fn effort_survives_all_keys(keys: &[&ProviderKey]) -> bool {
 ///   档位声明 → Codex UI 里那个选择器静默消失，而它对那些模型本来是真的能生效的。
 /// - **窗口**：全池取最小 → 独有模型的窗口被别人的低值压下去 → Codex 提前压缩/截断。
 ///
-/// 口径取 `may_serve` 而不是「确定认识」：一条没配模型的 Key 会把请求原样透传，
-/// 档位在那一跳的命运仍由它的 protocol 决定，故它必须参与档位交集（保守方向）。
+/// # 🔴 口径是 `serves_natively` 而**不是** `may_serve`（2026-08-31 用户实报后收窄）
+///
+/// 第一版用了 `may_serve`（含「没配模型信息、会原样透传」那一态），理由写的是「保守方向」
+/// —— **那个理由是错的**：一条空配置的 Chat 协议 Key 对**每个**模型都 `may_serve`，
+/// 于是它成为所有模型的 owner，交集判定当场把全部档位声明抹掉。用户 17 条 Key 的池子里
+/// 只要有一条这样的 Key，「按模型算」这一维就等于白改。完整理由见 `serves_natively`。
 ///
 /// 空子集回落全池：理论上不会发生（清单本身就是并集，每个名字至少有一条 Key 认识它），
 /// 但真发生时退回旧口径是保守方向，不该在这里 panic 或给空。
 fn owners_of<'a>(name: &str, keys: &'a [ProviderKey]) -> Vec<&'a ProviderKey> {
     let owners: Vec<&ProviderKey> = keys
         .iter()
-        .filter(|k| crate::proxy::model_pool::may_serve(k, name))
+        .filter(|k| crate::proxy::model_pool::serves_natively(k, name))
         .collect();
     if owners.is_empty() { keys.iter().collect() } else { owners }
 }
@@ -993,6 +996,37 @@ mod tests {
             e["context_window"],
             json!(1_000_000),
             "64k 那条 Key 压根不服务 claude-x，它的窗口不该参与取最小值"
+        );
+    }
+
+    /// 🔴 一条**空配置**的 Chat 协议 Key 不许抹掉别的模型的档位（2026-08-31 用户实报）。
+    ///
+    /// 那种 Key（只填了 base_url + key、还没拉模型列表）会把任何名字**原样透传**，
+    /// 于是 `may_serve` 对它恒为真 —— 第一版用那个口径，结果它成为**每个**模型的 owner，
+    /// 交集判定当场把全部档位声明抹掉，用户在 Codex 里看到「所有模型的推理强度都没了」。
+    /// 17 条 Key 的池子里只要有一条这样的 Key 就会发生，也就是「按模型算」这一维白改。
+    ///
+    /// 判据改成 `serves_natively`（只让**确定认识**该模型的 Key 参与）。
+    #[test]
+    fn an_unconfigured_chat_key_must_not_strip_everyone_elses_levels() {
+        let anth = key(Protocol::Anthropic, &[("claude-x", None)]);
+        // 空配置：没有 models、没有映射、没有三档 → 对任何名字都是「原样透传」。
+        let blank_chat = key(Protocol::OpenaiChat, &[]);
+        assert_eq!(
+            effort_levels_for("claude-x", &[anth, blank_chat]).len(),
+            EFFORT_LEVELS.len(),
+            "空配置的 Chat Key 对 claude-x 没有任何能力依据，不该参与档位交集"
+        );
+    }
+
+    /// 同上，但那条 Chat Key **确实**服务该模型 → 它必须参与交集（这才是真该不声明的情形）。
+    #[test]
+    fn a_chat_key_that_really_serves_the_model_still_strips_its_levels() {
+        let anth = key(Protocol::Anthropic, &[("shared", None)]);
+        let chat = key(Protocol::OpenaiChat, &[("shared", None)]);
+        assert!(
+            effort_levels_for("shared", &[anth, chat]).is_empty(),
+            "两条都认识 shared，其中一条是 Chat 上游 → 档位在那一跳会静默失效，必须不声明"
         );
     }
 

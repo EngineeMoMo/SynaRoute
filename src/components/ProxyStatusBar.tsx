@@ -6,6 +6,7 @@ import type { ProxyState } from "@/types";
 import { api } from "@/lib/bridge";
 import { useStore } from "@/store";
 import { useT } from "@/lib/useT";
+import { usePolling } from "@/lib/usePolling";
 import { discoverableModels, routingPrimaryKey } from "@/lib/modelSets";
 import { Play, Square, Copy, Waypoints, ArrowRight, AlertTriangle, LogOut } from "lucide-react";
 import { ToolConfigPreviewButton } from "@/components/ToolConfigPreview";
@@ -40,6 +41,13 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
    * 界面用权威口吻说了一个不生效的值。把真实值并列摆出来，用户一眼看出谁在生效。
    *
    * 只在 Codex 分类拉；`null` = 没接入 / 不是我们接入的 config，此时那一格不渲染。
+   *
+   * 🔴 **必须轮询，不能只在挂载/切分类时读一次**（2026-08-31 用户实报）：用户在 Codex 里
+   * 用 `/model` 换了模型 → Codex 把新值写回 `config.toml` → 而我们**无从知道**，那一格就
+   * 一直显示旧值。而这一格存在的全部理由就是「让用户一眼看出谁在生效」，显示陈旧值等于
+   * 把它要消除的那个问题换了个方向重现。
+   *
+   * `usePolling` 在窗口不可见时停表，故代价只有「用户正看着这一格时每 5s 读一次本地文件」。
    */
   const [codexModel, setCodexModel] = React.useState<string | null>(null);
   const refreshCodexModel = React.useCallback(() => {
@@ -51,6 +59,7 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
     void api.getCodexConfigModel().then(setCodexModel).catch(() => setCodexModel(null));
   }, [activeCategory]);
   React.useEffect(refreshCodexModel, [refreshCodexModel, proxy?.status]);
+  usePolling(refreshCodexModel, 5000, activeCategory === "codex");
 
   const enabledKeys = keys.filter((k) => k.enabled);
   const enabledCount = enabledKeys.length;

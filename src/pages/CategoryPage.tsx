@@ -353,29 +353,34 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
 
 interface Gap {
   expected: string;
-  missingKeys: string[];
+  /** 唯一能服务它的那条 Key 的备注名（单点才会进 Gap，见 detectMappingGaps）。 */
+  owner: string;
 }
 
 /**
- * 故障转移冗余检查（FR-006a）——「哪些模型不是所有启用 Key 都能服务」。
+ * 单点模型检查（FR-006a）——「哪些模型只有一条 Key 能服务」。
  *
- * 🔴 **2026-08-31 语义整体变了，别照旧注释理解**：对外清单此前取**交集**，所以这个检查
- * 回答的是「哪些模型没进 /model 选择器」；现在取**并集**，那些模型**全都在选择器里**，
- * 于是它回答的变成「哪些模型缺冗余」——只有一部分 Key 能服务它们，那些 Key 全部熔断时
- * 后端 `reject_if_unserviceable` 会**直接报 503**（刻意不悄悄换成别的模型）。
- * 旧文案照旧说「补映射让它出现在选择器里」，而它早就在里面了 —— 那会把用户送去做
- * 一个已经不需要的操作，正是本仓最在意的「指错方向的提示」。
+ * 🔴 **判据两次改过，别照旧注释理解**：
+ * - 交集时代：回答「哪些模型没进 /model 选择器」（补映射让它出现）。
+ * - 并集之后（2026-08-31）：那些模型全都在选择器里，于是改成回答「哪些模型缺冗余」。
+ * - 当天用户实报**太臃肿**后再收窄到现在这条：**只报单点**（有且仅有 1 条 Key 能服务）。
  *
- * 覆盖**并集里的每一个名字**，不再只看主 Key 的：备用 Key 独有的模型同样缺冗余，
- * 而交集口径下它们压根不在清单里、无从谈起。
+ * 为什么「不是所有 Key 都能服务」是个坏判据：用户有 17 条 Key，一个模型只要 3 条缺映射
+ * 就会被报出来 —— 而它还有 14 条能服务，完全不值得提醒。实测一屏十几条，全是噪音，
+ * 于是真正要紧的那一条（`claude-opus-5-thinking` 只有 1 条 Key 能服务）被埋在里面。
+ *
+ * 单点才是值得说的：唯一服务者一熔断，后端 `reject_if_unserviceable` 就会对这个模型
+ * 直接回 503（刻意不悄悄换成别的模型）。用户日志里那 88 条「当前不可用」正是这么来的。
  */
 function detectMappingGaps(enabledKeys: ProviderKey[]): Gap[] {
   if (enabledKeys.length < 2) return [];
   const sets = enabledKeys.map((k) => ({ key: k, set: keyExpectedSet(k) }));
   const gaps: Gap[] = [];
   for (const expected of discoverableModels(enabledKeys)) {
-    const missing = sets.filter(({ set }) => !set.has(expected)).map(({ key }) => key.name);
-    if (missing.length > 0) gaps.push({ expected, missingKeys: missing });
+    const owners = sets.filter(({ set }) => set.has(expected));
+    // 有 2 条以上能服务它就已经有冗余了 —— 提醒它纯属噪音。
+    if (owners.length !== 1) continue;
+    gaps.push({ expected, owner: owners[0].key.name });
   }
   return gaps;
 }
@@ -406,7 +411,7 @@ function MappingGapDialog({ gaps, onClose }: { gaps: Gap[]; onClose: () => void 
         <div className="flex-1 space-y-1.5 overflow-y-auto px-5 py-4">
           {gaps.map((g) => (
             <div key={g.expected} className="rounded-control bg-warning/8 px-3 py-2 text-xs text-text-secondary">
-              {t("category.mappingGapItem", { expected: g.expected, keys: g.missingKeys.join(t("common.listSep")) })}
+              {t("category.mappingGapItem", { expected: g.expected, keys: g.owner })}
             </div>
           ))}
         </div>

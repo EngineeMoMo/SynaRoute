@@ -95,6 +95,26 @@ pub(crate) fn may_serve(key: &ProviderKey, outward: &str) -> bool {
     confidence(key, outward) != Confidence::Fallback
 }
 
+/// 这条 Key **确定认识**这个对外名（`Confidence::Native`）。
+///
+/// # 与 [`may_serve`] 的分工：路由 vs 能力断言
+///
+/// 路由要宽（`may_serve`）—— 「不知道」的 Key 值得一试，替上游拒绝是误伤。
+/// 而**能力断言**要严（本函数）：Codex 目录里的「这个模型支持哪些思考档位、窗口多大」
+/// 是我们对用户做的承诺，一条没配模型信息、只会原样透传的 Key 对此**没有任何依据**。
+///
+/// 🔴 用错方向的代价是实测过的：2026-08-31 用户 17 条 Key 里只要有**一条**空配置的
+/// Chat 协议 Key，`may_serve` 就让它成为**每个**模型的 owner → 交集判定当场把
+/// **全部**模型的档位声明抹掉 → Codex 里所有模型的推理强度选择器一起消失。
+/// 那与改动前「全池取交集」一样糟，等于这一维白改。
+///
+/// 按 Native 判是有依据的、不是「碰巧大多数时候对」：[`rank_candidates`] **保证**请求
+/// 优先落到 Native 的 Key 上，Unknown 只在 Native 全被运行态挡住时才接手 —— 那时档位
+/// 跟着降级是可接受的（而拿不到回答才是真问题）。
+pub(crate) fn serves_natively(key: &ProviderKey, outward: &str) -> bool {
+    confidence(key, outward) == Confidence::Native
+}
+
 /// 对外可选模型集：各 Key [`ProviderKey::serviceable_models`] 的**并集**，去重、保序。
 ///
 /// `candidates` 必须已按 `priority` 升序（调用方一律传 `Store::enabled_keys_sorted`）。
@@ -139,6 +159,39 @@ pub(crate) fn discoverable_models(candidates: &[ProviderKey]) -> Vec<String> {
 /// 本仓对上游与日志体积一贯设上限（`REQ_LOG_CAP` / `TAIL_WINDOW_BYTES` / `log_rotate`），
 /// 这里同理 —— 一屏模型名对排障零价值，而它会随用户配置线性膨胀。
 const MAX_LISTED_MODELS: usize = 8;
+
+/// 同一个 (分类, 模型) 多久之内不再落第二条「当前不可用」事件。
+///
+/// # 🔴 折叠救不了这里 —— 本仓第二次踩同一个坑
+///
+/// `append_event_collapsible` 只合并**紧邻**的上一条。而客户端收到 503 会自动重发，
+/// 两次重发之间还夹着别的 failover / error 事件 —— 折叠链一断就各占一行。更根本的是
+/// 文案里带「预计 Ns 后恢复」这个**每秒都在变**的数字，即使紧邻也折不进去。
+/// `balance_gate` 的注释里写着同一句话（「折叠救不了这里」），我写这个模块时没应用它。
+///
+/// **实测代价**（用户 2026-08-31 的日志，v0.1.44）：6 分钟 **88 条**、三个模型各 30 条、
+/// `repeat` 全是 1，占满 `MAX_EVENTS`(500) 的 17% —— 而排障最需要的那几条 failover
+/// 正被它们挤出环。窗口取 60s，与 Key 级熔断窗口同量级：一个熔断周期只该说一次。
+const ANNOUNCE_THROTTLE_MS: i64 = 60_000;
+
+/// 这条「模型不可用」现在该不该落事件（进程级节流，见 [`ANNOUNCE_THROTTLE_MS`]）。
+///
+/// 键的组合数有界：判据②保证只有**我们宣称过的**名字才走到这里，故上限 = 分类数 × 并集大小。
+fn should_announce(category: CategoryType, model: &str, now: i64) -> bool {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<String, i64>>> =
+        std::sync::Mutex::new(None);
+    // 锁中毒也要继续（这只是节流，panic 掉它不如放过一条事件）。
+    let mut guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = guard.get_or_insert_with(std::collections::HashMap::new);
+    let key = format!("{}:{model}", category.as_str());
+    match seen.get(&key) {
+        Some(&last) if now - last < ANNOUNCE_THROTTLE_MS => false,
+        _ => {
+            seen.insert(key, now);
+            true
+        }
+    }
+}
 
 /// 从全部 Key 里挑出本次请求的候选，并排好序。返回 `(候选, 是否走了兜底)`。
 ///
@@ -297,15 +350,18 @@ pub(crate) fn reject_if_unserviceable(
     );
 
     // 落一条可折叠 warning：不落这层的话，用户只在客户端看到 503，而应用里毫无线索。
-    // 折叠键按**剥后**的模型名 —— 否则同一个模型的别名形态与裸名形态会各占一行。
-    store.append_event_collapsible(
-        category,
-        "warning",
-        None,
-        &msg,
-        None,
-        Some(format!("model-unavailable:{}:{bare}", category.as_str())),
-    );
+    // **但必须节流**：折叠只合并紧邻的一条，而这里两次之间会夹着 failover/error，
+    // 且文案带每秒都在变的秒数 —— 实测 6 分钟刷了 88 条。见 `should_announce`。
+    if should_announce(category, bare, now) {
+        store.append_event_collapsible(
+            category,
+            "warning",
+            None,
+            &msg,
+            None,
+            Some(format!("model-unavailable:{}:{bare}", category.as_str())),
+        );
+    }
 
     // 503 而不是 404：模型并非不存在，是它的服务者**暂时**不可用；回 404 会让客户端
     // 认定该模型永久不存在、可能把它从自己的清单里划掉。也不用 529（那是「过载」）。
@@ -928,6 +984,46 @@ mod tests {
             .expect("必须留一条事件");
         assert!(ev.detail.contains("共 40 个"), "要如实报总数：{}", ev.detail);
         assert!(!ev.detail.contains("m39"), "第 39 个不该被列出来（只列前 8 个）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 事件必须**按模型节流**，而 503 仍然每次都回。
+    ///
+    /// 两者的受众不同：客户端每次都需要那个 503（否则它以为请求成功了），而应用里的事件
+    /// 只需要「这件事发生了」一次。不节流的实测代价（用户 2026-08-31 的日志，v0.1.44）：
+    /// 6 分钟 **88 条**、三个模型各 30 条、`repeat` 全是 1，占满 `MAX_EVENTS`(500) 的 17%，
+    /// 把排障最需要的那几条 failover 挤出环。
+    ///
+    /// 折叠指望不上：`append_event_collapsible` 只合并**紧邻**的一条，而两次重发之间夹着
+    /// failover / error 事件，且文案带每秒都在变的「预计 Ns 后恢复」。
+    ///
+    /// ⚠️ 本用例用独有的模型名（`throttle-probe`）：节流表是**进程级** static，
+    /// 与别的用例共用同一个键会互相污染（同 CLAUDE.md 里 `DENIED_TOTAL` 那条 flaky）。
+    #[test]
+    fn the_unavailable_event_is_throttled_per_model() {
+        let (store, dir) = store_at("throttle");
+        let a = key("a", 0, &["opus"]);
+        store.upsert_key(a.clone()).unwrap();
+        store.upsert_key(breaker(key("b", 1, &["throttle-probe"]), 90_000)).unwrap();
+
+        for i in 1..=5 {
+            assert!(
+                reject_if_unserviceable(
+                    &store,
+                    CategoryType::ClaudeCli,
+                    "throttle-probe",
+                    std::slice::from_ref(&a)
+                )
+                .is_some(),
+                "第 {i} 次也必须回 503 —— 节流只管事件，不管响应"
+            );
+        }
+        let n = store
+            .list_events(CategoryType::ClaudeCli)
+            .into_iter()
+            .filter(|e| e.detail.contains("throttle-probe"))
+            .count();
+        assert_eq!(n, 1, "5 次请求只该落 1 条事件，实得 {n} 条");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

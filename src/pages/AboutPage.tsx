@@ -22,7 +22,7 @@ const AVATAR_URL = `https://github.com/${GH_USER}.png?size=160`;
  * 换人/换域名只改这两行。
  */
 const AUTHOR_EMAIL = "mhm292117@163.com";
-const SITE_URL = "https://www.mofamilys.com";
+const SITE_URL = "https://synaroute.mofamilys.com";
 
 /**
  * 在系统默认浏览器/邮件客户端里打开外部链接。
