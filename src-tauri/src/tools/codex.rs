@@ -4,8 +4,8 @@
 //! Codex 这条路上的判据密度远高于另两个客户端，而它们此前散在 tools.rs 的四个不相邻区段里，
 //! 「占位符是不是我们写的」这一个语义就被抄成了三份（见 [`auth_carries_our_placeholder`]）。
 //!
-//! # 2026-08-25 实测判据矩阵（codex-cli 0.148.0-alpha.9，隔离 `CODEX_HOME` + 本地探针抓
-//! `Authorization` 头）—— 本模块的每个决定都出自这张表，不是文档推测
+//! # 实测判据矩阵（2026-08-25 于 0.148.0-alpha.9，**08-31 于 0.151.0-alpha.7.1 重测**；隔离
+//! `CODEX_HOME` + 本地探针抓 `Authorization` 头）—— 本模块的每个决定都出自这张表，不是文档推测
 //!
 //! | config.toml | auth.json | 实际 base_url | 实际 Authorization |
 //! |---|---|---|---|
@@ -13,22 +13,24 @@
 //! | bearer + `requires_openai_auth = true` | **无** | provider 的 base_url | `Bearer <bearer>`，**没有凭据门禁** |
 //! | bearer + `requires_openai_auth` 省略 | **无** | provider 的 base_url | `Bearer <bearer>`（与上一行**逐字节相同**） |
 //! | bearer + `requires_openai_auth = false` | **无** | provider 的 base_url | `Bearer <bearer>`（同上） |
-//! | provider 表无 bearer，`requires_openai_auth = false` | 有 | provider 的 base_url | `Bearer <auth.json 的 key>`（本版**仍然继承**） |
+//! | provider 表无 bearer，`requires_openai_auth = false` | 有 | provider 的 base_url | **一个 `Authorization` 头都不发**（0.148 时继承 auth.json，**0.149 起变了**，见下） |
 //! | provider 表无 bearer，`requires_openai_auth = true` | 有 | provider 的 base_url | `Bearer <auth.json 的 key>` |
 //! | **顶层 `model_provider` 键整个缺失** | 有占位符 | `https://api.openai.com/v1` | `Bearer synaroute-proxy` → **401** |
 //! | `model_provider="synaroute"` 但**表缺失** | 任意 | —— | `Error: Model provider \`synaroute\` not found`，一个请求都不发 |
 //! | `[model_providers.openai]` 想覆盖内置 id | —— | —— | 启动即失败：`reserved built-in provider IDs` |
+//! | **接入完好**（provider 正确、目录在） | 有占位符 | **`api.openai.com/v1`** —— Codex 平台功能（`remote compaction v2` / remote control）**不读 `model_provider`** | `Bearer <占位符>` → **401**（2026-08-31 本机取证：`RemoteCompactionV2` 默认就在生效 features 里） |
 //!
 //! 由此三条结论，逐条对应本模块的一个设计：
 //!
-//! 1. **`experimental_bearer_token` 优先于 auth.json，且没有凭据门禁** → 我们**不写 auth.json**。
-//!    那份占位符在正常接入时从不外发，纯粹是负债：它只在漂移之后才会被发出去，而收件人是
-//!    **真实的 OpenAI**。用户看到 `Incorrect API key provided: synarout***roxy` 被指向
-//!    platform.openai.com 查自己的 key —— 方向完全相反。不写它，这个失败模式从根上消失，
-//!    顺带也不再动用户的 ChatGPT 登录态（旧实现是**整份替换** auth.json）。
-//! 2. **真正把假 key 送去官方的判据是「顶层 `model_provider` 键缺失」**，不是历史注释写的
-//!    「provider 表被丢掉而选中项留着」—— 后者 Codex 直接硬报错、不发请求。告警文案按形态分支
-//!    （见 [`DriftState`]），否则会把人指去查一个根本不会发生的 401。
+//! 1. **`experimental_bearer_token` 优先于 auth.json，且没有凭据门禁** → 转发链路上 auth.json
+//!    不参与鉴权。但它**仍然要写**（桌面端登录门，见 [`apply_auth_at`]），故占位符**长驻盘上**，
+//!    它的可见文本本身就是一道防线（见 [`CODEX_AUTH_PLACEHOLDER`]）。
+//! 2. **占位符外发有两条路径，不是一条。** ① `model_provider` 键缺失 → 回落官方（这一支
+//!    [`drift_state`] 测得出；「provider 表被丢掉而选中项留着」那个历史说法是错的 ——
+//!    那种情形 Codex 硬报错、不发请求）。② **Codex 自己的平台功能**（`remote compaction v2`、
+//!    remote control）**不读 `model_provider`**，无条件打官方 + 取 auth.json 的凭据，
+//!    **接入完好时照样发生**；config 里没有任何异常信号，[`drift_state`] 结构上测不到它。
+//!    取证与关闭办法见 CLAUDE.md「Codex 平台功能绕过 provider」一节。
 //! 3. **内置 provider id 不可覆盖** → 「把内置 `openai` 指向本地代理来中和回落」这条路已被证伪，
 //!    别再试（Codex 启动即失败）。
 //!
@@ -37,14 +39,16 @@
 //!
 //! # 版本前提（重要）
 //!
-//! 上表测的是**用户今天在跑的那个版本**（0.148.0-alpha.9）。这条路上已经有**两次**
-//! 版本相关的行为漂移，都不是「当时写错了」：
+//! 这条路上已经有**三次**版本相关的行为漂移，都不是「当时写错了」：
 //!
 //! - 2026-08-02 的旧判据「`requires_openai_auth=true` 必须配套 auth.json，否则停在登录页」
 //!   —— 今天测：`true` + 无 auth.json 照跑，无凭据门禁。
-//! - 2026-08-26 用户报的升级公告「新版不再允许自定义 provider 在
-//!   `requires_openai_auth=false` 时自动继承 auth.json 鉴权，报 `API_KEY_REQUIRED`」
-//!   —— 今天测：上表第 5 行，`false` **仍然继承**。说明那是比本机更新的版本。
+//! - 2026-08-26 用户报的升级公告「**0.149.0** 起自定义 provider 在 `requires_openai_auth=false`
+//!   时不再继承 auth.json 鉴权，报 `API_KEY_REQUIRED`」—— 08-25 在 0.148 上测是「仍然继承」，
+//!   **08-31 在 0.151 上复现成功**：那种形态现在**一个 `Authorization` 头都不发**。我们不受
+//!   影响只因为 bearer 在（上表 2~4 行在 0.151 上仍逐字节相同）—— `true` 防的是它哪天丢了。
+//! - **08-31 的否定结论**：五种写法**没有一组**回落 `api.openai.com`。所以「URL 是官方」
+//!   **排除**本字段 —— 只可能是顶层 `model_provider` 缺失，或平台功能那条路（结论 2）。
 //!
 //! 结论不是「谁对谁错」，而是**这个字段的语义会变**。故本模块的取舍一律按
 //! **代价不对称**定，不按「我测过所以就这样」：万一某版本 `true` 仍要凭据，它报的是
@@ -91,7 +95,6 @@ pub(super) const CODEX_AUTH_PLACEHOLDER: &str =
 /// **识别面必须比写入面宽** —— 故这里的字面量是刻意的，不能改成引用现值
 /// （`placeholder_has_a_single_source_of_truth` 那条门为此专门放过这一行）。
 pub(super) const LEGACY_CODEX_AUTH_PLACEHOLDERS: &[&str] = &["synaroute-proxy"];
-
 
 /// `~/.codex/config.toml`。
 pub(super) fn config_path() -> AppResult<PathBuf> {
@@ -211,9 +214,11 @@ pub(super) fn apply(
 /// 「这份文件能不能**整份删掉**」（不可逆操作，必须保守）。
 /// 而「能不能覆盖」由「备份是否成功」决定 —— `backup_and_write_bytes` 失败即整个 apply 失败回滚。
 ///
-/// # 三条防线（因为这份假凭据确实有外发风险）
+/// # 三条防线（因为这份假凭据确实会外发）
 ///
-/// 它只在「`model_provider` 被第三方改掉、Codex 回落官方地址」时才会被发出去。故：
+/// 外发有两条路径（模块头结论 2）：`model_provider` 漂移，以及 Codex 平台功能无条件打官方。
+/// **后者防线 2、3 都管不到**（config 完好、还原也不改变它会发生）—— 所以第 1 条才是这里
+/// 唯一恒定生效的那道，别把它当装饰。
 /// 1. **占位符自解释**：那句 401 显示成 `SEE-SYNA***OUTE`（见 `CODEX_AUTH_PLACEHOLDER`），
 ///    把人指向 SynaRoute 而不是 platform.openai.com；
 /// 2. **漂移检测**：`drift_state` 常驻盯着（启动即跑 + 60s 一轮 + 系统通知）；
@@ -262,6 +267,17 @@ fn apply_auth_at(path: &Path) -> AppResult<Option<String>> {
     )))
 }
 
+/// auth.json 解析成 JSON 对象；读不出、或顶层不是对象，一律 `None`。
+///
+/// 抽出来是因为下面四个判据的前奏**逐字节相同**。抄四份必然漂移 —— 本模块已经在
+/// 「占位符是不是我们写的」这一个语义上栽过一次（见模块头），那次就是三份副本各自演化的。
+fn auth_obj(path: &Path) -> Option<serde_json::Map<String, Value>> {
+    match serde_json::from_str::<Value>(&std::fs::read_to_string(path).ok()?) {
+        Ok(Value::Object(obj)) => Some(obj),
+        _ => None,
+    }
+}
+
 /// auth.json 里是否有一个**可用的、属于用户自己的** API key。
 ///
 /// 「可用」是关键限定：这个判据决定「要不要放弃覆盖」，而放弃覆盖的代价是用户停在登录页。
@@ -276,12 +292,7 @@ fn apply_auth_at(path: &Path) -> AppResult<Option<String>> {
 ///
 /// OAuth 的那份由 `.bak` 保护（覆盖前整份存档，还原时交还），见 [`apply_auth_at`]。
 fn auth_has_usable_api_key(path: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text) else {
-        return false;
-    };
+    let Some(obj) = auth_obj(path) else { return false };
     matches!(obj.get("OPENAI_API_KEY"), Some(Value::String(v))
         if !v.is_empty() && !is_our_placeholder_value(v))
 }
@@ -294,12 +305,7 @@ fn auth_has_usable_api_key(path: &Path) -> bool {
 /// `!t.is_null()` 不能写成 `.is_some()`：登出后的形态是 `"tokens": null`，
 /// 而 `.is_some()` 对 `Value::Null` 为真 —— 那会让文案谎称「已备份登录态」而其实没有。
 fn auth_has_oauth_tokens(path: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text) else {
-        return false;
-    };
+    let Some(obj) = auth_obj(path) else { return false };
     obj.get("tokens").is_some_and(|t| !t.is_null())
 }
 
@@ -339,8 +345,8 @@ fn expected_base_url(endpoint: &str) -> String {
 /// 而不写它有代价：用户报了一条**版本升级公告**级的现场信息 —— 新版 Codex 不再允许自定义
 /// provider 在 `requires_openai_auth = false` 时自动继承 auth.json 的鉴权，
 /// 症状是 `API_KEY_REQUIRED` / `401 Unauthorized`，官方给的解法就是把它改成 `true`。
-/// 那条在本机装的 0.148 上**复现不出来**（实测 `false` + 无 bearer + 有 auth.json 仍然继承成功），
-/// 说明它属于比本机更新的版本 —— 但正因为复现不出，才更不能赌。
+/// **那条已在 0.151.0-alpha.7.1 复现（08-31）**：`false` + 无 bearer 现在**一个
+/// `Authorization` 头都不发**（0.148 时仍继承）—— 公告是真的，`true` 防的是 bearer 哪天丢了。
 ///
 /// 三条旁证都指向 `true`：cc-switch 生成的生效配置是 `true`；用户自己那份能正常工作的
 /// `[model_providers.custom]` 也是 `true`；官方升级公告要求 `true`。
@@ -445,12 +451,7 @@ pub(super) fn apply_at(
 /// 写出的是 `{"auth_mode":"apikey","OPENAI_API_KEY":"…"}` **两个字段**，命中不了 `len()==1`，
 /// 于是漂移告警与清理同时哑掉，而那个 key 照样在发。
 pub(super) fn auth_carries_our_placeholder(path: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text) else {
-        return false;
-    };
+    let Some(obj) = auth_obj(path) else { return false };
     matches!(obj.get("OPENAI_API_KEY"), Some(Value::String(v)) if is_our_placeholder_value(v))
 }
 
@@ -462,20 +463,14 @@ pub(super) fn auth_carries_our_placeholder(path: &Path) -> bool {
 /// 允许 `auth_mode` 共存的理由：`codex login --with-api-key` 会补上它，而那种文件里
 /// **只有**我们的占位符，删掉它不会丢任何用户凭据。
 pub(super) fn auth_is_only_our_placeholder(path: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text) else {
-        return false;
-    };
+    let Some(obj) = auth_obj(path) else { return false };
     if !matches!(obj.get("OPENAI_API_KEY"), Some(Value::String(v)) if is_our_placeholder_value(v)) {
         return false;
     }
     if obj.get("tokens").is_some_and(|t| !t.is_null()) {
         return false;
     }
-    obj.keys()
-        .all(|k| k == "OPENAI_API_KEY" || k == "auth_mode")
+    obj.keys().all(|k| k == "OPENAI_API_KEY" || k == "auth_mode")
 }
 
 /// 解除 auth.json 里的占位符（本轮写的、或旧版本留下的）。返回 `Some(说明)` 表示确实动了。
@@ -524,10 +519,10 @@ pub(super) fn disarm_legacy_placeholder_auth(path: &Path) -> AppResult<Option<St
     }
 
     // 混合形态：只摘 key，保留用户自己的其余字段。
-    let text = std::fs::read_to_string(path)?;
-    let mut obj: serde_json::Map<String, Value> = match serde_json::from_str::<Value>(&text) {
-        Ok(Value::Object(o)) => o,
-        _ => return Ok(None),
+    // 能走到这里说明 `auth_carries_our_placeholder` 已经成功解析过它，故读失败按 `Ok(None)`
+    // 处理与原来的 `?` 上抛等价（都不会发生）—— 用 `auth_obj` 是为了不抄第五份解析前奏。
+    let Some(mut obj) = auth_obj(path) else {
+        return Ok(None);
     };
     obj.remove("OPENAI_API_KEY");
     // `auth_mode: "apikey"` 失去了它指向的 key，留着会让 Codex 判定为 api-key 模式却找不到 key。
@@ -623,7 +618,9 @@ pub(super) enum DriftState {
     /// 我们从未接入过（或已还原）—— 此时 config 不指向我们完全正常，不该报警。
     NotApplied,
     /// 顶层 `model_provider` 键缺失或 `= "openai"` → Codex 回落内置官方地址。
-    /// **只有这一支会出现那句 401 `Incorrect API key provided`**（且仅当假 key 还武装着）。
+    /// 会出现那句 401 `Incorrect API key provided`（仅当假 key 还武装着）。
+    /// ⚠️ **不是那句 401 的唯一来源** —— Codex 平台功能在 `Intact` 下也会打出同一句，
+    /// 见模块头结论 2。所以「用户报了这句 401」不等于「一定漂移了」，别据此反推形态。
     FellBackToOfficial { placeholder_armed: bool },
     /// 选中了别人的 provider。`destination` 是那个 provider 的 base_url（可能拿不到）。
     /// `placeholder_would_be_sent` = 该表没有自带凭据 → 我们的占位符会被发往那个地址。
@@ -647,9 +644,9 @@ pub(super) enum DriftState {
 
 /// 判定漂移形态。`applied` = 我们是否认为自己处于已接入态（由调用方按 `.bak`/运行态给出）。
 ///
-/// 判据刻意**不是**「占位符在不在 auth.json 里」（旧实现如此）：本版已经不写 auth.json 了，
-/// 那个门一旦成为唯一入口，整个漂移检测就会变成永不触发的死代码 —— 而检测器自己静默失效，
-/// 正是本仓反复吃过的那类亏。
+/// 判据刻意**不是**「占位符在不在 auth.json 里」（旧实现如此）：那份占位符**恒在**
+/// （[`apply_auth_at`] 每次接入都写它），于是那个门恒真、区分不出任何形态 —— 检测器自己
+/// 静默失效，正是本仓反复吃过的那类亏。
 pub(super) fn drift_state(
     cfg_path: &Path,
     auth_path: &Path,
@@ -668,7 +665,9 @@ pub(super) fn drift_state(
     if is_intact(cfg_path, endpoint) {
         return DriftState::Intact;
     }
-    if !applied {
+    // `!applied` = 从未接入 / 已还原，config 不指向我们本属正常。**但占位符还武装着时不能沉默**：
+    // 那时每次请求都把假 key 发给官方，而用户在 SynaRoute 里一个字都看不到（最忌的失效方向）。
+    if !applied && !auth_carries_our_placeholder(auth_path) {
         return DriftState::NotApplied;
     }
 
@@ -777,7 +776,7 @@ pub(super) fn drift_warning(state: &DriftState) -> Option<String> {
             if *placeholder_armed {
                 format!(
                     "{head}\n而 auth.json 里还留着 SynaRoute 写入的占位密钥（它只为让桌面端跳过登录页），\
-                     于是 Codex 会把它发给官方，报「Incorrect API key provided: synarout***roxy」\
+                     于是 Codex 会把它发给官方，报「Incorrect API key provided: SEE-SYNA***OUTE」\
                      —— **那不是你的 OpenAI 密钥有问题**。\n{FIX}\
                      （在本页点「停止」会自动摘除这份占位密钥；重新「启动」会重写正确的接入配置。）"
                 )
@@ -1392,6 +1391,68 @@ mod tests {
     }
 
     // ---- 漂移分支 ----
+
+    /// 🔴 `!applied` 不能一律沉默。副文件（`.bak` / `.synaroute-created`）不在、而 auth.json 里
+    /// 我们的占位符**还武装着**，是这条路上最危险的组合：Codex 每次请求都把假 key 发给官方，
+    /// 而旧实现在 `!applied` 处早退成 `NotApplied`、`drift_warning` 返 `None` ——
+    /// 用户每次对话都 401，却在 SynaRoute 里找不到任何线索。
+    ///
+    /// 成因不必是「从未接入」：还原中途失败、或副文件被清理工具/手工删掉，都会落到这里。
+    #[test]
+    fn an_armed_placeholder_is_never_silent_even_when_we_think_we_are_not_applied() {
+        let d = temp_dir("drift-armed");
+        let cfg = d.join("config.toml");
+        let auth = d.join("auth.json");
+        write(&cfg, "model = \"x\"\n"); // 顶层无 model_provider = 回落官方那一支
+        write(
+            &auth,
+            &format!(r#"{{"OPENAI_API_KEY":"{CODEX_AUTH_PLACEHOLDER}"}}"#),
+        );
+
+        let s = drift_state(&cfg, &auth, EP, false); // ← applied = false
+        assert_eq!(
+            s,
+            DriftState::FellBackToOfficial {
+                placeholder_armed: true
+            },
+            "占位符武装着就必须报出来，不能因为副文件不在而沉默"
+        );
+        assert!(drift_warning(&s).is_some(), "这个组合下沉默 = 用户拿不到线索");
+
+        // 对照：占位符不在时 `!applied` 仍然要安静，否则每个没接入 Codex 的用户都被打扰。
+        std::fs::remove_file(&auth).unwrap();
+        assert_eq!(drift_state(&cfg, &auth, EP, false), DriftState::NotApplied);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 告警里引用的那个掩码必须跟**当前**占位符对得上，判据从常量派生。
+    ///
+    /// 🔴 补这条是因为它已经过期过一次：占位符从 `synaroute-proxy` 换成 `SEE-SYNAROUTE-…` 时，
+    /// 这句文案里的 `synarout***roxy` 没跟着改。用户眼前的报错是 `SEE-SYNA***OUTE`，
+    /// 告警却在说另一个串 —— 他会判定「这个告警说的不是我遇到的事」，
+    /// 而这段文案唯一的作用就是把他从「去 platform.openai.com 查自己的密钥」拉回来。
+    #[test]
+    fn the_drift_warning_quotes_the_placeholder_that_is_actually_written() {
+        let w = drift_warning(&DriftState::FellBackToOfficial {
+            placeholder_armed: true,
+        })
+        .unwrap();
+        // OpenAI 的回显规则是「前 8 位 + 后 4~5 位」，告警必须引用同样那两截。
+        assert!(
+            w.contains(&CODEX_AUTH_PLACEHOLDER[..8]),
+            "前 8 位对不上：{w}"
+        );
+        assert!(
+            w.contains(&CODEX_AUTH_PLACEHOLDER[CODEX_AUTH_PLACEHOLDER.len() - 4..]),
+            "后 4 位对不上：{w}"
+        );
+        for &old in LEGACY_CODEX_AUTH_PLACEHOLDERS {
+            assert!(
+                !w.contains(&old[..old.len().min(8)]),
+                "不许再引用历史占位符 {old} 的形态：{w}"
+            );
+        }
+    }
 
     /// 每种漂移形态的文案必须点名**那个形态下 Codex 实际的行为**。
     /// 指错方向的告警比没有告警更糟：它会让用户去查一个根本不会发生的问题。
