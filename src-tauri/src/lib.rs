@@ -1506,7 +1506,7 @@ const TRAY_PROXY_PREFIX: &str = "proxy::";
 const TRAY_PRIMARY_PREFIX: &str = "primary::";
 
 /// 构建托盘菜单：显示主窗口 +（可选）Codex 模型快切子菜单 + 退出。
-/// 候选与 /v1/models、应用内下拉同源（discoverable_models 交集口径），当前选中项打勾。
+/// 候选与 /v1/models、应用内下拉同源（discoverable_models 并集口径），当前选中项打勾。
 /// 借鉴 cc-switch 托盘切换范式：右键托盘即可切 Codex 当前对外模型，免打开主窗口。
 fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
@@ -1575,10 +1575,10 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<ta
     }
     menu.append(&primary_menu)?;
 
-    // Codex 模型快切子菜单（开关开启时）：列出 Codex 启用 Key 可服务模型的交集，当前项打勾，
+    // Codex 模型快切子菜单（开关开启时）：列出 Codex 启用 Key 可服务模型的并集，当前项打勾，
     // 末尾附「跟随客户端（透传）」。关闭开关则托盘只留显示/退出，不构建此段。
     if settings.tray_model_switch_enabled {
-        // 候选与接入写盘、GET /v1/models 同源（交集口径，见 service::models_for_apply）：
+        // 候选与接入写盘、GET /v1/models 同源（并集口径，见 service::models_for_apply）：
         // 托盘若自己算一份，就会出现「托盘能选的模型接入时没写进去」。
         let models = service::models_for_apply(&state.store, CategoryType::Codex);
         let active = settings

@@ -7,8 +7,9 @@ import type { ProviderKey } from "@/types";
  * - 已配三档 → 追加 claude-*-4-5 家族代表名
  *
  * 从 CategoryPage 搬到这里，是因为状态条（ProxyStatusBar）也要算「当前模型」的候选集，
- * 而它与分类页是两个组件。**两份实现必然漂移**，而漂移的后果是：状态条列出的模型
- * 在某个备用 Key 上其实路由不了，故障转移落到它时就报「模型不存在」。
+ * 而它与分类页是两个组件。**两份实现必然漂移**，而漂移的后果是：界面列出的模型后端压根
+ * 没宣称过，于是转发时被 `reject_if_unserviceable` 当成「客户端自己编的名字」放过、
+ * 静默降级到别的模型 —— 用户选了 A 拿到 B 的回答，日志里也只是一行正常的「兜底改写」。
  */
 export function keyExpectedSet(k: ProviderKey): Set<string> {
   const set = new Set<string>();
@@ -28,20 +29,24 @@ export function keyExpectedSet(k: ProviderKey): Set<string> {
 }
 
 /**
- * 应用内「当前模型」下拉的候选集 —— 与后端 `discoverable_models`（GET /v1/models）同口径：
- * 主 Key（优先级最高的启用 Key）可服务模型集，与各备用 Key 取交集；空交集时回退主 Key。
- * 保证选中的任意名字在所有候选 Key 都能 resolve、故障转移无感。
+ * 应用内「当前模型」下拉的候选集 —— 必须与后端 `model_pool::discoverable_models`
+ * （即 `GET /v1/models`）同口径：按 priority 升序，把各 Key 的可服务集**并**起来，去重保序。
+ *
+ * 2026-08-31 起是并集（此前是交集，空交集时回退主 Key）。交集把备用 Key 独有的模型整个
+ * 藏了起来，而它们明明可用 —— 只要请求真的被路由到那条 Key，而这由后端
+ * `model_pool::rank_candidates` 保证（排序键把「能原生服务本次模型」摆在 priority 之前）。
+ *
+ * 🔴 顺序是契约，不只是观感：首个会被写进 `env.ANTHROPIC_MODEL`、Codex 目录挑默认模型、
+ * 桌面端选择器的默认项。故必须是「主 Key 的全部（保其自身顺序）→ 再按 priority 依次
+ * 追加各备用 Key 独有的」。跨语言一致性由 tests/discoverableModelsParity.test.ts 钉住。
  */
 export function discoverableModels(enabledKeys: ProviderKey[]): string[] {
-  const sorted = [...enabledKeys].sort((a, b) => a.priority - b.priority);
-  const primary = sorted[0];
-  if (!primary) return [];
-  const primaryModels = [...keyExpectedSet(primary)];
-  const backups = sorted.slice(1).map((k) => keyExpectedSet(k));
-  if (backups.length === 0) return primaryModels;
-  const intersection = primaryModels.filter((m) => backups.every((s) => s.has(m)));
-  // 空交集：对外名不统一，回退主 Key（与后端一致，保证下拉不空且主 Key 一定能路由）
-  return intersection.length > 0 ? intersection : primaryModels;
+  const out: string[] = [];
+  for (const k of [...enabledKeys].sort((a, b) => a.priority - b.priority)) {
+    // Set 的迭代顺序 = 插入顺序，与后端 serviceable_models 返回的 Vec 顺序一致。
+    for (const m of keyExpectedSet(k)) if (!out.includes(m)) out.push(m);
+  }
+  return out;
 }
 
 /**

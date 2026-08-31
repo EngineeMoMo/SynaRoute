@@ -51,12 +51,12 @@ fn notify(_title: &str, _body: &str) {}
 /// 写进客户端配置的**对外模型名**列表。
 ///
 /// 口径必须与 `GET /v1/models`、应用内模型下拉**完全一致**：都用
-/// [`crate::proxy::discoverable_models`]（多 Key 取**交集**），而非主 Key 的
-/// `serviceable_models()`（那是超集）。
+/// [`crate::proxy::discoverable_models`]（多 Key 取**并集**）。三个调用点（接入、改端口
+/// 后重写、托盘模型子菜单）各写一遍必然漂移 —— 历史上其中一处直接用主 Key 的
+/// `serviceable_models()`，症状是选择器列出备用 Key 服务不了的名字、转移过去就 404。
 ///
-/// 为什么这一条值得单独抽出来：它有三个调用点（接入、改端口后重写、托盘模型子菜单），
-/// 历史上其中一个用了超集口径，症状是桌面端模型选择器列出备用 Key 无法服务的名字，
-/// 故障转移到备用 Key 后那个模型必然 404。三处各写一遍就迟早再漂移一次。
+/// ⚠️ 并集不重演它，靠 `model_pool::rank_candidates` 把「能原生服务本次模型」排在
+/// `priority` 之前 —— 单独放开这个口径而不改排序会把那个缺陷原样带回来。
 pub(crate) fn models_for_apply(store: &Store, category: CategoryType) -> Vec<String> {
     crate::proxy::discoverable_models(&store.enabled_keys_sorted(category))
 }
@@ -185,8 +185,8 @@ fn warn_desktop_unacceptable_models(store: &Store, category: CategoryType, model
 /// 客户端（Codex / Claude）需重启才会重读 config —— 但因端口从此固定，仅此一次。
 ///
 /// 重写用的模型列表走 [`models_for_apply`]，与接入同源。**这一点是必须的**：
-/// 若这里退回主 Key 的超集口径，改一次端口就会把桌面端 gateway 档的 `inferenceModels`
-/// 从接入时的安全交集重写回超集，与接入路径自相矛盾。
+/// 若这里自己算一份口径，改一次端口就会把桌面端 gateway 档的 `inferenceModels`
+/// 重写成与接入时不同的清单，两条路径自相矛盾。
 ///
 /// 写 config 失败**不让整个改端口失败**：端口已经落盘、代理已按新端口跑起来了，
 /// 此时返回 Err 会让前端以为改端口没成功，而实际状态已变——只记一条 error 事件。
@@ -1884,14 +1884,18 @@ pub(crate) mod tests {
 
     // ---- 批 3：接入写盘的模型口径 ----
 
-    /// `models_for_apply` 必须是**交集**口径（不是主 Key 的超集）。
+    /// `models_for_apply` 是**并集**口径（2026-08-31 起；此前是交集）。
     ///
     /// 这是三个调用点（接入、改端口后重写、托盘模型子菜单）共用的单一事实来源。
     /// 历史上其中一处用了主 Key 的 `serviceable_models()`，症状是桌面端模型选择器
     /// 列出备用 Key 无法服务的名字，故障转移到备用 Key 后那个模型必然 404 ——
     /// 而故障转移本身是偶发的，用户看到的是「这个模型有时候能用有时候 404」。
+    ///
+    /// 并集**不会**重演那个症状：`model_pool::rank_candidates` 把「能原生服务本次模型」
+    /// 排在 `priority` 之前，请求先落到真正认识它的那条 Key。只放开这个口径而不改排序，
+    /// 就是原样把那个缺陷带回来 —— 两者必须同一次改动。
     #[test]
-    fn models_for_apply_is_the_intersection_not_the_primary_superset() {
+    fn models_for_apply_is_the_union_across_enabled_keys() {
         let (store, dir) = temp_store("models_apply");
 
         let mut primary = key(CategoryType::ClaudeCli);
@@ -1901,22 +1905,27 @@ pub(crate) mod tests {
         let mut backup = key(CategoryType::ClaudeCli);
         backup.id = "kb".into();
         backup.priority = 1;
-        backup.models = vec![model("claude-sonnet-4-5")]; // 备用 Key 服务不了 opus
+        backup.models = vec![model("claude-sonnet-4-5"), model("glm-4.6")]; // glm 是它独有的
         store.upsert_key(primary).unwrap();
         store.upsert_key(backup).unwrap();
 
         assert_eq!(
             models_for_apply(&store, CategoryType::ClaudeCli),
-            vec!["claude-sonnet-4-5".to_string()],
-            "只写两边都能服务的名字，否则转移到备用 Key 后 404"
+            vec![
+                "claude-opus-4-5".to_string(),
+                "claude-sonnet-4-5".to_string(),
+                "glm-4.6".to_string(),
+            ],
+            "并集：主 Key 独有的 opus 与备用 Key 独有的 glm 都要在，顺序以主 Key 为准"
         );
 
-        // 停用备用 Key → 交集不再受它约束，主 Key 全集恢复可见。
+        // 停用备用 Key → 它独有的那个必须随之消失（停用的 Key 不该继续贡献可选模型，
+        // 否则清单里会留下一个当前没人能服务的名字）。
         store.toggle_key("kb", false).unwrap();
         assert_eq!(
-            models_for_apply(&store, CategoryType::ClaudeCli).len(),
-            2,
-            "停用的 Key 不该继续收窄可用模型"
+            models_for_apply(&store, CategoryType::ClaudeCli),
+            vec!["claude-opus-4-5".to_string(), "claude-sonnet-4-5".to_string()],
+            "停用的 Key 独有的 glm-4.6 不该继续出现在清单里"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

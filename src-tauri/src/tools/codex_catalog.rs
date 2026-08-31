@@ -77,7 +77,11 @@
 //! **口径必须是交集，不能只看主 Key** —— 同 `service::models_for_apply` 那条注释里记的
 //! 「用超集口径导致桌面端列出备用 Key 服务不了的模型、故障转移后必然 404」。这里的对应
 //! 失效是：主 Key 走 Anthropic 所以声明了四档，而故障转移落到一条 Chat 上游的备用 Key 上，
-//! 档位当场静默失效。故 [`effort_levels_for`] 只在**所有**启用 Key 都能让 effort 生效时才声明。
+//! 档位当场静默失效。故 [`effort_levels_for`] 只在**所有**在册 Key 都能让 effort 生效时才声明。
+//!
+//! ⚠️ 「在册」是**按模型**算的（[`owners_of`]），不是全池：模型清单自 2026-08-31 起是各 Key
+//! 可服务集的**并集**，一条 Key 常常只服务其中一部分名字。拿全池取交集会让一条 Chat 协议
+//! 的备用 Key 把**全部**模型的档位声明抹掉，含它压根不服务的那些。
 
 use crate::error::{AppError, AppResult};
 use crate::model::{Protocol, ProviderKey};
@@ -195,13 +199,15 @@ const DEFAULT_EFFORT: &str = "medium";
 
 /// 这一组 Key 上，Codex 里选的思考档位能不能真的到达上游。
 ///
-/// **交集口径**：只要有**一条**启用 Key 的上游是 Chat Completions，就返回 `false`。
+/// **交集口径**：只要有**一条**在册 Key 的上游是 Chat Completions，就返回 `false`。
 /// 理由见模块头那张表——故障转移随时会落到那条 Key 上，而档位在那一跳是静默失效的。
 /// 一个「大多数时候生效」的档位选择器比没有选择器更糟：用户无法判断某次没变化
 /// 是模型的正常波动，还是档位压根没送出去。
 ///
+/// ⚠️ 「在册」= [`owners_of`] 筛过的那一组（**认识该模型的 Key**），不是全池。
+///
 /// 空列表返回 `false`（没有 Key 就没有依据，保守）。
-fn effort_survives_all_keys(keys: &[ProviderKey]) -> bool {
+fn effort_survives_all_keys(keys: &[&ProviderKey]) -> bool {
     !keys.is_empty()
         && keys.iter().all(|k| match k.protocol {
             // 我们自己算成 thinking.budget_tokens，生效与上游认不认 effort 无关。
@@ -214,11 +220,36 @@ fn effort_survives_all_keys(keys: &[ProviderKey]) -> bool {
         })
 }
 
-/// 该组 Key 应当声明的档位列表（`supported_reasoning_levels` 的值）。
+/// **有可能服务 `name` 这个对外名**的那些 Key（`model_pool::may_serve` 口径 ——
+/// 「确定认识」或「没配模型信息、会原样透传」，不含「会被换成兜底模型」的那些）。
+///
+/// # 🔴 为什么这两维必须按模型算，不能拿全池算
+///
+/// 对外清单是各 Key 可服务集的**并集**（`model_pool::discoverable_models`），所以一条 Key
+/// 常常只服务清单里的**一部分**名字。拿全池去判定会让两维都偏保守到失真：
+///
+/// - **档位**：一条 Chat 协议的备用 Key 会让**全部**模型（含 Anthropic Key 独有的）失去
+///   档位声明 → Codex UI 里那个选择器静默消失，而它对那些模型本来是真的能生效的。
+/// - **窗口**：全池取最小 → 独有模型的窗口被别人的低值压下去 → Codex 提前压缩/截断。
+///
+/// 口径取 `may_serve` 而不是「确定认识」：一条没配模型的 Key 会把请求原样透传，
+/// 档位在那一跳的命运仍由它的 protocol 决定，故它必须参与档位交集（保守方向）。
+///
+/// 空子集回落全池：理论上不会发生（清单本身就是并集，每个名字至少有一条 Key 认识它），
+/// 但真发生时退回旧口径是保守方向，不该在这里 panic 或给空。
+fn owners_of<'a>(name: &str, keys: &'a [ProviderKey]) -> Vec<&'a ProviderKey> {
+    let owners: Vec<&ProviderKey> = keys
+        .iter()
+        .filter(|k| crate::proxy::model_pool::may_serve(k, name))
+        .collect();
+    if owners.is_empty() { keys.iter().collect() } else { owners }
+}
+
+/// `name` 这个模型应当声明的档位列表（`supported_reasoning_levels` 的值）。
 /// 不该声明时返回**空数组** —— 实测空数组是合法的（`glm-4.6` 那条探针），Codex 不报错、
 /// 只是那个模型在 UI 上没有档位可选。
-fn effort_levels_for(keys: &[ProviderKey]) -> Vec<Value> {
-    if !effort_survives_all_keys(keys) {
+fn effort_levels_for(name: &str, keys: &[ProviderKey]) -> Vec<Value> {
+    if !effort_survives_all_keys(&owners_of(name, keys)) {
         return Vec::new();
     }
     EFFORT_LEVELS
@@ -304,10 +335,13 @@ fn build_entry(slug: &str, index: usize, levels: Vec<Value>, context_window: Opt
     })
 }
 
-/// 该对外模型名在**已取证的**启用 Key 上都成立的上下文窗口。
+/// 该对外模型名在**已取证的、且认识它的**启用 Key 上都成立的上下文窗口。
 ///
 /// 取已知值的**最小值**，而不是主 Key 的值：故障转移会落到任意一条 Key 上，
 /// 报一个只有主 Key 撑得住的窗口，等于让 Codex 把超长上下文送去一条撑不住的上游（400）。
+///
+/// 参与者限于 [`owners_of`]（认识该名字的那些 Key）—— 并集口径下拿全池取最小会被一条
+/// 压根不服务该模型的 Key 的低值压下去。
 ///
 /// ⚠️ **边界（审查时收窄的说法）**：只有**填过** `context_window` 的 Key 参与取最小值。
 /// 有 Key 没填时，我们报的窗口可能超过它的真实能力 —— 那是取证缺失的固有限制，
@@ -315,7 +349,8 @@ fn build_entry(slug: &str, index: usize, levels: Vec<Value>, context_window: Opt
 /// 输出上限判据仍在管着 `max_tokens`。全部 Key 都没填 → `None` → 由 [`build_entry`]
 /// 落到 [`FALLBACK_CONTEXT_WINDOW`]。
 fn context_window_across_keys(name: &str, keys: &[ProviderKey]) -> Option<u32> {
-    keys.iter()
+    owners_of(name, keys)
+        .iter()
         .filter_map(|k| k.context_window_for_outward(name))
         .min()
 }
@@ -333,15 +368,16 @@ fn context_window_across_keys(name: &str, keys: &[ProviderKey]) -> Option<u32> {
 /// 比菜单里少几个更难排查。还原会把 `config.toml` 整份从 `.bak` 恢复（指针那行随之消失）、
 /// 并按 `.synaroute-created` 标记删掉目录文件本身，官方条目当场回来。
 pub(super) fn build_catalog(models: &[String], keys: &[ProviderKey]) -> Value {
-    let levels = effort_levels_for(keys);
     let entries: Vec<Value> = models
         .iter()
         .enumerate()
         .map(|(i, name)| {
+            // 档位与窗口都**按模型**算（见 `owners_of`）：并集口径下一条 Key 只服务清单里的
+            // 一部分名字，拿全池算会让两维被压到失真。
             build_entry(
                 name,
                 i,
-                levels.clone(),
+                effort_levels_for(name, keys),
                 context_window_across_keys(name, keys),
             )
         })
@@ -382,11 +418,12 @@ pub(super) fn pointer_is_ours(pointer: &str) -> bool {
 /// 而它对空输入的行为**我们没有验证过** —— 而且这种状态下用户在菜单里一个模型都选不到，
 /// 比「回落到内置的 GPT 条目」糟得多。宁可让本功能对这种配置不生效。
 ///
-/// 什么时候会空：该分类**没有启用的 Key**，或主 Key 没有任何可服务模型。
-/// ⚠️ **不包含**「多 Key 交集为空」——`discoverable_models`（`proxy.rs`）在交集为空时
-/// **刻意回退主 Key 的超集**，故它永不返回空。原注释把这一支写成成因是错的。
-/// 代价随之而来且是已知的：目录里可能有备用 Key 服务不了的条目，故障转移到那条时会 404
-/// （effort 与 context_window 两维走的是真交集，模型列表这一维没有）。
+/// 什么时候会空：该分类**没有启用的 Key**，或没有任何一条启用 Key 有可服务模型。
+/// ⚠️ **不包含**「多 Key 对外名不重合」——`discoverable_models` 自 2026-08-31 起取**并集**，
+/// 只要有一条 Key 有模型它就非空（此前是交集 + 空则回退主 Key 超集，同样永不返回空）。
+/// 那个旧口径的已知代价「目录里可能有备用 Key 服务不了的条目、故障转移到那条时会 404」
+/// 已由 `model_pool::rank_candidates`（先路由到认识该模型的 Key）+
+/// `reject_if_unserviceable`（都不认识时响亮报错）消掉。
 pub(super) fn can_build(models: &[String]) -> bool {
     !models.is_empty()
 }
@@ -519,8 +556,8 @@ pub(super) fn wire_into(
             toml::Value::String(catalog_file.to_string_lossy().into_owned()),
         );
     } else {
-        // 列表空了（无启用 Key，或多 Key 交集为空）。留着指针会让 Codex 读一份陈旧目录，
-        // 而那份目录里的模型现在一个都服务不了。只摘我们自己的指针，见 `pointer_is_ours`。
+        // 列表空了（没有启用 Key，或它们一个可服务模型都没有）。留着指针会让 Codex 读一份
+        // 陈旧目录，而那份目录里的模型现在一个都服务不了。只摘我们自己的指针，见 `pointer_is_ours`。
         let ours = table
             .get("model_catalog_json")
             .and_then(|v| v.as_str())
@@ -895,30 +932,68 @@ mod tests {
         }
     }
 
-    /// 🔴 口径必须是**交集**：一条 Chat 上游的备用 Key 就足以让整组不声明档位。
+    /// 🔴 口径必须是**交集**：一条 Chat 上游、且同样服务该模型的备用 Key 就足以让它不声明档位。
     ///
     /// 用超集（只看主 Key）的失效是：主 Key 走 Anthropic 所以声明了四档，
-    /// 故障转移落到那条 Chat 上游的备用 Key 上，档位当场静默失效。同
-    /// `service::models_for_apply` 注释里记的「超集口径 → 桌面端列出备用 Key 服务不了的模型」。
+    /// 故障转移落到那条 Chat 上游的备用 Key 上，档位当场静默失效。
+    /// ⚠️ 参与交集的**只有认识该模型的那些 Key**（`owners_of`），不是全池 —— 那一半由
+    /// `a_chat_key_that_does_not_serve_the_model_must_not_strip_its_levels` 钉住。
     #[test]
     fn one_chat_key_disables_effort_levels_for_the_whole_pool() {
         let anth = key(Protocol::Anthropic, &[("m", None)]);
         let chat = key(Protocol::OpenaiChat, &[("m", None)]);
         let resp = key(Protocol::OpenaiResponses, &[("m", None)]);
 
-        assert_eq!(effort_levels_for(std::slice::from_ref(&anth)).len(), EFFORT_LEVELS.len());
-        assert_eq!(effort_levels_for(std::slice::from_ref(&resp)).len(), EFFORT_LEVELS.len());
+        assert_eq!(effort_levels_for("m", std::slice::from_ref(&anth)).len(), EFFORT_LEVELS.len());
+        assert_eq!(effort_levels_for("m", std::slice::from_ref(&resp)).len(), EFFORT_LEVELS.len());
         assert_eq!(
-            effort_levels_for(&[anth.clone(), resp.clone()]).len(),
+            effort_levels_for("m", &[anth.clone(), resp.clone()]).len(),
             EFFORT_LEVELS.len(),
             "两种能生效的协议混合仍应声明"
         );
         assert!(
-            effort_levels_for(&[anth, chat.clone()]).is_empty(),
-            "主 Key 能生效但备用 Key 是 Chat → 必须不声明（这就是交集口径）"
+            effort_levels_for("m", &[anth, chat.clone()]).is_empty(),
+            "备用 Key 也服务该模型、且是 Chat 上游 → 必须不声明（这就是交集口径）"
         );
-        assert!(effort_levels_for(std::slice::from_ref(&chat)).is_empty());
-        assert!(effort_levels_for(&[]).is_empty(), "没有 Key 就没有依据");
+        assert!(effort_levels_for("m", std::slice::from_ref(&chat)).is_empty());
+        assert!(effort_levels_for("m", &[]).is_empty(), "没有 Key 就没有依据");
+    }
+
+    /// 🔴 交集只在**认识该模型的 Key** 之间取（[`owners_of`]），不是全池。
+    ///
+    /// 模型清单自 2026-08-31 起是各 Key 可服务集的**并集**，一条 Key 常常只服务其中一部分
+    /// 名字。拿全池取交集的失效是：一条只服务 `glm` 的 Chat Key 会把 Anthropic Key 独有的
+    /// `claude-x` 的档位声明也抹掉 —— 而 `claude-x` 的请求压根不会落到它身上
+    /// （`model_pool::rank_candidates` 先给认识它的那条）。
+    /// 表现是「Codex 里某些模型的推理强度选择器莫名不见了」，静默且极难归因。
+    #[test]
+    fn a_chat_key_that_does_not_serve_the_model_must_not_strip_its_levels() {
+        let anth = key(Protocol::Anthropic, &[("claude-x", None)]);
+        let chat = key(Protocol::OpenaiChat, &[("glm", None)]);
+        assert_eq!(
+            effort_levels_for("claude-x", &[anth.clone(), chat.clone()]).len(),
+            EFFORT_LEVELS.len(),
+            "那条 Chat Key 不服务 claude-x，不该影响它的档位"
+        );
+        assert!(
+            effort_levels_for("glm", &[anth, chat]).is_empty(),
+            "而 glm 只有那条 Chat Key 服务 → 仍不声明"
+        );
+    }
+
+    /// 同上，窗口维度：不服务该模型的 Key 的低窗口值不该压住它。
+    ///
+    /// 失效方向是 Codex 提前压缩/截断上下文 —— **静默**，用户只看到「上下文莫名被压掉」。
+    #[test]
+    fn a_key_that_does_not_serve_the_model_must_not_shrink_its_window() {
+        let big = key(Protocol::Anthropic, &[("claude-x", Some(1_000_000))]);
+        let other = key(Protocol::Anthropic, &[("glm", Some(64_000))]);
+        let e = one(&["claude-x"], &[big, other]);
+        assert_eq!(
+            e["context_window"],
+            json!(1_000_000),
+            "64k 那条 Key 压根不服务 claude-x，它的窗口不该参与取最小值"
+        );
     }
 
     /// 无档位时 `default_reasoning_level` 必须是 `null`，不能留一个指向空列表的默认值。
@@ -976,7 +1051,7 @@ mod tests {
     ///
     /// `{"models":[]}` 会让 Codex 对着空列表挑默认模型（行为未验证），而用户在菜单里
     /// 一个都选不到 —— 比回落到官方内置条目糟得多。真实成因：该分类无启用 Key，
-    /// 或多 Key 的可服务模型交集为空。
+    /// 或那些 Key 一个可服务模型都没有（并集口径下这两条是唯一的两种）。
     #[test]
     fn empty_models_writes_neither_catalog_nor_pointer() {
         assert!(!can_build(&[]));

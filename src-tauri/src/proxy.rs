@@ -28,6 +28,10 @@ use tokio::task::JoinHandle;
 #[path = "custom_headers.rs"] pub(crate) mod custom_headers; // headers_json 接线 + 保留字段判据
 #[path = "proxy_listen.rs"] pub(crate) mod proxy_listen; // 粘滞端口 + 双栈绑定；来由见该文件模块注释
 #[path = "model_choice.rs"] mod model_choice; // 客户端发的名字 vs 应用内选的；来由见该文件模块注释
+#[path = "model_pool.rs"] pub(crate) mod model_pool; // 对外模型并集 + 模型感知路由；来由见该文件模块注释
+// 对外可选模型集的**唯一**实现。re-export 而不是留一层包装函数：包装函数会让
+// 「proxy.rs 生产段里不许有第二份并集实现」那条源码级判据失去意义。
+pub(crate) use model_pool::discoverable_models;
 pub(crate) type ResBody = BoxBody<Bytes, std::io::Error>;
 
 /// 把完整字节体装箱为 ResBody（Full 的错误类型是 Infallible，用 `match` 消解）。
@@ -476,7 +480,7 @@ async fn handle_request_inner(
         .unwrap_or_else(|| req.uri().path().to_string());
 
     // 模型发现端点：Claude Code（v2.1.126+）/model 选择器会 GET <base>/v1/models 拉取可选模型。
-    // 只放行 model 发现的可选模型（各启用 Key 可服务模型的交集/单 Key 自身），不进故障转移补全逻辑。
+    // 只放行 model 发现的可选模型（各启用 Key 可服务模型的并集），不进故障转移补全逻辑。
     // 用 path（去掉 query）的路径部分判定，避免把补全端点误判进来。
     let path_only = req.uri().path().to_string();
     if req.method() == hyper::Method::GET
@@ -635,6 +639,15 @@ async fn handle_request_inner(
             None,
             Some(format!("breaker-fallback:{}", category.as_str())),
         );
+    }
+
+    // 我们宣称过的模型名、全池却临时服务不了 → 响亮报错，而不是让第一个候选把它悄悄换成
+    // 别的模型。**必须排在候选循环之前**（有源码级判据钉着位置）：挂进循环里的任何分支都
+    // 意味着「至少已经打了一次上游、并已按那个被换掉的模型出了结果」。
+    if let Some(resp) =
+        model_pool::reject_if_unserviceable(&store, category, &requested_model, &candidates)
+    {
+        return Ok(resp);
     }
 
     // 调用模型日志开关（默认关）：开启后每次转发尝试记一条 request 事件（含完整链路快照）
@@ -1494,38 +1507,6 @@ fn handle_gateway_side_endpoints(
         return Some(json_resp(StatusCode::OK, Bytes::from_static(b"{}")));
     }
     None
-}
-
-/// 计算 `/model` 选择器应展示的可选模型集（用户约定）：
-/// - 无候选 → 空
-/// - 单个候选 → 该 Key 自身可服务模型集（cc-switch 式）
-/// - 多个候选 → 各 Key 可服务模型集的**交集**（共有），保证选任意模型都能在所有候选上路由，
-///   不会「模型不存在」。顺序以主 Key（candidates[0]，已按 priority 升序）为准。
-/// - 交集为空（多 Key 对外名不统一）→ 回退主 Key 的可服务模型集。
-pub(crate) fn discoverable_models(candidates: &[ProviderKey]) -> Vec<String> {
-    let Some((primary, rest)) = candidates.split_first() else {
-        return Vec::new();
-    };
-    let primary_models = primary.serviceable_models();
-    if rest.is_empty() {
-        return primary_models;
-    }
-    // 各备用 Key 的可服务集，用于取交集
-    let backup_sets: Vec<std::collections::HashSet<String>> = rest
-        .iter()
-        .map(|k| k.serviceable_models().into_iter().collect())
-        .collect();
-    let intersection: Vec<String> = primary_models
-        .iter()
-        .filter(|m| backup_sets.iter().all(|s| s.contains(*m)))
-        .cloned()
-        .collect();
-    if intersection.is_empty() {
-        // 空交集：对外名不统一。回退主 Key，保证选择器不空且主 Key 一定能路由。
-        primary_models
-    } else {
-        intersection
-    }
 }
 
 /// 返回模型发现结果（GET /v1/models）。按分类协议输出对应形态：
@@ -5714,23 +5695,31 @@ mod tests {
         assert_eq!(discoverable_models(&[k]), vec!["opus-4-8"]);
     }
 
+    /// 多 Key 取**并集**（2026-08-31 起；此前是交集）。备用 Key 独有的名字必须可见 ——
+    /// 它们明明能用，只要请求真的被路由到那条 Key，而那正是 `model_pool::rank_candidates`
+    /// 保证的事。顺序仍以主 Key 为准（首个会被写进 `env.ANTHROPIC_MODEL` 等三处）。
     #[test]
-    fn discover_multi_key_uses_intersection() {
+    fn discover_multi_key_uses_union() {
         let mut a = key("a", 0, "http://x");
         a.mappings = vec![mapping("opus-4-8", "glm-5.2"), mapping("opus-4-7", "glm-5.1")];
         let mut b = key("b", 1, "http://y");
-        b.mappings = vec![mapping("opus-4-8", "ds-v4")]; // 只共有 opus-4-8
-        assert_eq!(discoverable_models(&[a, b]), vec!["opus-4-8"]);
+        b.mappings = vec![mapping("opus-4-8", "ds-v4")]; // 共有 opus-4-8，无独有项
+        assert_eq!(discoverable_models(&[a, b]), vec!["opus-4-8", "opus-4-7"]);
     }
 
+    /// 对外名完全不重合：交集口径下备用 Key 的模型**根本看不到**（回退主 Key），
+    /// 并集口径下两个都在。这正是用户「多 Key 时能选的模型太少」那个抱怨的核心场景。
     #[test]
-    fn discover_empty_intersection_falls_back_to_primary() {
-        // 对外名不统一：a=claude-opus-4-7，b=opus-4-7 → 交集空 → 回退主 Key(a)
+    fn discover_disjoint_names_are_all_visible() {
         let mut a = key("a", 0, "http://x");
         a.mappings = vec![mapping("claude-opus-4-7", "glm-5.1")];
         let mut b = key("b", 1, "http://y");
         b.mappings = vec![mapping("opus-4-7", "ds-v4")];
-        assert_eq!(discoverable_models(&[a, b]), vec!["claude-opus-4-7"]);
+        assert_eq!(
+            discoverable_models(&[a, b]),
+            vec!["claude-opus-4-7", "opus-4-7"],
+            "备用 Key 独有的对外名不能被藏起来"
+        );
     }
 
     #[test]
@@ -5820,8 +5809,10 @@ mod tests {
         assert_eq!(no_usage, "百倍 · 流式返回 · 模型 glm-5.2 · 820ms · ⚠ 被上游截断（达最大输出上限）");
     }
 
+    /// `GET /v1/models` 返回**并集**（2026-08-31 起）：a 独有 opus-4-7、两边共有 opus-4-8。
+    /// 非 claude/anthropic 前缀的 id 会被包成 `claude-synaroute-*` 供 CLI 展示。
     #[tokio::test]
-    async fn proxy_get_v1_models_returns_intersection() {
+    async fn proxy_get_v1_models_returns_the_union() {
         let dir = temp_dir("listmodels");
         let store = std::sync::Arc::new(
             Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
@@ -5850,7 +5841,11 @@ mod tests {
             .map(|m| m["id"].as_str().unwrap().to_string())
             .collect();
         // 非 claude/anthropic 前缀的 id 会被包成 claude-synaroute-* 供 CLI 展示
-        assert_eq!(ids, vec!["claude-synaroute-opus-4-8"], "应只返回共有的 opus-4-8（已包装）");
+        assert_eq!(
+            ids,
+            vec!["claude-synaroute-opus-4-8", "claude-synaroute-opus-4-7"],
+            "并集：a 独有的 opus-4-7 也要在，顺序以主 Key 为准"
+        );
         assert_eq!(body["data"][0]["type"], "model", "Anthropic 形态");
         assert_eq!(body["data"][0]["display_name"], "opus-4-8", "展示名保持真实名");
         pm.stop(CategoryType::ClaudeCli);

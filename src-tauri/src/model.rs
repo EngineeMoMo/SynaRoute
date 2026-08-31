@@ -2382,6 +2382,26 @@ mod tests {
         assert_eq!(k.resolve_model("claude-sonnet-4-5"), "claude-sonnet-4-5");
     }
 
+    /// 桌面端**也走三档**（`CategoryMeta::tier_rewrite = true`）。
+    ///
+    /// 补的是三个分类里唯一没被覆盖的那一维：`codex_category_never_matches_tier` 与
+    /// `non_codex_category_still_matches_tier` 已经把 Codex（false）与 CLI（true）钉住了，
+    /// 而桌面端那一位改错（设成 false）**不会有任何测试变红** —— 表现是它按任务自动发的
+    /// 家族名不再被改写、落到兜底链上换成别的模型，静默。
+    ///
+    /// 它与 CLI 同侧的理由：桌面端同样会自动发 `claude-*` 家族名干杂活（这也正是
+    /// `model_pool` 里说它是「混合体」的那一半）。
+    #[test]
+    fn claude_desktop_also_rewrites_through_the_tier_table() {
+        let mut k = key_with(vec![model("glm-4.6")], vec![], None);
+        k.category_id = CategoryType::ClaudeDesktop;
+        k.tier_opus = Some("deepseek-reasoner".into());
+        assert_eq!(
+            k.resolve_model_detail("claude-opus-4-8"),
+            ("deepseek-reasoner".into(), ModelResolveKind::Tier)
+        );
+    }
+
     /// 桌面端模型名判据必须与 `app.asar` 的 `sD()` 逐例一致。
     ///
     /// 用例是把官方 `sD()` 原样搬到 Node 里跑出来的期望值（判据来源与反查方法见

@@ -31,7 +31,7 @@
 //! # 效率
 //!
 //! 第一步就是 `active_model_of`，未配置直接返回 —— 绝大多数用户走这条，零额外成本。
-//! 只有配过应用内选模型的 Codex 用户才会多做一次 `enabled_keys_sorted` + 交集。
+//! 只有配过应用内选模型的 Codex 用户才会多做一次 `enabled_keys_sorted` + 并集。
 
 use crate::model::CategoryType;
 use crate::store::Store;
@@ -50,7 +50,7 @@ pub(super) fn pick(store: &Store, category: CategoryType, client_model: String) 
     if asked.is_empty() {
         return active;
     }
-    // 与应用内选的是同一个 → 结论一样，省掉下面那次全 Key 克隆 + 交集计算。
+    // 与应用内选的是同一个 → 结论一样，省掉下面那次全 Key 克隆 + 清单计算。
     // 这不只是优化：`enabled_keys_sorted` 会克隆每条 `ProviderKey`（含 models / mappings /
     // health），而本函数在**转发热路径**上每请求跑一次。本仓整治过同一类开销
     //（「每请求克隆整份 AppSettings 3~4 次」）。
@@ -58,8 +58,12 @@ pub(super) fn pick(store: &Store, category: CategoryType, client_model: String) 
         return active;
     }
     // Codex 发来的名字如果我们能服务，那就是用户在它菜单里选的 —— 尊重它。
-    // 口径与写进模型目录的那份**同源**（`discoverable_models`，多 Key 取交集），
+    // 口径与写进模型目录的那份**同源**（`discoverable_models`，多 Key 取并集），
     // 否则会出现「目录里列了、这里却认不出」的自相矛盾。
+    //
+    // 并集口径下这道门比交集时**宽**得多（备用 Key 独有的名字现在也在清单里），方向是对的：
+    // 用户在 Codex 菜单里选了什么就用什么，而「这条名字有没有 Key 认识」由
+    // `model_pool::rank_candidates` 与 `reject_if_unserviceable` 各自把关。
     if crate::proxy::discoverable_models(&store.enabled_keys_sorted(category))
         .iter()
         .any(|m| m == asked)

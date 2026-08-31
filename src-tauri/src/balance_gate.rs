@@ -748,14 +748,19 @@ mod tests {
         assert_eq!(ev[0].repeat, 1, "查不到不是耗尽，不许惊动用户");
     }
 
-    /// 🔴 接线判据一：`candidates_for` 必须过这道闸门。
+    /// 🔴 接线判据一：候选排序必须过这道闸门。
     ///
     /// 上面那两条行为用例走的是真 `Store`，本来能抓住这条 —— 但它们只覆盖
     /// 「排序键里有它」这一个形态。这条源码级判据额外钉住「**只有一处**」，
     /// 防止日后有人在别处再补一份判据（两份必然漂移）。
+    ///
+    /// ⚠️ **2026-08-31 起看的是 `model_pool.rs`**：排序实现从 `store.rs` 搬进了
+    /// `proxy::model_pool::rank_candidates`（模型感知路由与余额闸门是同一个排序键的两位）。
+    /// `Store::candidates_for` 仍必须把决策交给它 —— 那一半由
+    /// `model_pool::tests::candidates_for_must_delegate_to_this_module` 钉住。
     #[test]
     fn candidates_for_must_consult_the_balance_gate() {
-        let src = std::fs::read_to_string("src/store.rs").unwrap();
+        let src = std::fs::read_to_string("src/model_pool.rs").unwrap();
         let prod = crate::proxy::custom_headers::production_code_only(&src);
         assert_eq!(
             prod.matches("balance_gate::is_exhausted").count(),

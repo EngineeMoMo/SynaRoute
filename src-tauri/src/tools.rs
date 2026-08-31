@@ -72,7 +72,7 @@ const DESKTOP_META_FILE: &str = "_meta.json";
 
 /// 将某分类的代理端点写入对应目标工具配置。返回人类可读的结果说明。
 ///
-/// `models`：`discoverable_models` 口径 —— 多 Key 取**交集**，空则回退主 Key 超集。有序。
+/// `models`：`discoverable_models` 口径 —— 多 Key 取**并集**（备用 Key 独有的也在）。有序。
 /// `keys`：按优先级排序的启用 Key。**桌面端与 Codex 都用**：前者推导能力断言，后者推导
 /// `supported_reasoning_levels` 与 `context_window` —— 传空切片会让 Codex 的档位选择器消失。
 /// - **Claude CLI only**：取首个写 env.ANTHROPIC_MODEL + 顶层 `model`；并清除三档 DEFAULT_* 残留。
@@ -314,7 +314,7 @@ fn apply_desktop_at(
     // → 连会话都开不起来，症状与「卡在 get-started」同样难排查。宁可明确报错，让用户先配模型。
     if effective.is_empty() {
         return Err(AppError::ToolConfig(
-            "桌面端接入需要至少一个可服务模型：当前分类启用的 Key 未配置任何模型（或多 Key 对外名无交集）。\
+            "桌面端接入需要至少一个可服务模型：当前分类启用的 Key 一个模型都没有配置。\
              请先在「模型映射」里为该分类配置模型后重试。"
                 .into(),
         ));

@@ -2230,61 +2230,26 @@ impl Store {
         })
     }
 
-    /// 路由候选：一次读锁内完成「筛分类+启用 → 排序（余额耗尽的后移，组内按优先级）→
-    /// 剔除熔断中」，**只对最终入选者克隆**。返回 (候选列表, 是否触发了全熔断兜底)。
+    /// 路由候选：一次读锁内完成「筛分类+启用 → 排序 → 剔除被运行态挡住的」，
+    /// **只对最终入选者克隆**。返回 (候选列表, 是否触发了兜底)。
+    ///
+    /// 排序键与兜底语义的**全部**判据在 [`crate::proxy::model_pool::rank_candidates`]
+    /// —— 含「能原生服务本次模型 > 余额未耗尽 > priority」这个三位键为什么要这么排。
+    /// 本函数只负责在一把读锁内把 `cfg.keys` 借给它，那是它必须留在 `Store` 上的唯一理由。
     ///
     /// 为什么不用 `enabled_keys_sorted` + `health::select_candidates`：那条路径克隆**两轮全量
     /// 启用 Key**（前者在筛选排序**之前**就 `.cloned()`，后者拿到 Vec 后再 `.cloned()`）。
     /// `ProviderKey` 带 `models`/`mappings` 两个 Vec，6 条 Key × 各 30 个 ModelInfo 就是单请求
     /// 克隆约 180 个 ModelInfo 两轮 —— 纯浪费，且**随 Key 数与模型数线性放大**（配得越全越慢）。
     ///
-    /// 兜底语义与 `health::select_candidates` **必须保持一致**：全部熔断时忽略熔断窗口、
-    /// 原样返回全部启用 Key（熔断本为「多 Key 快速切换」而设，无处可切时不应自杀成 503）。
-    /// 该语义有 4 条测试锁住，改这里前先读 `health::select_candidates` 的文档。
-    ///
-    /// `requested_model`：客户端要的对外模型名。用于叠加**第二层**（单模型锁定）门槛 ——
-    /// 每条 Key 各自 `resolve_model` 后判「这条 Key 上这个模型是否被锁」。传空串则只看第一层。
-    ///
-    /// 兜底也必须包含「只被模型锁挡住」的 Key：那条 Key 的其它模型可能好着，但本次请求要的
-    /// 就是被锁那个 —— 无处可切时仍应给它一次机会（与熔断兜底同一判据，理由也同一个）。
+    /// `requested_model`：客户端要的对外模型名。传空串则不叠加模型维度的两条判据。
     pub fn candidates_for(
         &self,
         category: CategoryType,
         requested_model: &str,
     ) -> (Vec<ProviderKey>, bool) {
         let cfg = self.config.read();
-        // 先按引用收集（零克隆），排序也只动指针。排序键把「余额已确定耗尽」摆在 `priority`
-        // **之前**（`bool: Ord`，false 在前）→ 耗尽的整体后移、组内仍按优先级，且兜底那条路
-        // 继承同一顺序（**降级不剔除**，全耗尽时仍有候选）。判据全文见 `health::balance_gate`。
-        let mut enabled: Vec<&ProviderKey> = cfg
-            .keys
-            .iter()
-            .filter(|k| k.category_id == category && k.enabled)
-            .collect();
-        enabled.sort_by_key(|k| (crate::health::balance_gate::is_exhausted(k), k.priority));
-
-        // 未熔断、且本次要的模型没被锁的优先。
-        // `is_candidate_for_model` 是纯函数（只读 HealthState + 当前时间），锁内调用安全。
-        // `resolve_model` 每条 Key 一次小字符串分配 —— 这是第二层门槛的必要代价，
-        // 且与转发循环里给诊断头算的那次同源（同一个函数、同一个结果）。
-        let primary: Vec<ProviderKey> = enabled
-            .iter()
-            .filter(|k| {
-                let real = if requested_model.is_empty() {
-                    None
-                } else {
-                    Some(k.resolve_model(requested_model))
-                };
-                crate::health::is_candidate_for_model(&k.health, real.as_deref())
-            })
-            .map(|k| (*k).clone())
-            .collect();
-        if !primary.is_empty() {
-            return (primary, false);
-        }
-        // 全部被挡（熔断或模型锁）时兜底：忽略两层门槛全部纳入。此时才克隆全部（罕见路径）。
-        let used_fallback = !enabled.is_empty();
-        (enabled.into_iter().cloned().collect(), used_fallback)
+        crate::proxy::model_pool::rank_candidates(&cfg.keys, category, requested_model)
     }
 
     /// 某分类下启用 Key 的 id 列表（按优先级升序）。

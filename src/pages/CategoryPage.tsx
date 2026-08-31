@@ -9,8 +9,9 @@ import { Button } from "@/components/ui/Button";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
-// 与状态条共用：两份实现必然漂移，而漂移后果是「状态条列出的模型在某备用 Key 上其实路由不了」
-import { keyExpectedSet, routingPrimaryKey } from "@/lib/modelSets";
+// 与状态条共用：两份实现必然漂移，而漂移后果是「界面列出的模型后端压根没宣称过 →
+// 转发时被当成客户端自己编的名字放过、静默降级」。完整理由见 modelSets.ts。
+import { discoverableModels, keyExpectedSet, routingPrimaryKey } from "@/lib/modelSets";
 import type { EventLogEntry, ProviderKey } from "@/types";
 import { Plus, AlertTriangle, Inbox, X, Database } from "lucide-react";
 
@@ -356,35 +357,25 @@ interface Gap {
 }
 
 /**
- * 模型可选性检查（FR-006a）——与后端 /v1/models 发现端点的「交集」口径对齐。
+ * 故障转移冗余检查（FR-006a）——「哪些模型不是所有启用 Key 都能服务」。
  *
- * Claude CLI 的 `/model` 选择器只展示各启用 Key「可服务模型」的**交集**（共有的那批），
- * 这样选中任意模型都能在所有候选 Key 上路由，无感切换不会“模型不存在”。
+ * 🔴 **2026-08-31 语义整体变了，别照旧注释理解**：对外清单此前取**交集**，所以这个检查
+ * 回答的是「哪些模型没进 /model 选择器」；现在取**并集**，那些模型**全都在选择器里**，
+ * 于是它回答的变成「哪些模型缺冗余」——只有一部分 Key 能服务它们，那些 Key 全部熔断时
+ * 后端 `reject_if_unserviceable` 会**直接报 503**（刻意不悄悄换成别的模型）。
+ * 旧文案照旧说「补映射让它出现在选择器里」，而它早就在里面了 —— 那会把用户送去做
+ * 一个已经不需要的操作，正是本仓最在意的「指错方向的提示」。
  *
- * 这里以主 Key（优先级最高的启用 Key，也是交集的排序/回退基准）的模型为准，标出哪些
- * 因为在某些备用 Key 上缺映射而**没进交集、不会出现在选择器里**。用户去对应 Key 补一条
- * 映射，该模型即可进入选择器。一个主 Key 模型只要不被任何备用 Key 缺失，就已在交集中、无需提示。
+ * 覆盖**并集里的每一个名字**，不再只看主 Key 的：备用 Key 独有的模型同样缺冗余，
+ * 而交集口径下它们压根不在清单里、无从谈起。
  */
 function detectMappingGaps(enabledKeys: ProviderKey[]): Gap[] {
   if (enabledKeys.length < 2) return [];
-
-  // 主 Key = 优先级最高（数值最小）的启用 Key（后端空交集时也回退到它）
-  const primary = [...enabledKeys].sort((a, b) => a.priority - b.priority)[0];
-  const primaryModels = keyExpectedSet(primary);
-
-  const backups = enabledKeys
-    .filter((k) => k.id !== primary.id)
-    .map((k) => ({ key: k, set: keyExpectedSet(k) }));
-
-  // 主 Key 的每个模型：凡是被某个备用 Key 缺失的，就没进交集 → 不会出现在选择器里
+  const sets = enabledKeys.map((k) => ({ key: k, set: keyExpectedSet(k) }));
   const gaps: Gap[] = [];
-  for (const expected of primaryModels) {
-    const missing = backups
-      .filter(({ set }) => !set.has(expected))
-      .map(({ key }) => key.name);
-    if (missing.length > 0) {
-      gaps.push({ expected, missingKeys: missing });
-    }
+  for (const expected of discoverableModels(enabledKeys)) {
+    const missing = sets.filter(({ set }) => !set.has(expected)).map(({ key }) => key.name);
+    if (missing.length > 0) gaps.push({ expected, missingKeys: missing });
   }
   return gaps;
 }

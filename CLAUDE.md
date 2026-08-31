@@ -947,6 +947,10 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   - **三处过时注释按事实收窄**：`can_build` 把「多 Key 交集为空」列为空列表成因，
     而 `discoverable_models` 在交集为空时**刻意回退主 Key 的超集**、永不返回空
     （代价随之而来且是已知的：目录里可能有备用 Key 服务不了的条目）；
+    <br>🔴 **勘误（2026-08-31）**：那个「交集 + 空则回退主 Key」的口径**已经不存在了** ——
+    `discoverable_models` 现在取**并集**、实现搬进了 `model_pool.rs`，而那条已知代价
+    （「转移到那条时会 404」）正是本轮修掉的东西。见本文档「对外模型清单改并集」那条。
+    照这句话去改代码的人会找不到那个 `split_first`。
     `tools::apply` / `service::apply_tool_config` 仍写「`keys` 仅桌面端用到」
     「Codex 取首个写顶层 `model`」，而本轮起 `keys` 决定 Codex 的
     `supported_reasoning_levels`（**传空切片 = 档位选择器悄悄消失**）、`models` 整份进目录、
@@ -1172,6 +1176,186 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   都不在非 Windows 上跑 `cargo test`（`tauri-action` 只构建）。**`macos-check` 是唯一的
   非 Windows 验证者** —— 它红的时候别想着「本机是绿的所以没事」。
   <br>📌 产物**不受影响**：生产代码一个字节没动，故 v0.1.43 的包与签名无需重出。
+- 🔴 **Codex 平台功能绕过 provider：占位符会被发给真实 OpenAI，而接入是完好的（2026-08-31）**：
+  症状是一句 `Error running remote compact task: … 401 Incorrect API key provided:
+  SEE-SYNA****OUTE …, url: https://api.openai.com/v1/responses`。
+  <br>🔴 **归因先纠正一次（同日，值得单独记）：用户那次实报其实是漂移，不是本路径。**
+  他随后补了一句「**每次对话都 401**」，而平台功能只影响压缩、正常对话照走代理 ——
+  两者的分辨判据就这一句话。**我第一版归错了，因为在错的机器上取证**：报错来自**另一台**机器，
+  而我核对的是**本机**的 `config.toml`（它确实完好、`drift_state` 判 `Intact`）。
+  **用户报的现场，取证对象必须是那台机器** —— 本机的「完好」什么都不证明。
+  同「判据存在 ≠ 判对了维度」那条，只是这次错的是**对象**而不是维度。
+  <br>**下面这条路径仍然真实存在**（本机独立取证，与那次报错的归因无关）——
+  它是那句 401 的**第二条**来源，不是那次的成因：
+  <br>**成因：Codex 有一类「平台功能」压根不读 `model_provider`**，直接打 `api.openai.com`
+  并取 auth.json 的凭据。取证（codex.exe **0.151.0-alpha.7.1** + 本机 `logs_2.sqlite`）：
+  - 二进制里有 `remote compact task` / `remote compaction v2` 字面量，源文件
+    `core/src/compact_remote{,_request,_v2,_v2_attempt,_v2_images}.rs`；
+  - 同族的 remote control **有**门禁且留了日志：`remote control requires ChatGPT
+    authentication; API key auth is not supported`（本机库里最后 5 条就是它）。
+    **remote compaction 没有这道门禁** → 拿 API key 打官方 → 必然 401；
+  - 那条会话日志里 `auth_mode=Some(ApiKey)` —— Codex 认定当前是 api-key 模式，正是我们写
+    auth.json 的直接后果（那道 UI 门只认「非空 `OPENAI_API_KEY`」，见 `apply_auth_at`）；
+  - **`RemoteCompactionV2` 就在那次会话生效的 55 个 features 里 —— 它默认是开的**，
+    所以这条路径对**每台**接入过的机器都成立，只是要会话长到触发 auto-compact 才撞上。
+  <br>🔴 **所以那句 401 有两条来源。** 别再从「用户报了 `Incorrect API key provided`」反推
+  「一定漂移了」，也别反过来（这一轮两个方向都走错过一次）。**分辨判据：正常对话通不通** ——
+  通就是平台功能，每次都 401 就是漂移。codex.rs 模块头矩阵已补这一行，
+  `DriftState::FellBackToOfficial` 那句「**只有这一支**会出现」已改。
+  <br>**关闭办法（三条实测，各有对照组）**：`~/.codex/config.toml` 的 `[features]` 下加
+  `remote_compaction_v2 = false`。
+  ① **键名被当前版本正式认识**：`exec --strict-config` + 该键 → 配置加载通过；换成胡编的名字
+  → `unknown configuration field \`features.definitely_not_real_xyz\``（**对照组证明这道校验
+  真的在跑**，不是恒绿的门）。② **关掉真的生效**：`RUST_LOG=info` 下生效 features 列表里
+  `RemoteCompactionV2` **消失**，而 `CompactionImageBudget` 仍在 —— 是精确关掉那一个，
+  不是整段丢失。③ **未知键默认静默忽略**（不加 `--strict-config` 时 exit 0）→ 日后 Codex
+  改名/移除该 flag **不会**让用户的 Codex 起不来，但那行会**静默失效**、报错悄悄回来。
+  ③ 是这个方案唯一的软肋，要盯就用 `--strict-config` 做 `#[ignore]` 真二进制探针
+  （同 `catalog_is_accepted_by_the_real_codex_binary` 的模式）。
+  <br>⚠️ **`[features]` 表可能已经存在**（本机就有 `js_repl = false`）—— 要在已有表里加行，
+  另起一个同名表会让**整份 config 加载失败、Codex 直接起不来**。
+  <br>🔴 **刻意不替用户写这个键**：① 它是 Codex 的功能开关、不是接入所需 —— 同「不认领用户自己的
+  `model_catalog_json`」那条（cc-switch #6087 抢用户指针的教训）；② 用户切回官方 ChatGPT 登录后
+  remote compaction 是**有用**的，而他若绕过「还原」自己手改 config 切回去，那行会**留着**
+  且他不知情（正是 #6087 那种形态）。
+  <br>⚠️ **原先列的第三条理由「还原时要额外清 `[features]`」是错的，别再引用**：`restore` 从
+  `.bak` 整份恢复 `config.toml`，我们加的键会自动消失（与 `model` 键同一个机制）。
+  <br>**危害限于「一句看不懂的报错」**：外发的是占位符、不含任何真实凭据；Codex 侧有本地压缩兜底
+  （`auto_compact_fallback_prompt` / `auto_compact_fallback_buffer_tokens` 都在二进制里）。
+  ⚠️ **未验证**：失败后回落本地压缩的实际行为、关掉该 feature 后 auto-compact 是否完全正常。
+  <br>**三条防线里只有第 1 条对这条路径有效**（占位符自解释）。防线 2（漂移检测）结构上测不到它
+  （config 完好、auth.json 也是我们写的正确形态，**没有任何异常信号**，故刻意**不加**新的
+  `DriftState` 分支）；防线 3（还原时解除）只在用户主动还原后才生效，而那时 Codex 也不再走我们。
+  **用户来问我们、而不是去 platform.openai.com 查自己的 key，就是第 1 条防线在起作用**
+  —— 那个 `SEE-SYNA` 前缀不是花招。
+- **对外模型清单改并集 + 模型感知路由（2026-08-31，用户提的需求）**：实现在
+  [`model_pool.rs`](src-tauri/src/model_pool.rs)（`#[path]` 挂 `proxy` 下 —— `proxy.rs`/
+  `store.rs`/`model.rs`/`service.rs` 余量全是 0）。
+  <br>🔴 **先纠正一处认知**：用户提的「故障转移走兜底默认模型」**早就实现了**
+  （`resolve_model_detail` 六级：映射 → 三档 → 原生 → `default_model` → 列表首个 → 透传，
+  `default_model` 在 KeyEditor 里有完整 UI）。真正取交集的只有**对外可选清单**
+  （`discoverable_models`，5 个消费者：`/v1/models`、三端客户端配置、Codex 目录、
+  应用内下拉、`model_choice::pick`）。
+  <br>🔴 **两半必须同一次上线，单独任何一半都比改之前糟**：候选排序键原本是
+  `(余额耗尽, priority)`，`requested_model` 只喂给模型锁、**不参与排序**。只把交集改并集的
+  表现是「用户在菜单里选 `glm-4.6`（只有备用 Key B 有）→ 主 Key A 排第一 → A 上落
+  `default_model` → **第一跳就被静默换掉，压根没等到故障转移**」，而并集里绝大多数模型
+  都只有部分 Key 支持，这是**常态不是边缘**。反过来只改排序则永远无事可做（交集里每条 Key
+  都认识每个名字）。
+  <br>**旧口径的代价从来不是零**：交集为空时它回退主 Key 超集，`codex_catalog` 里那句
+  「目录里可能有备用 Key 服务不了的条目、故障转移到那条时会 404」记的就是这条路。
+  <br>🔴 **判据是三态不是两态，这是本轮最重要的一条**：`Confidence::{Native, Unknown, Fallback}`
+  （变体顺序就是排序优先顺序）。第一版写成两态（把 `Passthrough` 并进「不支持」），被一条
+  **既有**端到端用例当场抓住 —— 一条**压根没配模型信息**的 Key 会把名字**原样透传**给上游，
+  上游很可能认识它，判成「不支持」等于对一个本来会成功的请求回 503。
+  判据与 `balance_gate` 的「**查不到 ≠ 为零**」完全同源（那里也是三态）。
+  <br>**报错判据刻意不按分类分支**（用户原本选的是那个），而是「**这个名字我们宣称过吗**」：
+  在并集清单里 → 用户从我们给的清单里选的 → 全池服务不了就是我们撒谎 → **503 + Retry-After
+  + 可折叠 warning**；不在 → 客户端自己编的（Claude Code 的 `claude-haiku-4-5-20241022`
+  带日期后缀、Codex 未重启时仍发内置 `gpt-5.6-*`）→ 照旧降级。
+  <br>为什么更准：**Claude 桌面端是混合的** —— 既有模型选择器（用户选）又会自动发家族名
+  干杂活（`tier_rewrite` 为 `true`）。按分类判会让它的杂活调度在「没配三档」时直接失败；
+  按「宣称过吗」判，同一条规则自动分清了这个混合体的两半，且**零 `CategoryMeta` 改动**。
+  <br>**503 不用 404**：模型并非不存在，是它的服务者**暂时**不可用；404 会让客户端认定
+  永久不存在、可能把它从自己清单里划掉。Retry-After 取「支持它的那些 Key 中最早解除的时刻」
+  （单条取熔断与模型锁里更晚的那个，跨 Key 取 min），不给凭空常数。
+  <br>**主 Key 徽标 / 托盘 / 状态条不受影响**：那些读 `enabled_keys_sorted`（配置态事实来源），
+  与 `balance_gate` 完全同一判据 —— 有**反向**判据钉着「那个函数里不许出现 `may_serve`」。
+  <br>**Codex 目录的档位与窗口两维也改成按模型算**（`owners_of`，口径取 `may_serve`）：
+  不改的两个失效都是静默的 —— 一条 Chat 协议的备用 Key 抹掉**全部**模型的档位声明
+  （含 Anthropic Key 独有的）；全池取窗口最小值让独有模型被别人的低值压小 → Codex 提前压缩。
+  <br>**新增跨语言判据** [tests/discoverableModelsParity.test.ts](tests/discoverableModelsParity.test.ts)：
+  `modelSets.ts` 自己的注释一直写着「两份实现必然漂移」，而这条缝**至今没有机械判据**
+  （既有 5 条 parity 测试都不管它）。分叉的表现是静默的：界面列一个后端没宣称过的名字 →
+  转发时被当成「客户端自己编的」放过 → 静默降级。
+  <br>**13 条注入全部有结论**（11 变红、1 按预期仍绿、1 是锚点自检）。其中一条注入
+  「`Confidence` 的 Native 与 Unknown 互换」第一次**仍绿 = 真盲区**：所有排序用例都是
+  Native vs Fallback，**没有一条压 Native vs Unknown**，于是一条空配置 Key 抢在真正认识
+  该模型的 Key 前面不会被发现。已补 `a_key_that_knows_the_model_outranks_one_that_merely_might`。
+  <br>⚠️ **注入脚本自己被行尾骗了一次**：`modelSets.ts` 是 **CRLF**（Rust 那些是 LF），
+  LF 搜索串静默没匹配 → 报「注入后仍绿」。同 CLAUDE.md 里 `Cargo.lock` 那条。
+  已改为按目标文件归一行尾。另一次是 vitest 的输出带 ANSI 颜色码，
+  `/Tests\s+(\d+) failed/` 匹配不上 → 一条真变红的注入被报成仍绿；改用**退出码**判红，
+  并额外要求输出里出现测试文件名（防「路径打错、压根没跑」被当成变红）。
+  <br>**「多 Key 取交集」这句话散在 9 处**，全部改过（`service.rs` / `tools.rs` / `lib.rs` /
+  `model_choice.rs` / `codex_catalog.rs`×4 / `modelSets.ts`×2）；`editor.defaultModelHint`
+  这条用户可见文案补上了「清单里的名字全池都服务不了会直接报错，不会悄悄换」。
+  <br>**零棘轮抬高，两项下调**：`proxy.rs` 3103→**3084**（`discoverable_models` 搬走）、
+  `store.rs` 2938→**2903**（`candidates_for` 收成一行委托）。
+  当前基线 `cargo test --lib` = **986 passed / 0 failed / 6 ignored**，
+  `npm test` **150 passed / 21 文件**，clippy 干净，`tsc --noEmit` 干净，`npm run gates` 全绿。
+  <br>📌 **仍未验证（真机才能闭环）**：① Claude Code `/model` 列表是否变长且选中后真的
+  路由到那条 Key；② Codex 重开后菜单条目数与各模型的档位选择器；③ 桌面端选择器不为空
+  （并集之后 `strict_model_id` 会滤掉更多名字，`warn_desktop_unacceptable_models`
+  照常提示但会变密）；④ 故意熔断独有模型的支持者，确认拿到 503 而不是别的模型的回答。
+  <br>⚠️ **一条已知代价，需要实测再决定**：Codex 目录是 full replacement 且**每条**内嵌
+  一份 20903 字节的官方 `prompt.md` 副本 —— 今天 9 条 ≈ 190 KB，6 条 Key × 30 个模型的
+  并集会到 **~3.6 MB**。影响限于 Codex 启动时多解析一次（`model_catalog_json` 官方注明
+  "applied on startup only"）。要加条数上限的话必须**落警告事件**，不静默截断。
+  <br>**收尾追问「三档只对 Claude 生效吗 / 三档没配会不会报错」，查出一个覆盖缺口（2026-08-31）**：
+  三档的门在 `match_tier` 开头（`CategoryMeta::tier_rewrite`）—— CLI 与桌面端 `true`、
+  Codex `false`，故 Codex 分类的解析顺序天然就是「映射 → 同名 → 默认 → 首个 → 透传」。
+  Codex 与 CLI 两侧都有测试（`codex_category_never_matches_tier` +
+  `non_codex_category_still_matches_tier`），而**桌面端那一位零覆盖**：把它改成 `false`
+  全套 990 条一条都不红（注入实测）。失效形态是静默的 —— 桌面端按任务自动发的家族名不再被
+  改写、落兜底链换成别的模型。已补 `claude_desktop_also_rewrites_through_the_tier_table`，
+  注入即红且**只红它**。
+  <br>另补一条回归钉住「三档一个都没配时 CC 的家族名不会被本轮的 503 闸门拦下」
+  （`claude_code_family_names_are_never_blocked_when_no_tier_is_configured`）——
+  那是本轮最坏的可能回归：CC 每次会话都发 `claude-*-4-5-<日期>`，一旦变 503 就是**全废**
+  而不是「某个模型不能用」。不会发生的原因在判据 ②：`serviceable_models` 只在配了三档时
+  才追加**不带日期后缀**的家族代表名，CC 实发的带后缀名字压根不在清单里。
+  <br>⚠️ **我为此写错过一句话，教训值得记**：新加测试的文档里我声称「Codex 不走三档这条判据
+  此前零覆盖」，依据是 `grep tier_rewrite` 只命中一个使用点、没有测试。**注入时被打脸** ——
+  既有那两条测试是通过「构造 Codex 分类的 Key 调 `resolve_model_detail`」覆盖的，
+  压根不含 `tier_rewrite` 这个字面量。已删掉那条重复测试、只留真正缺的桌面端那一维。
+  **按字面量搜不等于按行为搜**；断言「此前没有覆盖」之前，先把要注入的那处改坏跑一遍。
+  <br>🔴 **代码审查又从本轮自己身上查出一条高危缺陷（2026-08-31，v0.1.44 前）**：
+  `reject_if_unserviceable` 的判据②用**裸字符串**比较 `requested` 与并集清单，**没有先剥
+  `claude-synaroute-` 网关别名前缀**。而 `/v1/models` 对非 claude/anthropic 前缀的名字一律
+  包这个前缀（CLI 只展示这类 id），`resolve_model_detail` 的注释原文就写着「选中后客户端
+  发回别名」。于是第三方中转的模型名（glm / deepseek / kimi / gpt / grok… 几乎全是非 claude
+  前缀）在这里**永远认不出** → **整条 503 闸门在 Claude CLI 分类上整体失效**，静默降级照旧
+  发生，而那正是本轮要消除的东西。
+  <br>**判据①不受影响**（`confidence` → `resolve_model_detail` 内部已经剥过），所以失效是
+  静默的；而既有 12 条 reject 用例的模型名**恰好都不带前缀**，全绿。这是本仓「判据存在 ≠
+  判对了维度」的又一例，只是这次错的维度是**名字形态**。已加
+  `the_gateway_alias_prefix_must_be_stripped_before_the_advertised_check`（注入即红），
+  文案与事件折叠键也一并改用剥后的真实名（带前缀那个串用户从没见过）。
+  <br>同轮另修三条：**错误文案里的可用模型清单无上限**（并集下可达上百条 ≈ 4 KB，而同一份
+  文本要进 HTTP 响应体 + 事件环 + `logs/*.jsonl` + 诊断报告最近 200 条 —— 本仓对上游与日志
+  体积一贯设上限，这里是唯一一处会随用户配置线性膨胀的用户可见文本；已收成
+  `MAX_LISTED_MODELS = 8` 并如实报总数）；`discoverable_models` 的去重从 `Vec::any` 的
+  O(m²) 改成 HashSet；`CategoryPage.tsx` 那句 import 注释还是交集时代的说法，与
+  `modelSets.ts` 里已改的同一句话分叉。
+  <br>⚠️ **`sort_by_key` → `sort_by_cached_key`**：排序键第一位现在是 `confidence`，里面有
+  一次 `resolve_model_detail`（带 `to_ascii_lowercase` 分配）。`sort_by_key` 在比较过程中
+  **反复**调用 key 函数（O(n log n) 量级），而这是转发热路径上每请求一次的地方。
+
+- 🔴 **漂移检测在最危险的那个组合下沉默（2026-08-31 用户实报，已修）**：用户另一台机器
+  **每次对话都 401**（`api.openai.com` + 我们的占位符），而 SynaRoute **一个告警都没弹**。
+  <br>成因链：`drift_state` 在 `is_intact` 之后第二道就是 `if !applied { return NotApplied }`，
+  而 `NotApplied` 在 `drift_warning` 里 `return None`。于是「**副文件不在 + auth.json 里占位符
+  还武装着**」这个组合完全沉默 —— 而它恰恰最坏：config 不指向我们、假 key 却还在，
+  Codex 每次请求都把它发给官方，用户看到 401 却在应用里找不到任何线索。
+  <br>已改为 `if !applied && !auth_carries_our_placeholder(auth_path)`：占位符武装着就继续走形态
+  判定（落 `FellBackToOfficial { placeholder_armed: true }`，那支文案本来就最全）。
+  **对照仍在**：占位符不在时 `!applied` 照旧安静，否则每个没接入 Codex 的用户都被打扰。
+  <br>**`believed_applied` 为什么会判否**（两条，都不是「用户没接入过」）：
+  ① 还原/停止中途失败 —— config.toml 交还成功、`.bak` 已删，而 auth.json 的解除失败；
+  ② 🔴 **接入被幂等短路、`.bak` 从未创建** —— `backup_and_write_bytes` 在「序列化结果与磁盘
+  一致」时不备份不写，`apply_auth_at` 同样在占位符已在时早退。**把配置从另一台机器拷过去再点
+  接入**就会走进这一支：两个副文件一个都不生成，此后 config 一被改掉就永久沉默。
+  <br>本轮修法对两条成因都有效（它不再依赖 `applied`）。**刻意没改 `believed_applied` 本身** ——
+  那要引入一份独立的「已接入」状态记录，而「占位符武装」这个信号已经够了。
+  <br>**顺带修掉一处过时的用户可见文案**：那支告警写着「报『Incorrect API key provided:
+  `synarout***roxy`』」，而占位符 08-26 就换成了 `SEE-SYNAROUTE-…`（掩码 `SEE-SYNA***OUTE`）。
+  用户眼前的报错与告警说的是两个串 → 他会判定「这告警说的不是我遇到的事」，
+  而那段文案唯一的作用就是把他从「去 platform.openai.com 查自己的密钥」拉回来。
+  判据 `the_drift_warning_quotes_the_placeholder_that_is_actually_written` **从常量派生**
+  （前 8 位 + 后 4 位 + 历史值不许再现），换占位符时自动变红 —— 靠人记得改文案已经失败过一次。
+  <br>两条注入均验证变红：条件退回 `if !applied` → `left: NotApplied`；文案换回旧串 →
+  「前 8 位对不上」。
 - **刻意不修的项**（别当成遗漏重复劳动）：SmartScreen 签名告警、`retrieval.rs` 的 `cwd` 白名单、
   请求日志存明文对话（默认关闭）
 
@@ -1255,9 +1439,17 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
     `Model provider ... not found`、一个请求都不发**；`[model_providers.openai]` 想覆盖内置 id
     直接 `reserved built-in provider IDs` 拒启动（**这条路已证伪，别再试**）。
     <br>🔴 **决定性判据：`experimental_bearer_token` 优先于 auth.json，且 0.148 没有凭据门禁**
-    （本地探针抓 `Authorization` 头，四种组合全测过）。所以那份占位符在正常接入时**从不外发**，
-    纯粹是负债 —— **本版起不再写 `auth.json`**，接入只动 `config.toml`，
-    并在 apply/restore 时顺手**解除**旧版留下的占位符。用户的 ChatGPT 登录态从此完全不被触碰。
+    （本地探针抓 `Authorization` 头，四种组合全测过）—— 即**转发链路上** auth.json 不参与鉴权。
+    <br>🔴 **勘误（2026-08-31，详见下文「Codex 平台功能绕过 provider」一节）**：这里原先接着写
+    「占位符在正常接入时**从不外发**、**本版起不再写 `auth.json`**、登录态从此完全不被触碰」——
+    **那三句今天全错**。它们记的是同一天里的**第一次**改动，而**第二次**改动把 auth.json 写回来了
+    （删掉它 CLI 照跑、桌面端卡在登录页；`apply_auth_at` 里有 `getAuthStatus` 的逐形态实测表）。
+    现在的事实是：**每次接入都写**占位符，且在无可用凭据 / OAuth 已过期时**整份覆盖并备份原件**
+    （用户盘上那份 `auth.json.synaroute.bak` 就是被覆盖掉的登录态）。
+    <br>这条错记**已经害过一次**：08-31 用户报同一句 401 时，按它推出的第一反应是
+    「auth.json 不该被写 → 一定是旧版残留或漂移」，方向错。而 08-30 那轮其实已经半修正过它
+    （下文「工具配置预览」那条写着「『不写 auth.json』本来就与 `apply_auth_at` 矛盾」），
+    **却没回来把源头这句删掉** —— 修分叉时要顺着引用链把所有副本都改掉，只改最近那一处不够。
     <br>2026-08-02 那条旧判据（「`requires_openai_auth=true` 必须配套 auth.json，否则停在登录页」）
     对当前版本不成立；取舍不是赌版本，是**代价不对称**：万一某版本仍要凭据，它报的是
     `no Codex credentials were found · Run codex login`（响亮、可自助、OAuth 完好），
@@ -1268,9 +1460,18 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
     `true`/`false`/省略三者发出的 `Authorization` 头**逐字节相同**、都不读 auth.json，
     也就是写它**零代价**。而不写它有代价 —— 用户报的升级公告：新版 Codex 不再允许自定义 provider
     在 `requires_openai_auth = false` 时继承 auth.json 鉴权，报 `API_KEY_REQUIRED` / 401，
-    官方解法就是改成 `true`。那条在 0.148.0-alpha.9 上**复现不出**（`false` 仍然继承成功），
-    说明属于更新的版本 —— 正因复现不出才不能赌。三条旁证都指向 `true`：cc-switch 生成的生效配置、
-    用户自己那份能用的 `[model_providers.custom]`、官方升级公告。
+    官方解法就是改成 `true`。
+    <br>✅ **那条公告已在 0.151.0-alpha.7.1 复现（2026-08-31，用户贴出公告原文后重测）**：
+    确切版本是 **0.149.0** 起。`false` + **无 bearer** + 有 auth.json 现在**一个
+    `Authorization` 头都不发**（0.148 时是继承 auth.json —— 模块头矩阵第 5 行已按实测改）。
+    **所以它不再是「万一」，是已经发生的行为变更**，只不过我们因为总写 bearer 而没被碰到。
+    <br>🔴 **同一轮 5 组探针钉死一条否定结论**：`true`/`false`/省略 × 有无 bearer，
+    **没有任何一组**回落到 `api.openai.com`，五组全部打到 provider 的 base_url。
+    也就是说「用户看到 URL 是 `api.openai.com`」这个现象**排除**了本字段作为成因 ——
+    那只可能是顶层 `model_provider` 缺失，或平台功能那条路。别把这两件事混起来
+    （2026-08-31 用户按公告推测过一次「启用后应该是 false 吧」，方向正好相反）。
+    三条旁证也都指向 `true`：cc-switch 生成的生效配置、用户自己那份能用的
+    `[model_providers.custom]`、官方升级公告。
     <br>**这个字段的语义已经变过两次**（08-02 一次、08-26 一次），故它也进了 `is_intact`：
     被外部改成 `false` 或删掉即判「不完好」→ 漂移告警会报、下一次接入自动纠正回来，
     用户不必自己去 config.toml 手改那一行。有 `requires_openai_auth_is_written_as_true`
@@ -1339,16 +1540,38 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
 
 ## ⚠️ 构建/部署硬规则（踩过坑，务必遵守）
 
-**生产 exe 必须用 `tauri build`，禁止裸 `cargo build --release`。**
-
-裸 `cargo build` 不会嵌入前端资源，产出的 exe 运行时去连 `localhost:1420`（devUrl），生产环境无 dev server → `ERR_CONNECTION_REFUSED`，界面打不开。
+**出包一律走 `npm run release:build`，别直接 `npm run tauri build`。**
 
 ```bash
-npm run tauri build              # 出 NSIS 安装包（交付）
-npm run tauri build -- --no-bundle   # 只出 exe（快速验证）
+npm run release:build                    # 出包 + 自动跑三道产物门（交付走这条）
+npm run release:build -- --no-bundle     # 只出 exe（快速验证；无 bundle 故不签名）
 ```
 
-**部署前必须用可证伪证据验证前端已嵌入**：`dist/assets/` 的 chunk 名要能在产物 exe 里 `grep -c` 到（> 0）。裸 cargo build 产物该值为 0。
+🔴 **理由是一次真实失败（2026-08-31，v0.1.44）**：`npm run tauri build` 打完两个 bundle 的
+完整路径、看起来一切正常，**最后一行**才报
+`A public key has been found, but no private key`。没有 `.sig` 的包装得上、跑得起来，
+但 updater **会拒收**它 —— 用户点「检查更新」永远收不到。失效方向最坏：构建看起来是成功的，
+那次就被当成「有个警告但包是好的」。
+<br>成因：签名私钥在 `~/.tauri/synaroute.key`（`tauri signer generate` 的默认落点），
+而 **tauri 不会自动读它** —— 那只是生成时的输出位置，不是约定的读取位置，必须显式经
+`TAURI_SIGNING_PRIVATE_KEY` 传进去。CI 一直是对的（`release.yml` 从 GitHub secrets 注入），
+**只有本机手工出包这条路缺**。
+<br>[`scripts/build-release.mjs`](scripts/build-release.mjs) 把这件事收成两条纪律：
+① 拿不到私钥就**在构建开始之前**退出并说清去哪拿（而不是等 45 秒后最后一步失败）；
+② 构建成功后自动跑 embedded / signature / audit 三道产物门 —— 「签没签成」不再依赖有人
+去读日志最后一行。另设 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""`：本仓那把钥无口令
+（rsign 的 `encrypted secret key` 只是格式标签），不设它 tauri 会交互式索要、在非 tty 下挂住。
+<br>🔴 **别 `cat` / `head` 那个私钥文件**：它是**整份 base64 挤在一行**，`head -1` 会打出
+整个私钥（本轮实际踩过一次）。要看格式用 `wc -c` / `file`。判据与取证一律传**路径**，
+脚本只打印来源、不 echo 值。
+<br>**现役钥 `7A46ECB8087DE26F`**，与 `tauri.conf.json` 的 `pubkey` 逐字节配对（已核对）。
+未泄露就不要换 —— 换一次就甩掉一批收不到更新的老用户；台账在
+[`secrets/README.md`](secrets/README.md)。
+
+**裸 `cargo build --release` 一律禁止**：它不嵌入前端资源，产出的 exe 运行时去连
+`localhost:1420`（devUrl），生产环境无 dev server → `ERR_CONNECTION_REFUSED`，界面打不开。
+判据是 `dist/assets/` 的 chunk 名要能在产物 exe 里搜到（> 0），裸 cargo build 产物该值为 0
+—— 已由 `check:embedded` 机械化。
 
 ### 🔴 发布物**绝不能**含本地数据与密钥（每次发版必查）
 
@@ -1521,11 +1744,33 @@ Rust 测试是**同文件内联**的。若按整文件行数冻结，「补一�
 
 ### 产物门（只在 release 流程跑）
 
+`npm run release:build` 会把前三道**自动跑完**，不必手敲；单独跑用于排查。
+
 | 命令 | 判据 |
 |---|---|
 | `npm run check:embedded` | `dist/assets/` 的 chunk 名能在产物二进制里搜到（> 0）。裸 `cargo build` 该值为 0 → 装上去界面一片空白。**双向验过**：旧 exe 0/7 报红、`tauri build` 后 7/7 绿 |
+| `npm run check:signature` | **每个可更新产物都签过、且签的是对的那把钥**（2026-08-31 新增，见下） |
 | `npm run audit:release` | 既有的外泄审计（运行数据/密钥/演示数据不得进包） |
 | `npm run smoke:installer` | **真装真启动**：静默装 NSIS 包 → 启动 exe → 等它自己写出「启动自检」那行 → 收尾 |
+
+🔴 **`check:signature` 是真验签，不是「看 `.sig` 在不在」**
+（[`scripts/check-signature.mjs`](scripts/check-signature.mjs)，五条判据各做过注入）：
+updater 已启用且有 pubkey → 每个当次版本的产物旁边有 `.sig` →
+**`.sig` 的 keyid == 客户端内嵌 pubkey 的 keyid** → 签名对产物内容**数学上有效**
+（minisign prehashed：BLAKE2b-512 → Ed25519，用 node 的 `crypto.verify` 实现）→
+`trusted comment` 里的 `file:` 名与产物名一致，且 global signature 也验（防 comment 被改）。
+<br>**第三条是最要紧的**：换钥而没同步 `tauri.conf.json` 的表现是「包签过了、别的门都绿、
+**所有老用户验签失败**」，而那批用户从此收不到任何更新 —— 本仓 2026-08-16 换过一次钥，
+只查「文件存在」的门对这种错法完全无效。
+<br>**只覆盖 Windows 的 updater target**（`.msi` / `-setup.exe`）：macOS 是 `.app.tar.gz`、
+Linux 是 `.AppImage`，而 `.dmg` / `.deb` / `.rpm` **不签名**（列进去会误报），
+那两种形态本机无法验证。故 CI 里只在 Windows job 跑 —— 而它真正守的「secret 配没配、
+配的是不是现役钥」三平台共用同一个环境变量，Windows 绿就已经证明了。
+<br>三条注入均已验证变红：改 pubkey 的 keyid 一位 → 报「所有已发布客户端都会验签失败」；
+改签名段一位 → 报「产物与签名不匹配」；移走 `.sig` → 报「updater 会拒收」。
+<br>⚠️ 判据**只查当次版本**（按 `package.json` 的 version 过滤）：`bundle/` 不会自动清理，
+上一版的产物一直躺在那里（实测 v0.1.43 的两个还在），算进来会让门永远红在与本次发版
+无关的事上。同 `audit:release` 的口径。**解析到 0 个产物时主动判失败**（恒绿的门更糟）。
 
 `smoke:installer` 补的是 CLAUDE.md 里挂了很久的那句「**仍未验证：NSIS 安装器能否装成**」——
 也就是说交付给用户的那个包**从未被任何流程执行过**。OmniRoute 的
