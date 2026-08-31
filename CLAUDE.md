@@ -1156,6 +1156,22 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
     <br>⚠️ **别用 `grep -c '#\[tauri::command\]'` 数命令**：它把注释里提到这个属性的行也算进去
     （`key_flags.rs` 测试段就有一处），实测比门多 1 个。门用的是「行首必须是该属性」+ 去重成
     `Set`，那才是对的口径。
+- 🔴 **v0.1.43 的 `macOS check` 红了一条，成因是测试夹具的平台假设（2026-08-30）**：
+  `codex_catalog::tests::pointer_is_ours_only_matches_our_own_file_name` 无条件断言
+  `D:\somewhere\else\<CATALOG_FILE>` 是「我们的指针」，而 `Path::file_name()` 按**平台**语义
+  切分 —— Windows 认 `\` 也认 `/`，**Unix 只认 `/`**。于是那串在 macOS 上被当成一个完整
+  文件名 → 判否 → 红（**949 passed / 1 failed**，全套里就这一条）。
+  <br>**为什么只有它红**：全仓有 30 处 Windows 风格路径夹具，其余都只当**不透明字符串**用
+  （JSON 值 / 显示文案 / 脱敏输入），分隔符不参与判断；只有 `pointer_is_ours` 真去调了
+  `file_name()`。改法是把那条断言加 `#[cfg(windows)]` + 补一条**平台无关**的裸文件名断言。
+  <br>🔴 **刻意不把生产代码改成「Unix 上也把 `\` 当分隔符」**：反斜杠在 Unix 上是**合法的
+  文件名字符**，那样一个真名叫 `weird\cc-switch-model-catalog.json` 的用户文件就会被我们
+  认领并覆盖 —— 方向恰好是这个判据要防的那种（cc-switch #6087 抢用户指针）。
+  **平台原生语义是对的，错的是那条夹具。**
+  <br>⚠️ **Windows 侧一个门都抓不到它**：`Gates` 的 windows job 与 `Release` 的四平台构建
+  都不在非 Windows 上跑 `cargo test`（`tauri-action` 只构建）。**`macos-check` 是唯一的
+  非 Windows 验证者** —— 它红的时候别想着「本机是绿的所以没事」。
+  <br>📌 产物**不受影响**：生产代码一个字节没动，故 v0.1.43 的包与签名无需重出。
 - **刻意不修的项**（别当成遗漏重复劳动）：SmartScreen 签名告警、`retrieval.rs` 的 `cwd` 白名单、
   请求日志存明文对话（默认关闭）
 

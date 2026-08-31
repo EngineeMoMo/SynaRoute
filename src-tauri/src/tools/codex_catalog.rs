@@ -1017,10 +1017,27 @@ mod tests {
     }
 
     /// 认领指针的唯一判据是文件名。目录部分刻意不比（用户可能搬过 `CODEX_HOME`）。
+    ///
+    /// 🔴 **反斜杠那一条必须 `#[cfg(windows)]`**：`Path::file_name()` 按**平台**语义切分
+    /// —— Windows 认 `\` 也认 `/`，而 Unix **只认 `/`**。第一版把
+    /// `D:\somewhere\else\<CATALOG_FILE>` 无条件断言成「是我们的」，于是它在 Windows 上绿、
+    /// 在 macOS/Linux 上把整串当成一个文件名 → 判否 → 红。**这是 v0.1.43 那次
+    /// `macOS check` 唯一的失败**（949 passed / 1 failed），而 Windows 侧的 Gates 与
+    /// Release 构建都不跑非 Windows 的测试 —— `macos-check` 是唯一能抓到它的地方。
+    ///
+    /// **刻意不把生产代码改成「Unix 上也把 `\` 当分隔符」**：反斜杠在 Unix 上是**合法的
+    /// 文件名字符**，那么一个真名叫 `weird\cc-switch-model-catalog.json` 的用户文件就会被
+    /// 我们认领并覆盖 —— 方向恰好是这个判据要防的那种（cc-switch #6087 抢用户指针）。
+    /// 平台原生语义是对的，错的是那条夹具。
     #[test]
     fn pointer_is_ours_only_matches_our_own_file_name() {
         assert!(pointer_is_ours(&format!("/home/u/.codex/{CATALOG_FILE}")));
+        // 裸文件名：与平台无关，任何一方改坏切分逻辑都会红。
+        assert!(pointer_is_ours(CATALOG_FILE));
+        #[cfg(windows)]
         assert!(pointer_is_ours(&format!("D:\\somewhere\\else\\{CATALOG_FILE}")));
+        #[cfg(windows)]
+        assert!(pointer_is_ours(&format!("D:/forward/slashes/{CATALOG_FILE}")));
         assert!(!pointer_is_ours("/home/u/.codex/my-catalog.json"));
         assert!(!pointer_is_ours("/home/u/.codex/cc-switch-model-catalog.json"));
         assert!(!pointer_is_ours(""));
