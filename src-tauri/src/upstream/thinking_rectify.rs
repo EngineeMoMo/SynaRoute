@@ -2,7 +2,7 @@
 //!
 //! # 为什么需要它（以及我们原来的定性漏了什么）
 //!
-//! `proxy::annotate_known_upstream_error` 已经识别这条错误，并把它定性为
+//! `upstream::error_hint::annotate` 已经识别这条错误，并把它定性为
 //! **「故障转移的固有代价」**：思考块的 `signature` 由签发它的那个上游账号签，
 //! 换 Key 之后新上游验不了旧上游的名，于是整段历史被 400 拒。那个成因分析是对的。
 //!
@@ -45,7 +45,7 @@
 //! 都在 [`strip_thinking_blocks`] 的文档里：摘干净后必须关顶层 `thinking`、
 //! 留下的思考块不许摘它的 `signature`、剩块时不许关 `thinking`。
 //! 这三条错法的共同特征是**换来的那条错误不含 `signature` 字样** ——
-//! 既不命中本模块判据、也不命中 `annotate_known_upstream_error`，
+//! 既不命中本模块判据、也不命中 `upstream::error_hint::annotate`，
 //! 于是用户拿到的是一句零说明的英文，比整流之前更糟。
 
 use crate::model::{CategoryType, ProviderKey};
@@ -114,7 +114,7 @@ fn is_thinking(b: &Value) -> bool {
 /// Anthropic 要求续接工具调用的那条 assistant 消息**以思考块开头**
 /// （`Expected \`thinking\` or \`redacted_thinking\`, but found \`text\``）。
 /// 而那条错误里没有 `signature` 字样 —— 既不命中本模块的判据、也不命中
-/// `proxy::annotate_known_upstream_error`，于是用户拿到的是一句没有任何说明的英文，
+/// `upstream::error_hint::annotate`，于是用户拿到的是一句没有任何说明的英文，
 /// 比整流之前**更糟**（之前至少有三条出路的提示）。
 ///
 /// 关掉顶层 `thinking` 正是那三条出路里的第三条（「在客户端关掉扩展思考」），
@@ -285,7 +285,7 @@ mod tests {
     /// 只摘块、留着 `thinking:{type:"enabled"}` 换来的是
     /// `Expected \`thinking\` or \`redacted_thinking\`, but found \`text\``——
     /// 那条错误不含 `signature`，既不命中本模块判据也不命中
-    /// `annotate_known_upstream_error`，用户拿到一句零说明的英文。
+    /// `upstream::error_hint::annotate`，用户拿到一句零说明的英文。
     #[test]
     fn a_fully_stripped_payload_also_turns_extended_thinking_off() {
         let mut p = json!({

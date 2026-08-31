@@ -25,6 +25,7 @@ mod endpoint;
 mod probe;
 mod session;
 mod sse;
+mod error_hint;
 mod stream_idle;
 /// 上游因思考签名验不过而拒绝时的请求整流。放在 `upstream` 而不是 `proxy` 下：
 /// 它修的是「上游对请求体的兼容性要求」，与协议适配同一类事（cc-switch 也放在代理层）。
@@ -50,6 +51,7 @@ pub use discovery::fetch_models;
 pub use probe::{health_probe, health_probe_real};
 pub use sse::{sse_direction, SseTranslator};
 pub(crate) use stream_idle::guard as guard_stream_idle;
+pub(crate) use error_hint::annotate as annotate_upstream_error;
 pub(crate) use thinking_rectify::rectify_on_signature_error as rectify_thinking_signature;
 pub use convert::{
     apply_pending_thinking, convert_request_owned, convert_response_ext, strip_pending_effort,

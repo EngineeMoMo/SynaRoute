@@ -18,7 +18,7 @@
     "src-tauri/src/balance.rs": 1088,
     "src-tauri/src/lib.rs": 1894,
     "src-tauri/src/model.rs": 2067,
-    "src-tauri/src/proxy.rs": 3084,
+    "src-tauri/src/proxy.rs": 3036,
     "src-tauri/src/secret.rs": 1126,
     "src-tauri/src/service.rs": 1443,
     "src-tauri/src/store.rs": 2903,

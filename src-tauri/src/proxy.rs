@@ -2838,7 +2838,7 @@ fn estimate_count_tokens_local(req_json: &Value) -> u32 {
 ///    早就写明的定性 —— 后者的文案就是「请求被拒（非 Key 问题）」）。而下游那句
 ///    「全部 Key 不可用」会把用户直接送去查密钥、查额度、查中转站状态，
 ///    全是与本次失败无关的方向。
-/// 2. 命中已知形态时附上可行动说明（见 [`annotate_known_upstream_error`]）。
+/// 2. 命中已知形态时附上可行动说明（见 [`crate::upstream::annotate_upstream_error`]）。
 ///
 /// 抽成纯函数才测得到：调用点在一个 700 行的 async 转发函数尾部。
 fn compose_hard_error_body(last_status: Option<u16>, last_err: &str) -> String {
@@ -2847,58 +2847,10 @@ fn compose_hard_error_body(last_status: Option<u16>, last_err: &str) -> String {
         _ => "全部 Key 不可用：",
     };
     let mut body = format!("{prefix}{last_err}");
-    if let Some(note) = annotate_known_upstream_error(last_err) {
+    if let Some(note) = crate::upstream::annotate_upstream_error(last_err) {
         body.push_str(note);
     }
     body
-}
-
-/// 把上游那些**用户看不懂但成因确定**的错误，补一句可行动的解释。
-///
-/// 返回 `Some(附加说明)` 表示识别出了已知形态；`None` 表示不认识，原样透传。
-///
-/// 为什么值得有：本项目的错误文案纪律是「必须可行动」（已有先例：余额端点返回网页时给出
-/// 三条排查路径、缺密钥时指向 Key 编辑器）。而上游透传上来的原文有时是**另一套系统的内部
-/// 异常**，用户既看不懂、也无从判断该改什么。
-///
-/// ## 目前识别一种：扩展思考签名失效
-///
-/// 真机原文（经中转站脱敏后）：
-/// ```text
-/// {"__type":"***.***.***.runtimeservice#ValidationException",
-///  "message":"***.***.content.6: Invalid `signature` in `thinking` block",
-///  "reason":"THINKING_SIGNATURE_INVALID"}
-/// ```
-///
-/// 成因（这一条是本项目**故障转移的固有代价**，不是 bug）：Claude 的扩展思考块带一个
-/// 由**签发它的那个上游账号**签名的 `signature`，下一轮客户端把整段历史发回来时上游要验签。
-/// 而 SynaRoute 会在 Key 之间做故障转移 —— 上一轮由 Key A（中转站 A → 某后端账号）签的
-/// 思考块，这一轮若落到 Key B，B 验不了 A 的签名，直接 400。
-///
-/// **SynaRoute 从不伪造签名**（响应侧无一处构造 `"type":"thinking"`）。所以这不是转换丢字段，
-/// 而是「同一段历史换了上游」这件事本身在 Anthropic 侧不被允许。
-/// ⚠️ 但「我们完全不碰思考块」这句自 2026-08-30 起**不再成立**：命中本错误后
-/// `upstream::thinking_rectify` 会把历史里的思考块摘掉、并把顶层 `thinking` 关掉再让后续候选重试。
-///
-/// 故给出三条真正能解决的动作，而不是让用户去猜那句 coral 异常。
-fn annotate_known_upstream_error(upstream_err: &str) -> Option<&'static str> {
-    // 三种写法各自匹配：机器码 `reason`（最稳）、人类文案 message（部分中转站只透传它）、
-    // 以及整流没覆盖的后继形态 `Expected …redacted_thinking`（它不含 signature，漏了就零说明）。
-    let hit = upstream_err.contains("THINKING_SIGNATURE_INVALID") || upstream_err.contains("redacted_thinking")
-        || (upstream_err.contains("thinking") && upstream_err.contains("signature"));
-    if !hit {
-        return None;
-    }
-    Some(
-        "\n\n【SynaRoute 说明】这是**扩展思考签名**校验失败，不是密钥或额度问题。\n\
-         Claude 的思考块带一个由「签发它的那个上游账号」签的签名，下一轮把历史发回去时上游要验签；\n\
-         而故障转移换了 Key 之后，新上游验不了旧上游签的名 —— 于是整段历史被拒。\n\
-         可行动的三条：\n\
-         • **开一个新会话**（最快：历史里没有旧签名就不会再撞）；\n\
-         • 把这个会话**固定在一条 Key** 上（分类页里只启用一条，或把它设为主 Key 且暂时停用其余）；\n\
-         • 或在客户端**关掉扩展思考**（没有思考块就没有签名要验）。\n\
-         注：SynaRoute 从不伪造签名；本轮已自动摘除思考块并降级为不开思考后重试（日志页「故障转移」组有记录），仍失败才报到这里。",
-    )
 }
 
 fn failover_verb(status: u16) -> &'static str {
@@ -4687,13 +4639,13 @@ mod tests {
         // 只有 message 没有 reason 的中转站（丢了机器码）也要识别
         let only_msg = "HTTP 400: Invalid `signature` in `thinking` block";
         assert!(
-            annotate_known_upstream_error(only_msg).is_some(),
+            crate::upstream::annotate_upstream_error(only_msg).is_some(),
             "部分中转站只透传 message、丢掉 reason，两种写法都得认"
         );
 
         // 边界①：不认识的 400 不乱加说明（别对着一个我们没搞懂的错误编原因）
         let unknown = "HTTP 400: {\"error\":\"model not found\"}";
-        assert!(annotate_known_upstream_error(unknown).is_none());
+        assert!(crate::upstream::annotate_upstream_error(unknown).is_none());
         let plain = compose_hard_error_body(Some(400), unknown);
         assert!(plain.contains("非 Key 问题"), "前缀仍按请求级分流");
         assert!(plain.contains("model not found"));
