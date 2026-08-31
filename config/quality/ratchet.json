@@ -16,7 +16,7 @@
     "src-tauri/src/agent_tools.rs": 1117,
     "src-tauri/src/aggregate.rs": 2033,
     "src-tauri/src/balance.rs": 1088,
-    "src-tauri/src/lib.rs": 1895,
+    "src-tauri/src/lib.rs": 1894,
     "src-tauri/src/model.rs": 2067,
     "src-tauri/src/proxy.rs": 3084,
     "src-tauri/src/secret.rs": 1126,

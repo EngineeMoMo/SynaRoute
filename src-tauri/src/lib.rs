@@ -24,6 +24,7 @@ mod retrieval;
 /// 那份「头里允许携带什么」的清单需要一个显眼的落脚点，且 proxy.rs 已经 5300+ 行。
 mod route_meta;
 #[path = "usage_commands.rs"] mod usage_commands; // 用量面板的 IPC 命令；抽出理由见该文件模块注释
+#[path = "client_resync.rs"] mod client_resync; // Key 变更后同步客户端模型清单；来由见该文件模块注释
 mod secret;
 mod store;
 mod tools;
@@ -65,7 +66,7 @@ fn list_keys(state: tauri::State<AppState>, category_id: CategoryType) -> Vec<Pr
 
 #[tauri::command]
 fn upsert_key(state: tauri::State<AppState>, key: ProviderKey) -> AppResult<ProviderKey> {
-    service::save_key(&state.store, key)
+    client_resync::sync_after(&state, service::save_key(&state.store, key))
 }
 
 /// 桌面端对外模型名**即时**体检（UX#4），供 KeyEditor 边打字边提示。
@@ -83,7 +84,7 @@ fn check_desktop_model_names(key: ProviderKey) -> crate::model::DesktopModelName
 
 #[tauri::command]
 fn delete_key(state: tauri::State<AppState>, key_id: String) -> AppResult<()> {
-    state.store.delete_key(&key_id)
+    client_resync::sync_after(&state, state.store.delete_key(&key_id))
 }
 
 /// 按需揭示已存明文密钥（供编辑器"眼睛"查看/续用）。
@@ -113,7 +114,7 @@ fn toggle_key(
     key_id: String,
     enabled: bool,
 ) -> AppResult<()> {
-    if service::toggle_key(&state.store, &key_id, enabled)? {
+    if client_resync::sync_after(&state, service::toggle_key(&state.store, &key_id, enabled))? {
         let store = app.state::<AppState>().store.clone();
         tauri::async_runtime::spawn(async move {
             health::check_one(&store, &key_id).await;
@@ -194,11 +195,9 @@ fn set_primary_key(
     category_id: CategoryType,
     key_id: String,
 ) -> AppResult<bool> {
-    let changed = service::set_primary_key(
-        &state.store,
-        category_id,
-        &key_id,
-        service::PrimarySource::Ui,
+    let changed = client_resync::sync_after(
+        &state,
+        service::set_primary_key(&state.store, category_id, &key_id, service::PrimarySource::Ui),
     )?;
     if changed {
         let _ = rebuild_tray(&app);

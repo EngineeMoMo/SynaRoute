@@ -89,8 +89,9 @@ fn confidence(key: &ProviderKey, outward: &str) -> Confidence {
 
 /// 这条 Key **有可能**服务这个对外名（即：不会把它换成别的模型）。
 ///
-/// 也就是 `Native` 或 `Unknown`。凡是要回答「这个请求落到它身上还算不算在服务用户要的
-/// 模型」的地方都用它 —— 包括 Codex 目录按模型收窄档位与窗口那两维。
+/// 也就是 `Native` 或 `Unknown`。用于**路由侧**的判定（排序、以及「要不要报 503」）——
+/// 那里「不知道」的 Key 值得一试。**能力断言**（Codex 目录的档位与窗口）要用更严的
+/// [`serves_natively`]，理由见它的文档。
 pub(crate) fn may_serve(key: &ProviderKey, outward: &str) -> bool {
     confidence(key, outward) != Confidence::Fallback
 }

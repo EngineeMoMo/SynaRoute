@@ -152,7 +152,7 @@ fn record_apply_success(
 ///
 /// 用 `error` 而不新增 `warn` kind：前端 LogsPage 的分组映射是穷举的，
 /// 加新 kind 会落到「未分类」里；且这条本质就是「配置不可用」。
-fn warn_desktop_unacceptable_models(store: &Store, category: CategoryType, models: &[String]) {
+pub(crate) fn warn_desktop_unacceptable_models(store: &Store, category: CategoryType, models: &[String]) {
     if category != CategoryType::ClaudeDesktop {
         return;
     }
