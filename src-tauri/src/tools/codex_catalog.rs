@@ -388,7 +388,7 @@ pub(super) fn build_catalog(models: &[String], keys: &[ProviderKey]) -> Value {
     json!({ "models": entries })
 }
 
-/// 我们生成的目录文件路径：`~/.codex/synaroute-model-catalog.json`。
+/// 我们生成的目录文件路径：`<CODEX_HOME>/synaroute-model-catalog.json`（未设置时为 `~/.codex/…`）。
 pub(super) fn catalog_path() -> AppResult<PathBuf> {
     let cfg = super::config_path()?;
     Ok(cfg

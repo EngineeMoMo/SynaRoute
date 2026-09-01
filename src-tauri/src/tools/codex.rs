@@ -59,6 +59,8 @@ use crate::error::{AppError, AppResult};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+#[path = "codex_paths.rs"] mod codex_paths;
+
 #[path = "codex_catalog.rs"]
 pub(crate) mod codex_catalog;
 pub(crate) use codex_catalog::select_model; // 应用内选 Codex 模型；两个调用点在 lib.rs
@@ -96,13 +98,12 @@ pub(super) const CODEX_AUTH_PLACEHOLDER: &str =
 /// （`placeholder_has_a_single_source_of_truth` 那条门为此专门放过这一行）。
 pub(super) const LEGACY_CODEX_AUTH_PLACEHOLDERS: &[&str] = &["synaroute-proxy"];
 
-/// `~/.codex/config.toml`。
+/// `config.toml`（实际根目录由 `codex_paths::codex_home` 决定）。
 pub(super) fn config_path() -> AppResult<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| AppError::ToolConfig("无法定位用户目录".into()))?;
-    Ok(home.join(".codex").join("config.toml"))
+    Ok(codex_paths::codex_home()?.join("config.toml"))
 }
 
-/// `~/.codex/auth.json`（与 config.toml 同目录）。
+/// `auth.json`（与 `config.toml` 同属 [`codex_home`]）。
 ///
 /// **我们不再往这里写任何东西**（见模块头）。保留这个路径只为两件事：
 /// ① 写入让桌面端跳过登录页的占位符（见 [`apply_auth_at`]）；② 还原时解除它；

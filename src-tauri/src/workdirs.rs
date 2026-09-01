@@ -238,7 +238,11 @@ fn collect_path_strings(v: &serde_json::Value, f: &mut impl FnMut(String)) {
 
 fn codex_sessions_dir() -> Option<PathBuf> {
     if let Ok(h) = std::env::var("CODEX_HOME") {
-        return Some(PathBuf::from(h).join("sessions"));
+        if h.trim().is_empty() {
+            return None;
+        }
+        let path = PathBuf::from(h);
+        return path.is_absolute().then(|| path.join("sessions"));
     }
     dirs::home_dir().map(|h| h.join(".codex").join("sessions"))
 }
