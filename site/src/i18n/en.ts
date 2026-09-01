@@ -69,10 +69,21 @@ export const en: Dict = {
   "benefits.subtitle": "The things multi-key users do by hand every day, handed off to a resident app.",
 
   "benefits.failover.name": "Automatic failover",
-  "benefits.failover.desc":
-    "When the primary key errors, times out or gets rate limited, requests move to the next available key in the order you set.",
+  "benefits.failover.desc": "When a key is exhausted or blocked, the next one takes over within the same request.",
+  // 原先这句写「you don't feel the switch」——而你**会**感知到：429 响应头透传、
+  // 日志记录主/备 Key 与重试次数、诊断响应头带 `attempts=N`。源码就是这么做的，
+  // 而这句话是错的。「你不会感知」指的是**无需手动介入**（自动的），
+  // 而不是字面的「不知道发生了切换」。已改成精确的描述。
+  // 下半段是原 `features.failover.desc` 并进来的（那张 half 大卡已删，
+  // 理由见 `data/features.ts` 顶部）。
+  //
+  // 🔴 与 `zh.ts` 同一条纪律（那边有完整取证）：**不许把两层弹性混成一层**。
+  //   Key 级熔断 = 常量 3 次 / 固定 60s（`BREAKER_THRESHOLD` / `BREAKER_COOLDOWN_MS`）；
+  //   指数退避**只属**模型锁那层（120s × 2^n，夹 30min）。
+  //   ❌ 不许写 "after configured attempts"（没有那个设置项）、
+  //   ❌ 不许写 "provider-aware retry budgets"（全仓零匹配：预算是全局单值，超时按 Key）。
   "benefits.failover.more":
-    "A health probe runs before switching so you don't land on an equally dead key. Keys that keep failing are parked temporarily and rejoin automatically once they recover.",
+    "Two layers. A key that fails three times in a row is parked for 60 seconds and skipped, rejoining automatically when the window expires. Separately, when one model is unavailable on one key, only that model is parked — keyed on the real upstream model name, so an alias can't slip past it — starting at two minutes and doubling up to thirty. Upstream's own trouble (rate limits, 5xx) is not charged against the key, and rate-limit retry hints are passed through to the client rather than swallowed.",
 
   "benefits.threeClients.name": "Three clients, kept separate",
   "benefits.threeClients.desc":
@@ -86,20 +97,25 @@ export const en: Dict = {
   "benefits.local.more":
     "Keys are encrypted at rest through the Windows Data Protection API (DPAPI), with an optional master password for a second layer.",
 
-  "benefits.protocol.name": "Protocol translation",
-  "benefits.protocol.desc":
-    "When your client speaks a different protocol than the vendor expects, the proxy translates in between.",
+  "benefits.protocol.name": "Protocol conversion",
+  "benefits.protocol.desc": "When the client speaks one protocol and the vendor hears another, the proxy translates.",
+  // 这一段并进了原 `features.protocol.desc` 的内容（那张 half 大卡已删，理由见
+  // `data/features.ts` 顶部）。末句「not necessarily the same provider」是这条能力
+  // 真正值钱的地方 —— 它让故障转移可以跨厂商，而不只是同厂商多 Key。
   "benefits.protocol.more":
-    "Anthropic Messages, OpenAI Chat Completions and OpenAI Responses convert both ways, streaming and non-streaming alike.",
+    "Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses convert bidirectionally, covering streaming and non-streaming, tool use, and multi-turn history. This also means failover can cross protocols — the primary and backup keys are not necessarily the same provider.",
 
   // ---------- Features ----------
   "features.title": "Everything else",
   "features.subtitle": "Built around three problems: many keys, many clients, many protocols.",
 
-  "features.failover.name": "Failover routing",
-  "features.failover.short": "Requests land on the next healthy key when the primary one breaks.",
-  "features.failover.desc":
-    "Keys form a priority list; failover walks it top-down to the first usable one. A health probe runs before switching, and keys that fail repeatedly enter a short circuit-break window where they're skipped, rejoining automatically when it expires. Rate-limit retry hints from upstream are passed through to the client rather than swallowed.",
+  // `features.failover.*` and `features.protocol.*` removed — they were the same things
+  // told twice, with identical id to the two in `benefits`. The mechanism explanations
+  // have been merged into `benefits.failover.more` and `benefits.protocol.more`.
+  // See the rationale at the top of `data/features.ts`.
+  // 🔴 Do NOT add them back here: `check-forbidden`'s dead-key rule will report them
+  // as unused, and the real cost is the homepage's prime real estate getting occupied
+  // by the same thing twice, taking up ~600px.
 
   "features.mapping.name": "Model mapping",
   "features.mapping.short": "Map a vendor's real model names onto the names your client expects.",
@@ -110,11 +126,6 @@ export const en: Dict = {
   "features.brain.short": "Several models answer the same question in parallel; a decider writes the final answer.",
   "features.brain.desc":
     "Configure a set of members (a key plus a model) that answer in parallel, then hand their results to a chosen decider model. Summarisation can be compressed or full-context. Members can optionally read files from the working directory for reference, and images can be passed in as input.",
-
-  "features.protocol.name": "Cross-protocol conversion",
-  "features.protocol.short": "Any client protocol against any upstream protocol, converted on the fly.",
-  "features.protocol.desc":
-    "Anthropic Messages, OpenAI Chat Completions and OpenAI Responses convert in both directions, covering streaming, non-streaming, tool calls and multi-turn history. This is also what lets failover cross protocols — your primary and backup keys don't have to be the same vendor.",
 
   "features.secret.name": "Encrypted key storage",
   "features.secret.short": "Keys are encrypted on disk, with an optional master password.",
@@ -275,14 +286,41 @@ export const en: Dict = {
   "steps.s1.title": "Download and install",
   "steps.s1.desc": "Grab the installer and run through it. The local config folder is created on first launch.",
   "steps.s2.title": "Add a vendor key",
+  // 🔴 P1-1：原文「Saving … runs one health check」——而源码里**保存时不探测**。
+  // `KeyEditor.tsx:423` 的 `handleSave` → `api.upsertKey` → `lib.rs::upsert_key`
+  // → `store.rs:560` → **零探测**。探测点是 `health.rs::check_all_categories`
+  // （后台定时任务）+ 手动「测试查询」按钮。已删掉那半；模型列表那半是对的。
+  // 这条与 `zh.ts` 的同名键是**同一句话的两份副本**，改一份必须改另一份。
   "steps.s2.desc":
-    "Pick the client category you're configuring, add a key, and fill in the vendor's base URL and your secret. Saving pulls that vendor's available models and runs one health check.",
+    "Pick the client category you're configuring, add a key, and fill in the vendor's base URL and your secret. Saving pulls that vendor's available models.",
+  // 🔴 原 `steps.s4.*` 改名为 `steps.afterStart*`（组件已改用新键，`zh.ts` 已跟上，
+  // 而这边漏了 → **英文页会露中文**，官网 `i18n-zh-en-parity` 那道门就是为此而设）。
+  //
+  // 🔴 顺带修掉这条里那句 "without you noticing" —— 它与
+  // `benefits.failover.desc` 上方注释里已经判定为假的**是同一句话**：你**会**感知到
+  // （429 响应头透传、日志记主/备 Key 与重试次数、诊断响应头带 `attempts=N`）。
+  // 那次只改了 `benefits` 那一处，这份副本留了下来 —— 正是本仓
+  // 「修完一处分叉要顺着引用链把副本都改掉」那条纪律说的失效形态。
+  "steps.afterStart": "Use your tools as usual",
+  "steps.afterStartDesc":
+    "Go back to Claude Code or Codex and work normally. Requests route through the local proxy; when a key breaks the next one picks up within the same request, and the proxy keeps the accounting plus diagnostic response headers and logs for when you need them.",
+  // 🔴 P1-1 第三条：主动给出 cc-switch 迁移路径（不然熟手看完没找到迁移入口
+  // 会以为「不支持」）。口径：「**功能平级的开源替代**」，不贬不抬不拉踩。
+  "steps.fromCcSwitch": "Coming from cc-switch?",
+  "steps.fromCcSwitchDesc":
+    "SynaRoute can read cc-switch's database and carry the configuration over as-is — keys, vendors, models, mappings and balance-query endpoints are all preserved. Pick \"Import from cc-switch\" in the key editor. Balance queries and model icons are aligned to the values verified on that side.",
   "steps.s3.title": "Hit Start",
   "steps.s3.desc":
     "Starting the local proxy writes its endpoint into the matching client's config file, after backing up the original.",
-  "steps.s4.title": "Use your tools as usual",
-  "steps.s4.desc":
-    "Go back to Claude Code or Codex and work normally. Requests route through the local proxy, and when a key breaks the next one picks up without you noticing.",
+  // 🔴 P3-12：Claude Code CLI 有最低版本要求。gateway model discovery 走
+  // `anthropic.experimental.features.gateway.models`，该字段 **2.1.245+** 才是 JSON
+  // 形态（2.1.244 及更早是 `string[]` → 类型对不上报错）。不闸的话老用户能选模型、
+  // 点进去报错，而不知道原因在版本。
+  // ⚠️ 末句**不要写成 `claude version`**：那个命令自己回显的叫法是 `claude --version`，
+  // 且没有该子命令（`claude version` 会报 unknown command）。
+  "steps.cliMinVersion": "Claude Code CLI minimum version",
+  "steps.cliMinVersionDesc":
+    "The CLI needs 2.1.245 or newer for the proxy to take over model discovery. Older versions still connect, but error out when you pick a model. To update, run npx @anthropic-ai/claude@latest from any directory — it overwrites the old version itself. Check what you have with claude --version.",
 
   // ---------- Security ----------
   "security.title": "Data & privacy",

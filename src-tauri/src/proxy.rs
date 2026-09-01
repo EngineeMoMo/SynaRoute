@@ -1575,7 +1575,7 @@ const HEAD_WINDOW_BYTES: usize = 8192;
 /// 日志正文的截断口径（头尾各留，理由见模块头 —— 只留头部会丢掉 `tools`）。
 #[path = "proxy/log_cap.rs"]
 mod log_cap;
-use log_cap::{cap, cap_to, REQ_LOG_CAP};
+use log_cap::{cap, cap_to};
 
 /// 流式转发的尝试结果。
 enum StreamAttempt {

@@ -88,16 +88,29 @@ export const zh: Dict = {
   // 所以这条的名称与描述一律**按结果写**，机制细节降到 `.more`。
   "benefits.failover.name": "不用你去切",
   "benefits.failover.desc":
-    "Key 不是一次只用一条 —— 你配的全部 Key 同时在池子里。某次请求打失败了，代理在这一次请求里就换到下一条重发，你的客户端拿到的是一个正常回答，不是一个报错加一次手动切换。",
-  // 🔴 原文写「切换前会先做一次健康探测」，那句**核不出来**：`proxy.rs` 里
-  // `probe` 只有 `is_contentless_probe`（识别客户端发来的空请求）与一个测试夹具，
-  // 转发路径上**没有**在选下一条候选之前发探测请求的调用。候选筛选走
-  // `candidates_for`，按**已有**的熔断 / 模型锁 / 余额状态过滤；健康探测是
-  // `health.rs::check_all_categories` 的后台定时任务。
-  // 这一页的可信度建立在「每句都能对着源码核」上（见本文件顶部），而最可能去
-  // 翻源码的恰恰是怀疑者 —— 被找到一句核不出来的话，代价是整页而不是这一句。
+    "主 Key 用完了或被封了，同一次请求里就换到下一条，不用你自己发现然后手动去切。",
+  // 原先这句写「你感知不到这次切换」——而你**会**感知到：429 响应头透传、
+  // 日志记录主/备 Key 与重试次数、诊断响应头带 `attempts=N`。源码就是这么做的，
+  // 而这句话是错的。「你感知不到」指的是**无需手动介入**（自动的），
+  // 而不是字面的「不知道发生了切换」。已改成精确的描述。
+  // 下半段是原 `features.failover.desc` 并进来的（那张 half 大卡已删，
+  // 理由见 `data/features.ts` 顶部）。
+  //
+  // 🔴 这条改过三次，每次都是因为**把两层弹性混成一层**。现在的写法逐句对应源码：
+  //   - 「连续失败三次 / 停用 60 秒」= `health.rs` 的 `BREAKER_THRESHOLD: u32 = 3`
+  //     与 `BREAKER_COOLDOWN_MS: i64 = 60_000`，**都是编译期常量**。
+  //     ❌ 不许写「达到配置的次数」——没有任何设置项能改它，那是句假话。
+  //   - 「某个模型不可用只停那一个模型」= 第二层 `model_locks`，退避
+  //     `MODEL_LOCK_BASE_MS(120s) × 2^n` 夹到 `MODEL_LOCK_MAX_MS(30min)`。
+  //     ❌ 指数退避**只属这一层**，Key 级熔断是固定 60 秒。写成「熔断带指数退避」是错的。
+  //   - 「键是上游真实模型名」= 只对**模型锁**成立（换个别名绕不过去）。
+  //   - 「上游自己抖动不算这条 Key 的账」= `status_counts_against_breaker` 里
+  //     5xx / 429 / 400 / 422 刻意不计熔断。这是真正的差异点，比堆术语值钱。
+  // ❌ 不许写「厂商感知的重试预算」：全仓零匹配。`failover_total_budget_ms` 是
+  //    **全局单值**，`key_timeout` 是**按 Key**（`key.params.timeout_ms`），
+  //    重试路径里一个 `vendor` 引用都没有。
   "benefits.failover.more":
-    "不会切到刚刚失败过的那条：连续失败三次的 Key 会被停用 60 秒、期间直接跳过，到点自动放回；后台定时探测负责刷新每条 Key 的健康状态。",
+    "两层：一条 Key 连续失败三次会被停用 60 秒、期间直接跳过，到点自动放回；而某个模型在某条 Key 上不可用时只停那一个模型（按上游真实模型名记，换个别名绕不过去），停用时长从 2 分钟起翻倍、最长 30 分钟。上游自己抖动（限流、5xx）不算这条 Key 的账，限流的重试提示原样透传给客户端而不是被吞掉。",
 
   "benefits.threeClients.name": "三个客户端分开管",
   "benefits.threeClients.desc": "Claude CLI、Claude 桌面端、Codex 桌面端各有独立分类，配置互不干扰。",
@@ -111,10 +124,10 @@ export const zh: Dict = {
   "benefits.protocol.name": "协议自动转换",
   "benefits.protocol.desc": "客户端说的和厂商听的不是一种协议时，由代理层在中间做转换。",
   // 这一段并进了原 `features.protocol.desc` 的内容（那张 half 大卡已删，理由见
-  // `data/features.ts` 顶部）。末句「不必是同一家厂商」是这条能力真正值钱的地方 ——
-  // 它让故障转移可以跨厂商，而不只是同厂商多 Key。
+  // `data/features.ts` 顶部）。末句「主备 Key 不必来自同一家厂商」是这条能力
+  // 真正值钱的地方 —— 它让故障转移可以跨厂商，而不只是同厂商多 Key。
   "benefits.protocol.more":
-    "Anthropic Messages、OpenAI Chat Completions、OpenAI Responses 三种协议双向互转，覆盖流式与非流式、工具调用与多轮历史。这也意味着主 Key 和备用 Key 不必是同一家厂商。",
+    "Anthropic Messages、OpenAI Chat Completions、OpenAI Responses 三种协议双向互转，覆盖流式与非流式、工具调用、多轮历史。这也意味着故障转移可以跨协议 —— 主备 Key 不必来自同一家厂商。",
 
   // ---------- 核心功能 ----------
   // 🔴 标题原先是「其他功能」，而顶栏那个「功能」链接就落在这个区块

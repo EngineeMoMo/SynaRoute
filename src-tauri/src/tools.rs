@@ -680,7 +680,7 @@ const MCP_CLIENT_NAME: &str = "synaroute";
 
 /// Codex stdio MCP 的每工具调用超时（秒），写进 `tool_timeout_sec`。默认 60s 不够大脑聚合
 /// 跑完（多模型并行 + 决策者综合常 30s+，偶尔超 60s → `user cancelled MCP tool call`），放大到 600s。
-const MCP_TOOL_TIMEOUT_SEC: i64 = 600;
+pub(crate) const MCP_TOOL_TIMEOUT_SEC: i64 = 600;
 
 /// MCP 单次工具调用超时（毫秒）的**兜底下限**，写进客户端配置的 `timeout` 字段。
 ///

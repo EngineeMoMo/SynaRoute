@@ -215,22 +215,53 @@ fn cancels_request(line: &str, in_flight: &Value) -> bool {
     v.get("params").and_then(|p| p.get("requestId")) == Some(in_flight)
 }
 
-/// 转发到主应用的 HTTP 超时。**不是**客户端的 `tool_timeout_sec`（那个我们不写、也读不到），
-/// 只是本进程自己的上限，同时充当 [`slow_note`] 的参照物。
-const FORWARD_TIMEOUT_SECS: u64 = 600;
+/// 转发到主应用的 HTTP 超时，**派生自我们写给客户端的那个上限**。
+///
+/// # 🔴 这两个 600 不是巧合 —— 其中一个就是我们自己写的
+///
+/// 本注释上一版写着「不是客户端的 `tool_timeout_sec`（那个我们不写、也读不到）」
+/// 与「本仓从不写它（全仓零写入点，**已核对**）」。**两句都是假话**：
+/// [`crate::tools`] 里那个常量正是写进 `~/.codex/config.toml` 的
+/// `tool_timeout_sec` 的值（`entry.insert("tool_timeout_sec", …)`），而且它还进了
+/// 幂等判据 —— 用户手改小了，下一次接入会被我们改回来。所以客户端的容忍上限
+/// 不是「读不到」，是**由我们决定**的。
+///
+/// 那句「已核对」让它比普通过时注释更贵：它声称做过取证，于是下一个人不会再查。
+///
+/// # 为什么必须派生而不是各写一个 600
+///
+/// 语义上这两个数**应当相等**：我们等主应用的时间，就该正好等于我们让客户端等我们的时间。
+/// 各写一份的漂移方向有一条是**静默**的 ——
+///
+/// - 谁把 `MCP_TOOL_TIMEOUT_SEC` 调大到 900：`slow_note` 从 420s 起就开始告警，
+///   而客户端还能再等 480s → 纯噪音（响亮、可发现）。
+/// - 谁把它调**小**到 300：客户端 300s 就放弃，而 `slow_note` 要到 420s 才出声
+///   —— 也就是说**在它该报警的那些次里一个字都不说**，而那正是本函数存在的全部理由。
+///
+/// 派生之后这条漂移在编译期就不可能发生。
+const FORWARD_TIMEOUT_SECS: u64 = crate::tools::MCP_TOOL_TIMEOUT_SEC as u64;
+
+// `as u64` 在负值下会绕成天文数字（那会让本进程实际上永不超时）。负的工具超时本身是荒谬的
+// —— 它同时会写进 TOML 给客户端 —— 故在编译期挡掉，而不是留一条运行期分支。
+const _: () = assert!(
+    crate::tools::MCP_TOOL_TIMEOUT_SEC > 0,
+    "MCP_TOOL_TIMEOUT_SEC 必须为正：它既是我们写给客户端的上限，也是本进程 HTTP 超时的来源"
+);
 
 /// 一次转发耗时逼近客户端超时上限时的告警后缀（够快则为空串）。
 ///
 /// # 为什么这条值得单独存在
 ///
-/// 客户端的上限**我们看不到** —— `tool_timeout_sec` 由用户自己写在 `~/.codex/config.toml`
-/// 里，本仓从不写它（全仓零写入点，已核对）。所以这里只能拿本进程的 HTTP 超时
-/// [`FORWARD_TIMEOUT_SECS`] 当参照物：两者恰好都是 600s 是巧合，而**用户改小了 config 里那个
-/// 数字我们无从知晓**。
+/// 客户端的上限就是 [`FORWARD_TIMEOUT_SECS`]（同一个数，见它的文档 —— 那个值由我们
+/// 写进 `~/.codex/config.toml`），所以这里的百分比是**对着客户端真实容忍度**算的，
+/// 不是拿一个不相干的本地数字当参照。
 ///
 /// 2026-09-01 的现场是 486.9 秒（上限 600s，余量只剩 19%），而三份日志里没有任何东西
 /// 提示「这次差一点就超时了」。真正超时之后症状与被取消一模一样（客户端显示空），
 /// 而那时已经来不及取证 —— 告警必须在**还没超时**的那些次就开始出现。
+///
+/// ⚠️ 唯一仍看不到的情形：用户手改了 config 里那个数字，而我们**还没重新接入**
+/// （重新接入会按幂等判据把它改回 `MCP_TOOL_TIMEOUT_SEC`）。那段窗口里参照物偏大。
 ///
 /// 阈值取 70%：低了会在正常的多模型聚合上刷噪音（成员 + 决策者跑上几分钟是常态），
 /// 高了则留不出「下次调小成员数或超时」的反应余地。
@@ -700,6 +731,40 @@ mod tests {
         assert_eq!(ping_id(r#"{"id":1,"method":"tools/list"}"#), None);
         assert_eq!(ping_id("not json"), None);
         assert_eq!(ping_id(""), None);
+    }
+
+    /// 🔴 `FORWARD_TIMEOUT_SECS` 必须**派生**自我们写给客户端的那个上限，不许各写一个 600。
+    ///
+    /// 值相等这一半由类型系统保证（它就是那个常量），故本判据钉的是**来源**——
+    /// 同 `the_two_sse_invariants_must_stay_derived_not_assumed` 的思路：钉来源，不钉结论。
+    /// 谁把它改回字面量 `600`，两个数就能各自漂移，而其中一个方向是**静默**的：
+    /// `MCP_TOOL_TIMEOUT_SEC` 调小到 300 时客户端 300s 就放弃，而 `slow_note` 要到 420s
+    /// 才出声 —— 在它唯一该说话的那些次里一个字都不说。
+    ///
+    /// 上一版注释还声称「那个我们不写、也读不到」「全仓零写入点，**已核对**」，
+    /// 而 `tools.rs` 里写它的那行一直都在。带「已核对」字样的假话比普通过时注释更贵
+    /// —— 它声称做过取证，于是下一个人不会再查。这条判据同时钉死那句话不会复活。
+    #[test]
+    fn the_forward_timeout_must_stay_derived_from_what_we_tell_the_client() {
+        assert_eq!(
+            FORWARD_TIMEOUT_SECS,
+            crate::tools::MCP_TOOL_TIMEOUT_SEC as u64,
+            "我们等主应用的时间，必须正好等于我们让客户端等我们的时间"
+        );
+        let src = crate::proxy::custom_headers::production_code_only(include_str!("stdio.rs"));
+        let line = src
+            .lines()
+            .find(|l| l.contains("const FORWARD_TIMEOUT_SECS"))
+            .expect("常量还在吗");
+        assert!(
+            line.contains("MCP_TOOL_TIMEOUT_SEC"),
+            "必须派生，不许写死字面量（两处各写一个 600 必然漂移）：{line}"
+        );
+        // 那两句假话不许回来。
+        assert!(
+            !src.contains("我们不写、也读不到") && !src.contains("全仓零写入点"),
+            "`tool_timeout_sec` 由 tools.rs 写入，别再声称我们不写它"
+        );
     }
 
     /// 🔴 本轮的核心不变量：桌面端与 Codex 的 stdio args **必须不同**。
