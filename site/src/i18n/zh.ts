@@ -49,10 +49,19 @@ export const zh: Dict = {
   // 「Key 互为备份」中间断行。切分点就是那个逗号，改文案时保持这个结构。
   "hero.titleLead": "多个 Key 互为备份，",
   "hero.titleTail": "多个模型协同思考",
+  // 🔴 这两句里的每个数字都必须能对着源码核（同本文件顶部那条准则）：
+  //   33 家 —— `src-tauri/src/vendors.rs` 的 `builtin_seed()`，实测 33 条 `mk(`
+  //   三种协议 —— 同 `benefits.protocol.more` 的枚举，别写成抽象的「3 种」
+  //   三次 / 60 秒 —— `src-tauri/src/health.rs:38` `BREAKER_THRESHOLD: u32 = 3`
+  //                    与 `:40` `BREAKER_COOLDOWN_MS: i64 = 60_000`
+  //   2～4 个 —— 同 `brain.flow.members`
+  // 原文写的是「多家厂商」「多个模型」，换任何同类工具都成立 —— 而首屏是唯一
+  // 一次免费的可信度机会，「33 家」恰好是竞品抄不走的那句（它 20 条 provider 里
+  // 16 个中转站连图标都没有）。改这两句时同步核一遍上面五个数字。
   "hero.desc":
-    "本机运行的 API 路由代理，为 Claude CLI、Claude 桌面端和 Codex 桌面端统管多家厂商的 Key 与模型。",
+    "本机运行的 API 路由代理，为 Claude CLI、Claude 桌面端和 Codex 桌面端统管 Key 与模型：内置 33 家厂商的地址预设，Anthropic Messages / OpenAI Chat / OpenAI Responses 三种协议自动互转。",
   "hero.descSecond":
-    "主 Key 报错自动换下一个；也能让多个模型并行回答同一个问题，再由决策者综合出结论。",
+    "主 Key 报错自动换下一个，连续失败三次的 Key 停用 60 秒后自动放回；也能让 2～4 个模型并行回答同一个问题，再由决策者综合出结论。",
   "hero.ctaPrimary": "下载 Windows 版",
   // 三个平台都已发布（v0.1.33 起同时出 exe / dmg×2 / AppImage+deb+rpm），
   // 故主 CTA 按访客所在平台取词，而不是恒写「Windows 版」。
@@ -70,10 +79,25 @@ export const zh: Dict = {
   "benefits.title": "为什么需要它",
   "benefits.subtitle": "多 Key 用户每天都在手动做的事，交给一个常驻程序去做。",
 
-  "benefits.failover.name": "失败自动接力",
-  "benefits.failover.desc": "主 Key 报错、超时或触发限流时，按你排好的优先级顺次切换到下一个可用 Key。",
+  // 🔴 这条是全站最重要的一句话，因为它要回答的是「我已经有一个 Key 切换器了」。
+  // 原文是「按优先级顺次**切换**到下一个可用 Key」—— 而「切换」正是 cc-switch
+  // 托盘菜单里那个动词，读者的第一反应是「这个我已经有了」。真正的分水岭是：
+  // 切换器同一时刻只有一条 Key 生效、失败要你自己发现再去切；我们是全部 Key
+  // 同时在池子里，换 Key 发生在**同一次请求内部**（`proxy.rs` 的候选循环，
+  // `store.rs::candidates_for` → `model_pool::rank_candidates` 给出候选顺序）。
+  // 所以这条的名称与描述一律**按结果写**，机制细节降到 `.more`。
+  "benefits.failover.name": "不用你去切",
+  "benefits.failover.desc":
+    "Key 不是一次只用一条 —— 你配的全部 Key 同时在池子里。某次请求打失败了，代理在这一次请求里就换到下一条重发，你的客户端拿到的是一个正常回答，不是一个报错加一次手动切换。",
+  // 🔴 原文写「切换前会先做一次健康探测」，那句**核不出来**：`proxy.rs` 里
+  // `probe` 只有 `is_contentless_probe`（识别客户端发来的空请求）与一个测试夹具，
+  // 转发路径上**没有**在选下一条候选之前发探测请求的调用。候选筛选走
+  // `candidates_for`，按**已有**的熔断 / 模型锁 / 余额状态过滤；健康探测是
+  // `health.rs::check_all_categories` 的后台定时任务。
+  // 这一页的可信度建立在「每句都能对着源码核」上（见本文件顶部），而最可能去
+  // 翻源码的恰恰是怀疑者 —— 被找到一句核不出来的话，代价是整页而不是这一句。
   "benefits.failover.more":
-    "切换前会先做一次健康探测，避免切到同样不可用的 Key；连续失败的 Key 会被临时摘除，恢复后自动放回。",
+    "不会切到刚刚失败过的那条：连续失败三次的 Key 会被停用 60 秒、期间直接跳过，到点自动放回；后台定时探测负责刷新每条 Key 的健康状态。",
 
   "benefits.threeClients.name": "三个客户端分开管",
   "benefits.threeClients.desc": "Claude CLI、Claude 桌面端、Codex 桌面端各有独立分类，配置互不干扰。",
@@ -86,32 +110,42 @@ export const zh: Dict = {
 
   "benefits.protocol.name": "协议自动转换",
   "benefits.protocol.desc": "客户端说的和厂商听的不是一种协议时，由代理层在中间做转换。",
+  // 这一段并进了原 `features.protocol.desc` 的内容（那张 half 大卡已删，理由见
+  // `data/features.ts` 顶部）。末句「不必是同一家厂商」是这条能力真正值钱的地方 ——
+  // 它让故障转移可以跨厂商，而不只是同厂商多 Key。
   "benefits.protocol.more":
-    "支持 Anthropic Messages、OpenAI Chat Completions、OpenAI Responses 三种协议互转，流式与非流式都覆盖。",
+    "Anthropic Messages、OpenAI Chat Completions、OpenAI Responses 三种协议双向互转，覆盖流式与非流式、工具调用与多轮历史。这也意味着主 Key 和备用 Key 不必是同一家厂商。",
 
   // ---------- 核心功能 ----------
-  "features.title": "其他功能",
-  "features.subtitle": "围绕「多 Key、多客户端、多协议」这三件事展开。",
-
-  "features.failover.name": "故障转移路由",
-  "features.failover.short": "主 Key 出问题时，请求自动落到下一个可用 Key。",
-  "features.failover.desc":
-    "Key 按列表顺序构成优先级，转移时从上往下找第一个可用的。切换前做健康探测，连续失败的 Key 进入短路窗口被临时跳过，窗口结束后自动重新参与。上游返回的限流等待时间会被透传给客户端，而不是被吞掉。",
+  // 🔴 标题原先是「其他功能」，而顶栏那个「功能」链接就落在这个区块
+  // （`data/nav.ts` 的 hash=features → `Features.tsx` 的 `<Section id="features">`）。
+  // 也就是说：读者点「功能」，落地看到「其他功能」—— 会以为跳错了位置；而这一屏
+  // 装的正是排障响应头、单模型锁定、用量花费、余额查询、局域网共享、Codex 模型
+  // 选择器，是目标开发者最会买单的部分，被标题自己贬成了附录。
+  // 副标题也从「内部三分类」改成「读者会得到什么」。
+  // ⚠️ 标题别写成带数量的说法（「12 项能力」之类）—— `data/features.ts` 的条目数
+  // 受「必须是 6 的倍数」约束会变（见该文件注释与 `check-grid-rows` 那道门），
+  // 数字写进文案就会静默过期。
+  "features.title": "完整能力",
+  "features.subtitle":
+    "从故障转移、协议转换，到用量花费、余额查询与排障响应头 —— 每条都写明它做什么、代价是什么。",
 
   "features.mapping.name": "模型映射",
   "features.mapping.short": "把厂商的真实模型名，映射成客户端认识的名字。",
+  // 「降级」是内部词（CLAUDE.md 的叫法），用户视角是「用兜底模型顶上」。
   "features.mapping.desc":
-    "第三方厂商的模型名往往和客户端期望的对不上。配置一条映射后，客户端仍按熟悉的名字调用，代理层负责翻译成厂商真实模型名。还可以配置兜底模型，用于候选 Key 不提供所请求模型时的降级。",
+    "第三方厂商的模型名往往和客户端期望的对不上。配置一条映射后，客户端仍按熟悉的名字调用，代理层负责翻译成厂商真实模型名。还可以指定一个兜底模型：某条 Key 不提供客户端请求的那个模型时，用兜底模型顶上。",
 
   "features.brain.name": "大脑聚合",
   "features.brain.short": "多个模型并行解答同一个问题，再由决策者产出最终答案。",
   "features.brain.desc":
     "配置若干「成员」（Key + 模型的组合）并行回答，然后交给指定的决策模型汇总。汇总方式可选压缩汇总或全量上下文。成员还可以按需读取工作目录里的文件作为参考，也支持传图片作为输入。",
 
-  "features.protocol.name": "跨协议转换",
-  "features.protocol.short": "任意客户端协议对任意上游协议，动态转换。",
-  "features.protocol.desc":
-    "Anthropic Messages、OpenAI Chat Completions、OpenAI Responses 三种协议之间双向转换，覆盖流式与非流式、工具调用与多轮历史。这也意味着故障转移可以跨协议进行——主 Key 和备用 Key 不必是同一家厂商。",
+  // `features.failover.*` 与 `features.protocol.*` 已删 —— 它们与 `benefits` 的
+  // 同名两条是同一件事讲两遍（两处 id 逐字同名）。机制长文分别并进了
+  // `benefits.failover.more` 与 `benefits.protocol.more`。理由见 `data/features.ts` 顶部。
+  // 🔴 别在这里重新加回来：`check-forbidden` 的死键判据会报未使用，而更实际的代价是
+  // 首页最靠前的黄金位置又被同一件事占掉约 600px。
 
   "features.secret.name": "加密密钥存储",
   "features.secret.short": "密钥加密后存在本地文件，可选主口令二次保护。",
@@ -263,14 +297,39 @@ export const zh: Dict = {
   "steps.s1.title": "下载并安装",
   "steps.s1.desc": "下载安装包，按向导完成安装。首次启动会自动创建本地配置目录。",
   "steps.s2.title": "添加厂商 Key",
-  "steps.s2.desc":
-    "选择要配置的客户端分类，新增一条 Key，填入厂商地址与密钥。保存时会自动拉取该厂商的可用模型列表并做一次健康检查。",
+  // 🔴 P1-1：原文「保存时会自动拉取该厂商的可用模型列表并做一次健康检查」——
+  // 而源码里**保存时不探测**。`KeyEditor.tsx:423` 的 `handleSave` → `api.upsertKey` →
+  // `lib.rs` 的 `upsert_key` → `store.rs:560` → **零探测**。探测点是
+  // `health.rs::check_all_categories`（后台定时任务）+ 手动「测试查询」那个按钮
+  // （`KeyEditor.tsx:406` 的 `handleTest`）。这是 P1-1 第二条「假承诺」
+  // （第一条是「四步」里那个「你不会感知到切换」，已在 `benefits.failover.desc` 里修）。
+  // 删掉那句；模型列表那半是对的（`discover_models_for` 在 insert 与 update 里都调了）。
+  "steps.s2.desc": "选择要配置的客户端分类，新增一条 Key，填入厂商地址与密钥。保存时会自动拉取该厂商的可用模型列表。",
+  // 同时加上 cc-switch 迁移路径（P1-1 第三条）：把 steps 尾段从「这就完成了」改成主动指路。
+  "steps.afterStart": "照常使用就行",
+  "steps.afterStartDesc":
+    "回到 Claude Code 或 Codex 正常使用。请求经由本地代理转发，Key 出问题时自动接力到下一条，代理记账并提供排障响应头与日志。",
+  // 🔴 P1-1 第三条：主动给出 cc-switch 迁移路径（不然熟手看完没找到迁移入口
+  // 会以为「不支持」）。口径：「**功能平级的开源替代**」，不贬不抬不拉踩。
+  // 语气收在「照搬配置」上——那是唯一不再费力的路（3 分钟 vs 每个 Key 手填一遍），
+  // 与 cc-switch 同级别的熟手会在意的是这个。
+  "steps.fromCcSwitch": "从 cc-switch 切过来？",
+  "steps.fromCcSwitchDesc":
+    "SynaRoute 可以读取 cc-switch 的数据库并照搬配置（Key、厂商、模型、映射、余额查询地址全部保留），只要在 Key 编辑器里选「从 cc-switch 导入」。余额查询与模型图标会自动对齐它那边的取证值。",
   "steps.s3.title": "点「启动」",
   "steps.s3.desc":
     "启动本地代理，SynaRoute 会自动把代理端点写入对应客户端的配置文件（写入前先备份原文件）。",
-  "steps.s4.title": "照常使用",
-  "steps.s4.desc":
-    "回到 Claude Code 或 Codex 正常使用即可。请求经由本地代理转发，Key 出问题时自动接力，你不会感知到切换。",
+  // 🔴 P3-12：Claude Code CLI 有最低版本要求。起因是 gateway model discovery
+  // 走 `anthropic.experimental.features.gateway.models`（需 JSON 形态的 models 响应，
+  // 而老版本期望它是字符串数组 → 类型对不上报错），那个字段是 **2.1.245+** 才有的
+  // （2.1.244 及更早是 `string[]`，有三条判据都压这个版本边界，不是瞎写的）。
+  // 不闸的话 Claude Code 能选模型、点进去 404 或 401，而老用户不知道原因在版本。
+  // 本段文案顺着「怎么更新」那条自然疑问给出答案。
+  // ⚠️ 末句**不要写成「claude version」**：那个命令自己回显的叫法是 `claude --version`
+  // 并且没有子命令（`claude version` 会报 unknown command）。
+  "steps.cliMinVersion": "Claude Code CLI 最低版本要求",
+  "steps.cliMinVersionDesc":
+    "CLI 需要 2.1.245 或更新版本才能让代理接管模型发现。老版本仍能连上代理，但会在选模型时报错。更新 CLI 只需在任意目录跑 npx @anthropic-ai/claude@latest，它会自己覆盖掉旧版本；可以用 claude --version 查看当前版本。",
 
   // ---------- 安全与隐私 ----------
   "security.title": "数据与隐私",

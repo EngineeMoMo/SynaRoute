@@ -183,6 +183,65 @@ fn ping_id(line: &str) -> Option<Value> {
     v.get("id").cloned().filter(|i| !i.is_null())
 }
 
+/// 这一行是不是**针对在途请求的取消通知**（`notifications/cancelled`）？
+///
+/// # 🔴 为什么必须认它（2026-09-01 用户实报）
+///
+/// 现场：Codex 停在审批门等用户点确认，467 秒时这次 `tools/call` 被取消
+/// （Codex 自己记的是 `synaroute_ai result: aborted by user after 467.0s`），
+/// 而我们**486.9 秒才把结果写出去** —— 那时已经没人在听了。用户看到的是
+/// 「工具调用完成但返回内容为空……这通常是服务端超时或结果丢失」，**两个成因都不对**：
+/// 没有超时（`tool_timeout_sec` 是 600s，我们 486s 就写完了），结果也没丢。
+///
+/// 不认它的代价是具体的：取消之后聚合还在跑，那 20 秒继续烧上游额度，而结果注定没人要；
+/// 更糟的是排障方向被那句「服务端超时或结果丢失」带偏 —— 日志里 `forward ok` + `sent`
+/// 一切正常，与「返回为空」完全对不上，而真相（对端早已放弃）在本进程里没有任何痕迹。
+///
+/// # 判据只认「取消的正是在途这一条」
+///
+/// `params.requestId` 必须等于当前正在转发的那个 id。MCP 允许客户端取消任意在途请求，
+/// 而本进程同一时刻只跑一个 `tools/call`（其余排队，见 [`run_stdio`] 的 `select!`）——
+/// 取消一个**排队中**的请求不该中止正在跑的这个。id 的类型可以是数字或字符串，
+/// 故用 `Value` 全等比较而不是转成字符串（`1` 与 `"1"` 是不同的 JSON-RPC id）。
+///
+/// **不回响应**：它是 notification（无 `id`），按 JSON-RPC 规范回任何东西都是协议错误。
+fn cancels_request(line: &str, in_flight: &Value) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+        return false;
+    };
+    if v.get("method").and_then(Value::as_str) != Some("notifications/cancelled") {
+        return false;
+    }
+    v.get("params").and_then(|p| p.get("requestId")) == Some(in_flight)
+}
+
+/// 转发到主应用的 HTTP 超时。**不是**客户端的 `tool_timeout_sec`（那个我们不写、也读不到），
+/// 只是本进程自己的上限，同时充当 [`slow_note`] 的参照物。
+const FORWARD_TIMEOUT_SECS: u64 = 600;
+
+/// 一次转发耗时逼近客户端超时上限时的告警后缀（够快则为空串）。
+///
+/// # 为什么这条值得单独存在
+///
+/// 客户端的上限**我们看不到** —— `tool_timeout_sec` 由用户自己写在 `~/.codex/config.toml`
+/// 里，本仓从不写它（全仓零写入点，已核对）。所以这里只能拿本进程的 HTTP 超时
+/// [`FORWARD_TIMEOUT_SECS`] 当参照物：两者恰好都是 600s 是巧合，而**用户改小了 config 里那个
+/// 数字我们无从知晓**。
+///
+/// 2026-09-01 的现场是 486.9 秒（上限 600s，余量只剩 19%），而三份日志里没有任何东西
+/// 提示「这次差一点就超时了」。真正超时之后症状与被取消一模一样（客户端显示空），
+/// 而那时已经来不及取证 —— 告警必须在**还没超时**的那些次就开始出现。
+///
+/// 阈值取 70%：低了会在正常的多模型聚合上刷噪音（成员 + 决策者跑上几分钟是常态），
+/// 高了则留不出「下次调小成员数或超时」的反应余地。
+fn slow_note(ms: u128) -> String {
+    let cap = u128::from(FORWARD_TIMEOUT_SECS) * 1000;
+    if ms * 100 < cap * 70 {
+        return String::new();
+    }
+    format!(" ⚠ 已用 {}% 的超时预算（上限 {FORWARD_TIMEOUT_SECS}s）", ms * 100 / cap)
+}
+
 /// 写一条响应给客户端。返回 `false` = 管道已不可用，调用方该收尾退出。
 ///
 /// 抽成函数是因为**两处**要写：主循环，以及转发进行中即时回的那条 `ping`。
@@ -304,13 +363,22 @@ pub async fn run_stdio() {
                 // 另一件事（两轮聚合同时烧额度、响应还会乱序，而客户端未必都容得下乱序），
                 // 而 `ping` 是纯本地静态回答、零副作用。范围最小、收益最大。
                 let mut stdin_open = true;
+                // `None` = 正常跑完；`Some(())` = 被对端取消，见 `cancels_request`。
+                let mut cancelled = None;
                 let r = loop {
                     tokio::select! {
-                        res = &mut fwd => break res,
+                        res = &mut fwd => break Some(res),
                         got = rx.recv(), if stdin_open => match got {
                             // stdin 关了也要把这次转发跑完并写出去（写失败会在下面收尾）。
                             // 必须置 false：否则 recv 立刻再返 None，这里就成了忙等。
                             None => stdin_open = false,
+                            Some(l) if cancels_request(&l, &id) => {
+                                // 🔴 取消即**放弃这次转发**（`fwd` 在这里被 drop → HTTP 连接断开），
+                                // 且**不写响应** —— 对端已经不认这个 id 了，写过去只会被丢掉，
+                                // 而在它看来这次调用「返回了空」。
+                                cancelled = Some(());
+                                break None;
+                            }
                             Some(l) => match ping_id(&l) {
                                 Some(pid) => {
                                     diag("recv method=ping (转发进行中，即时回)");
@@ -324,12 +392,20 @@ pub async fn run_stdio() {
                     }
                 };
                 let ms = t0.elapsed().as_millis();
+                // 被取消：留一行**成因明确**的痕迹后回到主循环。这一行是本条修复的全部价值 ——
+                // 没有它，「对端早已放弃」在三份日志里都看不出来（主应用记成功、Codex 记空）。
+                if cancelled.is_some() {
+                    diag(&format!("forward cancelled by peer method={method} {ms}ms（未写响应）"));
+                    continue;
+                }
+                // `break None` 只在取消那一支发生，已在上面 continue 掉。
+                let Some(r) = r else { continue };
                 match r {
                     Ok(value) => {
                         // 刻意**不**在这里记结果长度：那要把整个结果再序列化一遍，而失败时
                         // 会显示成 `0` —— 与「返回空」这个正在查的症状撞车。长度统一由
                         // `sent` 那行的 `bytes` 给（它是真正写出去的字节数）。
-                        diag(&format!("forward ok method={method} {ms}ms"));
+                        diag(&format!("forward ok method={method} {ms}ms{}", slow_note(ms)));
                         super::rpc_ok(id, value)
                     }
                     Err(msg) => {
@@ -370,9 +446,9 @@ async fn forward_tool_call_to_main(
         "method": "tools/call",
         "params": params,
     });
-    // 聚合可能耗时较久（多模型并行 + 决策者），给足超时（与 tool_timeout_sec 对齐留余量）。
+    // 聚合可能耗时较久（多模型并行 + 决策者），给足超时。
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
+        .timeout(std::time::Duration::from_secs(FORWARD_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("构造 HTTP 客户端失败: {e}"))?;
     let resp = client

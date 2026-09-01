@@ -4,7 +4,6 @@ import {
   Layers,
   ShieldCheck,
   ArrowLeftRight,
-  Split,
   Replace,
   KeyRound,
   PlugZap,
@@ -65,9 +64,19 @@ export interface Feature {
   span: "half" | "third";
 }
 
+// 🔴 **`half` 今天是空的，这是刻意的，别顺手加回来。**
+//
+// 原先这里有两条 half 大卡：`features.failover` 与 `features.protocol` —— 而它们与
+// `benefits` 里的 `failover` / `protocol` 是同一件事讲两遍（两处 id 逐字同名，
+// 文案也只是换了说法）。读者在两屏之内被同一件事说服两次，第二次不增加信息只增加
+// 长度，还会让人怀疑功能被拆开凑数了；那两张卡占的约 600px 又正好在页面最靠前的
+// 黄金位置。已把它们的机制长文并进 `benefits.*.more`（那个承载位本来就有）。
+//
+// 也就是说这一屏现在只讲**只讲一次**的能力，标题「完整能力」才名副其实。
+// 要新增能力一律进 `third`（并保持 6 的倍数）；真要恢复 half 形态，先确认它讲的
+// 事情在 Benefits 里没有对应条目。`Features.tsx` 对空 `half` 是安全的
+// （`wide.map` 直接渲染出零个节点，那个网格容器本身不产生高度）。
 export const features: Feature[] = [
-  { id: "failover", icon: Split, i18nPrefix: "features.failover", span: "half" },
-  { id: "protocol", icon: ArrowLeftRight, i18nPrefix: "features.protocol", span: "half" },
   { id: "mapping", icon: Replace, i18nPrefix: "features.mapping", span: "third" },
   { id: "secret", icon: KeyRound, i18nPrefix: "features.secret", span: "third" },
   { id: "apply", icon: PlugZap, i18nPrefix: "features.apply", span: "third" },

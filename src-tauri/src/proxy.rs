@@ -662,7 +662,9 @@ async fn handle_request_inner(
     let downstream_body = if !req_log {
         String::new()
     } else if req_json.is_null() {
-        String::from_utf8_lossy(&body_bytes).chars().take(REQ_LOG_CAP).collect()
+        // 走 cap 而不是裸 take：非 JSON 的 body（解析失败那一支）同样需要保住尾段，
+        // 那里才有 tools/response_format 这些易致 400 的字段（见 `cap_to`）。
+        cap(&String::from_utf8_lossy(&body_bytes))
     } else {
         serde_json::to_string_pretty(&req_json).unwrap_or_else(|_| req_json.to_string())
     };
@@ -908,6 +910,17 @@ async fn handle_request_inner(
             }
             None => None,
         };
+        // 🔴 第二跳的「宁可报错也不悄悄换模型」：这条候选会把用户点名的模型换掉就跳过它。
+        // 循环前那道 `reject_if_unserviceable` 只判一次（那时首选还没失败），降级恰恰发生在这里。
+        // 全部候选都会降级时循环走到尾部，由既有全失败分支回 503 —— 正是我们要的结果。
+        if model_pool::would_silently_substitute(&store, category, &requested_model, key) {
+            last_err = format!(
+                "「{}」不支持 {requested_model}（会被兜底改写成 {}），已跳过：你点名的模型不该被悄悄换掉",
+                key.name,
+                key.resolve_model(&requested_model)
+            );
+            continue;
+        }
         let started = std::time::Instant::now();
         let next = candidates.get(i + 1);
         // 上一候选若因思考块签名被拒 → 就地摘掉再给本候选用。刻意放在**共享前段**而不是某条失败
@@ -1549,9 +1562,6 @@ fn handle_list_models(store: &Arc<Store>, category: CategoryType) -> Response<Re
     json_resp(StatusCode::OK, bytes)
 }
 
-/// 请求/响应体在日志里的最大字符数（防止超大 body 撑爆内存日志）
-const REQ_LOG_CAP: usize = 20_000;
-
 /// 流式响应尾部滑动窗口大小。SSE 的 usage 统计在最末几个事件里，只需留住尾巴，
 /// 不缓存全文 —— 既不牺牲首字节延迟，也不让长会话的响应体常驻内存。
 const TAIL_WINDOW_BYTES: usize = 8192;
@@ -1562,20 +1572,10 @@ const TAIL_WINDOW_BYTES: usize = 8192;
 /// 就不再增长（message_start 是第一个事件，必在其中），流末与尾窗合并取 usage。
 const HEAD_WINDOW_BYTES: usize = 8192;
 
-/// 截断超长文本，附省略提示。
-fn cap(s: &str) -> String {
-    cap_to(s, REQ_LOG_CAP)
-}
-
-/// 按指定上限截断（供双段日志分别控额度：转换后段须完整可见，下游原始段太大只留头部）。
-fn cap_to(s: &str, limit: usize) -> String {
-    if s.chars().count() <= limit {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(limit).collect();
-        format!("{head}\n…（已截断，共 {} 字符）", s.chars().count())
-    }
-}
+/// 日志正文的截断口径（头尾各留，理由见模块头 —— 只留头部会丢掉 `tools`）。
+#[path = "proxy/log_cap.rs"]
+mod log_cap;
+use log_cap::{cap, cap_to, REQ_LOG_CAP};
 
 /// 流式转发的尝试结果。
 enum StreamAttempt {

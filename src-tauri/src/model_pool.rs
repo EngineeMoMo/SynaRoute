@@ -311,6 +311,56 @@ pub(crate) fn note_silent_downgrade(
     );
 }
 
+/// 这个候选会不会把用户**明确点名**的模型悄悄换掉？是则本次请求不该用它。
+///
+/// # 🔴 为什么 [`note_silent_downgrade`] 不够（2026-09-01 用户实报的第二半）
+///
+/// 那个函数把降级**记下来**了，但降级照旧发生：用户在 Codex 里选 `grok-4.6`，luckyg 的网关
+/// 因一个工具 schema 连续 400（`tool parameter root must be an object type` —— 与 Key 无关、
+/// 换谁都一样），转移到 agentrouter → 它不支持 grok-4.6 → 兜底改写成 `glm-5.3` → **200**。
+/// 客户端拿到的是 glm 的回答，而它以为在用 grok。留痕只是让这件事**可查**，没让它**不发生**。
+///
+/// v0.1.44 定过判据「宁可 503 也不悄悄换模型」，但那道门（[`reject_if_unserviceable`]）
+/// 只在**进入候选循环之前**判一次：那一刻 luckyg 还没失败、`may_serve` 为真，放行是对的。
+/// 本函数补的正是**第二跳**那次判定。
+///
+/// # 只拦「用户点名过」的，且判据与那道门同源
+///
+/// 名字必须来自并集清单或 `active_models`（= 我们自己界面上选的）。客户端自动发的家族名
+/// （CC 的带日期后缀名、Codex 未重启时的内置 GPT 名）**必须放行** —— 被三档/`default_model`
+/// 改写是那两个机制存在的全部理由，拦下它们就是把 CC 的杂活调度整个打死。
+/// 这一点与 `note_silent_downgrade` 的口径刻意一致（连 `active_models` 那一支也一样），
+/// 两者判的是同一件事的两半：一个决定「要不要留一句话」，一个决定「要不要用这条候选」。
+///
+/// # 拦下之后不是失败，是**继续找下一个**
+///
+/// 调用方 `continue` 到下一个候选。全部候选都会降级时循环自然走到尾部，
+/// 由既有的全失败分支给出 503 —— 那正是「宁可报错也不悄悄换」想要的结果，
+/// 而且沿用现成的错误路径（含 `Retry-After`），本函数一行都不用管。
+pub(crate) fn would_silently_substitute(
+    store: &Store,
+    category: CategoryType,
+    requested: &str,
+    key: &ProviderKey,
+) -> bool {
+    let bare = crate::model::unwrap_gateway_model_id(requested);
+    if bare.is_empty() {
+        return false;
+    }
+    // `Unknown`（原样透传）不算降级：上游很可能认识它，拦下反而误伤。
+    // 与 `note_silent_downgrade` 用同一个三态判据，别在这里退化成两态。
+    if confidence(key, requested) != Confidence::Fallback {
+        return false;
+    }
+    // 解析结果与请求名一致时没有替换发生（理论上 Fallback 下不会，判一次不吃亏）。
+    if key.resolve_model(requested) == bare {
+        return false;
+    }
+    let enabled = store.enabled_keys_sorted(category);
+    discoverable_models(&enabled).iter().any(|m| m == bare)
+        || store.active_model_of(category).as_deref() == Some(bare)
+}
+
 /// 从全部 Key 里挑出本次请求的候选，并排好序。返回 `(候选, 是否走了兜底)`。
 ///
 /// 排序键 `(服务把握, 余额已耗尽, priority)` —— 三位都是「越靠前越该先用」，

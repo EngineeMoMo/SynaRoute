@@ -249,8 +249,17 @@ const bad = (name, hits, how) => {
   // 同本仓记过多次的那类坑：判据被「长得像但不是」的东西满足/污染。
   const third = countOf(featuresSrc, /span:\s*"third"\s*\}/g);
   const half = countOf(featuresSrc, /span:\s*"half"\s*\}/g);
-  if (third === 0 || half === 0) {
-    hits.push(`features.ts 只数出 half=${half} / third=${third} —— 判据在空转，先修正则`);
+  // 🔴 空转哨兵只能对 `third` 用，**不能对 `half` 用**。
+  // `half` 合法地可以是 0（本轮就删掉了那两张 —— 它们与 Benefits 的 failover /
+  // protocol 是同一件事讲两遍，`features.ts` 里两处 id 都同名）。
+  // 第一版写的是 `third === 0 || half === 0` → 一删就假红，而假红会把人推向
+  // 「那就把卡加回来」，正好抵消这次去重。哨兵改为「总条目数」：正则失效时它必然为 0，
+  // 而它不会因为某一档合法地空掉而误报。
+  const entries = countOf(featuresSrc, /i18nPrefix:\s*"features\./g);
+  if (entries === 0 || third === 0) {
+    hits.push(
+      `features.ts 只数出 entries=${entries} / half=${half} / third=${third} —— 判据在空转，先修正则`,
+    );
   } else {
     if (third % 6 !== 0) {
       hits.push(
