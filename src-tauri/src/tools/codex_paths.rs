@@ -49,10 +49,28 @@ pub(super) fn codex_home() -> AppResult<PathBuf> {
 mod tests {
     use super::*;
 
+    /// 绝对路径原样采用。
+    ///
+    /// 🔴 **夹具必须按平台给**：`is_absolute()` 走宿主平台语义 —— `C:\isolated\codex` 在
+    /// Windows 上绝对，在 **Unix 上是相对路径**（反斜杠只是合法的普通文件名字符），
+    /// 于是 `from_env` 按设计 fail closed、`unwrap()` 当场 panic。
+    /// v0.1.47~0.1.49 的 `macOS check` 就是这么**连红三个版本**的，而本机一直全绿 ——
+    /// Windows 侧没有任何门能抓到它，`macos-check` 是唯一的非 Windows 验证者。
+    ///
+    /// **别为了让它变绿去放宽生产判据**：让 Unix 也把 `\` 当分隔符，会把一个真名带反斜杠的
+    /// 用户目录误判成绝对路径 —— 方向正好是这条 fail closed 要防的那种。错的是夹具。
     #[test]
     fn an_absolute_codex_home_is_used_verbatim() {
-        let got = from_env(Some(OsString::from("C:\\isolated\\codex"))).unwrap();
-        assert_eq!(got, PathBuf::from("C:\\isolated\\codex"));
+        #[cfg(windows)]
+        let raw = "C:\\isolated\\codex";
+        #[cfg(not(windows))]
+        let raw = "/isolated/codex";
+
+        let got = from_env(Some(OsString::from(raw))).unwrap();
+        assert_eq!(got, PathBuf::from(raw));
+        // 与分隔符无关的两条：每个平台都真的验到了东西，而不是只在 Windows 上有意义。
+        assert!(got.is_absolute(), "解析结果必须仍是绝对路径");
+        assert!(got.ends_with("codex"), "末段必须原样保留");
     }
 
     /// 🔴 接线判据：`codex.rs` 的路径入口必须经 [`codex_home`]，不许自己拼 `.codex`。
