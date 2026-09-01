@@ -9,6 +9,11 @@ use serde_json::{json, Value};
 use super::tools_meta::*;
 use super::util::{extract_text_content, uuid_like};
 
+// 结构化输出（「我要 JSON」）在三协议间的换算自成一族，挂出去给 convert.rs 腾棘轮余量。
+#[path = "structured_output.rs"]
+mod structured_output;
+use structured_output::*;
+
 // ---- 协议字段转换（proxy 跨协议故障转移时使用）----
 //
 // 覆盖范围（本轮从「纯文本」扩展）：
@@ -62,75 +67,6 @@ fn request_usage_in_stream(dst: &mut serde_json::Map<String, Value>) {
     dst.insert("stream_options".into(), json!({ "include_usage": true }));
 }
 
-/// Chat 的 `response_format` → Responses 的 `text` 对象（结构化输出约束）。
-///
-/// ## 为什么必须转，而不是让 copy_through 带过去
-///
-/// 两协议表达「我要 JSON」的字段完全不同名：Chat 用顶层 `response_format`，
-/// Responses 用 `text.format`（同一份 schema、不同位置）。`response_format` 从来没进过
-/// `copy_through` 的白名单，于是 Chat→Responses 时它被**整个丢掉**。
-///
-/// 后果是纯静默失效里最难查的一种：请求 200、模型正常作答，只是回的是散文而不是 JSON，
-/// 客户端在 `JSON.parse` 上炸掉。用户看到的是「我的程序解析失败」，而根因在代理的协议转换里
-/// —— 日志、状态码、错误信息里没有任何线索。
-///
-/// ## json_schema 要**摊平**
-///
-/// Chat：`{"type":"json_schema","json_schema":{"name":…,"schema":…,"strict":true}}`
-/// Responses：`{"format":{"type":"json_schema","name":…,"schema":…,"strict":true}}`
-/// —— 内层 `json_schema` 包裹层没了，`name`/`schema`/`strict` 直接挂在 `format` 下。
-///
-/// 判据来源（非推测）：① Microsoft Learn 的结构化输出文档明确写「Chat Completions 在
-/// `response_format` 里定义 schema，Responses 在 `text.format` 里定义」；② 本机
-/// `codex.exe`（Responses 原生客户端）的 serde 字段名串里，`strict`/`schema`/`format`/
-/// `json_schema` 是同级相邻字段，与摊平形态一致、与嵌套形态不一致。
-///
-/// 未知 `type` **原样搬进 format 而不是丢掉**：上游若不认会明确报错，那比静默降级成散文好 ——
-/// 后者用户查不到，前者一次就定位。
-fn chat_response_format_to_responses_text(rf: &Value) -> Option<Value> {
-    let obj = rf.as_object()?;
-    let mut format = serde_json::Map::new();
-    match obj.get("type").and_then(|t| t.as_str()) {
-        Some("json_schema") => {
-            format.insert("type".into(), json!("json_schema"));
-            // 摊平内层：把 name/schema/strict 及未来新增字段一并提上来。
-            if let Some(inner) = obj.get("json_schema").and_then(|j| j.as_object()) {
-                for (k, v) in inner {
-                    format.insert(k.clone(), v.clone());
-                }
-            }
-        }
-        // json_object / text 及其它：只有 type，位置换一下即可
-        _ => {
-            for (k, v) in obj {
-                format.insert(k.clone(), v.clone());
-            }
-        }
-    }
-    Some(json!({ "format": Value::Object(format) }))
-}
-
-/// Responses 的 `text.format` → Chat 的 `response_format`（[`chat_response_format_to_responses_text`] 的逆向）。
-///
-/// 反向同样漏过：Codex（Responses 客户端）配一个 Chat 协议的 Key 时，结构化输出约束
-/// 一样会被丢掉。两向都补才对称 —— 只补一向的话，同一个功能在「哪种 Key」下可用
-/// 取决于用户碰巧选了谁，而那是他最不该需要知道的事。
-///
-/// `json_schema` 要重新**包回**内层对象（`type` 留在外层，其余进 `json_schema`）。
-fn responses_text_to_chat_response_format(text: &Value) -> Option<Value> {
-    let format = text.get("format")?.as_object()?;
-    let ty = format.get("type").and_then(|t| t.as_str())?;
-    if ty != "json_schema" {
-        return Some(json!({ "type": ty }));
-    }
-    let mut inner = serde_json::Map::new();
-    for (k, v) in format {
-        if k != "type" {
-            inner.insert(k.clone(), v.clone());
-        }
-    }
-    Some(json!({ "type": "json_schema", "json_schema": Value::Object(inner) }))
-}
 
 /// 从请求体里读出 OpenAI 推理强度档位。
 ///
@@ -642,6 +578,29 @@ pub fn openai_to_anthropic(body: &Value) -> Value {
             other => other.clone(),
         };
         out.insert("stop_sequences".into(), seqs);
+    }
+    // 结构化输出：Chat 的 `response_format` / Responses 的 `text.format` → Anthropic 的
+    // `output_config.format`。三协议表达「我要符合这份 schema 的 JSON」的位置各不相同。
+    //
+    // 🔴 **不补这一向的表现正是本仓记过的那条**：请求 200、模型回散文、客户端 `JSON.parse`
+    // 当场炸掉，而日志里毫无线索。此前 `response_format` 只在 Chat↔Responses 之间双向转，
+    // 于是同一个客户端在 Chat/Responses Key 上好用、**故障转移落到 Anthropic Key 就坏**
+    // —— 取决于用户碰巧路由到谁，最难复现的那种。
+    //
+    // 🔴 字段名是 `output_config.format`，**不是** `output_format`：后者是 beta 期的名字，
+    // 官方文档明说新代码用前者（过渡期两者都还收，但那是会到期的）。写错的代价不是静默 ——
+    // Anthropic 对未知顶层字段是 400，也就是每个结构化输出请求当场失败。
+    // schema 形态与 Chat 的 `json_schema` 一致（`{type, schema}`），故直接复用既有转换。
+    if let Some(fmt) = body
+        .get("response_format")
+        .and_then(chat_response_format_to_anthropic_format)
+        .or_else(|| {
+            body.get("text")
+                .and_then(|t| t.get("format"))
+                .and_then(responses_text_format_to_anthropic_format)
+        })
+    {
+        out.insert("output_config".into(), json!({ "format": fmt }));
     }
     if let Some(t) = body.get("tools").and_then(openai_tools_to_anthropic) {
         out.insert("tools".into(), t);
@@ -1482,14 +1441,26 @@ pub fn chat_to_responses(body: &Value) -> Value {
         for m in arr {
             let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             match role {
-                "system" => {
-                    // 多条 system 累加（Responses 只有单一 instructions 槽）
-                    let t = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                // 🔴 `developer` 必须与 `system` 同权，理由与 [`openai_to_anthropic`] 那侧
+                // **一字不差**：Codex 把 skills 说明（含「必须使用该 skill」这类强指令）装在
+                // developer 消息里。此前它落进下面的 `_ =>` 分支被当成普通 input 消息，
+                // 而 Responses 的 `instructions` 是独立字段、权重高于对话消息 ——
+                // 降级的表现是「skill 时好时坏、不点名就不触发」，且完全静默。
+                //
+                // 那处修复只做了 Anthropic 方向，这条路径漏了整整一轮（本仓最熟的
+                // 「只修了一条路径」形态）。判据 `developer_is_instructions_in_both_directions`。
+                //
+                // content 用 `extract_text_content` 而非 `as_str()`：Chat 允许 system/developer
+                // 的 content 是分块数组，`as_str()` 对数组返回 None → 整条提示词静默丢弃、
+                // 连 `instructions` 字段都不产出（请求 200、模型完全不带人设作答）。
+                "system" | "developer" => {
+                    // 多条累加（Responses 只有单一 instructions 槽）
+                    let t = extract_text_content(m.get("content"));
                     if !t.is_empty() {
                         if !instructions.is_empty() {
                             instructions.push_str("\n\n");
                         }
-                        instructions.push_str(t);
+                        instructions.push_str(&t);
                     }
                 }
                 "assistant" if m.get("tool_calls").is_some() => {
@@ -1518,7 +1489,10 @@ pub fn chat_to_responses(body: &Value) -> Value {
                     input.push(json!({
                         "type": "function_call_output",
                         "call_id": m.get("tool_call_id").cloned().unwrap_or(json!("")),
-                        "output": m.get("content").and_then(|c| c.as_str()).unwrap_or(""),
+                        // 同 system：工具结果的 content 也可能是分块数组（把文件内容包成
+                        // `[{"type":"text",...}]` 的客户端不少），`as_str()` 会让整条结果变空串
+                        // → 模型看到「工具执行了但什么都没返回」，比报错更难查。
+                        "output": extract_text_content(m.get("content")),
                     }));
                 }
                 _ => {
@@ -1636,6 +1610,26 @@ pub fn responses_resp_to_chat(body: &Value) -> Value {
                             // 与工具声明一致（见 join_namespaced_tool_name）。
                             "name": join_namespaced_tool_name(item),
                             "arguments": item.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}"),
+                        }
+                    }));
+                }
+                // 🔴 Codex 的 type:"custom" 工具（apply_patch / exec）回程是 `custom_tool_call`，
+                // 载荷是**裸字符串** `input` 而不是 JSON `arguments`。不认它的表现：item 落进
+                // 下面的 `_ => {}` 被吞 → `tool_calls` 为空 → `finish_reason` 变 `"stop"`
+                // → 下游客户端认为模型压根没调工具（「模型从不执行 apply_patch」）。
+                //
+                // **流式那条路径一直是对的**（`sse.rs` 有 20 处 custom_tool_call），所以这个缺陷
+                // 只在 `stream:false` 时出现 —— 同一个客户端开不开流式行为不同，最难归因。
+                // 包装口径与请求侧 [`responses_to_chat`] 的 `custom_tool_call` 分支对称：
+                // 那边把 `{"input":…}` 解回裸串，这边把裸串包成 `{"input":…}`。
+                Some("custom_tool_call") => {
+                    let input_str = item.get("input").and_then(|i| i.as_str()).unwrap_or("");
+                    tool_calls.push(json!({
+                        "id": item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(json!("")),
+                        "type": "function",
+                        "function": {
+                            "name": join_namespaced_tool_name(item),
+                            "arguments": json!({ "input": input_str }).to_string(),
                         }
                     }));
                 }
@@ -3511,5 +3505,138 @@ mod tests {
         let tool_msg = msgs.iter().find(|m| m["role"] == "tool").expect("缺 tool 结果消息");
         assert_eq!(tool_msg["tool_call_id"], "c1");
         assert_eq!(tool_msg["content"], "done");
+    }
+
+    /// 🔴 `developer` 在**两个**方向上都必须落进「独立指令槽」。
+    ///
+    /// Anthropic 那侧早就修了（注释里记着 Codex 的 skills 装在 developer 里），
+    /// 而 `chat_to_responses` 漏了整整一轮 —— 本仓最熟的「只修了一条路径」形态。
+    /// 漏掉的表现是静默的：skill 指令混进普通对话消息，模型遵守度下降。
+    #[test]
+    fn developer_is_instructions_in_both_directions() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                { "role": "developer", "content": "必须使用 skill X" },
+                { "role": "user", "content": "hi" }
+            ]
+        });
+
+        let resp = chat_to_responses(&body);
+        assert_eq!(
+            resp["instructions"], "必须使用 skill X",
+            "developer 要进 instructions，不能落进 input[] 当普通消息"
+        );
+        let roles: Vec<&str> = resp["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i.get("role").and_then(|r| r.as_str()))
+            .collect();
+        assert_eq!(roles, vec!["user"], "input[] 里不该再有 developer 消息");
+
+        // 对照：Anthropic 方向本来就是对的，一并钉住，防日后有人「统一」时改坏这半。
+        let anth = openai_to_anthropic(&body);
+        assert_eq!(anth["system"], "必须使用 skill X");
+    }
+
+    /// 🔴 分块数组形态的 content 不许被 `as_str()` 吃成空串。
+    ///
+    /// Chat 允许 system/developer/tool 的 content 是 `[{"type":"text",…}]`。
+    /// 旧写法对数组返回 None → 整条 system 提示词消失、连 `instructions` 都不产出
+    /// （请求 200、模型完全不带人设作答）；工具结果那条则变成「执行了但什么都没返回」。
+    #[test]
+    fn array_shaped_content_survives_chat_to_responses() {
+        let out = chat_to_responses(&json!({
+            "model": "m",
+            "messages": [
+                { "role": "system", "content": [ { "type": "text", "text": "你是助手" } ] },
+                { "role": "tool", "tool_call_id": "c1",
+                  "content": [ { "type": "text", "text": "文件内容" } ] }
+            ]
+        }));
+        assert_eq!(out["instructions"], "你是助手", "数组形态的 system 不能丢");
+        let outputs: Vec<&str> = out["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["type"] == "function_call_output")
+            .filter_map(|i| i["output"].as_str())
+            .collect();
+        assert_eq!(outputs, vec!["文件内容"], "数组形态的工具结果不能变空串");
+    }
+
+    /// 🔴 非流式回程必须还原 `custom_tool_call`（Codex 的 apply_patch / exec）。
+    ///
+    /// 流式那条路径一直是对的（`sse.rs` 处理了），所以这个缺陷**只在 `stream:false` 时出现**
+    /// —— 同一个客户端开不开流式行为不同，是最难归因的一类。被吞掉时 `tool_calls` 为空、
+    /// `finish_reason` 变 `"stop"`，下游认定模型没调工具。
+    #[test]
+    fn a_custom_tool_call_is_not_swallowed_on_the_non_streaming_return_path() {
+        let chat = responses_resp_to_chat(&json!({
+            "id": "resp_1",
+            "model": "m",
+            "status": "completed",
+            "output": [ {
+                "type": "custom_tool_call",
+                "call_id": "call_9",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** End Patch"
+            } ]
+        }));
+        let choice = &chat["choices"][0];
+        assert_eq!(
+            choice["finish_reason"], "tool_calls",
+            "被吞掉时这里会是 stop —— 下游据此认为模型没调工具"
+        );
+        let tc = &choice["message"]["tool_calls"][0];
+        assert_eq!(tc["id"], "call_9");
+        assert_eq!(tc["function"]["name"], "apply_patch");
+        // 裸串要包成 {"input": …}，与请求侧 responses_to_chat 的解包严格对称。
+        let args: Value = serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["input"], "*** Begin Patch\n*** End Patch");
+    }
+
+    /// 🔴 结构化输出约束必须也能到 **Anthropic** 上游。
+    ///
+    /// 此前只在 Chat↔Responses 之间双向转，于是同一个客户端在 Chat/Responses Key 上好用、
+    /// 故障转移落到 Anthropic Key 就静默回散文 → 客户端 `JSON.parse` 炸掉、日志无线索。
+    ///
+    /// 字段名钉死为 `output_config.format`：`output_format` 是 beta 期的旧名，
+    /// 官方明说新代码用前者，而写错**不是**静默失败 —— Anthropic 对未知顶层字段返 400。
+    #[test]
+    fn structured_output_reaches_anthropic_upstreams_too() {
+        let schema = json!({ "type": "object", "properties": { "a": { "type": "string" } } });
+
+        // 下游是 Chat 形态（嵌套 json_schema）
+        let from_chat = openai_to_anthropic(&json!({
+            "model": "m",
+            "messages": [ { "role": "user", "content": "hi" } ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": { "name": "r", "schema": schema.clone() }
+            }
+        }));
+        assert_eq!(from_chat["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(from_chat["output_config"]["format"]["schema"], schema);
+        assert!(
+            from_chat.get("output_format").is_none(),
+            "别用 beta 期的旧名 output_format"
+        );
+
+        // 下游是 Responses 形态（摊平 text.format）
+        let from_responses = openai_to_anthropic(&json!({
+            "model": "m",
+            "messages": [ { "role": "user", "content": "hi" } ],
+            "text": { "format": { "type": "json_schema", "schema": schema.clone() } }
+        }));
+        assert_eq!(from_responses["output_config"]["format"]["schema"], schema);
+
+        // 没配结构化输出时**一个字节都不加**：绝大多数请求走这条，多一个未知字段就是 400。
+        let plain = openai_to_anthropic(&json!({
+            "model": "m",
+            "messages": [ { "role": "user", "content": "hi" } ]
+        }));
+        assert!(plain.get("output_config").is_none());
     }
 }

@@ -23,7 +23,7 @@
     "src-tauri/src/service.rs": 1443,
     "src-tauri/src/store.rs": 2903,
     "src-tauri/src/tools.rs": 1909,
-    "src-tauri/src/upstream/convert.rs": 1690,
+    "src-tauri/src/upstream/convert.rs": 1684,
     "src-tauri/src/upstream/sse.rs": 1247,
     "src/components/KeyEditor.tsx": 1624,
     "src/lib/i18n.ts": 1469,
