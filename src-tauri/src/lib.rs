@@ -205,7 +205,6 @@ fn set_primary_key(
     Ok(changed)
 }
 
-
 /// 上移 / 下移某 Key 的优先级（相邻交换 + 整列连续重编号）。
 ///
 /// 为什么收进后端、而不是让前端重编号后并发 `upsert_key`（旧实现）：
@@ -235,7 +234,8 @@ fn move_key(
             )))
         }
     };
-    let changed = state.store.move_key(category_id, &key_id, up)?;
+    // 必须过 `sync_after`：重排会改客户端的**默认模型**，理由见 `client_resync` 模块头。
+    let changed = client_resync::sync_after(&state, state.store.move_key(category_id, &key_id, up))?;
     if changed {
         // 主 Key 可能因此易主（上移到 0 / 原主被顶下去）→ 托盘勾选要跟上。
         let _ = rebuild_tray(&app);
@@ -960,7 +960,7 @@ async fn pick_and_preview_import(
 }
 
 /// 执行导入。`path` 来自 `pick_and_preview_import`；`mode` 由用户当场选。
-/// 编排（含「为何重新读盘而不缓存预检结果」）在 [`service::apply_import_config`]。
+/// 编排在 [`service::apply_import_config`]；整份换 Key → 清单集合必变，故也过 `sync_after`。
 #[tauri::command]
 async fn apply_import_config(
     state: tauri::State<'_, AppState>,
@@ -968,7 +968,7 @@ async fn apply_import_config(
     mode: portable::ImportMode,
     password: Option<String>,
 ) -> AppResult<portable::ImportReport> {
-    service::apply_import_config(&state.store, &path, mode, password.as_ref())
+    client_resync::sync_after(&state, service::apply_import_config(&state.store, &path, mode, password.as_ref()))
 }
 
 /// 统计孤儿密钥条数（P2-3）：密钥库里有、但配置里已无对应 Key 的残留。
@@ -1866,7 +1866,7 @@ fn handle_tray_proxy_toggle(app: &tauri::AppHandle, id: &str) {
     });
 }
 
-/// 托盘「主 Key」项被点击：把该 Key 设为所属分类的主（优先级 0）。
+/// 托盘「主 Key」项被点击：设为该分类的主（优先级 0）**并同步客户端配置**（同界面那条）。
 ///
 /// id 形如 `primary::<分类>::<keyId>`。keyId 本身可能含 `::`（UUID 不会，但不做无据假设），
 /// 故按**首个** `::` 切分，右侧整体当 keyId。
@@ -1876,7 +1876,7 @@ fn handle_tray_set_primary(app: &tauri::AppHandle, id: &str) {
     let Some(category) = parse_tray_category(cat_str) else { return };
 
     let state = app.state::<AppState>();
-    match service::set_primary_key(&state.store, category, key_id, service::PrimarySource::Tray) {
+    match client_resync::sync_after(&state, service::set_primary_key(&state.store, category, key_id, service::PrimarySource::Tray)) {
         // 改成功：刷托盘让勾选跟上。
         Ok(true) => {
             let _ = rebuild_tray(app);

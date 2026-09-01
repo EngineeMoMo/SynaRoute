@@ -8,6 +8,78 @@
 
 use crate::model::CategoryType;
 use crate::store::Store;
+
+/// 遮掉 URL 里可能就是凭据的部分：`user:pass@`、像令牌的路径段、全部 query 值。
+///
+/// # 🔴 为什么需要它（审查发现）
+///
+/// 本文件开头对用户声明「本文件**不**包含：任何 API 密钥明文」，而 `base_url` 此前
+/// **原样打印两次**（Key 摘要行 + 「配置（已脱敏）」那段 JSON）—— 那份脱敏只按**键名**
+/// 与 `sk-` 前缀判，`baseUrl` 不在清单里。
+///
+/// 而同仓 [`crate::route_meta`] 为**同一个字段**立的规矩正好相反，原文：
+/// 「部分中转站把访问令牌放在 URL 路径里（`https://host/v1/<token>/`）。把 URL 写进响应头
+/// 等于把密钥回显给下游。`RouteMeta` 结构里**故意不留** url 字段，让这件事在编译期就做不到。」
+///
+/// 同一条风险，一处编译期禁掉、另一处写进用户要发给别人的报告 —— 而报告开头还向他保证不含密钥。
+///
+/// # 为什么不整段遮掉
+///
+/// 原注释说得对：`base_url` 常是问题根源（协议选错、路径写错），整段遮掉会拿走这份诊断价值。
+/// 故只遮**像凭据**的部分，`https://api.example.com/v1` 这类原样保留。
+///
+/// # 判据：长且不含点的 opaque 段
+///
+/// 真实路径段是词（`v1`/`chat`/`completions`/`openai`）或带点的域名式片段；令牌是 ≥16 位的
+/// 无意义串。**宁可多遮一个长段，也不能漏一个令牌** —— 前者只是报告里少一行线索，
+/// 后者是把用户的付费凭据发给了他正在求助的那个人。
+fn mask_url_credentials(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (format!("{s}://"), r),
+        None => (String::new(), url),
+    };
+    // query 一律只留键名：`?key=xxx` / `?token=xxx` 是另一种常见放法。
+    let (path_part, query) = match rest.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (rest, None),
+    };
+    let mut segs = path_part.split('/');
+    // 第一段是 host（可能带 `user:pass@`）。userinfo 里的密码是明确的凭据。
+    let host = segs.next().unwrap_or("");
+    let host = match host.rsplit_once('@') {
+        Some((_userinfo, h)) => format!("***@{h}"),
+        None => host.to_string(),
+    };
+    let mut out = format!("{scheme}{host}");
+    for seg in segs {
+        out.push('/');
+        if looks_like_token(seg) {
+            out.push_str("***");
+        } else {
+            out.push_str(seg);
+        }
+    }
+    if let Some(q) = query {
+        out.push('?');
+        let masked: Vec<String> = q
+            .split('&')
+            .map(|kv| match kv.split_once('=') {
+                Some((k, _)) => format!("{k}=***"),
+                None => kv.to_string(),
+            })
+            .collect();
+        out.push_str(&masked.join("&"));
+    }
+    out
+}
+
+/// 路径段是否像令牌：≥16 位、只由 token 字符组成、且**不含点**（域名式片段要留着）。
+fn looks_like_token(seg: &str) -> bool {
+    seg.len() >= 16
+        && !seg.contains('.')
+        && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 // ==== 诊断报告（UX#12）====
 
 /// 诊断报告里那些**只能由 lib.rs 提供**的运行环境信息。
@@ -81,6 +153,13 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
         "- 丢弃日志条数（打不开文件，如盘满/目录不可写）：{}",
         crate::store::log_rotate::open_failed_line_count()
     );
+    // 第三条：文件打开成功、写入/冲刷失败（卷写满或掉线）。上面两行在这条路径上都读 0，
+    // 而「报告说没丢、日志正在丢」是这三行存在的全部理由。
+    let _ = writeln!(
+        r,
+        "- 丢弃日志条数（写入失败，如卷已满/已掉线）：{}",
+        crate::store::log_rotate::write_failed_line_count()
+    );
     // 状态推送也可能丢（队列满）。丢了不影响正确性——前端 30s 兜底轮询会追上——
     // 但「界面偶尔慢半拍」的排障线索就在这个数字里，必须能被问到。
     let _ = writeln!(r, "- 丢弃状态推送数（队列满）：{}", crate::events::dropped_count());
@@ -144,8 +223,10 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
                 k.models.len(),
                 k.mappings.len()
             );
-            // base_url 单列一行：它常是问题根源（协议选错、路径写错），但不含密钥，可以给。
-            let _ = writeln!(r, "  base_url: {}", k.base_url);
+            // base_url 单列一行：它常是问题根源（协议选错、路径写错）。
+            // **必须过 `mask_url_credentials`** —— 中转站会把令牌放在 URL 路径里，
+            // 而本报告开头向用户保证「不含任何 API 密钥明文」。理由全文见该函数。
+            let _ = writeln!(r, "  base_url: {}", mask_url_credentials(&k.base_url));
         }
     }
     let _ = writeln!(r);
@@ -154,7 +235,21 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
     let _ = writeln!(r, "```json");
     match store.redacted_config_json() {
         Ok(s) => {
-            let _ = writeln!(r, "{s}");
+            // redacted_config_json 只管键名与 sk- 前缀，不碰 base_url —— 那要另外遮。
+            if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(keys) = v.get_mut("keys").and_then(|k| k.as_array_mut()) {
+                    for k_val in keys {
+                        if let Some(base_url_val) = k_val.get_mut("baseUrl") {
+                            if let Some(url_str) = base_url_val.as_str() {
+                                *base_url_val = serde_json::Value::String(mask_url_credentials(url_str));
+                            }
+                        }
+                    }
+                }
+                let _ = writeln!(r, "{}", serde_json::to_string_pretty(&v).unwrap_or(s));
+            } else {
+                let _ = writeln!(r, "{s}");
+            }
         }
         Err(e) => {
             let _ = writeln!(r, "（读取配置失败：{e}）");
@@ -220,6 +315,56 @@ mod tests {
     // 「ProviderKey 加了字段」这类改动会让两处各自漂移，而漂移的表现是
     // 「一边测的还是旧结构」——比重复本身更糟。
     use crate::service::tests::{key, temp_store};
+
+    #[test]
+    fn mask_url_credentials_preserves_normal_paths() {
+        assert_eq!(mask_url_credentials("https://api.example.com/v1"), "https://api.example.com/v1");
+        assert_eq!(mask_url_credentials("https://api.example.com/v1/chat/completions"), "https://api.example.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn mask_url_credentials_hides_userinfo() {
+        assert_eq!(mask_url_credentials("https://user:pass@api.example.com/v1"), "https://***@api.example.com/v1");
+    }
+
+    #[test]
+    fn mask_url_credentials_hides_token_segments() {
+        assert_eq!(
+            mask_url_credentials("https://api.example.com/v1/sk-proj-abc123def456ghi789jkl012mno345pqr678stu901vwx234yz/chat"),
+            "https://api.example.com/v1/***/chat"
+        );
+        assert_eq!(
+            mask_url_credentials("https://relay.example.com/v1/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9/completions"),
+            "https://relay.example.com/v1/***/completions"
+        );
+    }
+
+    #[test]
+    fn mask_url_credentials_hides_query_values() {
+        assert_eq!(
+            mask_url_credentials("https://api.example.com/v1?key=secret123&token=abc"),
+            "https://api.example.com/v1?key=***&token=***"
+        );
+    }
+
+    #[test]
+    fn mask_url_credentials_preserves_dotted_segments() {
+        // 域名式片段（带点）不该被当成令牌遮掉
+        assert_eq!(
+            mask_url_credentials("https://api.example.com/v1/some.qualified.name/chat"),
+            "https://api.example.com/v1/some.qualified.name/chat"
+        );
+    }
+
+    #[test]
+    fn looks_like_token_recognizes_opaque_long_segments() {
+        assert!(looks_like_token("sk-proj-abc123def456ghi789jkl012mno345pqr"));
+        assert!(looks_like_token("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"));
+        assert!(!looks_like_token("v1"));
+        assert!(!looks_like_token("chat"));
+        assert!(!looks_like_token("completions"));
+        assert!(!looks_like_token("some.qualified.name"));
+    }
 
     /// 诊断报告**绝不能含密钥明文**，且必须自带「包含/不含什么」的声明。
     ///

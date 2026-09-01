@@ -50,6 +50,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// 而 `store.rs` 的棘轮余量是 0。进程级 static 与 `log_dropped` 的
 /// 「每进程一个 Store」语义一致。
 static OPEN_FAILED_LINES: AtomicU64 = AtomicU64::new(0);
+/// 第三条丢日志路径的计数，理由见 [`note_write_failed_line`]。
+static WRITE_FAILED_LINES: AtomicU64 = AtomicU64::new(0);
 
 /// 记一次「因打不开文件而丢行」。**由写线程在 `OpenLog::open` 失败时调用。**
 ///
@@ -78,6 +80,31 @@ pub(crate) fn note_open_failed_line() {
 ///   本仓 `flush_logs_drains_the_queue` 当场就红了（加这条时实际踩到）。
 pub(crate) fn open_failed_line_count() -> u64 {
     OPEN_FAILED_LINES.load(Ordering::Relaxed)
+}
+
+/// 🔴 **第三条丢日志路径**：文件打开成功、`write_all` / `flush` 却失败（审查发现）。
+///
+/// 上面那两条覆盖不到它 —— 当天日志文件**已存在且已被 append 打开**时 `OpenLog::open`
+/// 不会失败，于是盘满只在 `write_line` 的 `Err` 分支现形，而那里原本只 `tracing::warn!` 一句。
+///
+/// 危害与 [`note_open_failed_line`] **完全同形**：诊断报告那两行都读 0，
+/// 排障者据此判定「没丢过日志」，而日志正在成片丢失。更糟的是那句 `warn!` 用户看不到 ——
+/// `tracing_subscriber::fmt()` 默认写 stdout，而双击启动的 GUI 进程没有控制台。
+///
+/// **刻意做成第三个数字，不并进前两个**（同前两条分开的理由）：
+/// 「打不开」指向路径/权限坏了，「打开了但写不进」几乎总是卷写满或卷掉线 ——
+/// 两者处置不同。而 `flush` 的错误也走这里：`write_all` 只把字节交给 `BufWriter`，
+/// 真正的 ENOSPC 往往在 flush 时才浮出来，两处不同计数会让同一次盘满被记两遍。
+pub(crate) fn note_write_failed_line() {
+    let n = WRITE_FAILED_LINES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 100 == 0 {
+        tracing::warn!("写入日志文件失败，累计丢弃 {n} 条（磁盘可能已满或卷已掉线）");
+    }
+}
+
+/// 因写入/冲刷失败而丢掉的行数。诊断报告单独打一行，理由见 [`note_write_failed_line`]。
+pub(crate) fn write_failed_line_count() -> u64 {
+    WRITE_FAILED_LINES.load(Ordering::Relaxed)
 }
 
 /// 单个日志文件的字节上限。超过即滚到下一个序号。
@@ -198,7 +225,9 @@ impl OpenLog {
         // （旧的 writeln! 会拆成两次写，多线程下产生粘行）。
         match self.w.write_all(&buf) {
             Ok(()) => self.size += buf.len() as u64,
-            Err(e) => tracing::warn!("写入日志文件失败: {e}"),
+            // 计数而不只是 warn：那句 warn 用户看不见（GUI 无控制台），而诊断报告里
+            // 前两个数字在这条路径上都读 0 —— 详见 `note_write_failed_line`。
+            Err(_) => note_write_failed_line(),
         }
     }
 
@@ -287,8 +316,13 @@ impl OpenLog {
         }
     }
 
+    /// 冲刷缓冲区。**错误必须计数，不能 `let _ =` 吞掉** —— `write_all` 只把字节交给
+    /// `BufWriter`，盘满（ENOSPC）往往到这里才浮出来。吞掉它的表现正是本模块要消除的那个：
+    /// 日志在丢，而诊断报告里三个数字全读 0。
     pub(crate) fn flush(&mut self) {
-        let _ = self.w.flush();
+        if self.w.flush().is_err() {
+            note_write_failed_line();
+        }
     }
 }
 
@@ -551,6 +585,43 @@ mod tests {
             open_failed_line_count(),
             before + 2,
             "打不开文件丢掉的行必须计数，否则诊断报告会在盘满时报 0"
+        );
+    }
+
+    /// 🔴 **第三条丢日志路径**：文件打开成功、写入/冲刷却失败（审查发现）。
+    ///
+    /// 上面两条覆盖不到它 —— 当天文件**已存在且已被 append 打开**时 `OpenLog::open`
+    /// 不会失败，于是盘满只在 `write_line` 的 `Err` 分支现形，而那里原本只
+    /// `tracing::warn!` 一句。三个数字全读 0 而日志正在成片丢失，正是这一组计数要消除的东西；
+    /// 那句 warn 也救不了：`tracing_subscriber::fmt()` 默认写 stdout，双击启动的 GUI 无控制台。
+    ///
+    /// 两处都必须接上：`write_all` 的 Err **与** `flush` 的 Err。后者尤其关键 ——
+    /// `write_all` 只把字节交给 `BufWriter`，真正的 ENOSPC 往往到 flush 才浮出来，
+    /// 而 `flush` 原本是 `let _ = self.w.flush();`，把它整个吞掉。
+    ///
+    /// 用 `production_code_only` 而不是 `production_slice`：本条查的是「代码里必须出现某字面量」，
+    /// 而本文件注释里就写着这些函数名 —— 本仓已 5 次栽在「注释满足了断言」上。
+    #[test]
+    fn the_write_failure_path_is_counted_at_both_exits_and_shown_in_diagnostics() {
+        let prod = crate::proxy::custom_headers::production_code_only(include_str!("log_rotate.rs"));
+        assert_eq!(
+            prod.matches("note_write_failed_line()").count(),
+            3,
+            "定义 1 处 + write_all 的 Err 1 处 + flush 的 Err 1 处，缺一处即有一条路径静默丢日志"
+        );
+        // 🔴 只看 `flush()` 的函数体。第一版扫全文件，把 `roll()` 里那句**正当的**
+        // 滚动前冲刷（那里失败也无处可去，且紧接着就换文件）一起抓了 —— 测试当场红而代码是对的。
+        // 同本仓「判据存在 ≠ 判对了维度」：范围错了的判据会逼人去改一段没问题的代码。
+        let at = prod.find("pub(crate) fn flush").expect("flush 改名了，请同步本判据");
+        let body = &prod[at..prod[at..].find("\n    }").map(|i| at + i).unwrap_or(prod.len())];
+        assert!(
+            !body.contains("let _ = self.w.flush();"),
+            "flush 的错误不许吞掉 —— 盘满往往正是在这里才浮出来：{body}"
+        );
+        let diag = crate::proxy::custom_headers::production_code_only(include_str!("diagnostics.rs"));
+        assert!(
+            diag.contains("write_failed_line_count()"),
+            "诊断报告必须打这个数字，否则计数了也没人看得到"
         );
     }
 

@@ -137,8 +137,6 @@ pub struct Store {
     usage_baseline_date: RwLock<String>,
 }
 
-
-
 /// 用量累计的定时落盘间隔（秒）。
 ///
 /// 60s 是「最多丢 1 分钟用量」与「写盘频率」之间的取舍：
@@ -540,7 +538,6 @@ impl Store {
         }
         added
     }
-
 
     /// 迁移余额查询 URL：将旧的错误默认值 `/v1/usage` 改为正确的 `/user/balance`。
     ///
@@ -1339,6 +1336,9 @@ impl Store {
             // 用户**从未点过启动**、客户端却已被指向 127.0.0.1，而这台机器的 Key 可能一条都
             // 没配好 —— 客户端当场不可用，且没人会往「我昨天导入了配置」上想。
             incoming.proxy_running_categories = cfg.settings.proxy_running_categories.clone();
+            // 同为本机运行态，且失效方向是**安全**的（界面说已关、socket 仍在 0.0.0.0 上）。
+            // 理由全文见 `portable::strip_machine_local`。
+            incoming.lan_exposure = cfg.settings.lan_exposure;
             cfg.settings = incoming;
             Ok(removed)
         })
@@ -1368,7 +1368,8 @@ impl Store {
             self.config.read().keys.iter().map(|k| k.id.clone()).collect();
         let orphans: Vec<String> = {
             let sec = self.secrets.read();
-            sec.all_key_ids().into_iter().filter(|id| !live.contains(id)).collect()
+            // 跳过库内部条目（局域网令牌）—— 删了它局域网客户端立刻 401，见 `is_internal_secret_id`。
+            sec.all_key_ids().into_iter().filter(|id| !live.contains(id) && !crate::proxy::lan_guard::is_internal_secret_id(id)).collect()
         };
         let mut n = 0;
         for id in &orphans {
@@ -1393,7 +1394,7 @@ impl Store {
         let live: std::collections::HashSet<String> =
             self.config.read().keys.iter().map(|k| k.id.clone()).collect();
         let sec = self.secrets.read();
-        sec.all_key_ids().into_iter().filter(|id| !live.contains(id)).count()
+        sec.all_key_ids().into_iter().filter(|id| !live.contains(id) && !crate::proxy::lan_guard::is_internal_secret_id(id)).count()
     }
 
     /// 让每个 Key 的 `has_secret` 标记与密钥库实际内容对账，返回「标记有但实际没有」的条数。
@@ -1807,7 +1808,6 @@ impl Store {
         self.health_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
-
 
     /// 标记「用量累计有未落盘的变更」。
     fn mark_usage_dirty(&self) {
@@ -3026,6 +3026,114 @@ mod tests {
     /// 「上移/下移」也走整份 upsert，同样踩这条。cached_balance 同理（旧余额顶回卡片）。
     ///
     /// 故障注入判据：去掉 upsert_key 里沿用 health/cached_balance 的两行，本测试立即变红。
+    /// 🔴 **导入配置不许改写「局域网暴露」**（审查发现）。
+    ///
+    /// `model.rs` 把 `lan_exposure` 从 `UserPrefs` 移出时写明了理由：绑定地址在
+    /// `ProxyManager::start` 里**一次定死**，只落盘不重建监听 → 关掉开关后端口仍在
+    /// `0.0.0.0` 上，界面说「已关闭」而实际对整个局域网敞开（**安全方向**的「界面说 A、实际 B」）。
+    /// 为此它有了专用命令 `set_lan_exposure`（落盘 + 重启在跑的代理）。
+    ///
+    /// 而导入走的正是那条被封掉的**整份覆盖**路径（`cfg.settings = incoming`），
+    /// 于是能原样造出同一个失效：在一台局域网开着且代理在跑的机器上导入一份 `false` 的配置 →
+    /// 开关显示关、socket 还在 `0.0.0.0` 上。反方向（导入 `true`）是「界面说开着、
+    /// 局域网连不上」—— 不安全但同样撒谎。
+    ///
+    /// 两侧都要管：导出侧 `strip_machine_local` 不带它（老版本导入也不会中招），
+    /// 导入侧保留本机值。本测试盯导入侧；导出侧由 `portable.rs` 那条盯。
+    #[test]
+    fn importing_a_config_must_not_flip_lan_exposure() {
+        let dir = temp_dir("import_vs_lan");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        // 本机：局域网**开着**（危险方向的前提）。
+        store
+            .mutate_and_persist(|cfg| {
+                cfg.settings.lan_exposure = true;
+                Ok(())
+            })
+            .unwrap();
+
+        // 导入一份「关着」的配置（源机器从没开过局域网）。
+        // `theme` 是一个正常该被导入的字段，用来证明导入本身生效了（否则断言是空洞的绿）。
+        let incoming = crate::model::AppSettings {
+            lan_exposure: false,
+            theme: "dark".into(),
+            ..Default::default()
+        };
+        let payload = crate::portable::ExportPayload {
+            keys: vec![],
+            brain: store.snapshot_config().brain.clone(),
+            vendors: vec![],
+            settings: incoming,
+        };
+        store
+            .apply_imported_config(&payload, crate::portable::ImportMode::Merge)
+            .unwrap();
+
+        assert!(
+            store.get_settings().lan_exposure,
+            "导入不许改写 lan_exposure —— 翻成 false 会让界面说「已关闭」而 socket 仍在 0.0.0.0 上"
+        );
+        assert_eq!(
+            store.get_settings().theme, "dark",
+            "前置条件：导入本身要生效，否则上面那条断言是空洞的绿"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 🔴 **「清理孤儿密钥」不许删掉局域网接入令牌**（审查发现）。
+    ///
+    /// 孤儿判据是 `!live.contains(id)`，而 `live` 只由 `cfg.keys` 的 id 构成 ——
+    /// `__lan_access_token` 永远不在里面，于是它**每次**都被判成孤儿。
+    ///
+    /// 用户视角：设置页说「检测到 N 条可清理的旧密钥」并明示这个操作**不影响使用**，
+    /// 点下去之后**所有已配好的局域网客户端立刻 401**，而他不知道自己刚做了什么 ——
+    /// 令牌的唯一出口是设置页，删掉就再也拿不回那一个（要重新生成并改每个客户端）。
+    ///
+    /// 还有一重更日常的：`count_orphan_secrets` 用同一判据，所以**一个真孤儿都没有的用户
+    /// 会永久看到「检测到 1 条可清理」**，点了清理数字才归零 —— 而代价是令牌。
+    ///
+    /// ⚠️ `lan_guard::TOKEN_ID` 的注释原先明确写着「不会被孤儿密钥清理当成孤儿删掉」，
+    /// 理由是「它本就不在 `keys` 里」—— **因果正好说反**：那恰恰是它会被删的原因。
+    /// 而 `token_id_is_frozen` 复述了同一句假话却只验 id 形态，压根没验清理行为。
+    ///
+    /// 注入验证：去掉两处 `is_internal_secret_id` 过滤中的任意一处，本测试变红。
+    #[test]
+    fn the_lan_token_survives_orphan_pruning() {
+        let dir = temp_dir("lan_token_vs_prune");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // 一条真 Key（有密钥）+ 一条真孤儿（密钥库有、配置里没有）+ 局域网令牌。
+        let mut k = sample_key("k1", 0);
+        k.id = "k1".into();
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("k1", "sk-live").unwrap();
+        store.secrets.write().set("orphan-uuid", "sk-orphan").unwrap();
+        crate::proxy::lan_guard::ensure_token(&store);
+        let token = crate::proxy::lan_guard::read_lan_token_from(&store)
+            .unwrap()
+            .expect("前置条件：令牌已生成");
+
+        // 只该数到那一条真孤儿 —— 数成 2 就是「零孤儿的用户永久看到 1 条」那个现象。
+        assert_eq!(store.count_orphan_secrets(), 1, "令牌不该被算成孤儿");
+        assert_eq!(store.prune_orphan_secrets(), 1, "只该清掉那条真孤儿");
+
+        // 🔴 真正的判据：令牌还在，且值没变。
+        assert_eq!(
+            crate::proxy::lan_guard::read_lan_token_from(&store).unwrap().as_deref(),
+            Some(token.as_str()),
+            "清理孤儿把局域网令牌删了 —— 所有已配好的局域网客户端会立刻 401"
+        );
+        // 真 Key 的密钥不受影响；那条真孤儿确实被清掉了。
+        assert!(store.secrets.read().get("k1").unwrap().is_some(), "在用的密钥不许动");
+        assert!(store.secrets.read().get("orphan-uuid").unwrap().is_none(), "真孤儿该被清掉");
+        // 清完应当归零（幂等），否则用户会看到一个永远清不掉的数字。
+        assert_eq!(store.count_orphan_secrets(), 0, "清完必须归零");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn upsert_key_preserves_runtime_state_against_stale_client_snapshot() {
         let dir = temp_dir("upsert_keeps_runtime");

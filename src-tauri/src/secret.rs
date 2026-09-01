@@ -245,6 +245,18 @@ impl SecretStore {
         })
     }
 
+    /// 🔴 「读取失败」降级下一律**拒绝写库**；`set` 与 `remove` 共用（各写一份必然漂移，判据见测试段）。
+    fn refuse_if_unreadable(&self) -> AppResult<()> {
+        if self.unreadable {
+            return Err(AppError::Invalid(
+                "密钥库本次启动读取失败（文件可能被杀毒/备份软件临时占用），为避免覆盖磁盘上完好的密钥，已拒绝保存。\
+                 请重启 SynaRoute 后再试；若持续失败，请检查是否有软件正在占用 secrets.enc。"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// 保存一条密钥（按当前模式加密）。
     ///
     /// 主口令模式下未解锁则**拒绝写入**——不能退回 DPAPI 加密，否则库里会同时存在两种密文，
@@ -254,20 +266,7 @@ impl SecretStore {
     /// 旧密文，切模式后会读出**过期的密钥**（用户改过密钥、切回原模式却拿到改之前那条），
     /// 表现为「明明更新过密钥却仍报鉴权失败」。
     pub fn set(&mut self, key_id: &str, secret: &str) -> AppResult<()> {
-        if self.unreadable {
-            // **只在「读取失败」这一种降级下拒写**（与「解析失败」区别对待，两者后果完全不同）：
-            // - 解析失败：磁盘那份已经损坏，里面的密文本来就解不出来 → 允许「先备份原文件再写」
-            //   （见 persist 的降级分支），让用户能继续用；这是既有的、有测试的刻意设计。
-            // - 读取失败（杀软/备份软件/OneDrive 短暂独占）：磁盘那份**完好无损**，只是本次读不到。
-            //   此时写入会把一份健康的库（可能带 master 头部 + N 条密钥）换成「空库 + 这一条」，
-            //   虽然 persist 会留个 .corrupt-* 备份，但主口令保护会静默降级成 DPAPI、
-            //   用户界面显示「主口令已关闭」，而正确做法只是**重启重试**即可完全恢复。
-            return Err(AppError::Invalid(
-                "密钥库本次启动读取失败（文件可能被杀毒/备份软件临时占用），为避免覆盖磁盘上完好的密钥，已拒绝保存。\
-                 请重启 SynaRoute 后再试；若持续失败，请检查是否有软件正在占用 secrets.enc。"
-                    .into(),
-            ));
-        }
+        self.refuse_if_unreadable()?;
         if self.is_master_mode() {
             let boxed = {
                 let key = self.require_vault_key()?;
@@ -358,6 +357,7 @@ impl SecretStore {
     }
 
     pub fn remove(&mut self, key_id: &str) -> AppResult<()> {
+        self.refuse_if_unreadable()?; // 同 `set`：降级态下删一条会把整份库换成空库
         // 两个 map 都删：模式切换过程中断时同 id 可能两处都有，只删一个会留下能被
         // 反向模式读出的残留密文。
         self.vault.entries.remove(key_id);
@@ -1117,9 +1117,9 @@ pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> AppResult<()> {
         }
     }
 
-    let _ = std::fs::remove_file(&tmp);
+    // 🔴 **失败路径绝不删 tmp**：它是上面那句「最后保障」，而这里正是需要它的唯一时刻。判据见测试段。
     Err(ctx(
-        "原地写(回退)",
+        &format!("原地写(回退)；完整数据仍在 {} —— 请把它复制回目标文件", tmp.display()),
         &last_err.unwrap_or_else(|| std::io::Error::other("未知落盘错误")),
     ))
 }
@@ -1136,6 +1136,123 @@ mod tests {
             .join(format!("synaroute_secret_test_{}_{}_{}", tag, std::process::id(), seq));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 🔴 **「读取失败」降级态下，`remove` 必须与 `set` 一样拒写**（审查发现的数据丢失）。
+    ///
+    /// `set` 早就有这道门，`remove` 没有 —— 同一个场景、相反的处置。链条：
+    /// 杀软/备份软件/OneDrive 短暂独占 `secrets.enc` → `load` 读失败 → 内存里是**空库**
+    /// （磁盘那份完好无损）→ 用户此时删掉任意一条 Key（或点一次「清理孤儿密钥」）→
+    /// `remove` 照常走到 `persist()` → **把空库整份写到磁盘上**。
+    ///
+    /// 后果比表面更重：`persist` 会留一个 `.corrupt-*` 备份，但**主口令保护会静默降级成 DPAPI**
+    /// （`master` 头部随空库一起没了），界面显示「主口令已关闭」；而正确处置本来只是**重启重试**。
+    ///
+    /// 为什么「拒绝」是对的处置而不是「照删」：两个调用方都把 `Err` 当
+    /// 「记一条 warn、残留孤儿无害」（`store.rs` 的 `delete_key` 与 `prune_orphan_secrets`），
+    /// **都不回退已完成的 config 删除**。也就是说拒绝只留下一条无害的孤儿密文，
+    /// 而放行会销毁整个库 —— 代价完全不对称。
+    ///
+    /// ⚠️ 这道门**只针对读取失败，不针对解析失败**：后者磁盘那份已经损坏、密文本来就解不出，
+    /// 允许「先备份再写」是既有的刻意设计（`persist` 的降级分支）。把两者混起来会让
+    /// 「库损坏了就再也删不掉任何东西」。
+    #[test]
+    fn removing_a_key_while_the_vault_is_unreadable_must_not_wipe_it() {
+        let dir = temp_dir("remove_in_degraded");
+        let path = dir.join("secrets.enc");
+
+        // 先造一份**健康**的库（两条密钥），落盘。
+        let mut healthy = SecretStore::load(path.clone()).unwrap();
+        healthy.set("k1", "sk-first").unwrap();
+        healthy.set("k2", "sk-second").unwrap();
+        let on_disk = std::fs::read(&path).unwrap();
+        assert!(on_disk.len() > 20, "前置条件：磁盘上得有真东西");
+
+        // 模拟「读取失败」降级：内存空库 + unreadable 标记（load 在文件被独占时就是这个状态）。
+        let mut degraded = SecretStore::load(path.clone()).unwrap();
+        degraded.vault = SecretVault::default();
+        degraded.load_failed = true;
+        degraded.unreadable = true;
+
+        let err = degraded.remove("k1").unwrap_err();
+        assert!(
+            err.to_string().contains("读取失败"),
+            "必须明确拒绝并说清原因（用户要知道「重启即可」）：{err}"
+        );
+
+        // 🔴 真正的判据不是「返回了 Err」，而是**磁盘那份没被动过**。
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            on_disk,
+            "降级态删 Key 不许碰磁盘 —— 写下去就是把健康库换成空库，用户全部密钥丢失"
+        );
+        // 重启即恢复：两条密钥都还在。
+        let reopened = SecretStore::load(path.clone()).unwrap();
+        assert!(!reopened.is_degraded(), "重新读应当成功");
+        let got = |s: &SecretStore, id: &str| s.get(id).unwrap().map(|v| v.to_string());
+        assert_eq!(got(&reopened, "k1").as_deref(), Some("sk-first"));
+        assert_eq!(got(&reopened, "k2").as_deref(), Some("sk-second"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 🔴 **回退原地写全部失败时，那份完整数据（tmp）必须留在盘上。**
+    ///
+    /// 这条是审查发现的一条 **P0 数据丢失**。链条：
+    /// 1. 企业管控机（文件夹重定向 / 配额卷）上 `fs::rename` 确定性抛跨设备错误 →
+    ///    **每一次**落盘都走原地写回退（不是偶发，是那类机器的常态）；
+    /// 2. 该卷配额用满或盘满时，`File::create(path)` 第一次尝试就把目标**截成 0 字节**；
+    /// 3. 6 次重试全失败；
+    /// 4. 旧实现在这里 `remove_file(&tmp)` —— 删掉唯一那份完整数据。
+    ///
+    /// 结局正是本文件 `write_tmp` 上方注释早已写下、并声明要避免的那条：
+    /// 0 字节 `secrets.enc` → 下次启动解析失败 → 降级空库 → 首次 persist 把这个 0 字节文件
+    /// 「备份」成 `.enc.corrupt-*`（备份的是空文件，等于没备份）→ **用户全部 API 密钥永久丢失**，
+    /// 而界面只显示「各 Key 未配置密钥」，没有任何线索指向落盘。
+    ///
+    /// 而回退路径的注释自己就写着「tmp 里已有完整数据作为**最后保障**」——
+    /// 那句承诺与紧随其后的 `remove_file` 直接矛盾，且矛盾恰好落在需要它的那条路径上。
+    /// 成功分支删 tmp（数据已在目标文件里）是对的，失败分支删它是错的。
+    ///
+    /// 留下 tmp 的代价（散落的 `.tmp` 干扰「看数据目录清单」那套诊断，见 `write_tmp` 上方注释）
+    /// 是**已知且刻意接受**的：那点排障噪音换不回永久丢失的密钥，且错误消息现在点名了它的路径。
+    ///
+    /// 注入验证：把 `remove_file` 加回失败路径，本测试变红。
+    #[test]
+    fn a_failed_fallback_write_must_not_delete_the_only_complete_copy() {
+        let dir = temp_dir("keep_tmp_on_fallback_failure");
+        // 造出「rename 必失败 + 原地写必失败」：把目标路径做成一个**目录**。
+        // `fs::rename(file, dir)` 与 `File::create(dir)` 在两个平台上都失败，
+        // 于是必然走完 rename 重试 → 回退原地写 → 6 次全败 → 到达被测那一行。
+        let target = dir.join("secrets.enc");
+        std::fs::create_dir(&target).unwrap();
+
+        let err = atomic_write(&target, b"THE-ONLY-COMPLETE-COPY").unwrap_err();
+
+        // tmp 必须还在，且内容完整 —— 这是用户唯一的抢救来源。
+        let leftovers: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "tmp"))
+            .collect();
+        assert_eq!(
+            leftovers.len(),
+            1,
+            "回退写失败后必须留下那份完整数据；删掉它就是本条 P0 缺陷本身。err={err}"
+        );
+        assert_eq!(
+            std::fs::read(&leftovers[0]).unwrap(),
+            b"THE-ONLY-COMPLETE-COPY",
+            "留下的 tmp 必须是完整内容，否则留了也救不回来"
+        );
+        // 错误消息要点名它 —— 不然用户不知道盘上还有救命的东西。
+        let msg = err.to_string();
+        assert!(
+            msg.contains(".tmp"),
+            "错误消息必须给出 tmp 路径，否则那份数据等于不存在：{msg}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 「跨设备」错误码必须按平台取，不能是一个写死的数值。

@@ -49,11 +49,32 @@ use std::sync::Arc;
 
 /// 令牌在 `SecretStore` 里的 id。
 ///
-/// 前缀 `__` 与真实 Key 的 UUID 形态区分开：`ProviderKey.id` 一律是 uuid，
-/// 故这个 id 不可能与任何一条 Key 撞上，也不会被「孤儿密钥清理」当成孤儿删掉
-/// （那条逻辑按 `keys` 列表比对，而它本就不在 `keys` 里 —— 见下方 `token_id_is_frozen`
-/// 那条测试对这个不变量的说明）。
+/// 前缀 `__` 与真实 Key 的 UUID 形态区分开：`ProviderKey.id` 一律是 uuid，故这个 id
+/// 不可能与任何一条 Key 撞上。
+///
+/// 🔴 **这里原先写着「也不会被『孤儿密钥清理』当成孤儿删掉」，那句话是错的，而且因果说反了**
+/// （审查发现）：孤儿判据是 `!live.contains(id)` 而 `live` 只由 `cfg.keys` 的 id 构成，
+/// 所以「本就不在 `keys` 里」恰恰是它**会**被删的原因。真正拦住它的是
+/// [`is_internal_secret_id`]，那是本轮补上的。
 pub(crate) const TOKEN_ID: &str = "__lan_access_token";
+
+/// 这个 id 是**库内部条目**、不属于任何 `ProviderKey` → 孤儿清理必须跳过它。
+///
+/// # 为什么单独一个谓词，而不是在孤儿判据里直接比 `TOKEN_ID`
+///
+/// 下一个内部条目（比如日后要存的什么设备指纹）加进来时，直接比常量的写法会**静默**地
+/// 重犯一次同样的错。约定收成一条：库里 `__` 前缀的 id 都不是 Key 的密钥。
+///
+/// # 为什么不让 `SecretStore::all_key_ids` 自己排除
+///
+/// 那个函数的调用方还有**整库迁移**（`enable_master_password` 等）——它靠它决定
+/// 「要把哪些密文用新口令重新封装」。在那里排除令牌的后果是：启用主口令之后
+/// 令牌那条仍是旧密文，`get` 按新模式读不出来 → 局域网客户端集体 401，
+/// 而这比误删更难查（库里那条还在，看起来什么都没丢）。
+/// 故 `all_key_ids` 保持「库里的全部 id」这个语义，过滤落在**孤儿判定**这一处。
+pub(crate) fn is_internal_secret_id(id: &str) -> bool {
+    id.starts_with("__")
+}
 
 /// 鉴权结论。用枚举而不是 `bool`：调用方要能区分「放行」与「为什么拒」，
 /// 而拒绝原因决定了要不要落事件（扫描器打过来的和用户配错的，价值完全不同）。
@@ -665,14 +686,27 @@ mod tests {
 
     /// 令牌 id 不能与真实 Key 的 id 空间相撞。
     ///
-    /// `ProviderKey.id` 一律是 uuid（含连字符、无 `__` 前缀），故这个字面量不可能撞上，
-    /// 也不会被孤儿密钥清理当成孤儿删掉。改这个常量会让老用户的令牌「消失」
-    /// （库里那条还在，但按新 id 取不到 → 局域网客户端集体 401 且无从排查）。
+    /// `ProviderKey.id` 一律是 uuid（含连字符、无 `__` 前缀），故这个字面量不可能撞上。
+    /// 改这个常量会让老用户的令牌「消失」（库里那条还在，但按新 id 取不到 →
+    /// 局域网客户端集体 401 且无从排查）。
+    ///
+    /// ⚠️ 这条注释原先还写着「也不会被孤儿密钥清理当成孤儿删掉」—— **那是假的**
+    /// （见 `TOKEN_ID` 上方的说明），而本测试**只验了 id 形态、压根没验清理行为**，
+    /// 所以那句假话一直挂在一条绿色测试上。真正验它的是
+    /// `the_lan_token_survives_orphan_pruning`（在 `store.rs` 的测试段）。
+    /// 本仓「判据存在 ≠ 判对了维度」的又一例。
     #[test]
     fn token_id_is_frozen() {
         assert_eq!(TOKEN_ID, "__lan_access_token");
         assert!(TOKEN_ID.starts_with("__"), "必须与 uuid 形态的 Key id 区分开");
         assert!(uuid::Uuid::parse_str(TOKEN_ID).is_err(), "不能长得像 uuid");
+        // 令牌必须满足「库内部条目」那个谓词 —— 否则孤儿清理会把它删掉。
+        // 换 id 时若丢了 `__` 前缀，这一条会红。
+        assert!(
+            is_internal_secret_id(TOKEN_ID),
+            "令牌 id 必须被 is_internal_secret_id 认出，否则孤儿清理会删掉它"
+        );
+        assert!(!is_internal_secret_id(&uuid::Uuid::new_v4().to_string()), "真 Key 不该被认成内部条目");
     }
 
     /// 生成的令牌要够长、且两次不同。

@@ -177,6 +177,13 @@ fn payload_digest(payload: &ExportPayload) -> AppResult<String> {
 ///   127.0.0.1，而这台机器上的 Key 可能一条都没配好 —— 客户端当场不可用，
 ///   且用户根本不会往「我昨天导入了一份配置」上想。这是本清单里唯一会去改**外部程序
 ///   配置文件**的一项，故也是最该剔的一项。
+/// - `lan_exposure`（审查补入）：它决定监听地址是 `127.0.0.1` 还是 `0.0.0.0`，而**绑定在
+///   `ProxyManager::start` 里一次定死**。`model.rs` 里把这个字段从 `UserPrefs` 移出时写明了
+///   理由：只落盘不重建监听 → 关掉开关后端口仍在 `0.0.0.0` 上，界面说「已关闭」而实际对整个
+///   局域网敞开（**安全方向**的「界面说 A、实际 B」）。导入走的正是那条被封掉的整份覆盖路径，
+///   于是能原样造出同一个失效：在一台局域网开着且代理在跑的机器上导入一份 `false` 的配置，
+///   开关变成关、socket 还在 `0.0.0.0` 上听着。反方向（导入 `true`）只是「界面说开着、
+///   局域网连不上」，不安全但同样是撒谎。故两侧都剔：导出不带它，导入保留本机值。
 fn strip_machine_local(mut s: AppSettings) -> AppSettings {
     s.proxy_ports.clear();
     s.mcp_registered_categories.clear();
@@ -185,6 +192,7 @@ fn strip_machine_local(mut s: AppSettings) -> AppSettings {
     s.log_dir = None;
     s.auto_start = false;
     s.proxy_running_categories.clear();
+    s.lan_exposure = false;
     s
 }
 
@@ -863,9 +871,13 @@ mod tests {
             let mut s = src.get_settings();
             s.log_dir = Some("E:\\源机器专属日志目录".into());
             s.auto_start = true;
-            s.theme = "dark".into(); // 非本机绑定字段，应当被带走
+            s.theme = "dark".into(); // 非本机绑定字段,应当被带走
             src.save_settings(UserPrefs::from(&s)).unwrap();
         }
+        // 🔴 必须走专用 setter：`lan_exposure` 刻意**不在** `UserPrefs` 里（它有系统副作用），
+        // 塞进上面那个 `save_settings` 会被静默丢掉 → 前置条件不成立 → 断言变成空洞的绿。
+        src.set_lan_exposure(true).unwrap();
+        assert!(src.get_settings().lan_exposure, "前置条件：源机器局域网开着");
 
         let file = build_export(&src, "1.0.0", None).unwrap().0;
         // 导出侧已剔除
@@ -877,6 +889,11 @@ mod tests {
         assert!(file.payload.settings.log_dir.is_none(), "日志目录不得带走");
         assert!(!file.payload.settings.auto_start, "自启动状态不得带走");
         assert!(!file.payload.settings.mcp_enabled, "MCP 开关不得带走");
+        assert!(
+            !file.payload.settings.lan_exposure,
+            "「局域网暴露」不得带走：绑定地址在 ProxyManager::start 里一次定死，导入一份 false \
+             会让界面说「已关闭」而 socket 仍在 0.0.0.0 上听着（安全方向的界面撒谎）"
+        );
         assert!(
             file.payload.settings.proxy_running_categories.is_empty(),
             "「上次哪几个代理在跑」不得带走：restore_proxies_on_launch 会照它在新机器上自动拉起\
