@@ -328,9 +328,24 @@ pub fn record_live_failure(store: &Arc<Store>, key_id: &str) {
     let now_tripped = breaker_window_active(store.key_breaker_until(key_id), now);
     if now_tripped && !was_tripped {
         let name = store.key_name(key_id).unwrap_or_else(|| key_id.to_string());
+        // 🔴 **不许无条件承诺「其它 Key 自动接管」**（2026-09-01 用户日志实证）。
+        //
+        // 本函数只拿到 `key_id`，**不知道这次请求的是哪个模型** —— 而「能不能接管」恰恰
+        // 取决于那个模型有没有别的 Key 能服务。用户那份日志里这句话被自己的系统当场
+        // 否证了两次：`21:07:02.785` 说「其它 Key 自动接管」→ **791ms 后**
+        // `model_pool` 的 503 闸门说「本池中能服务它的只有「luckyg」」→ 客户端拿到 503；
+        // `21:10:54.513` 同一对，间隔 191ms。
+        //
+        // 代价不是「多一句废话」：用户读到「自动接管」会判定故障转移兜住了，
+        // 于是排除掉「代理这边把请求挡了」这个方向 —— 而那正是真相。同
+        // `model_pool` 里那句「文案要**指对方向**」，那道门已经执行了这个标准，这里没有。
+        //
+        // 改成**条件句**而不是去查一遍：查需要模型名（这里没有），而条件句在两种情形下
+        // 都为真，且把「取决于什么」如实交给用户。
+        let takeover = "若本池中还有能服务该模型的 Key，会自动接管";
         notify(
             "Key 已熔断",
-            &format!("「{name}」连续失败，已暂停使用 60 秒。其他 Key 将自动接管。"),
+            &format!("「{name}」连续失败，已暂停使用 60 秒。{takeover}。"),
         );
         // 🔴 事件是**必须**的，不是通知的附赠：系统通知可能被用户或系统静音（免打扰、
         // 焦点助手），而排障时唯一可回溯的地方是日志页。上面那句注释此前写着
@@ -342,7 +357,7 @@ pub fn record_live_failure(store: &Arc<Store>, key_id: &str) {
             "warning",
             Some(key_id),
             &format!(
-                "{name} 已熔断，暂停使用 {}s（连续失败达阈值；其它 Key 自动接管）",
+                "{name} 已熔断，暂停使用 {}s（连续失败达阈值；{takeover}）",
                 BREAKER_COOLDOWN_MS / 1000
             ),
             None,
@@ -1177,6 +1192,19 @@ mod tests {
             .expect("熔断跃迁必须落一条事件");
         assert_eq!(hit.kind, "warning", "熔断是告警级，不是普通 failover");
         assert_eq!(hit.key_id.as_deref(), Some("k"));
+        // 🔴 不许无条件承诺「其它 Key 自动接管」—— 本函数不知道请求的是哪个模型。
+        // 用户 2026-09-01 的日志里这句话被 503 闸门当场否证两次（间隔 791ms / 191ms）。
+        assert!(
+            !hit.detail.contains("其它 Key 自动接管")
+                && !hit.detail.contains("其他 Key 将自动接管"),
+            "无条件的接管承诺会让用户排除掉「代理挡了请求」这个方向，而那正是真相：{}",
+            hit.detail
+        );
+        assert!(
+            hit.detail.contains("若本池中还有能服务该模型的 Key"),
+            "要如实说明接管取决于什么（条件句在两种情形下都为真）：{}",
+            hit.detail
+        );
     }
 
     /// 🔴 流内失败必须在日志页留下一条**红色**记录。
