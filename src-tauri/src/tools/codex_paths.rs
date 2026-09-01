@@ -55,6 +55,35 @@ mod tests {
         assert_eq!(got, PathBuf::from("C:\\isolated\\codex"));
     }
 
+    /// 🔴 接线判据：`codex.rs` 的路径入口必须经 [`codex_home`]，不许自己拼 `.codex`。
+    ///
+    /// 上面那几条只测解析函数 —— **注入实测**：把 `config_path()` 改回
+    /// `dirs::home_dir().join(".codex")`，它们全部照样绿，而那就是这个缺陷本体
+    /// （SynaRoute 写默认目录、Codex 从 `$CODEX_HOME` 读另一份 → 回落官方 → 占位符外发 → 401）。
+    /// 在默认目录的开发机上，任何行为测试也都是绿的，这正是它潜伏这么久的原因。
+    #[test]
+    fn the_codex_path_entrypoints_must_go_through_codex_home() {
+        let src = crate::proxy::custom_headers::production_code_only(include_str!("codex.rs"));
+        let at = src.find("pub(super) fn config_path").expect("函数改名了，请同步本判据");
+        let end = src[at..].find("\n}").map(|i| at + i).unwrap_or(src.len());
+        let body = &src[at..end];
+        assert!(
+            body.contains("codex_paths::codex_home()"),
+            "config_path 必须经 codex_paths::codex_home()，否则设了 CODEX_HOME 的机器上会写错目录"
+        );
+        assert!(
+            !body.contains("home_dir()"),
+            "不许在 config_path 里直接拼 dirs::home_dir() —— 那是跨机器 401 的成因"
+        );
+        // auth.json 必须与 config.toml 同根（它们要么一起对、要么一起错，分开推导必然漂移）。
+        let at = src.find("pub(super) fn auth_path").expect("auth_path 改名了，请同步本判据");
+        let end = src[at..].find("\n}").map(|i| at + i).unwrap_or(src.len());
+        assert!(
+            src[at..end].contains("config_path()"),
+            "auth_path 必须由 config_path 派生，不许独立拼路径"
+        );
+    }
+
     #[test]
     fn an_unset_codex_home_falls_back_to_the_user_default() {
         let got = from_env(None).unwrap();

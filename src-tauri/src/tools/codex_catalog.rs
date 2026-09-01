@@ -1134,9 +1134,14 @@ mod tests {
         assert_eq!(e["context_window"], json!(1_000_000));
     }
 
-    /// 🔴 接入时必须把 `remote_compaction_v2` 关掉 —— 那是 Codex 唯一会**绕过
-    /// `model_provider`** 的平台功能，开着就会把我们 auth.json 里的占位符发给真实 OpenAI
+    /// 接入时把 `remote_compaction_v2` 关掉 —— 它是**已取证**的一条绕过 `model_provider`
+    /// 的平台功能，开着会把 auth.json 里的占位符发给真实 OpenAI
     /// （用户 2026-08-31 两次实报 `401 Incorrect API key provided: SEE-SYNA***OUTE`）。
+    ///
+    /// ⚠️ **它不是唯一一条**（08-31 二进制取证）：feature 枚举里还有 `RemoteControl` /
+    /// `RemoteModels` / `ResponsesWebsockets*`，而源文件 `compact_remote.rs`（无 v2 后缀）
+    /// **压根没有对应开关名**。所以「逐个关 feature」不是收敛路径，别把这一条当成完整防线 ——
+    /// 真正的根解是「SynaRoute 与 Codex 读写同一份配置」，见 `codex_paths`。
     ///
     /// 四种输入形态各验一次：无 `[features]` 表 / 有表但无该键 / 显式 `false` / 显式 `true`。
     #[test]
@@ -1196,6 +1201,29 @@ mod tests {
         assert!(
             src[at..end].contains("disable_remote_compaction(table)"),
             "wire_into 必须关掉远端压缩 —— 漏掉它的表现是「接入完好却每次压缩都 401」"
+        );
+    }
+
+    /// 🔴 目录路径必须跟随 `CODEX_HOME`，不许自己拼 `dirs::home_dir()/.codex`。
+    ///
+    /// 这是用户跨机器 401 的确定成因：SynaRoute 写默认目录、Codex 从 `$CODEX_HOME` 读另一份，
+    /// 那一份缺 `model_provider` → 回落 `api.openai.com` → 把占位符发给真实 OpenAI。
+    /// 源码级判据而非行为判据：改回硬编码时 `catalog_path()` 在**默认目录的机器上照样绿**，
+    /// 而那正是这个缺陷能潜伏这么久的原因。
+    #[test]
+    fn the_catalog_path_must_follow_the_resolved_codex_home() {
+        let src =
+            crate::proxy::custom_headers::production_code_only(include_str!("codex_catalog.rs"));
+        let at = src.find("pub(super) fn catalog_path").expect("函数改名了，请同步本判据");
+        let end = src[at..].find("\n}").map(|i| at + i).unwrap_or(src.len());
+        let body = &src[at..end];
+        assert!(
+            body.contains("config_path()"),
+            "catalog_path 必须经 config_path（它已跟随 codex_home），不许自己拼路径"
+        );
+        assert!(
+            !body.contains("home_dir()"),
+            "不许绕过 codex_home 直接拼 dirs::home_dir() —— 那会在设了 CODEX_HOME 的机器上写错目录"
         );
     }
 
