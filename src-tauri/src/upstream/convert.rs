@@ -948,9 +948,9 @@ pub fn responses_to_chat(body: &Value) -> Value {
                                 "id": call_id,
                                 "type": "function",
                                 "function": {
-                                    // 必须拼回全名（见 join_namespaced_tool_name）：历史里 Codex 把
-                                    // MCP 工具存成 {name, namespace} 两字段，只取 name 会让模型下一轮
-                                    // 照抄短名，回程拆不出 namespace → Codex 报 unsupported call。
+                                    // 必须拼回全名（见 join_namespaced_tool_name）：历史里 Codex 把 MCP
+                                    // 工具存成 {name, namespace} 两字段，只取 name 会让模型下一轮照抄短名，
+                                    // 回程拆不出 namespace → Codex 报 unsupported call。
                                     "name": join_namespaced_tool_name(it),
                                     "arguments": it.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}"),
                                 }
@@ -961,14 +961,14 @@ pub fn responses_to_chat(body: &Value) -> Value {
                         messages.push(json!({
                             "role": "tool",
                             "tool_call_id": it.get("call_id").cloned().unwrap_or(json!("")),
-                            "content": it.get("output").and_then(|o| o.as_str()).unwrap_or(""),
+                            // 🔴 数组形态（Codex 实测占 13%）被 `as_str()` 清成空串，判据见测试段。
+                            "content": extract_text_content(it.get("output")),
                         }));
                     }
                     // Codex 多轮会把上一轮的 custom 工具调用（apply_patch/exec）作为历史带回。
                     // custom_tool_call 携带裸字符串 `input`；还原成 assistant.tool_calls 时把 arguments
-                    // 重新包成 {"input":"<裸串>"}，与响应侧解包（unpack_custom_tool_input）对称——
-                    // 模型看到自己上一轮产出的同一形态。不处理会落到 `_` 分支被当成空 user 消息，
-                    // 多轮里工具调用与结果全丢失，模型失去上下文。
+                    // 重新包成 {"input":"<裸串>"}，与响应侧 `unpack_custom_tool_input` 对称。不处理会落到
+                    // `_` 分支被当成空 user 消息 → 多轮里工具调用与结果全丢失，模型失去上下文。
                     Some("custom_tool_call") => {
                         let call_id = it
                             .get("call_id")
@@ -992,18 +992,18 @@ pub fn responses_to_chat(body: &Value) -> Value {
                             } ]
                         }));
                     }
-                    // custom 工具执行结果回传：同 function_call_output → role:"tool"。
+                    // custom 工具执行结果回传：同 function_call_output → role:"tool"（含数组形态）。
                     Some("custom_tool_call_output") => {
                         messages.push(json!({
                             "role": "tool",
                             "tool_call_id": it.get("call_id").cloned().unwrap_or(json!("")),
-                            "content": it.get("output").and_then(|o| o.as_str()).unwrap_or(""),
+                            "content": extract_text_content(it.get("output")),
                         }));
                     }
                     // 模型上一轮对延迟工具检索器的调用。`arguments` 在此 item 上是**对象**
-                    // （`{"query":"…","limit":8}`），而 Chat 的 tool_calls.function.arguments 要求
-                    // JSON **字符串**，故序列化后再放。不处理会落到 `_` 分支成空消息，模型看不到
-                    // 自己检索过什么 → 反复用同义词重复检索（实测同一会话 5 次同义查询）。
+                    // （`{"query":"…","limit":8}`），而 Chat 的 tool_calls.function.arguments 要求 JSON
+                    // **字符串**，故序列化后再放。不处理会落到 `_` 分支成空消息 → 模型看不到自己
+                    // 检索过什么，反复用同义词重复检索（实测同一会话 5 次同义查询）。
                     Some(TOOL_SEARCH_CALL_ITEM) => {
                         let call_id = it
                             .get("call_id")
@@ -3260,6 +3260,80 @@ mod tests {
             !msgs.iter().any(|m| m["content"].as_str() == Some("")),
             "不应出现空 content 消息（旧行为症状）"
         );
+    }
+
+    /// 🔴 工具结果的 `output` 是**数组**时不许被清成空串（2026-09-01 用户实报）。
+    ///
+    /// # 现场
+    ///
+    /// 用户在 Codex 里调 `synaroute_ai`，Codex 自己的审批评审器把这次调用拒了，
+    /// 理由写在工具结果里（「该操作会将本地源码发送到默认不受信任的外部服务」）。
+    /// 而模型收到的是**空**，于是它对用户说「工具调用完成但返回内容为空，
+    /// 这通常是服务端超时或结果丢失」—— 把用户指向 SynaRoute 的超时/网络，
+    /// 而真相是 Codex 拒了、且拒绝理由被**我们**擦掉了。
+    ///
+    /// # 机制
+    ///
+    /// Codex 的 `function_call_output.output` 有两种形态，实测该用户当日 38 条里
+    /// **5 条是数组**（13%）：`[{"type":"input_text","text":"…"}]`。
+    /// `Value::as_str()` 对 Array 返回 `None` → `unwrap_or("")` → `content: ""`。
+    /// 下一跳 `openai_to_anthropic`（`:465`）本来是数组感知的，但内容在上一跳就没了。
+    ///
+    /// # 🔴 这是「只修了一条路径」的当日复发
+    ///
+    /// 镜像方向 `chat_to_responses` 的 `"tool"` 分支在同一天的 `b463976` 刚修过，
+    /// 那里的注释逐字写着这个失效形态（「`as_str()` 会让整条结果变空串 → 模型看到
+    /// 『工具执行了但什么都没返回』，比报错更难查」）—— 而那次只修了去程，没修回程。
+    /// 两个方向共用 `extract_text_content` 之后，这条缝才真的合上。
+    ///
+    /// 夹具用**真实 rollout 里的形态**（`input_text` 而非 `text`），因为 helper 只认
+    /// `text` 字段、不看 `type`：换个夹具类型名就测不到真实链路。
+    #[test]
+    fn tool_result_blocks_survive_the_responses_to_chat_hop() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [
+                { "type": "function_call", "call_id": "c1", "name": "synaroute_ai",
+                  "arguments": "{}" },
+                // 真实形态：Codex 把 wall-time 头与正文拆成两块
+                { "type": "function_call_output", "call_id": "c1", "output": [
+                    { "type": "input_text", "text": "Wall time: 10.7 seconds\nOutput:" },
+                    { "type": "input_text", "text": "rejected due to unacceptable risk" }
+                ] },
+                { "type": "custom_tool_call", "call_id": "c2", "name": "exec", "input": "ls" },
+                { "type": "custom_tool_call_output", "call_id": "c2", "output": [
+                    { "type": "input_text", "text": "EPERM: operation not permitted" }
+                ] },
+                // 对照：字符串形态必须原样保留（别为了修数组把它改坏）
+                { "type": "function_call", "call_id": "c3", "name": "t", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "c3", "output": "plain string" }
+            ]
+        });
+        let chat = responses_to_chat(&body);
+        let tool_msgs: Vec<&str> = chat["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["content"].as_str().unwrap_or("<非字符串>"))
+            .collect();
+        assert_eq!(tool_msgs.len(), 3, "三条工具结果都要在");
+        assert!(
+            tool_msgs[0].contains("rejected due to unacceptable risk"),
+            "function_call_output 的数组正文被清空了 —— 模型只会看到「返回为空」：{:?}",
+            tool_msgs[0]
+        );
+        assert!(
+            tool_msgs[0].contains("Wall time"),
+            "多个分块要全部拼上，不能只取第一块：{:?}",
+            tool_msgs[0]
+        );
+        assert!(
+            tool_msgs[1].contains("EPERM"),
+            "custom_tool_call_output 是同一个错法的第二份，必须一起修：{:?}",
+            tool_msgs[1]
+        );
+        assert_eq!(tool_msgs[2], "plain string", "字符串形态不得被改动");
     }
 
     #[test]
