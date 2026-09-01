@@ -194,6 +194,78 @@ fn should_announce(category: CategoryType, model: &str, now: i64) -> bool {
     }
 }
 
+/// 一次**静默降级**留痕：请求成功了，但用的不是用户要的那个模型。
+///
+/// # 🔴 为什么必须单独一条 warning，而不是指望那行 route 日志
+///
+/// 用户 2026-09-01 实报的现场：他在 Codex 里选 `grok-4.6`，唯一支持它的 luckyg 被自己的
+/// 网关连续 400，于是转移到 agentrouter → 那条 Key 不支持 grok-4.6 → 兜底改写为它的
+/// `default_model`（`glm-5.3`）→ **流式返回 200**。日志里 31 轮全是这个形态。
+///
+/// 客户端那边看起来完全正常，而 route 那行是**绿色的「成功」**，「兜底改写为 glm-5.3」
+/// 只是它模型段里的一小句 —— 没人会去逐行读成功日志。于是用户以为自己在用 grok，
+/// 拿到的是 glm 的回答。
+///
+/// `reject_if_unserviceable` 拦不住这一支：它只在**进入候选循环之前**判一次，那一刻 luckyg
+/// 还没失败、`may_serve` 为真、放行是对的。**降级发生在第二跳**，而那时没有任何人再判一次。
+///
+/// # 只对「我们宣称过的名字」留痕
+///
+/// 判据与 503 闸门同源。客户端自己编的名字（CC 的带日期后缀家族名、Codex 未重启时的内置
+/// GPT 名）本来就该被三档/`default_model` 改写 —— 那是那两个机制存在的全部理由，
+/// 对它们留痕会把日志刷成噪音。
+///
+/// 节流复用 [`should_announce`]（60s / 每个模型）：客户端会自动重发，实测 31 轮里
+/// 每轮都会走到这里。
+pub(crate) fn note_silent_downgrade(
+    store: &Store,
+    category: CategoryType,
+    requested: &str,
+    key: &ProviderKey,
+    real: &str,
+) {
+    let bare = crate::model::unwrap_gateway_model_id(requested);
+    if bare.is_empty() || bare == real {
+        return;
+    }
+    // 只在「确定被换掉」时留痕。`Unknown`（原样透传）不算降级 —— 上游很可能认识它。
+    if confidence(key, requested) != Confidence::Fallback {
+        return;
+    }
+    let enabled = store.enabled_keys_sorted(category);
+    if !discoverable_models(&enabled).iter().any(|m| m == bare) {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    if !should_announce(category, &format!("downgrade:{bare}"), now) {
+        return;
+    }
+    // 谁本来能服务它 —— 这句是用户判断「该去修哪条 Key」的唯一线索。
+    let owners: Vec<&str> = enabled
+        .iter()
+        .filter(|k| may_serve(k, requested))
+        .map(|k| k.name.as_str())
+        .collect();
+    let who = if owners.is_empty() {
+        "当前没有任何已启用 Key 能服务它".to_string()
+    } else {
+        format!("能服务它的是「{}」", owners.join("、"))
+    };
+    store.append_event_collapsible(
+        category,
+        "warning",
+        Some(&key.id),
+        &format!(
+            "⚠ 你要的是 {bare}，实际用的是 {real} —— 「{}」不支持 {bare}，已按它的兜底模型改写。\
+             {who}，那条 Key 此刻不可用（上游报错或已熔断），故障转移落到了这一条。\
+             回答来自 {real}，不是 {bare}。",
+            key.name
+        ),
+        None,
+        Some(format!("downgrade:{}:{bare}", category.as_str())),
+    );
+}
+
 /// 从全部 Key 里挑出本次请求的候选，并排好序。返回 `(候选, 是否走了兜底)`。
 ///
 /// 排序键 `(服务把握, 余额已耗尽, priority)` —— 三位都是「越靠前越该先用」，
@@ -1026,6 +1098,140 @@ mod tests {
             .count();
         assert_eq!(n, 1, "5 次请求只该落 1 条事件，实得 {n} 条");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 复现用户 2026-09-01 实报那条链：**降级到别的模型时必须留一条 warning**。
+    ///
+    /// 现场（日志里 31 轮完全相同）：用户选 `grok-4.6`，唯一支持它的 `luckyg` 被自己的网关
+    /// 连续 400 → 转移到 `agentrouter`（只有 glm-5.3 等）→ 兜底改写 → **流式返回 200**。
+    /// 那行 route 是绿色的「成功」，「兜底改写为 glm-5.3」只是模型段里一小句 ——
+    /// 用户以为在用 grok，拿到的是 glm。
+    ///
+    /// `reject_if_unserviceable` 结构上拦不住它：它只在**进入候选循环之前**判一次，
+    /// 那一刻 luckyg 还没失败、`may_serve` 为真、放行是对的。降级发生在**第二跳**。
+    #[test]
+    fn a_downgrade_to_another_model_leaves_a_warning() {
+        let (store, dir) = store_at("downgrade");
+        // 复刻用户的真实两条 Key（含 priority：luckyg 反而更靠后，靠模型感知路由排到前面）。
+        let mut owner = key("luckyg", 1000, &["grok-4.5", "grok-4.6"]);
+        owner.name = "luckyg".into();
+        let mut other = key("agentrouter", 999, &["glm-5.3", "gpt-5.6-sol"]);
+        other.name = "agentrouter(linux.do)".into();
+        other.default_model = Some("glm-5.3".into());
+        store.upsert_key(owner).unwrap();
+        store.upsert_key(other.clone()).unwrap();
+
+        // 第二跳：请求 grok-4.6 落到 agentrouter 上，被改写成 glm-5.3。
+        note_silent_downgrade(&store, CategoryType::ClaudeCli, "grok-4.6", &other, "glm-5.3");
+
+        let ev = store
+            .list_events(CategoryType::ClaudeCli)
+            .into_iter()
+            .find(|e| e.kind == "warning")
+            .expect("降级必须留痕 —— 那行 route 是绿色成功，没人会去逐行读");
+        assert!(ev.detail.contains("grok-4.6"), "要说清用户要的是什么：{}", ev.detail);
+        assert!(ev.detail.contains("glm-5.3"), "也要说清实际用了什么：{}", ev.detail);
+        assert!(
+            ev.detail.contains("luckyg"),
+            "要指出谁本来能服务它 —— 那是「该去修哪条 Key」的唯一线索：{}",
+            ev.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 反向三条：**不该留痕的情形一条都不许留**（否则日志被刷成噪音）。
+    #[test]
+    fn a_downgrade_note_is_not_left_for_names_we_never_advertised() {
+        let (store, dir) = store_at("no_downgrade");
+        let mut other = key("k", 0, &["glm-5.3"]);
+        other.default_model = Some("glm-5.3".into());
+        store.upsert_key(other.clone()).unwrap();
+
+        // ① 客户端自己编的名字（CC 的带日期后缀家族名）—— 被三档/default_model 改写是
+        // 那两个机制存在的**全部理由**，对它留痕等于每次会话刷屏。
+        note_silent_downgrade(
+            &store,
+            CategoryType::ClaudeCli,
+            "claude-sonnet-4-5-20250929",
+            &other,
+            "glm-5.3",
+        );
+        // ② 没被换掉（要的就是它）。
+        note_silent_downgrade(&store, CategoryType::ClaudeCli, "glm-5.3", &other, "glm-5.3");
+        // ③ 空模型名（下游压根没给）。
+        note_silent_downgrade(&store, CategoryType::ClaudeCli, "", &other, "glm-5.3");
+
+        assert_eq!(
+            store
+                .list_events(CategoryType::ClaudeCli)
+                .into_iter()
+                .filter(|e| e.kind == "warning")
+                .count(),
+            0,
+            "这三种都不是「用户选的模型被换掉」，一条都不该留"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 用户**显式配了映射**时不许报警 —— 那是他自己的意图，不是我们悄悄换的。
+    ///
+    /// ⚠️ 这条是注入实测补上来的：上面那三条反向用例**全被前面的门先挡住**
+    /// （`bare == real` / 判据②「没宣称过」），于是把 `Fallback` 那道门改成恒不早退，
+    /// 36 条**照样全绿** —— 判据重叠、压根没压到那一支。同 CLAUDE.md 里
+    /// 「注入不变红时先怀疑判据本身重复或没压到边界」那条。
+    ///
+    /// 要压到它必须同时满足：名字在宣称清单里（判据②过）、`bare != real`（第一道门过）、
+    /// 而 `confidence` 不是 `Fallback` —— 映射命中（`Mapping` → `Native`）正是这个组合。
+    #[test]
+    fn an_explicit_mapping_is_the_users_own_intent_not_a_silent_downgrade() {
+        let (store, dir) = store_at("mapped");
+        // ⚠️ 模型名必须与别的用例**互不相同**：节流表是进程级 static，共用一个名字会让
+        // 本条被 60s 窗口跳过 —— 那时「0 条事件」是假绿，注入也照样绿。
+        // 同 CLAUDE.md 里 `DENIED_TOTAL` 那条 flaky（进程级计数器的断言必须隔离）。
+        let mut k = key("k", 0, &["glm-5.3"]);
+        // 用户手配：我要 mapped-probe，就发 glm-5.3 给上游。
+        k.mappings = vec![mapping("mapped-probe", "glm-5.3")];
+        store.upsert_key(k.clone()).unwrap();
+        // 前提：这个名字确实被宣称了（否则判据②会先挡住，这条用例又变成空转）。
+        assert!(
+            discoverable_models(&[k.clone()]).iter().any(|m| m == "mapped-probe"),
+            "映射的对外名必须在宣称清单里，否则本用例压不到 Fallback 那道门"
+        );
+
+        note_silent_downgrade(&store, CategoryType::ClaudeCli, "mapped-probe", &k, "glm-5.3");
+
+        assert_eq!(
+            store
+                .list_events(CategoryType::ClaudeCli)
+                .into_iter()
+                .filter(|e| e.kind == "warning")
+                .count(),
+            0,
+            "映射命中是用户的明确配置，报警等于对他自己配的东西发警告"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 接线判据：成功路径必须调 [`note_silent_downgrade`]。
+    ///
+    /// 上面那几条都直接调函数 —— 把 `proxy.rs` 里那一行删掉它们照样全绿，而那正是缺陷本体
+    /// （降级照旧发生、只是没人说）。本仓第 17 次盯同一类盲区。
+    #[test]
+    fn the_success_path_must_note_silent_downgrades() {
+        let src = prod(include_str!("proxy.rs"));
+        assert_eq!(
+            src.matches("model_pool::note_silent_downgrade(").count(),
+            1,
+            "成功路径必须留痕降级，且只该有一处调用点"
+        );
+        // 位置必须在 `log_success` 闭包里：挂到别处（比如候选循环）会对流式与非流式
+        // 两条成功路径漏掉一条 —— 那种漏是静默的。
+        let at = src.find("let log_success =").expect("log_success 改名了，请同步本判据");
+        let end = src[at..].find("\n    };").map(|i| at + i).unwrap_or(src.len());
+        assert!(
+            src[at..end].contains("note_silent_downgrade("),
+            "必须挂在 log_success 里 —— 那是流式与非流式共用的唯一成功出口"
+        );
     }
 
     /// Codex 目录的档位与窗口两维必须**按模型**收窄（`owners_of`），不能拿全池算。

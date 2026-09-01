@@ -667,14 +667,13 @@ async fn handle_request_inner(
         serde_json::to_string_pretty(&req_json).unwrap_or_else(|_| req_json.to_string())
     };
 
-    // 一次成功转发只记**一条**日志（kind = route，带链路快照）。
+    // 一次成功转发只记**一条**日志（kind = route，带链路快照）。此前是两条
+    // （`route`「成功返回」+ `request`「调用」），而两者的 Key 名与模型段完全一样、只有延迟
+    // 在后者里 —— 高频转发时界面上就是成对的重复行（实测 14 秒刷 12 条、6 对是同一件事）。
+    // 合成一条后信息一个不少：延迟并进 detail，链路快照仍挂这条上。
     //
-    // 此前是两条：`route`「成功返回」+ `request`「调用」。两者的 Key 名、模型段完全一样，
-    // 只有延迟数字在后者里 —— 高频转发时界面上就是成对的重复行（实测 14 秒刷 12 条、
-    // 其中 6 对是同一件事）。合成一条后信息一个不少：延迟并进 detail，链路快照仍挂在这条上。
-    //
-    // 另带 collapse_key：连续的「同 Key、同请求模型、同流式与否」成功记录会被折叠成一条
-    // 带「×N」计数（见 `Store::append_event_collapsible`）。日志文件仍逐条完整写。
+    // 另带 collapse_key：连续的「同 Key、同请求模型、同流式与否」成功记录折叠成一条带「×N」
+    // 计数（见 `Store::append_event_collapsible`）。日志文件仍逐条完整写。
     let log_success = |store: &Arc<Store>,
                        key: &ProviderKey,
                        elapsed: u64,
@@ -694,6 +693,9 @@ async fn handle_request_inner(
             was_truncated,
             usage.as_ref(),
         );
+        // 成功但换了模型时另落一条 warning（理由见该函数文档）。排在 `trace` 之前：那里会
+        // move 掉 `real_model`，放后面就得多一次 clone。
+        model_pool::note_silent_downgrade(store, category, &requested_model, key, &real_model);
         // 链路快照只在「调用模型日志」开关开启时产生（正文可达 2×20000 字符）。
         let trace = req_log.then(|| RequestTrace {
             request_id: request_id.clone(),
@@ -722,11 +724,9 @@ async fn handle_request_inner(
         );
     };
 
-    // 失败的单次尝试（开关开启时记，含链路快照供排障）。
-    //
-    // 与成功路径分开：失败信息（状态码、上游错误体）是排障核心，且它总伴随一条 failover
-    // 事件说明「转给了谁」，两条不重复。折叠判据带上状态码 —— 同 Key 连续同码失败才合并，
-    // 401 与 500 交替出现时不会被压成一条。
+    // 失败的单次尝试（开关开启时记，含链路快照供排障）。与成功路径分开：失败信息（状态码、
+    // 上游错误体）是排障核心，且它总伴随一条 failover 事件说明「转给了谁」，两条不重复。
+    // 折叠判据带状态码 —— 同 Key 连续同码失败才合并，401 与 500 交替时不会被压成一条。
     let log_request = |store: &Arc<Store>,
                        key: &ProviderKey,
                        elapsed: u64,
