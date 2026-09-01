@@ -31,6 +31,19 @@
 //! 与「起=写、停=还原」那条纪律同源（见 [`crate::service::apply_tool_config`] 的文档）。
 //! 有源码级判据钉住这一点。
 //!
+//! # 边界：两条会改写清单、却**没有**过本模块的路径
+//!
+//! 1. **`move_key`（上移/下移优先级）**。[`crate::proxy::discoverable_models`] 按 Key 顺序
+//!    产出，故重排会改清单的**顺序** —— Codex 目录里的 `priority`/`isDefault`、桌面端
+//!    `inferenceModels` 的排列都跟着变。**集合不变**，所以影响止于「菜单里的先后」，
+//!    下一次任何 Key 编辑就会顺带刷新。同为重排的 `set_primary_key` 过了本模块，
+//!    这处不对称是**成本决定的**：`lib.rs` 棘轮余量为 0，而收益是排序美观。
+//! 2. **`fetch_models`（拉取并落盘）**。它经 `Store::set_models` 直接改**集合**，
+//!    影响是功能性的；今天无害只因为**前端零调用**（唯一入口是编辑器里的「拉取」按钮，
+//!    走不落盘的 `fetch_models_draft` + 保存，那条走 `upsert_key` → 本模块）。
+//!    有判据 `fetch_models_stays_unreachable_until_someone_wires_the_resync` 钉住这个前提：
+//!    谁接上按钮就会变红，逼他一并过这里。
+//!
 //! # 🔴 失败只记事件，不让 Key 操作跟着失败
 //!
 //! Key 已经存好了。返回 `Err` 会让前端显示「保存失败」而其实存上了 —— 那比清单陈旧糟得多

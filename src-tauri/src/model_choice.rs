@@ -37,63 +37,11 @@ use crate::model::CategoryType;
 use crate::store::Store;
 
 /// 本次请求应当使用的对外模型名。
-/// 应用内选定的那个名字，现在还有 Key 能服务吗。
-///
-/// 🔴 **口径必须与 503 闸门同源**（`may_serve`，含「没配模型信息、会原样透传」那一态），
-/// 不能用「确定认识」—— 后者会把一条空配置 Key 判成「不能服务」，而它其实会把名字原样
-/// 发给上游、上游很可能认识。判错方向是误清用户的选择。
-///
-/// **一条 Key 都没启用时返回 `true`（不清）**：那是「还没配好」而不是「选择失效」，
-/// 在用户配置过程中清掉他刚选的东西是最糟的时机。
-fn still_serviceable(store: &Store, category: CategoryType, active: &str) -> bool {
-    let keys = store.enabled_keys_sorted(category);
-    if keys.is_empty() {
-        return true;
-    }
-    keys.iter().any(|k| crate::proxy::model_pool::may_serve(k, active))
-}
-
-/// 清掉一个已经没人能服务的应用内选择，并留痕说明原因。
-///
-/// 为什么必须落事件：这是**我们替用户做的决定**（他选的东西被我们改回「跟随客户端」）。
-/// 不留痕就是又一次静默改写 —— 而本模块存在的全部理由就是消除那一类。
-fn drop_stale_choice(store: &Store, category: CategoryType, active: &str) {
-    // 落盘失败不上抛：这是转发热路径，让一次请求因为「清不掉一个设置」而失败毫无道理。
-    // 失败的后果只是下一个请求再清一次（判据是幂等的），而事件仍然会留下来。
-    let _ = store.set_active_model(category, "");
-    store.append_event(
-        category,
-        "warning",
-        None,
-        &format!(
-            "应用内选定的模型 {active} 当前没有任何已启用 Key 能服务，已清除该选择、回到\
-             「跟随客户端」。常见成因：那条 Key 的模型列表还没拉到（新加的 Key 会自动拉取），\
-             或它被停用/删除了。模型列表就绪后可以重新选。"
-        ),
-    );
-}
-
 pub(super) fn pick(store: &Store, category: CategoryType, client_model: String) -> String {
     let Some(active) = store.active_model_of(category) else {
         // 没在应用内选过 → 一律透传客户端原值（现状，也是绝大多数用户的路径）。
         return client_model;
     };
-    // 🔴 **必须排在分类分支之前**（2026-09-01 用户实报那条链的 `categoryId` 是 claude-cli）。
-    //
-    // 那次的现场：`active_models` 里是 `grok-4.5`，而 luckyg 的模型列表**还没拉到它**
-    // （`fetchedAt` 比那次请求晚 5 分 35 秒）。于是每次请求都「客户端要 grok-4.5
-    // （此 Key 不支持）→ 兜底改写为 glm-5.3」—— 用户以为在用 grok，拿到的是 glm。
-    //
-    // 503 闸门拦不住它：判据②查「这名字在 `discoverable_models` 里吗」，不在就判成
-    // 「客户端自己编的」放行降级。那个判据本身没错，**但用错了对象** ——
-    // 这个名字不是客户端编的，是我们自己写进 `active_models` 的。
-    //
-    // 挂在这里而不是 Codex 分支里：三个分类都有 `active_models`，而 CLI / 桌面端在下面
-    // 那道门就 `return active` 了 —— 挂进 Codex 分支等于对实报的那个分类完全无效。
-    if !still_serviceable(store, category, &active) {
-        drop_stale_choice(store, category, &active);
-        return client_model;
-    }
     if category != CategoryType::Codex {
         // 见模块头那张表：CLI / 桌面端的名字是客户端自己调度出来的，不是用户的选择。
         return active;
@@ -172,65 +120,37 @@ mod tests {
         store
     }
 
-    /// 🔴 复现 2026-09-01 用户实报那条链：**选定的模型没人能服务时必须清掉，不许静默降级**。
+    /// 🔴 **`pick` 只读：任何情形下都不许改用户的设置。**
     ///
-    /// 现场是 `claude-cli` 分类（不是 Codex）—— 所以这条判据必须排在分类分支**之前**，
-    /// 挂进 Codex 分支等于对实报的那个分类完全无效。
+    /// v0.1.48 曾在这里加过一道「自清」——选定的模型此刻没人能服务时就把它清成空、
+    /// 回到「跟随客户端」。v0.1.50 撤销，两条理由：
     ///
-    /// 那次的成因是时间差：`active_models` 里是 `grok-4.5`，而那条 Key 的模型列表
-    /// **还没拉到它**（`fetchedAt` 比请求晚 5 分 35 秒）。于是每次都「此 Key 不支持 →
-    /// 兜底改写为 glm-5.3」，用户以为在用 grok、拿到的是 glm，而那句改写只写在日志里。
+    /// 1. 它的立论建立在**读错的一份配置**上（我把另一台机器的 11 条 Key 当成了用户的 3 条），
+    ///    那份「`fetchedAt` 晚 5 分 35 秒」的推理随之作废；
+    /// 2. 即使场景为真，自清也是错的处置 —— 「模型列表还没拉到」是**正常过渡期**
+    ///    （拉取要用户手点一次，全仓**没有**自动拉取路径），在那个窗口里清掉用户刚选的东西，他看到的是
+    ///    「我明明选了 grok，它自己变回跟随客户端了」，而且**永不自愈**（选择已经没了）。
+    ///
+    /// 那个场景现在由 [`crate::proxy::model_pool::note_silent_downgrade`] 留一条 warning 兜住，
+    /// 它是只读的。这条判据钉住「别再把写操作加回热路径」——`pick` 每请求跑一次，
+    /// 在这里落盘还会顺带引入一次 read-modify-write。
     #[test]
-    fn a_selection_that_no_key_can_serve_is_dropped_instead_of_silently_downgraded() {
-        // 这条 Key 只有 glm-5.3（= 那一刻 luckyg 的真实状态），而应用内选的是 grok-4.5。
+    fn pick_never_mutates_the_users_settings() {
+        // 选的是 grok-4.5，而唯一那条 Key 只有 glm-5.3 —— 正是 v0.1.48 会触发自清的现场。
         let store = store_with(CategoryType::ClaudeCli, &["glm-5.3"], Some("grok-4.5"));
+        let before = store.active_model_of(CategoryType::ClaudeCli);
 
         let got = pick(&store, CategoryType::ClaudeCli, "claude-sonnet-4-5".into());
+
+        assert_eq!(got, "grok-4.5", "CLI/桌面端保持强制语义：选了就用，别悄悄回退");
         assert_eq!(
-            got, "claude-sonnet-4-5",
-            "选择已失效 → 该回到「跟随客户端」，而不是把 grok-4.5 交出去等着被降级"
+            store.active_model_of(CategoryType::ClaudeCli),
+            before,
+            "pick 是只读的 —— 别再把 v0.1.48 那道自清加回来"
         );
         assert!(
-            store.active_model_of(CategoryType::ClaudeCli).is_none(),
-            "失效的选择必须被清掉，否则下一个请求还会重演"
-        );
-        let ev = store
-            .list_events(CategoryType::ClaudeCli)
-            .into_iter()
-            .find(|e| e.detail.contains("grok-4.5"))
-            .expect("必须留痕 —— 这是我们替用户做的决定，不留痕就是又一次静默改写");
-        assert_eq!(ev.kind, "warning", "LogsPage 的分组是穷举的，别新造 kind");
-    }
-
-    /// 🔴 **一条 Key 都没启用时不许清** —— 那是「还没配好」而不是「选择失效」。
-    ///
-    /// 在用户配置过程中把他刚选的东西清掉是最糟的时机：他会以为界面坏了。
-    #[test]
-    fn a_selection_survives_when_no_key_is_enabled_yet() {
-        let store = store_with(CategoryType::ClaudeCli, &["glm-5.3"], Some("grok-4.5"));
-        store.toggle_key("k1", false).unwrap();
-
-        let got = pick(&store, CategoryType::ClaudeCli, "claude-sonnet-4-5".into());
-        assert_eq!(got, "grok-4.5", "没有启用 Key 时不该动用户的选择");
-        assert_eq!(
-            store.active_model_of(CategoryType::ClaudeCli).as_deref(),
-            Some("grok-4.5")
-        );
-    }
-
-    /// 反向：选择仍然可服务时**一个字节都不许动**。
-    ///
-    /// 少了这条反向判据，自清那道门可以退化成「无条件清」而不被发现 ——
-    /// 那会让「应用内选模型」这个功能整体失效。
-    #[test]
-    fn a_serviceable_selection_is_never_touched() {
-        let store = store_with(CategoryType::ClaudeCli, &["grok-4.5"], Some("grok-4.5"));
-
-        assert_eq!(pick(&store, CategoryType::ClaudeCli, "claude-sonnet-4-5".into()), "grok-4.5");
-        assert_eq!(
-            store.active_model_of(CategoryType::ClaudeCli).as_deref(),
-            Some("grok-4.5"),
-            "还能服务的选择不该被清"
+            store.list_events(CategoryType::ClaudeCli).is_empty(),
+            "更不该为此落事件：那会在每个请求上重复一句用户无法行动的话"
         );
     }
 

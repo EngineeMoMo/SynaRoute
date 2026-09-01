@@ -177,7 +177,8 @@ const ANNOUNCE_THROTTLE_MS: i64 = 60_000;
 
 /// 这条「模型不可用」现在该不该落事件（进程级节流，见 [`ANNOUNCE_THROTTLE_MS`]）。
 ///
-/// 键的组合数有界：判据②保证只有**我们宣称过的**名字才走到这里，故上限 = 分类数 × 并集大小。
+/// 键的组合数有界：调用方的判据保证只有**我们宣称过的**名字才走到这里
+/// （并集清单 ∪ 应用内选定的那一个），故上限 = 分类数 ×（并集大小 + 1）。
 fn should_announce(category: CategoryType, model: &str, now: i64) -> bool {
     static SEEN: std::sync::Mutex<Option<std::collections::HashMap<String, i64>>> =
         std::sync::Mutex::new(None);
@@ -209,11 +210,34 @@ fn should_announce(category: CategoryType, model: &str, now: i64) -> bool {
 /// `reject_if_unserviceable` 拦不住这一支：它只在**进入候选循环之前**判一次，那一刻 luckyg
 /// 还没失败、`may_serve` 为真、放行是对的。**降级发生在第二跳**，而那时没有任何人再判一次。
 ///
-/// # 只对「我们宣称过的名字」留痕
+/// # 只对「我们宣称过的名字」留痕，而那有**两个**来源
 ///
-/// 判据与 503 闸门同源。客户端自己编的名字（CC 的带日期后缀家族名、Codex 未重启时的内置
-/// GPT 名）本来就该被三档/`default_model` 改写 —— 那是那两个机制存在的全部理由，
-/// 对它们留痕会把日志刷成噪音。
+/// 主判据与 503 闸门同源（并集清单）。客户端自己编的名字（CC 的带日期后缀家族名、Codex
+/// 未重启时的内置 GPT 名）本来就该被三档/`default_model` 改写 —— 那是那两个机制存在的
+/// 全部理由，对它们留痕会把日志刷成噪音。
+///
+/// 🔴 **但 `active_models` 里那个名字也必须算**，哪怕它此刻不在并集清单里。它是用户在**我们
+/// 自己的界面**上选的，本就不可能是「客户端编的」。漏掉它的失效场景是真实发生过的
+/// （2026-09-01 用户实报）：那一刻 luckyg 的模型列表还没拉到 `grok-4.5`，于是它在
+/// `active_models` 里、却不在并集里 —— 每次请求都被兜底改写成 `glm-5.3`，而这道门把唯一
+/// 一条线索也挡掉了。
+///
+/// v0.1.48 曾用另一种修法（那名字没人能服务时**自动清掉**用户的选择），已于 v0.1.50 撤销：
+/// 它的立论建立在读错的一份配置上，且会在「Key 的模型列表还没拉到」这种正常过渡期里
+/// 替用户改设置 —— 而留痕已经足够，不必动他的配置。
+///
+/// # 🔴 与 [`reject_if_unserviceable`] 判据②的不对称是**刻意的**，别去「统一口径」
+///
+/// 那道门只认并集清单，本函数额外认 `active_models`。本仓的纪律通常是「口径必须同源」，
+/// 故这处分叉必须写明白 —— 而**统一的方向只可能错**：
+///
+/// - 往 reject 那边统一（让它也认 `active_models`）→「选了个模型列表还没拉到的名字」
+///   从「降级 + 一条红字」变成**每个请求都 503**，用户什么都做不了。远比降级糟。
+/// - 往本函数这边统一（只认并集）→ 就是 v0.1.49 那个缺陷本身：用户实报的现场里
+///   唯一一条线索被这道门挡掉，整件事完全静默。
+///
+/// 两者判的**不是同一件事**：那道门决定「要不要让请求失败」（宁窄勿宽，误伤代价是全废），
+/// 本函数决定「要不要留一句话」（宁宽勿窄，代价只是多一行日志，而且有 60s 节流）。
 ///
 /// 节流复用 [`should_announce`]（60s / 每个模型）：客户端会自动重发，实测 31 轮里
 /// 每轮都会走到这里。
@@ -233,7 +257,9 @@ pub(crate) fn note_silent_downgrade(
         return;
     }
     let enabled = store.enabled_keys_sorted(category);
-    if !discoverable_models(&enabled).iter().any(|m| m == bare) {
+    let we_advertised = discoverable_models(&enabled).iter().any(|m| m == bare)
+        || store.active_model_of(category).as_deref() == Some(bare);
+    if !we_advertised {
         return;
     }
     let now = chrono::Utc::now().timestamp_millis();
@@ -241,15 +267,29 @@ pub(crate) fn note_silent_downgrade(
         return;
     }
     // 谁本来能服务它 —— 这句是用户判断「该去修哪条 Key」的唯一线索。
+    //
+    // 🔴 两支的**处置完全不同**，不能合成一句：有支持者 = 它此刻挂了（等它恢复 / 查那条 Key）；
+    // 没有支持者 = 这个名字压根没人能服务（模型列表还没拉到，或那条 Key 被停用/删了）。
+    // 后一支在判据放宽之后是**主路径**（`active_models` 里的陈旧选择），不是边缘情形。
     let owners: Vec<&str> = enabled
         .iter()
         .filter(|k| may_serve(k, requested))
         .map(|k| k.name.as_str())
         .collect();
-    let who = if owners.is_empty() {
-        "当前没有任何已启用 Key 能服务它".to_string()
+    let why = if owners.is_empty() {
+        // 🔴 **不许写「会自动拉取」** —— 全仓没有任何自动拉取模型列表的路径：落盘那条
+        // `fetch_models` 命令前端零调用，唯一入口是 Key 编辑器里用户手点的「拉取」按钮
+        // （走 `fetch_models_draft` + 保存）。说「等它自动拉」是把用户送去等一件永不发生的事，
+        // 而这条事件是他手里唯一的线索。判据 `the_no_owner_hint_must_not_promise_auto_fetch`。
+        "当前没有任何已启用 Key 能服务它 —— 常见成因是那条 Key 的模型列表还没拉到\
+         （模型列表不会自动更新：打开那条 Key 点一下「拉取」再保存，或直接手填这个模型名），\
+         也可能它已被停用/删除。列表就绪后可以重新选。"
+            .to_string()
     } else {
-        format!("能服务它的是「{}」", owners.join("、"))
+        format!(
+            "能服务它的是「{}」，那条 Key 此刻不可用（上游报错或已熔断），故障转移落到了这一条。",
+            owners.join("、")
+        )
     };
     store.append_event_collapsible(
         category,
@@ -257,12 +297,17 @@ pub(crate) fn note_silent_downgrade(
         Some(&key.id),
         &format!(
             "⚠ 你要的是 {bare}，实际用的是 {real} —— 「{}」不支持 {bare}，已按它的兜底模型改写。\
-             {who}，那条 Key 此刻不可用（上游报错或已熔断），故障转移落到了这一条。\
-             回答来自 {real}，不是 {bare}。",
+             {why}回答来自 {real}，不是 {bare}。",
             key.name
         ),
         None,
-        Some(format!("downgrade:{}:{bare}", category.as_str())),
+        // 🔴 折叠键带 `key.id`：合并时 `push_event_in_memory` 会刷新 `detail` 却**保留第一条的
+        // `key_id`/`key_name`**，而 detail 里点名的是「哪条 Key 不支持它」→ 徽标写 A、正文说 B。
+        //
+        // 今天**这条路不可达**（节流键不含 Key，60s 内落不了第二条；60s 后中间必已夹一条 route
+        // 成功事件，而折叠只合并紧邻的上一条）—— 也就是说这里摘掉的是**隐患不是活缺陷**，
+        // 改节流键或事件顺序的人才会撞上它。不影响事件频率。判据见测试段同名那条。
+        Some(format!("downgrade:{}:{}:{bare}", category.as_str(), key.id)),
     );
 }
 
@@ -1171,6 +1216,138 @@ mod tests {
             "这三种都不是「用户选的模型被换掉」，一条都不该留"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 **应用内选定的名字也算「我们宣称过」，哪怕它此刻不在并集清单里。**
+    ///
+    /// 这是 2026-09-01 用户实报那条链**真正**的形态：那一刻 luckyg 的模型列表还没拉到
+    /// `grok-4.5`，于是它在 `active_models` 里、却不在 `discoverable_models` 里 ——
+    /// 只查并集的话这道门会把唯一一条线索也挡掉，用户每次都拿到 glm 却什么提示都没有。
+    ///
+    /// v0.1.48 曾改用「自动清掉那个选择」来处理同一场景，v0.1.50 已撤销（见
+    /// [`note_silent_downgrade`] 的文档）—— 留痕足够，不该替用户改设置。
+    #[test]
+    fn an_in_app_selection_counts_as_advertised_even_before_the_model_list_catches_up() {
+        let (store, dir) = store_at("active_not_yet_listed");
+        // ⚠️ 名字必须与别的用例互不相同：节流表是进程级 static（见下一条用例的注释）。
+        let mut k = key("k", 0, &["glm-5.3"]);
+        k.default_model = Some("glm-5.3".into());
+        store.upsert_key(k.clone()).unwrap();
+        store.set_active_model(CategoryType::ClaudeCli, "stale-pick-probe").unwrap();
+        // 前提①：这个名字**不在**并集清单里 —— 否则本用例走的是旧判据，压不到新放宽的那一支。
+        assert!(
+            !discoverable_models(&[k.clone()]).iter().any(|m| m == "stale-pick-probe"),
+            "夹具前提破了：这个名字不该出现在并集清单里"
+        );
+
+        note_silent_downgrade(&store, CategoryType::ClaudeCli, "stale-pick-probe", &k, "glm-5.3");
+
+        let ev = store
+            .list_events(CategoryType::ClaudeCli)
+            .into_iter()
+            .find(|e| e.kind == "warning")
+            .expect("应用内选的名字被换掉时必须留痕 —— 那是用户在我们界面上选的，不是客户端编的");
+        assert!(ev.detail.contains("stale-pick-probe"), "要说清用户要的是什么：{}", ev.detail);
+        assert!(ev.detail.contains("glm-5.3"), "也要说清实际用了什么：{}", ev.detail);
+        // 🔴 「没有任何 Key 能服务它」这一支的处置与「支持者挂了」**完全不同**，文案必须分支。
+        // 合成一句会拼出「…没有任何已启用 Key 能服务它，**那条 Key** 此刻不可用」——「那条」无所指。
+        assert!(
+            ev.detail.contains("列表还没拉到") || ev.detail.contains("已被停用"),
+            "无支持者时要给出这一支的成因与恢复办法：{}",
+            ev.detail
+        );
+        assert!(
+            !ev.detail.contains("那条 Key 此刻不可用"),
+            "无支持者时不许说「那条 Key」—— 没有那条 Key：{}",
+            ev.detail
+        );
+        // 🔴 **留痕不许顺手改用户的设置**（v0.1.48 那个自清已撤销）。
+        assert_eq!(
+            store.active_model_of(CategoryType::ClaudeCli).as_deref(),
+            Some("stale-pick-probe"),
+            "留痕是只读的：模型列表还没拉到时清掉用户刚选的东西，他会以为界面坏了"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 折叠键必须带 `key.id`，否则两条不同 Key 的降级合并后「徽标写 A、正文说 B」。
+    ///
+    /// **判据只能是源码级的，而这一点本身要说实话**：这条错配今天**行为上不可达** ——
+    /// 折叠只合并**紧邻**的上一条，而 ① `should_announce` 的节流键是「分类 + 模型」
+    /// （不含 Key），60s 内第二条 Key 的降级压根不会落；② 60s 之后中间必然已夹了
+    /// 本次请求那条 route 成功事件。也就是说这个修复**摘掉的是一个隐患，不是一个活缺陷**，
+    /// 写不出能变红的行为用例（能写出来就说明前两个前提已经被改坏了）。
+    ///
+    /// 把「不可达」如实写在这里，是为了让下一个人知道：改动节流键或事件顺序时，
+    /// 这条判据是他唯一的护栏。
+    #[test]
+    fn two_keys_downgrading_the_same_model_must_not_merge_into_one_row() {
+        let src = crate::proxy::custom_headers::production_code_only(include_str!("model_pool.rs"));
+        let call = src
+            .split("fn note_silent_downgrade")
+            .nth(1)
+            .and_then(|s| s.split("\npub").next())
+            .expect("函数还在吗");
+        let collapse = call
+            .split("Some(format!(\"downgrade:")
+            .nth(1)
+            .expect("折叠键还是这个形状吗");
+        assert!(
+            collapse.starts_with("{}:{}:{bare}\", category.as_str(), key.id)"),
+            "折叠键要带 key.id —— 合并会刷新 detail 却保留第一条的 key_id：{collapse:.60}"
+        );
+    }
+
+    /// 🔴 **无支持者那支不许承诺「自动拉取」** —— 全仓没有这条路径。
+    ///
+    /// v0.1.49 那句原文是「常见成因是那条 Key 的模型列表还没拉到（新加的 Key 会自动拉取）」。
+    /// 取证：落盘那条 `fetch_models` 命令**前端零调用**（`bridge.ts` 里 `fetchModels`
+    /// 定义了但没有任何 caller），唯一入口是 Key 编辑器里用户手点的「拉取」按钮，
+    /// 走 `fetch_models_draft`（不落盘）+ 保存；`save_key` / `toggle_key` / `check_one`
+    /// 都不写 `models`。也就是说「等它自动拉」是**把用户送去等一件永不发生的事**，
+    /// 而这条事件是他手里唯一的线索 —— 同本仓「指错方向的提示比没有提示更糟」那条。
+    #[test]
+    fn the_no_owner_hint_must_not_promise_auto_fetch() {
+        let src = crate::proxy::custom_headers::production_code_only(include_str!("model_pool.rs"));
+        let hint = src
+            .split("let why = if owners.is_empty()")
+            .nth(1)
+            .and_then(|s| s.split("} else {").next())
+            .expect("无支持者那支的文案还在这个形状里吗");
+        assert!(
+            !hint.contains("自动拉取"),
+            "别再承诺自动拉取（全仓无此路径）：{hint}"
+        );
+        assert!(
+            hint.contains("不会自动更新") && hint.contains("拉取"),
+            "要如实说明并给出可执行动作（手点「拉取」/ 手填模型名）：{hint}"
+        );
+    }
+
+    /// 🔴 `fetch_models` 写模型清单却**不过** [`crate::client_resync::sync_after`] ——
+    /// 今天无害只因为前端从不调它。谁接上按钮，这条判据就变红。
+    ///
+    /// 它是 `Store::set_models` 的唯一调用链（`service::fetch_models_for_key`），
+    /// 也就是**唯一会改并集清单却不重写客户端配置**的写入点。接上之后的失效形态很具体：
+    /// 用户点「拉取」拿到 `grok-4.6` 并保存 → Codex 菜单里仍然没有它（目录是
+    /// `applied on startup only`，得有人重写那个文件）—— 正是 `client_resync` 存在的理由。
+    ///
+    /// **刻意不现在就接上**：`lib.rs` 棘轮余量为 0，而今天这条命令不可达、零用户可感收益。
+    /// 判据钉住「不可达」这个前提本身，比钉住一个用不到的调用更有用（同
+    /// `the_two_sse_invariants_must_stay_derived_not_assumed` 的思路：钉来源，不钉结论）。
+    #[test]
+    fn fetch_models_stays_unreachable_until_someone_wires_the_resync() {
+        let bridge = include_str!("../../src/lib/bridge.ts");
+        // 定义行本身不算调用（`fetchModels: (keyId) => call<...>("fetch_models", ...)`）。
+        let callers = bridge.matches("api.fetchModels(").count()
+            + include_str!("../../src/components/KeyEditor.tsx")
+                .matches("api.fetchModels(")
+                .count();
+        assert_eq!(
+            callers, 0,
+            "有人接上了落盘版模型拉取 —— 请让它一并过 client_resync::sync_after，\
+             否则拉到的新模型不会出现在 Codex 菜单/桌面端选择器里"
+        );
     }
 
     /// 🔴 用户**显式配了映射**时不许报警 —— 那是他自己的意图，不是我们悄悄换的。
