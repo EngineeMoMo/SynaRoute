@@ -1458,109 +1458,9 @@ fn all_failed_is_hard_error(config_error: bool, last_status: Option<u16>) -> boo
         )
 }
 
-/// 单模型检索 `GET /v1/models/{id}`：返回**单个**模型对象（Anthropic SDK 的 models.retrieve
-/// 期望的形状），查不到则按官方规范返回 404 + 标准错误信封。
-fn handle_retrieve_model(
-    store: &Arc<Store>,
-    category: CategoryType,
-    raw_id: &str,
-) -> Response<ResBody> {
-    // 去掉可能的 query（`?beta=true`）与尾斜杠；SDK 会做 URL 编码，这里解一层百分号。
-    let id = raw_id.split('?').next().unwrap_or("").trim_end_matches('/');
-    if id.is_empty() {
-        return handle_list_models(store, category);
-    }
-    let models = discoverable_models(&store.enabled_keys_sorted(category));
-    // 客户端可能用对外名，也可能用我们暴露的 gateway 别名（claude-synaroute-*），两者都接。
-    let hit = models.iter().find(|m| {
-        m.as_str() == id || crate::model::to_gateway_model_id(m) == id
-    });
-    match hit {
-        Some(m) => {
-            let body = if matches!(category, CategoryType::Codex) {
-                serde_json::json!({ "id": m, "object": "model", "owned_by": "synaroute" })
-            } else {
-                serde_json::json!({
-                    "type": "model",
-                    "id": crate::model::to_gateway_model_id(m),
-                    "display_name": m,
-                })
-            };
-            json_resp(StatusCode::OK, Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))
-        }
-        None => error_resp(StatusCode::NOT_FOUND, &format!("未知模型: {id}")),
-    }
-}
-
-/// 官方 gateway 协议里的非推理端点，由代理本地应答。
-///
-/// 判据全部来自 claude.exe v2.1.219 内嵌的 llm-gateway-protocol 规范原文：
-/// - `GET /managed/settings`（可选）：「Return `404` for "no managed policy"；
-///   `200 {}` means "this user has an empty policy" — they're not the same」。
-///   SynaRoute 不做企业策略下发，故返 404（干净的「未实现」）。
-/// - `POST /v1/{metrics,logs,traces}`（可选，OTLP）：「Return `200` whether you forward or
-///   discard — `404` makes the client's exporter log an error on every flush」。
-///   故一律 200 丢弃，避免客户端每次 flush 刷错误日志。
-///
-/// 返回 `None` 表示「不是这些端点」，交由原有故障转移逻辑继续处理。
-fn handle_gateway_side_endpoints(
-    method: &hyper::Method,
-    path_only: &str,
-) -> Option<Response<ResBody>> {
-    if method == hyper::Method::GET && path_only == "/managed/settings" {
-        return Some(error_resp(
-            StatusCode::NOT_FOUND,
-            "SynaRoute 不下发企业管控策略（managed settings 未实现）",
-        ));
-    }
-    if method == hyper::Method::POST
-        && matches!(path_only, "/v1/metrics" | "/v1/logs" | "/v1/traces")
-    {
-        // 明确丢弃但回 200：规范要求如此，否则客户端 OTLP exporter 每次 flush 记一条错误。
-        return Some(json_resp(StatusCode::OK, Bytes::from_static(b"{}")));
-    }
-    None
-}
-
-/// 返回模型发现结果（GET /v1/models）。按分类协议输出对应形态：
-/// - Claude CLI / 桌面端（Anthropic）：`{"data":[{"type":"model","id":..,"display_name":..}],"has_more":false}`
-/// - Codex（OpenAI）：`{"object":"list","data":[{"id":..,"object":"model","owned_by":"synaroute"}]}`
-fn handle_list_models(store: &Arc<Store>, category: CategoryType) -> Response<ResBody> {
-    // 模型发现不受健康态影响：只要 Key 启用，就应在 /model 选择器里列出它能服务的模型名。
-    // 健康/熔断只决定「实际路由到哪个 Key」，不该决定「能选哪些模型」——否则单 Key 被真实探测
-    // 判 Down 后 /model 会空掉，用户连模型都选不了（此前用 select_candidates 过滤导致的 bug）。
-    let models = discoverable_models(&store.enabled_keys_sorted(category));
-
-    // 分类固定了下游协议形态：Codex 用 OpenAI，Claude CLI/桌面端用 Anthropic。
-    // Claude Code 静默丢弃 id 不以 claude/anthropic 开头的条目 → 非合规名包成
-    // `claude-synaroute-<real>`，display_name 仍显示真实名，resolve 时剥前缀。
-    let body = if matches!(category, CategoryType::Codex) {
-        let data: Vec<Value> = models
-            .iter()
-            .map(|m| serde_json::json!({"id": m, "object": "model", "owned_by": "synaroute"}))
-            .collect();
-        serde_json::json!({"object": "list", "data": data})
-    } else {
-        let data: Vec<Value> = models
-            .iter()
-            .map(|m| {
-                let id = crate::model::to_gateway_model_id(m);
-                // display_name 用真实名，选择器上用户看到 grok-4.5 而非长前缀
-                serde_json::json!({"type": "model", "id": id, "display_name": m})
-            })
-            .collect();
-        let first = models.first().map(|m| crate::model::to_gateway_model_id(m));
-        let last = models.last().map(|m| crate::model::to_gateway_model_id(m));
-        serde_json::json!({
-            "data": data,
-            "has_more": false,
-            "first_id": first,
-            "last_id": last,
-        })
-    };
-    let bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
-    json_resp(StatusCode::OK, bytes)
-}
+/// 模型发现 / gateway side endpoints：代理自己应答的非转发端点。
+#[path = "proxy/models_endpoint.rs"] mod models_endpoint; // 显示名这一维的取证见该文件模块注释
+use models_endpoint::{handle_gateway_side_endpoints, handle_list_models, handle_retrieve_model};
 
 /// 流式响应尾部滑动窗口大小。SSE 的 usage 统计在最末几个事件里，只需留住尾巴，
 /// 不缓存全文 —— 既不牺牲首字节延迟，也不让长会话的响应体常驻内存。
@@ -2884,7 +2784,7 @@ fn failover_verb(status: u16) -> &'static str {
 /// - 原生:          `模型 glm-5.2`
 /// - 透传:          `模型 grok-4.5（未配模型清单，原样透传）`
 /// - 映射:          `客户端要 claude-opus-4-8 → 映射为 glm-5.2`
-/// - 三档:          `客户端要 claude-sonnet-4-5 → 三档命中 glm-4.6`
+/// - 档位:          `客户端要 claude-sonnet-4-5 → 档位命中 glm-4.6`
 /// - 默认兜底:      `客户端要 grok-4.5（此 Key 不支持）→ 兜底改写为 claude-opus-4-7`
 /// - 列表首个:      `客户端要 grok-4.5（此 Key 不支持）→ 取列表首个 claude-opus-4-7`
 fn fmt_route_model(requested: &str, real: &str, kind: crate::model::ModelResolveKind) -> String {
@@ -2900,8 +2800,8 @@ fn fmt_route_model(requested: &str, real: &str, kind: crate::model::ModelResolve
         ModelResolveKind::Passthrough => format!("模型 {real}（未配模型清单，原样透传）"),
         // 精确映射：用户显式配的规则
         ModelResolveKind::Mapping => format!("客户端要 {requested} → 映射为 {real}"),
-        // 三档匹配：haiku/sonnet/opus 家族级
-        ModelResolveKind::Tier => format!("客户端要 {requested} → 三档命中 {real}"),
+        // 档位匹配：haiku/sonnet/opus/fable 家族级
+        ModelResolveKind::Tier => format!("客户端要 {requested} → 档位命中 {real}"),
         // 兜底路径：明说「此 Key 不支持」消除歧义
         ModelResolveKind::Default => {
             format!("客户端要 {requested}（此 Key 不支持）→ 兜底改写为 {real}")
@@ -3785,6 +3685,7 @@ mod tests {
 
     fn key(id: &str, priority: i32, base_url: &str) -> ProviderKey {
         ProviderKey {
+            tier_fable: None,
             id: id.into(),
             category_id: CategoryType::ClaudeCli,
             name: format!("k-{id}"),
@@ -4168,12 +4069,14 @@ mod tests {
         // 两条 Key 把同一个对外名映射到**不同**真实模型名
         let mut k1 = key("k1", 0, &bad);
         k1.mappings = vec![crate::model::ModelMapping {
+            display_name: None,
             id: "m1".into(),
             expected_name: "outer".into(),
             real_name: "real-FIRST".into(),
         }];
         let mut k2 = key("k2", 1, &good);
         k2.mappings = vec![crate::model::ModelMapping {
+            display_name: None,
             id: "m2".into(),
             expected_name: "outer".into(),
             real_name: "real-SECOND".into(),
@@ -5635,7 +5538,7 @@ mod tests {
         ModelInfo { real_name: name.into(), source: "manual".into(), fetched_at: None, context_window: None, max_output_tokens: None }
     }
     fn mapping(expected: &str, real: &str) -> ModelMapping {
-        ModelMapping { id: format!("{expected}->{real}"), expected_name: expected.into(), real_name: real.into() }
+        ModelMapping { display_name: None, id: format!("{expected}->{real}"), expected_name: expected.into(), real_name: real.into() }
     }
 
     #[test]
@@ -5693,10 +5596,10 @@ mod tests {
             fmt_route_model("claude-opus-4-8", "glm-5.2", ModelResolveKind::Mapping),
             "客户端要 claude-opus-4-8 → 映射为 glm-5.2"
         );
-        // 三档命中
+        // 档位命中
         assert_eq!(
             fmt_route_model("claude-sonnet-4-5", "glm-4.6", ModelResolveKind::Tier),
-            "客户端要 claude-sonnet-4-5 → 三档命中 glm-4.6"
+            "客户端要 claude-sonnet-4-5 → 档位命中 glm-4.6"
         );
         // 原生同名：简洁
         assert_eq!(
@@ -5799,7 +5702,13 @@ mod tests {
             "并集：a 独有的 opus-4-7 也要在，顺序以主 Key 为准"
         );
         assert_eq!(body["data"][0]["type"], "model", "Anthropic 形态");
-        assert_eq!(body["data"][0]["display_name"], "opus-4-8", "展示名保持真实名");
+        // 显示名 = 映射的真实模型名（2026-09-02 起）：菜单里用户看到 glm-5.2，
+        // 而不是他为了过客户端合规判据而编出来的 opus-4-8。
+        // 同名冲突取**首个宣称者** —— a 的 glm-5.2，不是备用 Key b 的 ds-v4。
+        assert_eq!(body["data"][0]["display_name"], "glm-5.2", "展示名 = 真实模型名");
+        // description 交出对外名：那才是客户端选中后发回来、并出现在路由日志与
+        // X-SynaRoute-Decision 里的 id，报障时靠它把两边对上。
+        assert_eq!(body["data"][0]["description"], "opus-4-8", "description = 对外名");
         pm.stop(CategoryType::ClaudeCli);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -5830,7 +5739,10 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body.get("data").is_none(), "单模型检索不得返回列表形状: {body}");
         assert_eq!(body["id"], "claude-synaroute-opus-4-8");
-        assert_eq!(body["display_name"], "opus-4-8");
+        // 🔴 与列表分支**同口径**：显示名走真实模型名、description 给对外名。
+        // 只改列表那一半、漏掉这条检索路径，是本仓「修了 A→B，同一个坑几乎必然也在 B→A」的原样复发。
+        assert_eq!(body["display_name"], "glm-5.2");
+        assert_eq!(body["description"], "opus-4-8");
         assert_eq!(body["type"], "model");
 
         // 用真实对外名也能检索到（两种写法都接）。
@@ -6500,11 +6412,13 @@ mod tests {
         let mut k1 = key("k1", 0, &bad);
         k1.mappings = vec![
             crate::model::ModelMapping {
+                display_name: None,
                 id: "m1".into(),
                 expected_name: "alias-A".into(),
                 real_name: "upstream-X".into(),
             },
             crate::model::ModelMapping {
+                display_name: None,
                 id: "m2".into(),
                 expected_name: "alias-B".into(),
                 real_name: "upstream-X".into(),

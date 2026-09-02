@@ -16,9 +16,11 @@ import type { EventLogEntry, ProviderKey } from "@/types";
 import { Plus, AlertTriangle, Inbox, X, Database } from "lucide-react";
 
 /** 分类主页：代理状态条 + 模型映射兜底提示 + Key 卡片列表 */
-export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
+export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }: {
   onAddKey: () => void;
   onEditKey: (k: ProviderKey) => void;
+  /** 复制一条 Key 的配置（打开预填好的编辑器，密钥留空）。 */
+  onDuplicateKey: (k: ProviderKey) => void;
   /** 跳转到运行日志页（「最近失败原因」横幅的「查看详情」用）。 */
   onOpenLogs: () => void;
 }) {
@@ -341,6 +343,7 @@ export function CategoryPage({ onAddKey, onEditKey, onOpenLogs }: {
               key={k.id}
               k={k}
               onEdit={onEditKey}
+              onDuplicate={onDuplicateKey}
               isFirst={i === 0}
               isLast={i === sorted.length - 1}
               isRoutingPrimary={k.id === routingPrimaryId}

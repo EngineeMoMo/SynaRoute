@@ -542,6 +542,7 @@ mod tests {
 
     fn key_with(protocol: Protocol, models: &[(&str, Option<u32>)]) -> ProviderKey {
         ProviderKey {
+            tier_fable: None,
             id: "k".into(),
             category_id: CategoryType::ClaudeCli,
             name: "K".into(),

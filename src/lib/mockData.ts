@@ -558,7 +558,7 @@ export const mockBridge = {
     return {
       categoryId,
       summary:
-        "Claude CLI：settings.json。写入 BASE_URL / AUTH_TOKEN(占位) / 发现开关 / ANTHROPIC_MODEL / 顶层 model；不写三档 DEFAULT_*。",
+        "Claude CLI：settings.json。写入 BASE_URL / AUTH_TOKEN(占位) / 发现开关 / ANTHROPIC_MODEL / 顶层 model；不写档位 DEFAULT_*。",
       files: [
         {
           path: "~/.claude/settings.json",

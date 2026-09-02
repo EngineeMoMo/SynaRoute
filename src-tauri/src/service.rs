@@ -1467,6 +1467,7 @@ pub(crate) mod tests {
 
     pub(crate) fn key(category: CategoryType) -> ProviderKey {
         ProviderKey {
+            tier_fable: None,
             id: "k1".into(),
             category_id: category,
             name: "k".into(),
@@ -1533,6 +1534,7 @@ pub(crate) mod tests {
         // 上游真实名是 glm-4.6（不合规），但对外只暴露 claude-opus-4-8。
         k.models = vec![model("glm-4.6")];
         k.mappings = vec![ModelMapping {
+            display_name: None,
             id: "m1".into(),
             expected_name: "claude-opus-4-8".into(),
             real_name: "glm-4.6".into(),

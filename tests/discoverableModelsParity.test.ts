@@ -88,7 +88,17 @@ describe("对外模型清单：前后端同口径", () => {
     ).toBe(true);
 
     // 并集的形态：遍历**每一条** Key，逐个 push 去重。
-    expect(prod).toMatch(/for key in candidates \{[\s\S]*?for name in key\.serviceable_models\(\)/);
+    //
+    // 2026-09-02 起实现搬进了 `advertised_pool`（它多带一维「菜单显示名」），
+    // 而 `discoverable_models` 是它的投影 —— 故并集形态要在那个函数里找，
+    // 并且要一并钉住「投影不许变成第二份遍历」（两份并集实现必然漂移）。
+    expect(prod).toMatch(
+      /pub\(crate\) fn advertised_pool[\s\S]*?for key in candidates \{[\s\S]*?for adv in advertised_models\(key\)/
+    );
+    expect(
+      /pub\(crate\) fn discoverable_models[\s\S]{0,240}?advertised_pool\(candidates\)/.test(prod),
+      "discoverable_models 必须是 advertised_pool 的投影，不许自己再遍历一遍 candidates"
+    ).toBe(true);
 
     // 🔴 交集的三种残留形态。任何一种回来都意味着备用 Key 独有的模型又被藏了起来，
     // 而那正是用户报的「多 Key 时能选的模型太少」。
@@ -121,10 +131,30 @@ describe("对外模型清单：前后端同口径", () => {
     expect([...keyExpectedSet(k)]).toEqual(["opus-4-8"]);
   });
 
-  it("已配三档追加 Claude 家族代表名，与 Rust 第 3 条规则一致", () => {
+  it("已配档位追加 Claude 家族代表名，与 Rust 第 3 条规则一致", () => {
     const k = { ...key("a", 0, []), tierOpus: "deepseek-reasoner", tierHaiku: "glm-4.5-air" };
-    // Rust 侧的追加顺序是 opus → sonnet → haiku（`serviceable_models` 里写死的）。
+    // Rust 侧的追加顺序在 `advertise::TIER_FAMILY` 里：opus → sonnet → haiku → fable。
     expect(discoverableModels([k])).toEqual(["claude-opus-4-5", "claude-haiku-4-5"]);
+  });
+
+  it("Fable 档也追加家族名，且排在既有三档之后（顺序是契约）", () => {
+    const k = {
+      ...key("a", 0, []),
+      tierOpus: "deepseek-reasoner",
+      tierSonnet: "glm-4.6",
+      tierHaiku: "glm-4.5-air",
+      tierFable: "gpt-5.6-sol",
+    };
+    expect(discoverableModels([k])).toEqual([
+      "claude-opus-4-5",
+      "claude-sonnet-4-5",
+      "claude-haiku-4-5",
+      "claude-fable-5",
+    ]);
+    // 只配 fable 也要出现 —— CLI 那道 `pY` 过滤对 fable5 是特例放行，不显式列出就用不上。
+    expect(discoverableModels([{ ...key("a", 0, []), tierFable: "gpt-5.6-sol" }])).toEqual([
+      "claude-fable-5",
+    ]);
   });
 
   it("没有 Key 就没有模型", () => {

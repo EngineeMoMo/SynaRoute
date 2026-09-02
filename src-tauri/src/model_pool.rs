@@ -40,6 +40,7 @@
 //! 三者在 [`rank_candidates`] 里叠加：配置态决定顺序，运行态决定去留。
 
 use super::{error_resp_with_retry_after, ResBody};
+use crate::model::advertise::{advertised_models, AdvertisedModel};
 use crate::model::{CategoryType, ModelResolveKind, ProviderKey};
 use crate::store::Store;
 use hyper::{Response, StatusCode};
@@ -139,14 +140,38 @@ pub(crate) fn serves_natively(key: &ProviderKey, outward: &str) -> bool {
 /// 的名字集合** —— 方向是「凡我们宣称的，一定有 Key 真的认识」，反之不成立（用户手打一个
 /// 我们没宣称的真实名也能被正确路由）。[`reject_if_unserviceable`] 依赖的正是这个方向。
 pub(crate) fn discoverable_models(candidates: &[ProviderKey]) -> Vec<String> {
+    advertised_pool(candidates)
+        .into_iter()
+        .map(|a| a.outward)
+        .collect()
+}
+
+/// 同 [`discoverable_models`]，但保留每条的**菜单显示名**。
+///
+/// 三个出口要用它：`/v1/models` 的 `display_name`、`/v1/models/{id}`、
+/// 桌面端 `inferenceModels[].labelOverride`。其余十几个只关心名字的调用方继续用
+/// [`discoverable_models`]（它现在就是本函数的投影，**不存在第二份并集实现**）。
+///
+/// # 同名冲突：首个宣称者赢
+///
+/// 并集口径下同一个对外名可能被多条 Key 宣称（典型：两条 Key 都映射了 `claude-opus-4-8`，
+/// 一条指向 `glm-5.3`、另一条指向 `deepseek-v4-flash`）。label 取**首个**，
+/// 即 `priority` 最高的那条 Key 的说法。
+///
+/// ⚠️ **已知的不精确，写明免得当 bug 查**：真正的落点由 [`rank_candidates`] 决定，
+/// 它把「服务把握」摆在 `priority` 之前，所以实际转发到的可能是**第二条** Key ——
+/// 那时菜单上的显示名与真实落点不符。不去修它的理由：菜单是**静态**的（客户端启动/
+/// 刷新时才拉一次），而落点是**每请求**算的，两者不可能恒等；而 label 只影响显示，
+/// 真正要排障时看的是路由日志与 `X-SynaRoute-Decision` 响应头（那里给的是本次的真实落点）。
+pub(crate) fn advertised_pool(candidates: &[ProviderKey]) -> Vec<AdvertisedModel> {
     let mut seen = std::collections::HashSet::new();
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<AdvertisedModel> = Vec::new();
     for key in candidates {
-        for name in key.serviceable_models() {
+        for adv in advertised_models(key) {
             // HashSet 去重而不是 `out.iter().any(..)`：并集口径下 m 可达上百
             // （6 条 Key × 各 30 个模型），线性扫描是 O(m²)。一次 String clone 换掉它。
-            if seen.insert(name.clone()) {
-                out.push(name);
+            if seen.insert(adv.outward.clone()) {
+                out.push(adv);
             }
         }
     }
@@ -580,6 +605,7 @@ mod tests {
 
     fn mapping(expected: &str, real: &str) -> ModelMapping {
         ModelMapping {
+            display_name: None,
             id: format!("{expected}->{real}"),
             expected_name: expected.into(),
             real_name: real.into(),

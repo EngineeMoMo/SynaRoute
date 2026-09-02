@@ -2766,6 +2766,7 @@ mod tests {
 
     fn test_key(base_url: &str) -> crate::model::ProviderKey {
         crate::model::ProviderKey {
+            tier_fable: None,
             id: "k1".into(),
             category_id: CategoryType::ClaudeCli,
             name: "mock".into(),

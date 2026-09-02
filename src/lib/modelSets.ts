@@ -1,15 +1,19 @@
 import type { ProviderKey } from "@/types";
 
 /**
- * 某个 Key 对外「可服务」的模型名集合 —— 必须与后端 `ProviderKey::serviceable_models` 同口径：
+ * 某个 Key 对外「可服务」的模型名集合 —— 必须与后端 `model::advertise::advertised_models`
+ * 同口径（`ProviderKey::serviceable_models` 现在只是它丢掉「菜单显示名」那一维的投影）：
  * - 有完整映射 → 只取映射对外名（expectedName），不并入 models 真实名
  * - 无映射 → 取 models 真实名
- * - 已配三档 → 追加 claude-*-4-5 家族代表名
+ * - 已配档位 → 追加家族代表名（opus/sonnet/haiku 用 `claude-*-4-5`、fable 用 `claude-fable-5`）
  *
  * 从 CategoryPage 搬到这里，是因为状态条（ProxyStatusBar）也要算「当前模型」的候选集，
  * 而它与分类页是两个组件。**两份实现必然漂移**，而漂移的后果是：界面列出的模型后端压根
  * 没宣称过，于是转发时被 `reject_if_unserviceable` 当成「客户端自己编的名字」放过、
  * 静默降级到别的模型 —— 用户选了 A 拿到 B 的回答，日志里也只是一行正常的「兜底改写」。
+ *
+ * ⚠️ 本函数**刻意只算名字、不算显示名**：显示名只影响客户端菜单，前端这几处用不到它，
+ * 而多算一维就要多维护一条跨语言 parity。追加顺序与后端 `TIER_FAMILY` 一致（fable 排最后）。
  */
 export function keyExpectedSet(k: ProviderKey): Set<string> {
   const set = new Set<string>();
@@ -25,6 +29,7 @@ export function keyExpectedSet(k: ProviderKey): Set<string> {
   if (k.tierOpus?.trim()) set.add("claude-opus-4-5");
   if (k.tierSonnet?.trim()) set.add("claude-sonnet-4-5");
   if (k.tierHaiku?.trim()) set.add("claude-haiku-4-5");
+  if (k.tierFable?.trim()) set.add("claude-fable-5");
   return set;
 }
 

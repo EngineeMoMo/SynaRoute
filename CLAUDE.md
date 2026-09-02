@@ -1362,6 +1362,105 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   （前 8 位 + 后 4 位 + 历史值不许再现），换占位符时自动变红 —— 靠人记得改文案已经失败过一次。
   <br>两条注入均验证变红：条件退回 `if !applied` → `left: NotApplied`；文案换回旧串 →
   「前 8 位对不上」。
+
+- **模型映射对齐 cc-switch：菜单显示真实模型名 + 对外名自动生成（2026-09-02，用户报的痛点）**。
+  完整取证与复现命令在 [docs/14 第二十二节](docs/14-交接与待办清单.md)。三句最要紧的：
+  <br>🔴 **两端都有官方的「显示名」通道，且都是 display-only、不过合规判据**：桌面端
+  `inferenceModels[].labelOverride`（官方文档原文点名用途包含 "gateway routing aliases"，
+  消费点 `r.labelOverride ?? i?.name ?? r.name` 优先级最高）、CLI `/v1/models` 的
+  `display_name`（`claude.exe` 的 `TSv()`：`label: o.display_name ?? o.id`）。
+  也就是说 `glm-5.3` 完全可以显示在菜单上 —— 只要写进 `name`/`id` 的是合规别名。
+  **docs/14 第九节那张「桌面端 ✗」的表只管 id，不管显示名**，已在那里补了说明。
+  <br>🔴 **恒等映射与直连必须给 `label = None`，不能给「与对外名相同的字符串」**：
+  桌面端没有 `labelOverride` 时走 `Vwt(name)` 把 `claude-opus-5` 派生成友好的
+  「Claude Opus 5」，写一个等于 outward 的 label 反而把它降级成裸 slug ——
+  「加了功能、界面变丑」。而用户的真实配置里就有 `claude-opus-5 → claude-opus-5` 这种恒等行。
+  收在 `advertise::menu_label` 一处，四个来源共用。
+  <br>🔴 **`claude-fable-5` 必须显式列出才可用**（这是补 Fable 档的真正理由，不是凑数）：
+  CLI 的第二道 filter `pY(o.id)` 会把「恰好等于官方模型 ID」的条目丢掉以免与内置列表重复，
+  而 fable5 那组是**特例放行**。**刻意不加 mythos** —— Project Glasswing 限定，
+  普通用户拿不到，做出来是一个永远选不到的死配置。
+  <br>实现在 [`model/advertise.rs`](src-tauri/src/model/advertise.rs)（对外清单的**唯一**产出点，
+  `serviceable_models()` 退化成它的投影）+ `model_pool::advertised_pool`（`discoverable_models`
+  是它的投影，故 10+ 个只关心名字的调用点一行没动）+ `proxy/models_endpoint.rs` +
+  `tools/desktop_profile.rs` + `ModelMappingSection.tsx` + `i18n.mapping.ts`。
+  <br>**对外名自动生成零新增 IPC**：复用 `checkDesktopModelNames`，前端构造一份把
+  `expectedName` 置成 `realName` 的探测副本，拿回 `issues[].suggestion`。
+  CLI/Codex 分类不需要建议（无合规约束 + `to_gateway_model_id` 自动包前缀），直接用真实名。
+  <br>⚠️ **副作用要如实告知，别隐瞒你知道会发生的事**：设了 `labelOverride` 后桌面端会在
+  系统提示词里追加「本部署把该模型标注为 X」。方向上是好事（模型不再误以为自己是 Claude），
+  但它改变模型可见上下文 —— 文案 `editor.mappingDisplayNote` 只在用户真填了显示名时才出现。
+  <br>⚠️ **顺带修掉一句只覆盖一半的注释**：`proxy.rs` 原写「display_name 用真实名」，
+  而那**只在无映射时为真**（那时对外名恰好 == 真实名）。同类还有 `model.rs` 那句
+  「CLI 丢弃 id 不以 claude/anthropic **开头**的条目」—— 实测是**子串**匹配
+  （我们 `starts_with` 是更严的一侧，方向安全，故不放宽，只改措辞）。
+  <br>**16 条注入全部有结论**（后端 9：8 变红 + 1 条**编译器**护栏 —— `TIER_FAMILY` 数组长度
+  标注为 4，少一条编译不过，这一点写进了那个常量的文档，否则下一个人会以为那里有测试在守；
+  前端 7 条全变红，含「新 i18n 分片是否真进了对称性保护范围」那一条）。
+  新增两条跨语言判据：`modelMappingFieldParity`（`providerKeyDraftParity` 只管 `ProviderKey`
+  **顶层**字段，管不到 `mappings[]` 里面 —— 那条缝里的失效形态与 `allowInAggregate` 那次
+  一模一样）、`modelMappingRows`（本仓无 jsdom，故把两条用户可感知的规则抽成纯函数再测 +
+  一条接线判据）。
+  <br>⚠️ **判据自己被模板串骗过一次**：解析 ``id: `m_${Date.now()}` `` 时「找配对右括号」
+  在 `${…}` 的 `}` 处停下，只抽到 `id` 一个键、把另外三个报成缺失。
+  **解析 JS 对象字面量前先把 `${…}` 挖掉。**
+  <br>**零棘轮抬高，五项基线下调**：`model.rs` 2067→2064、`proxy.rs` 3036→**2936**、
+  `tools.rs` 1909→**1797**、`KeyEditor.tsx` 1624→**1452**、`i18n.ts` 1469→**1434**。
+  <br>📌 **仍未真机验证**（浏览器预览已过：四档渲染 / 三格表头 / 选模型自动填对外名 /
+  显示名 placeholder 跟随 / 改过的对外名不被覆盖）：桌面端重启后菜单是否真显示 `glm-5.3`、
+  选中后能否正常对话、系统提示词那句是否出现、CLI `/model` 的 label 与 description、
+  以及 fable 档在两端的表现。
+  <br>🔴 **「还有什么没做」这一问又查出补 Fable 时漏掉的三处（2026-09-02 同日，已修）** ——
+  全部是「加了第四档，但别处还在枚举三档」，且三处的失效方向都静默：
+  <br>① `fallback_model_for_empty_request` 与 ② `probe_model` 各写了一份硬编码
+  `[&self.tier_opus, &self.tier_sonnet, &self.tier_haiku]`。于是**只配了 fable 档**的 Key：
+  下游没给模型名时我们对一条明明有模型信息的 Key 说「它没有任何模型信息」；
+  健康探测选不出模型 → 退回轻量 `/models` 探测 → 按那个函数自己的注释
+  「被上游 401/403 误判失败而反复熔断，即便真实业务完全正常」。
+  已收成 `advertise::configured_tier_models`（唯一枚举点，顺序与对外清单一致），
+  并加源码级判据钉住「生产段里不许再出现那种硬编码档位数组」。
+  **加第五档时只需改 `TIER_FAMILY`** —— 只有那张表有编译器护栏（数组长度标注）。
+  <br>③ `tools.rs` 清 `ANTHROPIC_DEFAULT_*_MODEL` 残留的清单只有三个键。
+  取证：`claude.exe` 里 `ANTHROPIC_DEFAULT_FABLE_MODEL` 出现 **14 次**
+  （`..._MYTHOS_MODEL` 是 **0 次**，故刻意不列它）。而 cc-switch 的档位表里就有 Fable ——
+  用户从那边切过来时残留的这个键不清，`/model` 里会多出一个指向**旧值**的 fable 项，
+  且它绕过我们的档位映射。3 条注入全部变红。
+  <br>**教训**：加一个字段，要搜的不是「这个字段名」（它还不存在），
+  而是**「与它同族的那些字段名」**（`grep tier_opus` 一下就看到两处硬编码三元组）。
+  顺带把用户可见的日志文案「三档命中」改成「档位命中」—— 用户配了 fable，
+  日志说「三档」会让他以为走的是另一条路。
+
+- **Key 卡片加「复制配置」（2026-09-02，用户报的痛点）**：「同一供应商有不同 key，新建太麻烦了」
+  —— 而 baseUrl / 协议 / 模型列表 / 映射 / 档位 / 余额查询 / 计费倍率 全都一样，真正要换的只有密钥。
+  规则收在 [`src/lib/keyCopy.ts`](src/lib/keyCopy.ts)，入口是卡片上的第三个图标按钮。
+  <br>**打开预填好的编辑器，而不是「点一下就落盘一条副本」**：后者会立刻多出一条
+  `hasSecret: false` 的**启用** Key，它进候选池后每次请求都取不到密钥。而用户点复制的下一步
+  本来就是填密钥。
+  <br>🔴 **必须用展开式 `{...k}`，不许改成逐字段列举**：白名单式的失效方向是静默的
+  （`ProviderKey` 日后加字段 → 复制时漏掉 → 用户以为设置跟过来了）。有一条**逐字段对账**的
+  测试钉住它（不是源码级 grep —— 那种判据太容易被写法绕过）。四项覆盖各对应一个具体后果：
+  `id: ""`（否则 `upsert_key` 按 id 认领 → **直接覆盖掉原 Key**）、`hasSecret: false`
+  （否则编辑器显示「已配置，留空则不修改」，用户不填就保存 → config 说有密钥、库里没有）、
+  `health` 归零（否则副本带着**另一条 Key** 的熔断计数）、`name` 加「（副本）」后缀。
+  <br>**`priority` 刻意不动**：副本必然与原 Key 撞同一个值，而 `upsert_key` 的新插入分支
+  正是为此建的（撞了就顶到队尾 `max+1`，其注释原文「判据放在**碰撞**而不是无条件重编号上」）。
+  前端再猜一个数字只会两处打架。
+  <br>🔴 **`KeyEditor` 的 `isNew` 判据从 `!initial` 改成 `!initial?.id`**：复制传进来的是
+  `id: ""` 的草稿，它确实是新建的一条。按 `!initial` 判会让标题写「编辑 Key」、
+  并放过「拉模型前先填密钥」那道校验（那时点拉取会拿空 id 去密钥库取，报的是底层错误、
+  不是就地可行动的提示）。对原有两条路径行为完全不变。
+  <br>🔴 **抽屉的 `key` prop 必须带打开序号**（`editorSeq`）：复制路径下 id 恒为空串，
+  于是「连续复制两条不同的 Key」两次的 key 完全相同 → React 不重新挂载 → 抽屉标题换了、
+  表单里还是上一条的内容。那正是 App.tsx 里早就记过的事故形态，只是这次触发者从
+  「切换编辑对象」变成了「复制」。7 条注入全部变红，含 4 条**接线**判据
+  （按钮 → 分类页透传 → App 调 `makeKeyCopy` → 编辑器按新建对待）。
+  <br>**零棘轮抬高**：`KeyEditor.tsx` 顶在 1452，靠删掉一段与 `bridge.ts` 重复的注释
+  （「判据不在前端复刻」那三行两边都写了）+ 把 `isNew` 的长解释搬进 `keyCopy.ts` 腾出来。
+  ⚠️ 中途踩了 CLAUDE.md 记过的「腾空间是删、不是重排」—— 第一次改注释只是把 4 行断成 3 行，
+  减了 1 行，白跑一次门。
+  <br>📌 浏览器预览已验证：按钮出现在 6 张卡片上、复制后标题为「新增」、密钥框空且要求填、
+  映射/档位/模型列表全部沿用、**连续复制两条不同 Key 显示的是各自的内容**。
+
 - **刻意不修的项**（别当成遗漏重复劳动）：SmartScreen 签名告警、`retrieval.rs` 的 `cwd` 白名单、
   请求日志存明文对话（默认关闭）
 

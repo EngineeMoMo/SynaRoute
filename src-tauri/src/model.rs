@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+#[path = "model/advertise.rs"] pub(crate) mod advertise; // 对外名 + 菜单显示名；来由见该文件模块注释
+
 /// 三个目标工具分类
 ///
 /// `Default` = `ClaudeCli`，**仅为 `ProviderKey::default()` 的测试便利**而存在
@@ -40,8 +42,8 @@ pub struct CategoryMeta {
     /// 代理的默认首选端口。选用冷门段避开常见软件占用（8080/8888/3000/5173/7890/9527…），
     /// 且三分类连续好记
     pub default_port: u16,
-    /// 是否参与「三档（快/中/强 = haiku/sonnet/opus）」改写。
-    /// Codex 为 false：它发 GPT 名或应用内下拉覆盖的对外名，落到三档会被误改写到无关档位。
+    /// 是否参与「档位（快/中/强/最强 = haiku/sonnet/opus/fable）」改写。
+    /// Codex 为 false：它发 GPT 名或应用内下拉覆盖的对外名，落到档位改写会被换成无关档位的真实名。
     pub tier_rewrite: bool,
     /// 对外模型名是否受**硬过滤**约束。仅 Claude 桌面端为 true ——
     /// 不合规的名字会被它从模型列表里静默过滤掉，全被滤掉时选择器为空、
@@ -282,6 +284,16 @@ pub struct ModelMapping {
     pub id: String,
     pub expected_name: String,
     pub real_name: String,
+    /// 客户端模型菜单里显示的文字。**留空 = 自动用 `real_name`**（见 `advertise::advertised_models`）。
+    ///
+    /// 它只影响显示：桌面端走 `inferenceModels[].labelOverride`、CLI 走 `/v1/models` 的
+    /// `display_name`，两者官方语义都是 display-only，**实际发给上游的仍是 `real_name`**。
+    /// 存在的理由是让用户能写「GLM 5.3（思考）」这类带备注的名字；不填也已经解决了
+    /// 「菜单里看不到真实模型名」这个本体问题，故它是可选字段而非必填。
+    ///
+    /// `#[serde(default)]`：老配置读进来是 `None` → 自动显示真实名，无需迁移。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -418,15 +430,21 @@ pub struct ProviderKey {
     /// 也不是本 Key 的真实模型名，则改用此模型转发。为空时退回「该 Key 第一个模型」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
-    /// 三档快捷映射（取自 cc-switch 的 haiku/sonnet/opus 语义，落到我们的运行时代理）。
-    /// Claude Code 按任务发不同家族模型名（含 haiku/sonnet/opus 子串），配了对应档位即改写为上游真实名。
-    /// 与 `mappings` 并存：自由映射（精确名）优先级更高，三档作为家族级兜底。
+    /// 档位快捷映射（取自 cc-switch 的 haiku/sonnet/opus/fable 语义，落到我们的运行时代理）。
+    /// Claude Code 按任务发不同家族模型名（含 haiku/sonnet/opus/fable 子串），配了对应档位即改写为上游真实名。
+    /// 与 `mappings` 并存：自由映射（精确名）优先级更高，档位作为家族级兜底。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier_haiku: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier_sonnet: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier_opus: Option<String>,
+    /// Fable 档（官方 `Dc` 里的第四个家族，现役家族名 `claude-fable-5`）。
+    ///
+    /// **刻意没有 mythos 档**：那是 Project Glasswing 限定（`claude.exe` 的 `iHu`），
+    /// 普通用户拿不到，做出来是一个永远选不到的死配置。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_fable: Option<String>,
     #[serde(default)]
     pub health: HealthState,
     /// 余额查询配置（可选）。`None` = 该 Key 未配置余额查询。
@@ -653,13 +671,21 @@ impl BalanceResult {
     }
 }
 
-/// Claude Code 网关模型发现：CLI 静默丢弃 id 不以 `claude`/`anthropic` 开头的条目
+/// Claude Code 网关模型发现：CLI 会丢弃 id 里**不含** `claude`/`anthropic` 的条目
 ///（见官方 llm-gateway-protocol / CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY）。
 /// 非合规名（如 grok-4.5、glm-4.6）在 `/v1/models` 暴露时包一层此外缀，客户端选中后
 /// `resolve_model` 再剥掉还原。
 pub const GATEWAY_ALIAS_PREFIX: &str = "claude-synaroute-";
 
 /// 该模型 id 是否能直接出现在 Claude Code /model 的 From gateway 列表里。
+///
+/// 实测判据（`claude.exe` v2.1.x 的 `TSv()` @294227923）是
+/// `/(claude|anthropic)/i.test(o.id)` —— **子串**，不是前缀。本函数用 `starts_with` 是
+/// **更严的一侧**：方向上只会给本可直出的名字多包一层 `claude-synaroute-`（无害，
+/// `display_name` 仍显示真名），不会放过一个 CLI 其实会丢弃的 id。故刻意不放宽。
+///
+/// CLI 那里还有**第二道** filter（`pY`）：id 恰好等于某个官方模型 ID 时会被丢掉
+/// （避免与内置列表重复），`fable5` 那组是特例放行 —— 详见 `advertise::TIER_FAMILY` 的注释。
 pub fn is_cli_discoverable_model_id(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
     lower.starts_with("claude") || lower.starts_with("anthropic")
@@ -863,7 +889,7 @@ pub struct DesktopModelNameReport {
 
 /// 为一个不合规的对外名生成合规替代。
 ///
-/// **档位靠猜，但猜错不影响路由**：自由映射的 exact match 优先于三档家族匹配
+/// **档位靠猜，但猜错不影响路由**：自由映射的 exact match 优先于档位家族匹配
 /// （见 `resolve_model`），档位只决定桌面端把它归到哪个 `anthropicFamilyTier` 家族桶里显示。
 /// 所以这里宁可给一个「一定能用」的名字，也不追求档位判断精准。
 ///
@@ -964,7 +990,7 @@ pub fn desktop_model_name_report(key: &ProviderKey) -> DesktopModelNameReport {
 pub enum ModelResolveKind {
     /// 自由映射 exact match
     Mapping,
-    /// 三档家族（haiku/sonnet/opus）
+    /// 档位家族（haiku/sonnet/opus/fable）
     Tier,
     /// Key 的 models 列表里原生有这个名
     Native,
@@ -981,7 +1007,7 @@ impl ModelResolveKind {
     pub fn label_zh(self) -> &'static str {
         match self {
             Self::Mapping => "映射",
-            Self::Tier => "三档",
+            Self::Tier => "档位",
             Self::Native => "原生",
             Self::Default => "默认兜底",
             Self::First => "列表首个",
@@ -995,14 +1021,14 @@ impl ProviderKey {
     ///
     /// 优先级：
     /// 1. 映射命中：`requested` 命中某条映射的期望名 → 用其真实名（用户显式意图，最高）
-    /// 2. 三档命中：`requested` 含 haiku/sonnet/opus 家族子串且配了对应档位 → 用该档真实名
+    /// 2. 档位命中：`requested` 含 haiku/sonnet/opus/fable 家族子串且配了对应档位 → 用该档真实名
     /// 3. 原生支持：`requested` 恰好是本 Key 的某个真实模型名 → 原样使用
     /// 4. 默认兜底：用户为本 Key 配置的 `default_model`（可选）
     /// 5. 第一个模型：本 Key 拉取/手填的模型列表非空则取首个
     /// 6. 透传：以上都不满足（Key 未配置任何模型）→ 原样发 `requested`（保持旧行为）
     ///
-    /// 三档放在「原生支持」之前：Claude Code 发的是 `claude-sonnet-4-5-*` 等家族名，
-    /// 上游多半不原生支持，应优先落三档；自由映射仍在最前——用户手配精确映射永远赢。
+    /// 档位放在「原生支持」之前：Claude Code 发的是 `claude-sonnet-4-5-*` 等家族名，
+    /// 上游多半不原生支持，应优先落档位；自由映射仍在最前——用户手配精确映射永远赢。
     pub fn resolve_model(&self, requested_model: &str) -> String {
         self.resolve_model_detail(requested_model).0
     }
@@ -1010,7 +1036,7 @@ impl ProviderKey {
     /// 下游**完全没给模型名**时，为本 Key 选一个它一定能认的模型。
     ///
     /// 只在 `requested_model` 为空时用（见 `resolve_model_detail` 第 6 步的注释）。
-    /// 顺序：默认兜底 → 首个已知模型 → 任一映射的真实名 → 任一三档。
+    /// 顺序：默认兜底 → 首个已知模型 → 任一映射的真实名 → 任一档位。
     /// 全都没有则返回 `None`（该 Key 确实没有任何模型信息，只能让上游报错，
     /// 此时硬编造一个名字反而会把「配置不全」伪装成「上游拒绝」）。
     ///
@@ -1036,19 +1062,16 @@ impl ProviderKey {
         {
             return Some(m.real_name.trim().to_string());
         }
-        // 三档任一（顺序取 opus → sonnet → haiku，与家族默认口径一致）
-        [&self.tier_opus, &self.tier_sonnet, &self.tier_haiku]
-            .into_iter()
-            .flatten()
-            .map(|s| s.trim())
-            .find(|s| !s.is_empty())
+        // 档位任一（顺序与对外清单一致，见 `advertise::configured_tier_models`）
+        advertise::configured_tier_models(self)
+            .next()
             .map(|s| s.to_string())
     }
 
     /// 同 [`Self::resolve_model`]，额外返回命中路径，供日志写清「请求/实际/原因」。
     pub fn resolve_model_detail(&self, requested_model: &str) -> (String, ModelResolveKind) {
         // 0. 网关别名反解：CLI 只能展示 claude/anthropic 前缀 id，/v1/models 对非合规名
-        // 包了 `claude-synaroute-`；选中后客户端发回别名，先剥掉再走映射/三档/原生。
+        // 包了 `claude-synaroute-`；选中后客户端发回别名，先剥掉再走映射/档位/原生。
         let requested_model = unwrap_gateway_model_id(requested_model);
 
         // 1. 映射命中（精确名，最高优先级）
@@ -1059,7 +1082,7 @@ impl ProviderKey {
         {
             return (m.real_name.clone(), ModelResolveKind::Mapping);
         }
-        // 2. 三档命中（家族级：按模型名包含 haiku/sonnet/opus 子串匹配，CC 版本号常变故不精确匹配）
+        // 2. 档位命中（家族级：按模型名包含 haiku/sonnet/opus/fable 子串匹配，CC 版本号常变故不精确匹配）
         if let Some(tier) = self.match_tier(requested_model) {
             return (tier, ModelResolveKind::Tier);
         }
@@ -1103,15 +1126,16 @@ impl ProviderKey {
         (requested_model.to_string(), ModelResolveKind::Passthrough)
     }
 
-    /// 三档家族匹配：`requested` 含 opus/sonnet/haiku 子串且配了对应档位 → 返回该档真实名。
-    /// 先判 opus、再 sonnet、再 haiku（名称互不包含，顺序不影响结果，仅为可读）。
-    /// 返回的档位真实名 trim 后为空视为未配。
+    /// 档位家族匹配：`requested` 含 opus/sonnet/haiku/fable 子串且配了对应档位 → 返回该档真实名。
+    ///
+    /// 四个档位词**互不包含**，故判定顺序不影响结果（仅为可读性排成 强→弱→fable）。
+    /// 这条性质有测试钉着 —— 它不成立时表现是「选了某档、走了另一档的模型」，且完全静默。
     fn match_tier(&self, requested_model: &str) -> Option<String> {
-        // 三档（快/中/强 = haiku/sonnet/opus）是 Claude Code 语义：它按任务发带
+        // 档位（快/中/强/最强 = haiku/sonnet/opus/fable）是 Claude Code 语义：它按任务发带
         // opus/sonnet/haiku 子串的模型名才触发档位改写。Codex 发 GPT 名或经应用内下拉
-        // 覆盖的对外名（可能含 claude-*opus* 之类），一旦落到三档会被误改写到无关档位真实名
-        // （如 claude-opus-4-8 → deepseek-reasoner）。故 Codex 分类一律不走三档，从后端根治
-        // 误改写——不依赖前端保存守卫（旧数据可能仍带三档字段）。
+        // 覆盖的对外名（可能含 claude-*opus* 之类），一旦落到档位改写会被换成无关档位的真实名
+        // （如 claude-opus-4-8 → deepseek-reasoner）。故 Codex 分类一律不走档位改写，从后端根治
+        // 误改写——不依赖前端保存守卫（旧数据可能仍带档位字段）。
         if !self.category_id.meta().tier_rewrite {
             return None;
         }
@@ -1131,55 +1155,25 @@ impl ProviderKey {
         if lower.contains("haiku") {
             return pick(&self.tier_haiku);
         }
+        if lower.contains("fable") {
+            return pick(&self.tier_fable);
+        }
         None
     }
 
     /// 本 Key 对客户端「可点选」的对外模型名集合，供 `/v1/models` 发现端点使用。
     ///
-    /// 对齐 cc-switch：映射表是对外列表的主来源，避免「映射对外名 + 上游真实名」双暴露
-    /// （用户配了 `opus-4-7→grok-4.5` 时，选择器只应看到对外名，不该再冒出 `grok-4.5`）。
+    /// **规则与实现都在 [`advertise::advertised_models`]**，这里只做投影 —— 丢掉「菜单显示名」
+    /// 那一维，给只关心名字的调用方（对外名体检、`discoverable_models` 的旧签名）。
     ///
-    /// 规则（有序、去重）：
-    /// 1. **有任意非空映射** → 只暴露映射的 `expected_name`（对外名）；
-    ///    `models` 真实名仅作上游解析/探测素材，不进发现列表。
-    /// 2. **无映射** → 暴露 `models` 的 `real_name`（直连/原生场景）。
-    /// 3. 不论 1/2，已配的三档仍追加 Claude 家族代表名（`claude-*-4-5`），
-    ///    因为 CLI 内置档会发这些名，需能被 `match_tier` 命中且在 From gateway 可见。
+    /// 🔴 **别把规则再抄一份回来。** 那份实现同时供三个出口用（`/v1/models`、
+    /// `/v1/models/{id}`、桌面端 `inferenceModels`），两份必然漂移，
+    /// 而漂移的表现是「选择器里列着的名字，转发时不认」——静默且难归因。
     pub fn serviceable_models(&self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        let mut push = |name: &str| {
-            let name = name.trim();
-            if !name.is_empty() && !out.iter().any(|x| x == name) {
-                out.push(name.to_string());
-            }
-        };
-        let has_mapping = self
-            .mappings
-            .iter()
-            .any(|mp| !mp.expected_name.trim().is_empty() && !mp.real_name.trim().is_empty());
-        if has_mapping {
-            for mp in &self.mappings {
-                if mp.real_name.trim().is_empty() {
-                    continue;
-                }
-                push(&mp.expected_name);
-            }
-        } else {
-            for m in &self.models {
-                push(&m.real_name);
-            }
-        }
-        // 三档配了就把对应 Claude 家族代表名纳入——CC 会发这些名，能被 match_tier 命中。
-        if self.tier_opus.as_ref().is_some_and(|s| !s.trim().is_empty()) {
-            push("claude-opus-4-5");
-        }
-        if self.tier_sonnet.as_ref().is_some_and(|s| !s.trim().is_empty()) {
-            push("claude-sonnet-4-5");
-        }
-        if self.tier_haiku.as_ref().is_some_and(|s| !s.trim().is_empty()) {
-            push("claude-haiku-4-5");
-        }
-        out
+        advertise::advertised_models(self)
+            .into_iter()
+            .map(|a| a.outward)
+            .collect()
     }
 
     /// 某**对外名**对应的上游模型上下文窗口（token 数）；查不到返回 None。
@@ -1241,7 +1235,7 @@ impl ProviderKey {
     /// 导致「只配了自由映射、没填模型列表」的 Key（探测模型选不出）退回轻量 /models 探测，
     /// 被上游 401/403 误判失败而反复熔断——即便真实业务（映射改写后）完全正常。
     ///
-    /// 优先级：第一条映射的真实名 > 默认兜底 > 模型列表首个 > 三档真实名。都没有则 None
+    /// 优先级：第一条映射的真实名 > 默认兜底 > 模型列表首个 > 档位真实名。都没有则 None
     /// （调用方据此退回轻量探测）。
     pub fn probe_model(&self) -> Option<String> {
         let clean = |s: &str| {
@@ -1257,9 +1251,7 @@ impl ProviderKey {
         if let Some(first) = self.models.iter().find_map(|m| clean(&m.real_name)) {
             return Some(first);
         }
-        [&self.tier_opus, &self.tier_sonnet, &self.tier_haiku]
-            .into_iter()
-            .find_map(|t| t.as_deref().and_then(clean))
+        advertise::configured_tier_models(self).next().map(|s| s.to_string())
     }
 }
 
@@ -2182,6 +2174,7 @@ mod tests {
 
     fn key_with(models: Vec<ModelInfo>, mappings: Vec<ModelMapping>, default_model: Option<&str>) -> ProviderKey {
         ProviderKey {
+            tier_fable: None,
             id: "k".into(),
             category_id: CategoryType::ClaudeCli,
             name: "k".into(),
@@ -2209,7 +2202,7 @@ mod tests {
     }
 
     fn mapping(expected: &str, real: &str) -> ModelMapping {
-        ModelMapping { id: "m".into(), expected_name: expected.into(), real_name: real.into() }
+        ModelMapping { display_name: None, id: "m".into(), expected_name: expected.into(), real_name: real.into() }
     }
 
     #[test]
@@ -2590,6 +2583,32 @@ mod tests {
         assert_eq!(kind, ModelResolveKind::Tier);
     }
 
+    /// Fable 档（2026-09-02 新增，对齐 cc-switch 的四档）。
+    ///
+    /// 同时钉住 `match_tier` 的前提：**四个档位词互不包含**。这条性质一破，
+    /// 表现是「用户选了某档、实际走了另一档的模型」，而且完全静默 ——
+    /// 故不是只验 fable 能命中，还要验它**不会**被另外三档抢走、也不会去抢它们的。
+    #[test]
+    fn the_fable_tier_matches_only_fable_names() {
+        let mut k = key_with(vec![model("glm-4.6")], vec![], None);
+        k.tier_fable = Some("gpt-5.6-sol".into());
+        k.tier_opus = Some("deepseek-reasoner".into());
+
+        let (real, kind) = k.resolve_model_detail("claude-fable-5");
+        assert_eq!(real, "gpt-5.6-sol", "fable 名必须落 fable 档");
+        assert_eq!(kind, ModelResolveKind::Tier);
+
+        // 反向：opus 名不许被 fable 档接走。
+        assert_eq!(k.resolve_model_detail("claude-opus-4-7").0, "deepseek-reasoner");
+
+        // 只配 opus 而请求 fable → 该档未配，落兜底链（不是静默走 opus 的模型）。
+        let mut only_opus = key_with(vec![model("glm-4.6")], vec![], None);
+        only_opus.tier_opus = Some("deepseek-reasoner".into());
+        let (real, kind) = only_opus.resolve_model_detail("claude-fable-5");
+        assert_eq!(real, "glm-4.6", "未配 fable → 落列表首个，而不是 opus 档的模型");
+        assert_eq!(kind, ModelResolveKind::First);
+    }
+
     #[test]
     fn gateway_alias_wraps_non_claude_names_only() {
         assert_eq!(to_gateway_model_id("grok-4.5"), "claude-synaroute-grok-4.5");
@@ -2907,6 +2926,7 @@ mod tests {
                     .map(|x| x.suggestion.clone())
                     .unwrap_or_else(|| m.real_name.clone());
                 ModelMapping {
+                    display_name: None,
                     id: format!("m_{i}"),
                     expected_name: outward,
                     real_name: m.real_name.clone(),

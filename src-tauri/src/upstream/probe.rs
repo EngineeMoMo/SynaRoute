@@ -73,7 +73,7 @@ pub async fn health_probe(key: &ProviderKey, secret: &str) -> (bool, u64, Option
 /// （max_tokens=1、prompt 一个字），能拿到成功响应才算 up。这样「可用/熔断」与真实业务一致，
 /// 消除「连通正常却熔断」的割裂——代价是消耗极少量额度（1 token 输出）。
 ///
-/// 探测模型用 `key.probe_model()`：优先取「映射 real_name / default_model / 模型列表 / 三档」里
+/// 探测模型用 `key.probe_model()`：优先取「映射 real_name / default_model / 模型列表 / 档位」里
 /// **保证被上游接受的真实模型名**——这正是真实请求经映射改写后发出去的名字，使探测与业务同路。
 /// 修复了旧实现「只看 default_model+models、Key 仅配自由映射时 models 为空 → 退回轻量 /models 探测
 /// → 被 401/403 误杀熔断」的 bug。都没有可探测模型时才退回轻量探测。

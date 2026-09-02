@@ -516,6 +516,7 @@ fn import_rows(
             tier_haiku: None,
             tier_sonnet: None,
             tier_opus: None,
+            tier_fable: None,
             balance_query: None,
             cached_balance: None,
             cost_multiplier: None,

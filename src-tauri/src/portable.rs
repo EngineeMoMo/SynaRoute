@@ -545,6 +545,7 @@ mod tests {
 
     fn key(id: &str, name: &str) -> ProviderKey {
         ProviderKey {
+            tier_fable: None,
             id: id.into(),
             category_id: CategoryType::ClaudeCli,
             name: name.into(),

@@ -1,11 +1,12 @@
-// 各处**独立字段组件**的本地化词条（`CustomHeadersField` / `LanTokenPanel` …）。
+// 各处**独立字段组件与零散控件**的本地化词条（`CustomHeadersField` / `LanTokenPanel` /
+// KeyCard 的复制按钮 …）。
 //
-// 命名按「一组独立字段」而不是某一个组件：这些组件都是为了绕开 KeyEditor /
-// SettingsPage 的棘轮而抽出来的，每个只有几条文案，各占一个 sidecar 会让
+// 命名按「一组独立字段」而不是某一个组件：这些都是为了绕开 KeyEditor /
+// SettingsPage / i18n.ts 的棘轮而收在这里的，每处只有几条文案，各占一个 sidecar 会让
 // i18n.ts 的 import 与 spread 迅速膨胀（而那边余量恒为 0）。
 //
 // 从 i18n.ts 拆出来的（那边冻结在棘轮上）。粒度按**组件**分，
-// 与 i18n.usage.ts / i18n.brandPicker.ts 同一口径。
+// 与 i18n.usage.ts / i18n.brandPicker.ts / i18n.mapping.ts 同一口径。
 //
 // ⚠️ zh 与 en 的 key 集合必须完全一致 —— 由 src/lib/i18n.test.ts 机械校验
 // （它遍历 SOURCES 里的每个分片；**新增分片必须加进那张表**，
@@ -33,6 +34,12 @@ export const fieldsZh: Dict = {
   "lanToken.confirmDesc": "重新生成后旧令牌立即失效，每一个已配好的局域网客户端都要改成新令牌才能继续用。本机客户端不受影响。",
   "lanToken.confirmYes": "确认重新生成",
   "lanToken.hint": "把它填进局域网客户端的 API Key（或 Authorization: Bearer）。本机客户端不需要填。",
+  // Key 卡片上的「复制」：同一供应商多个 key 时省掉重填一整套配置。
+  // tooltip 里必须点明「密钥要重新填」—— 否则用户会以为连密钥一起复制了，
+  // 保存后转发报「未配置密钥」，而他不知道自己漏了一步。
+  "key.duplicate": "复制这条 Key 的配置",
+  "key.duplicateHint": "除 API 密钥外全部沿用（密钥请重新填）",
+  "key.copySuffix": "（副本）",
 };
 
 export const fieldsEn: Dict = {
@@ -53,4 +60,7 @@ export const fieldsEn: Dict = {
   "lanToken.confirmDesc": "Regenerating invalidates the old token immediately. Every already-configured LAN client must be updated to the new one. Local clients are unaffected.",
   "lanToken.confirmYes": "Yes, regenerate",
   "lanToken.hint": "Put it in the LAN client's API key field (or Authorization: Bearer). Local clients do not need it.",
+  "key.duplicate": "Duplicate this key's settings",
+  "key.duplicateHint": "Everything except the API key is carried over (enter the key again)",
+  "key.copySuffix": " (copy)",
 };

@@ -10,10 +10,10 @@ import { SaveErrorDialog } from "@/components/SaveErrorDialog";
 import { MAX_COST_MULTIPLIER, isValidCostMultiplier } from "@/lib/costMultiplier";
 import { CostMultiplierField } from "@/components/CostMultiplierField";
 import { CustomHeadersField } from "@/components/CustomHeadersField";
+import { ModelMappingSection, type TierValues } from "@/components/ModelMappingSection";
 import type {
   BalanceQuery,
   BalanceResult,
-  DesktopModelNameIssue,
   ModelInfo,
   ModelMapping,
   ProviderKey,
@@ -26,7 +26,7 @@ import {
   amountForUnit,
 } from "@/lib/tokenUnit";
 import { balanceFingerprint, formatBalanceAmount } from "@/lib/balance";
-import { X, RefreshCw, Plus, Trash2, ArrowRight, Eye, EyeOff, Zap, Gauge, Brain, Download, AlertTriangle, Wallet, ChevronRight } from "lucide-react";
+import { X, RefreshCw, Plus, Eye, EyeOff, Download, AlertTriangle, Wallet, ChevronRight } from "lucide-react";
 
 interface KeyEditorProps {
   initial: ProviderKey | null; // null = 新增
@@ -137,7 +137,11 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const setBalanceResult = useStore((s) => s.setBalanceResult);
   const clearBalance = useStore((s) => s.clearBalance);
   const t = useT();
-  const isNew = !initial;
+  /**
+   * 这条 Key 还没落盘 —— 决定标题、新建提示条、以及「拉模型前必须先填密钥」那道校验。
+   * 🔴 判据是 `!initial?.id` 而**不是** `!initial`，理由与代价见 `lib/keyCopy.ts`（复制路径）。
+   */
+  const isNew = !initial?.id;
 
   /**
    * 本次编辑会话中**已落盘的真实 id**。
@@ -167,9 +171,14 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const [models, setModels] = useState<ModelInfo[]>(initial?.models ?? []);
   const [mappings, setMappings] = useState<ModelMapping[]>(initial?.mappings ?? []);
   const [defaultModel, setDefaultModel] = useState(initial?.defaultModel ?? "");
-  const [tierHaiku, setTierHaiku] = useState(initial?.tierHaiku ?? "");
-  const [tierSonnet, setTierSonnet] = useState(initial?.tierSonnet ?? "");
-  const [tierOpus, setTierOpus] = useState(initial?.tierOpus ?? "");
+  // 四档快捷映射放一个对象：它们总是一起读、一起落盘，四个 useState 只会让
+  // 「加第五档」变成四处改动（而 mythos 迟早会有人问）。字段名与 ProviderKey 的 tier* 对应。
+  const [tiers, setTiers] = useState<TierValues>({
+    haiku: initial?.tierHaiku ?? "",
+    sonnet: initial?.tierSonnet ?? "",
+    opus: initial?.tierOpus ?? "",
+    fable: initial?.tierFable ?? "",
+  });
   // ---- 余额查询（第④批）----
   // 整份配置放一个 state：字段间有联动（换模板要一次改 url/method/auth 三项），
   // 拆成 8 个 useState 会让「换模板」变成 8 次 setState、且容易漏改其中一项。
@@ -334,9 +343,6 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     setModels([...models, { realName: nm, source: "manual" }]);
     setManualModel("");
   };
-
-  const addMapping = () =>
-    setMappings([...mappings, { id: `m_${Date.now()}`, expectedName: "", realName: "" }]);
 
   /**
    * 切余额查询模板：套用该模板的 url/method/auth，其余字段（超时、间隔、覆盖项）保留。
@@ -515,11 +521,12 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     models,
     mappings: mappings.filter((m) => m.expectedName && m.realName),
     defaultModel: defaultModel.trim() || undefined,
-    // 三档仅 Claude CLI/桌面端有意义；Codex 一律不落三档，避免 claude-*opus* 类名字被误改写路由
-    // （即使该 Key 早前存过三档，此处也强制清空）。
-    tierHaiku: activeCategory === "codex" ? undefined : tierHaiku.trim() || undefined,
-    tierSonnet: activeCategory === "codex" ? undefined : tierSonnet.trim() || undefined,
-    tierOpus: activeCategory === "codex" ? undefined : tierOpus.trim() || undefined,
+    // 档位仅 Claude CLI/桌面端有意义；Codex 一律不落，避免 claude-*opus* 类名字被误改写路由
+    // （即使该 Key 早前存过档位，此处也强制清空）。
+    tierHaiku: activeCategory === "codex" ? undefined : tiers.haiku.trim() || undefined,
+    tierSonnet: activeCategory === "codex" ? undefined : tiers.sonnet.trim() || undefined,
+    tierOpus: activeCategory === "codex" ? undefined : tiers.opus.trim() || undefined,
+    tierFable: activeCategory === "codex" ? undefined : tiers.fable.trim() || undefined,
     health: initial?.health ?? { status: "unknown", failCount: 0 },
     // 余额查询：从未配置过且仍是关闭态时不落这个字段，避免给每条 Key 的
     // config.json 都塞一段没用的默认配置（老 Key 保持原样、导出文件也更干净）。
@@ -540,79 +547,23 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   });
 
   /**
-   * 桌面端对外模型名的**即时**体检（UX#4）。
+   * 桌面端对外模型名的**即时**体检（UX#4）—— 提供给 `ModelMappingSection`。
    *
-   * 为什么值得单开一条 IPC：对外名不合规会被 Claude 桌面端**静默过滤掉**，
-   * 全被过滤则模型选择器为空、打开会话报 ModelsNotDiscoveredError ——
-   * 这是本项目记录过的最难排查的症状之一。此前只在「保存」那一刻拦，
-   * 用户可能已经填完整个表单（13 个字段）才被拒。
+   * 为什么值得单开一条 IPC：对外名不合规会被 Claude 桌面端**静默过滤掉**，全被过滤则模型
+   * 选择器为空、打开会话报 ModelsNotDiscoveredError（本项目记录过的最难排查的症状之一）。
+   * 此前只在「保存」那一刻拦，用户可能已经填完整个表单（13 个字段）才被拒。
+   * 判据**不在前端复刻**（理由与代价见 `bridge.ts` 那条命令的文档）。
    *
-   * **判据不在前端复刻**：那是 50+ 条厂商名子串加一套词边界匹配（逆向自桌面端 app.asar）。
-   * 两份规则必然漂移，而漂移的两个方向都很糟 —— 轻则「界面说没问题、保存被拒」，
-   * 重则「界面放行、桌面端静默过滤」。故调后端那份唯一事实。
+   * 🔴 **入参是 mappings 而不是无参**：调用方有两种用法 —— 常规体检传当前值，
+   * 「求一个合规对外名」时传一份把 `expectedName` 置成 `realName` 的探测副本。
+   * 而 draft 必须由这里拼（体检的输入源是 `serviceable_models()`，与保存拦截同一个集合；
+   * 两边各拼一份就会出现「界面说没问题、保存却被拒」的自相矛盾）。
    *
-   * 三条约束：
-   * 1. **250ms 防抖**：这个 effect 跟着打字走，不防抖会每键一发 IPC。
-   * 2. **cancelled 标志**：慢的旧响应回来会盖掉新结果，表现为「明明改好了黄条还在」。
-   * 3. **失败只清空、绝不阻断保存**：即时校验只是把反馈提前，真正的防线仍是后端保存拦截
-   *    （无条件、且能覆盖历史 Key）。同理不因有问题就 disable 保存按钮 ——
-   *    那样用户反而看不到后端那段带后果与修法的完整说明。
+   * 防抖、cancelled 竞态、以及「失败只清空、绝不阻断保存」都在 `ModelMappingSection` 里 ——
+   * 那三条约束服务的是那一区的显示，跟着它走。
    */
-  const [desktopIssues, setDesktopIssues] = useState<DesktopModelNameIssue[]>([]);
-  useEffect(() => {
-    if (activeCategory !== "claude-desktop") {
-      setDesktopIssues([]);
-      return;
-    }
-    let cancelled = false;
-    const timer = setTimeout(() => {
-      void api
-        .checkDesktopModelNames(buildDraftKey())
-        .then((r) => {
-          if (!cancelled) setDesktopIssues(r.applicable ? r.issues : []);
-        })
-        .catch(() => {
-          if (!cancelled) setDesktopIssues([]);
-        });
-    }, 250);
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-    // deps 精确取 serviceable_models() 真正会读的那几项，别用整个 draft（每次渲染都是新对象）
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeCategory, models, mappings, tierHaiku, tierSonnet, tierOpus]);
-
-  /** 是否已有「填完整」的映射行——决定 serviceable_models 走映射还是走 models 列表。 */
-  const hasEffectiveMapping = mappings.some((m) => m.expectedName.trim() && m.realName.trim());
-
-  /** 把某一行映射的对外名改成建议值。 */
-  const applySuggestion = (rowId: string, suggestion: string) =>
-    setMappings(mappings.map((m) => (m.id === rowId ? { ...m, expectedName: suggestion } : m)));
-
-  /**
-   * 一键修法：给 `models` 里的**每一个**模型都建一条映射。
-   *
-   * **必须是每一个，不能只给不合规的建** —— `serviceable_models()` 的语义是「只要存在任意一条
-   * 完整映射，models 列表就被整份忽略」。若只给 glm-4.6 建映射，同列表里本来合规的
-   * claude-opus-4-8 会直接从桌面端选择器里**消失**，用户「修好一个问题、丢了一个模型」，
-   * 而且没有任何提示。合规的那些建 realName → realName 的恒等映射即可。
-   * （model.rs 的 applying_report_suggestions_makes_key_saveable 用故障注入钉住了这条。）
-   *
-   * id 用 `m_${Date.now()}_${i}`：批量生成会落在同一毫秒，只用 Date.now() 会撞号 ——
-   * React key 重复，且按 id 删除时会一次删掉多条。
-   */
-  const fixAllByAddingMappings = () => {
-    const now = Date.now();
-    setMappings(
-      models.map((m, i) => ({
-        id: `m_${now}_${i}`,
-        expectedName:
-          desktopIssues.find((x) => x.name === m.realName)?.suggestion ?? m.realName,
-        realName: m.realName,
-      })),
-    );
-  };
+  const probeDesktopNames = (mappings: ModelMapping[]) =>
+    api.checkDesktopModelNames({ ...buildDraftKey(), mappings });
 
   const save = async () => {
     if (!name.trim()) return setError(t("editor.errNeedName"));
@@ -954,142 +905,19 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
             </div>
           </div>
 
-          {/* 三档快捷映射（取自 cc-switch 的 haiku/sonnet/opus 语义，落到运行时代理）。
-              仅 Claude CLI / 桌面端有意义：Claude Code 按任务发带 opus/sonnet/haiku 的模型名才触发档位改写。
-              Codex 发 GPT 名匹配不到三档，且若 models 里有 claude-*opus* 之类名字反而会被误改写 → 故 Codex 隐藏。 */}
-          {activeCategory !== "codex" && (
-          <div>
-            <div className="mb-1.5">
-              <span className="text-xs font-medium text-text-secondary">{t("editor.tierTitle")}</span>
-              <p className="mt-0.5 text-[11px] leading-relaxed text-text-muted">{t("editor.tierHint")}</p>
-            </div>
-            <div className="space-y-1.5">
-              {([
-                { icon: Zap, label: t("editor.tierHaiku"), value: tierHaiku, set: setTierHaiku, ph: "glm-4.5-air" },
-                { icon: Gauge, label: t("editor.tierSonnet"), value: tierSonnet, set: setTierSonnet, ph: "glm-4.6" },
-                { icon: Brain, label: t("editor.tierOpus"), value: tierOpus, set: setTierOpus, ph: "deepseek-reasoner" },
-              ] as const).map((tier) => {
-                const Icon = tier.icon;
-                return (
-                  <div key={tier.label} className="flex items-center gap-1.5">
-                    <span className="flex w-24 shrink-0 items-center gap-1 text-xs text-text-secondary">
-                      <Icon size={13} className="text-text-muted" /> {tier.label}
-                    </span>
-                    <ArrowRight size={14} className="shrink-0 text-text-muted" />
-                    <div className="flex-1">
-                      <Combobox
-                        className={`${inputCls} font-mono`}
-                        value={tier.value}
-                        options={models.map((mm) => mm.realName)}
-                        placeholder={tier.ph}
-                        emptyHint={t("editor.comboNoModels")}
-                        onChange={tier.set}
-                      />
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-          )}
-
-          {/* 模型映射 */}
-          <div>
-            <div className="mb-1.5 flex items-center justify-between">
-              <span className="text-xs font-medium text-text-secondary">{t("editor.mappingTitle")}</span>
-              <Button size="sm" variant="ghost" onClick={addMapping}>
-                <Plus size={13} /> {t("editor.addMapping")}
-              </Button>
-            </div>
-            <div className="space-y-1.5">
-              {/* 批量警告条（UX#4）：只在「还没配任何有效映射」时出——此时用户的对外名就是
-                  models 里的真实名，一个都不合规，逐行提示会刷屏，给一键修法才是正解。
-                  一旦有了映射，就转为逐行提示（下面那段），因为那时问题是具体某一行填错了。 */}
-              {desktopIssues.length > 0 && !hasEffectiveMapping && (
-                <div className="space-y-1.5 rounded-control border border-warning/40 bg-warning/10 px-2.5 py-2">
-                  <div className="flex items-start gap-2 text-[11px] leading-relaxed text-warning">
-                    <AlertTriangle size={12} className="mt-0.5 shrink-0" />
-                    <span className="flex-1">
-                      {t("editor.desktopNameBadBanner", { n: desktopIssues.length })}
-                    </span>
-                  </div>
-                  <div className="text-[11px] leading-relaxed text-text-muted">
-                    {t("editor.desktopNameFixAllHint")}
-                    <br />
-                    {t("editor.desktopNamePrefixUseless")}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={fixAllByAddingMappings}
-                    className="rounded border border-warning/40 px-2 py-0.5 text-[11px] font-medium text-warning hover:bg-warning/20"
-                  >
-                    {t("editor.desktopNameFixAll", { n: models.length })}
-                  </button>
-                </div>
-              )}
-              {mappings.length === 0 && (
-                <span className="text-xs text-text-muted">{t("editor.noMapping")}</span>
-              )}
-              {mappings.map((m, i) => {
-                // 逐行提示：只有「这一行的对外名」出现在体检结果里才提示。
-                // realName 还空着的行不会进 serviceable_models，也就不会有 issue —— 刻意如此，
-                // 否则用户填了一半就被警告、而保存其实会成功，属于假警报。
-                const issue = desktopIssues.find((x) => x.name === m.expectedName.trim());
-                return (
-                  <div key={m.id} className="space-y-1">
-                    <div className="flex items-center gap-1.5">
-                      <div className="flex-1">
-                        <Combobox
-                          className={`${inputCls} font-mono`}
-                          value={m.realName}
-                          options={models.map((mm) => mm.realName)}
-                          placeholder="GLM5.1"
-                          emptyHint={t("editor.comboNoModels")}
-                          onChange={(val) => {
-                            const next = [...mappings];
-                            next[i] = { ...m, realName: val };
-                            setMappings(next);
-                          }}
-                        />
-                      </div>
-                      <ArrowRight size={14} className="shrink-0 text-text-muted" />
-                      <input
-                        className={`${inputCls} flex-1 font-mono ${issue ? "border-warning" : ""}`}
-                        placeholder="opus-4-7"
-                        value={m.expectedName}
-                        onChange={(e) => {
-                          const next = [...mappings];
-                          next[i] = { ...m, expectedName: e.target.value };
-                          setMappings(next);
-                        }}
-                      />
-                      <button
-                        onClick={() => setMappings(mappings.filter((x) => x.id !== m.id))}
-                        className="shrink-0 rounded p-1.5 text-text-muted hover:bg-surface-hover hover:text-danger"
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    </div>
-                    {issue && (
-                      <div className="flex items-start gap-2 rounded-control bg-warning/10 px-2 py-1 text-[11px] leading-relaxed text-warning">
-                        <AlertTriangle size={11} className="mt-0.5 shrink-0" />
-                        <span className="flex-1">
-                          {t("editor.desktopNameBadRow", { name: issue.name })}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => applySuggestion(m.id, issue.suggestion)}
-                          className="shrink-0 whitespace-nowrap rounded border border-warning/40 px-1.5 py-0.5 font-medium hover:bg-warning/20"
-                        >
-                          {t("editor.desktopNameFixTo", { name: issue.suggestion })}
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
+          {/* 档位快捷映射（四档）+ 精确映射（真实名 → 对外名 · 显示名）。
+              整块抽成 ModelMappingSection —— 本文件冻结在棘轮上、余量为 0，而这一区本轮要长。
+              分类传 activeCategory 而不是 initial?.categoryId：与下面 buildDraftKey 里
+              `activeCategory === "codex"` 那三行的口径保持一致，别让「显示与落盘」各按一套判。 */}
+          <ModelMappingSection
+            category={activeCategory}
+            models={models}
+            mappings={mappings}
+            setMappings={setMappings}
+            tiers={tiers}
+            onTierChange={(which, v) => setTiers((p) => ({ ...p, [which]: v }))}
+            probe={probeDesktopNames}
+          />
 
           {/* 默认兜底模型（选填）：故障转移到本 Key 时，请求模型既无映射、本 Key 又不支持，则改用它。 */}
           <Field label={t("editor.defaultModel")}>

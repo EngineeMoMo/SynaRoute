@@ -53,6 +53,13 @@ export interface ModelMapping {
   id: string;
   expectedName: string; // 工具请求的模型名，如 opus-4-7
   realName: string; // 厂商真实模型名，如 GLM5.1
+  /**
+   * 客户端模型菜单里显示的文字。**留空 = 自动用 realName**。
+   *
+   * 桌面端走 `inferenceModels[].labelOverride`、CLI 走 `/v1/models` 的 `display_name`，
+   * 两者官方语义都是 display-only —— 实际发给上游的仍是 realName。
+   */
+  displayName?: string;
 }
 
 /** 一个不被 Claude 桌面端接受的对外模型名，及其合规替代建议（UX#4）。 */
@@ -96,11 +103,13 @@ export interface DesktopModelNameReport {
   mappings: ModelMapping[];
   /** 默认兜底模型（可选）：故障转移到本 Key 时，请求模型既非映射期望名也非本 Key 真实模型名，则改用它（FR-006） */
   defaultModel?: string;
-  /** 三档快捷映射（取自 cc-switch 的 haiku/sonnet/opus 语义）：Claude Code 按任务发家族模型名，
+  /** 档位快捷映射（取自 cc-switch 的 haiku/sonnet/opus/fable 语义）：Claude Code 按任务发家族模型名，
    *  配了对应档位即在运行时代理改写为上游真实名。与 mappings 并存，精确映射优先级更高。 */
   tierHaiku?: string;
   tierSonnet?: string;
   tierOpus?: string;
+  /** Fable 档（官方第四个家族，现役家族名 `claude-fable-5`）。刻意没有 mythos —— 那是限定开放的。 */
+  tierFable?: string;
   health: HealthState;
   /** 余额查询配置。未配置时为 undefined */
   balanceQuery?: BalanceQuery;

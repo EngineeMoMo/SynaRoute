@@ -17,6 +17,7 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { ConfigAppliedDialog } from "@/components/ConfigAppliedDialog";
 import { useStore, applyTheme } from "@/store";
 import { useBackendEvents } from "@/lib/useBackendEvents";
+import { makeKeyCopy } from "@/lib/keyCopy";
 import { isTauri } from "@/lib/bridge";
 import { requestNotificationPermission } from "@/lib/notifications";
 import { useT } from "@/lib/useT";
@@ -44,6 +45,17 @@ export default function App() {
   const [nav, setNav] = useState<NavKey>("claude-cli");
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingKey, setEditingKey] = useState<ProviderKey | null>(null);
+  /**
+   * 编辑器的打开序号 —— 进抽屉的 `key` prop，保证**每一次打开都重新挂载**。
+   *
+   * 光靠 `editingKey?.id` 不够：复制路径下 id 恒为空串，于是「连续复制两条不同的 Key」
+   * 会命中「同类型同位置的元素不重新挂载」，抽屉标题换了、表单里还是上一条的内容 ——
+   * 与下面那段注释记的事故形态一模一样，只是触发者从「切换编辑对象」变成了「复制」。
+   *
+   * ⚠️ 只在三个 `open*` 里递增，**不要**在 `onSaved` 里动它：那会让保存后整个抽屉重挂载，
+   * 把「测试查询」的结果与未提交草稿在同一帧清空（下面 onSaved 的注释记着这个坑）。
+   */
+  const [editorSeq, setEditorSeq] = useState(0);
   const [paletteOpen, setPaletteOpen] = useState(false);
 
   // 初次加载
@@ -135,12 +147,31 @@ export default function App() {
   // setState 函数本身是稳定的，故依赖数组为空。
   const openAdd = React.useCallback(() => {
     setEditingKey(null);
+    setEditorSeq((s) => s + 1);
     setEditorOpen(true);
   }, []);
   const openEdit = React.useCallback((k: ProviderKey) => {
     setEditingKey(k);
+    setEditorSeq((s) => s + 1);
     setEditorOpen(true);
   }, []);
+  /**
+   * 复制一条 Key：打开一个**预填好**的编辑器（密钥留空），用户填上新密钥即可保存。
+   *
+   * 刻意不做成「点一下就落盘一条副本」：那样会立刻多出一条 `hasSecret: false` 的启用 Key，
+   * 它进候选池后每次请求都取不到密钥。而用户点复制的下一步本来就是填密钥 ——
+   * 开编辑器既省了那趟无效路由，也留了「看一眼再改名/改模型」的余地。
+   *
+   * 规则在 [`makeKeyCopy`]（哪些字段沿用、哪四项必须覆盖、以及为什么 priority 不动）。
+   */
+  const openDuplicate = React.useCallback(
+    (k: ProviderKey) => {
+      setEditingKey(makeKeyCopy(k, t("key.copySuffix")));
+      setEditorSeq((s) => s + 1);
+      setEditorOpen(true);
+    },
+    [t],
+  );
 
   const renderMain = () => {
     if (nav === "brain") return <BrainPage />;
@@ -151,7 +182,7 @@ export default function App() {
     if (nav === "about") return <AboutPage />;
     // onOpenLogs：分类页的「最近失败原因」横幅要能一键跳到运行日志页看详情
     // （与 UpdateBanner 的 onOpenSettings 同一模式——nav 是 App 的局部状态，靠回调上抛）。
-    return <CategoryPage onAddKey={openAdd} onEditKey={openEdit} onOpenLogs={() => handleNav("logs")} />;
+    return <CategoryPage onAddKey={openAdd} onEditKey={openEdit} onDuplicateKey={openDuplicate} onOpenLogs={() => handleNav("logs")} />;
   };
 
   return (
@@ -179,7 +210,7 @@ export default function App() {
         // 同类型同位置的元素不会重新挂载，而 KeyEditor 的字段全是 useState(initial?.x)
         // 只在挂载时取一次 —— 结果是抽屉标题换了、表单里还是上一条 Key 的 baseUrl 与密钥态。
         <KeyEditor
-          key={editingKey?.id ?? "new"}
+          key={`${editingKey?.id ?? "new"}-${editorSeq}`}
           initial={editingKey}
           onClose={() => setEditorOpen(false)}
           onSaved={() => {

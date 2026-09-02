@@ -673,6 +673,7 @@ mod tests {
             Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let key = ProviderKey {
+            tier_fable: None,
             id: "k1".into(),
             category_id: CategoryType::ClaudeCli,
             name: "k".into(),
@@ -790,6 +791,7 @@ mod tests {
             let id = format!("k{i}");
             store
                 .upsert_key(crate::model::ProviderKey {
+                    tier_fable: None,
                     id: id.clone(),
                     category_id: CategoryType::ClaudeCli,
                     name: id.clone(),
@@ -862,6 +864,7 @@ mod tests {
 
         let mk = |id: &str, cat: CategoryType, prio: i32, enabled: bool, health: HealthState| {
             ProviderKey {
+                tier_fable: None,
                 id: id.into(),
                 category_id: cat,
                 name: id.into(),
@@ -950,6 +953,7 @@ mod tests {
         );
         store
             .upsert_key(ProviderKey {
+                tier_fable: None,
                 id: "k1".into(),
                 category_id: CategoryType::ClaudeCli,
                 name: "k".into(),
@@ -1085,6 +1089,7 @@ mod tests {
 
     fn key(id: &str) -> ProviderKey {
         ProviderKey {
+            tier_fable: None,
             id: id.into(),
             category_id: CategoryType::ClaudeCli,
             name: id.into(),

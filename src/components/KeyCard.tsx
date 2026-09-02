@@ -14,7 +14,7 @@ import { balanceFingerprint, formatBalanceAmount, usedPercent } from "@/lib/bala
 import { usePolling } from "@/lib/usePolling";
 import { openExternalUrl } from "@/lib/openExternal";
 import { useT } from "@/lib/useT";
-import { ChevronUp, ChevronDown, RefreshCw, Pencil, Trash2, ArrowRight, Wallet, ExternalLink } from "lucide-react";
+import { ChevronUp, ChevronDown, RefreshCw, Pencil, Copy, Trash2, ArrowRight, Wallet, ExternalLink } from "lucide-react";
 
 /**
  * 单个厂商 Key 卡片（FR-001/003/006/010/011）。
@@ -27,9 +27,15 @@ import { ChevronUp, ChevronDown, RefreshCw, Pencil, Trash2, ArrowRight, Wallet, 
  * 若不在 store 里复用未变对象，`prevProps.k === nextProps.k` 恒为 false、memo 恒失效
  * （实测确认过：轮询后 k 引用必变而内容全等）。两者必须成对存在，改一处要想到另一处。
  */
-export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast, isRoutingPrimary }: {
+export const KeyCard = React.memo(function KeyCard({ k, onEdit, onDuplicate, isFirst, isLast, isRoutingPrimary }: {
   k: ProviderKey;
   onEdit: (k: ProviderKey) => void;
+  /**
+   * 「复制这条 Key 的配置」。与 `onEdit` 同样必须由父级用 `useCallback` 包稳 ——
+   * 本组件是 `memo`，每次父级重渲染都造新函数的话浅比较在这一项上就失败，N 张卡片全量重渲染
+   * （见文件头那段注释）。
+   */
+  onDuplicate: (k: ProviderKey) => void;
   isFirst: boolean;
   isLast: boolean;
   /**
@@ -428,7 +434,7 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast,
             </div>
           ) : (
             <div className="flex items-center gap-0.5">
-              {/* 三个图标按钮都要 aria-label：Tooltip 只是 hover/focus 时出现的视觉层，
+              {/* 四个图标按钮都要 aria-label：Tooltip 只是 hover/focus 时出现的视觉层，
                   不构成无障碍名称——没有 aria-label 时屏幕阅读器只会读到一个空按钮。
                   文案与 Tooltip 内容同源，避免两处各说一套。 */}
               <Tooltip content={t("key.checkHealth")} side="top">
@@ -449,6 +455,21 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, isFirst, isLast,
                   onClick={() => onEdit(k)}
                 >
                   <Pencil size={14} />
+                </Button>
+              </Tooltip>
+              {/* 复制：同一供应商常有多个 key（不同额度/账号），而 baseUrl、协议、模型列表、
+                  映射、余额查询、计费倍率全都一样 —— 用户原话「新建太麻烦了」。
+                  tooltip 分两行：第二行必须说明「密钥要重新填」，否则用户会以为密钥也复制了，
+                  保存后转发报「未配置密钥」而他不知道漏了哪一步（密钥在加密库里，
+                  前端只有 hasSecret 这个布尔值，本来就拿不到明文）。 */}
+              <Tooltip content={`${t("key.duplicate")} · ${t("key.duplicateHint")}`} side="top">
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  aria-label={t("key.duplicate")}
+                  onClick={() => onDuplicate(k)}
+                >
+                  <Copy size={14} />
                 </Button>
               </Tooltip>
               <Tooltip content={t("common.delete")} side="top">

@@ -6,6 +6,7 @@ import { usageEn, usageZh } from "./i18n.usage";
 import { brandPickerEn, brandPickerZh } from "./i18n.brandPicker";
 import { vendorEn, vendorZh } from "./i18n.vendor";
 import { fieldsEn, fieldsZh } from "./i18n.fields";
+import { mappingEn, mappingZh } from "./i18n.mapping";
 
 export type Lang = "zh" | "en";
 
@@ -340,16 +341,6 @@ const zh: Dict = {
   "editor.baseUrlPlaceholder": "https://api.example.com",
   "editor.protocolMismatch": "接口地址看起来是 {guess} 协议，与当前选择不一致——协议选错会导致每次请求都失败。",
   "editor.protocolAdopt": "采纳",
-  // 桌面端对外模型名即时校验（UX#4）。不合规名会被桌面端**静默过滤**，全被过滤则选择器为空。
-  "editor.desktopNameBadRow":
-    "「{name}」会被 Claude 桌面端过滤掉：对外名须含 claude/opus/sonnet/haiku 之一，且不能含 glm/gpt/grok/deepseek 等厂商名。",
-  "editor.desktopNameFixTo": "改为 {name}",
-  "editor.desktopNameBadBanner":
-    "{n} 个对外模型名不被 Claude 桌面端接受。桌面端加载配置时会把它们从模型列表里删掉——全被删完则模型选择器为空、打开会话报 ModelsNotDiscoveredError。",
-  "editor.desktopNameFixAll": "一键加映射（{n} 条）",
-  "editor.desktopNameFixAllHint":
-    "给模型列表里每个模型各加一条映射：不合规的换成建议的合规对外名，其余保持原名。上游仍然请求真实模型名。",
-  "editor.desktopNamePrefixUseless": "注意：claude-synaroute- 前缀对桌面端无效，厂商名黑名单优先。",
   "editor.apiKey": "API 密钥",
   "editor.apiKeyConfigured": "API 密钥（已配置，留空则不修改）",
   "editor.showSecret": "显示",
@@ -361,16 +352,7 @@ const zh: Dict = {
   "editor.fetch": "拉取",
   "editor.modelManualPlaceholder": "手动输入模型名后回车，如 gpt-4o",
   "editor.noModels": "尚无模型，点击拉取或手动添加",
-  "editor.comboNoModels": "先拉取或添加模型，或直接输入模型名",
   "editor.importPreset": "从预设导入 {n} 个模型",
-  "editor.tierTitle": "三档快捷映射（快 / 中 / 强）",
-  "editor.tierHint": "Claude Code 按任务发不同档位模型，配好即自动改写为上游真实模型。留空则该档不生效，落到下方精确映射或兜底。",
-  "editor.tierHaiku": "快 · Haiku",
-  "editor.tierSonnet": "中 · Sonnet",
-  "editor.tierOpus": "强 · Opus",
-  "editor.mappingTitle": "模型映射（真实名 → 对外名）",
-  "editor.addMapping": "添加映射",
-  "editor.noMapping": "无映射时，真实模型名即对外名称",
   "editor.defaultModel": "默认兜底模型（选填）",
   "editor.defaultModelPlaceholder": "留空则用本 Key 第一个模型",
   "editor.defaultModelHint": "故障转移到本 Key 时：优先按映射，其次本 Key 原生支持的同名模型；都没有才用此兜底模型；不填则退回本 Key 第一个模型。只对客户端自己发来的模型名生效——应用模型清单里的名字若全部 Key 都服务不了，会直接报错，不会悄悄换成别的模型。",
@@ -509,6 +491,7 @@ const zh: Dict = {
   ...usageZh,
   ...brandPickerZh,
   ...fieldsZh,
+  ...mappingZh,
   "logs.empty": "暂无事件",
   "logs.searchPlaceholder": "搜索日志（Key 名、模型、错误…）",
   "logs.noMatch": "没有匹配「{q}」的日志",
@@ -1056,16 +1039,6 @@ const en: Dict = {
   "editor.baseUrlPlaceholder": "https://api.example.com",
   "editor.protocolMismatch": "The endpoint looks like the {guess} protocol, which differs from your selection — a wrong protocol makes every request fail.",
   "editor.protocolAdopt": "Use it",
-  "editor.desktopNameBadRow":
-    "Claude Desktop will drop “{name}”: an outward name must contain one of claude/opus/sonnet/haiku and must not contain a vendor name such as glm/gpt/grok/deepseek.",
-  "editor.desktopNameFixTo": "Change to {name}",
-  "editor.desktopNameBadBanner":
-    "{n} outward model names are not accepted by Claude Desktop. It drops them from the model list when loading the config — if all of them are dropped, the model picker is empty and opening a chat throws ModelsNotDiscoveredError.",
-  "editor.desktopNameFixAll": "Add mappings ({n})",
-  "editor.desktopNameFixAllHint":
-    "Adds one mapping for every model in the list: non-compliant ones get a suggested compliant outward name, the rest keep theirs. Requests still hit the real upstream model.",
-  "editor.desktopNamePrefixUseless":
-    "Note: the claude-synaroute- prefix does not help here — the vendor blocklist takes precedence.",
   "editor.apiKey": "API Key",
   "editor.apiKeyConfigured": "API Key (configured; leave blank to keep)",
   "editor.showSecret": "Show",
@@ -1077,16 +1050,7 @@ const en: Dict = {
   "editor.fetch": "Fetch",
   "editor.modelManualPlaceholder": "Type a model name and press Enter, e.g. gpt-4o",
   "editor.noModels": "No models yet — fetch or add manually",
-  "editor.comboNoModels": "Fetch or add models first, or just type a model name",
   "editor.importPreset": "Import {n} preset models",
-  "editor.tierTitle": "Quick tier mapping (fast / mid / strong)",
-  "editor.tierHint": "Claude Code sends different tier models per task; set these and they're rewritten to the upstream real model. Leave empty to skip a tier and fall through to the exact mappings or fallback below.",
-  "editor.tierHaiku": "Fast · Haiku",
-  "editor.tierSonnet": "Mid · Sonnet",
-  "editor.tierOpus": "Strong · Opus",
-  "editor.mappingTitle": "Model mapping (real → exposed)",
-  "editor.addMapping": "Add mapping",
-  "editor.noMapping": "Without mapping, the real model name is used as-is",
   "editor.defaultModel": "Default fallback model (optional)",
   "editor.defaultModelPlaceholder": "Leave empty to use this key's first model",
   "editor.defaultModelHint": "On failover to this key: mapping first, then a same-named model this key natively supports; only if neither matches is this fallback used; leave empty to fall back to this key's first model. Applies only to model names the client sends on its own — a name from the app's model list that no key can serve returns an error instead of being silently swapped.",
@@ -1224,6 +1188,7 @@ const en: Dict = {
   ...usageEn,
   ...brandPickerEn,
   ...fieldsEn,
+  ...mappingEn,
   "logs.empty": "No events yet",
   "logs.searchPlaceholder": "Search logs (key, model, error…)",
   "logs.noMatch": "No logs match “{q}”",

@@ -9,8 +9,7 @@
 //! - **Claude CLI**：`~/.claude/settings.json`
 //!   - 写：env.ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN(占位) / GATEWAY_MODEL_DISCOVERY
 //!   - 写：env.ANTHROPIC_MODEL + 顶层 `model`（主 Key 首个可服务**对外名**；策略 A）
-//!   - **不写** ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL（避免 /model 三个 Custom 同名）
-//!   - 应用时**删除** env 里残留的三档 DEFAULT_*（清 cc-switch/旧版写入）
+//!   - **不写**、且应用时**删除** env 里的 ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS,FABLE}_MODEL
 //! - **Codex**：`~/.codex/config.toml` + `auth.json`（OpenAI 形态，无 ANTHROPIC_*）
 //!   - 写：model_provider=synaroute、[model_providers.synaroute]、可选顶层 model、OPENAI_API_KEY 占位
 //! - **Claude 桌面端**：切「第三方部署模式（deploymentMode=3p）」+ 预置 gateway 配置档
@@ -75,7 +74,7 @@ const DESKTOP_META_FILE: &str = "_meta.json";
 /// `models`：`discoverable_models` 口径 —— 多 Key 取**并集**（备用 Key 独有的也在）。有序。
 /// `keys`：按优先级排序的启用 Key。**桌面端与 Codex 都用**：前者推导能力断言，后者推导
 /// `supported_reasoning_levels` 与 `context_window` —— 传空切片会让 Codex 的档位选择器消失。
-/// - **Claude CLI only**：取首个写 env.ANTHROPIC_MODEL + 顶层 `model`；并清除三档 DEFAULT_* 残留。
+/// - **Claude CLI only**：取首个写 env.ANTHROPIC_MODEL + 顶层 `model`；并清除档位 DEFAULT_* 残留。
 /// - **Codex only**：整份写进 `model_catalog_json` 模型目录；顶层 `model` **仅在缺失/不可服务时**写。
 /// - **桌面端**：整份列表写进 gateway 档的 `inferenceModels`（切 3p 部署模式，见 apply_claude_desktop）。
 pub fn apply(
@@ -139,13 +138,15 @@ fn apply_claude_cli_at(
     );
 
     // 策略 A（用户拍板）：只写 ANTHROPIC_MODEL + 顶层 model（对外名），
-    // 不写 ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL —— 内置三档靠代理 resolve_model，
-    // 避免 /model 出现三个「Custom * 都是同一个 id」。
-    // 同时删除 env 里残留的三档 DEFAULT_*（旧版/cc-switch 可能写入）。
+    // 不写 ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS,FABLE}_MODEL —— 档位改写靠代理 resolve_model，
+    // 避免 /model 出现好几个「Custom * 都是同一个 id」。同时删除 env 里残留的这四个键
+    // （旧版 / cc-switch 可能写入）。FABLE 为何在列、MYTHOS 为何不在，取证见
+    // `claude_cli_apply_overwrites_model_defaults_like_cc_switch` 里那条断言上方。
     for k in [
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
     ] {
         env_obj.remove(k);
     }
@@ -156,7 +157,7 @@ fn apply_claude_cli_at(
         if let Some(obj) = root.as_object_mut() {
             obj.insert("model".into(), Value::String(m.to_string()));
         }
-        format!("，默认模型={m}（未写三档 DEFAULT_*）")
+        format!("，默认模型={m}（未写档位 DEFAULT_*）")
     } else {
         String::new()
     };
@@ -521,121 +522,8 @@ fn write_deployment_mode(path: &Path, mode: &str) -> AppResult<()> {
     backup_and_write_json(path, &root)
 }
 
-/// 桌面端 gateway 档里 `inferenceModels` 的一条：对外名 + 由 Key 数据推导出的能力断言。
-///
-/// 三个字段各有官方语义（判据：`app.asar` v1.24012.9 的 `inferenceModels` schema，
-/// offset ≈ 7013300 / 消费点 ≈ 7400700）：
-/// - `supports1m`：**你对自己部署做的能力断言**，只对确认支持 1M 窗口的模型设置。
-///   故此处按该对外名解析到的上游模型 `contextWindow` 判定，**无数据时保守 false**——
-///   一律写 true 会让桌面端给出一个上游实际不支持、必然失败的 1M 选项。
-/// - `anthropic_family_tier`：桌面端遇到裸别名（`opus`/`sonnet`/…）时钉到本条；不填则裸别名无处可落。
-/// - `is_family_default`：同档位多条时选谁。同档位内只给**第一条**置 true（官方对多个 true
-///   会告警并取首个，我们不制造这种告警）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct DesktopModelEntry {
-    pub name: String,
-    pub supports1m: bool,
-    pub anthropic_family_tier: Option<&'static str>,
-    pub is_family_default: bool,
-}
-
-/// 把「对外名列表 + 各分类启用 Key」组装成 gateway 档需要的模型条目。
-///
-/// `keys` 为该分类按优先级排序的启用 Key（与 `discoverable_models` 同源）。
-///
-/// **窗口只认主 Key**（`keys.first()`，即路由实际优先落点），不逐 Key 找第一个有数据的。
-/// 逐 Key 找的问题：主 Key 把 `claude-opus-4-8` 映射到一个没记 `context_window` 的模型
-/// （`fetch_models` 拉来的模型一律 `context_window: None`，很常见），备用 Key 恰好记了 1M，
-/// 于是写出 `supports1m: true` —— 而请求实际落在主 Key 的 200k 上，桌面端给出一个必然被截断
-/// 的选项。查不到就保守写 false：少一个 1M 选项只是少个可选项，多一个假的会让请求直接失败。
-fn build_desktop_model_entries(
-    models: &[String],
-    keys: &[ProviderKey],
-) -> Vec<DesktopModelEntry> {
-    let mut tier_seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
-    let primary = keys.first();
-    models
-        .iter()
-        .map(|name| {
-            let ctx = primary.and_then(|k| k.context_window_for_outward(name));
-            let tier = crate::model::desktop_family_tier_of(name);
-            // 同档位只让第一条当默认（官方对多个 isFamilyDefault 会告警并取首个）。
-            let is_default = tier.is_some_and(|t| tier_seen.insert(t));
-            DesktopModelEntry {
-                name: name.clone(),
-                supports1m: ctx.is_some_and(|c| c >= crate::model::ONE_MILLION_CONTEXT),
-                anthropic_family_tier: tier,
-                is_family_default: is_default,
-            }
-        })
-        .collect()
-}
-
-/// 构造 gateway 配置档 JSON（对齐 cc-switch `build_gateway_profile`）。
-///
-/// **合并写**：在 `existing`（档内既有内容）之上覆盖本函数负责的 7 个键，其余键原样保留——
-/// 用户若在桌面端 Setup 面板里给本档加过字段，不会因改端口/重新接入而被静默抹掉。
-/// `existing` 非对象（空档/损坏）时按空对象起算。
-///
-/// `inferenceGatewayApiKey` 用占位（代理剥入站鉴权头、按路由 Key 注入真实密钥）；
-/// `inferenceGatewayBaseUrl` 指向本地代理源（桌面端按 Anthropic 风格发 /v1/messages，代理已识别）。
-///
-/// `disableDeploymentModeChooser` 恒 `true`：**对齐 cc-switch 实测样本**（用户拍板保持一致）。
-/// 注意它并非 3p 生效的必需条件——判据 `pd(e) = hasInference(e) && (disableClaudeAiSignIn(e)
-/// || persistedMode() !== "1p")`（`app.asar` offset ≈ 7100100）是「或」关系，而我们本就会写
-/// `deploymentMode=3p`。代价是接入后桌面端里看不到官方登录入口，须从 SynaRoute 点还原才能回官方。
-///
-/// `entries` 恒非空（调用方已挡空列表）；每条的能力断言见 [`DesktopModelEntry`]。
-fn build_gateway_profile(
-    existing: Value,
-    endpoint: &str,
-    entries: &[DesktopModelEntry],
-) -> Value {
-    let mut obj = match existing {
-        Value::Object(map) => map,
-        _ => serde_json::Map::new(),
-    };
-    obj.insert(
-        "coworkEgressAllowedHosts".into(),
-        Value::Array(vec![Value::String("*".into())]),
-    );
-    obj.insert("disableDeploymentModeChooser".into(), Value::Bool(true));
-    obj.insert(
-        "inferenceGatewayApiKey".into(),
-        Value::String(DESKTOP_GATEWAY_PLACEHOLDER.into()),
-    );
-    obj.insert(
-        "inferenceGatewayAuthScheme".into(),
-        Value::String("bearer".into()),
-    );
-    obj.insert(
-        "inferenceGatewayBaseUrl".into(),
-        Value::String(endpoint.to_string()),
-    );
-    obj.insert("inferenceProvider".into(), Value::String("gateway".into()));
-    // 恒写 inferenceModels（调用方已挡空列表）：合并写下若沿用旧值会与当前可服务集脱节。
-    let arr: Vec<Value> = entries
-        .iter()
-        .map(|e| {
-            let mut o = serde_json::Map::new();
-            o.insert("name".into(), Value::String(e.name.clone()));
-            // supports1m 只在确有依据时写：官方语义是能力断言，无依据即不断言。
-            if e.supports1m {
-                o.insert("supports1m".into(), Value::Bool(true));
-            }
-            if let Some(tier) = e.anthropic_family_tier {
-                o.insert("anthropicFamilyTier".into(), Value::String(tier.into()));
-                // isFamilyDefault 只在有 tier 时才有意义（官方对「无 tier 却设该标记」会告警并忽略）。
-                if e.is_family_default {
-                    o.insert("isFamilyDefault".into(), Value::Bool(true));
-                }
-            }
-            Value::Object(o)
-        })
-        .collect();
-    obj.insert("inferenceModels".into(), Value::Array(arr));
-    Value::Object(obj)
-}
+#[path = "tools/desktop_profile.rs"] mod desktop_profile; // 桌面端 gateway 档 + labelOverride；取证见该文件模块注释
+use desktop_profile::{build_desktop_model_entries, build_gateway_profile};
 
 /// 接入时更新 `_meta.json`：确保 entries 里有本档（去重，与 cc-switch 档共存），appliedId 指向本档。
 fn write_desktop_meta_apply(path: &Path) -> AppResult<()> {
@@ -1559,7 +1447,7 @@ fn preview_claude_cli() -> AppResult<ToolConfigPreview> {
     let (exists, content) = read_preview_text(&path, true)?;
     Ok(ToolConfigPreview {
         category_id: CategoryType::ClaudeCli,
-        summary: "Claude CLI：~/.claude/settings.json。写入 BASE_URL / AUTH_TOKEN(占位) / 发现开关 / ANTHROPIC_MODEL / 顶层 model；不写三档 DEFAULT_*，不写 Codex/桌面端文件。".into(),
+        summary: "Claude CLI：~/.claude/settings.json。写入 BASE_URL / AUTH_TOKEN(占位) / 发现开关 / ANTHROPIC_MODEL / 顶层 model；不写档位 DEFAULT_*，不写 Codex/桌面端文件。".into(),
         mcp_registered: is_mcp_registered(CategoryType::ClaudeCli),
         takeover_warning: None,
         files: vec![ToolConfigFilePreview {
@@ -2626,8 +2514,8 @@ mod tests {
 
     #[test]
     fn claude_cli_apply_overwrites_model_defaults_like_cc_switch() {
-        // 策略 A：只写 ANTHROPIC_MODEL + 顶层 model；并清除三档 DEFAULT_* 残留。
-        // 不写 DEFAULT_*，避免 /model 出现三个 Custom 同名。仅 Claude CLI 路径。
+        // 策略 A：只写 ANTHROPIC_MODEL + 顶层 model；并清除档位 DEFAULT_* 残留。
+        // 不写 DEFAULT_*，避免 /model 出现多个 Custom 同名。仅 Claude CLI 路径。
         let path = temp_file("claude_cli_model", "settings.json");
         std::fs::write(
             &path,
@@ -2637,7 +2525,8 @@ mod tests {
     "ANTHROPIC_MODEL": "claude-synaroute-grok-4.5",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "grok-4.5",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "grok-4.5",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "grok-4.5"
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "grok-4.5",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "grok-4.5"
   },
   "model": "claude-synaroute-grok-4.5"
 }"#,
@@ -2651,16 +2540,20 @@ mod tests {
         )
         .unwrap();
         assert!(msg.contains("默认模型=claude-opus-4-7"));
-        assert!(msg.contains("未写三档 DEFAULT_*"));
+        assert!(msg.contains("未写档位 DEFAULT_*"));
 
         let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(v["model"], "claude-opus-4-7");
         assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8788");
         assert_eq!(v["env"]["ANTHROPIC_MODEL"], "claude-opus-4-7");
-        // 策略 A：必须清除三档 DEFAULT_*
+        // 策略 A：必须清除档位 DEFAULT_*
         assert!(v["env"].get("ANTHROPIC_DEFAULT_HAIKU_MODEL").is_none());
         assert!(v["env"].get("ANTHROPIC_DEFAULT_SONNET_MODEL").is_none());
         assert!(v["env"].get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none());
+        // 🔴 FABLE 也必须清（2026-09-02 补）：`claude.exe` 实测认这个键（14 处），
+        // 而 cc-switch 的档位表里就有 Fable —— 残留它会让 /model 多出一个指向旧值的项，
+        // 且那一项绕过我们的档位映射。MYTHOS 在 claude.exe 里是 0 处，故刻意不列。
+        assert!(v["env"].get("ANTHROPIC_DEFAULT_FABLE_MODEL").is_none());
         assert_eq!(v["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], "1");
         assert_eq!(v["env"]["ANTHROPIC_AUTH_TOKEN"], "synaroute-proxy");
 
@@ -3164,6 +3057,7 @@ tool_timeout_sec = 600
     ) -> ProviderKey {
         use crate::model::{HealthState, KeyParams, ModelInfo, ModelMapping, Protocol};
         ProviderKey {
+            tier_fable: None,
             id: "k1".into(),
             category_id: CategoryType::ClaudeDesktop,
             name: "k".into(),
@@ -3190,6 +3084,7 @@ tool_timeout_sec = 600
                 .iter()
                 .enumerate()
                 .map(|(i, (out, real))| ModelMapping {
+                    display_name: None,
                     id: format!("m{i}"),
                     expected_name: (*out).into(),
                     real_name: (*real).into(),

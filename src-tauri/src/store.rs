@@ -2954,6 +2954,7 @@ mod tests {
 
     fn sample_key(id: &str, priority: i32) -> ProviderKey {
         ProviderKey {
+            tier_fable: None,
             id: id.to_string(),
             category_id: CategoryType::ClaudeCli,
             name: format!("测试Key-{id}"),

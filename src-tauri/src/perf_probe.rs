@@ -70,6 +70,7 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 
 fn bench_key(id: &str, base_url: &str) -> ProviderKey {
     ProviderKey {
+        tier_fable: None,
         id: id.into(),
         category_id: CategoryType::ClaudeCli,
         name: format!("bench-{id}"),
