@@ -1104,6 +1104,123 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 🔴 下游断连后，在途的聚合必须**真的停下**，而不是继续烧上游额度。
+    ///
+    /// # 为什么这条必须有（2026-09-01 用户实报的第二半）
+    ///
+    /// 现场：用户等了 7 分 47 秒后按停止 → Codex 发 `notifications/cancelled` →
+    /// stdio 层丢弃转发（`stdio::cancels_request`）→ **HTTP 连接断开**。
+    /// 而那一刻聚合还在跑，我们 22 秒后才写完结果。
+    ///
+    /// 「断连之后聚合还在不在跑」决定了这次取消是**真的止损**还是只是不写响应：
+    /// 后者的表现是用户按了停止、额度继续烧 20 秒（多模型并行时是几倍）。
+    /// 修 stdio 那一层时只验到「不写响应」，**没验过这一步** —— 本用例补的正是它。
+    ///
+    /// # 判据：future 被 drop
+    ///
+    /// `handle_http` 里是 `dispatch(...).await`。Rust 的 async 是**惰性**的 ——
+    /// 承载它的 future 一被 drop，其中所有未完成的 await 点一并停止，
+    /// 不需要我们自己接 cancel token。本用例用一个「drop 时留痕」的哨兵证明这一点。
+    ///
+    /// **刻意不调真的聚合**：那要打真实上游。这里验的是承载机制（hyper 会不会在断连时
+    /// drop 处理 future）；「聚合确实长在这个 future 上」由紧邻的源码级判据保证。
+    #[tokio::test]
+    async fn a_disconnected_client_must_cancel_the_in_flight_work() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DROPPED: AtomicBool = AtomicBool::new(false);
+        static STARTED: AtomicBool = AtomicBool::new(false);
+
+        struct Sentinel;
+        impl Drop for Sentinel {
+            fn drop(&mut self) {
+                DROPPED.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            let svc = service_fn(move |_req| async move {
+                let _guard = Sentinel; // 与「工作」同生命周期
+                STARTED.store(true, Ordering::SeqCst);
+                // 模拟一次长聚合：远长于客户端的等待时间
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Ok::<_, hyper::Error>(empty_response(StatusCode::OK))
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), svc)
+                .await;
+        });
+
+        // 发一个请求然后**中途断开**（超时即 drop 掉整个 reqwest future → 连接关闭）
+        let client = reqwest::Client::new();
+        let r = client
+            .post(format!("http://127.0.0.1:{port}/mcp/codex"))
+            .timeout(std::time::Duration::from_millis(600))
+            .body("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"}")
+            .send()
+            .await;
+        assert!(r.is_err(), "夹具前提：这次请求必须因超时而中断，而不是拿到响应");
+
+        // 给 hyper 一点时间感知对端关闭
+        for _ in 0..40 {
+            if DROPPED.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(STARTED.load(Ordering::SeqCst), "夹具前提：处理必须真的开始过");
+        assert!(
+            DROPPED.load(Ordering::SeqCst),
+            "下游断连后在途工作没有被取消 —— 用户按了停止，聚合却还在烧额度"
+        );
+        server.abort();
+    }
+
+    /// 上一条的另一半：聚合必须**长在**那个会被 drop 的 future 上。
+    ///
+    /// 上面那条验的是 hyper 的承载机制，用的是自造的 `service_fn` —— 把真实的
+    /// `dispatch` 改成 `tokio::spawn`，它**照样绿**。而 spawn 出去的任务有自己的
+    /// 生命周期：连接断了它照样跑完、照样烧额度，也就是取消静默失效。
+    ///
+    /// # ⚠️ 这条判据**弱于**它看起来的样子，写明免得被当成护栏
+    ///
+    /// 注入实测（把这一行换成 `spawn` + `h.await`）的结果是 **E0597 编译不过**：
+    /// `method`/`params` 借自本函数的局部量，而 `tokio::spawn` 要求 `'static`。
+    /// 也就是说**真正拦住这个改法的是借用检查器，不是本判据** —— 谁要绕过去，
+    /// 得先把那几个值都 clone 成 owned，那是一次显眼的改动，不会是手滑。
+    ///
+    /// 保留它的理由是钉住**形态**（那行必须长这样），让改动者读到上面这段说明；
+    /// 而不是假装这里有一道机械防线。同本仓「把硬保证写成软保证是退步」那条 ——
+    /// 这里反过来：软保证就该写明自己是软的。
+    #[test]
+    fn dispatch_must_be_awaited_inline_so_a_disconnect_cancels_it() {
+        let src = crate::proxy::custom_headers::production_code_only(include_str!("mcp.rs"));
+        // 🔴 只看生产段：本判据自己的字面量在测试段里，一起扫会「自我满足」而恒绿
+        // —— 本仓已栽过五次的那个坑（写注入脚本时又撞了一次，锚点命中 2 处）。
+        let prod = &src[..src.find("mod tests").unwrap_or(src.len())];
+        assert!(
+            prod.contains("dispatch(&store, method, params, caller).await"),
+            "dispatch 必须在 handle_http 里直接 await —— 换成 spawn 会让「下游断连即止损」失效"
+        );
+        // 🔴 链条的最后一环，也是**唯一会静默断掉**的一环：聚合自己不许 spawn。
+        //
+        // 上面两条只保证「承载 future 被 drop」+「dispatch 长在它上面」。但聚合内部若
+        // 把成员调用 `tokio::spawn` 出去，那些任务就有了自己的生命周期 —— 连接断了照样
+        // 跑完、照样烧额度，而外层三条判据**全绿**。
+        //
+        // 今天的实现是 `join_all` + `Semaphore`（全内联 future），故取消能一路传到每个
+        // 成员的 HTTP 请求上。谁为「并发更好控制」改成 `JoinSet`/`spawn`，这条就变红 ——
+        // 那不是不能做，而是必须同时接一条取消通路，别让它静默退化。
+        let agg = crate::proxy::custom_headers::production_code_only(include_str!("aggregate.rs"));
+        let agg_prod = &agg[..agg.find("mod tests").unwrap_or(agg.len())];
+        assert!(
+            !agg_prod.contains("tokio::spawn"),
+            "聚合生产段出现了 tokio::spawn：那些任务不随连接取消，用户按停止后仍会烧额度"
+        );
+    }
+
     /// 用户拿到一个走错 Key 池、却毫无提示的结果。
     #[test]
     fn bare_and_unknown_paths_are_unbound_not_claude_cli() {
