@@ -31,6 +31,9 @@ const pass = (msg) => console.log(`✅ ${msg}`);
   const bad = tracked.filter((f) =>
     /(^|\/)config\.json$/.test(f) ||
     /(^|\/)secrets\.enc$/.test(f) ||
+    // `usage.json` / `usage-keys.json` 是用量运行数据（后者含用户给厂商起的名字、
+    // 代表模型与计费倍率）。不含密钥，但同属「开发机的数据不该进包」那一类。
+    /(^|\/)usage(-keys)?\.json$/.test(f) ||
     /(^|\/)logs\//.test(f) ||
     /(^|\/)latest\.json$/.test(f) ||
     (/\.key$|\.pem$/.test(f) && !f.endsWith(".gpg")),

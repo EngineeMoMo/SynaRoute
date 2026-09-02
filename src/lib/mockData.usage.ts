@@ -19,7 +19,8 @@ import type { PricingSource } from "@/types";
  * - `modelNotInTable` → 「—」+ 点出那个模型名
  * - `aggregate` → 「—」+ 说明是旧版聚合用量、**没有**「去 Key 里设兜底模型」那句
  *   （那句对它是无效操作）
- * - `keyDeleted` → 「—」+ keyName 为 null，表格显示 keyId
+ * - `keyDeleted` → 「—」+ keyName 为 null，表格显示 keyId（**没有墓碑**的历史行）
+ * - 已删除但有墓碑 → 名字与金额照旧，只多一个「（已删除）」标记（现在删 Key 的常态）
  * - `noModelName` → 「—」+ 唯一一句「去设兜底模型」真正成立的成因
  */
 export function mockUsageWithCost(
@@ -101,16 +102,32 @@ export function mockUsageWithCost(
     unpricedReason: { kind: "aggregate" },
   });
 
-  // 成因②：指向一条已被删除的 Key（keyName 为 null，表格退回显示 keyId）
+  // 成因②：Key 在「删除前留档」上线**之前**就删了 —— 没有墓碑，金额不可恢复。
+  // keyName 为 null，表格退回显示 keyId。这一支是历史遗留，不会再新增。
   out.push({
     categoryId: "claude-desktop",
     keyId: "2c24a048-401d-deleted",
     keyName: null,
+    keyDeleted: true,
     usage: { input: 88_000, output: 5_400, cacheRead: 210_000, cacheCreation: 0 },
     costNano: null,
     pricingSource: "unknown",
     multiplier: "1.0",
     unpricedReason: { kind: "keyDeleted" },
+  });
+
+  // 已删除但**有墓碑**：名字与金额都从留档还原，只多一个「（已删除）」标记。
+  // 这是现在删 Key 的常态 —— 演示数据必须体现它，否则截图里看不出这个功能存在。
+  out.push({
+    categoryId: "claude-cli",
+    keyId: "9f31c7be-old-relay",
+    keyName: "厂商3（已下线中转）",
+    keyDeleted: true,
+    usage: { input: 412_000, output: 26_500, cacheRead: 980_000, cacheCreation: 12_000 },
+    costNano: 2_140_000_000,
+    pricingSource: "family",
+    multiplier: "1.4",
+    pricedByModel: "claude-sonnet-4-5",
   });
 
   return out;

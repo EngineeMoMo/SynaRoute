@@ -2897,6 +2897,44 @@ mod tests {
         }
     }
 
+    /// 🔴 **上游回 200 但正文是错误** —— 聚合这条链路与转发路径完全独立
+    /// （它走 `ToolSession`，不经过 `proxy.rs` 的 `soft_error::demote`）。
+    ///
+    /// 修之前的表现：状态码门放过 200 → `parse_anthropic_turn` 找不到 `content`
+    /// → 兜底文本提取也返 None → 报「响应无法解析」，把排障的人指向我们的解析器，
+    /// 而真相是上游返了个错误。判据与转发路径共用 `body_is_upstream_error`。
+    #[tokio::test]
+    async fn a_200_with_an_error_body_is_reported_as_an_upstream_error() {
+        let (upstream, _seen) =
+            spawn_scripted(vec![r#"{"error":{"type":"overloaded_error","message":"上游分组已饱和"}}"#])
+                .await;
+        let (_sdir, store) = test_store("agg_soft_err");
+        let key = test_key(&upstream);
+        let mut session =
+            ToolSession::new(Protocol::Anthropic, &MultimodalPrompt::from_text("在吗"));
+        let err = run_member_turns(
+            &store,
+            CategoryType::ClaudeCli,
+            &mut session,
+            &ctx_for(&key, "sk", "mock/m"),
+            None,
+            6,
+            60_000,
+            0,
+        )
+        .await
+        .expect_err("200 包着 error 必须报错，不能当成一次成功的空回答");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("上游分组已饱和"),
+            "必须把上游原话带给用户：{msg}"
+        );
+        assert!(
+            !msg.contains("无法解析"),
+            "不能报成「响应无法解析」——那把人指向我们的解析器而不是上游：{msg}"
+        );
+    }
+
     /// 端到端：模型先要求 read_file → 本地执行 → 结果回填 → 第二轮给出最终答案。
     #[tokio::test]
     async fn tool_loop_executes_tool_then_returns_final_text() {

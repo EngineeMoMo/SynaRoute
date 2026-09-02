@@ -27,6 +27,7 @@ mod session;
 mod sse;
 mod error_hint;
 mod stream_idle;
+mod thinking_effort; // Anthropic 两套 thinking 形态 → 中枢档位；来由见该文件模块注释
 /// 上游因思考签名验不过而拒绝时的请求整流。放在 `upstream` 而不是 `proxy` 下：
 /// 它修的是「上游对请求体的兼容性要求」，与协议适配同一类事（cc-switch 也放在代理层）。
 mod thinking_rectify;
@@ -51,6 +52,9 @@ pub use discovery::fetch_models;
 pub use probe::{health_probe, health_probe_real};
 pub use sse::{sse_direction, SseTranslator};
 pub(crate) use stream_idle::guard as guard_stream_idle;
+// 「这个 JSON 载荷是不是上游报错」的**唯一**判据。非流式那条路
+// （`proxy::soft_error`）复用它 —— 两侧各写一份的话，迟早只有一处被修。
+pub(crate) use sse::sse_error::upstream_error_message;
 pub(crate) use error_hint::annotate as annotate_upstream_error;
 pub(crate) use thinking_rectify::rectify_on_signature_error as rectify_thinking_signature;
 pub use convert::{
@@ -124,6 +128,37 @@ pub fn is_truncated_response(body: &serde_json::Value) -> bool {
         return true;
     }
     false
+}
+
+/// **非流式**响应体是不是「200 包着的一个错误」？是则返回可读消息。
+///
+/// 判据本体是 [`upstream_error_message`]（三家协议的三种形态，单一事实来源）。
+/// 这里只加两道**收窄**的前置门，理由是非流式侧误判更贵 —— 流式那侧误判只丢一个
+/// 增量，这一侧误判会把一次**完整的成功回答**整个扔掉：
+///
+/// 1. **顶层必须是 JSON 对象**。三家协议的补全响应都是对象；非对象说明这压根不是
+///    补全响应，不在这里下判断。
+///    <br>⚠️ 这道门与 `upstream_error_message` **行为重叠**（注入实测：去掉它，数组
+///    形态照样不命中 —— `Value::get(&str)` 对数组返回 `None`）。门保留：它表达的是
+///    「只对补全响应形态下判断」这个语义边界，不该依赖另一个函数的实现细节成立。
+/// 2. **`error` 是空字符串时不算错误**。部分中转站在正常响应里放 `"error": ""` 占位，
+///    而 `upstream_error_message` 的假阳性防线只挡住了 `null`（`is_string()` 对空串
+///    为真）。`type == "error"` 同时成立时仍算错误 —— 那是 Anthropic 的明确错误形态。
+///
+/// **两条调用链共用它**（缺一条就是同一个洞只堵了一半）：
+/// `proxy::soft_error`（转发路径，命中即降级成 502 走故障转移）与
+/// `session.rs`（大脑聚合路径，命中即报上游错误而不是「响应无法解析」）。
+pub(crate) fn body_is_upstream_error(bytes: &[u8]) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let obj = json.as_object()?;
+    let declared_error =
+        obj.get("type").and_then(serde_json::Value::as_str) == Some("error");
+    if let Some(serde_json::Value::String(s)) = obj.get("error") {
+        if s.trim().is_empty() && !declared_error {
+            return None;
+        }
+    }
+    upstream_error_message(&json)
 }
 
 /// 流式 SSE（末尾窗口）里是否出现**上游报错事件**。

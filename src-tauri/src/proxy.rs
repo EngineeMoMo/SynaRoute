@@ -29,6 +29,7 @@ use tokio::task::JoinHandle;
 #[path = "proxy_listen.rs"] pub(crate) mod proxy_listen; // 粘滞端口 + 双栈绑定；来由见该文件模块注释
 #[path = "model_choice.rs"] mod model_choice; // 客户端发的名字 vs 应用内选的；来由见该文件模块注释
 #[path = "model_pool.rs"] pub(crate) mod model_pool; // 对外模型并集 + 模型感知路由；来由见该文件模块注释
+#[path = "proxy/soft_error.rs"] mod soft_error; // 非流式「200 包着错误」的降级；调用**必须**排在 outcome.ok 守卫之前（有判据钉着），来由见该文件模块注释
 // 对外可选模型集的**唯一**实现。re-export 而不是留一层包装函数：包装函数会让
 // 「proxy.rs 生产段里不许有第二份并集实现」那条源码级判据失去意义。
 pub(crate) use model_pool::discoverable_models;
@@ -1078,12 +1079,12 @@ async fn handle_request_inner(
                     };
                     if let Some(s) = retry_after {
                         retry_after_hint = Some(retry_after_hint.map_or(s, |cur: i64| cur.min(s)));
+                        health::quota_window::arm(&store, category, &key.id, s);
                     }
                     last_status = Some(status);
                     // 整池口径：这一条是否属「等一等可能会好」（见 saw_transient 声明处的混合池说明）
                     saw_transient = saw_transient || !all_failed_is_hard_error(false, last_status);
-                    // 临时性失败却没给 Retry-After → 它的恢复时间未知，不该由别的候选的
-                    // 长退避代它发言（见 saw_transient_without_hint 声明处）。
+                    // 没给 Retry-After 的临时性失败：恢复时间未知（见 saw_transient_without_hint 声明处）。
                     if retry_after.is_none() && !all_failed_is_hard_error(false, last_status) {
                         saw_transient_without_hint = true;
                     }
@@ -1173,7 +1174,7 @@ async fn handle_request_inner(
         // 诊断头：本次尝试耗时。放在这里（三个分支之前）而不是各分支里 ——
         // 成功/上游非 2xx/连接层失败都会经过这一行，少一处漏的可能。
         meta.latency_ms = elapsed;
-        match result {
+        match result.map(|o| soft_error::demote(&store, category, key, o)) {
             Ok(outcome) if outcome.ok => {
                 // 响应体快照只在开关开启时构造：唯一去向是下面的 log_success，
                 // 而它在 `req_log` 关闭时直接 return。成功响应体常态几十 KB~几百 KB
@@ -1235,12 +1236,12 @@ async fn handle_request_inner(
                 };
                 if let Some(s) = outcome.retry_after {
                     retry_after_hint = Some(retry_after_hint.map_or(s, |cur: i64| cur.min(s)));
+                    health::quota_window::arm(&store, category, &key.id, s);
                 }
                 last_status = Some(outcome.status);
                 // 整池口径：这一条是否属「等一等可能会好」（见 saw_transient 声明处的混合池说明）
                 saw_transient = saw_transient || !all_failed_is_hard_error(false, last_status);
-                // 临时性失败却没给 Retry-After → 恢复时间未知，不该由别的候选的长退避代它发言
-                // （见 saw_transient_without_hint 声明处）。
+                // 没给 Retry-After 的临时性失败：恢复时间未知（见 saw_transient_without_hint 声明处）。
                 if outcome.retry_after.is_none() && !all_failed_is_hard_error(false, last_status) {
                     saw_transient_without_hint = true;
                 }
@@ -1473,8 +1474,7 @@ const TAIL_WINDOW_BYTES: usize = 8192;
 const HEAD_WINDOW_BYTES: usize = 8192;
 
 /// 日志正文的截断口径（头尾各留，理由见模块头 —— 只留头部会丢掉 `tools`）。
-#[path = "proxy/log_cap.rs"]
-mod log_cap;
+#[path = "proxy/log_cap.rs"] mod log_cap;
 use log_cap::{cap, cap_to};
 
 /// 流式转发的尝试结果。
@@ -4804,14 +4804,14 @@ mod tests {
         );
         // 分类用 Codex：本用例走 Responses 之外的 Anthropic 端点也无妨，这里只关心 Retry-After
         // 是否被采集并透传（gate 已按代理实例隔离，用哪个分类都不会污染别的用例）。
-        let mut k1 = key("k1", 0, &limited_short);
+        let mut k1 = key("ra1", 0, &limited_short);
         k1.category_id = CategoryType::Codex;
-        let mut k2 = key("k2", 1, &limited_long);
+        let mut k2 = key("ra2", 1, &limited_long);
         k2.category_id = CategoryType::Codex;
         store.upsert_key(k1).unwrap();
         store.upsert_key(k2).unwrap();
-        store.secrets.write().set("k1", "x").unwrap();
-        store.secrets.write().set("k2", "y").unwrap();
+        store.secrets.write().set("ra1", "x").unwrap();
+        store.secrets.write().set("ra2", "y").unwrap();
         let pm = ProxyManager::new(store.clone());
         let port = pm.start(CategoryType::Codex).await.unwrap();
         let resp = reqwest::Client::new()
@@ -5023,14 +5023,14 @@ mod tests {
         let store = std::sync::Arc::new(
             Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
-        let mut k1 = key("k1", 0, &quota);
+        let mut k1 = key("mp1", 0, &quota);
         k1.category_id = CategoryType::Codex;
-        let mut k2 = key("k2", 1, &flaky);
+        let mut k2 = key("mp2", 1, &flaky);
         k2.category_id = CategoryType::Codex;
         store.upsert_key(k1).unwrap();
         store.upsert_key(k2).unwrap();
-        store.secrets.write().set("k1", "x").unwrap();
-        store.secrets.write().set("k2", "y").unwrap();
+        store.secrets.write().set("mp1", "x").unwrap();
+        store.secrets.write().set("mp2", "y").unwrap();
         let pm = ProxyManager::new(store.clone());
         let port = pm.start(CategoryType::Codex).await.unwrap();
         let resp = reqwest::Client::new()
@@ -5075,14 +5075,14 @@ mod tests {
             Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // k1 先被尝试（priority 0）回 429，k2 后被尝试回 401 —— 401 是「最后一次失败」。
-        let mut k1 = key("k1", 0, &limited);
+        let mut k1 = key("mf1", 0, &limited);
         k1.category_id = CategoryType::Codex;
-        let mut k2 = key("k2", 1, &expired);
+        let mut k2 = key("mf2", 1, &expired);
         k2.category_id = CategoryType::Codex;
         store.upsert_key(k1).unwrap();
         store.upsert_key(k2).unwrap();
-        store.secrets.write().set("k1", "x").unwrap();
-        store.secrets.write().set("k2", "y").unwrap();
+        store.secrets.write().set("mf1", "x").unwrap();
+        store.secrets.write().set("mf2", "y").unwrap();
         let pm = ProxyManager::new(store.clone());
         let port = pm.start(CategoryType::Codex).await.unwrap();
         let resp = reqwest::Client::new()

@@ -203,7 +203,7 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
         for k in keys {
             let _ = writeln!(
                 r,
-                "- [{}] {} | 协议={:?} | 优先级={} | 启用={} | 允许聚合={} | 余额={} | 有密钥={} | 状态={:?} 失败计数={} 熔断至={:?} 延迟={:?}ms | 模型数={} 映射数={}",
+                "- [{}] {} | 协议={:?} | 优先级={} | 启用={} | 允许聚合={} | 余额={} | 配额窗口={} | 有密钥={} | 状态={:?} 失败计数={} 熔断至={:?} 延迟={:?}ms | 模型数={} 映射数={}",
                 k.id,
                 k.name,
                 k.protocol,
@@ -215,6 +215,9 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
                 // 同上一条的理由：余额闸门会把「已耗尽」的 Key 降到候选池末尾，而候选顺序
                 // 在界面上压根没有呈现。没有这一位，「这条 Key 为什么最后才被用」无从解释。
                 crate::health::balance_gate::verdict_label(&k),
+                // 配额窗口不进 `HealthState`（进程级，见其模块头），所以**熔断至那一列看不到它**。
+                // 不打这一位的话，「这条 Key 没被熔断、余额也够，为什么被跳过」在报告里零线索。
+                if crate::health::quota_window::active(&k.id) { "生效中" } else { "无" },
                 k.has_secret,
                 k.health.status,
                 k.health.fail_count,

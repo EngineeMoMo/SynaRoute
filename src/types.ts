@@ -369,8 +369,15 @@ export type UnpricedReason =
 export interface UsageCostRow {
   categoryId: CategoryType;
   keyId: string;
-  /** Key 可读名；Key 已删除时为 null */
+  /** Key 可读名；Key 已删除时从墓碑还原，只有连墓碑也没有时才是 null */
   keyName: string | null;
+  /**
+   * 这一行的 Key 已经不在配置里了。
+   *
+   * 🔴 `keyName` 现在对已删 Key 也有值（后端从 `usage-keys.json` 墓碑还原），
+   * 所以界面**必须**靠这一位区分「还在用」和「已删除」—— 光看名字两者一模一样。
+   */
+  keyDeleted?: boolean;
   usage: TokenUsage;
   /** 估算成本（纳美元 = 1e-9 USD）。null = 无可用单价 */
   costNano: number | null;

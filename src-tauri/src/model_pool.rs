@@ -432,8 +432,9 @@ pub(crate) fn rank_candidates(
         )
     });
 
-    // 未熔断、且本次要的模型没被锁的优先。`is_candidate_for_model` 是纯函数
-    // （只读 HealthState + 当前时间），调用方持着读锁时调用安全。
+    // 未熔断、要的模型没被锁、且不在上游给的配额窗口内。前两条是纯函数（只读
+    // HealthState + 当前时间），调用方持着读锁时调用安全；第三条读进程级窗口表
+    // （不进 HealthState 的理由见 `quota_window` 模块头第 2 条）。
     let primary: Vec<ProviderKey> = enabled
         .iter()
         .filter(|k| {
@@ -443,6 +444,7 @@ pub(crate) fn rank_candidates(
                 Some(k.resolve_model(requested_model))
             };
             crate::health::is_candidate_for_model(&k.health, real.as_deref())
+                && !crate::health::quota_window::active(&k.id)
         })
         .map(|k| (*k).clone())
         .collect();

@@ -713,6 +713,23 @@ impl ToolSession {
                 format!("{label} HTTP {status}: {}", truncate_body(&raw)),
             ));
         }
+        // 🔴 状态码是 2xx 不等于成功：上游可能回 200 而正文是一个错误对象
+        // （`{"error":{…}}` / `{"type":"error",…}`，中转站过载时的常见形态）。
+        //
+        // 不判它的话这条路**不会**静默成功，但会报成「响应无法解析」——
+        // `parse_*_turn` 找不到 content/choices，兜底文本提取也返回 None。
+        // 那句话把排障的人指向我们的解析器，而真相是上游返了个错误
+        // （上游原文虽然带在后面，第一眼的方向已经错了）。
+        //
+        // 判据与转发路径**共用** `body_is_upstream_error`：只堵一条链路就是同一个洞
+        // 只堵一半。`upstream_http` 如实带上游给的 200 —— 那是事实，
+        // 而消息里写明「HTTP 200 但正文是错误」才是可行动的信息。
+        if let Some(msg) = super::body_is_upstream_error(raw.as_bytes()) {
+            return Err(AppError::upstream_http(
+                status.as_u16(),
+                format!("{label} 上游回了 HTTP {status} 但正文是一个错误：{msg}"),
+            ));
+        }
         // 记 token 用量(含 cache_read/cache_creation)。命中缓存时 cache_read 会显著大于 0,
         // 即可在日志徽标里看到「缓存生效了」——这是本次改动可证伪的验收点。
         record_usage_from_raw(&raw);
@@ -733,6 +750,30 @@ impl ToolSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔴 **接线判据**：软错误那道门必须在**这条链路上**、且排在解析之前。
+    ///
+    /// 行为用例在 `aggregate.rs`（那里有 HTTP mock），但它证明不了「门排在哪」——
+    /// 把门挪到 `parse_*_turn` 之后，解析会先失败并 return，门永远走不到，
+    /// 而那正是修之前的行为（报「响应无法解析」）。本仓在这类
+    /// 「组件覆盖了、接线没覆盖」的盲区上已栽过十余次。
+    #[test]
+    fn the_soft_error_gate_must_precede_parsing() {
+        let src = include_str!("session.rs");
+        let prod = crate::proxy::custom_headers::production_code_only(src);
+        let n = prod.matches("body_is_upstream_error(").count();
+        assert_eq!(n, 1, "这条链路上必须恰好有一处软错误门，实际 {n} 处");
+        let gate = prod.find("body_is_upstream_error(").expect("上面刚断言过存在");
+        // 找**调用**形态而不是函数定义（定义排在文件前部，会让顺序断言恒真）。
+        let parse = prod
+            .find("parse_anthropic_turn(&raw)")
+            .expect("解析调用点的形态变了，本判据要跟着改");
+        assert!(
+            gate < parse,
+            "软错误门必须排在解析之前（gate@{gate} vs parse@{parse}）——\
+             排在后面时解析已经先失败并报出「响应无法解析」了"
+        );
+    }
 
     // ---- 多模态 + 工具调用（聚合成员 agent 循环的协议层）----
 

@@ -293,6 +293,9 @@ export function UsagePage() {
                     </td>
                     <td className="max-w-[180px] truncate px-4 py-2 text-xs text-text-secondary">
                       {r.keyName || r.keyId || t("usage.systemLevel")}
+                      {r.keyDeleted && (
+                        <span className="ml-1 text-text-tertiary">{t("usage.keyDeletedTag")}</span>
+                      )}
                     </td>
                     <td className="px-4 py-2 text-right font-mono tabular-nums">{fmt(r.usage.input)}</td>
                     <td className="px-4 py-2 text-right font-mono tabular-nums">{fmt(r.usage.output)}</td>

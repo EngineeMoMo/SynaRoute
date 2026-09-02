@@ -27,7 +27,7 @@ use super::tools_meta::{
 // 故覆盖这几类并重组；Responses 独有的 reasoning_summary / image / code_interpreter 等因
 // Chat 源头无数据而不出现 —— 能力上限，非遗漏。
 
-#[path = "sse_error.rs"] mod sse_error; // 上游流内 error 的跨协议翻译；来由见该文件模块注释
+#[path = "sse_error.rs"] pub(crate) mod sse_error; // 上游流内 error 的跨协议翻译；来由见该文件模块注释
 
 /// SSE 流的跨协议翻译方向。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

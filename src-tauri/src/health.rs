@@ -6,6 +6,11 @@
 #[path = "balance_gate.rs"]
 pub(crate) mod balance_gate;
 
+/// 弹性第四层：上游明确给出的配额恢复窗口。挂在这里的理由同 `balance_gate` ——
+/// 同族，且三个"自然家"余量都是 0。**它不是熔断**，三处语义差异写在它的模块头。
+#[path = "quota_window.rs"]
+pub(crate) mod quota_window;
+
 use crate::model::{HealthState, HealthStatus};
 use crate::store::Store;
 use crate::upstream;

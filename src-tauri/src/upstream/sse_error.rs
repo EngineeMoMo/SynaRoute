@@ -58,7 +58,7 @@ const MSG_CAP: usize = 500;
 /// **假阳性防线**：只认「`error` 是对象或字符串」。有些上游在正常 chunk 里带
 /// `"error": null` 占位，`Value::Null` 既不是对象也不是字符串，故不会被误判 ——
 /// 而误判的代价是把一条正常增量翻译成错误、当场掐断一次好的对话。
-pub(super) fn upstream_error_message(json: &Value) -> Option<String> {
+pub(crate) fn upstream_error_message(json: &Value) -> Option<String> {
     let kind = json.get("type").and_then(Value::as_str);
     let err = json.get("error");
     let is_err = kind == Some("error")

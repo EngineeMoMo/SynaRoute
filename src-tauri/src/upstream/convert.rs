@@ -143,17 +143,6 @@ pub fn strip_pending_effort(payload: &mut Value) {
     }
 }
 
-/// Anthropic thinking.budget_tokens → OpenAI 推理强度档位（反向，补全对称）。
-/// 按预算落到最接近的档位，供下游 Chat/Responses 客户端连 Anthropic-thinking 上游时还原语义。
-fn thinking_budget_to_effort(budget: u64) -> &'static str {
-    match budget {
-        0..=3072 => "low",
-        3073..=12288 => "medium",
-        12289..=24576 => "high",
-        _ => "xhigh",
-    }
-}
-
 /// Chat Completions API 的顶层 `reasoning_effort` 只认 minimal/low/medium/high（无 xhigh），
 /// 且是**字符串**而非 Responses 的 `reasoning:{effort}` 对象。把中枢里的档位归一到 Chat 认的集合：
 /// xhigh 钳到 high，其余原样；未知值返回 None（不落字段，避免上游 400）。
@@ -396,15 +385,10 @@ pub fn anthropic_to_openai(body: &Value) -> Value {
     // （这条是写测试时发现的：静默丢弃用户显式设置，正是本项目最忌讳的形态。）
     copy_through(body, &mut out, &["temperature", "top_p", "stream", "stream_options"]);
     request_usage_in_stream(&mut out);
-    // Anthropic thinking.budget_tokens → OpenAI reasoning.effort（反向映射，补全对称）：
-    // 下游 Anthropic 客户端开了扩展思考、上游是 OpenAI 协议时，把 token 预算落到最近的推理档位，
-    // 使推理强度语义不在跨协议时丢失。
-    if let Some(budget) = body
-        .get("thinking")
-        .and_then(|t| t.get("budget_tokens"))
-        .and_then(|b| b.as_u64())
-    {
-        out.insert("reasoning".into(), json!({ "effort": thinking_budget_to_effort(budget) }));
+    // 推理强度反向映射（补全对称）：legacy 的 budget_tokens 与新的 adaptive 形态**都要认**，
+    // 只认一种就是静默丢掉另一种客户端设的档位。判据与取证见 thinking_effort 模块头。
+    if let Some(effort) = super::thinking_effort::request_effort(body) {
+        out.insert("reasoning".into(), json!({ "effort": effort }));
     }
     // Anthropic stop_sequences → OpenAI stop
     if let Some(s) = body.get("stop_sequences") {

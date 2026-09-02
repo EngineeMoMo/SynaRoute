@@ -49,7 +49,9 @@ export const usageZh: Dict = {
   // 送去做无效操作 —— 而做完之后界面上没有任何新信息，用户只能认为功能坏了。
   "usage.reason.aggregate":
     "这笔是「大脑聚合」的消耗，旧版本没把它记到具体 Key 上，因此取不到单价与倍率。升级后新产生的聚合用量会归到各参与者 Key 上；这一行是历史数据，会停止增长但不会消失。",
-  "usage.reason.keyDeleted": "这条 Key 已被删除。历史用量保留下来了，但已无法取到它的单价与计费倍率。",
+  "usage.reason.keyDeleted":
+    "这一行的 Key 是在「删除前留档」功能上线之前删掉的，它的代表模型与计费倍率当时没有留下来，所以金额算不出。token 数仍然计入总量。之后删除的 Key 不会再有这个问题 —— 金额会照旧显示。",
+  "usage.keyDeletedTag": "（已删除）",
   "usage.reason.noModelName":
     "这条 Key 没有可识别的模型名。在 Key 编辑器里设置「默认兜底模型」或拉取一次模型列表即可估算。",
   "usage.reason.modelNotInTable":
@@ -57,7 +59,7 @@ export const usageZh: Dict = {
   // 横幅按成因分组，每组一句、各自指路。
   "usage.unpricedBanner": "有 {n} 行无法估算花费（金额列显示「—」）：",
   "usage.unpricedGroup.aggregate": "{n} 行是旧版大脑聚合用量（无 Key 归属）",
-  "usage.unpricedGroup.keyDeleted": "{n} 行的 Key 已删除",
+  "usage.unpricedGroup.keyDeleted": "{n} 行的 Key 在「删除前留档」上线前就删掉了（不可恢复）",
   "usage.unpricedGroup.noModelName": "{n} 行没有代表模型名 —— 去 Key 里设「默认兜底模型」即可",
   "usage.unpricedGroup.modelNotInTable": "{n} 行的模型不在单价表：{models}",
   // 累计金额那一格：**必须**标出「有几行没算进去」。
@@ -106,14 +108,16 @@ export const usageEn: Dict = {
   // that changes nothing — and afterwards the screen shows no new information.
   "usage.reason.aggregate":
     "This is brain-aggregation usage. Older versions didn't attribute it to a specific key, so there's no price or multiplier to apply. New aggregation usage is attributed to each participating key; this row is historical — it stops growing but is never dropped.",
-  "usage.reason.keyDeleted": "This key was deleted. Its historical usage is kept, but its price and cost multiplier are no longer available.",
+  "usage.reason.keyDeleted":
+    "This row's key was deleted before the \"snapshot before delete\" feature shipped, so its representative model and cost multiplier were never recorded and the amount can't be computed. Its tokens still count toward the totals. Keys deleted from now on keep their pricing.",
+  "usage.keyDeletedTag": "(deleted)",
   "usage.reason.noModelName":
     "No recognizable model name for this key. Set a default fallback model in the key editor, or fetch the model list once.",
   "usage.reason.modelNotInTable":
     "Model \"{model}\" isn't in the built-in price table (table verified {date}). You can calibrate the amount with a cost multiplier under Billing in the key editor.",
   "usage.unpricedBanner": "{n} row(s) can't be priced (cost shows as \"—\"):",
   "usage.unpricedGroup.aggregate": "{n} from legacy brain aggregation (no key attribution)",
-  "usage.unpricedGroup.keyDeleted": "{n} whose key was deleted",
+  "usage.unpricedGroup.keyDeleted": "{n} whose key was deleted before pricing was snapshotted (unrecoverable)",
   "usage.unpricedGroup.noModelName": "{n} with no representative model — set a default fallback model",
   "usage.unpricedGroup.modelNotInTable": "{n} whose model isn't in the price table: {models}",
   "usage.estCostExcluded": "+{n} row(s) excluded",

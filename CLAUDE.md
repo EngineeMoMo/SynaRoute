@@ -95,13 +95,11 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   **三道路径防线恒定生效**：拒 `..`/绝对路径 → canonicalize 后须仍在工作目录内 →
   凭据类文件一律拒读（按「模型给的名字」与「解析链接后的真实落点」**各判一次**，两次都不能省）。
   每条防线都做过故障注入验证（去掉后测试必须变红）。当前基线 **433 passed / 0 failed**
-  <br>📌 **基线口径（2026-08-30 实测）**：上面各条历史行里的 311/312/368/383/433/506/719/760/806/911
-  都是**当时**的数字，勿当现值。当前实测 `cargo test --lib` = **941 passed / 0 failed / 6 ignored**
-  （`cargo clippy --lib --all-targets -- -D warnings` 零警告；`tsc --noEmit` 干净；
-  `npm test` **143 passed / 20 文件**；`npm run gates` 全绿，**零棘轮抬高**，
-  且 `lib.rs` 2076→2074、`proxy.rs` 3105→3103 两项**下调**）。
-  🔴 **B4 落地后（同日）**：`cargo test --lib` = **953 passed / 0 failed / 6 ignored**，
-  `lib.rs` 基线进一步下调到 **1907**（余额查询实现搬进 `balance_gate`）。
+  <br>📌 **基线口径（2026-09-02 实测）**：上面各条历史行里的
+  311/312/368/383/433/506/719/760/806/911/941/953/986 都是**当时**的数字，勿当现值。
+  当前实测 `cargo test --lib` = **1080 passed / 0 failed / 6 ignored**（连跑 3 次全绿），
+  `npm test` **176 passed / 24 文件**，`cargo clippy --lib --all-targets -- -D warnings` 零警告，
+  `tsc --noEmit` 干净，`npm run gates` 全绿、**零棘轮抬高**（`convert.rs` 1684→**1668**）。
   接手时请自己跑一遍取当前值，不要引用本文档里的历史数字当基线。
   <br>⚠️ 观察中的一次偶发：`upstream_retry_after_is_propagated_downstream` 在 2026-08-23
   的一次全量跑里红过一次，此后连跑 9 次未复现，单独跑也稳定绿。尚未定性
@@ -1460,6 +1458,100 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   减了 1 行，白跑一次门。
   <br>📌 浏览器预览已验证：按钮出现在 6 张卡片上、复制后标题为「新增」、密钥框空且要求填、
   映射/档位/模型列表全部沿用、**连续复制两条不同 Key 显示的是各自的内容**。
+
+- **对标五家网关后借鉴的第一批（2026-09-02）**：读了 ccLoad / CLIProxyAPI / EasyCLIProxyAPI /
+  cc-switch / OmniRoute 的源码（走 GitHub contents API —— clone 与 raw 在本机被封）。
+  可借鉴机制的**文件级索引**在会话记忆 `gateway-competitor-source-map`，别再重新摸一遍。
+  本批做了三条「修缺陷而非加功能」的，都零 UI：
+  - 🔴 **非流式「200 但正文是错误」此前被记成成功**
+    （[`proxy/soft_error.rs`](src-tauri/src/proxy/soft_error.rs)）。流式那半早修过
+    （`sse_error.rs` + `saw_upstream_error` + `record_stream_end`），**非流式一直开着**：
+    `record_live_success` 坐实成功、`fail_count` 减半、短路窗口解除、日志页一条绿色「路由」，
+    而客户端拿到的是错误。命中即降级成 **502** 走完既有失败链路（转移/记账/last_err 全复用）。
+    <br>降 502 而不是留 200：留着 200 会让 `status_counts_against_breaker` /
+    `all_failed_is_hard_error` 拿一个**落在定义域之外**的码去判，行为是碰巧的。
+    502 精确落进「5xx：临时、**不罚 Key**、可重试」那一支，而语义本身也准确。
+    <br>**刻意不计熔断**：判据读的是上游自由文本，误判必然有；不罚的代价是「白耗一次往返」
+    （故障转移已让用户拿到正确回答），罚错的代价是屏蔽一条好 Key 60s。
+    <br>**必须落一条 error 级事件**：日志页会显示 502 而上游明明回的 200 —— 不落就是假现场。
+    同 `record_stream_end` 的处置（不改已写出的那行，**追加**一条）。
+    <br>🔴 **同一个洞的另一半：大脑聚合走 `ToolSession`，完全不经过 `proxy.rs`。**
+    修之前它不会静默成功，但会报成「响应无法解析」—— 把人指向我们的解析器。
+    判据抽成 `upstream::body_is_upstream_error`，**两条链路共用**。
+    两道收窄门（顶层必须是对象 / `error: ""` 空串占位不算错误）也在里面 ——
+    后者是 `upstream_error_message` 的 `null` 防线挡不住的（`is_string()` 对空串为真）。
+    <br>⚠️ 「顶层必须是对象」那道门与 `upstream_error_message` **行为重叠**（注入实测仍绿），
+    门保留：它表达语义边界，不该依赖另一个函数的实现细节。同 `codex_catalog` 那条。
+  - 🔴 **Anthropic thinking 补上 adaptive 形态**
+    （[`upstream/thinking_effort.rs`](src-tauri/src/upstream/thinking_effort.rs)）。
+    `anthropic_to_openai` 原先**只读 `thinking.budget_tokens`**，下游发
+    `thinking.type="adaptive"` + `output_config.effort` 时档位**整个丢掉**（请求正常返回、
+    只是不思考了）。取证：CLIProxyAPI `internal/thinking/apply.go:640` 明确处理它，
+    ccLoad 把 `enabled` 直接称作 **legacy** 并主动归一化。
+    <br>讽刺的是同一个 `output_config` 信封我们**已经在用**（`structured_output.rs` 的
+    `format`，那里还钉过「不是 `output_format`」）—— 一个字段跟上了、另一个没有。
+    <br>🔴 **`max` 必须翻成 `xhigh`**：中枢档位表没有 `max`，原样传过去走
+    `_ => return None`，也就是**用户选了最高档反而完全不思考**。同
+    `codex_catalog` 刻意不声明 `max` 档的那个坑。测试用 `apply_pending_thinking` 反证过。
+    <br>**出方向刻意仍发 legacy**：`enabled`+`budget_tokens` 已在所有用户的中转站上跑通过，
+    换 adaptive 是拿已验证的兼容面赌未验证的，而那条路上没有回退。要改先拿到中转站的实际响应。
+  - 🔴 **上游 `Retry-After` 形成配额窗口**（[`quota_window.rs`](src-tauri/src/quota_window.rs)，
+    `#[path]` 挂 `health` 下，弹性**第四层**）。**这条替换了原计划的「手填 RPM 限额」**
+    （ccLoad 的 `channel_rpm_limiter.go`）：同一个目标 —— 让「429 刻意不计熔断」这条正确规则
+    不再有代价 —— 但数据来源是**上游自己送上来的**而不是用户手填，零新增字段、零 UI、
+    收益不依赖用户配置。正是 ccLoad README 那句 "explicit upstream reset deadlines take priority"。
+    <br>**刻意不是熔断，三处语义都不同**：`record_live_success` 不清它（另一个模型成功不代表
+    配额恢复）、不进 `HealthState` 不落盘（Retry-After 是秒级量，持久化只会让重启后被陈旧窗口
+    挡住）、不参与「主 Key 是哪条」（那是配置态，同 `balance_gate`）。
+    <br>**时长夹 300s 上限**：上游填 86400 时把 Key 挡一天不可接受（用户可能刚充钱），
+    过期后最坏白撞一次 429。全池都在窗口内时由 `rank_candidates` 的兜底分支接管（各撞一次）。
+    <br>⚠️ **进程级表 + 共用短测试 id = 跨模块串台，真踩过**：功能一上线全量测试红 **8 条**
+    （单独跑本模块永远绿）。`proxy.rs` 测试里 **37 处**用 `key("k1"/"k2", …)`，其中三条会让
+    上游返回 Retry-After → 它们武装的窗口挡掉了**别的用例**的候选。本模块的串行锁只保护自己。
+    修的是**夹具**（那三条改用 `ra*`/`mp*`/`mf*`，本模块一律 `qw_*`），生产 id 是 UUID 不会撞。
+    **加新的「上游返回 Retry-After」用例时必须给它独有的 key id。**
+  <br>⚠️ **注入⑤第一次仍绿**：判据写成「事件条数不变」，而那条事件**可折叠** ——
+  同 collapse key 再 append 会折进原来那条，`len()` 恒为 1。已改为断言 `repeat`。
+  这是本仓**第二次**栽在这里（B4 注入⑧同一个坑）。
+  <br>📌 **仍然刻意未做**（别当遗漏）：**并发限流**要让槽位活到响应体 drop，
+  而唯一合适的挂点 `guard_stream_idle(resp.bytes_stream())` 有源码级判据钉着「恰好 2 次」，
+  改签名会让那条判据失效 —— 属独立改动。`quota_window` 在**聚合路径**的接线也没做
+  （聚合按 `keyId::model` 精确调用、不走故障转移，窗口对它自己无用，但同一条 Key 的配额是
+  共享的，故有中等价值）。**健康探测那条刻意不接**：探测的 429 可能只是探测端点在限流，
+  武装窗口会误伤一条业务完全正常的 Key（同 `probe_model` 注释里那个「被 401/403 误判」的同族）。
+  <br>**零棘轮抬高**，`convert.rs` 基线反而 1684 → **1668**。
+
+- **Key 删了金额还在（2026-09-02，用户报的问题）**：「key 删除了用量要可看，价格应该是算好的」。
+  实现在 [`usage_keys.rs`](src-tauri/src/usage_keys.rs)（`#[path]` 挂 `usage_cost` 下）。
+  <br>根因：算金额要的两样东西（代表模型、计费倍率）**只存在于 `ProviderKey` 里**，
+  而用量是纯累加值、删 Key 之后仍保留 → 那些行的金额永远是「—」，成因 `KeyDeleted`
+  的可行动项写着「无」。
+  <br>🔴 **存「事实」而不是存「金额」**：单价表会被修正（本仓的表曾整体偏 3 倍、opus 用退役价），
+  存死金额那批历史就永远错着；存模型名+倍率会随表的修正一起变准，且与「Key 还在」走同一套
+  `estimate_cost`，不会出现「删之前和删之后金额不一样」。
+  <br>🔴 **挂在读路径而不是 `delete_key`**：直觉挂点是删除那一刻，但 `store.rs` 余量为 0，
+  而这件事不需要那个位置 —— 只要 Key 活着时记下来，删除后自然就是墓碑。
+  故挂在 `usage_cost::rows()`（用量页每次刷新都走它）。**零 frozen 文件改动。**
+  <br>🔴 **`seen_day_ms` 按 UTC 日取整**：第一版用精确时刻，于是每次读都让该字段变一点、
+  `merged == before` 永不成立、用量页轮询一次写一次盘（被自己写的
+  `repeated_reads_do_not_rewrite_the_tombstone_file` 当场抓住）。取整到天后同一天内读多少次
+  都不写，而活着的 Key 每天仍刷新一次 —— 后者是淘汰策略的前提（活着的必须永远比墓碑新）。
+  <br>🔴 **新增 `key_deleted` 这一位**：`keyName` 现在对已删 Key 也有值（从墓碑还原），
+  界面光看名字**分辨不出 Key 还在不在**，用户会以为它还能用。加墓碑之前不需要这一位
+  （那时名字是空的、表格显示 uuid，异常一眼可见）。**这是本改动自己带出来的问题。**
+  <br>📌 **本功能上线前就已删除的 Key 救不回来**（用户那 3 行）：模型名与倍率在删除那一刻
+  就不在任何地方了。**不编造一个模型名去凑金额** —— 那会给用户一个看起来精确、实际凭空捏造
+  的数字，比「—」糟得多。token 数仍计入总量，文案已改成如实说明「上线前就删掉了（不可恢复）」
+  + 「之后删除的 Key 不会再有这个问题」。
+  <br>**边界（都核过、都一致，别当遗漏）**：金额只有一条计算路径（`get_usage_with_cost` →
+  `rows()`；`get_daily_usage` 只返回 token 桶、不含金额）；墓碑**不随配置导出走** ——
+  `ExportPayload` 只有 `keys/brain/vendors/settings`，`usage.json` 本来也不走，
+  用量是本机统计数据，跟着机器不跟着配置。
+  <br>`usage-keys.json` 已加进 `audit:release` 的运行数据名单（含用户给厂商起的名字）。
+  <br>📌 本批四个模块共 **27 条故障注入全部有结论**（26 变红 + 1 条按预期仍绿）。
+  **仍未真机验证**：三条弹性改动都只有单测 + 注入，而 `quota_window` 会改变候选选择、
+  是用户可感知的行为。发版前应走一遍：故意让上游回 429 + Retry-After，确认那条 Key
+  在窗口内被跳过、事件流里有说明、且窗口到期后自动回来。
 
 - **刻意不修的项**（别当成遗漏重复劳动）：SmartScreen 签名告警、`retrieval.rs` 的 `cwd` 白名单、
   请求日志存明文对话（默认关闭）
