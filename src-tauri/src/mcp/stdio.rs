@@ -170,6 +170,26 @@ pub(crate) fn diag_dir() -> Option<std::path::PathBuf> {
 ///
 /// 分类身份来自**自己的 argv**（注册时写死，见 [`CATEGORY_FLAG_PREFIX`]）。在这里读一次、
 /// 整个进程生命周期不变 —— 一个 stdio 子进程只属于一个客户端。
+/// 对端取消之后，仍给在途聚合多少秒把结果**落进日志页**。
+///
+/// # 🔴 为什么取消之后还要让它跑完（2026-09-01 实测数字）
+///
+/// 那次现场：聚合 +210s 交给决策者，用户 **+467s** 按停止，决策者 **+487s** 返回 ——
+/// 也就是取消时它已经跑了 **92%**，差 20 秒。而 `决策者返回` 那条**带完整正文的事件**
+/// 是在 `.await` 之后才落的（`aggregate.rs`），一取消就永远不落。
+///
+/// 于是「取消即丢弃转发」这个修法省下最后 8% 的 token，代价是**丢掉 100% 的答案** ——
+/// 而取消几乎总是发生在晚期（用户是等久了才不耐烦），这个取舍在常见情形下是亏的。
+/// 事故当时我们还没实现取消检测，反而**无视取消跑完了**，所以用户在日志页里
+/// 拿到了完整答案（他截图里那一大段就是它）。
+///
+/// # 为什么必须**有界**，不能无脑跑完
+///
+/// 用户也可能在第 5 秒改主意就取消 —— 那时无脑跑完等于让一轮 600s 的聚合在后台
+/// 继续烧到底，而他刚刚明确表达了「不要了」。60 秒是两边都站得住的界：
+/// 「快跑完了」的情形 20 秒就够（实测），而早期取消的浪费被压在 600s 预算的 10%。
+const CANCEL_GRACE_SECS: u64 = 60;
+
 /// 客户端在本次请求的 `_meta.progressToken` 里声明的进度令牌（没声明则 `None`）。
 ///
 /// # 🔴 只在客户端给了令牌时才推进度
@@ -444,8 +464,11 @@ pub async fn run_stdio() {
                     "tools/call progressToken={}",
                     ptok.as_ref().map(|t| t.to_string()).unwrap_or_else(|| "(未下发)".into())
                 ));
-                let fwd = forward_tool_call_to_main(&params, caller);
-                tokio::pin!(fwd);
+                // `Box::pin` 而不是 `tokio::pin!`：取消那一支要把这个 future **整体移交**
+                // 给一个后台任务（见 `CANCEL_GRACE_SECS`），而 `tokio::pin!` 只给出
+                // `Pin<&mut F>`，借着栈上的局部量、不满足 `spawn` 的 `'static`。
+                // 代价是一次堆分配，对一次最长 600s 的调用可以忽略。
+                let mut fwd = Box::pin(forward_tool_call_to_main(params, caller));
                 // 进度心跳（仅当客户端给了令牌，见 `progress_token`）。第一跳排在
                 // `PROGRESS_TICK_SECS` 之后 —— `interval` 的首跳会立即完成，
                 // 那会在 0 秒推一条「已 0s」，是纯噪音。
@@ -483,9 +506,11 @@ pub async fn run_stdio() {
                             // 必须置 false：否则 recv 立刻再返 None，这里就成了忙等。
                             None => stdin_open = false,
                             Some(l) if cancels_request(&l, &id) => {
-                                // 🔴 取消即**放弃这次转发**（`fwd` 在这里被 drop → HTTP 连接断开），
-                                // 且**不写响应** —— 对端已经不认这个 id 了，写过去只会被丢掉，
-                                // 而在它看来这次调用「返回了空」。
+                                // 🔴 **不写响应**（对端已不认这个 id，写过去只会被丢掉，
+                                // 而在它看来这次调用「返回了空」），但**也不丢弃这次转发** ——
+                                // 见 `CANCEL_GRACE_SECS`：`决策者返回` 那条带正文的事件在
+                                // `.await` 之后才落，取消即丢弃等于把一个 92% 已付费的答案扔掉。
+                                // 交给循环外的后台任务在有界时间内跑完。
                                 cancelled = Some(());
                                 break None;
                             }
@@ -502,10 +527,30 @@ pub async fn run_stdio() {
                     }
                 };
                 let ms = t0.elapsed().as_millis();
-                // 被取消：留一行**成因明确**的痕迹后回到主循环。这一行是本条修复的全部价值 ——
-                // 没有它，「对端早已放弃」在三份日志里都看不出来（主应用记成功、Codex 记空）。
+                // 被取消：不写响应，但把在途聚合**交给后台跑完**，让结果落进日志页
+                // （理由与那个 60 秒的界都在 `CANCEL_GRACE_SECS` 的文档里）。
+                //
+                // 🔴 后台任务**绝不能碰 stdout**：那是 JSON-RPC 协议信道，主循环此刻已经
+                // 在处理下一条请求，插一行进去会把流撕开（表现是「工具突然全坏」）。
+                // 它唯一的输出是 `diag`（另一个文件，只追加）。
                 if cancelled.is_some() {
-                    diag(&format!("forward cancelled by peer method={method} {ms}ms（未写响应）"));
+                    diag(&format!(
+                        "forward cancelled by peer method={method} {ms}ms（不写响应；\
+                         后台最多再等 {CANCEL_GRACE_SECS}s 让结果落进日志页）"
+                    ));
+                    tokio::spawn(async move {
+                        let grace = std::time::Duration::from_secs(CANCEL_GRACE_SECS);
+                        match tokio::time::timeout(grace, fwd).await {
+                            // 跑完了 —— 结果已由主应用落进日志页（`决策者返回` 带正文的那条）。
+                            Ok(Ok(_)) => diag("cancelled forward finished（结果已落日志页，可在那里复制）"),
+                            Ok(Err(e)) => diag(&format!("cancelled forward failed: {e}")),
+                            // 超出宽限：这时 `fwd` 被 drop → HTTP 断开 → 主应用那侧聚合随之停止
+                            // （有 `mcp::tests::a_disconnected_client_must_cancel_the_in_flight_work` 钉着）。
+                            Err(_) => diag(&format!(
+                                "cancelled forward gave up after {CANCEL_GRACE_SECS}s（早期取消，已止损）"
+                            )),
+                        }
+                    });
                     continue;
                 }
                 // `break None` 只在取消那一支发生，已在上面 continue 掉。
@@ -542,7 +587,7 @@ pub async fn run_stdio() {
 /// 目标**路径带分类**（见 [`super::forward_url`]）：这是服务端唯一能知道
 /// 「这次调用来自哪个客户端」的途径。
 async fn forward_tool_call_to_main(
-    params: &Value,
+    params: Value,
     caller: Option<CategoryType>,
 ) -> Result<Value, String> {
     let port = discover_main_mcp_port()
@@ -900,10 +945,78 @@ mod tests {
             "心跳分支必须同时受「有令牌」与「stdin 还开着」两个门约束"
         );
         let tok_at = prod.find("tools/call progressToken=").expect("取证行还在吗");
-        let fwd_at = prod.find("let fwd = forward_tool_call_to_main(").expect("转发点还在吗");
+        let fwd_at = prod.find("forward_tool_call_to_main(params, caller)").expect("转发点还在吗");
         assert!(
             tok_at < fwd_at,
             "取证行必须排在转发之前 —— 否则主应用没运行时它不落，而那正是最需要它的时候"
+        );
+    }
+
+    /// 🔴 对端取消之后，在途聚合必须**交给后台在有界时间内跑完**，不是当场丢弃。
+    ///
+    /// 两个方向的失效都真实发生过/会发生：
+    /// - **当场丢弃**（`63401c8` 的行为）：`决策者返回` 那条带正文的事件在 `.await` 之后
+    ///   才落，取消即丢弃 = 把一个 92% 已付费的答案扔掉（实测取消时差 20 秒完成）。
+    /// - **无界跑完**：用户第 5 秒改主意取消，一轮 600s 聚合在后台烧到底，
+    ///   而他刚明确表达了「不要了」。
+    ///
+    /// 故判据同时钉住三件事：交给 `tokio::spawn`、界**必须是那个常量**、
+    /// 且那个后台任务**绝不许碰 stdout**（主循环此刻已在处理下一条请求，插一行会把
+    /// JSON-RPC 流撕开 —— 表现是「工具突然全坏」，而这类症状最难归因）。
+    ///
+    /// # 三条断言的强度不一样，写明免得被当成同等护栏
+    ///
+    /// 注入实测（2026-09-02）：
+    /// - **拿掉 spawn** → 变红 ✅
+    /// - **把 grace 改成字面量 3600**（绕开常量）→ 变红 ✅。第一版判据只查
+    ///   `contains("CANCEL_GRACE_SECS")`，而那个名字在 `diag` 文案里也出现，
+    ///   改掉 `from_secs` 的入参照样绿 —— 已收紧成查 `from_secs(CANCEL_GRACE_SECS)`。
+    /// - **让后台任务写 stdout** → **注入不出来**：`stdout` 是主循环栈上的局部量，
+    ///   `tokio::spawn` 要 `'static`，编译器直接拦住。也就是说这一条**今天是编译器在守**，
+    ///   本断言只是给「有人把 stdout 包成 `Arc<Mutex>` 之后」留的绊线。
+    ///
+    /// # 端到端已实测（2026-09-02），取证方式与观测到的时间线
+    ///
+    /// 手法：debug 二进制拷到临时目录，同级写 `mcp-port` 指向一个**每次 `tools/call` 睡
+    /// 20 秒**的 node 假主应用；起 stdio 子进程 → 发 `tools/call` id=2 → 2.5 秒后发
+    /// `notifications/cancelled` → 1.2 秒后立刻发 id=3。观测到：
+    ///
+    /// ```text
+    /// +0.7s   recv tools/call (id=2)
+    /// +3.2s   forward cancelled by peer 2499ms（不写响应；后台最多再等 60s）
+    /// +4.4s   recv tools/call (id=3)          ← 主循环立刻空出来了
+    /// +20.7s  cancelled forward finished（结果已落日志页）  ← 被取消的那次跑完了
+    /// +24.4s  forward ok 20004ms → sent bytes=105 (id=3)
+    /// ```
+    ///
+    /// 六条判定全过：假主应用**收到 2 次**（被取消的那次没被丢弃）、`stdout` 上没有 id=2
+    /// 的响应、id=3 正常拿到响应。
+    ///
+    /// ⚠️ 写第二个这类探针的人省两趟：端口文件名是 **`mcp-port`**（不是
+    /// `synaroute-mcp.port`），且 `probe_mcp_alive` 要求响应里
+    /// `result.serverInfo.name` **逐字**等于 `"SynaRoute"` —— 这两条任一错，
+    /// 子进程会回落去扫 9527 起的端口范围，请求压根不到你的假主应用，
+    /// 而症状（转发一直 pending）看起来像别的问题。
+    #[test]
+    fn a_cancelled_forward_must_finish_in_the_background_but_bounded() {
+        let src = crate::proxy::custom_headers::production_code_only(include_str!("stdio.rs"));
+        let prod = &src[..src.find("mod tests").unwrap_or(src.len())];
+        let at = prod.find("if cancelled.is_some()").expect("取消分支还在吗");
+        let end = prod[at..].find("\n                }").map(|e| at + e).unwrap_or(prod.len());
+        let branch = &prod[at..end];
+        assert!(
+            branch.contains("tokio::spawn"),
+            "取消后必须把在途转发交给后台，否则一个快跑完的答案被当场扔掉：{branch}"
+        );
+        assert!(
+            branch.contains("timeout(grace, fwd)")
+                && branch.contains("from_secs(CANCEL_GRACE_SECS)"),
+            "后台完成必须有界，且界必须**是那个常量**（把 grace 改成字面量 3600 也算无界）：{branch}"
+        );
+        // 🔴 stdout 是协议信道：后台任务只能写 diag（另一个文件），一个字节都不许进 stdout。
+        assert!(
+            !branch.contains("write_resp") && !branch.contains("stdout"),
+            "后台任务碰了 stdout —— 会与主循环的下一条响应交错，把 JSON-RPC 流撕开：{branch}"
         );
     }
 
