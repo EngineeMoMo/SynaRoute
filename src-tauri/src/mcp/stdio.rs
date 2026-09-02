@@ -170,6 +170,60 @@ pub(crate) fn diag_dir() -> Option<std::path::PathBuf> {
 ///
 /// 分类身份来自**自己的 argv**（注册时写死，见 [`CATEGORY_FLAG_PREFIX`]）。在这里读一次、
 /// 整个进程生命周期不变 —— 一个 stdio 子进程只属于一个客户端。
+/// 客户端在本次请求的 `_meta.progressToken` 里声明的进度令牌（没声明则 `None`）。
+///
+/// # 🔴 只在客户端给了令牌时才推进度
+///
+/// MCP 规范：`notifications/progress` 的 `progressToken` **必须**是客户端在请求
+/// `_meta` 里给出的那个值。没给就代表「我不接收进度」，此时主动推送是协议噪音 ——
+/// 严格客户端可能报错，宽松客户端会丢弃，两种都没有收益。
+///
+/// 令牌可以是字符串或数字（规范原文 `string | integer`），故原样保留 `Value`
+/// 而不是转成 `String`：回传时必须与客户端给的**同类型**，`1` 与 `"1"` 不是一回事
+/// （同 `cancels_request` 里 id 比较的那条理由）。
+fn progress_token(params: &Value) -> Option<Value> {
+    params
+        .get("_meta")
+        .and_then(|m| m.get("progressToken"))
+        .cloned()
+        .filter(|t| !t.is_null())
+}
+
+/// 进度心跳间隔。
+///
+/// # 为什么是**心跳**而不是真实阶段进度
+///
+/// 真实阶段（「成员 1/3 完成」）只有主应用知道，而 stdio → 主应用这一跳是一次普通的
+/// HTTP 请求-响应，**没有回传通道**。要做成真进度得把它改成流式 + 让主应用感知
+/// progressToken，那是另一个量级的改动。
+///
+/// 而用户实际卡住的问题不是「跑到哪一步了」，是**「还要不要继续等」** ——
+/// 2026-09-01 他等了 7 分 47 秒后按停止，而结果 22 秒后就出来了。心跳恰好回答这个：
+/// 只要还在推，就说明我们还在跑、没死。
+///
+/// 30 秒：短了在正常的多模型聚合上刷屏（一轮几分钟很常见），长了失去「它还活着」的意义。
+const PROGRESS_TICK_SECS: u64 = 30;
+
+/// 一条进度通知（JSON-RPC notification，无 `id`）。
+///
+/// `progress` 用**已耗秒数**：规范要求它每次必须增大，而秒数天然单调。
+/// `total` 用客户端的容忍上限（= [`FORWARD_TIMEOUT_SECS`]，我们自己写给它的那个数），
+/// 于是客户端能画出一个**有意义**的进度条 —— 分母正是「等到这里它就会放弃」。
+fn progress_note(token: &Value, elapsed_secs: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {
+            "progressToken": token,
+            "progress": elapsed_secs,
+            "total": FORWARD_TIMEOUT_SECS,
+            "message": format!(
+                "大脑聚合进行中 · 已 {elapsed_secs}s / 上限 {FORWARD_TIMEOUT_SECS}s（多模型并行 + 决策者综合，通常数分钟）"
+            ),
+        }
+    })
+}
+
 /// 这一行是不是一条**带 id 的 `ping`**？是则返回它的 id。
 ///
 /// 只给「转发进行中插进来的行」用（见 [`run_stdio`] 里那个 `select!`）。刻意不在这里
@@ -382,8 +436,23 @@ pub async fn run_stdio() {
             // tools/call：转发到运行中主应用（持有真实配置）。
             None => {
                 let t0 = std::time::Instant::now();
+                // 🔴 **在转发之前**记下有没有 progressToken。放在这里而不是转发之后，
+                // 是为了让「Codex 到底发不发这个字段」这个问题在**主应用没运行**时也能取证
+                // ——那时转发会失败，但这一行已经落下了。
+                let ptok = progress_token(&params);
+                diag(&format!(
+                    "tools/call progressToken={}",
+                    ptok.as_ref().map(|t| t.to_string()).unwrap_or_else(|| "(未下发)".into())
+                ));
                 let fwd = forward_tool_call_to_main(&params, caller);
                 tokio::pin!(fwd);
+                // 进度心跳（仅当客户端给了令牌，见 `progress_token`）。第一跳排在
+                // `PROGRESS_TICK_SECS` 之后 —— `interval` 的首跳会立即完成，
+                // 那会在 0 秒推一条「已 0s」，是纯噪音。
+                let mut tick = tokio::time::interval_at(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(PROGRESS_TICK_SECS),
+                    std::time::Duration::from_secs(PROGRESS_TICK_SECS),
+                );
                 // 🔴 转发期间**继续读 stdin**，但只即时回 `ping`。
                 //
                 // 主循环此前在这里一动不动最长 600s：客户端的 keepalive ping 排在队里得不到
@@ -399,6 +468,16 @@ pub async fn run_stdio() {
                 let r = loop {
                     tokio::select! {
                         res = &mut fwd => break Some(res),
+                        // 进度心跳：`if ptok.is_some()` 让没给令牌的客户端一个字节都收不到
+                        // （见 `progress_token`）。写失败即停止读 stdin —— 管道已不可用，
+                        // 与 `write_resp` 的其它失败路径同口径。
+                        _ = tick.tick(), if ptok.is_some() && stdin_open => {
+                            let secs = t0.elapsed().as_secs();
+                            let note = progress_note(ptok.as_ref().unwrap(), secs);
+                            if !write_resp(&mut stdout, &note, "notifications/progress").await {
+                                stdin_open = false;
+                            }
+                        }
                         got = rx.recv(), if stdin_open => match got {
                             // stdin 关了也要把这次转发跑完并写出去（写失败会在下面收尾）。
                             // 必须置 false：否则 recv 立刻再返 None，这里就成了忙等。
@@ -733,8 +812,102 @@ mod tests {
         assert_eq!(ping_id(""), None);
     }
 
-    /// 🔴 `FORWARD_TIMEOUT_SECS` 必须**派生**自我们写给客户端的那个上限，不许各写一个 600。
+    /// 进度令牌只能来自客户端的 `_meta.progressToken`，且**原样保留类型**。
     ///
+    /// MCP 规范允许 `string | integer`。转成 `String` 回传会让给数字令牌的客户端对不上
+    /// （`1` 与 `"1"` 是不同的值），同 `cancels_request` 里 id 比较那条理由。
+    #[test]
+    fn progress_token_is_read_from_meta_and_keeps_its_type() {
+        let s = json!({ "name": "x", "_meta": { "progressToken": "abc" } });
+        assert_eq!(progress_token(&s), Some(json!("abc")));
+        let n = json!({ "_meta": { "progressToken": 7 } });
+        assert_eq!(progress_token(&n), Some(json!(7)), "数字令牌不许被转成字符串");
+        // 没给 = 「我不接收进度」，必须一个字节都不推
+        assert_eq!(progress_token(&json!({ "name": "x" })), None);
+        assert_eq!(progress_token(&json!({ "_meta": {} })), None);
+        assert_eq!(progress_token(&json!({ "_meta": { "progressToken": null } })), None);
+        assert_eq!(progress_token(&Value::Null), None);
+    }
+
+    /// 🔴 进度通知的形态必须合规：**无 `id`**（它是 notification，不是请求）。
+    ///
+    /// 带上 `id` 会让客户端等一个永不到来的响应；而 `progress` 必须单调增
+    /// （规范原文 "MUST increase with each notification"），故用已耗秒数。
+    /// `total` 取客户端的容忍上限 —— 分母正是「等到这里它就放弃」，进度条才有意义。
+    #[test]
+    fn a_progress_note_is_a_valid_notification_not_a_request() {
+        let a = progress_note(&json!("tok"), 30);
+        assert_eq!(a["jsonrpc"], "2.0");
+        assert_eq!(a["method"], "notifications/progress");
+        assert!(a.get("id").is_none(), "notification 不许带 id，否则客户端会等一个永不到来的响应");
+        assert_eq!(a["params"]["progressToken"], json!("tok"), "必须回传客户端给的那个令牌");
+        assert_eq!(a["params"]["progress"], json!(30));
+        assert_eq!(
+            a["params"]["total"], json!(FORWARD_TIMEOUT_SECS),
+            "分母要用客户端的容忍上限，不是凭空的常数"
+        );
+        // 单调增：规范硬要求
+        let b = progress_note(&json!("tok"), 60);
+        assert!(
+            b["params"]["progress"].as_u64() > a["params"]["progress"].as_u64(),
+            "progress 必须随时间增大"
+        );
+        // 那句话要能回答用户真正的问题（还要不要继续等）
+        let msg = a["params"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("30") && msg.contains("600"), "要同时给出已耗时与上限：{msg}");
+    }
+
+    /// 🔴 接线判据：心跳分支必须**由令牌把门**，且取证行必须排在转发**之前**。
+    ///
+    /// 两条各对应一种失效：
+    /// - 门丢了 → 对没要进度的客户端推通知。宽松客户端丢弃、严格客户端报协议错，
+    ///   而我们这边完全无痕（写成功了）。
+    /// - 取证行挪到转发之后 → 主应用没在跑时那一行压根不落，而「Codex 到底发不发
+    ///   progressToken」这个问题**只能**靠它回答（我们看不到 Codex 的请求原文）。
+    ///
+    /// # 端到端已实测（2026-09-02），取证方式如下
+    ///
+    /// 本条与上面两条都是**静态**判据 —— 它们证明代码长得对，证明不了 `select!` 分支
+    /// 真的会 fire（本仓已 13 次栽在「覆盖了组件 ≠ 覆盖了接线」上）。故另跑过一次
+    /// 真进程端到端：
+    ///
+    /// 手法：把 debug 二进制拷到临时目录，同级写一个 `synaroute-mcp.port` 指向一个
+    /// **睡 90 秒**的 node HTTP 假主应用，然后用 `--mcp-stdio --mcp-category=codex`
+    /// 起它、往 stdin 喂 `initialize` + 带 `_meta.progressToken` 的 `tools/call`，
+    /// 读 stdout 上的行。
+    ///
+    /// 实测结果（两组）：
+    /// - **给令牌**：stdout 上收到 **3** 条 `notifications/progress`，
+    ///   `progress` = 30 / 60 / 90（单调增）、`total` = 600、令牌原样回传、均无 `id`；
+    ///   `logs/mcp-stdio.log` 里有 `tools/call progressToken="probe-token-42"`。
+    /// - **不给令牌**（对照组）：**0** 条通知，诊断行为 `progressToken=(未下发)`。
+    ///
+    /// 探针是一次性脚本、跑完删掉（要 90 秒 + 一个假 HTTP 服务，不适合进套件）。
+    ///
+    /// # 📌 仍未验证：**Codex 会不会把这些通知显示给用户**
+    ///
+    /// 那是 Codex 的事，我们控制不了，也没法在本机自造 —— 要 Codex 真发一次 `tools/call`，
+    /// 而那需要一个能驱动工具调用的模型会话。静态取证只能到这一步：Codex 二进制里有
+    /// `ProgressNotificationParam`（serde 结构，说明它**解析得了**）与 `progressToken`
+    /// 字段，但「解析得了」不等于「会显示」（同本仓那次教训：静态取证只能提出假设，
+    /// 不能下结论）。答案会在用户下一次真实调用时自动落进 `mcp-stdio.log` 的那行取证里。
+    #[test]
+    fn the_progress_heartbeat_must_be_gated_and_logged_before_forwarding() {
+        let src = crate::proxy::custom_headers::production_code_only(include_str!("stdio.rs"));
+        let prod = &src[..src.find("mod tests").unwrap_or(src.len())];
+        assert!(
+            prod.contains("_ = tick.tick(), if ptok.is_some() && stdin_open =>"),
+            "心跳分支必须同时受「有令牌」与「stdin 还开着」两个门约束"
+        );
+        let tok_at = prod.find("tools/call progressToken=").expect("取证行还在吗");
+        let fwd_at = prod.find("let fwd = forward_tool_call_to_main(").expect("转发点还在吗");
+        assert!(
+            tok_at < fwd_at,
+            "取证行必须排在转发之前 —— 否则主应用没运行时它不落，而那正是最需要它的时候"
+        );
+    }
+
+    /// 🔴 `FORWARD_TIMEOUT_SECS` 必须**派生**自我们写给客户端的那个上限，不许各写一个 600。
     /// 值相等这一半由类型系统保证（它就是那个常量），故本判据钉的是**来源**——
     /// 同 `the_two_sse_invariants_must_stay_derived_not_assumed` 的思路：钉来源，不钉结论。
     /// 谁把它改回字面量 `600`，两个数就能各自漂移，而其中一个方向是**静默**的：
