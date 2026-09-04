@@ -1,4 +1,5 @@
 import type {
+  AggregatePreview,
   AggregateResult,
   AppSettings,
   OnboardingState,
@@ -511,22 +512,43 @@ export const api = {
   deleteVendor: (vendorId: string) =>
     call<void>("delete_vendor", { vendorId }, () => mockBridge.deleteVendor(vendorId)),
 
-  // ---- 大脑聚合 V2（文件检索 + 两阶段决策） ----
+  // ---- 大脑聚合 V2（文件检索 + 三阶段：计划 → 预览 → 落盘） ----
   runAggregatePlan: (categoryId: CategoryType, prompt: string) =>
     call<AggregateResult>("aggregate_plan", { categoryId, prompt }, async () => ({
       resultType: "plan" as const,
       content: "Mock: 修改 src/main.ts 第 10 行...",
+      planStartedMs: Date.now(),
     })),
 
-  runAggregateExecute: (
+  /// Phase2a：决策者出完整文件内容 + 落盘预览。**不写任何文件。**
+  runAggregatePreview: (
     categoryId: CategoryType,
     prompt: string,
     confirmedPlan: string,
-    workDir?: string,
+    workDir: string | undefined,
+    planStartedMs: number,
+  ) =>
+    call<AggregatePreview>(
+      "aggregate_execute",
+      { categoryId, prompt, confirmedPlan, workDir, planStartedMs },
+      async () => ({
+        content: "```file:src/main.ts\nconsole.log('mock');\n```",
+        changes: [{ path: "src/main.ts", bytes: 26, exists: true }],
+        workDir,
+      }),
+    ),
+
+  /// Phase2b：按决策者原文落盘。原文原样回传 —— 服务端按它重新解析，
+  /// 走的是与预览同一道判定（见 aggregate/write.rs 的 judge）。
+  runAggregateWrite: (
+    categoryId: CategoryType,
+    deciderOutput: string,
+    workDir: string | undefined,
+    planStartedMs: number,
   ) =>
     call<AggregateResult>(
-      "aggregate_execute",
-      { categoryId, prompt, confirmedPlan, workDir },
+      "aggregate_write",
+      { categoryId, deciderOutput, workDir, planStartedMs },
       async () => ({
         resultType: "applied" as const,
         content: "已修改 src/main.ts",

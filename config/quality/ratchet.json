@@ -14,10 +14,10 @@
   "newFileCapLines": 900,
   "frozen": {
     "src-tauri/src/agent_tools.rs": 1117,
-    "src-tauri/src/aggregate.rs": 2033,
+    "src-tauri/src/aggregate.rs": 1189,
     "src-tauri/src/balance.rs": 1088,
-    "src-tauri/src/lib.rs": 1894,
-    "src-tauri/src/model.rs": 2059,
+    "src-tauri/src/lib.rs": 1870,
+    "src-tauri/src/model.rs": 2024,
     "src-tauri/src/proxy.rs": 2936,
     "src-tauri/src/secret.rs": 1126,
     "src-tauri/src/service.rs": 1443,
@@ -26,8 +26,8 @@
     "src-tauri/src/upstream/convert.rs": 1668,
     "src-tauri/src/upstream/sse.rs": 1247,
     "src/components/KeyEditor.tsx": 1452,
-    "src/lib/i18n.ts": 1434,
-    "src/pages/BrainPage.tsx": 1393,
+    "src/lib/i18n.ts": 1419,
+    "src/pages/BrainPage.tsx": 1262,
     "src/pages/SettingsPage.tsx": 1850
   },
   "counters": {

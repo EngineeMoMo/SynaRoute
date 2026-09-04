@@ -16,8 +16,8 @@
 //! 工具参数来自模型输出，而 prompt 里混着检索到的项目文件内容 —— 即模型可能被内容里的
 //! 注入指令诱导。且**工具结果会进上游请求体**：读到什么就等于把什么发给第三方中转商。
 //!
-//! 1. [`crate::aggregate::is_safe_relative_path`]：字符串级，拒 `..`、绝对路径、盘符、UNC
-//! 2. [`crate::aggregate::is_within_work_root`]：canonicalize 后仍须在工作目录内，堵链接逃逸
+//! 1. [`crate::aggregate::write::is_safe_relative_path`]：字符串级，拒 `..`、绝对路径、盘符、UNC
+//! 2. [`crate::aggregate::write::is_within_work_root`]：canonicalize 后仍须在工作目录内，堵链接逃逸
 //! 3. [`crate::retrieval::is_sensitive_path`]：凭据类文件一律拒读
 //!
 //! 第 3 道比前两道更要紧：前两道只防「读到工作目录**外**」，第 3 道防「读到工作目录**内**的
@@ -29,7 +29,7 @@
 //! [`load_images`] 放在这里而不是 `mcp`：图片路径同样来自外部输入、同样要过上面那三道防线，
 //! 而防线实现（[`resolve_readable`]）就在本模块。放两处必然漂移。
 
-use crate::aggregate::{is_safe_relative_path, is_within_work_root};
+use crate::aggregate::write::{is_safe_relative_path, is_within_work_root};
 use crate::proc::hidden;
 use crate::retrieval::is_sensitive_path;
 use crate::upstream::{ImagePart, ToolDef, ToolInvocation, ToolResultMsg};

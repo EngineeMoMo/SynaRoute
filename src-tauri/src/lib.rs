@@ -1005,31 +1005,6 @@ fn delete_vendor(state: tauri::State<AppState>, vendor_id: String) -> AppResult<
     state.store.delete_vendor(&vendor_id)
 }
 
-// ============ 大脑聚合 V2 ============
-
-/// Phase1: 文件检索 + 参与者思考 + 决策者输出计划
-#[tauri::command]
-async fn aggregate_plan(
-    state: tauri::State<'_, AppState>,
-    category_id: CategoryType,
-    prompt: String,
-) -> AppResult<model::AggregateResult> {
-    aggregate::run_plan(&state.store, category_id, &prompt).await
-}
-
-/// Phase2: 用户确认计划后，决策者执行修改。
-/// work_dir 由 Phase1 的返回结果回传，锁定工作目录避免 auto-follow 漂移。
-#[tauri::command]
-async fn aggregate_execute(
-    state: tauri::State<'_, AppState>,
-    category_id: CategoryType,
-    prompt: String,
-    confirmed_plan: String,
-    work_dir: Option<String>,
-) -> AppResult<model::AggregateResult> {
-    aggregate::run_apply(&state.store, category_id, &prompt, &confirmed_plan, work_dir).await
-}
-
 /// 检索文件（供前端预览用）
 #[tauri::command]
 async fn retrieve_files(
@@ -1409,8 +1384,9 @@ pub fn run() {
             list_vendors,
             upsert_vendor,
             delete_vendor,
-            aggregate_plan,
-            aggregate_execute,
+            aggregate::aggregate_plan,
+            aggregate::aggregate_execute,
+            aggregate::aggregate_write,
             retrieve_files,
             detect_recent_workdirs,
             detect_codegraph,

@@ -1334,41 +1334,6 @@ fn default_max_context_tokens() -> u32 {
     50_000
 }
 
-/// 单个文件的修改结果
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AppliedChange {
-    pub path: String,
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// 聚合运行结果（内部标签枚举，序列化为 tagged JSON 给前端）。
-///
-/// 注意：serde 的内部标签（`#[serde(tag)]`）**不支持 newtype 变体包裹基本类型**
-/// （如 `Plan(String)` 会在运行时报 "cannot serialize tagged newtype variant ...
-/// containing a string"，导致 aggregate_plan 命令必然失败）。故所有变体必须是
-/// struct 变体。字段名对齐前端契约 src/types.ts::AggregateResult（content / filesModified）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "resultType", rename_all = "camelCase")]
-pub enum AggregateResult {
-    /// 决策者输出的修改计划（Phase1）。work_dir 为本次解析定下的工作目录，
-    /// 前端须在 Phase2 原样回传，避免 auto-follow 期间目录漂移把改动写进别的项目。
-    #[serde(rename = "plan")]
-    Plan {
-        content: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        work_dir: Option<String>,
-    },
-    /// 执行结果（Phase2）：content 为决策者原始输出，files_modified 为实际写入的文件路径。
-    #[serde(rename = "applied")]
-    Applied {
-        content: String,
-        files_modified: Vec<String>,
-    },
-}
-
 fn default_concurrency() -> u32 {
     3
 }

@@ -213,6 +213,31 @@ export interface AggregateResult {
   filesModified?: string[];
   /** Phase1 定下的工作目录，Phase2 执行时回传以避免 auto-follow 目录漂移 */
   workDir?: string;
+  /**
+   * Phase1 **开始**的墙钟毫秒。Phase2 原样回传，后端据此拒绝覆盖「用户在确认期间自己
+   * 改过」的文件（见 aggregate/write.rs 的 changed_since）。不回传 = 那道防线整个跳过。
+   */
+  planStartedMs?: number;
+}
+
+/** 一个待写入文件块的落盘预览（Phase2a 产物，此时一个字节都还没写） */
+export interface PlannedChange {
+  path: string;
+  /** 将写入的字节数 */
+  bytes: number;
+  /** 该路径当前是否已存在（true = 覆盖，比新建危险，UI 要区分） */
+  exists: boolean;
+  /** 有值 = 这一条**不会**被写，且落盘阶段会给出同一句话 */
+  rejected?: string;
+}
+
+/** Phase2a 的返回：决策者原文 + 落盘预览 */
+export interface AggregatePreview {
+  /** 决策者原始输出。Phase2b 原样回传（服务端按它重新解析，不缓存） */
+  content: string;
+  changes: PlannedChange[];
+  /** 将写入哪个目录；缺失 = 无工作目录，本轮不会写任何文件 */
+  workDir?: string;
 }
 
 /** 文件检索结果 */

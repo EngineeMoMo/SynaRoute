@@ -7,6 +7,7 @@ import { brandPickerEn, brandPickerZh } from "./i18n.brandPicker";
 import { vendorEn, vendorZh } from "./i18n.vendor";
 import { fieldsEn, fieldsZh } from "./i18n.fields";
 import { mappingEn, mappingZh } from "./i18n.mapping";
+import { brainRunEn, brainRunZh } from "./i18n.brain";
 
 export type Lang = "zh" | "en";
 
@@ -475,15 +476,6 @@ const zh: Dict = {
   "brain.cgLocalNote": "纯本地：索引落在项目的 .codegraph/ 目录，不上传代码。",
   "brain.cgBadgeNotIndexed": "未索引",
   "brain.cgBadgeNotInstalled": "未安装",
-  "brain.runTitle": "运行聚合",
-  "brain.runPlaceholder": "输入需求…如：给登录页添加记住密码功能",
-  "brain.runStart": "开始运行",
-  "brain.runThinking": "参与者思考中…",
-  "brain.runConfirm": "确认执行",
-  "brain.runExecuting": "执行中…",
-  "brain.runReset": "新一轮",
-  "brain.runPlanTitle": "决策者计划",
-  "brain.runResultTitle": "执行结果",
 
   // 日志
   "logs.title": "运行日志",
@@ -492,6 +484,7 @@ const zh: Dict = {
   ...brandPickerZh,
   ...fieldsZh,
   ...mappingZh,
+  ...brainRunZh,
   "logs.empty": "暂无事件",
   "logs.searchPlaceholder": "搜索日志（Key 名、模型、错误…）",
   "logs.noMatch": "没有匹配「{q}」的日志",
@@ -1173,15 +1166,6 @@ const en: Dict = {
   "brain.noActiveProject": "No active project detected — open a project in Claude CLI or Codex",
   "brain.noRecentWorkdirs": "No recent projects detected",
   "brain.recentWorkdirs": "Pick from recent projects",
-  "brain.runTitle": "Run Aggregation",
-  "brain.runPlaceholder": "Describe what you'd like to change, e.g. \"Add a dark mode toggle to Settings\"",
-  "brain.runStart": "Run",
-  "brain.runThinking": "Members thinking…",
-  "brain.runConfirm": "Confirm & Execute",
-  "brain.runExecuting": "Executing…",
-  "brain.runReset": "New round",
-  "brain.runPlanTitle": "Decider Plan",
-  "brain.runResultTitle": "Result",
 
   "logs.title": "Logs",
   "logs.subtitle": "Grouped by system / brain / routing / error (keys redacted)",
@@ -1189,6 +1173,7 @@ const en: Dict = {
   ...brandPickerEn,
   ...fieldsEn,
   ...mappingEn,
+  ...brainRunEn,
   "logs.empty": "No events yet",
   "logs.searchPlaceholder": "Search logs (key, model, error…)",
   "logs.noMatch": "No logs match “{q}”",

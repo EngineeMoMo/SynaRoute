@@ -10,12 +10,13 @@ import { Badge } from "@/components/ui/Badge";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { HealthBadge } from "@/components/HealthBadge";
 import { BrandIcon } from "@/components/BrandIcon";
+import { BrainRunPanel } from "@/components/BrainRunPanel";
 import { useT } from "@/lib/useT";
 import { formatRelativeTime } from "@/lib/utils";
 import type { TFunc } from "@/lib/i18n";
 import type { AggregateMode, BrainConfig, CategoryType, CodegraphState, ProviderKey } from "@/types";
 import type { RecentWorkdir } from "@/types";
-import { Brain, Info, Save, Plus, X, FolderOpen, Play, CheckCircle, History, Activity, ChevronDown, Wand2, Plug, AlertTriangle } from "lucide-react";
+import { Brain, Info, Save, Plus, X, FolderOpen, CheckCircle, History, Activity, ChevronDown, Wand2, Plug, AlertTriangle } from "lucide-react";
 
 const CATEGORIES: { value: CategoryType; tKey: string }[] = [
   { value: "claude-cli", tKey: "nav.claude-cli" },
@@ -454,7 +455,7 @@ export function BrainPage() {
               <NumberField
                 label={t("brain.totalTimeout")}
                 value={config.totalTimeoutMs}
-                min={5000}
+                min={10000}
                 max={1800000}
                 step={5000}
                 onChange={(v) => update({ totalTimeoutMs: v })}
@@ -602,142 +603,10 @@ export function BrainPage() {
 
         {/* 运行聚合面板 */}
         {config.enabled && config.deciderRef && (
-          <AggregateRunner category={category} />
+          <BrainRunPanel category={category} />
         )}
       </div>
     </div>
-  );
-}
-
-/** 运行聚合交互面板：输入 prompt → 参与者思考 → 决策者输出计划 → 确认执行 */
-function AggregateRunner({ category }: { category: CategoryType }) {
-  const t = useT();
-  const [prompt, setPrompt] = useState("");
-  const [phase, setPhase] = useState<"idle" | "planning" | "planned" | "executing" | "done">("idle");
-  const [plan, setPlan] = useState("");
-  // Phase1 定下的工作目录，Phase2 原样回传（避免 auto-follow 期间目录漂移写错项目）
-  const [planWorkDir, setPlanWorkDir] = useState<string | undefined>(undefined);
-  const [result, setResult] = useState("");
-  const [error, setError] = useState<string | null>(null);
-
-  const runPlan = async () => {
-    if (!prompt.trim()) return;
-    setPhase("planning");
-    setError(null);
-    setPlan("");
-    setResult("");
-    try {
-      const res = await api.runAggregatePlan(category, prompt);
-      if (res.resultType === "plan") {
-        setPlan(res.content);
-        // ⚠️ `?? ""` 不能省：Plan.work_dir 为 None 时被 serde skip，前端拿到 undefined，
-        // Phase2 原样回传 undefined 会让后端 run_apply 走「回退实时解析」分支 ——
-        // 若用户在确认计划前于任意项目里开过一个 CLI/Codex 会话，Phase2 会解析出一个
-        // Phase1 从未使用、用户从未确认的目录，把决策者输出直接写进那个项目（目录漂移）。
-        // 空字符串是后端约定的「Phase1 确认无工作目录」哨兵：Phase2 据此不写任何文件。
-        setPlanWorkDir(res.workDir ?? "");
-        setPhase("planned");
-      } else {
-        setResult(res.content);
-        setPhase("done");
-      }
-    } catch (e) {
-      setError(String((e as Error)?.message ?? e));
-      setPhase("idle");
-    }
-  };
-
-  const runExecute = async () => {
-    setPhase("executing");
-    setError(null);
-    try {
-      const res = await api.runAggregateExecute(category, prompt, plan, planWorkDir);
-      setResult(res.content);
-      setPhase("done");
-    } catch (e) {
-      setError(String((e as Error)?.message ?? e));
-      setPhase("planned");
-    }
-  };
-
-  const reset = () => {
-    setPhase("idle");
-    setPlan("");
-    setPlanWorkDir(undefined);
-    setResult("");
-    setError(null);
-  };
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{t("brain.runTitle")}</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        {/* Prompt 输入 */}
-        <textarea
-          className="w-full rounded-control border border-border bg-background px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ring"
-          rows={3}
-          placeholder={t("brain.runPlaceholder")}
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          disabled={phase !== "idle"}
-        />
-
-        {/* 操作按钮 */}
-        <div className="flex gap-2">
-          {phase === "idle" && (
-            <Button size="sm" onClick={() => void runPlan()} disabled={!prompt.trim()}>
-              <Play size={14} /> {t("brain.runStart")}
-            </Button>
-          )}
-          {phase === "planning" && (
-            <span className="text-xs text-text-muted">{t("brain.runThinking")}</span>
-          )}
-          {phase === "planned" && (
-            <>
-              <Button size="sm" onClick={() => void runExecute()}>
-                <CheckCircle size={14} /> {t("brain.runConfirm")}
-              </Button>
-              <Button size="sm" variant="outline" onClick={reset}>
-                {t("common.cancel")}
-              </Button>
-            </>
-          )}
-          {phase === "executing" && (
-            <span className="text-xs text-text-muted">{t("brain.runExecuting")}</span>
-          )}
-          {phase === "done" && (
-            <Button size="sm" variant="secondary" onClick={reset}>
-              {t("brain.runReset")}
-            </Button>
-          )}
-        </div>
-
-        {/* 错误 */}
-        {error && <div className="text-xs text-danger">{error}</div>}
-
-        {/* 计划展示 */}
-        {plan && (
-          <div>
-            <div className="mb-1 text-xs font-medium text-text-secondary">{t("brain.runPlanTitle")}</div>
-            <pre className="max-h-64 overflow-auto rounded-control border border-border bg-background p-3 font-mono text-xs leading-relaxed text-text-primary">
-              {plan}
-            </pre>
-          </div>
-        )}
-
-        {/* 执行结果 */}
-        {result && phase === "done" && (
-          <div>
-            <div className="mb-1 text-xs font-medium text-success">{t("brain.runResultTitle")}</div>
-            <pre className="max-h-64 overflow-auto rounded-control border border-success/30 bg-success/5 p-3 font-mono text-xs leading-relaxed text-text-primary">
-              {result}
-            </pre>
-          </div>
-        )}
-      </CardContent>
-    </Card>
   );
 }
 

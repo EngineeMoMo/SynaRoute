@@ -7,12 +7,14 @@ import i18nBrandPickerSource from "./i18n.brandPicker.ts?raw";
 import i18nVendorSource from "./i18n.vendor.ts?raw";
 import i18nFieldsSource from "./i18n.fields.ts?raw";
 import i18nMappingSource from "./i18n.mapping.ts?raw";
+import i18nBrainSource from "./i18n.brain.ts?raw";
 import { translate } from "@/lib/i18n";
 import { usageEn, usageZh } from "@/lib/i18n.usage";
 import { brandPickerEn, brandPickerZh } from "@/lib/i18n.brandPicker";
 import { vendorEn, vendorZh } from "@/lib/i18n.vendor";
 import { fieldsEn, fieldsZh } from "@/lib/i18n.fields";
 import { mappingEn, mappingZh } from "@/lib/i18n.mapping";
+import { brainRunEn, brainRunZh } from "@/lib/i18n.brain";
 
 /**
  * i18n 的结构性判据。**这些浏览器里看不出来**（缺翻译只是显示成另一种语言或原始 key，
@@ -48,6 +50,7 @@ const SOURCES: { name: string; src: string }[] = [
   { name: "i18n.vendor.ts", src: i18nVendorSource },
   { name: "i18n.fields.ts", src: i18nFieldsSource },
   { name: "i18n.mapping.ts", src: i18nMappingSource },
+  { name: "i18n.brain.ts", src: i18nBrainSource },
 ];
 
 /** 各分片导出的运行时字典，用于校验「分片真的被展开进主词典了」。 */
@@ -57,6 +60,7 @@ const CHUNKS: { name: string; zh: Record<string, string>; en: Record<string, str
   { name: "vendor", zh: vendorZh, en: vendorEn },
   { name: "fields", zh: fieldsZh, en: fieldsEn },
   { name: "mapping", zh: mappingZh, en: mappingEn },
+  { name: "brainRun", zh: brainRunZh, en: brainRunEn },
 ];
 
 /**

@@ -8,10 +8,10 @@ use crate::secret::{atomic_write, SecretStore};
 use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::time::SystemTime;
-// 三个子模块都挂在这里，因为它们要调私有的 mutate_and_persist / 解析数据目录；各自的挂载理由写在对应文件的模块注释里。
+// 四个子模块都挂在这里，因为它们要调私有的 mutate_and_persist / 解析数据目录 / 守住唯一落盘点；各自的挂载理由写在对应文件的模块注释里。
 #[path = "data_dir.rs"] pub(crate) mod data_dir;
 #[path = "log_rotate.rs"] pub(crate) mod log_rotate;
-#[path = "key_flags.rs"] pub(crate) mod key_flags;
+#[path = "key_flags.rs"] pub(crate) mod key_flags; #[path = "brain_config.rs"] mod brain_config;
 
 /// 检查 baseUrl 是否含路径后缀（如 `https://api.deepseek.com/anthropic` 中的 `/anthropic`）。
 ///
@@ -2312,17 +2312,17 @@ impl Store {
             })
     }
 
-    /// 保存某分类的大脑聚合配置。
+    /// 保存某分类的大脑聚合配置。**校验挂在这里**（`brain_config::validate`）：这是唯一落盘点。
     ///
     /// 走 `mutate_and_persist`：落盘失败时从磁盘对账回滚，不让内存态领先磁盘。
     /// 与 Key 的 CRUD 同一套保证——「内存比磁盘新」这个方向的背离**永不自愈**
     /// （mtime 自愈只认「磁盘比内存新」），会一直显示成功保存直到重启才露馅。
     pub fn save_brain(&self, brain: BrainConfig) -> AppResult<()> {
+        brain_config::validate(&brain)?;
         self.mutate_and_persist(|cfg| {
-            if let Some(b) = cfg.brain.iter_mut().find(|b| b.category_id == brain.category_id) {
-                *b = brain;
-            } else {
-                cfg.brain.push(brain);
+            match cfg.brain.iter_mut().find(|b| b.category_id == brain.category_id) {
+                Some(b) => *b = brain,
+                None => cfg.brain.push(brain),
             }
             Ok(())
         })
