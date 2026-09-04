@@ -792,10 +792,12 @@ pub(super) fn missing_catalog_warning(path: &str) -> String {
     )
 }
 
-/// 还原时要处理的两个副文件：`auth.json` 里的占位凭据，以及我们生成的模型目录。
+/// 还原时要处理的三件事：`auth.json` 里的占位凭据、我们生成的模型目录，以及历史对话
+/// 里被我们改过的 `model_provider`（见 [`super::codex_sessions`]）。
 ///
-/// 合成一个函数是为了让 `tools::restore` 的 Codex 分支保持**一行**（那个文件棘轮余量为 0）。
-/// 两件事的失败都不早退、都汇总上报——早退会让用户停在「假 key 摘不掉、目录也没删」
+/// 合成一个函数是为了让 `tools::restore` 的 Codex 分支保持**一行**（那个文件棘轮余量为 0），
+/// 也为了不制造第二个「还原副作用」的汇总点 —— 两个汇总点必然漂移，本仓反复吃过这个亏。
+/// 三件事的失败都不早退、都汇总上报——早退会让用户停在「假 key 摘不掉、目录也没删」
 /// 这种两头皆输的状态，那正是原实现在 auth 这一支上已经定下的纪律。
 ///
 /// # 指针为什么不在这里删
@@ -824,6 +826,16 @@ pub(in crate::tools) fn restore_side_files() -> AppResult<Option<String>> {
         // 而目录文件残留是无害的（指针已随 config.toml 的 .bak 一起消失）。
         // ⚠️ 这与上面注释里「都汇总上报」不是一回事，审查时特意分清：**不早退**是真的
         //（两件事都会尝试），**都上报**只做到「第一个错误 + 已完成项」。
+        Err(_) => {}
+    }
+
+    // 历史对话的 provider 改回原值。排在最后：它最不紧急（假凭据与残留文件都更要紧），
+    // 而且它是三件事里**唯一可重试**的 —— 清单在失败时刻意保留，用户退出 Codex 再点一次
+    // 「停止」就能补完。同理它的错误也只在前两件都成功时才成为主错误。
+    match super::codex_sessions::restore_from_manifest() {
+        Ok(Some(note)) => notes.push(note),
+        Ok(None) => {}
+        Err(e) if failure.is_none() => failure = Some(e),
         Err(_) => {}
     }
 

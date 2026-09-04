@@ -25,12 +25,14 @@
 //! 1. **`experimental_bearer_token` 优先于 auth.json，且没有凭据门禁** → 转发链路上 auth.json
 //!    不参与鉴权。但它**仍然要写**（桌面端登录门，见 [`apply_auth_at`]），故占位符**长驻盘上**，
 //!    它的可见文本本身就是一道防线（见 [`CODEX_AUTH_PLACEHOLDER`]）。
-//! 2. **占位符外发有两条路径，不是一条。** ① `model_provider` 键缺失 → 回落官方（这一支
+//! 2. **占位符外发有三条路径，不是一条。** ① `model_provider` 键缺失 → 回落官方（这一支
 //!    [`drift_state`] 测得出；「provider 表被丢掉而选中项留着」那个历史说法是错的 ——
 //!    那种情形 Codex 硬报错、不发请求）。② **Codex 自己的平台功能**（`remote compaction v2`、
 //!    remote control）**不读 `model_provider`**，无条件打官方 + 取 auth.json 的凭据，
 //!    **接入完好时照样发生**；config 里没有任何异常信号，[`drift_state`] 结构上测不到它。
 //!    取证与关闭办法见 CLAUDE.md「Codex 平台功能绕过 provider」一节。
+//!    ③ **每条历史会话自带的 provider 快照**（rollout 首行的 `session_meta.model_provider`）
+//!    覆盖 config 的根，取证见 [`codex_sessions`]。**分辨：只有旧对话→③、只压缩→②、全都不行→①。**
 //! 3. **内置 provider id 不可覆盖** → 「把内置 `openai` 指向本地代理来中和回落」这条路已被证伪，
 //!    别再试（Codex 启动即失败）。
 //!
@@ -60,9 +62,8 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 #[path = "codex_paths.rs"] mod codex_paths;
-
-#[path = "codex_catalog.rs"]
-pub(crate) mod codex_catalog;
+#[path = "codex_catalog.rs"] pub(crate) mod codex_catalog;
+#[path = "codex_sessions.rs"] pub(in crate::tools) mod codex_sessions;
 pub(crate) use codex_catalog::select_model; // 应用内选 Codex 模型；两个调用点在 lib.rs
 
 use super::{
@@ -133,9 +134,8 @@ pub(super) fn apply(
     // 三条路径都进 with_rollback。副文件（`.bak` / `.synaroute-created`）由 `with_rollback`
     // 自己按主路径推导后一并纳入快照 —— 漏了它们会造成数据丢失级后果，
     // 判据见 tools.rs 里 `with_rollback` 的文档。
-    with_rollback(&[path.clone(), auth.clone(), catalog.clone()], || {
+    let applied = with_rollback(&[path.clone(), auth.clone(), catalog.clone()], || {
         let msg = apply_at(&path, endpoint, models, keys, &catalog)?;
-
         // **写完立刻读回校验**，且校验的是「身份」不是「存在」（见 `is_intact`）。
         //
         // 为什么不可省：Codex 桌面端 App 拥有 config.toml，会在接入**之后**重写它。
@@ -157,7 +157,8 @@ pub(super) fn apply(
             Some(note) => format!("{msg}；{note}"),
             None => msg,
         })
-    })
+    })?;
+    Ok(codex_sessions::append_sync_note(applied))
 }
 
 /// 让桌面端 App 跳过登录页所需的最小写入。返回 `Some(说明)` 表示确实写了。
