@@ -6,6 +6,20 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
 
 **[docs/14-交接与待办清单.md](docs/14-交接与待办清单.md)** —— 2026-07-31 换机交接。里面有：
 
+> 📌 **当前待办（2026-09-04）：代码侧没有待办，只剩 6 条真机验证。**
+> 坐标全部在 [docs/14 §21.2](docs/14-交接与待办清单.md)：**C-19~C-23** 是大脑聚合加固那轮
+> （关掉开关后「确认执行」是否真被拒 / 预览屏的三种标记 / `.synaroute.bak` 是否真在同目录且
+> 内容是原文 / 两个 phase 之间手工改文件是否被拦 / 多客户端并发是否受同一把闸约束），
+> **C-24** 是 Codex 走 Responses 那轮（⚠️ 验的时候要让 Key **带着** temperature ——
+> 清空它是当初用来*确认成因*的绕法，不是修复本身）。
+> 每条都带「怎么判 / 若为否说明什么坏了」，**别在别处另抄一份清单**。
+>
+> ⚠️ **工作区混着三轮互不相关的未提交工作**（Codex 旧会话 provider 同步 / 采样参数注入收窄 /
+> 大脑聚合加固），分表在 §24.1 —— 别当成一轮来读或一次提交。三轮都**未出包**。
+>
+> ⚠️ **`cargo test --lib` 的全量数是三轮合计**，会随另两轮漂。要核某一轮就跑那一轮的过滤器
+> （大脑聚合那轮：`aggregate` 63 / `brain_config` 8 / `aggregateWriteConfirmation` 5）。
+
 - **已修完（换机后）**：重复接入冲掉「接入前备份」（P0 数据丢失级）、短路窗口测试串台 + 重启代理不解除窗口、
   桌面端还原非原子、429 `Retry-After` 不透传、全失败返 502 应为 529、
   **桌面端模型名硬过滤**（对外名不合规会导致模型选择器为空 + `ModelsNotDiscoveredError`，
@@ -1552,6 +1566,423 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   **仍未真机验证**：三条弹性改动都只有单测 + 注入，而 `quota_window` 会改变候选选择、
   是用户可感知的行为。发版前应走一遍：故意让上游回 429 + Retry-After，确认那条 Key
   在窗口内被跳过、事件流里有说明、且窗口到期后自动回来。
+
+- **Codex 旧会话仍打官方（2026-09-03，用户报的 401）**：从官方登录切到 SynaRoute 后
+  **每次对话都 401，而只有新建对话正常**。这是占位符外发的**第三条路径**，此前完全没记录 ——
+  `config.toml` 完好、`drift_state` 判 `Intact`、一个字都不报。实现在
+  [`codex_sessions.rs`](src-tauri/src/tools/codex_sessions.rs)（`#[path]` 挂 `tools/codex.rs` 下，
+  理由同 `codex_catalog`：那个文件生产段 899/900、余量 0）。
+  <br>**成因**：每条 thread **自带一个 provider 身份**，写在 rollout 首行的
+  `session_meta.payload.model_provider`；app-server 的 `thread/resume` **用它覆盖 config 的根
+  `model_provider`**。官方登录期建的对话记着 `openai`（内置、永远存在 → 不报
+  `Model provider not found` 而是**静默**打 `api.openai.com`）→ 拿 auth.json 的占位符 → 401。
+  <br>**四组实测**（隔离 `CODEX_HOME` + 两个本地探针分别扮演 config 的与会话里记的）：
+  ① `codex exec resume` → 打 **config 的**（CLI 那条路不受影响）；② app-server 传
+  `modelProvider:"stale"` → stale；③ app-server **不传** → **仍是 stale**（自己从 rollout 读的）；
+  ④ 把 rollout 首行改成 current、不传 → **current** ✅ 改文件即修复。第 ③ 行是这个模块存在的
+  理由：**不需要客户端传参**，所以我们改 config 再正确也管不到旧会话。
+  权威协议定义可自己导：`codex.exe app-server generate-json-schema --out <dir>`
+  （`Thread` 与 `ThreadResumeResponse` 的 `modelProvider` 都是 **required**）。
+  <br>🔴 **别把第三方工具的说法当成这条的解释**：`Dailin521/codex-provider-sync` 与
+  CodexPlusPlus 改的就是这两处，但两个 README 都只说「切 provider 后旧会话**从列表里消失**
+  （可见性）」—— **打错上游这个后果它们没写**，而那才是 401 的来源。改的地方对、描述不全。
+  故本模块的判据按**路由正确性**设计，不按可见性。
+  <br>🔴 **rollout 是权威，sqlite 只影响列表侧**：恢复会话时 Codex 只
+  `SELECT rollout_path FROM threads WHERE id = ?`（二进制里那条 SQL），provider 是从文件读的
+  —— 第 ③ 组实测的夹具**根本没有 sqlite 记录**也照样生效。故 sqlite 那半是 best-effort
+  （Codex 在跑时 WAL 常锁着），**核心修复不依赖它可写**。看到 sqlite 跳过就以为整个功能没生效
+  是误读，代码注释里写明了。`sqlite/*.db`（新布局）与 `state_5.sqlite`（legacy）**两个都要写** ——
+  只写后者在已迁移的机器上**静默无效**。
+  <br>🔴 **只判/只改首行，依据是 Codex 自己写的 `"ordinal":0`**（本机 4 个 rollout 逐个核过，
+  含一个 fork 出来的子会话）。CodexPlusPlus 遍历全文找 session_meta，那要把几十 MB 整个读进
+  内存；而万一 Codex 日后挪走它，我们的表现是**首行认不出 → 跳过并计数**，不是静默改错行。
+  写入走「新首行 + `io::copy` 剩余 → rename」，内存 O(1)、任何中途失败都不留半个文件
+  （几百 MB 的会话做整份备份不现实，**清单 + 原子替换**合起来比备份强）。
+  临时文件必须与目标**同目录** —— `%TEMP%` 跨卷会让 `fs::rename` 失败，而原子性全靠它。
+  <br>🔴 **清单「首记即锁」，与 `.bak` 同一条纪律**：每个路径的原值只在第一次见到时记录。
+  反过来做是**数据丢失级**链路 —— 第二次接入时文件已经是 target → 没有新条目 → 清单被覆盖成空
+  → 还原时一个都改不回来，用户的旧对话永久指向一个已经停掉的代理端口。
+  还原时**清单缺失就什么都不改**（不能退化成「全部改成当前 provider」——会把我们从没动过的
+  cc-switch/手配会话一起改掉）。清单落 `%APPDATA%\SynaRoute\codex-session-providers.json`，
+  受 `SYNAROUTE_DATA_DIR` 隔离。
+  <br>**同步范围是所有 provider ≠ target 的会话，不只 `openai` 的**：用户那些自定义 provider
+  在我们接入后未必还在 config 里，那种形态 Codex **启动即硬报错**、一个请求都不发。
+  改了有清单可回滚，不改则没有退路。
+  <br>🔴 **用户可见文案只说「已把 N 个旧对话指向 SynaRoute」，绝不说「已恢复可用」**：
+  跨账号恢复时 Responses 的 reasoning 带 `encrypted_content`、由原账号加密，可能解不开
+  （与 `THINKING_SIGNATURE_INVALID` 同族）。那是我们手里的信息支撑不了的承诺。
+  <br>**同步挂在 `with_rollback` 之外**：它失败时接入本身是成功的（config 与目录都写对了、
+  新建对话可用），放进去会把一次成功的接入整个回滚，用户从「旧对话不能用」变成「全都不能用」。
+  反向顺序同样刻意：config 写失败时不该已经动过用户的会话文件（同 `select_model` 那条）。
+  还原**并进 `restore_side_files`** 而不是在 `tools.rs` 另开一处 —— 那个文件余量为 0，
+  且两个「还原副作用」的汇总点必然漂移。
+  <br>**12 条注入全部变红**，含 2 条源码级接线判据（第 14 次同类盲区：11 条行为用例全都直调
+  函数，把两处调用点摘掉照样全绿）。另有一条 `#[ignore]` 用**真实 codex 二进制**验证
+  （`the_real_codex_binary_resumes_with_the_provider_we_wrote`）：读 `thread/resume` 响应里的
+  `modelProvider`，**含对照组**（先断言不改就走 stale —— 没有它，「改完走 current」也可能只是
+  因为 Codex 一直读 config，那样整个模块就是白做的）。
+  <br>⚠️ **两条注入教训**：① 「首记即锁」第一次注入**仍绿** —— 用例里第二次接入 `changed == 0`，
+  那道门**压根没被执行到**。已补一条压得到的（接入 → 用户中途切到别的 provider → 再接入）。
+  ② 「清单缺失时不改」那条注入仍绿是**判据重叠**不是盲区（空 `entries` 天然什么都不做），
+  门保留、注释写明，换成真正的缺陷形态（「没清单就自己扫一份」）即变红。
+  <br>⚠️ **别用 `grep -c $'\r'` 判行尾**：Git Bash 下那个模式匹配**每一行**，于是一个纯 LF 的
+  文件会报「990 行有 CR」。我照着它把注入脚本的搜索串全归一成 CRLF，结果两条多行锚点命中 0 处、
+  被误报成「注入本身没生效」。**本仓工作区的 Rust 源码是 LF**（`core.autocrlf` 只在
+  checkout/commit 时转）。要数就用 node 数字节，或让脚本自己在 LF/CRLF 两种形态里挑唯一命中的那个。
+  <br>**零棘轮抬高**：`codex.rs` 顶在 900 —— 靠把三行模块声明压成单行（省 1）+ 把详细取证放进
+  新模块的模块头（codex.rs 只留 3 行指路）腾出来。
+  当前基线 `cargo test --lib` **1094 passed / 0 failed / 7 ignored**，clippy 干净，
+  `npm run gates` 全绿，`tsc --noEmit` 干净，`npm test` 176 passed / 24 文件。
+  <br>📌 **仍未真机验证**：官方登录下开几个对话 → 接入 → **重启 Codex Desktop** → 旧对话是否
+  不再 401 且走代理；点还原 → 旧对话是否回到官方；Codex 开着时接入 → 提示里是否如实说了
+  「N 个对话因占用未同步」。探针夹具留在 `%TEMP%\cxprobe\`（含从 WindowsApps 拷出的 codex.exe）。
+  <br>🔴 **代码审查又从本轮自己身上查出 8 条，5 条是真缺陷（2026-09-04）** —— 全部修完 +
+  各带回归测试，注入累计 **22 条全部有结论**（21 变红 + 1 条预期仍绿）。逐条记：
+  <br>**① 清单必须在改文件之前落盘（数据丢失级）**：第一版是「改完全部 rollout 再写清单」。
+  `%APPDATA%` 盘满或权限受限时 → 文件已被改成 target 而清单从未落盘 → `?` 返回 Err、
+  只变成一句提示 → 用户点停止时 `restore_at` 读不到凭据、按设计什么都不改 →
+  **那些旧对话永久指向一个已经停掉的代理端口**。反过来的两种失败都安全：清单写失败则一个
+  文件都还没动；清单写成功而某文件改失败，还原时那条发现已是原值、返回 `Ok(None)`。
+  夹具用「把 data_dir 那个路径做成一个文件」让 `create_dir_all` 失败 —— 跨平台都成立，
+  不依赖权限位（Unix 的 rename 看目录权限、Windows 看文件属性，拿只读位当夹具会在另一个
+  平台上静默失效）。
+  <br>**② sqlite 不许无条件全表 UPDATE**：第一版 `UPDATE threads SET model_provider = ?`
+  不看 rollout 那半成不成功。于是 Codex 正在运行（接入时的常态）→ rollout 全被独占、
+  `changed == 0` → 而 sqlite 未必同时被锁 → 列表显示这些对话已属 synaroute，而打开旧对话
+  照旧 401。**列表替一个没完成的修复背了书**，用户据此排除掉「同步没生效」这个真方向。
+  已改为按「确实处理过的 thread id」收窄（`WHERE id IN (…)`），`done_ids` 为空则一个字节
+  都不写。判据用一条**孤立行**（sqlite 里有、磁盘上没有对应 rollout）—— 全表 UPDATE 会连它
+  一起改，那是它的指纹。
+  <br>**③ 多库「一个成功一个失败」不许汇总成纯成功**：`Option<Result<usize,String>>` 换成
+  `SqliteOutcome { updated, error }` 两者并存。本机同时有 `sqlite/*.db` 与 `state_5.sqlite`，
+  Codex 可能只锁住其中一个。同「两条丢日志路径不能合成一个数字」那条。
+  <br>**④ 还原要对称回滚 sqlite**：同步那半刻意写了 `threads.model_provider`，还原那半漏掉
+  就是我们自己造的长期不一致（config 与 rollout 都回了官方，列表仍标 synaroute，
+  **永不自愈**）。清单条目因此加了 `thread_id`（`#[serde(default)]`，旧清单仍可读）。
+  🔴 **按原值分组、一组一次连接**：逐条来的话上百个条目遇上锁库最坏是「条目数 × 1.5s」，
+  会让「停止代理」卡上几分钟。
+  <br>**⑤ 写库前要备份**（计划里承诺过、第一版漏了）：落 `<data_dir>/backups/codex-sqlite/`，
+  连 `-wal` 一起（WAL 模式下主文件可能是旧快照），每库留最近 3 份。**备份失败就不写那个库**
+  —— 宁可不同步，也不留一个无法回退的改动。
+  <br>🔴 **秒级时间戳会让备份自我覆盖**：用户连点两下「启动」时两次备份同名、后一次盖掉前
+  一次，于是「保留 3 份」实际只有 1 份。已加毫秒 + 进程内自增序号（同 `tmp_path_for` /
+  `ccswitch::db_copy_path`）。**是写那条裁剪判据时当场撞到的。**
+  <br>**⑥ 清单里的 `rel_path` 要做路径遏制**：三道 —— 拒空串 → 拒绝对路径 → 所有 component
+  必须是 `Normal`（挡 `..`）→ join 后仍 `starts_with(home)`。刻意不用 `canonicalize`
+  （它解析符号链接、且对已被删掉的文件直接失败，而那是还原时的正常情形）。
+  <br>🔴 **写这条判据时当场抓到一个真缺口**：空 `rel_path` 会通过全部三道门 ——
+  `Path::new("").components()` 是空迭代器、`all()` 对空集恒真、`home.join("")` 又恰好等于
+  home 自身，于是 **`$CODEX_HOME` 目录本身**会被当成一个 rollout 交出去。
+  <br>⚠️ **三道门的实际覆盖面与直觉不符（注入实测）**：逐段 `Normal` 那道是**唯一**挡得住
+  `..` 的 —— `Path::starts_with` 按 component 比较、**不做规范化**，`home.join("../x")` 的
+  前缀检查照样通过。而 `is_absolute` 与前缀检查对绝对路径互为冗余。故「去掉第三道」这条
+  注入**预期仍绿**（判据重叠，非盲区），结论写进了函数文档 —— 别以为去掉第二道还有东西兜着。
+  <br>**⑦ 未同步的文案改成条件句**：Windows 把「文件被独占」与「目录不可写」都映射成
+  `PermissionDenied`，分不开。第一版只说「退出 Codex 再试」，在只读卷上是无效指路 ——
+  用户照做后一字不变。同「拿不到判断依据时把话写成条件句」那条。
+  <br>**⑧ `MAX_DEPTH` 注释是错的**：它声称防符号链接环，而 `DirEntry::file_type()` 按 std
+  语义**不跟随符号链接**（指向目录的链接 `is_dir()`/`is_file()` 双 false、直接被跳过），
+  那种环压根形成不了。它真正防的是异常深的真实目录树。一句声称取证过的话指向了不存在的
+  防护对象 —— 本仓最贵的那类过时注释。
+  <br>⚠️ **判据没压过边界（第一版 `old_db_backups_are_pruned` 注入仍绿）**：`prune_backups`
+  的窗口是 `KEEP*2`（按「主文件 + wal」估），而夹具的库没有 wal、每轮只产 1 个文件，
+  第一版只跑 `KEEP+3 = 6` 轮 —— 恰好等于窗口，**不裁剪也过**。已提到 `KEEP*2+3` 轮。
+  同「注入不变红时先怀疑用例没压到边界」那条。
+  <br>⚠️ **又一次栽在 `| tail` 上（第二次）**：收尾时有一次全量跑报 `1 failed`，而我用的是
+  `cargo test --lib 2>&1 | tail -3` —— **用例名不可恢复**。此后连跑 3 次全绿（1139 passed），
+  这次偶发红**未定性**。CLAUDE.md 里那条「你依赖其输出当证据的那次运行，不要接 tail」
+  已经记过一遍，这是重犯。
+  <br>⚠️ **本轮中途撞上另一个会话在同仓改代码**：`local_cc147cc3`「大脑集合实现评审」正在把
+  `aggregate.rs` 拆成 `aggregate/{write,round,gate,prompt,tool_loop}.rs`，中间态让
+  `agent_tools.rs:32` 的 import 悬空、整个 crate 编译不过约 13 小时。**没去帮它补 import**
+  （会与它正在进行的编辑打架），等它收尾后才跑验证。多会话并行改同一个 crate 时，
+  「编译不过」的第一嫌疑是别人的中间态，不是自己的改动 —— 先 `git status` 看有没有
+  自己没碰过的文件被改。
+  <br>**当前基线**：`cargo test --lib` **1139 passed / 0 failed / 7 ignored**（连跑 3 次全绿）、
+  clippy 干净、`npm run gates` 全绿、`tsc --noEmit` 干净、`npm test` 181 passed / 25 文件、
+  真二进制 `#[ignore]` 探针通过。`codex_sessions.rs` 生产段 **872/900**。
+
+  <br>🔴 **第二轮代码审查（针对第一轮的修复本身）又查出 4 条，2 条是真缺陷** —— 全部修完，
+  另有 6 条注入全部有结论。前两条都是「修复自己带出来的洞」，这类最容易漏：
+  <br>**① 清单非原子写 + 解析失败被当成「没有清单」（数据丢失级，与第一轮同族）**：
+  `write_manifest` 用裸 `fs::write`（先截断再写），在它写入中途崩溃/断电/盘满就留下一份
+  **被我们自己写坏的 JSON**；而 `read_manifest` 的 `from_str(..).ok()?` 把解析失败与文件
+  不存在归成同一个 `None` → 同步侧 `unwrap_or_default()` 以空清单起步 → 首记即锁失效 →
+  覆盖写回，**原值永久消失且用户毫无提示**；还原侧则静默什么都不改。
+  两处都改了：清单走临时文件 + rename（同 `store.rs` 对 config.json 的做法），
+  读取改成三态 `ManifestState::{Missing, Corrupt, Loaded}` —— **Corrupt 一律返回 Err、
+  绝不覆盖那份文件**（它是用户最后的线索）。
+  <br>**② sqlite 回滚失败时清单仍被删 —— 泄漏了本轮刚加的对称回滚**：删清单的条件是
+  `if failed == 0`，而 `failed` **只统计 rollout 那半**。于是「rollout 全还原成功、sqlite 被
+  锁」时清单照样被删 → 重试路径被永久切掉、`threads.model_provider` 停在 synaroute 再也
+  回不去。已改成 `failed == 0 && db_note.is_none()`。
+  <br>**③ `IN (?,…)` 参数数无上限**：每个 id 一个绑定参数，而 SQLite 上限是 32766
+  （3.32 之前 999）。已按 `SQL_CHUNK = 500` 分批。
+  <br>⚠️ **这条的行为测试压不到真边界**（注入实测）：505 个参数远低于 32766，不分批也成功；
+  要让它真失败得造三万多行，成本不合理。故上限改由**编译期**钉住
+  （`const _: () = assert!(SQL_CHUNK < 999)`），「分批这件事还在做」由源码级判据钉住。
+  🔴 顺带被 clippy 的 `assertions_on_constants` 拦了一次 —— 那个 lint 是对的：常量断言该在
+  编译期做，写成 `#[test]` 是把硬保证降级成软保证。
+  <br>**④ 路径越界被计入 `unreadable`，文案说「首行无法解析」**：两个成因的处置完全不同
+  （一个查符号链接、一个是 Codex 换了 rollout 格式）。已拆出 `path_rejected` 单独计数与
+  单独措辞；`rel_of` 的 `strip_prefix(..).unwrap_or(path)` 兜底也一并改成返回 `None` ——
+  写一个绝对路径进清单会同时丢掉「换机器不认领别人的文件」与 `resolve_in_home` 那道遏制。
+  <br>⚠️ **腾行的账**：这一轮把生产段从 **969** 压回 **898/900**，靠的是把四组实测对照表
+  整个搬进 `the_real_codex_binary_resumes_with_the_provider_we_wrote` 的文档注释（测试段
+  不计入棘轮，而那张表本来就该和它的可执行版本放在一起）+ 压缩各处长论证 + 删掉 14 行
+  `// ---` 分隔线。**没有抬任何上限。**
+  <br>⚠️ **另一个会话改过我的文件而我不知情**：`codex_sessions.rs` 里那处
+  `std::iter::repeat_n` 被它换成了 `repeat("?").take(..)`（`repeat_n` 要 Rust 1.82、本仓
+  MSRV 是 1.77，clippy 的 `incompatible_msrv` 拦住了它）。改动是对的，我后续跑的
+  clippy/测试都在改后的版本上 —— 但这意味着**多会话并行时「我写的代码」不等于「盘上的
+  代码」**，收尾前该 `git diff` 自己那几个文件看一遍。
+  <br>**当前基线**：`cargo test --lib` **1145 passed / 0 failed / 7 ignored**（连跑 2 次全绿）、
+  clippy 干净、`npm run gates` 全绿零抬高、生产段 **898/900**、真二进制探针通过。
+
+  <br>📌 **本轮只做了第一批**（provider 同步）。用户已批准的后两批：会话列表页（查看/删除/导出）、
+  三项借鉴（环境变量冲突检测 / config.toml 外部改动监听 / Responses 侧 `encrypted_content` 整流，
+  后者**先取证再动手**）。计划全文在 `~/.claude/plans/elegant-strolling-kite.md`。
+
+- **大脑聚合全面加固（2026-09-04，用户「都需要修复」）**：一次评审查出的四类问题全部修完，
+  新增 6 个模块、26 条故障注入全部有结论。**零棘轮抬高，五项基线反而下调**
+  （`aggregate.rs` 2033→**1189**、`lib.rs` 1894→1870、`model.rs` 2059→2024、
+  `i18n.ts` 1434→1419、`BrainPage.tsx` 1393→**1262**）。
+  - 🔴 **写路径比读路径松，而写是不可逆的**（本轮最重的一类）。实现收进
+    [`aggregate/write.rs`](src-tauri/src/aggregate/write.rs)，**六道防线只有一处实现**
+    （`judge`），预览与落盘共用它。补的四道：**版本库内部**（`.git/hooks/*` 会被 git
+    自动执行，是提示注入通往任意代码执行的最短路径，而它不含 `..`、非绝对、非链接 ——
+    原先两道全部放行）；**凭据类**（`is_sensitive_path` 在读路径有 9 个调用点，写路径
+    **一个都没有** —— 我们拒绝让模型看 `.env`，却允许它覆盖 `.env`）；**名字形态**
+    （ADS 冒号 / Windows 保留设备名 / 尾随点空格 —— 这三种不逃逸目录，但让落点不是那个
+    文件，也就是**谎报成功**）；**mtime**（用户在「看计划」与「点确认」之间自己改过的文件
+    拒绝覆盖）。落盘改「备份 → 同目录临时文件 → rename」：原先是裸 `fs::write`，
+    **零备份、非原子**，而本仓对自己的 `config.toml` 都做 `.bak`。
+    <br>🔴 **备份失败一律中止写入**（fail-closed）—— 备份是这次改动对用户的核心承诺，
+    「备份没成还照写」等于无备份覆盖源代码。
+    <br>⚠️ **ADS/设备名那道刻意不并进共享的 `is_safe_relative_path`**：读路径有一条测试
+    （`defense_3_target_check_catches_windows_name_aliases`）专门钉住「`.env::$DATA` 必须被
+    **按落点**那道拦住」，用来证明第二次判定不是冗余。把冒号提到第一道会让那条测试改为
+    在第一道就红 —— 判据还在，但它守的东西没了。
+    <br>⚠️ `is_safe_write_name` 必须跳过 `.` 这一段：`./a.rs` 是第一道明确放行的形态，
+    而 `.` 以点结尾 —— 不排掉它，「尾随点」那条会把一个合法路径拒掉（第一版踩到）。
+  - 🔴 **「用户确认的」与「实际执行的」不是同一个东西** —— Phase1 让用户确认的是**计划文本**，
+    完整文件内容是 Phase2 才生成的，而原实现「确认执行」一点就直接落盘：他从未看到将写入的
+    字节，也没有「将改动这 N 个文件」的清单。已拆成 **Phase2a 预览**（`run_preview`，
+    出内容 + 判定，一个字节都不写）与 **Phase2b 落盘**（`run_write`，不调模型）。
+    前端多一屏清单（[`BrainRunPanel.tsx`](src/components/BrainRunPanel.tsx)，从
+    `BrainPage.tsx` 抽出，标出「覆盖 / 新建 / 已拒绝」+ 字节数 + 备份说明）。
+    <br>🔴 **Phase2b 按决策者原文重新解析，不接收前端传回的 changes**：那份数据在前端手里
+    待过一趟，拿它当写入依据等于让前端决定往哪写什么。
+  - 🔴 **`run_plan` 与 `run_mcp` 各写一份骨架，已漂出五处真缺陷**，全部收进
+    [`aggregate/round.rs`](src-tauri/src/aggregate/round.rs)（唯一实现，差异只由
+    `RoundKind` 承载 —— 用枚举不用函数指针，加第三种调用方时编译器会要求它在两处 match
+    里都表态）。五处逐条：① **桌面端决策者的 token 用量从未进累加器**（`decider_used` 只被
+    拼进 detail 文本，而紧挨着的注释写着「分项已各自记过账（…决策者在其调用点…）」——
+    那句话在 `run_mcp` 里是真的，在 `run_plan` 里**没有那个调用点**；决策者是整轮最重的
+    一笔，用量页与金额系统性偏低且落进日桶后永不自愈）；② `aggregate_trace_enabled`
+    **在桌面端半失效**（整个 `run_plan` 一次都没读它 → 用户开了开关却看不到决策者的入参，
+    而那才是「为什么答案是这样」的答案）；③ 桌面端缺「大脑聚合开始 / 参与者汇总 /
+    交由决策者 / 决策者返回」**四条日志**；④ 独答降级的说明事件只有 MCP 有；
+    ⑤ **方向相反的一处** —— 独答降级的 usage 只有桌面端记了，MCP 那份裸 `call_ref` 没记。
+    <br>**也就是说两份实现里较新的修复只落在被人盯着的那一份上**，而它藏在同一个文件里、
+    隔了 300 行。合并后 `run_plan` 从 186 行变成 12 行、`run_mcp` 从 380 行变成 25 行。
+  - 🔴 **`run_apply` 此前不检查 `brain.enabled`**（另两个入口都检查）→ 用户关掉大脑聚合后
+    「确认执行」照样能跑并**写文件**。已收进 `require_enabled`，判据钉住「四个入口都调它、
+    且 `brain.enabled` 只被读一次」。
+  - 🔴 **聚合是唯一不受任何全局闸门约束的付费路径**。实现收进
+    [`aggregate/gate.rs`](src-tauri/src/aggregate/gate.rs)：`concurrency_limit` 的信号量
+    原先**每轮新建**，而聚合有四个入口能同时开轮（CLI 走 HTTP、Codex 与桌面端各一个 stdio
+    子进程、桌面端 BrainPage 自己还能点）→ 真实并发 = 4 × limit，**用户设的数字在最需要它的
+    场合恰好不生效**。改成进程级、按「分类 + 容量」缓存（容量是用户可改的，而 `Semaphore`
+    创建后不可变，故 key 带上它）。同时补上三层弹性里漏掉的两层：**配额窗口**
+    （上游刚用 `Retry-After` 说「N 秒后再来」，代理路径会跳过、聚合照打，而 429 刻意不计
+    熔断 → 这个白打**每轮重复**）与**余额耗尽**（判据用 `is_exhausted` 的三态，
+    「查不到 ≠ 为零」）。
+    <br>🔴 **成员「跳过」、决策者只「警告」**：代价不对称 —— 跳过一个成员只是少一份意见，
+    而决策者被跳过整轮就没有答案了；且这三个信号都可能过时。
+  - **`save_brain` 此前零校验** → [`brain_config.rs`](src-tauri/src/brain_config.rs)：
+    引用形态（`call_ref` 运行时按 `::` 切，切不出来整轮失败，而那时用户已等了几十秒）、
+    成员去重（同 Key 同模型两次 → 标签逐字相同 → 运行日志分不清谁是谁，工具事件的折叠键
+    `tool:{label}:{工具名}` 还会把两位合并成一行；**反面**：不同 Key 上的同名模型是合法的）、
+    成员数上限、整轮预算与上下文 token 的范围。
+    <br>🔴 **只在保存路径校验，读取路径一个字都不查**：老配置里可能已有本模块认为不合法的
+    组合，读取时也拒的话，升级一次就让他的大脑聚合彻底不可用，而他并没有做错任何事。
+    <br>⚠️ **我评审时说的「`total_timeout_ms` 与 MCP 客户端超时无联动」是错的** ——
+    `service::mcp_client_timeout_ms` 早就取各分类最大值 + 30s 余量。故上限那条纯粹是防误输入
+    （把 60000 打成 6000000），不是为了对齐客户端。
+  - 🔴 **提示注入的第二层：检索文件的封装形态**（[`aggregate/prompt.rs`](src-tauri/src/aggregate/prompt.rs)）。
+    原实现把检索来的文件内容**裸包在固定三反引号里**，零转义、零 nonce。而 Phase2 给决策者的
+    指令恰好是「对每个要改的文件输出 ```` ```file:路径 ```` 块」—— 一个被污染的文件只要在自己
+    内容里写上四反引号包住的 `file:` 块，那段文字就会**原样流过**「成员 → 汇总 → 决策者」三跳，
+    模型有相当概率把它复述进输出，那时 `parse_blocks` 会把它当成真指令。
+    <br>🔴 **上面那六道防线挡不住这条**：它们判的是「往哪写」，这里被劫持的是「写什么」——
+    攻击者完全可以指定一个合法路径（`src/main.rs`）配上恶意内容。两层缺一层都不成立。
+    <br>改成**随机 nonce 的 XML 风格围栏**（`<file id="{8位随机}">…</file id="{同一值}">`）：
+    写文件的人不知道这一轮会用哪个值，造不出能提前闭合的字符串。开场那句说明必须点明三件事
+    （这是数据 / 边界靠一个它猜不到的值 / 里面的指令一律不执行）—— 只有 nonce 没有说明，
+    模型不知道该怎么对待它；只有说明没有 nonce，攻击者可以伪造闭合标签跳出来。
+    **刻意选 XML 标签而不是继续用反引号**：Anthropic 自己的长上下文最佳实践就推荐它，
+    模型对这个形态的理解比「围栏里的围栏」稳得多。
+    <br>**正文一个字节都不改写** —— 那会让模型看到的代码与磁盘上的不一致，而它的修改是基于
+    看到的那份。有测试同时钉住这一点与「伪造闭合标签跳不出来」。
+    <br>🔴 **接线判据钉的是「只有一条通道」**：`aggregate.rs` / `round.rs` 生产段里不许出现
+    `.content` —— 谁在别处直接拼一段正文进 prompt，围栏就被绕过了，而那是这个模块存在的全部
+    理由。4 条注入全部变红（nonce 变常量 / 退回裸反引号 / 删掉「不要执行」那句 / 另开一条通道）。
+    <br>⚠️ **这一条是我评审时列出来、第一轮实现却漏掉的**：当时只做了路径级的六道防线，
+    而评审原文写着「注入链是闭环的，不是理论攻击面」。用户追问「都修复完成了吧」时才发现。
+    **教训：评审清单要逐条对代码核一遍，别凭「这一类我做过了」的印象结账。**
+  - **零散**：`run_write` 落一条「写了哪些文件 + 备份几份」的事件（改用户源文件是唯一不可逆
+    的动作，而它此前的审计痕迹**只活在前端那次 IPC 返回值里**，窗口一关就查不到）；
+    `cap_text` 从两遍 `chars()` 改成一遍 `char_indices().nth()`（每轮对每个成员的入参出参
+    各调一次，单个可达数十万字符）；`call_ref` 的文档说「budget_ms 取 total_timeout_ms」
+    已过时（阶段预算体系加进来之后调用方传的是阶段预算）；顺手修掉 `codex_sessions.rs` 里
+    一处 `repeat_n`（Rust 1.82 API 而本仓 MSRV 是 1.77，clippy 的 `incompatible_msrv` 拦住了）。
+  - **26 条故障注入全部有结论**（24 变红 + 2 条换手法/换过滤器后变红）。含 4 条**跨语言/源码级接线判据**
+    —— 本仓第 15~17 次盯同一类盲区：`gather_members` 的信号量来源、`save_brain` 的落盘点、
+    以及 [tests/aggregateWriteConfirmation.test.ts](tests/aggregateWriteConfirmation.test.ts)
+    钉住「前端必须先拿到预览才可能落盘」+「`planStartedMs` 一路回传」——
+    **后端那两道防线都依赖前端如实接线，而漏掉的表现全是静默的**（Rust 侧用例直接传参数，
+    照样全绿）。
+    <br>⚠️ **搬代码时判据要跟着搬，本轮被自己的判据抓住两次**：
+    `aggregate_usage_is_never_recorded_without_a_key` 只扫 `aggregate.rs`，骨架搬进
+    `round.rs` 后它报「只解析到 4 处 —— 判据在空转」（反向断言起作用了）；
+    IPC 命令搬进 `aggregate.rs` 后，那条跨语言判据仍在 `lib.rs` 里找 `async fn`，当场变红。
+    <br>⚠️ **两次栽在行尾上**：`aggregate.rs` 实测是 **CRLF**（不是 CLAUDE.md 里那句
+    「本仓工作区 Rust 源码是 LF」—— 按文件实测，别按记忆），LF 写的多行锚点静默落空、
+    症状是「单行锚点匹配得上、多行的报找不到」。所有一次性脚本现在都按目标文件归一行尾。
+    <br>⚠️ **腾行时又踩了「腾空间是删、不是重排」**：为 store.rs 腾 1 行去改注释，
+    结果把 5 行注释改成 6 行。最后靠把两个 `#[path]` 模块声明并成一行真省下 1 行。
+  - **自审又修出四条（同日，评审→修复的第二轮）**。前三条都是「新加的防线自己带出来的洞」，
+    最容易漏 —— 写的时候脑子里是新行为，而它的副作用要换个角度才看得见：
+    <br>🔴 **备份文件可以被模型自己覆盖。** `a.rs.synaroute.bak` 过得了另外五道防线
+    （不含冒号、非设备名、不在版本库内、扩展名 `bak` 也不在凭据黑名单里）。失效链很具体：
+    第一轮落盘把原文留在 `.bak`，第二轮模型输出一个 `file:a.rs.synaroute.bak` 块，那份原文
+    就没了。最坏是**同一轮**里同时输出 `a.rs` 与 `a.rs.synaroute.bak` —— 前者写入时备份原文，
+    后者紧接着覆盖那份备份，两条都「成功」而撤销路径已经不存在。
+    **备份是这次改动对用户的核心承诺，而它当时是可写的。** 已补 `is_our_side_file` 那道
+    （按**任意路径段**判，不只判整串结尾 —— `x.synaroute.bak/y.rs` 这种把备份当目录用的形态
+    在 Unix 上成立）。
+    <br>🔴 **工具并发从「16 路齐发」收成分批 4 路。** `grep` 与 `codegraph_query` 都起子进程，
+    在大仓库上单个就吃满 IO —— 一轮放 16 个并发 `rg` 出去，是在**用户自己的开发机**上制造
+    资源尖峰，而收益早在前几个就拿到了（模型一轮真正会读的文件通常 2~5 个）。
+    <br>⚠️ **`StreamExt::buffered` 那条路走不通，别再试**：它更精确（滑动窗口而非批屏障），
+    但会把借用了 `calls` 的 future 塞进 `FuturesOrdered`，推导出的 auto-trait bound 不够
+    general —— 实测让**`mcp.rs` 里两处与本改动毫无关系的 `tokio::spawn` 编译失败**
+    （`Send` is not general enough）。改用 `chunks` + `join_all`：批屏障的代价在 4 个一批、
+    正常 1~2 批的量级上可以忽略，让一个无关模块编译不过不行。
+    <br>🔴 **排队耗尽那条错误回显了未 clamp 的原值。** 文案说「并发上限 N 低于成员数…可提高
+    『并发上限』」，而用户填 999 时真实上限是 gate 的硬顶 32 —— 那句话告诉他去提高一个
+    已经到顶的数字，**提高到任何值都不会有效果**。已收成 `gate::effective_limit`，
+    判据同时钉住「文案里的数字 == 闸门实际容量」与「aggregate.rs 里不许再有第二份 clamp」。
+    <br>**顺手把工具循环抽进 [`aggregate/tool_loop.rs`](src-tauri/src/aggregate/tool_loop.rs)**
+    （`aggregate.rs` 因此从 1482 降到 1189）。
+    <br>⚠️ **注入验证这一轮踩了两次「过滤器写错」**：`the_user_facing_limit_is_the_effective_one`
+    那两条接线断言我按 `gather_members_must_take_its_gate_from_this_module` 去跑，报「仍绿」；
+    工具并发那条的锚点写的是搬家前的文本，报「命中 0 处」。两次都是脚本的问题、不是判据的问题
+    —— 同 CLAUDE.md 那条：**注入不变红先怀疑自己，第一嫌疑是过滤器/锚点没压到那一处。**
+  - 当前基线（⚠️ **含未提交的三轮工作合计**，不是本轮单独的数字）：`cargo test --lib`
+    **1147 passed / 0 failed / 7 ignored**（连跑 3 次一致）、`npm test` **181 passed / 25 文件**、
+    clippy 干净、`tsc --noEmit` 干净、`npm run gates` 全绿。
+    <br>**本轮自己的部分可单独核**（这几条命令的数字只受本轮影响）：
+    `cargo test --lib aggregate` = **63**（write 23 / gate 7 / prompt 5 / aggregate.rs 自身 28）、
+    `cargo test --lib brain_config` = **8**、
+    `npx vitest run tests/aggregateWriteConfirmation.test.ts` = **5**。
+    <br>⚠️ **别去推算「合计减本轮 = 另两轮」**：本轮结束时测得 1130，现在是 1147，而
+    `cargo test --lib sampling_params` 只有 **3** 条 —— 那 17 的来源我没有逐条核过，
+    写一个猜出来的归因比不写更糟（同「拿不到判断依据时把话写成条件句」那条）。
+    接手要准确数字就自己重跑。
+  - 📌 **仍未真机验证**：① 关掉大脑聚合后「确认执行」是否真的被拒；② 预览屏在真实决策者输出下
+    的呈现（覆盖/新建/被拒三种标记、备份提示）；③ 落盘后 `.synaroute.bak` 是否真在同目录且
+    内容是原文；④ 两个 phase 之间手工改文件，确认拿到「确认计划之后被改动过」而不是被静默覆盖；
+    ⑤ 多客户端同时调 `synaroute_ai`，确认并发受同一把闸约束。
+    <br>**这五条已落进 [docs/14 §21.2](docs/14-交接与待办清单.md) 的 C-19~C-23**（带「怎么判 /
+    若为否」），本轮的三条「刻意不做」落进 §21.3 D 层，全貌与未提交状态落进 §24 ——
+    真机验证清单只该有一处，别在这里另抄一份。
+
+- **Codex 走 Responses 一律 400，成因是我们替它补了 `temperature`（2026-09-04 用户实报，已修）**：
+  症状迷惑性极强 —— **同一个自建 sub2api，「OpenAI Chat」能用、「OpenAI Responses」一律
+  `HTTP 400 {"error":{"message":"Upstream request failed","type":"upstream_error"}}`，
+  而那个站在 cc-switch 下走 Responses 完好**。三方对照把成因锁死在「SynaRoute 往 Responses
+  请求里加了 Codex 没发的字段」上。
+  <br>🔴 **那句错误不是我们输出的**（全仓 grep `Upstream request failed` = **0 命中**），
+  是中转站自己的网关在说话 —— 同 `bad_response_status_code` 那条。这一条推论排掉一大片方向：
+  它**已经接受**了我们的请求（鉴权过了、路由到了、body 也解析了），失败发生在
+  **它与它的上游之间**。别再从「用户报了 400」反推「我们的请求格式非法」。
+  <br>**成因链三段，每段单独看都无害**：① Codex 的真实报文**不含** `temperature`/`top_p`/
+  `reasoning`（Responses 的 reasoning 模型不接受采样参数，它是**刻意不发**的；取证：用户给的
+  157 KB 原始报文里三者全部缺席）；② `KeyEditor` 把 temperature 预填成 `1.0` 且无条件写进
+  `params`，于是**每条 Key** 都带着一个用户从没配过的采样参数 —— 而那个输入框**还清不掉**
+  （`Number("")` 得到 `0`，仍是合法有限值、仍会被注入）；③ `apply_key_params` 排在
+  `convert_request_owned` **之前**。
+  <br>🔴 **Chat 能用是歪打正着，不是因为它「更兼容」**：跨协议时 `responses_to_chat` 是
+  **白名单重建**（从空 `Map` 起手，只插 model/messages/max_tokens/response_format/reasoning/
+  tools/tool_choice 七个字段），temperature 不在名单里、被顺带丢掉；同协议直通零转换，
+  它就原样到达上游。**一道防线只在一半路径上偶然成立，另一半完全裸奔**，而那一半的失效
+  被「另一半好着」掩盖了。找这类缺陷的姿势是「列出我们相对纯透传的全部增量」，不是「查上游」。
+  <br>**修法两条**：`apply_key_params` 收一道 `skip_sampling`（Responses 上游一律不注入。
+  代价不对称 —— 不注入只是「Key 上配的值在该协议上不生效」，而 1.0 本就是各家默认值、近乎
+  无感；注入则整条链路 400，且中转站只回一句自己的网关错误、归因极难）；`KeyEditor` 改成
+  `number | ""`（照隔壁 `timeoutMs` 的既有模式）并**不再预填 1.0**。
+  <br>**3 条注入全部有结论**：删掉那道门 → 两条测试变红，失败输出里逐字打出
+  `"temperature": 1.0, "top_p": 0.9`（缺陷本体的完整复现）；**把调用点第三个实参换成硬编码
+  `Protocol::Anthropic` → 只有 e2e 变红、单元判据照样绿** —— 第 **16** 次同类接线盲区，
+  故那条走真 mock 上游 + 真 `ProxyManager` 的 e2e 不可省。
+  <br>⚠️ **顺带修掉两处当场变过时的注释**：`path_takes_sampling_params` 与它那条测试都写着
+  「KeyEditor 默认就带 temperature=1.0」——改完默认值那句就成了假话，而它恰恰是「为什么这
+  不是边角场景」的论据。已改成「老配置里普遍存着」（存量 Key 里它确实还在，论据依然成立）。
+  <br>📌 **刻意没做 + 已知残留**：前端那半没加机械判据（改回 `?? 1.0` 后端门仍在、不会再 400，
+  失效方向退化成「又给每条 Key 带一个没配过的参数」；而加判据要从 `KeyEditor.tsx` 抽纯函数
+  ——本仓无 jsdom——而那个文件余量为 0）。**存量 Key 里的 `temperature: 1.0` 不会被自动清掉**，
+  想彻底摆脱得去编辑器里清空一次。零棘轮抬高（`proxy.rs` 与 `KeyEditor.tsx` 都净零，
+  后者靠把两条注释各压成一行腾出）。
+  <br>📌 **待办与真机验证判据落在 [docs/14 第二十五节](docs/14-交接与待办清单.md) 与 §21.2 的
+  C-24**（⚠️ 验的时候要让 Key 上**带着** temperature —— 清空它是当初用来*确认成因*的绕法、
+  不是修复本身，拿清空后的 Key 去验等于测绕法）；两条「刻意不做」在 §21.3 D 层。**未出包。**
+
+- **发版前全链路审查（2026-09-04，v0.1.56 前）：又修出 4 条，4 条注入全部变红**。三轮工作
+  彼此没有冲突（唯一交叉是 `agent_tools.rs` 那两个 import 跟着 `write.rs` 搬家，已改对）。逐条：
+  - 🔴 **前后端边界不一致：界面能点到 5 秒总超时，而后端拒 <10 秒。** `brain_config::validate`
+    是这一轮新加的，下限 10s 有实据（`decider_floor_ms` 要切 35% 给决策者）；而 `BrainPage`
+    那个输入框的 `min` 还是校验加进来之前的 **5000**。`NumberField` 是裸
+    `<input type=number>`、`onChange` 直接 `Number(e.target.value)` **不 clamp**，所以手打还能填 0。
+    同 `headers_json` 那条「界面能填、存不进去」。
+    <br>判据落在 [tests/brainConfigBoundsParity.test.ts](tests/brainConfigBoundsParity.test.ts)：
+    **前端范围必须是后端接受范围的子集**（更严可以，更宽不行 —— `maxContextTokens` 前端 50 万、
+    后端 100 万是刻意的）。**JSX 属性区写不了 `//` 注释**，所以「为什么是 10000」这句话在那一行
+    根本放不下，判据文件是它唯一的家。只对账 `validate` 会**硬拒**的那两项 —— 并发上限 /
+    工具轮数那些运行时有 clamp，收进来会把判据变成「两份数字必须逐一相等」，而那不是事实。
+  - 🔴 **同一路径重复输出时，「预览说会写、实际被拒」真的会发生** —— 而 `write.rs` 模块头
+    恰好承诺了不会。链路：预览阶段一个字节都没写 → 两块都过 `judge` → 界面显示「将写入 2 个」；
+    落盘时第一块写完、目标 mtime 变新 → 第二块撞 `changed_since` → 拒，**而那句话说的是
+    「你在确认之后改过这个文件」**。改它的是我们自己，用户拿到一句指向不存在原因的解释。
+    <br>已在 `parse_blocks` 里去重（**一处**，不在两个消费者里各写一份 —— 那正是模块头要防的），
+    第二块起标 `duplicate` 并给 `DUPLICATE_BLOCK` 那句话。按**归一后**路径比：`./a.rs` 与
+    `a.rs` 落点相同，裸字符串比会让两块各写一次、后者覆盖前者而**两条都报成功**。
+    另一半断言同样要钉：留在磁盘上的必须是**第一块**（用户在预览里核对的就是它）。
+    <br>⚠️ 第一次注入用 `b.duplicate = false` **编译不过**（`HashSet` 类型推导不出）——
+    同「注入不变红的第四种成因」，换成整段删掉即红，且**只红那两条**。
+  - 🔴 **sqlite 备份的裁剪把主文件与 wal 拆散了。** `prune_backups` 用裸 `mine.sort()` 比整个
+    文件名，而 `-`(0x2D) **小于** `.`(0x2E) → **全部** `{stem}-wal.*` 排在**全部** `{stem}.*`
+    之前，两类被分成两段而不是按轮次交错。于是 `KEEP*2` 那个窗口的真实语义是「先把所有 wal
+    删光」：跑 5 轮留下 **5 份主文件 + 1 份 wal**（宣称 3 份），且**留下的旧主文件没有配对的
+    wal** —— 而 WAL 模式下主文件可能只是旧快照，备份 wal 的全部理由就是这个。
+    原注释还写着「方向安全」，那句话在有 wal 的库上不成立（**声称分析过的注释比没有更贵**）。
+    <br>排序键改成 `(时间戳段, is_wal)`：同一轮相邻、主文件在前，窗口边界落在一对中间时丢的是
+    主文件、留一个无害的孤儿 wal。
+    <br>⚠️ **原有那条用例压根压不到这一维** —— 夹具没有 wal，每轮只产 1 个文件。已加
+    「留下的每份主文件都必须有配对 wal」那条断言，并**在每轮循环里**重写假 wal ——
+    只在循环外写一次的话，rusqlite 打开非 WAL 模式的库会把它清掉，第 2 轮起就没有 wal 备份了
+    （第一版实测如此，症状是判据在**修复之后**照样红）。
+  - **`BrainRunPanel` 的 React key 撞车**：`key={c.path}` 而同一路径**可以**在清单里出现两次
+    （上面那条修完，第二条带「重复块」的拒绝原因）。同 `updateMemberModel` 那条确定性 id 的坑。
+  - 顺手改准一句注释：`tool_call_brief` 里 `parts.sort()` 声称「折叠 key 才不会抖动」——
+    折叠键是 `tool:{label}:{工具名}`、**不含参数**。它真正守的是折叠时的 detail 覆盖。
+  <br>📌 **`codex_sessions.rs` 生产段现在 899/900，余量只剩 1 行**，而且是靠把 `describe` 的
+  函数体第一行挤到签名后面撑住的 —— **动它之前必须先腾**，也别对它跑 `cargo fmt`（会拆开那行
+  → 900 行 → 棘轮红）。仓里没有 fmt 门，所以这一条只能靠这句话提醒。
+  <br>当前基线：`cargo test --lib` **1149 passed / 0 failed / 7 ignored**、
+  `npm test` **184 passed / 26 文件**、clippy 干净、`tsc --noEmit` 干净、
+  `npm run gates` 全绿、**零棘轮抬高**（5 项下调）。
 
 - **刻意不修的项**（别当成遗漏重复劳动）：SmartScreen 签名告警、`retrieval.rs` 的 `cwd` 白名单、
   请求日志存明文对话（默认关闭）
