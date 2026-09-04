@@ -164,9 +164,9 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const [secret, setSecret] = useState("");
   const [showSecret, setShowSecret] = useState(false);
   const [revealing, setRevealing] = useState(false);
-  const [temperature, setTemperature] = useState(initial?.params.temperature ?? 1.0);
-  // 请求超时(ms):空 = 未设(后端默认 30000)。服务非流式转发,慢厂商可调大;
-  // 健康探测/拉模型后端固定封顶 30s,大脑聚合用大脑页「总超时」——均不受此值放大影响。
+  // 空 = 不发送该字段(同下方 timeoutMs)。刻意**不预填 1.0**:那会让每条 Key 都带一个用户没配过的采样参数,而同协议直通到 Responses 上游时它原样发出即 400(见 proxy.rs 的 `skip_sampling`)。
+  const [temperature, setTemperature] = useState<number | "">(initial?.params.temperature ?? "");
+  // 请求超时(ms):空 = 未设(后端默认 30000),服务非流式转发、慢厂商可调大;健康探测/拉模型后端固定封顶 30s,大脑聚合用大脑页「总超时」——均不受此值放大影响。
   const [timeoutMs, setTimeoutMs] = useState<number | "">(initial?.params.timeoutMs ?? "");
   const [models, setModels] = useState<ModelInfo[]>(initial?.models ?? []);
   const [mappings, setMappings] = useState<ModelMapping[]>(initial?.mappings ?? []);
@@ -297,7 +297,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
         hasSecret: initial?.hasSecret || secret.length > 0,
         enabled: initial?.enabled ?? true,
         priority: initial?.priority ?? 999,
-        params: { ...initial?.params, temperature, timeoutMs: typeof timeoutMs === "number" && timeoutMs >= 1000 ? timeoutMs : undefined },
+        params: { ...initial?.params, temperature: typeof temperature === "number" ? temperature : undefined, timeoutMs: typeof timeoutMs === "number" && timeoutMs >= 1000 ? timeoutMs : undefined },
         models,
         mappings,
         defaultModel: defaultModel.trim() || undefined,
@@ -517,7 +517,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     enabled: initial?.enabled ?? true,
     allowInAggregate: initial?.allowInAggregate, // 必须透传：入口在 Key 卡片上，漏了则保存一次就被静默清掉（有 parity 判据钉住）
     priority: initial?.priority ?? 999,
-    params: { ...initial?.params, temperature, timeoutMs: typeof timeoutMs === "number" && timeoutMs >= 1000 ? timeoutMs : undefined },
+    params: { ...initial?.params, temperature: typeof temperature === "number" ? temperature : undefined, timeoutMs: typeof timeoutMs === "number" && timeoutMs >= 1000 ? timeoutMs : undefined },
     models,
     mappings: mappings.filter((m) => m.expectedName && m.realName),
     defaultModel: defaultModel.trim() || undefined,
@@ -782,7 +782,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
           {/* 参数 */}
           <div className="flex gap-3">
             <Field label={t("editor.temperature")} className="flex-1">
-              <input type="number" step={0.1} min={0} max={2} className={inputCls} value={temperature} onChange={(e) => setTemperature(Number(e.target.value))} />
+              <input type="number" step={0.1} min={0} max={2} placeholder="1.0" className={inputCls} value={temperature} onChange={(e) => setTemperature(e.target.value === "" ? "" : Number(e.target.value))} />
             </Field>
             <Field label={t("editor.reqTimeout")} className="flex-1">
               <input
