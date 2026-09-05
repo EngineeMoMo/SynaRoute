@@ -97,7 +97,7 @@ export function CodexSessionsPage() {
         <button
           type="button"
           onClick={() => void load()}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm text-text hover:bg-surface-2"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm text-text hover:bg-surface-hover"
         >
           <RefreshCw className="h-4 w-4" />
           {t("sessions.refresh")}
@@ -107,7 +107,7 @@ export function CodexSessionsPage() {
       {data?.currentProvider && (
         <p className="text-sm text-text-muted">
           {t("sessions.current")}
-          <code className="ml-1 rounded bg-surface-2 px-1.5 py-0.5 text-text">
+          <code className="ml-1 rounded bg-surface-hover px-1.5 py-0.5 text-text">
             {data.currentProvider}
           </code>
         </p>
@@ -131,7 +131,7 @@ export function CodexSessionsPage() {
         </p>
       )}
 
-      {note && <p className="rounded-md bg-surface-2 p-3 text-sm text-text">{note}</p>}
+      {note && <p className="rounded-md bg-surface-hover p-3 text-sm text-text">{note}</p>}
       {error && (
         <p className="rounded-md border border-danger/40 bg-danger/8 p-3 text-sm text-text">
           {t("sessions.loadFailed")}: {error}
@@ -139,7 +139,7 @@ export function CodexSessionsPage() {
       )}
 
       {picked.size > 0 && (
-        <div className="flex items-center gap-3 rounded-md border border-border bg-surface-2 p-3">
+        <div className="flex items-center gap-3 rounded-md border border-border bg-surface-hover p-3">
           <span className="text-sm text-text">
             {t("sessions.selected", { n: picked.size })}
           </span>
@@ -187,7 +187,7 @@ export function CodexSessionsPage() {
       ) : (
         <div className="overflow-x-auto rounded-md border border-border">
           <table className="w-full text-sm">
-            <thead className="bg-surface-2 text-left text-text-muted">
+            <thead className="bg-surface-hover/60 text-left text-text-muted">
               <tr>
                 <th className="w-8 px-3 py-2" />
                 <th className="px-3 py-2">{t("sessions.colTime")}</th>
@@ -239,7 +239,7 @@ export function CodexSessionsPage() {
                         type="button"
                         onClick={() => void doExport(r)}
                         title={t("sessions.export")}
-                        className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-text hover:bg-surface-2"
+                        className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-text hover:bg-surface-hover"
                       >
                         <Download className="h-3.5 w-3.5" />
                         {t("sessions.export")}
