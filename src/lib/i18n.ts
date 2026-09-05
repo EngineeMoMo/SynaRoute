@@ -7,7 +7,7 @@ import { brandPickerEn, brandPickerZh } from "./i18n.brandPicker";
 import { vendorEn, vendorZh } from "./i18n.vendor";
 import { fieldsEn, fieldsZh } from "./i18n.fields";
 import { mappingEn, mappingZh } from "./i18n.mapping";
-import { brainRunEn, brainRunZh } from "./i18n.brain";
+import { brainRunEn, brainRunZh } from "./i18n.brain"; import { sessionsEn, sessionsZh } from "./i18n.sessions";
 
 export type Lang = "zh" | "en";
 
@@ -78,11 +78,11 @@ const zh: Dict = {
   "balance.url": "请求地址",
   "balance.urlAutoPlaceholder": "留空 = 按接口地址自动识别端点",
   "balance.urlHint":
-    "留空即按本 Key 的接口地址**自动识别**余额端点（DeepSeek / SiliconFlow / OpenRouter / StepFun / Novita / GLM / Kimi / 官方 Anthropic 已内置；认不出的按中转站通用端点试）。自动识别不对时再手填。占位符：{{baseUrl}} 本 Key 的接口地址（含路径）、{{origin}} 只取域名（剥掉路径）、{{apiKey}} 密钥。余额端点在域名根下、而接口地址带路径后缀时（如 DeepSeek 的 /anthropic），要用 {{origin}}。",
+    "留空即按本 Key 的接口地址「自动识别」余额端点（DeepSeek / SiliconFlow / OpenRouter / StepFun / Novita / GLM / Kimi / 官方 Anthropic 已内置；认不出的按中转站通用端点试）。自动识别不对时再手填。占位符：{{baseUrl}} 本 Key 的接口地址（含路径）、{{origin}} 只取域名（剥掉路径）、{{apiKey}} 密钥。余额端点在域名根下、而接口地址带路径后缀时（如 DeepSeek 的 /anthropic），要用 {{origin}}。",
   "balance.accessToken": "Access Token",
   "balance.userId": "用户 ID",
   "balance.accessTokenHint":
-    "NewAPI 类面板的用量接口认的是**面板登录态**，不是转发用的 API 密钥。在面板的「个人设置」里生成 Access Token，用户 ID 也在那里。",
+    "NewAPI 类面板的用量接口认的是「面板登录态」，不是转发用的 API 密钥。在面板的「个人设置」里生成 Access Token，用户 ID 也在那里。",
   "balance.ofTotal": "共 {total} {unit}",
   // Key 卡片余额行（第④批）
   "balance.cardLabel": "余额",
@@ -300,12 +300,12 @@ const zh: Dict = {
   "category.empty": "还没有配置任何 Key",
   "category.addFirst": "添加第一个 Key",
   "category.activeModel": "当前模型",
-  "category.activeModelHint": "此处选的是**兜底**模型：Codex 自己菜单里选的可服务模型优先（SynaRoute 已把清单写进它的模型目录），仅在客户端没选或选了不可服务的名字时才用这里的值；新会话生效",
+  "category.activeModelHint": "此处选的是「兜底」模型：Codex 自己菜单里选的可服务模型优先（SynaRoute 已把清单写进它的模型目录），仅在客户端没选或选了不可服务的名字时才用这里的值；新会话生效",
   "category.codexCurrentModel": "Codex 实际在用", // 只读回显它的 config.toml；来由见 codex_catalog::current_config_model
   "category.activeModelAuto": "跟随客户端（透传）",
   "category.activeModelEmpty": "先添加并启用 Key 才有可选模型",
   "category.effortTitle": "推理强度",
-  "category.effortHint": "此处是**兜底**档位：SynaRoute 已把档位写进 Codex 的模型目录，Codex 自己下发档位时以它为准；仅在客户端没下发时才注入这里的值（Claude→思考预算 / OpenAI 系→reasoning_effort）。选“关”则不注入。",
+  "category.effortHint": "此处是「兜底」档位：SynaRoute 已把档位写进 Codex 的模型目录，Codex 自己下发档位时以它为准；仅在客户端没下发时才注入这里的值（Claude→思考预算 / OpenAI 系→reasoning_effort）。选“关”则不注入。",
   "category.effort.off": "关",
   "category.effort.low": "低",
   "category.effort.medium": "中",
@@ -413,7 +413,7 @@ const zh: Dict = {
     "同时最多向几个成员发起请求。成员数超过这个值不会被丢掉，而是排队分批跑——调小可减轻上游限流，代价是整轮更慢。",
   "brain.memberModelTip": "该成员用这个模型作答。改完记得点页面底部的「保存配置」，否则不生效。",
   "brain.memberHealthTip":
-    "这条 Key 的健康探测结果。探测为不可用**不会**让整轮聚合失败——只是这个成员可能拿不到结果，其余成员照常作答。",
+    "这条 Key 的健康探测结果。探测为不可用「不会」让整轮聚合失败——只是这个成员可能拿不到结果，其余成员照常作答。",
   "brain.memberRemoveTip": "从参与成员中移除（不会删除这条 Key）。",
   "brain.totalTimeout": "整轮总预算 (ms)",
   "brain.totalTimeoutHint":
@@ -484,7 +484,7 @@ const zh: Dict = {
   ...brandPickerZh,
   ...fieldsZh,
   ...mappingZh,
-  ...brainRunZh,
+  ...brainRunZh, ...sessionsZh,
   "logs.empty": "暂无事件",
   "logs.searchPlaceholder": "搜索日志（Key 名、模型、错误…）",
   "logs.noMatch": "没有匹配「{q}」的日志",
@@ -775,11 +775,11 @@ const en: Dict = {
   "balance.url": "Request URL",
   "balance.urlAutoPlaceholder": "Leave empty to auto-detect from the base URL",
   "balance.urlHint":
-    "Leave empty to **auto-detect** the balance endpoint from this key's base URL (DeepSeek / SiliconFlow / OpenRouter / StepFun / Novita / GLM / Kimi / official Anthropic are built in; unknown hosts fall back to the common relay endpoint). Fill it in manually only when auto-detection gets it wrong. Placeholders: {{baseUrl}} this key's base URL (path included), {{origin}} scheme+host only (path stripped), {{apiKey}} the secret. Use {{origin}} when the balance endpoint sits at the domain root but the base URL carries a path suffix (e.g. DeepSeek's /anthropic).",
+    "Leave empty to auto-detect the balance endpoint from this key's base URL (DeepSeek / SiliconFlow / OpenRouter / StepFun / Novita / GLM / Kimi / official Anthropic are built in; unknown hosts fall back to the common relay endpoint). Fill it in manually only when auto-detection gets it wrong. Placeholders: {{baseUrl}} this key's base URL (path included), {{origin}} scheme+host only (path stripped), {{apiKey}} the secret. Use {{origin}} when the balance endpoint sits at the domain root but the base URL carries a path suffix (e.g. DeepSeek's /anthropic).",
   "balance.accessToken": "Access Token",
   "balance.userId": "User ID",
   "balance.accessTokenHint":
-    "NewAPI-style panels authenticate the usage endpoint with the **panel session**, not the forwarding API key. Generate an Access Token in the panel's personal settings; the User ID is there too.",
+    "NewAPI-style panels authenticate the usage endpoint with the panel session, not the forwarding API key. Generate an Access Token in the panel's personal settings; the User ID is there too.",
   "balance.ofTotal": "of {total} {unit}",
   // Key card balance row (batch ④)
   "balance.cardLabel": "Balance",
@@ -994,12 +994,12 @@ const en: Dict = {
   "category.empty": "No keys configured yet",
   "category.addFirst": "Add your first key",
   "category.activeModel": "Active model",
-  "category.activeModelHint": "This is the **fallback** model: a serviceable model picked in Codex own menu wins (SynaRoute writes its model catalog); this value is used only when the client sends none or an unserviceable one. Effective on the next session.",
+  "category.activeModelHint": "This is the fallback model: a serviceable model picked in Codex own menu wins (SynaRoute writes its model catalog); this value is used only when the client sends none or an unserviceable one. Effective on the next session.",
   "category.codexCurrentModel": "Codex is using",
   "category.activeModelAuto": "Follow client (passthrough)",
   "category.activeModelEmpty": "Add and enable a key first to get selectable models",
   "category.effortTitle": "Reasoning effort",
-  "category.effortHint": "This is the **fallback** level: SynaRoute writes the levels into Codex model catalog, so a level sent by the client wins; this value is injected only when the client sends none (maps to Anthropic thinking / Chat reasoning_effort). Off = don't inject.",
+  "category.effortHint": "This is the fallback level: SynaRoute writes the levels into Codex model catalog, so a level sent by the client wins; this value is injected only when the client sends none (maps to Anthropic thinking / Chat reasoning_effort). Off = don't inject.",
   "category.effort.off": "Off",
   "category.effort.low": "Low",
   "category.effort.medium": "Medium",
@@ -1102,7 +1102,7 @@ const en: Dict = {
   "brain.memberModelTip":
     "The model this member answers with. Remember to press Save config at the bottom of the page, or the change won't take effect.",
   "brain.memberHealthTip":
-    "Health-probe result for this key. A failed probe does **not** fail the round — that member may simply return nothing while the others answer normally.",
+    "Health-probe result for this key. A failed probe does not fail the round — that member may simply return nothing while the others answer normally.",
   "brain.memberRemoveTip": "Remove from members (does not delete the key itself).",
   "brain.totalTimeout": "Whole-round budget (ms)",
   "brain.totalTimeoutHint":
@@ -1173,7 +1173,7 @@ const en: Dict = {
   ...brandPickerEn,
   ...fieldsEn,
   ...mappingEn,
-  ...brainRunEn,
+  ...brainRunEn, ...sessionsEn,
   "logs.empty": "No events yet",
   "logs.searchPlaceholder": "Search logs (key, model, error…)",
   "logs.noMatch": "No logs match “{q}”",

@@ -13,12 +13,21 @@ import {
   Building2,
   UserRound,
   Gauge,
+  History,
   Waypoints,
   Search,
   type LucideIcon,
 } from "lucide-react";
 
-export type NavKey = CategoryType | "brain" | "logs" | "usage" | "vendors" | "settings" | "about";
+export type NavKey =
+  | CategoryType
+  | "brain"
+  | "sessions"
+  | "logs"
+  | "usage"
+  | "vendors"
+  | "settings"
+  | "about";
 
 interface NavItem {
   key: NavKey;
@@ -32,6 +41,8 @@ const NAV: NavItem[] = [
   { key: "claude-desktop", tKey: "nav.claude-desktop", icon: MonitorSmartphone, group: "category" },
   { key: "codex", tKey: "nav.codex", icon: Code2, group: "category" },
   { key: "brain", tKey: "nav.brain", icon: Brain, group: "feature" },
+  // Codex 专属：本地历史对话（每条自带 provider，与当前不一致时打开会走错上游）
+  { key: "sessions", tKey: "nav.sessions", icon: History, group: "feature" },
   { key: "logs", tKey: "nav.logs", icon: ScrollText, group: "feature" },
   { key: "usage", tKey: "nav.usage", icon: Gauge, group: "feature" },
   { key: "vendors", tKey: "nav.vendors", icon: Building2, group: "system" },

@@ -1984,6 +1984,57 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   `npm test` **184 passed / 26 文件**、clippy 干净、`tsc --noEmit` 干净、
   `npm run gates` 全绿、**零棘轮抬高**（5 项下调）。
 
+- **Codex 会话管理页已实现（2026-09-04，第二批）**：v0.1.56 只发了第一批（接入时自动同步
+  provider，**零 UI**），用户升级后反馈「没看到会话管理的功能和菜单」—— 那是对的，菜单在这一批。
+  侧边栏「能力」组新增 **Codex 会话**（`nav.sessions`），页面
+  [`CodexSessionsPage.tsx`](src/pages/CodexSessionsPage.tsx) + 后端
+  [`codex_session_ops.rs`](src-tauri/src/tools/codex_session_ops.rs)（挂 `codex_sessions` 下 ——
+  它需要父模块的私有 `resolve_in_home`/`session_db_paths`，而 Rust 子模块看得见父模块私有项）。
+  <br>**页面的主要理由是「会话记的 provider」那一列**：与当前生效的不一致时标红 + 顶部横幅说明
+  「打开它们会走那个上游，若是官方 openai 就会用占位凭据换回 401」。接入时后端已自动同步，
+  所以这页多数时候应该全绿 —— 它存在的价值是**当自动同步没做完时给出解释**（Codex 当时开着、
+  文件被独占）。
+  <br>🔴 **导出刻意只带对话正文**，三样东西绝不进导出文件：`developer` 消息（Desktop 注入的
+  app-context，几十 KB）、`function_call_output`（可能是整个文件内容）、
+  `reasoning.encrypted_content`（密文）。工具调用只留一行名字 —— `arguments` 里常是本机绝对
+  路径和整段命令。导出的 Markdown 是**用户会分享出去的东西**，有一条判据逐项断言这几样不出现。
+  <br>🔴 **删除三处一起删，且先删索引、后删文件**：先删文件中途失败 → 索引里留下一条指向不存在
+  路径的记录，Desktop 列表里就是**点开即报错的死条目**；先删索引中途失败 → 只剩一个不再被引用
+  的文件，下次删除重新扫到，**可自愈**。两种中途失败的代价不对称，顺序不是随手定的。
+  删除走确认框、文案明说不可逆（这是本应用唯一会主动删用户对话记录的地方）。
+  <br>**4 条测试**，含一条**接线判据**（三个命令必须在 `generate_handler!` 里 —— 策略门
+  `invoke-command-must-exist` 只查正向，写了命令没注册只在用户点按钮时才炸）。
+  <br>🔴 **顺手修出一条既有缺陷：i18n 词条值里的 Markdown 会把星号原样显示给用户。**
+  应用侧的词条是**纯文本渲染**（全仓无 markdown 渲染器、`dangerouslySetInnerHTML` 0 处），
+  所以 `**此操作不可逆**` 在界面上就是带星号的。我自己先踩到（删除确认框），一查 `i18n.ts`
+  里还有 **10 处**存量（余额提示、兜底模型/档位 hint、健康探测说明等），一直这么显示着。
+  已全部改成「」（中文）/ 去掉星号（英文），并在 `i18n.test.ts` 补了一条判据 ——
+  官网侧那条同名策略门（`no-markdown-in-i18n-values`）**只扫 `site/`**，应用侧这条缝此前没人管。
+  <br>**零棘轮抬高**：`lib.rs` 三个命令写一行 + 把 `usage_commands` 两行并一行抵掉；
+  `i18n.ts` 新分片的 import 与 `i18n.brain` 那行挤一行（同 `codex.rs` 里 `#[path]` 的做法）。
+  新文件 `codex_session_ops.rs` 生产段 **266/900**。
+  <br>**当前基线**：`cargo test --lib` **1153 passed / 0 failed / 7 ignored**（连跑 2 次）、
+  `npm test` **185 passed / 26 文件**、clippy 干净、`tsc --noEmit` 干净、`npm run gates` 全绿。
+  浏览器预览已验证：菜单项、标红那一列、警告横幅、勾选 → 删除确认框（文案无星号）、导出按钮。
+  <br>📌 **仍未真机验证**：真实 `$CODEX_HOME` 下的列表是否完整（本机只有 4 条会话）、
+  删除后重启 Codex 列表里是否没有死条目、导出的 Markdown 在真实长会话上的可读性。
+
+  <br>🔴 **发版前的代码审查又修出 3 条（2026-09-04，v0.1.57）**：
+  <br>**① 导出走 blob 下载 —— 真机行为未验证。** 第一版让后端返回 Markdown 文本、前端用
+  `<a download>` + `URL.createObjectURL` 存盘。那依赖 WebView2 的下载行为，而**失败形态是
+  「点了什么都不发生」**；我在浏览器预览里测得通，但那证明不了 Tauri 里可以。已改为**后端
+  直接写进 `<data_dir>/exports/` 并返回完整路径**，前端只负责显示路径 —— 真机必然可靠、
+  受 `SYNAROUTE_DATA_DIR` 隔离、路径可回显。也不用 dialog 插件（要新增命令与权限配置）。
+  <br>**② `DELETE FROM threads` 没查表在不在。** `session_db_paths` 只按扩展名筛文件，
+  `~/.codex/sqlite/` 下将来可能有别的库 → DELETE 报 `no such table` → 一次**成功的删除**
+  附带一句无意义的错误消息，用户以为没删干净。已加 `sqlite_master` 检查（同
+  `set_threads_provider` 里那道），并补一条回归测试。
+  <br>**③ 手写 `.replace("{n}", …)` 而不用 `t()` 的插值能力**（5 处）。`translate` 本来就支持
+  `t(key, { n })`，自己再实现一遍是第二份事实来源 —— 两处实现必然漂移。已全部改掉。
+  <br>**当前基线**：`cargo test --lib` **1154 passed / 0 failed / 7 ignored**、
+  `npm test` **185 passed / 26 文件**、clippy 干净、`tsc --noEmit` 干净、`npm run gates` 全绿、
+  零棘轮抬高。浏览器预览复验：插值不再露 `{n}`、导出提示显示落盘路径。
+
 - **刻意不修的项**（别当成遗漏重复劳动）：SmartScreen 签名告警、`retrieval.rs` 的 `cwd` 白名单、
   请求日志存明文对话（默认关闭）
 

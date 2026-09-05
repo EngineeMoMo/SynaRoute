@@ -10,6 +10,7 @@ import type {
   CcSwitchImportReport,
   CcSwitchScanResult,
   CodegraphState,
+  CodexSessionList,
   DailyUsageBucket,
   DesktopModelNameReport,
   EventLogEntry,
@@ -238,6 +239,26 @@ export const api = {
    */
   getCodexConfigModel: () =>
     call<string | null>("get_codex_config_model", undefined, () => mockBridge.getCodexConfigModel()),
+
+  /** Codex 本地会话列表（会话管理页）。只读每个 rollout 的首行，几百条也很快。 */
+  listCodexSessions: () =>
+    call<CodexSessionList>("list_codex_sessions", undefined, () => mockBridge.listCodexSessions()),
+
+  /**
+   * 删除选中的会话。**不可逆**，调用方必须先弹确认。
+   *
+   * 部分成功时后端返回 Err 并列出没删掉的那些 —— 只报一个成功数字会让用户以为全删了。
+   */
+  deleteCodexSessions: (relPaths: string[]) =>
+    call<string>("delete_codex_sessions", { relPaths }, () =>
+      mockBridge.deleteCodexSessions(relPaths),
+    ),
+
+  /** 导出一条会话为 Markdown 文本（存盘由调用方做）。 */
+  exportCodexSessionMarkdown: (relPath: string) =>
+    call<string>("export_codex_session_markdown", { relPath }, () =>
+      mockBridge.exportCodexSessionMarkdown(relPath),
+    ),
 
   /** 按「分类 × Key」聚合的 token 用量（用量统计面板）。 */
   getTokenUsage: () =>

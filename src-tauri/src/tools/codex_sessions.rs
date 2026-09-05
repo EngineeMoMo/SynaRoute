@@ -56,6 +56,7 @@ const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 /// `is_dir()` / `is_file()` 双false、直接落进 `_` 被跳过，那种环压根形成不了。
 /// （这条原先写的是「防链接环」，代码审查时按 std 文档核出来是错的。）
 const MAX_DEPTH: usize = 6;
+#[path = "codex_session_ops.rs"] pub(crate) mod ops;
 
 /// 每个 sqlite 库保留几份写前备份。3 份足够回退一次误操作，而不至于让频繁启停把
 /// 备份目录堆成无界增长（每份约 0.5 MB）。
@@ -72,7 +73,7 @@ const _: () = assert!(SQL_CHUNK < 999, "3.32 之前的 SQLite 绑定参数上限
 /// 一条会话的首行元数据。**只从 rollout 首行读**，不碰正文。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(in crate::tools) struct SessionRef {
+pub(crate) struct SessionRef {
     /// 相对 `$CODEX_HOME` 的路径。清单里存的也是它 —— 存绝对路径会在换机器或改
     /// `CODEX_HOME` 之后认领到别人的文件上去。
     pub rel_path: String,

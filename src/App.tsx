@@ -4,6 +4,7 @@ import { Sidebar, type NavKey } from "@/components/Sidebar";
 import { CategoryPage } from "@/pages/CategoryPage";
 import { BrainPage } from "@/pages/BrainPage";
 import { LogsPage } from "@/pages/LogsPage";
+import { CodexSessionsPage } from "@/pages/CodexSessionsPage";
 import { UsagePage } from "@/pages/UsagePage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { AboutPage } from "@/pages/AboutPage";
@@ -175,6 +176,7 @@ export default function App() {
 
   const renderMain = () => {
     if (nav === "brain") return <BrainPage />;
+    if (nav === "sessions") return <CodexSessionsPage />;
     if (nav === "logs") return <LogsPage />;
     if (nav === "usage") return <UsagePage />;
     if (nav === "vendors") return <VendorPage />;

@@ -63,7 +63,7 @@ use std::path::{Path, PathBuf};
 
 #[path = "codex_paths.rs"] mod codex_paths;
 #[path = "codex_catalog.rs"] pub(crate) mod codex_catalog;
-#[path = "codex_sessions.rs"] pub(in crate::tools) mod codex_sessions;
+#[path = "codex_sessions.rs"] pub(crate) mod codex_sessions;
 pub(crate) use codex_catalog::select_model; // 应用内选 Codex 模型；两个调用点在 lib.rs
 
 use super::{

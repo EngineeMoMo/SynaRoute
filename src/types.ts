@@ -744,3 +744,32 @@ export interface MasterPasswordState {
   /** 是否锁着（主口令模式但本次进程还没解锁）。DPAPI 模式恒 false */
   locked: boolean;
 }
+
+/**
+ * Codex 会话管理页的一行。字段与 Rust 侧 `codex_sessions::SessionRef` 一一对应。
+ *
+ * `provider` 是这条会话**自己记着**的那个（rollout 首行的 `session_meta.model_provider`），
+ * 它会覆盖 `config.toml` 的根 provider —— 与 `currentProvider` 不一致的行就是「打开会 401」
+ * 的那些。这一列是这个页面存在的主要理由。
+ */
+export interface CodexSessionRow {
+  /** 相对 `$CODEX_HOME` 的路径，用 `/` 分隔。删除与导出都拿它当句柄 */
+  relPath: string;
+  threadId: string;
+  provider: string;
+  archived: boolean;
+  cwd: string;
+  timestamp: string;
+  bytes: number;
+}
+
+/** 会话列表的一次快照。 */
+export interface CodexSessionList {
+  rows: CodexSessionRow[];
+  /** `config.toml` 里当前生效的根 provider；空串 = 读不出来（此时不标红任何行） */
+  currentProvider: string;
+  /** 首行认不出的文件数（Codex 换过 rollout 格式时该让用户看到这个数字） */
+  unreadable: number;
+  /** 路径无法安全定位的文件数（与上一条成因不同，故分开） */
+  pathRejected: number;
+}

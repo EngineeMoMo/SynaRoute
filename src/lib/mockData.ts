@@ -744,6 +744,57 @@ export const mockBridge = {
     await delay();
     return null;
   },
+  /**
+   * 演示模式的会话列表：给三条，其中一条**记着 openai**，好让「与当前 provider 不一致
+   * 就标红」这条规则在浏览器预览里看得见 —— 它是这个页面的主要卖点，不能只在真机可见。
+   */
+  async listCodexSessions() {
+    await delay();
+    return {
+      rows: [
+        {
+          relPath: "sessions/2026/09/03/rollout-2026-09-03T10-12-00-demo1.jsonl",
+          threadId: "demo1",
+          provider: "synaroute",
+          archived: false,
+          cwd: "C:/work/demo",
+          timestamp: "2026-09-03T10:12:00.000Z",
+          bytes: 182_343,
+        },
+        {
+          relPath: "sessions/2026/09/01/rollout-2026-09-01T21-06-47-demo2.jsonl",
+          threadId: "demo2",
+          provider: "openai",
+          archived: false,
+          cwd: "C:/work/legacy",
+          timestamp: "2026-09-01T21:06:47.000Z",
+          bytes: 52_879,
+        },
+        {
+          relPath: "archived_sessions/2026/08/28/rollout-2026-08-28T09-00-00-demo3.jsonl",
+          threadId: "demo3",
+          provider: "synaroute",
+          archived: true,
+          cwd: "C:/work/old",
+          timestamp: "2026-08-28T09:00:00.000Z",
+          bytes: 697_060,
+        },
+      ],
+      currentProvider: "synaroute",
+      unreadable: 0,
+      pathRejected: 0,
+    };
+  },
+  async deleteCodexSessions(relPaths: string[]): Promise<string> {
+    await delay();
+    return `已删除 ${relPaths.length} 个会话（演示模式，未真的动文件）`;
+  },
+  async exportCodexSessionMarkdown(relPath: string): Promise<string> {
+    await delay();
+    // 真机是后端落盘后返回路径，这里给一个同形态的假路径（演示模式不写任何文件）。
+    const stem = relPath.split("/").pop()?.replace(/\.jsonl$/, "") ?? "session";
+    return `C:\\Users\\demo\\AppData\\Roaming\\SynaRoute\\exports\\${stem}.md`;
+  },
   async regenerateLanToken(): Promise<string> {
     await delay();
     settings.lanExposure = true;

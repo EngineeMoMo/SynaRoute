@@ -15,6 +15,8 @@ import { vendorEn, vendorZh } from "@/lib/i18n.vendor";
 import { fieldsEn, fieldsZh } from "@/lib/i18n.fields";
 import { mappingEn, mappingZh } from "@/lib/i18n.mapping";
 import { brainRunEn, brainRunZh } from "@/lib/i18n.brain";
+import sessionsSource from "./i18n.sessions.ts?raw";
+import { sessionsEn, sessionsZh } from "@/lib/i18n.sessions";
 
 /**
  * i18n 的结构性判据。**这些浏览器里看不出来**（缺翻译只是显示成另一种语言或原始 key，
@@ -51,6 +53,7 @@ const SOURCES: { name: string; src: string }[] = [
   { name: "i18n.fields.ts", src: i18nFieldsSource },
   { name: "i18n.mapping.ts", src: i18nMappingSource },
   { name: "i18n.brain.ts", src: i18nBrainSource },
+  { name: "i18n.sessions.ts", src: sessionsSource },
 ];
 
 /** 各分片导出的运行时字典，用于校验「分片真的被展开进主词典了」。 */
@@ -61,6 +64,7 @@ const CHUNKS: { name: string; zh: Record<string, string>; en: Record<string, str
   { name: "fields", zh: fieldsZh, en: fieldsEn },
   { name: "mapping", zh: mappingZh, en: mappingEn },
   { name: "brainRun", zh: brainRunZh, en: brainRunEn },
+  { name: "sessions", zh: sessionsZh, en: sessionsEn },
 ];
 
 /**
@@ -137,5 +141,27 @@ describe("i18n 结构判据", () => {
     expect(translate("en", "common.save")).toBeTruthy();
     // 未知键回退到 key 本身而非空串（空串会让按钮变成一个看不见的方块）
     expect(translate("en", "definitely.missing.key")).toBe("definitely.missing.key");
+  });
+
+  /**
+   * 词条值里不许出现 Markdown 语法。
+   *
+   * 界面把词条当**纯文本**渲染（全仓没有任何地方对它跑 markdown），所以 `**x**` 会把星号
+   * 原样显示给用户。本轮真踩到过：会话页的删除确认框显示成「**此操作不可逆**」，
+   * 而它恰恰是最需要用户认真读的那句话。
+   *
+   * 官网侧有一条同名策略门（`no-markdown-in-i18n-values`），但它只扫 `site/` 的文案 ——
+   * 应用侧这条缝此前没人管。剥注释再扫：这些文件的注释里大量使用 `**强调**`。
+   */
+  it("词条值里不含 Markdown 语法（界面按纯文本渲染）", () => {
+    for (const s of SOURCES) {
+      const code = s.src
+        .replace(/\/\*[\s\S]*?\*\//g, "") // 块注释
+        .split("\n")
+        .filter((l) => !/^\s*(\/\/|\*)/.test(l)) // 行注释与块注释续行
+        .join("\n");
+      const hits = [...code.matchAll(/\*\*|\[[^\]\n]*\]\(/g)].map((m) => m[0]);
+      expect(hits, `${s.name} 的词条值里有 Markdown 语法（会把符号原样显示给用户）`).toEqual([]);
+    }
   });
 });
