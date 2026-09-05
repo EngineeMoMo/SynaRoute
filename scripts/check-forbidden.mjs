@@ -215,8 +215,13 @@ const pass = (name, detail) => console.log(`✅ ${name}${detail ? ` —— ${det
   //   - 而 `x-synaroute-version` 响应头取自 CARGO_PKG_VERSION，即 Cargo.toml。
   // 两处一旦漂移，exe 属性页与响应头会给出两个不同的版本，且**不会有任何报错**。
   //
-  // 刻意**不**查 Cargo.lock：cargo 每次构建会自己把它对齐，
-  // 收进来只会让「刚 bump 完还没构建」这个正常中间态变红，是纯摩擦。
+  // 🔴 **Cargo.lock 必须查**（2026-09-04 推翻了原先「刻意不查」那条）：macOS check 跑的是
+  // `cargo check --locked`，而 --locked 下 lock 与 Cargo.toml 不一致会直接 exit 101
+  // （`cannot update the lock file ... because --locked was passed`）。本机不带 --locked、
+  // cargo 会顺手对齐它，所以这个缝**只在 CI 上现形**：v0.1.58 就是这么红的 ——
+  // bump 完先 commit、再跑 cargo，lock 的改动落在了 tag 之后。
+  // 原注释说「刚 bump 完还没构建是正常中间态」—— 那个中间态一旦被提交就是 CI 红，
+  // 所以门在这里红是对的，它给的提示就是「先跑一次 cargo build 再提交」。
   const readVersions = () => {
     const json = (p) => JSON.parse(readFileSync(p, "utf8"));
     const cargoToml = () => {
@@ -236,16 +241,25 @@ const pass = (name, detail) => console.log(`✅ ${name}${detail ? ` —— ${det
       }
       return undefined;
     };
+    // Cargo.lock 里 synaroute 自己那条 [[package]] 的 version。
+    const cargoLock = () => {
+      const text = readFileSync("src-tauri/Cargo.lock", "utf8");
+      const at = text.indexOf('name = "synaroute"');
+      if (at < 0) return undefined;
+      const m = /^version = "([^"]+)"/m.exec(text.slice(at));
+      return m ? m[1] : undefined;
+    };
     return [
       ["package.json", ".version", () => json("package.json").version],
       ["package-lock.json", ".version", () => json("package-lock.json").version],
       ["package-lock.json", '.packages[""].version', () => json("package-lock.json").packages[""].version],
       ["src-tauri/tauri.conf.json", ".version", () => json("src-tauri/tauri.conf.json").version],
       ["src-tauri/Cargo.toml", "[package] version", cargoToml],
+      ["src-tauri/Cargo.lock", "[[package]] synaroute version", cargoLock],
     ];
   };
 
-  const EXPECTED_FIELDS = 5;
+  const EXPECTED_FIELDS = 6;
   const found = [];
   const unreadable = [];
   for (const [file, field, read] of readVersions()) {
