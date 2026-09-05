@@ -37,7 +37,7 @@ export const sessionsZh: Dict = {
   "sessions.confirmOk": "确认删除",
   "sessions.cancel": "取消",
   "sessions.mismatchHint":
-    "有 {n} 条会话指向别的 provider。它们在 Codex 里打开会走那个上游 —— 若那是官方 openai，就会用占位凭据换来 401。点「启动」重新接入一次即可把它们指向 SynaRoute。",
+    "有 {n} 条会话指向别的 provider。它们在 Codex 里打开会走那个上游 —— 若那是官方 openai，就会用占位凭据换来 401。重新接入一次即可把它们指向 SynaRoute（代理正在运行时，先「停止」再「启动」）。",
   "sessions.unreadable": "{n} 个文件的首行无法解析（Codex 可能改过 rollout 格式），已跳过",
   "sessions.pathRejected": "{n} 个文件的路径无法安全定位，已跳过",
   "sessions.loadFailed": "读取会话列表失败",
@@ -72,7 +72,7 @@ export const sessionsEn: Dict = {
   "sessions.confirmOk": "Delete",
   "sessions.cancel": "Cancel",
   "sessions.mismatchHint":
-    "{n} session(s) point at a different provider. Opening them in Codex routes to that upstream — if it is the official openai, the placeholder credential comes back as a 401. Click Start to re-apply and point them at SynaRoute.",
+    "{n} session(s) point at a different provider. Opening them in Codex routes to that upstream — if it is the official openai, the placeholder credential comes back as a 401. Re-apply to point them at SynaRoute (if the proxy is running, Stop then Start).",
   "sessions.unreadable":
     "{n} file(s) had an unparsable first line (Codex may have changed the rollout format); skipped",
   "sessions.pathRejected": "{n} file(s) could not be safely located; skipped",

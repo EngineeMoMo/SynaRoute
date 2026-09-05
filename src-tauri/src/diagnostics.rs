@@ -179,6 +179,13 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
             let _ = writeln!(r, "- MCP stdio 子进程日志：{}（{} 字节）", p.display(), m.len());
         }
     }
+    // Codex 历史会话的 provider 一致性。**排障 401 的关键信息** —— 每条 thread 自带一个
+    // provider 身份，与 config 的根不一致时打开那条对话会走错上游（用户报过「旧对话每次都
+    // 401、新建正常」）。拿到报告的人此前看不到这个数字，也就看不到那个答案。
+    // 同上面那条 mcp-stdio.log 的取舍：只在真有会话时打，没接入 Codex 的用户不多这行噪音。
+    if let Some(line) = crate::tools::codex::codex_sessions::ops::diagnostics_line() {
+        let _ = writeln!(r, "- {line}");
+    }
     let _ = writeln!(r);
 
     let _ = writeln!(r, "## 代理状态");

@@ -862,12 +862,7 @@ pub(super) fn preview(endpoint: &str) -> AppResult<super::ToolConfigPreview> {
     let state = drift_state(&cfg, &auth, endpoint, believed_applied(&cfg));
     Ok(super::ToolConfigPreview {
         category_id: crate::model::CategoryType::Codex,
-        summary: "Codex：写 ~/.codex/config.toml（model_provider=synaroute、\
-                  [model_providers.synaroute] 含 base_url/wire_api/bearer 占位、可选顶层 model）\
-                  与 ~/.codex/synaroute-model-catalog.json（模型目录，还原时整份删除）。\
-                  auth.json **仅在无可用凭据 / OAuth 已过期时**才写占位并备份原件，\
-                  其余情况原样保留官方 ChatGPT 登录态。不写任何 ANTHROPIC_*。"
-            .into(),
+        summary: codex_sessions::ops::preview_summary().into(),
         mcp_registered: super::is_mcp_registered(crate::model::CategoryType::Codex),
         takeover_warning: drift_warning(&state),
         files: vec![

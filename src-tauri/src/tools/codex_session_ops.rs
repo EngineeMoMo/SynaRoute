@@ -132,9 +132,12 @@ fn remove_from_index(home: &Path, thread_ids: &[String]) {
             id.is_empty() || !thread_ids.iter().any(|t| t == &id)
         })
         .collect();
-    let mut out = kept.join("\n");
+    // 行尾按原文件保留 —— 同 rollout 改写那条纪律（本仓在行尾上栽过三次）。
+    // 本机实测这个文件是 LF，但那是观察不是保证，而归一的收益为零。
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut out = kept.join(eol);
     if !out.is_empty() {
-        out.push('\n');
+        out.push_str(eol);
     }
     let _ = fs::write(&path, out);
 }
@@ -242,6 +245,62 @@ fn collect_text(content: Option<&Value>) -> String {
         .filter_map(|i| i.get("text").and_then(Value::as_str))
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// 工具配置预览面板的整段摘要。
+///
+/// 🔴 **它必须如实列出我们会动的每一类文件。** 那个面板是用户核对「SynaRoute 动了我哪些
+/// 东西」的**唯一**界面，而本轮之前它只提 `config.toml` / 模型目录 / `auth.json` ——
+/// **一个字都没提历史对话**。本仓在同一个地方栽过一次（模型目录上线时漏了），教训原文是
+/// 「预览面板是用户核对的唯一界面，已如实改写并补上那一条 files 条目」。
+///
+/// 整段收在这里而不是留在 `codex.rs`：那个文件生产段顶在 900 行上限，而这段话的主体
+/// （会话那半）属于本模块。同 `codex_catalog::apply_note` / `missing_catalog_warning`
+/// 收在子模块的既有做法。
+///
+/// **`files` 列表刻意不加东西**：rollout 有几百个、列不完；回滚清单与 sqlite 备份落在
+/// **应用数据目录**（不是 Codex 目录），放进「客户端配置文件」那个列表会让用户以为它们是
+/// Codex 的文件。说明写在这段摘要里就够。
+pub(in crate::tools) fn preview_summary() -> &'static str {
+    "Codex：写 ~/.codex/config.toml（model_provider=synaroute、\
+     [model_providers.synaroute] 含 base_url/wire_api/bearer 占位、可选顶层 model）\
+     与 ~/.codex/synaroute-model-catalog.json（模型目录，还原时整份删除）。\
+     auth.json 仅在无可用凭据 / OAuth 已过期时才写占位并备份原件，其余情况原样保留官方 \
+     ChatGPT 登录态。不写任何 ANTHROPIC_*。\
+     另外会改历史对话的 provider：sessions/ 与 archived_sessions/ 下每个 rollout-*.jsonl \
+     的首行 model_provider（只改这一个字段，其余字节逐字不动），以及会话库 threads 表的\
+     同名列；原值记在应用数据目录的 codex-session-providers.json，还原时按它逐条改回，\
+     写库前先备份到 backups/codex-sqlite/。不改任何对话正文。\
+     在会话页手动删除时，会一并删掉 rollout 文件、session_index.jsonl 里那一行与 threads 行。"
+}
+
+/// 给诊断报告用的一行：会话总数与「指向别处」的条数。
+///
+/// 🔴 这是**排障 401 的关键信息**，而它此前不在报告里 —— 用户报「旧对话每次都 401」时，
+/// 拿到报告的人看不出有多少会话指向别的 provider，也就看不到那个答案。
+/// 同 CLAUDE.md 里 `mcp-stdio.log` 那条：「可观测性到不了排障者手上就等于没有」。
+///
+/// 读不出 `$CODEX_HOME` 时返回 `None`（没接入过 Codex 的用户不该在报告里多一行噪音）。
+pub(crate) fn diagnostics_line() -> Option<String> {
+    let home = super::super::codex_paths::codex_home().ok()?;
+    let list = list_at(&home);
+    if list.rows.is_empty() && list.unreadable == 0 {
+        return None;
+    }
+    let bad = list
+        .rows
+        .iter()
+        .filter(|r| !list.current_provider.is_empty() && r.provider != list.current_provider)
+        .count();
+    let mut s = format!(
+        "Codex 会话: {} 条，当前 provider={}，指向别处={bad}",
+        list.rows.len(),
+        if list.current_provider.is_empty() { "(读不出)" } else { &list.current_provider },
+    );
+    if list.unreadable > 0 {
+        s.push_str(&format!("，首行认不出={}", list.unreadable));
+    }
+    Some(s)
 }
 
 /// 会话列表（会话管理页）。
@@ -426,6 +485,49 @@ mod tests {
 
         let (deleted, failed) = delete_at(&home, std::slice::from_ref(&rel));
         assert_eq!((deleted, failed.len()), (1, 0), "无关的库不该产生错误: {failed:?}");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// 🔴 预览摘要必须点名我们会动的每一类文件。那个面板是用户核对「SynaRoute 动了我哪些
+    /// 东西」的**唯一**界面，而本轮之前它一个字都没提历史对话 —— 本仓在同一个地方栽过一次
+    /// （模型目录上线时漏了）。这条按「文件类别」逐项断言，改文案时会强制过一遍清单。
+    #[test]
+    fn the_preview_summary_names_every_kind_of_file_we_touch() {
+        let s = preview_summary();
+        for kind in [
+            "config.toml",
+            "synaroute-model-catalog.json",
+            "auth.json",
+            "rollout-*.jsonl",          // 历史对话首行
+            "archived_sessions",        // 归档目录同样会被改
+            "threads",                  // 会话库那一列
+            "codex-session-providers.json", // 回滚清单
+            "backups/codex-sqlite/",    // 写库前的备份
+            "session_index.jsonl",      // 手动删除时一并清理
+        ] {
+            assert!(s.contains(kind), "预览摘要没提 {kind}：\n{s}");
+        }
+        // 反过来也要说清**不动**什么 —— 用户最担心的是对话内容被改。
+        assert!(s.contains("不改任何对话正文"));
+    }
+
+    /// 诊断报告里那一行：有会话时必须给出「总数 / 当前 provider / 指向别处」三个数字。
+    /// 没接入过 Codex 的机器返回 `None`（不在报告里多一行噪音）。
+    #[test]
+    fn the_diagnostics_line_carries_the_mismatch_count() {
+        let home = tmp_home("diagline");
+        write_full_rollout(&home, "t1"); // 这条记的是 openai
+        fs::write(
+            home.join("config.toml"),
+            "model_provider = \"synaroute\"\n\n[model_providers.synaroute]\nname = \"x\"\n",
+        )
+        .unwrap();
+
+        let list = list_at(&home);
+        assert_eq!(list.current_provider, "synaroute");
+        assert_eq!(list.rows.len(), 1);
+        let bad = list.rows.iter().filter(|r| r.provider != list.current_provider).count();
+        assert_eq!(bad, 1, "那条 openai 的会话就是「指向别处」");
         let _ = fs::remove_dir_all(&home);
     }
 
