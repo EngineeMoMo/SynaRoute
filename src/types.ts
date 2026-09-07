@@ -755,12 +755,56 @@ export interface MasterPasswordState {
 export interface CodexSessionRow {
   /** 相对 `$CODEX_HOME` 的路径，用 `/` 分隔。删除与导出都拿它当句柄 */
   relPath: string;
+  /**
+   * 从**文件名**推导的 thread id（不是首行的 `payload.id`）—— fork 子会话的首行记的是
+   * **父**会话的 id，拿它去删会把父会话从 Codex 列表里删掉。空串 = 推导不出来。
+   */
   threadId: string;
   provider: string;
   archived: boolean;
   cwd: string;
   timestamp: string;
   bytes: number;
+  /** `user` = 用户自己的对话；其它值（`guardian_review` 等）是 Codex 内部派生的 */
+  threadSource: string;
+  /** fork 出来的分支（文件名带两个 UUID） */
+  forked: boolean;
+  /** 展示用标题：会话库的 `name` → `title` → 正文第一条用户消息，取不到就空串 */
+  title: string;
+  model: string;
+  effort: string;
+  tokens: number;
+  /**
+   * 这条对话用的模型，SynaRoute 现在已经服务不了了（Codex 分类下没有任何启用的 Key 认它）。
+   *
+   * **只有代理侧能给这一位** —— 启动器类工具没有 Key 池。它回答的是「provider 那一列是绿的，
+   * 为什么打开还是不对」：用户后来删掉了服务那个模型的 Key，或改了模型映射。
+   * 只在确知时为 true（没记模型名、或压根没有启用的 Key 时一律 false）。
+   */
+  modelUnserviceable: boolean;
+  /**
+   * Desktop 项目侧栏里这条对话归属的项目名。空串 = 未归入任何项目。
+   *
+   * 只读自 `.codex-global-state.json` —— 那是 Electron 的 atom store（装着窗口位置、
+   * prompt 历史等），我们绝不写它。它回答「这条对话为什么不在我的项目侧栏里」，
+   * 而那个问题与 provider 正交，看 provider 那一列永远看不出来。
+   */
+  project: string;
+}
+
+/** 列表页顶部那张统计卡。 */
+export interface CodexSessionStats {
+  total: number;
+  active: number;
+  archived: number;
+  /** provider 与当前生效的根 provider 不一致的条数 */
+  mismatched: number;
+  /** 我们实际读写的会话库；空串 = 一个都没找到 */
+  dbPath: string;
+  /** 会话库里能匹配上的条目数。与 `total` 的差额就是「库里没有记录的会话」 */
+  inDb: number;
+  /** 用的模型现在已经服务不了的条数 */
+  modelGone: number;
 }
 
 /** 会话列表的一次快照。 */
@@ -772,4 +816,70 @@ export interface CodexSessionList {
   unreadable: number;
   /** 路径无法安全定位的文件数（与上一条成因不同，故分开） */
   pathRejected: number;
+  stats: CodexSessionStats;
+}
+
+/** 一个可选的同步目标。`sources` 说明它在哪儿出现过（`config` / `rollout` / `sqlite`）。 */
+export interface CodexProviderTarget {
+  id: string;
+  sources: string[];
+  isCurrent: boolean;
+}
+
+/** 同步目标下拉的数据源。 */
+export interface CodexProviderTargetList {
+  /** `config.toml` 的根 `model_provider`；空串 = 读不出来 */
+  current: string;
+  targets: CodexProviderTarget[];
+  /** 我们接入时会用的那个 id（前端据此标「推荐」） */
+  ours: string;
+  prefs: {
+    /** 关掉「接入时自动同步历史会话」 */
+    autoSyncDisabled: boolean;
+    lastTarget: string;
+  };
+}
+
+/** `session_index.jsonl` 的孤儿审计（只读）。 */
+export interface CodexSessionIndexAudit {
+  total: number;
+  /** 指向已不存在会话的行数 —— 它们在 Codex 列表里是「点开即报错」的死条目 */
+  orphans: number;
+  sample: string[];
+}
+
+/**
+ * 一条「客户端环境变量可能顶掉我们写的配置」的发现。
+ *
+ * 失效形态是**接入提示说成功、请求一个都没到代理**，而用户完全看不出原因 ——
+ * 界面上的一切（config 文件、代理状态）都是对的。判据与 CodexPlusPlus 的差异
+ * 见 `src-tauri/src/tools/env_conflicts.rs` 的模块头。
+ */
+export interface EnvFinding {
+  name: string;
+  /** `process` = 本进程环境里就有；`user` = Windows 用户级（HKCU\Environment） */
+  source: "process" | "user";
+  /** `conflict` = 有依据认为它会顶掉我们写的配置；`notice` = 只在特定前提下才顶事 */
+  severity: "conflict" | "notice";
+  /** 已脱敏的值。凭据类恒为空串（那时看 `hasValue`） */
+  value: string;
+  hasValue: boolean;
+  /** 它会造成什么 —— 不是重复变量名 */
+  note: string;
+  /**
+   * 这一条能不能用「移除」按钮解决。
+   *
+   * 目录变量（`CODEX_HOME` 等）为 false：正确处置是**对齐两侧**，删掉会破坏用户自己配的
+   * Codex 布局。这一位与后端移除的白名单是**同一个**事实来源 —— 前端据它决定要不要显示
+   * 移除按钮，否则会出现「能点、点了没反应」。
+   */
+  removable: boolean;
+}
+
+/** 移除环境变量的结果。`backupPath` 为空 = 什么都没做。 */
+export interface EnvRemovalResult {
+  removed: string[];
+  backupPath: string;
+  failed: string[];
+  note: string;
 }

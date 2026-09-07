@@ -810,10 +810,8 @@ async fn export_diagnostics(
         exe_path: std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "?".into()),
-        proxy: CategoryType::ALL
-            .iter()
-            .map(|c| (*c, state.proxy.is_running(*c), state.proxy.port_of(*c)))
-            .collect(),
+        proxy: CategoryType::ALL.iter().map(|c| (*c, state.proxy.is_running(*c), state.proxy.port_of(*c))).collect(),
+        claude_cli_endpoint: service::expected_endpoint(&state.store, &state.proxy, CategoryType::ClaudeCli),
     };
     let report = diagnostics::build_diagnostics_report(&state.store, &env);
 
@@ -1203,10 +1201,7 @@ pub fn run() {
             let rt = tokio::runtime::Runtime::new().expect("tokio rt");
             rt.block_on(async move {
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        store::USAGE_FLUSH_INTERVAL_SECS,
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_secs(store::USAGE_FLUSH_INTERVAL_SECS)).await;
                     store_bg.flush_usage_if_dirty();
                     // 代理运行态快照（恢复上次启用状态用）。搭这条现成线程而不另起一条：
                     // 本循环已经是「周期性、可容忍延迟、不在请求路径上」的载体。
@@ -1220,6 +1215,8 @@ pub fn run() {
     // 余额闸门的数据源（B4）。线程与节奏都收在模块里；**刻意独立一趟**的三条理由
     // （关掉探测会一起停 / 周期被探测间隔牵着走 / 吃掉那一轮的 timeout 预算）见其文档。
     health::balance_gate::spawn_background(store.clone());
+    // Codex config.toml 的外部改动监听（轮询 mtime）。**同上刻意独立一趟**，理由同源。
+    tools::codex::codex_watch::spawn_background(store.clone());
 
     tauri::Builder::default()
         // 单实例：再次启动时聚焦已有窗口，避免开多个进程（必须最先注册）
@@ -1342,12 +1339,12 @@ pub fn run() {
             list_all_events,
             get_lan_token,
             regenerate_lan_token,
-            usage_commands::get_token_usage, usage_commands::get_usage_since,
-            usage_commands::get_daily_usage,
-            usage_commands::get_usage_with_cost,
+            usage_commands::get_token_usage, usage_commands::get_usage_since, usage_commands::get_daily_usage, usage_commands::get_usage_with_cost,
             usage_commands::get_pricing_table_date,
+            tools::env_conflicts::detect_env_conflicts, tools::env_conflicts::remove_env_conflicts,
             tools::codex::codex_catalog::get_codex_config_model,
             tools::codex::codex_sessions::ops::list_codex_sessions, tools::codex::codex_sessions::ops::delete_codex_sessions, tools::codex::codex_sessions::ops::export_codex_session_markdown,
+            tools::codex::codex_sessions::sync::list_codex_provider_targets, tools::codex::codex_sessions::sync::sync_codex_sessions, tools::codex::codex_sessions::sync::set_codex_session_auto_sync, tools::codex::codex_sessions::sync::audit_codex_session_index, tools::codex::codex_sessions::sync::prune_codex_session_index,
             health::balance_gate::query_key_balance,
             show_main_window_cmd,
             recent_failure,

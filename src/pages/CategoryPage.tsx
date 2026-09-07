@@ -14,6 +14,7 @@ import { useT } from "@/lib/useT";
 import { discoverableModels, keyExpectedSet, routingPrimaryKey } from "@/lib/modelSets";
 import type { EventLogEntry, ProviderKey } from "@/types";
 import { Plus, AlertTriangle, Inbox, X, Database } from "lucide-react";
+import { EnvConflictBanner } from "@/components/EnvConflictBanner";
 
 /** 分类主页：代理状态条 + 模型映射兜底提示 + Key 卡片列表 */
 export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }: {
@@ -241,6 +242,10 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
           <span className="flex-1 leading-relaxed">{takeover}</span>
         </div>
       )}
+
+      {/* 环境变量顶掉我们写的配置：与 takeover 同族（都是「接入完成但不生效」），
+          故紧挨着它。只在真有 conflict 级发现时才渲染，见该组件模块头。 */}
+      <EnvConflictBanner category={activeCategory} />
 
       {/* 最近一次转发失败（UX#11）：客户端只会显示 502/529 之类的状态码，真实原因
           （哪个 Key、鉴权还是限流）此前只藏在运行日志页里，用户得先想到去翻。

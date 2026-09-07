@@ -11,6 +11,10 @@ import type {
   CcSwitchScanResult,
   CodegraphState,
   CodexSessionList,
+  EnvFinding,
+  EnvRemovalResult,
+  CodexProviderTargetList,
+  CodexSessionIndexAudit,
   DailyUsageBucket,
   DesktopModelNameReport,
   EventLogEntry,
@@ -245,8 +249,10 @@ export const api = {
     call<CodexSessionList>("list_codex_sessions", undefined, () => mockBridge.listCodexSessions()),
 
   /**
-   * 删除选中的会话。**不可逆**，调用方必须先弹确认。
+   * 删除选中的会话。调用方必须先弹确认。
    *
+   * 后端会**先把 rollout 备份**到数据目录的 `backups/codex-sessions-deleted/`（保留 30 天），
+   * 备份不成就不删那一条 —— 成功消息里带备份目录，原样展示给用户。
    * 部分成功时后端返回 Err 并列出没删掉的那些 —— 只报一个成功数字会让用户以为全删了。
    */
   deleteCodexSessions: (relPaths: string[]) =>
@@ -258,6 +264,45 @@ export const api = {
   exportCodexSessionMarkdown: (relPath: string) =>
     call<string>("export_codex_session_markdown", { relPath }, () =>
       mockBridge.exportCodexSessionMarkdown(relPath),
+    ),
+
+  /** 同步目标下拉的数据源（config / rollout / sqlite 里出现过的 provider id）。 */
+  listCodexProviderTargets: () =>
+    call<CodexProviderTargetList>("list_codex_provider_targets", undefined, () =>
+      mockBridge.listCodexProviderTargets(),
+    ),
+
+  /**
+   * 手动把历史会话的 provider 同步到 `target`。
+   *
+   * 与接入时的自动同步走**同一段实现**（同一把进程内互斥锁）。存在的理由是：接入那一刻
+   * Codex 可能正开着、文件被独占，而此前唯一的补救是「先停止再启动」整个代理。
+   */
+  syncCodexSessions: (target: string) =>
+    call<string>("sync_codex_sessions", { target }, () => mockBridge.syncCodexSessions(target)),
+  detectEnvConflicts: () =>
+    call<EnvFinding[]>("detect_env_conflicts", undefined, () => mockBridge.detectEnvConflicts()),
+  removeEnvConflicts: (names: string[]) =>
+    call<EnvRemovalResult>("remove_env_conflicts", { names }, () =>
+      mockBridge.removeEnvConflicts(names),
+    ),
+
+  /** 开关「接入时自动同步历史会话」。 */
+  setCodexSessionAutoSync: (enabled: boolean) =>
+    call<void>("set_codex_session_auto_sync", { enabled }, () =>
+      mockBridge.setCodexSessionAutoSync(enabled),
+    ),
+
+  /** 审计 `session_index.jsonl` 里指向已删除会话的死条目（只读）。 */
+  auditCodexSessionIndex: () =>
+    call<CodexSessionIndexAudit>("audit_codex_session_index", undefined, () =>
+      mockBridge.auditCodexSessionIndex(),
+    ),
+
+  /** 清掉那些死条目（清理前整份备份索引）。 */
+  pruneCodexSessionIndex: () =>
+    call<string>("prune_codex_session_index", undefined, () =>
+      mockBridge.pruneCodexSessionIndex(),
     ),
 
   /** 按「分类 × Key」聚合的 token 用量（用量统计面板）。 */

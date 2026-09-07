@@ -68,10 +68,15 @@ const pass = (name, detail) => console.log(`✅ ${name}${detail ? ` —— ${det
   // 刻意**不**查 `C:\Program Files\`：那是标准安装位置，测试里作为夹具出现是合理的，
   // 且生产代码若真需要它也应经 `dirs`/`std::env` 解析（那时不会出现字面量）。
   const RE = /(?:"|'|`|r#?")(?:[A-Za-z]:[\\/]{1,2}Users|\/c\/Users\/|\/mnt\/[a-z]\/Users\/)/;
-  // mockData.ts 是浏览器预览用的演示数据（生产构建被 vite alias 换成空桩，见 CLAUDE.md），
-  // 里面的假路径是**刻意**的展示内容，不是运行时会用到的路径。
-  const SKIP_FILES = new Set(["src/lib/mockData.ts"]);
-  const files = [...RUST, ...TS].filter((f) => !SKIP_FILES.has(f));
+  // mockData 及其**全部分片**是浏览器预览用的演示数据（生产构建被 vite alias 换成空桩，
+  // 见 CLAUDE.md），里面的假路径是**刻意**的展示内容，不是运行时会用到的路径。
+  //
+  // 🔴 **按前缀跳过，不要写死单个文件名。** 第一版只列了 `src/lib/mockData.ts`，于是
+  // 把演示数据拆成分片（`mockData.events.ts` / `mockData.sessions.ts` …）之后，
+  // 同一批假路径又会被报成违规 —— 而拆分片是本仓为了让 mockData 不超行数上限的常规动作。
+  // 同 i18n 分片那条教训：判据要跟着「文件会被拆开」这件事一起设计。
+  const isMockData = (f) => f.startsWith("src/lib/mockData.");
+  const files = [...RUST, ...TS].filter((f) => !isMockData(f));
   const hits = [];
   for (const f of files) {
     for (const { n, text } of sliceLines(readFileSync(f, "utf8"), f)) {

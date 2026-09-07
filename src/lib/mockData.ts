@@ -23,6 +23,12 @@ import type { UserPrefs } from "@/lib/prefs";
 import { mockUsageWithCost } from "./mockData.usage";
 import { MOCK_VENDORS } from "./mockData.vendors";
 import { mockEvents } from "./mockData.events";
+import {
+  mockCodexProviderTargets,
+  mockCodexSessionIndexAudit,
+  mockCodexSessions,
+} from "./mockData.sessions";
+import { MOCK_ENV_FINDINGS, mockEnvRemoval } from "./mockData.env";
 
 const now = Date.now();
 
@@ -750,44 +756,39 @@ export const mockBridge = {
    */
   async listCodexSessions() {
     await delay();
-    return {
-      rows: [
-        {
-          relPath: "sessions/2026/09/03/rollout-2026-09-03T10-12-00-demo1.jsonl",
-          threadId: "demo1",
-          provider: "synaroute",
-          archived: false,
-          cwd: "C:/work/demo",
-          timestamp: "2026-09-03T10:12:00.000Z",
-          bytes: 182_343,
-        },
-        {
-          relPath: "sessions/2026/09/01/rollout-2026-09-01T21-06-47-demo2.jsonl",
-          threadId: "demo2",
-          provider: "openai",
-          archived: false,
-          cwd: "C:/work/legacy",
-          timestamp: "2026-09-01T21:06:47.000Z",
-          bytes: 52_879,
-        },
-        {
-          relPath: "archived_sessions/2026/08/28/rollout-2026-08-28T09-00-00-demo3.jsonl",
-          threadId: "demo3",
-          provider: "synaroute",
-          archived: true,
-          cwd: "C:/work/old",
-          timestamp: "2026-08-28T09:00:00.000Z",
-          bytes: 697_060,
-        },
-      ],
-      currentProvider: "synaroute",
-      unreadable: 0,
-      pathRejected: 0,
-    };
+    return mockCodexSessions();
   },
   async deleteCodexSessions(relPaths: string[]): Promise<string> {
     await delay();
     return `已删除 ${relPaths.length} 个会话（演示模式，未真的动文件）`;
+  },
+  async listCodexProviderTargets() {
+    await delay();
+    return mockCodexProviderTargets();
+  },
+  async syncCodexSessions(target: string): Promise<string> {
+    await delay();
+    return `已把 2 个历史对话指向 ${target}（演示模式，未真的动文件）`;
+  },
+  async setCodexSessionAutoSync(_enabled: boolean): Promise<void> {
+    await delay();
+  },
+  // 三条样本各自的用途写在 `mockData.env.ts` 里（别随手删其中任何一条）。
+  async detectEnvConflicts() {
+    await delay();
+    return MOCK_ENV_FINDINGS;
+  },
+  async removeEnvConflicts(names: string[]) {
+    await delay();
+    return mockEnvRemoval(names);
+  },
+  async auditCodexSessionIndex() {
+    await delay();
+    return mockCodexSessionIndexAudit();
+  },
+  async pruneCodexSessionIndex(): Promise<string> {
+    await delay();
+    return "已清掉 1 条指向已删除会话的索引行（演示模式，未真的动文件）";
   },
   async exportCodexSessionMarkdown(relPath: string): Promise<string> {
     await delay();

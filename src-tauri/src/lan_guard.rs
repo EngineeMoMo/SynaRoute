@@ -636,6 +636,7 @@ mod tests {
             app_version: "0.0.0-test".into(),
             exe_path: "x".into(),
             proxy: vec![],
+            claude_cli_endpoint: String::new(),
         };
         let report = crate::diagnostics::build_diagnostics_report(&store, &env);
         assert!(
@@ -972,6 +973,7 @@ mod tests {
             app_version: "0.0.0-test".into(),
             exe_path: "x".into(),
             proxy: vec![],
+            claude_cli_endpoint: String::new(),
         };
         let report = crate::diagnostics::build_diagnostics_report(&store, &env);
         for t in [&token, &rotated] {

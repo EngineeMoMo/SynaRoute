@@ -1865,11 +1865,27 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
     <br>🔴 **工具并发从「16 路齐发」收成分批 4 路。** `grep` 与 `codegraph_query` 都起子进程，
     在大仓库上单个就吃满 IO —— 一轮放 16 个并发 `rg` 出去，是在**用户自己的开发机**上制造
     资源尖峰，而收益早在前几个就拿到了（模型一轮真正会读的文件通常 2~5 个）。
-    <br>⚠️ **`StreamExt::buffered` 那条路走不通，别再试**：它更精确（滑动窗口而非批屏障），
-    但会把借用了 `calls` 的 future 塞进 `FuturesOrdered`，推导出的 auto-trait bound 不够
-    general —— 实测让**`mcp.rs` 里两处与本改动毫无关系的 `tokio::spawn` 编译失败**
-    （`Send` is not general enough）。改用 `chunks` + `join_all`：批屏障的代价在 4 个一批、
-    正常 1~2 批的量级上可以忽略，让一个无关模块编译不过不行。
+    <br>🔴 **已改成信号量滑动窗口（2026-09-06）。这里原先写「`StreamExt::buffered` 那条路
+    走不通，别再试」—— 那句话是错的，别再引用。**
+    <br>事实部分是对的：`buffered(N)` 会把借用了 `calls` 的 future 塞进 `FuturesOrdered`，
+    那个具体类型参与 auto-trait 推导，实测让**`mcp.rs` 里两处与本改动毫无关系的
+    `tokio::spawn` 编译失败**（`Send` is not general enough）。
+    <br>**错的是从它推出的结论。** 那是 higher-ranked lifetime 推导的已知局限，不是
+    「滑动窗口做不到」—— 而我当时只试了一种手法就把整个目标判成不可达，还把它写成
+    「别再试」。**`Semaphore` + `join_all` 拿到完全一样的语义，且压根不引入 `FuturesOrdered`**，
+    推导问题从源头不存在。一次编译通过，`mcp.rs` 那两处 spawn 毫发无损。
+    <br>现在是真的滑动窗口（谁做完谁立刻让位），批屏障那个代价（一批里最慢的拖住下一批）
+    没有了。顺序仍由 `join_all` 保证（**按入参顺序返回，与完成顺序无关**）——
+    tool_result 与 tool_use 按位置配对，乱序即上游 400。
+    <br>⚠️ **判据也跟着改了，这一点比功能本身值得记**：原判据写死
+    `.chunks(MAX_CONCURRENT_TOOLS)`，于是把实现换成**更好的**那个时它当场变红，
+    而那次改动并没有破坏任何一条它想守的东西。**判据要钉「上限存在」这个性质，
+    不要钉某一种写法** —— 钉手法的判据会在有人改进实现时制造假红，而假红的代价是
+    下一个人把改进撤回去。现在两种手法都接受，并额外钉住「建了信号量必须真的 acquire」
+    （只 new 不 acquire = 上限是个摆设，注入验证过）。
+    <br>**教训**：「实测某个写法编译不过」是观测；「这条路走不通」是**结论**。
+    把前者升级成后者、再写上「别再试」，等于给下一个人立一道不存在的墙。
+    同本仓「带『已核对』字样的注释是更贵的一种过时」那条。
     <br>🔴 **排队耗尽那条错误回显了未 clamp 的原值。** 文案说「并发上限 N 低于成员数…可提高
     『并发上限』」，而用户填 999 时真实上限是 gate 的硬顶 32 —— 那句话告诉他去提高一个
     已经到顶的数字，**提高到任何值都不会有效果**。已收成 `gate::effective_limit`，
@@ -2057,6 +2073,421 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   <br>⚠️ **v0.1.57 那个 tag 是个死 tag**：它指向的提交因 `bg-surface-2` 构建失败，
   Release CI 红、**没有 Release 对象也没有任何资产**（API 查过）。没有删它 —— 那要动远端 tag。
   发布从 **v0.1.58** 起算。
+
+  <br>🔴 **会话管理按 CodexPlusPlus 源码补齐（2026-09-05，用户反馈「你的会话管理太简单了」）**。
+  取证方式是**读它的源码**，不是读 README —— 文件级索引已进会话记忆
+  `gateway-competitor-source-map`（`crates/codex-plus-data/src/provider_sync.rs` 151 KB /
+  `codex-plus-core/src/codex_sqlite.rs` / `session_share.rs` + 那份设计文档），
+  别再重新摸一遍（clone 与 raw 在本机被封，走 contents API）。
+  <br>**读源码当场查出两条我们自己的真缺陷**，都不是「少个功能」而是会出错：
+  <br>🔴 **① fork 子会话的 thread id 取错了 —— 删一个分支会把父会话从 Codex 列表里删掉。**
+  本机 5 个 rollout 里有 2 个是 fork 形态（文件名带**两个** UUID），而它们首行的
+  `payload.id` 记的是**父**会话的 id。我们原先就取那个字段，于是删一个分支会执行
+  `DELETE FROM threads WHERE id = <父id>` 并摘掉父会话的 `session_index.jsonl` 行 ——
+  用户只想删掉一个派生分支，他真正的那条对话从列表里消失了。已改为从**文件名末 36 字符**
+  推导（同它的 `rollout_thread_id_from_filename`），推导不出就留空、sqlite 与索引那两步一律
+  跳过（宁可少做，不能做错）。这也解释了为什么 `threads` 表只有 3 行而磁盘上有 5 个 rollout。
+  <br>🔴 **② 一次接入会把用户所有历史会话文件的 mtime 全部推到现在。** 我们只改首行那一个
+  字段，正文一个字节不动，却没保全 mtime —— 备份工具、文件管理器的「最近修改」排序、任何按
+  mtime 增量同步的东西都会认为几百个文件刚被改过。它的设计文档把这条列为必须
+  （"Continue to preserve file modification time after rewriting"）。已在改写后原样恢复。
+  <br>⚠️ **保全 mtime 让「有没有写过」那条判据当场失效**：原来那条用例正是用 mtime 判
+  「已经是目标 provider 就一个字节都不写」的，而现在两者在 mtime 上长得一样。替代判据是
+  **首行字节** —— `serde_json` 默认用 `BTreeMap`，重新序列化会把键按字母排序，所以哪怕语义
+  相同，一次真实改写也必然改变字节形态（比 mtime 更难绕过）。**加一个保全就要回头看
+  「谁在拿这个可观测量当判据」**，否则判据会静默退化成什么都没查。
+  <br>**借来的功能（都在会话页上）**：标题列（会话库 `name` → `title`/`first_user_message`
+  → 正文第一条用户消息；实测 `name` 是 Codex 自己生成的短标题「实现 Java 快速排序」，
+  而 `title` 是原始消息「使用java写一个快速排序」，**它显示后者、我们优先前者**）、
+  模型/档位/token 列、统计卡（总数/未归档/已归档/指向别处）+ 会话库路径、
+  **同步目标下拉**（候选来自 config 根 provider + `[model_providers.*]` + rollout 里出现过的
+  + 会话库里出现过的，当前生效的排第一，带来源徽标）、**「立刻同步」按钮**、
+  「接入时自动同步」开关、`session_index.jsonl` 孤儿清理（先备份再删）、删除前备份 rollout。
+  <br>🔴 **列表刻意不照抄它的数据源。** 它整个列表**直接读 `state_5.sqlite`**，于是本机 5 个
+  会话只列出 3 条 —— fork 子会话在 `threads` 里压根没有记录，而它们**同样带 provider**、
+  同样会被 `thread/resume` 用到。我们的口径是「**文件为准 + 库来补充**」：provider 与条目
+  来自 rollout（事实来源），标题/模型/token 从库里补，取不到就回落读正文。
+  另一个理由是 Codex 在跑时 sqlite 常被 WAL 锁着，而「Codex 正开着」恰恰是用户来这一页的
+  典型时刻 —— 以库为准的列表那时会变成空的。`stats.inDb` 与 `total` 的差额就是这个数字。
+  <br>🔴 **`CODEX_SQLITE_HOME` 是真的**（二进制里 "`CODEX_SQLITE_HOME` is overridden by an
+  exact requirement for sqlite_home"，出自 `core/src/config/requirements.rs`）。不认它的失效
+  是静默的：我们对着 `$CODEX_HOME` 下那个陈旧的库写，而 Codex 读的是别处那个 → 用户看到
+  「列表里的 provider 怎么改都不变」而 rollout 那半明明成功了。判据做成**纯函数**
+  （env 值当入参）+ 一条源码级接线 —— 直接在测试里 `set_var` 会污染同进程并行跑的其它用例。
+  <br>🔴 **「被占用」与「不可写」现在能分开了**：Windows 把两者都映射成 `PermissionDenied`，
+  而 **raw OS error 32/33**（`ERROR_SHARING_VIOLATION` / `ERROR_LOCK_VIOLATION`）能精确区分。
+  于是那句提示从「覆盖两种成因的条件句」升级成精确指路，只在归类不出来时才退回条件句 ——
+  在只读卷上说「退出 Codex 再试」是无效指路，用户照做后一字不变。
+  <br>**`encrypted_content` 顺手数了**（零额外 IO：改写时本来就要把整份文件流过一遍，
+  在 `io::copy` 的读侧挂一个找标记的适配器）。文案**只说「可能」** —— 会不会真的解不开取决于
+  上游账号，那是我们看不到的。它也是 CodexPlusPlus 的做法（它的文案里点了
+  `invalid_encrypted_content` 这个错误码，但那是**它的**说法、不是我们的取证，故不写进文案）。
+  ⚠️ 扫描必须**保留上一块尾部** `PAT.len()-1` 字节：标记恰好跨在两次 `read` 边界上会静默漏掉，
+  而漏掉的表现是报告说「没有加密内容」—— 正是用户要据此判断「这条旧对话还能不能续」的那一位。
+  <br>**删除改成先备份**（`backups/codex-sessions-deleted/`，保留 30 天），**备份不成就不删
+  那一条**，成功消息回显备份目录。它的界面上写着「删除会创建本地备份」，那是对的 ——
+  而我们原先的确认框写「不可逆、SynaRoute 不会为它们留备份」。
+  🔴 **保留口径必须是「按天数过期」而不是「留最近 N 份」**：删除的每条是**不同的文件**，
+  按数量裁到 5 份会让用户勾的另外 15 条备份当场消失，而确认框刚承诺了备份 ——
+  正是本仓最忌的「界面说做了、实际没做」。
+  <br>**偏好落在自己的小文件里**（`codex-session-prefs.json`）：`AppSettings` 会被前端整份
+  `saveSettings` 覆盖（`userPrefsParity` 那条判据就是为此建的），而 `model.rs` /
+  `SettingsPage.tsx` 棘轮余量都是 0。🔴 **绝不能塞进回滚清单
+  `codex-session-providers.json`** —— 那份文件在还原成功后会被**删掉**，偏好会跟着消失，
+  而它是我们唯一的原值凭据，多一个用途就多一条搞坏它的路（有判据钉着）。
+  <br>**互斥用进程内 `Mutex`，不做它那样的锁文件**：它必须跨进程（launcher 与 manager 是两个
+  可执行文件），而我们只有一个进程 —— 锁文件带来的是「上次崩溃留下陈旧锁、此后永远同步
+  不了」，而它要防的东西在这里压根不存在。有了手动按钮之后接入那趟与用户点按钮那趟确实可能
+  同时跑，而清单的「首记即锁」依赖读-改-写是原子的。
+  <br>**刻意不做的四项**（别当遗漏）：① **它的会话分享**（自建 share.codexpp.cc + E2E 加密）
+  —— 那是把用户的对话上传到第三方服务，与本仓「不把项目代码/用户数据发给第三方端点」直接冲突；
+  ② **`local_thread_catalog` 缺行修复**（往 Codex 库里 INSERT 行让消失的会话重新出现）——
+  schema 逆向的面太大，而我们的 sqlite 一直是 best-effort/只 UPDATE；顺带取证：
+  `has_user_event` 在二进制里只出现在 DDL 与 migration 文本里，**没有**证据表明它门控列表可见性，
+  所以不拿「修它就能让会话回到列表」当理由；③ **`.codex-global-state.json` 的 workspace roots**
+  （Desktop 项目侧栏的可见性，与 provider/401 正交，5 个键的面）；④ **`threads.model` 的
+  `[1M]` 后缀清理** —— 那是它自己给模型名加后缀带来的问题，我们不写后缀。
+  <br>**判据：后端 17 条注入 + 前端 3 条注入全部按预期变红。** 后端那 17 条里有 4 条第一次
+  报「仍绿（0 passed）」—— 过滤器写成了**文件名**而模块名是 `#[path]` 挂载后的 `files`/`view`/
+  `sync`，`cargo test --lib codex_session_fs` 匹配到 0 个测试。**脚本自带的「0 个用例就主动
+  判失败」那道防线抓住了它**（同 `catalog_is_accepted_by_the_real_codex` 那次 `--exact` 的坑）。
+  另有一条注入**编译不过**（`stats.mismatched = rows.len()` 触发 E0502，借用检查器不让）——
+  按 CLAUDE.md 那条「注入不变红的第四种成因」换成 `+= 1` 才验到，同时把夹具从 1 行改成
+  **2 行只有 1 条不一致**（1 行时 `1 == 1`，错误实现照样绿）。
+  <br>新增两条判据补接线盲区：`tests/codexSessionPage.test.ts`（前端必须直接用后端算好的
+  `stats.mismatched`、不许自己再 filter 一遍 —— 两处各算一遍的表现是「表头说 3 条、表里标红
+  1 行」；删除确认文案里的备份目录名从 Rust 的 `BACKUP_KIND` 抽出来对账 —— 后端改了目录名
+  而文案没跟上，用户会去一个不存在的目录里找他的对话），以及五个新命令必须在页面上真有调用点。
+  <br>⚠️ **策略门跟着「文件会被拆开」这件事一起改了**：`no-hardcoded-local-paths` 的跳过清单
+  原先写死 `src/lib/mockData.ts` 一个文件名，于是把演示数据拆成 `mockData.sessions.ts` 之后，
+  同一批演示用假路径又被报成违规。已改成按 `src/lib/mockData.` 前缀跳过 —— 而拆分片是本仓
+  为了让 mockData 不超行数上限的**常规**动作，判据必须预期它。同 i18n 分片那条教训。
+  <br>**零棘轮抬高**：新增 4 个 Rust 模块（`codex_session_fs`/`view`/`sync` + 既有 `ops`）与
+  2 个前端文件（`SessionTable.tsx` / `mockData.sessions.ts`）；`codex_sessions.rs` 把文件层原语
+  搬进 `files` 后从 900 降到 **838**，`lib.rs` 靠合并两行命令注册腾出 1 行放 5 个新命令。
+  <br>**当前基线**：`cargo test --lib` **1179 passed / 0 failed / 7 ignored**、
+  `npm test` **188 passed / 27 文件**、clippy 干净、`tsc --noEmit` 干净、
+  `npm run gates` 全绿零抬高、`npm run build` 的 tailwind 令牌门绿。
+  <br>📌 **仍未真机验证**：真实 `$CODEX_HOME` 上的标题列（本机只有 5 条会话，且其中一条标题是
+  几千字符的审查提示词）、「立刻同步」在 Codex 开着时是否如实报「N 条被占用」并给出精确指路、
+  删除后重启 Codex 列表里是否没有死条目、索引孤儿清理在真实索引上的效果、
+  以及 mtime 保全（同步一次后文件管理器里的修改时间应当不变）。
+
+  <br>🔴 **同一轮里在它之上做的四项（不是照抄，是它没有的）**：
+  <br>**① 「这条对话用的模型现在还服务得了吗」—— 只有代理侧能回答的那一位。**
+  启动器类工具（CodexPlusPlus / codex-provider-sync）永远给不出它，因为它们没有 Key 池。
+  用处很具体：用户点开旧对话报错，而 provider 那一列是**绿的** —— 真成因是他后来删掉了服务
+  `glm-5.3` 的那条 Key、或改了模型映射。判据是 `model_pool::may_serve` 对 Codex 分类当前启用
+  的 Key 池取「有没有任何一条可能服务它」。
+  🔴 **压根没有启用的 Key 时一条都不许标**：那只说明用户还没配 Codex，而按「没人能服务」判
+  会把整张表刷红 —— 同 `balance_gate` 的「查不到 ≠ 为零」。三个边界（认识/不认识/没有 Key）
+  一起钉在一条用例里，注入即红。
+  <br>**② 筛选：文本框 + 「只看指向别处」+ 「只看模型已失效」。** 它的界面没有筛选，而几百条
+  会话时列表本身就不可用。纯前端（整份列表已在手里，为一次筛选再跑一趟 IPC + 重扫几百个文件
+  毫无道理）。⚠️ **它不是把 `stats.mismatched` 重算一遍** —— 那一位仍然只来自后端，
+  这里算的是「当前筛选下显示几行」，统计卡永远报全量，两个数字回答不同问题。
+  <br>顺手堵了自己造出来的一个坑：**勾完再筛选会让选中项藏起来，而藏着的条目照样会被删。**
+  已在选中条上单独报「其中 N 条已被当前筛选隐藏，但仍会被删除」。
+  <br>**③ 「立刻同步」加确认框。** 它是点一下就写。而我们这一版的同步目标是个**可以任选的
+  下拉**（能指向任何 provider id），误操作代价比只有「同步到 synaroute」那一版高得多；
+  本仓刚在大脑聚合那轮定下同一条纪律（让用户确认的必须是他看到的那份，为此把落盘拆成
+  Phase2a 预览 + Phase2b 写入）。确认框里的条数用**用户正在看的这份列表**算，刻意不取
+  `stats.mismatched` —— 那一位是与 `config.toml` 当前生效的 provider 比，而这里比的是下拉里
+  选的目标，两者未必是同一个 provider；真正权威的数字是同步完那条结果消息。
+  有一条跨语言判据钉住「按钮只打开确认框、`api.syncCodexSessions` 只有一个调用点」。
+  <br>**④ 标题回落加进程内缓存**（键 = 相对路径 + mtime 毫秒 + 字节数）。这是**我们独有的
+  性能问题**：它整个列表读 sqlite、天然不碰文件，而我们「文件为准 + 库来补充」，库里没有记录
+  的会话要开文件读第一条用户消息 —— 而列表页是可以反复刷新的（点刷新、同步完自动刷、切页面
+  回来再刷），几百条会话时每次刷新就是几百次 open+read。
+  🔴 **键里必须带 mtime**，缺这一半的表现是「用户继续对话之后标题永远停在旧的那条」，
+  而那种陈旧是静默的。判据两个方向都钉：等长换掉正文并把 mtime 拨回去 → 必须命中缓存；
+  mtime 往后拨 → 必须失效。
+  ⚠️ 缓存**上限**那一条没有机械判据（要造 4096 个夹具文件），代码里写明了守不住 ——
+  别把那句注释读成「有测试在守」。
+  <br>**判据总账**：后端 17 + 2 条、前端 3 + 2 条注入全部按预期变红，另有 1 条如实记为
+  「没有判据守着」。当前基线 `cargo test --lib` **1181 passed / 0 failed / 7 ignored**、
+  `npm test` **189 passed / 27 文件**、clippy 干净、`tsc` 干净、`npm run gates` 全绿零抬高、
+  `npm run build` 的 tailwind 令牌门绿。
+  <br>⚠️ **clippy 拦了一次 `type_complexity`**（`Mutex<Option<HashMap<(String,u64,u64),String>>>`）
+  —— 抽成 `type TitleCache` 即过。那个 lint 是对的：三层嵌套的键类型放在 static 上没人读得懂。
+
+- **第三批（三项借鉴）+ CodexPlusPlus 剩余两项已全部做完（2026-09-06）**。23 条注入全部按预期
+  变红，2 条如实记为「没有判据守着」。逐项记结论，**其中两项的判据刻意与它不同，别照它「补齐」回去**：
+  - 🔴 **客户端环境变量冲突检测**（[`env_conflicts.rs`](src-tauri/src/tools/env_conflicts.rs)）。
+    失效形态是「接入提示说成功、请求一个都没到代理」，而界面上的一切（config 文件、代理状态）
+    都是对的 —— 用户完全看不出原因。三处判据与 CodexPlusPlus 的 `env_conflicts.rs` **不同**：
+    <br>① **它只查 `OPENAI_*`，我们主要查 `ANTHROPIC_*`，且刻意把 `OPENAI_*` 降成 `notice`。**
+    取证（codex.exe 0.151.0-alpha.7.2）：`OPENAI_BASE_URL` 全二进制**只出现 1 次**，紧邻的源
+    文件路径是 `network-proxy\src\credential_broker\providers\openai.rs`（凭据代理组件，不是
+    provider 解析路径）；`OPENAI_API_KEY` 那 23 处旁边是 `env_key` /
+    `experimental_bearer_token` / `requires_openai_auth` 三个字面量 —— 也就是说环境变量是经
+    `env_key` 起作用的，而**我们写的 provider 块刻意不写 `env_key`**（`codex.rs:945` 有测试
+    钉着）。照它那样报成 conflict，对**每个装过 OpenAI SDK 的用户**都是假警。
+    <br>② **判据是「指向别处」而不是「存在」。** 它的 `EnvConflict` 只带一位 `value_present`，
+    而 `ANTHROPIC_BASE_URL` 恰好等于我们的入口是完全正常的形态 —— 报它等于叫用户去删一个
+    **正确**的设置。
+    <br>③ 🔴 **目录变量两侧不一致 —— 它刻意排除了 `CODEX_HOME`，而那是最静默的一种。**
+    三种形态都要报：注册表有、进程没有（用户在系统设置里配过，我们没继承到 → 我们写默认
+    `~/.codex`、Codex 读他配的那个）；进程有、注册表没有（**用户双击启动 Codex 时**读默认目录）；
+    两侧都有但值不同。三种下表现一样：接入说成功、Codex 里毫无变化，而两边各自都「正确」。
+    <br>**凭据类的值绝不外发**：名字含 `TOKEN`/`KEY`/`SECRET`/`PASSWORD` 的只报「已设置」——
+    这些发现进诊断报告（用户会发给别人）与界面，同 `lan_guard` 那条。URL 与目录**要**带值，
+    那正是「指向哪里」这个答案本身。
+    <br>🔴 **移除必须广播 `WM_SETTINGCHANGE`，少了这一步按钮就是空动作**：Explorer 缓存着
+    一份环境块，用户从开始菜单启动 Codex 时继承那份缓存 → 删完、重启客户端、问题照旧，
+    而用户会得出「SynaRoute 说删了但没删」（比不提供这个按钮更糟）。为此给 `windows` crate
+    加了 `Win32_UI_WindowsAndMessaging` feature。读注册表用 `winreg = "0.55"`——**零新增 crate**
+    （`auto-launch` 已经把同一个版本拉进依赖树），刻意不用 `Win32_System_Registry`：
+    那要 40 行 unsafe 做 `RegEnumValueW` 的宽字符缓冲区管理，而这里只是读一串字符串。
+    <br>**只 banner `conflict`，不 banner `notice`**（`EnvConflictBanner.tsx`）；移除走确认框 +
+    先备份 JSON，**备份失败一律不动手**（那是用户的系统环境）；**只删我们报出来的名字**——
+    否则这个 IPC 命令就是一个任意注册表删除原语。
+    <br>⚠️ **备份那两步只有第一步有夹具**：备份文件名带时间戳，没法预先把它做成目录去让
+    `write` 失败，而只读属性在 Windows 上拦不住目录内建文件。注入实测确认「把
+    `fs::write(..)?` 改成 `let _ =` 时那条仍绿」，故第二步由一条**形态判据**钉住
+    （`the_backup_write_must_propagate_its_error`）—— 别把那条夹具读成「两步都验过了」。
+  - 🔴 **`config.toml` 外部改动监听**（[`codex_watch.rs`](src-tauri/src/tools/codex_watch.rs)）。
+    `drift_state` 一直是**被动**的（只在启动/接入/打开预览时查），而改写 config.toml 的另外
+    三方都不通知我们：Codex 桌面端自己会重写它、cc-switch 切档、用户手改 —— 于是「接入已失效」
+    要等到下次打开应用才被发现，而那段窗口里每个请求都是 401。
+    <br>**不引入 `notify` crate**（判据同 `socket2` 那条的取舍标准）。顺带一条实质理由：
+    文件系统事件在这个场景**反而更差** —— 编辑器与 Codex 写盘常是「写临时文件 + rename」，
+    会产生一串事件（有时带一个「文件短暂不存在」的中间态），要自己去抖；轮询 mtime 天然只看终态。
+    <br>🔴 **必须独立起线程**（`balance_gate` 上踩过完整一遍：搭 `check_all_categories` 的车
+    会让 `health_check_interval_secs == 0` 这个**无关设置**静默停掉本功能）。判据两个方向都钉：
+    `lib.rs` 必须有那一行、`health.rs` 不许出现本模块的调用、本模块自己不许读那个设置。
+    <br>**只在「变了 且 有告警」时落事件**，可折叠 + 固定折叠键 —— mtime 变化本身不是问题
+    （Codex 每次会话都可能回写 `model`），无条件落会把有用事件挤出 `MAX_EVENTS` 环（同 B4 那次）。
+    <br>**第一轮只记基线不报告**：启动自检那条路已经查过一次，再报一次就是同一件事说两遍。
+    <br>判据里刻意写明**已知漏检**：「内容变了但 mtime 与大小都没变」不认（需要等长替换 + 回拨
+    时间戳，不是真实场景 —— 而 `codex_session_view` 的标题缓存刻意利用了同一个性质）。
+  - 🔴 **Responses 侧 `encrypted_content`：只做了取证 + 取证钩子，刻意没做整流。**
+    2026-09-06 专查一轮，结论是**我们手上仍然没有真实错误文案**：
+    `invalid_encrypted_content`（第三方 README 提到的码）在 codex.exe 里 **0 命中** ——
+    它若存在也是**上游 API** 的码；`failed to decrypt` 那两处与推理无关（一处是 agent identity
+    的 encrypted task id，一处是它自己的 secrets 文件）。但**机制是确凿的**：
+    `reasoning.encrypted_content` 以 Responses API 的 `include[]` 取值出现，旁边还有官方指引
+    原文「with `store: false` or ZDR, request and replay `reasoning.encrypted_content`」——
+    Codex 确实会请求并回放它，而我们同协议直通会把它原样转给**另一个账号**。
+    <br>故本轮**不做字段摘除**（`thinking_rectify` 那条路「修一个 400 换来另一个 400」踩过
+    三次，摘字段的边界必须先有真实响应），改为在 `error_hint` 加一支**取证钩子**：命中就给
+    一段说明 + **明确请用户把上游原文报上来**。文案里写死「SynaRoute 对这个字段不做任何改写」
+    并有判据钉住「不许声称已自动摘除」—— 说做过就是界面撒谎，而用户会据此排除掉真相所在的方向。
+    <br>⚠️ 判据第一版写成「加密那支里不许出现『扩展思考签名』」，被自己的文案打回：
+    那段说明**就该**点出「与那一族同源」。改成钉**可行动的那一位**（思考块会自动摘除后重试、
+    加密内容什么都不做）。
+  - 🔴 **`local_thread_catalog`：第三份 provider 副本，我们此前一份都没写**
+    （[`codex_session_catalog.rs`](src-tauri/src/tools/codex_session_catalog.rs)）。
+    本机实测：provider 在磁盘上有**三份**（rollout 首行 / `threads.model_provider` /
+    `local_thread_catalog.model_provider`），而 `local_thread_catalog` **不在**
+    `state_5.sqlite` 里、在**新布局**的 `sqlite/codex-dev.db` 里，**而那个库没有 `threads` 表**。
+    也就是说两张表在两个不同的库里 —— 只按「有 `threads` 表的库」去写，这一份永远不会被碰到。
+    好消息是它**不影响路由**（`thread/resume` 只读 rollout），所以此前的 401 修复是完整的。
+    <br>做了三件事，风险递增，**每件都只在列已存在时做**：同步 `model_provider`（UPDATE）、
+    清 `missing_candidate`（UPDATE，我们手上恰好有「rollout 真的在磁盘上」这个事实）、
+    补缺行（`INSERT OR IGNORE`）。
+    <br>🔴 **补缺行的四条收窄**：列不齐就整个跳过；`host_id` 从
+    `local_thread_catalog_hosts` 取真实值、**取不到就不做**（不硬编码 `"local"`——那是猜，
+    猜错会插出一条 Codex 认不出的行）；`source_kind` 取不到那一行也不补（NOT NULL 列被塞一个
+    Codex 认不出的来源比少一行糟）；**刻意不写 `local_thread_catalog_sync_state` 的水位线、
+    也不删任何行**（它的「全量同步」会做这两件事，而推进水位线可能让 Codex 跳过它本该自己做的
+    扫描；删条目属于「影响范围超出修复」）。`observation_sequence` 接着现有最大值逐条递增、
+    `catalog_revision` 按补行数推进 —— 那两个是 Codex 自己的账，序号重复会让它把两条记录看成
+    同一次观察，不推 revision 则补了行而 Desktop 可能不刷新。
+    <br>🔴 **「修它就能让会话回到列表」这句话我们没有取证**：`has_user_event` 在 codex.exe 里
+    只出现在 DDL 与 migration 文本里，没有证据表明它门控列表可见性。故文案只说**做了什么**
+    （「补了 N 条索引记录、清了 N 个失效标记」），不承诺「会话会回来」。
+    <br>⚠️ **一条注入仍绿是判据重叠不是盲区**：删掉 `supports_repair` 那道门之后 INSERT 会
+    引用不存在的列 → SQL 报错 → `inserted` 仍是 0，于是只看它的断言照样绿。已把判据改成
+    「**干净地**跳过」（要求 `skipped` 为空），那道门的贡献才变成机械可观测的。
+  - **`.codex-global-state.json` 的项目归属：只读，绝不写。** 会话页现在显示每条对话属于哪个
+    项目、以及「未归入项目」——**那正是「这条对话为什么不在我的项目侧栏里」的答案**，而它与
+    provider 正交，看 provider 那一列永远看不出来。
+    <br>🔴 **不写的理由是具体的**：它是 Electron 的持久化 atom store，本机实测 **24 个顶层键**，
+    装着窗口位置、onboarding 标记、以及 `prompt-history`（用户逐字打过的每一句话）。
+    Desktop 运行时整份持在内存里并按自己的节奏整份写回 —— 我们去写它就是「最后写的人赢」，
+    **可能把 Desktop 更新的状态整片抹掉**（用户会看到 prompt 历史莫名消失）。CodexPlusPlus
+    写它，我们刻意不写；有一条形态判据钉住「本模块生产段不许出现 `fs::write` / `File::create`
+    / `write_all`」。
+  - **它的「会话分享」我们不做**（自建 share.codexpp.cc + E2E 加密上传）：那是把用户的对话
+    上传到第三方服务，与本仓「不把项目代码/用户数据发给第三方端点」直接冲突。同一需求的本地
+    等价物**已经有了** —— 导出 Markdown（后端直接落盘到 `<data_dir>/exports/`，且刻意只带
+    对话正文，不带 developer 消息 / 工具输出 / `encrypted_content`）。
+    <br>**刻意不做导入**（把别人的 rollout 写进 `$CODEX_HOME`）：那要凭空造 sqlite 与 catalog
+    记录，正是上面那条「补缺行」里风险最高的部分，而没有人要求过这个方向。
+  <br>**当前基线**：`cargo test --lib` **1208 passed / 0 failed / 7 ignored**、
+  `npm test` **189 passed / 27 文件**、clippy 干净、`tsc --noEmit` 干净、
+  `npm run gates` 全绿（棘轮**下调 2 项**：`lib.rs` 1870→1868）、`npm run build` 的
+  tailwind 令牌门绿。三个新模块生产段：`env_conflicts` 481/900、`codex_session_catalog` 375/900、
+  `codex_watch` 104/900。
+  <br>⚠️ **本轮踩到的三件事**：① `text-warning-foreground` 这个令牌**不存在**，写了一条 CSS
+  都不生成 —— 被 `npm run build` 里的 tailwind 令牌门当场抓住（`npm run gates` 抓不到它，
+  那道门在 build 里）；② 又一次栽在 `node -e` 的反引号上（模板串被 bash 当成命令替换），
+  改成写临时脚本文件；③ `CategoryPage.tsx` 是 **CRLF**，LF 锚点静默命中 0 处 ——
+  按目标文件实测行尾，别按记忆。
+  <br>📌 **仍未真机验证**：真实注册表里有 `ANTHROPIC_*` 时 banner 是否出现、点「移除」后
+  重启客户端是否真的生效（`WM_SETTINGCHANGE` 那一步只能真机验）、外部改 config.toml 后 60s
+  内是否落告警事件、`local_thread_catalog` 补行后 Desktop 列表里那些会话会不会回来
+  （**这一条我们本来就没承诺**）、以及项目归属那一列在多项目机器上的表现。
+
+- 🔴 **全链路审查（2026-09-06，第三批之后）：修出 3 条真缺陷 + 推翻自己两条错结论。**
+  <br>本轮最值得记的**不是**那些缺陷，而是**两条「我说做不到、其实是我自己挡的」** ——
+  它们同形，而且都被我写进了本文档当结论用。用户连问两次「这个也可以跑通吧」才逼出来。
+  - 🔴 **① `StreamExt::buffered` 那句「走不通，别再试」是错的（已改写，别再引用）。**
+    观测是真的：`buffered(N)` 把借用 `calls` 的 future 塞进 `FuturesOrdered`，那个具体类型
+    参与 auto-trait 推导，实测让 **`mcp.rs` 里两处与本改动无关的 `tokio::spawn`** 编译失败
+    （`Send` is not general enough）。**错的是从它推出的结论** —— 那是 higher-ranked lifetime
+    推导的已知局限，不是「滑动窗口做不到」。
+    <br>**`Semaphore` + `join_all` 拿到完全一样的语义，且压根不引入 `FuturesOrdered`**，
+    推导问题从源头不存在。一次编译通过，那两处 spawn 毫发无损。现在是真滑动窗口
+    （谁做完谁让位），批屏障那个「一批里最慢的拖住下一批」的代价没有了；顺序仍由 `join_all`
+    保证（**按入参顺序返回，与完成顺序无关**）—— tool_result 与 tool_use 按位置配对，乱序即 400。
+    <br>**教训**：「实测某个写法编译不过」是观测；「这条路走不通」是**结论**。把前者升级成后者、
+    再写上「别再试」，等于给下一个人立一道不存在的墙。同「带『已核对』字样的注释是更贵的一种
+    过时」那条 —— 只是这次更贵，因为它劝阻的是**尝试**。
+  - 🔴 **② 「并发限流做不到」的障碍是一条我自己写的判据。**
+    原话是「唯一合适的挂点 `guard_stream_idle(resp.bytes_stream())` 有源码级判据钉着
+    『恰好 2 次』，改签名会让那条判据失效」。**判据是我们自己写的，改它就行。**
+    已改成按「函数名出现两次 + 两处字节流都交出去」判，加参数不再触发。
+    <br>顺着同一个形状还发现 `tool_calls_must_run_concurrently` 也钉死了
+    `.chunks(MAX_CONCURRENT_TOOLS)` —— 于是把实现换成**更好的**信号量时它当场变红，
+    而那次改动没有破坏它想守的任何一条。已改成两种手法都接受，并额外钉住
+    「建了信号量必须真的 `acquire`」（只 new 不 acquire = 上限是摆设，注入验证过）。
+    <br>🔴 **判据要钉「性质 / 来源」，不要钉「某一种写法」** —— 钉手法的判据会在有人改进实现时
+    制造**假红**，而假红的代价是**改进被撤回去**。本仓已经为此付过一次代价（就是①）。
+    <br>📌 **限流本身仍未实现**（障碍清掉了 ≠ 做完了）：还缺一个「限额从哪来」——
+    `KeyParams` 没有这个字段，加它会连带 UI 与 `providerKeyDraftParity`。属独立一轮。
+  - 🔴 **③ `quota_window` 在聚合路径的接线补上了 —— 原先记的「刻意未做」理由是反的。**
+    旧理由写「窗口对它自己无用」，而 `gate.rs:85` **一直在读**这个窗口。缺的是**写**那一半：
+    聚合撞 429 时从不武装窗口，而 **429 刻意不计熔断**（那条规则是对的）→ 熔断层也兜不住
+    → 一条撞了配额的 Key **每一轮聚合都白打一次**，每轮重复且完全静默。
+    <br>实现：`AppError::Upstream` 加**独立**的 `retry_after` 字段（不从 `msg` 里 parse ——
+    同「状态码必须是独立字段」那条，从人类可读文本反推数字会在文案改动时静默失效）；
+    新增 `upstream_http_after` 而**不给 `upstream_http` 加参数**（它有 15 个调用点，
+    其中只有少数几处拿得到这个值，加参数会让另外那些被迫写 `None`，而一个到处是 `None` 的
+    参数下一个人会照着抄成 `None`）；`parse_retry_after` 从 `proxy.rs` 提成 `pub(crate)` 共用。
+    <br>🔴 **必须在读响应体之前读头**：`resp.text()` 消费掉 `resp`，之后再读头恒为 `None`
+    —— 那个失效方向是静默的（窗口永不武装，而代码看起来是对的）。两处非 2xx 都改了。
+    <br>挂点是 `record_failure`（聚合两条失败路径的**汇总点**），不在两处各写一遍。
+    <br>**3 条注入全红**，含一条**反向**判据：「上游没给 `Retry-After` 时不许凭空造窗口」——
+    凭空造会把一条只是偶发限流的 Key 挡上 60s，是这个改动唯一可能引入的误伤方向。
+  - 🔴 **④ 新代码自己的真缺陷：环境变量 banner 在桌面端页面指错方向。**
+    `EnvConflictBanner.relevant` 原先对 `claude-desktop` 也报 `ANTHROPIC_*`，而**桌面端压根
+    不读那些变量** —— 它走 `deploymentMode=3p` + `configLibrary/{ID}.json`（`tools.rs` 模块头
+    有取证：早期往 `claude_desktop_config.json` 写 `baseUrl` **从未生效**，因为桌面端
+    「无 baseUrl 概念」）。在那一页报它 = 叫用户去删一个与他的故障毫无关系的系统设置，
+    而真正的成因（部署模式没切、配置档没写进去）被这条告警盖住。已收窄成只对 `claude-cli` 报。
+  <br>**另外三条来自上一轮自审、这轮才闭环**（都是「新加的防线自己带出来的洞」）：
+  `remove_from_index` 非原子 + 吞错（**击穿了模块头那条刻意的删除顺序** —— 索引没删成却照删
+  文件，得到的正是那个顺序想避免的死条目；已改 temp+rename + 返回 `Result` + 调用方早退）；
+  `CODEX_HOME` 有一个能点、点了返回「没有可移除的项」的移除按钮（已加 `removable` 作**唯一**
+  事实来源，目录变量恒 false —— 正确处置是对齐两侧，删它会破坏用户自己配的 Codex 布局）；
+  非 Windows 上把「什么都没做」报成「已移除 N 个」（`remove_user_env_value` 改返 `bool`）。
+  <br>⚠️ **`mockData.ts` 撞了新文件上限 906 > 900**，抽出 `mockData.env.ts`。腾空间**是删/搬，
+  不是重排** —— 本仓为这条栽过两次。抽的时候顺手修出一个真 bug：`"D:\codex-home"` 里
+  `\c` 在 TS 中就是 `c`，演示数据一直渲染成 `D:codex-home`（不存在的路径形态）。
+  <br>⚠️ **又一次栽在 `node -e` 的反引号/正则上**（bash 把模板串当命令替换、把 `\\` 吃掉），
+  以及 **`types.ts` 是 CRLF** 导致 `^\s{2}` 锚点全部对不齐 —— 这两条 CLAUDE.md 都记过。
+  **一次性脚本一律写文件，别走 `-e`；两侧先归一行尾再对账。**
+  <br>**本轮机械核过的三件**（都干净）：10 个新 IPC 命令的端到端接线（Rust 定义 → 
+  `generate_handler!` → `bridge.ts` → UI 调用点，逐个 4 段齐全）；8 个 serde 结构体与
+  `types.ts` 的字段对账（`SessionPrefs` 后端自用、不过 IPC，已在脚本里显式排除而不是当缺失）；
+  `i18n.sessions.ts` 两侧 **81 键**与占位符逐条一致。
+  <br>⚠️ **收尾时被 clippy 抓到一件比 lint 更重的事**：`upstream_http_after` 与
+  `upstream_retry_after` **从未被调用** —— 也就是说③的接线（`completion.rs` 读头 +
+  `record_failure` 挂点）压根没落盘，只有 `error.rs` 那一半在。我在此之前已经把③写成
+  「已完成」了。抓住它的是 `dead_code`，不是任何测试。
+  <br>**教训**：`cargo build` 通过 ≠ 新写的东西被接上了。**加了一个 `pub fn` 而没人调它，
+  唯一会说话的是 clippy** —— 收尾必须跑它，而且「基线数字对不上」（当时 1212 而我记了 1217）
+  是同一件事的第二个信号，别当成随机波动。
+  <br>**当前基线**：`cargo test --lib` **1213 passed / 0 failed / 7 ignored**、
+  `npm test` **189 passed / 27 文件**、clippy 干净、`tsc --noEmit` 干净、
+  `npm run gates` 全绿（棘轮**又下调 1 项**）、`npm run build` 的 tailwind 令牌门绿。
+  <br>⚠️ ③补完之后 `aggregate.rs`（+15）与 `proxy.rs`（+3）都撞了冻结值。**靠压缩既有表述腾回来，
+  一行上限没抬** —— 长论证搬进那条测试的文档注释（测试段不计入棘轮），模块头的分点列表并成整句。
+  <br>🔴 **继续往下审又修出 3 条，全在 `EnvConflictBanner` 上，且都是「界面撒谎」那一族**
+  （新增 [tests/envConflictBanner.test.ts](tests/envConflictBanner.test.ts)，4 条注入全变红）：
+  <br>**⑤ 桌面端报 `ANTHROPIC_*` —— 指错方向。** 见上面④，这里补的是判据。
+  <br>**⑥ `note` 与 `found` 不随分类清空。** 本组件**不随分类重新挂载**（只是换了个 prop），
+  而 `note` 参与渲染判据（`found.length === 0 && !note` 才返回 null）。于是在 claude-cli 上点过
+  「移除」之后切到 codex，那条横幅**照旧显示**、写着 claude-cli 那次的结果，而 codex 这边压根
+  没有任何问题。第二半是 `found`：新一趟取数返回前旧分类的发现还挂在屏幕上 —— 同本仓
+  「切分类时在途 IPC 把上一个分类的 Key 写进新分类页」那条 P0 的形状。
+  <br>**⑦ 🔴 我自己写的那道竞态守卫是恒假的。** 第一版写
+  `const started = category; … if (started !== category) return;` —— **`category` 是闭包捕获的
+  值**，`await` 之后它仍是这一趟开始时的那个，两边永远相等，守卫等于没写。已改为
+  `useRef` + `currentRef.current`（ref 才读得到最新值）。
+  <br>**教训**：「在 async 回调里比对一个 prop 判断自己是否过期」这个模式，**只有读 ref 才成立**。
+  写完这类守卫要问一句「我比的两个值会不会是同一个」—— 恒假的守卫比没有守卫更糟，
+  因为它让人以为这一维已经防住了。判据里为此加了一条**反向**断言（不许出现
+  `started !== category` 那个形态）。
+  <br>⚠️ 那 5 条判据里 `relevant` 是**从源码抽出来执行**的，不是在测试里抄一份 ——
+  抄一份的话组件改了判据、测试照样绿（同 `modelMappingRows` 的做法）。
+  <br>✅ **并发限流本体已实现（2026-09-07）**，见下一条。本轮改动**未出包**。
+
+- **每 Key 并发上限：弹性第五层（2026-09-07）**。实现在
+  [`concurrency.rs`](src-tauri/src/concurrency.rs)（`#[path]` 挂 `health` 下 —— 同族，
+  且 `proxy.rs` 余量是 0）。这条是上一轮「障碍清掉了 ≠ 做完了」那句话的兑现。
+  <br>**它治的是前四层都治不了的那一种**：熔断 / 模型锁 / 配额窗口 / 余额闸门的共同前提都是
+  **先失败一次**。而中转站按并发限流的相当多，撞上去是 429 或 `bad_response_status_code`，
+  而 **429 刻意不计熔断**（那条规则是对的）→ 我们只会一次次白撞。配额窗口只兜得住
+  「上游明说了多久之后再来」，兜不住「它只是拒绝、不给头」。
+  <br>🔴 **槽位必须活到响应体 drop，不是拿到响应头就放。** 这是本模块唯一容易做错的地方，
+  也是它当初被判成「做不到」的原因：流式请求在**拿到 2xx 之后**才是真正占用上游那一段
+  （SSE 可达几分钟）。在 `send()` 返回时就释放，等于只限制了「同时握手的数量」——
+  而真实并发压力全在握手之后，也就是**这个上限会静默地什么都不限**。
+  挂法是把 permit 交给 `guard_stream_idle` 一起搬进流的状态机（`unfold` 的 state），
+  流被 drop（正常结束 / 客户端断开 / 静默超时注入后终止）时它跟着 drop ——
+  不用在三条终止路径上各写一次释放。非流式那条不用特别处理：`resp.bytes()` 在同一作用域
+  await 完，permit 随函数返回落地。
+  <br>🔴 **permit 刻意不进 `StreamAttempt::Streaming`**（第一版加了那个字段，编译不过）：
+  两个 guard 调用点都在 `try_stream_to_key` **内部**，permit 在那里就用完了。
+  让它跨函数传是多余的，且会在构造点与消费点之间制造一个「能被就地 drop」的窗口。
+  <br>**进程级常量而不是 `KeyParams` 字段**：加字段会连带 KeyEditor 的 UI、
+  `providerKeyDraftParity`、`upsert_key` 的运行态清单 —— 而那条链上本仓刚栽过一次
+  （`allow_in_aggregate` 保存一次 Key 就被清成 false）。本层的收益不依赖用户填对一个数字。
+  日后要做成可配，改成「读 Key 上的值、缺省回落本常量」即可，**调用点一行都不用动**。
+  <br>**阈值 8、排队不拒绝**：判据是「不改变今天正常用户的体验，只削掉尖峰」（实测 CC 单会话
+  并发 2~4，Codex 工具循环受 `MAX_CONCURRENT_TOOLS` 约束也在这个量级）。宁可这一层偶尔不起
+  作用，也不要它成为正常使用下的排队点 —— 后者的表现是「代理变慢了」而用户无从归因。
+  满了 `await` 而不返回错误，理由同 `balance_gate` 的「降级不剔除」：这一层的判据是**我们自己
+  猜的**（用户上游到底允许多少并发我们不知道），猜错时排队只是慢一点，拒绝则是把一个本来会
+  成功的请求变成失败。
+  <br>诊断报告 Key 摘要行加了「在途=N/8」：撞满时的表现是**请求变慢**（在我们这边排队），
+  而那与「上游慢」在用户侧长得一模一样 —— 没有这一位，排障者会去查上游而真相在代理内部。
+  <br>**4 条注入全部有结论**（全变红），含一条源码级接线判据（第 19 次同类盲区：3 条行为用例
+  直调本模块函数，把 `proxy.rs` 那两行 `acquire` 删掉它们照样全绿）。
+  <br>⚠️ **判据第一版有两个洞，都是注入实测抓出来的**：
+  ① 只钉「调了 `acquire`」→ 把实参换成固定串（= 退化成全局上限，一条 Key 的流量挡住所有 Key）
+  照样绿。已改成钉 `acquire(&key.id)`。
+  ② permit 那一侧只列了 `let _ = permit;` 的**反向黑名单** → 注入用
+  `drop(permit); … guard_with(.., None)` 就绕过去了。**正向断言（「它必须交给 guard_with」）
+  比一串黑名单可靠** —— 列黑名单永远漏一种写法。
+  <br>🔴 **两条关于「注入脚本自己」的教训，都是这一轮踩的**：
+  <br>① **被外层超时杀掉的注入脚本，`finally` 不执行 —— 注入留在盘上。**
+  上一轮那次 `t.entry("__global__")` 就这么留下了，症状是两条本模块用例莫名变红
+  （`in_flight` 报 0 而断言要 8），而我差点去改用例。**每条注入必须有自己的超时**，
+  且脚本被杀之后要先 `git diff` 确认盘上干净，再怀疑判据。
+  <br>② **被杀掉的测试进程会一直占着 `target/debug/deps/*.exe`**，此后每次 `cargo test`
+  都报 `LNK1104 无法打开文件` —— 而那个错误看起来像「编译不过」，于是注入脚本把**四条**
+  全报成「护栏是编译器」。实际是一个残留进程（`tasklist | grep synaroute` 一眼可见，
+  `taskkill //F //PID` 清掉即恢复）。**把 LNK1104 当成编译失败会得出完全错误的注入结论。**
+  <br>⚠️ **测试里不许裸 `.await` 取槽位。** 注入 ④ 下 `acquire` 会**永远等下去**，
+  `cargo test` 被外层超时杀掉 —— 而**挂死比变红糟得多**：它在 CI 里烧满整个 job 的时间预算，
+  且长得像基建故障而不是判据失败。两条用例的获取循环都改成 `now_or_never` + 明确 panic 文案。
+  <br>⚠️ clippy 拦了一次 `await_holding_lock`（测试里那把串行化用的 std `Mutex` 跨 await）。
+  那个 lint 是对的，而**这里压根不需要串行化**：本模块的表**按 key id 分桶**，用独有 id 就天然
+  互不干扰。故一并删掉了 `reset_for_tests`（它清**整张**表，反而会踩并行跑的别的用例）——
+  这一点与 `quota_window` 刻意不同，理由写在代码里。
+  <br>**零棘轮抬高**：`proxy.rs` 净零（两处 acquire 共 5 行，靠压缩探头超时那段既有长注释腾回）。
+  当前基线 `cargo test --lib` **1217 passed / 0 failed / 7 ignored**、`npm test` **194 passed /
+  28 文件**、clippy 干净、`tsc --noEmit` 干净、`npm run gates` 全绿（棘轮下调 1 项）、
+  `npm run build` 的 tailwind 令牌门绿。
+  <br>📌 **仍未真机验证**：撞满上限时的实际表现（应当是排队变慢、且诊断报告里「在途」看得到），
+  以及它对 CC 多路并发会话的影响（预期无感 —— 若有感就说明 8 定得太低）。
+  <br>**浏览器预览逐项验过**：claude-cli 上出横幅 + 「移除这 1 个」；桌面端**不出** `ANTHROPIC_*`；
+  codex 出 `CODEX_HOME` 且**无移除按钮** + 那句「目录类不提供移除」；点确认移除 → claude-cli 上
+  出结果提示 → 切到 codex **提示不残留**、且显示的是 codex 自己的发现。
 
 - **刻意不修的项**（别当成遗漏重复劳动）：SmartScreen 签名告警、`retrieval.rs` 的 `cwd` 白名单、
   请求日志存明文对话（默认关闭）

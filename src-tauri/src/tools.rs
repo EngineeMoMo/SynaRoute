@@ -1,8 +1,7 @@
 //! 目标工具接入模块 —— 把本地代理端点写入三个工具的真实配置文件。
 //!
 //! 硬规则（dev-hard-rules，用户强制要求）：
-//! 1. 改写任何配置文件前，先备份为 *.synaroute.bak
-//! 2. 原子写（临时文件 → 重命名替换）
+//! 1. 改写任何配置文件前，先备份为 *.synaroute.bak；2. 原子写（临时文件 → 重命名替换）
 //! 3. 路径全部动态解析（dirs / env），禁止硬编码本机路径
 //!
 //! 接入机制（三端严格分离，禁止混写）：
@@ -523,6 +522,7 @@ fn write_deployment_mode(path: &Path, mode: &str) -> AppResult<()> {
 }
 
 #[path = "tools/desktop_profile.rs"] mod desktop_profile; // 桌面端 gateway 档 + labelOverride；取证见该文件模块注释
+#[path = "tools/env_conflicts.rs"] pub(crate) mod env_conflicts; // 客户端环境变量顶掉我们写的配置；判据与 CodexPlusPlus 的差异见该文件模块注释
 use desktop_profile::{build_desktop_model_entries, build_gateway_profile};
 
 /// 接入时更新 `_meta.json`：确保 entries 里有本档（去重，与 cc-switch 档共存），appliedId 指向本档。
