@@ -426,7 +426,7 @@ pub(super) fn apply_at(
     let serialized =
         toml::to_string_pretty(&doc).map_err(|e| AppError::ToolConfig(e.to_string()))?;
     backup_and_write_bytes(path, serialized.as_bytes())?;
-    let model_note = codex_catalog::apply_note(models);
+    let model_note = codex_catalog::apply_note(models, keys);
     Ok(format!(
         "已写入 Codex 配置：{}（model_provider={MCP_CLIENT_NAME}，base_url={base_url}，\
          wire_api=responses{model_note}）；转发鉴权走 provider 表的 bearer 占位，\
@@ -977,6 +977,29 @@ mod tests {
         assert!(
             msg.contains("重启"),
             "接入消息必须带「要重启 Codex」那句话：{msg}"
+        );
+
+        // 🔴 **接线判据（2026-09-07）：`keys` 必须真的传给 `apply_note`。**
+        //
+        // `codex_catalog` 那边的 11 条 apply_note 用例全都**直接调函数并自己传 keys**，
+        // 于是把这里改成 `apply_note(models, &[])` 它们照样全绿（注入实测）——
+        // 而那时有 Chat Key 的用户拿不到「档位是否生效取决于上游」那句实话，且完全静默。
+        // 这是本仓第 22 次同类盲区，所以判据必须打在**真实调用点**上。
+        let chat_key = crate::model::ProviderKey {
+            protocol: crate::model::Protocol::OpenaiChat,
+            ..crate::model::ProviderKey::default()
+        };
+        let msg2 = apply_at(
+            &cfg,
+            EP,
+            &["claude-opus-4-8".to_string()],
+            std::slice::from_ref(&chat_key),
+            &cat,
+        )
+        .unwrap();
+        assert!(
+            msg2.contains("取决于上游"),
+            "有 Chat Key 时接入消息必须如实说一句 —— 这条红了通常是 apply_note 没收到真实 keys：{msg2}"
         );
         let doc = std::fs::read_to_string(&cfg)
             .unwrap()

@@ -475,12 +475,25 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   <br>🔴 **`supported_in_api` 必须为 `true`**：`ModelPreset::filter_by_auth` 是
   `chatgpt_mode || supported_in_api`，而我们走 `experimental_bearer_token` →
   `chatgpt_mode = false`。给 false 的表现是模型**静默从选择器里消失**。
-  <br>🔴 **档位按 `ProviderKey.protocol` 推导，不猜模型名**：Anthropic 上游 →
-  `convert.rs` 自己算 `thinking.budget_tokens`（**生效由我们保证**）；原生 Responses → 原样透传；
-  **Chat Completions → 不声明**。cc-switch 用 22 家预设换来的结论：只有「思考开关」的供应商
-  （Kimi/GLM/Qwen/MiniMax/MiMo/SiliconFlow）**在 Codex 里调档位不会有任何效果**。
-  口径是**交集**（一条 Chat 备用 Key 就让整组不声明）—— 同 `models_for_apply` 那条
-  「超集口径 → 故障转移后必然 404」。
+  <br>🔴 **档位一律声明四档，判据是「能不能到达上游」而非「上游会不会认」（2026-09-07 反转，
+  用户实报 `gpt-5.6-luna`）。别照旧版改回去。** 三种协议都送得到：Anthropic → `convert.rs` 算成
+  `thinking.budget_tokens`（**生效由我们保证**）；原生 Responses → 原样透传；
+  Chat Completions → `effort_for_chat_completions` **区间转换**成顶层 `reasoning_effort`
+  （无 `xhigh` 档，钳到 `high`）。
+  <br>旧口径是「只要有一条在册 Key 走 Chat 就整组不声明」，依据是 cc-switch 用 22 家预设换来的
+  结论：只暴露「思考开/关」的供应商（Kimi/GLM/Qwen/MiniMax/MiMo/SiliconFlow）调档位没有效果。
+  🔴 **那条取证是真的，但它支撑不了那个口径** —— 它说的全是**非 GPT 供应商**，而门按 protocol
+  一刀切，于是真正认 `reasoning_effort` 的 OpenAI o 系 / gpt-5 系一并被牵连：**官方 Codex 对
+  GPT 模型显示四档，接入我们之后档位整个消失**，相对于不用这个工具是回退。
+  <br>**代价不对称**：声明而上游忽略 = 用户切档位没变化，**与不用我们时完全一样**，不是我们造成的；
+  不声明而上游其实认 = 用户**彻底失去**原生档位控制、只能改用应用内那个设置（`inject_default_effort`
+  的兜底），这是**我们独有**的损失。原注释「一个『大多数时候生效』的选择器比没有选择器更糟」
+  那句话的前提是**我们**在丢弃那个值 —— 这里我们没有丢，不确定性完全在上游侧。
+  <br>随之而来的诚实义务：接入消息里**只在真有 Chat Key 时**加一句「档位在那些 Key 上是否生效
+  取决于上游」（有依据说得精确，protocol 是已知的），措辞是**条件句** —— 写「不会生效」在 OpenAI
+  官方那类上游上是假话，有判据钉住这一点。5 条注入全变红，含一条打在**真实调用点**上的
+  （`apply_note` 必须收到真实 keys —— 11 条 apply_note 用例全都直接调函数并自己传 keys，
+  把 `apply_at` 那行改成 `&[]` 它们照样全绿，第 22 次同类接线盲区）。
   <br>**声明的档位只有 `low/medium/high/xhigh`**，与官方 `gpt-5.5` 一字不差。**不含 `max`/`ultra`**：
   `effort_to_thinking_budget` 对它们走 `_ => return None` = 不开思考，声明它等于
   「用户选了最高档反而完全不思考」，方向最坏的界面撒谎。有源码级判据钉住

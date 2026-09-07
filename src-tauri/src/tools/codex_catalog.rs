@@ -59,29 +59,27 @@
 //! 那条、也是最保守的一档 —— `effective_tool_mode` 里 `CodeMode`（非 Only）在 code_mode
 //! 不可用时**会回落 Direct**，而 `CodeModeOnly` 不回落。cc-switch 的 DeepSeek 模板同值。
 //!
-//! # 🔴 思考档位：判据是「我们这一跳怎么落地 effort」，不是「模型叫什么名字」
+//! # 🔴 思考档位：判据是「档位能不能**到达**上游」，不是「上游会不会认」
 //!
-//! 声明一个上游其实不认的档位，后果是**界面撒谎**：用户在 Codex 里切档位、请求正常返回、
-//! 行为毫无变化，而日志里没有任何线索指向「那个档位被丢掉了」。cc-switch 用 22 家预设
-//! 换来的结论原话是：只暴露「思考开/关」的供应商（Kimi、GLM、Qwen、MiniMax、MiMo、
-//! SiliconFlow）**在 Codex 里调节思考等级不会有任何效果**。
+//! 全部四档一律声明，档位到上游那一跳由 `convert.rs` 做**区间转换**
+//! （Anthropic 算成 `thinking.budget_tokens`；Chat Completions 无 `xhigh` 档，钳到 `high`）。
 //!
-//! 所以本模块不去猜模型名，而是看 [`Protocol`] —— 那是我们自己这一跳的确定事实：
+//! ⚠️ **本节 2026-09-07 反转过，别照旧版改回去。** 原设计是「只要有一条在册 Key 走 Chat
+//! Completions 就整个不声明」，依据是 cc-switch 用 22 家预设换来的结论：只暴露「思考开/关」
+//! 的供应商（Kimi/GLM/Qwen/MiniMax/MiMo/SiliconFlow）在 Codex 里调档位不会有任何效果。
 //!
-//! | 上游 protocol | effort 在我们这里怎么落地 | 声明档位？ |
-//! |---|---|---|
-//! | [`Protocol::Anthropic`] | `convert.rs` 自己算成 `thinking.budget_tokens` | ✅ **生效由我们保证**，与上游认不认 effort 无关 |
-//! | [`Protocol::OpenaiResponses`] | 原样透传 `reasoning.effort`（原生语义） | ✅ |
-//! | [`Protocol::OpenaiChat`] | 落成顶层 `reasoning_effort`，认不认全看上游 | ❌ 不声明 |
+//! **那条取证是真的，但它支撑不了那个口径** —— 它说的全是**非 GPT 供应商**，而门按
+//! [`Protocol`] 一刀切，于是真正认 `reasoning_effort` 的 OpenAI o 系 / gpt-5 系一并被牵连：
+//! 官方 Codex 对 GPT 模型显示四档，**接入我们之后档位整个消失**，相对于不用这个工具是回退。
+//! 用户实报的就是这个（`model = "gpt-5.6-luna"`）。
 //!
-//! **口径必须是交集，不能只看主 Key** —— 同 `service::models_for_apply` 那条注释里记的
-//! 「用超集口径导致桌面端列出备用 Key 服务不了的模型、故障转移后必然 404」。这里的对应
-//! 失效是：主 Key 走 Anthropic 所以声明了四档，而故障转移落到一条 Chat 上游的备用 Key 上，
-//! 档位当场静默失效。故 [`effort_levels_for`] 只在**所有**在册 Key 都能让 effort 生效时才声明。
+//! 现在的分工是：**我们负责把档位以上游接受的形态送到**，上游认不认是上游的事 ——
+//! 用户直接用官方 Codex 打 Kimi，档位同样没效果，那不是我们该用「摘掉选择器」表达的事。
+//! 代价对比见 [`effort_reaches_upstream`] 的文档（关键是：声明而上游忽略 =「与不用我们时
+//! 一样」，不声明而上游其实认 = **我们独有的**损失）。
 //!
-//! ⚠️ 「在册」是**按模型**算的（[`owners_of`]），不是全池：模型清单自 2026-08-31 起是各 Key
-//! 可服务集的**并集**，一条 Key 常常只服务其中一部分名字。拿全池取交集会让一条 Chat 协议
-//! 的备用 Key 把**全部**模型的档位声明抹掉，含它压根不服务的那些。
+//! ⚠️ 「在册」仍是**按模型**算的（[`owners_of`]），不是全池 —— 那一维与本次反转无关，
+//! 且窗口维度仍按模型取最小值。
 
 use crate::error::{AppError, AppResult};
 use crate::model::{Protocol, ProviderKey};
@@ -197,26 +195,49 @@ const EFFORT_LEVELS: &[(&str, &str)] = &[
 /// 默认档位。与官方 `gpt-5.5` 的 `default_reasoning_level` 一致。
 const DEFAULT_EFFORT: &str = "medium";
 
-/// 这一组 Key 上，Codex 里选的思考档位能不能真的到达上游。
+/// 这一组 Key 上，Codex 里选的思考档位能不能**到达**上游。
 ///
-/// **交集口径**：只要有**一条**在册 Key 的上游是 Chat Completions，就返回 `false`。
-/// 理由见模块头那张表——故障转移随时会落到那条 Key 上，而档位在那一跳是静默失效的。
-/// 一个「大多数时候生效」的档位选择器比没有选择器更糟：用户无法判断某次没变化
-/// 是模型的正常波动，还是档位压根没送出去。
+/// 🔴 **2026-09-07 推翻了原先的「Chat 协议一律不声明」交集口径**（用户实报）。
+/// 原口径是「只要有一条在册 Key 走 Chat Completions 就返回 `false`」，依据是 cc-switch
+/// 用 22 家预设换来的结论：只暴露「思考开/关」的供应商（Kimi/GLM/Qwen/MiniMax/MiMo/
+/// SiliconFlow）在 Codex 里调档位不会有任何效果。
+///
+/// **那条取证是真的，但它支撑不了这个口径** —— 它说的全是**非 GPT 供应商**，而门是按
+/// protocol 一刀切，于是真正认这个字段的 OpenAI o 系 / gpt-5 系也被牵连：
+/// 官方 Codex 对 GPT 模型显示四档，接入我们之后档位整个消失。**相对于不用这个工具是回退。**
+///
+/// # 判据改成「档位能不能到达上游」，而不是「上游会不会认」
+///
+/// 三种协议**都**把档位送出去了（各有测试）：
+///
+/// | 上游 protocol | 落地形态 | 谁保证 |
+/// |---|---|---|
+/// | [`Protocol::Anthropic`] | `convert.rs` 算成 `thinking.budget_tokens` | **我们**（生效与上游认不认 effort 无关）|
+/// | [`Protocol::OpenaiResponses`] | 原样透传 `reasoning.effort` | 原生语义 |
+/// | [`Protocol::OpenaiChat`] | `effort_for_chat_completions` 区间转换成顶层 `reasoning_effort`（`xhigh`→`high`）| 送到了；认不认是上游的事 |
+///
+/// 我们的责任到「以上游接受的形态把档位送到」为止。**Kimi 忽略它，不是我们该用「摘掉
+/// 选择器」来表达的事** —— 用户不接这个代理、直接用官方 Codex 打 Kimi，档位同样没效果。
+/// 替上游做这个判断，代价是让一个**本来能用**的功能在 GPT 上也消失。
+///
+/// # 代价对比（为什么反转是对的）
+///
+/// - 声明了而上游忽略：用户切档位、看不出变化。**与不用我们时完全一样**，不是我们造成的。
+/// - 不声明而上游其实认：用户**彻底失去**原生档位控制，只能改用我们应用内那个设置
+///   （`inject_default_effort` 的兜底）。这是我们**独有**的损失。
+///
+/// 原注释里「一个『大多数时候生效』的选择器比没有选择器更糟」那句话，前提是**我们**在丢弃
+/// 那个值。这里我们没有丢——不确定性完全在上游侧，且与本代理是否存在无关。
 ///
 /// ⚠️ 「在册」= [`owners_of`] 筛过的那一组（**认识该模型的 Key**），不是全池。
-///
-/// 空列表返回 `false`（没有 Key 就没有依据，保守）。
-fn effort_survives_all_keys(keys: &[&ProviderKey]) -> bool {
+/// 空列表仍返回 `false`（没有 Key 就没有依据）。
+fn effort_reaches_upstream(keys: &[&ProviderKey]) -> bool {
+    // 目前三种协议都送得到，故只剩「有没有 Key」这一条。**刻意保留这个函数与那张表** ——
+    // 日后若新增一种压根送不出 effort 的上游形态，这里是唯一该加分支的地方，
+    // 而不是回到「按 protocol 猜上游认不认」。
     !keys.is_empty()
         && keys.iter().all(|k| match k.protocol {
-            // 我们自己算成 thinking.budget_tokens，生效与上游认不认 effort 无关。
-            Protocol::Anthropic => true,
-            // 原生语义，原样透传。
-            Protocol::OpenaiResponses => true,
-            // 落成顶层 reasoning_effort，认不认全看上游；cc-switch 实测 Kimi/GLM/Qwen/
-            // MiniMax/MiMo/SiliconFlow 一律忽略。不赌。
-            Protocol::OpenaiChat => false,
+            Protocol::Anthropic | Protocol::OpenaiResponses | Protocol::OpenaiChat => true,
         })
 }
 
@@ -252,7 +273,7 @@ fn owners_of<'a>(name: &str, keys: &'a [ProviderKey]) -> Vec<&'a ProviderKey> {
 /// 不该声明时返回**空数组** —— 实测空数组是合法的（`glm-4.6` 那条探针），Codex 不报错、
 /// 只是那个模型在 UI 上没有档位可选。
 fn effort_levels_for(name: &str, keys: &[ProviderKey]) -> Vec<Value> {
-    if !effort_survives_all_keys(&owners_of(name, keys)) {
+    if !effort_reaches_upstream(&owners_of(name, keys)) {
         return Vec::new();
     }
     EFFORT_LEVELS
@@ -712,15 +733,32 @@ fn select_model_at(
 /// **不会变**。没有这句话的话那个现象长得跟「功能没生效」一模一样,而用户能做的唯一正确
 /// 动作(重启一次 Codex)压根没人告诉他。这条消息同时进接入结果提示与事件流(重写客户端
 /// 配置那条链路也落它),所以它是这句提示唯一必须落地的地方 —— 不需要动任何前端文件。
-pub(super) fn apply_note(models: &[String]) -> String {
+pub(super) fn apply_note(models: &[String], keys: &[ProviderKey]) -> String {
     // 「远端压缩已关」这句无条件说，且措辞对两种情形都成立（我们没覆盖用户显式设的值）——
     // 不说的话用户不知道我们动过他的 Codex 功能开关，而那是个会影响他行为的事实。
     let compaction = "；顺带关掉了 Codex 的远端自动压缩（它绕过本代理直打官方、会报 401；\
                       你显式设过的值不动）";
+    // 🔴 档位改成一律声明之后（见 `effort_reaches_upstream`），选择器会对 Chat Completions
+    //    上游也出现，而部分供应商（Kimi/GLM/Qwen/MiniMax/MiMo/SiliconFlow）**忽略**
+    //    `reasoning_effort`。旧设计用「摘掉选择器」表达这件事，代价是 GPT 也跟着没了。
+    //    现在改成**如实说一句** —— 我们有依据说得精确（protocol 是已知的），故只在真有
+    //    Chat Key 时才提，且措辞是条件句（"取决于"），不承诺我们判断不了的事。
+    let n_chat = keys
+        .iter()
+        .filter(|k| k.protocol == Protocol::OpenaiChat)
+        .count();
+    let effort = if n_chat > 0 {
+        format!(
+            "；推理强度四档已全部声明，但其中 {n_chat} 条 Key 走 Chat Completions 协议 ——\
+             档位在那些 Key 上是否生效取决于上游（部分供应商只有「思考开/关」、会忽略它）"
+        )
+    } else {
+        String::new()
+    };
     match models.first() {
         Some(m) => format!(
             "，模型目录 {} 条（首个 {m}）—— 目录只在 Codex 启动时加载，\
-             之后改了模型列表要重启一次 Codex 才会看到{compaction}",
+             之后改了模型列表要重启一次 Codex 才会看到{compaction}{effort}",
             models.len()
         ),
         None => format!("，当前无可服务模型，故未写模型目录{compaction}"),
@@ -1000,52 +1038,59 @@ mod tests {
         }
     }
 
-    /// 🔴 口径必须是**交集**：一条 Chat 上游、且同样服务该模型的备用 Key 就足以让它不声明档位。
+    /// 🔴 **三种协议都要声明四档**（2026-09-07 反转，用户实报）。
     ///
-    /// 用超集（只看主 Key）的失效是：主 Key 走 Anthropic 所以声明了四档，
-    /// 故障转移落到那条 Chat 上游的备用 Key 上，档位当场静默失效。
-    /// ⚠️ 参与交集的**只有认识该模型的那些 Key**（`owners_of`），不是全池 —— 那一半由
-    /// `a_chat_key_that_does_not_serve_the_model_must_not_strip_its_levels` 钉住。
+    /// 这条替换了原先的 `one_chat_key_disables_effort_levels_for_the_whole_pool` ——
+    /// 那条钉的是「一条 Chat Key 就让整组不声明」，而那个口径的代价是：官方 Codex 对
+    /// GPT 模型显示四档，接入我们之后档位整个消失（用户实报 `gpt-5.6-luna`）。
+    ///
+    /// 判据改成「档位能不能**到达**上游」：三种协议都送得到（Anthropic 算 budget_tokens、
+    /// Responses 原样透传、Chat 区间转换成顶层 `reasoning_effort`），故都声明。
+    /// 上游认不认是上游的事 —— 详见 [`effort_reaches_upstream`] 的代价对比。
     #[test]
-    fn one_chat_key_disables_effort_levels_for_the_whole_pool() {
+    fn every_protocol_declares_all_four_levels() {
         let anth = key(Protocol::Anthropic, &[("m", None)]);
         let chat = key(Protocol::OpenaiChat, &[("m", None)]);
         let resp = key(Protocol::OpenaiResponses, &[("m", None)]);
 
-        assert_eq!(effort_levels_for("m", std::slice::from_ref(&anth)).len(), EFFORT_LEVELS.len());
-        assert_eq!(effort_levels_for("m", std::slice::from_ref(&resp)).len(), EFFORT_LEVELS.len());
+        for (name, k) in [("Anthropic", &anth), ("Chat", &chat), ("Responses", &resp)] {
+            assert_eq!(
+                effort_levels_for("m", std::slice::from_ref(k)).len(),
+                EFFORT_LEVELS.len(),
+                "{name} 上游必须声明全部四档 —— 档位送得到，认不认是上游的事"
+            );
+        }
+        // 混合池同样声明：一条 Chat 备用 Key 不该再抹掉档位（这就是本次反转）。
         assert_eq!(
-            effort_levels_for("m", &[anth.clone(), resp.clone()]).len(),
+            effort_levels_for("m", &[anth.clone(), chat.clone(), resp]).len(),
             EFFORT_LEVELS.len(),
-            "两种能生效的协议混合仍应声明"
+            "混合池仍要声明 —— 原口径在这里返回空，那正是用户报的回退"
         );
-        assert!(
-            effort_levels_for("m", &[anth, chat.clone()]).is_empty(),
-            "备用 Key 也服务该模型、且是 Chat 上游 → 必须不声明（这就是交集口径）"
-        );
-        assert!(effort_levels_for("m", std::slice::from_ref(&chat)).is_empty());
         assert!(effort_levels_for("m", &[]).is_empty(), "没有 Key 就没有依据");
     }
 
-    /// 🔴 交集只在**认识该模型的 Key** 之间取（[`owners_of`]），不是全池。
+    /// 🔴 **`owners_of` 那一维没有变**：不服务该模型的 Key 不参与判定。
     ///
-    /// 模型清单自 2026-08-31 起是各 Key 可服务集的**并集**，一条 Key 常常只服务其中一部分
-    /// 名字。拿全池取交集的失效是：一条只服务 `glm` 的 Chat Key 会把 Anthropic Key 独有的
-    /// `claude-x` 的档位声明也抹掉 —— 而 `claude-x` 的请求压根不会落到它身上
-    /// （`model_pool::rank_candidates` 先给认识它的那条）。
-    /// 表现是「Codex 里某些模型的推理强度选择器莫名不见了」，静默且极难归因。
+    /// 本次反转只动了「protocol 要不要卡」，没动「按模型算」。这条仍然要绿，因为
+    /// 「没有任何 Key 服务某个名字」时不该凭空声明档位 —— 那个名字压根不该在目录里。
     #[test]
-    fn a_chat_key_that_does_not_serve_the_model_must_not_strip_its_levels() {
+    fn levels_are_decided_per_model_not_per_pool() {
         let anth = key(Protocol::Anthropic, &[("claude-x", None)]);
         let chat = key(Protocol::OpenaiChat, &[("glm", None)]);
+        for name in ["claude-x", "glm"] {
+            assert_eq!(
+                effort_levels_for(name, &[anth.clone(), chat.clone()]).len(),
+                EFFORT_LEVELS.len(),
+                "{name} 有 Key 服务它 → 声明四档"
+            );
+        }
+        // ⚠️ **无人原生服务的名字不会得到空档位** —— `owners_of` 在那种情形下**回落全池**
+        //    （那个名字可能靠原样透传被服务）。所以唯一的空档位来源是「压根没有 Key」，
+        //    上一条已经钉住。第一版判据写成「nobody-serves-this 应为空」，实测即红。
         assert_eq!(
-            effort_levels_for("claude-x", &[anth.clone(), chat.clone()]).len(),
+            effort_levels_for("nobody-serves-this", &[anth, chat]).len(),
             EFFORT_LEVELS.len(),
-            "那条 Chat Key 不服务 claude-x，不该影响它的档位"
-        );
-        assert!(
-            effort_levels_for("glm", &[anth, chat]).is_empty(),
-            "而 glm 只有那条 Chat Key 服务 → 仍不声明"
+            "无人原生服务时回落全池，仍声明 —— 别把这里改成断言为空"
         );
     }
 
@@ -1084,27 +1129,46 @@ mod tests {
         );
     }
 
-    /// 同上，但那条 Chat Key **确实**服务该模型 → 它必须参与交集（这才是真该不声明的情形）。
+    /// 🔴 **一条真的服务该模型的 Chat Key 不再抹掉档位**（2026-09-07 反转）。
+    ///
+    /// 这条原先叫 `..._still_strips_its_levels`、断言为空，钉的是旧的交集口径。
+    /// 反转的理由：那个口径让官方 Codex 显示四档的 GPT 模型在接入我们之后档位整个消失
+    /// （用户实报 `gpt-5.6-luna`）。档位**送得到** Chat 上游（区间转换成顶层
+    /// `reasoning_effort`），认不认是上游的事。
     #[test]
-    fn a_chat_key_that_really_serves_the_model_still_strips_its_levels() {
+    fn a_chat_key_that_serves_the_model_no_longer_strips_its_levels() {
         let anth = key(Protocol::Anthropic, &[("shared", None)]);
         let chat = key(Protocol::OpenaiChat, &[("shared", None)]);
-        assert!(
-            effort_levels_for("shared", &[anth, chat]).is_empty(),
-            "两条都认识 shared，其中一条是 Chat 上游 → 档位在那一跳会静默失效，必须不声明"
+        assert_eq!(
+            effort_levels_for("shared", &[anth, chat]).len(),
+            EFFORT_LEVELS.len(),
+            "两条都认识 shared、其中一条走 Chat —— 旧口径在这里返回空，那正是用户报的回退"
         );
     }
 
     /// 无档位时 `default_reasoning_level` 必须是 `null`，不能留一个指向空列表的默认值。
+    ///
+    /// ⚠️ **夹具换过一次（2026-09-07）**：原先用一条 Chat Key 造「空档位」，而 Chat 现在也
+    /// 声明四档了（见 [`effort_reaches_upstream`] 的反转）。空档位如今**只有一个来源** ——
+    /// 压根没有 Key。判据本身没变，它守的是「两个字段必须同进同退」。
     #[test]
     fn no_levels_means_no_default_level() {
-        let chat = [key(Protocol::OpenaiChat, &[("m", None)])];
-        let e = one(&["glm-4.6"], &chat);
-        assert_eq!(e["supported_reasoning_levels"], json!([]));
-        assert_eq!(e["default_reasoning_level"], Value::Null);
+        let e = one(&["glm-4.6"], &[]);
+        assert_eq!(
+            e["supported_reasoning_levels"],
+            json!([]),
+            "没有任何 Key → 没有依据声明档位"
+        );
+        assert_eq!(
+            e["default_reasoning_level"],
+            Value::Null,
+            "档位为空时默认档必须是 null —— 指向一个空列表的默认值会让 Codex 拿到一个选不到的档"
+        );
 
+        // 反面：有 Key 就该同时有档位与默认档（否则上面那条在「永远为空」时空洞成立）。
         let anth = [key(Protocol::Anthropic, &[("m", None)])];
         let e = one(&["claude-opus-4-8"], &anth);
+        assert_eq!(e["supported_reasoning_levels"].as_array().unwrap().len(), EFFORT_LEVELS.len());
         assert_eq!(e["default_reasoning_level"], json!(DEFAULT_EFFORT));
     }
 
@@ -1621,13 +1685,47 @@ mod tests {
     /// 而那个现象长得跟「功能没生效」一模一样。这句提示是唯一会到达用户眼前的文本。
     #[test]
     fn the_apply_note_tells_the_user_to_restart_codex() {
-        let note = apply_note(&["a".to_string(), "b".to_string()]);
+        let anth = [key(Protocol::Anthropic, &[("m", None)])];
+        let note = apply_note(&["a".to_string(), "b".to_string()], &anth);
         assert!(note.contains('2'), "要报出条数：{note}");
         assert!(note.contains("重启"), "必须说清要重启 Codex：{note}");
-        let empty = apply_note(&[]);
+        let empty = apply_note(&[], &anth);
         assert!(
             !empty.contains("重启") && empty.contains("无可服务模型"),
             "没写目录时不该让人去重启：{empty}"
+        );
+    }
+
+    /// 🔴 **有 Chat Key 时必须如实说一句「档位是否生效取决于上游」**（2026-09-07）。
+    ///
+    /// 档位改成一律声明之后（见 [`effort_reaches_upstream`]），选择器对 Chat Completions
+    /// 上游也会出现，而部分供应商忽略 `reasoning_effort`。旧设计用「摘掉选择器」表达这件事，
+    /// 代价是 GPT 模型也跟着没了档位。现在改成如实说明 —— 但**只在真有 Chat Key 时说**，
+    /// 否则对纯 Anthropic/Responses 用户就是一句无关的噪音（他们的档位是确定生效的）。
+    ///
+    /// 措辞必须是**条件句**（"取决于"）：我们判断不了某个第三方中转到底认不认这个字段，
+    /// 而写成「不会生效」在 OpenAI 官方那类上游上是假话。同本仓「拿不到判断依据时把话写成
+    /// 条件句」那条。
+    #[test]
+    fn the_apply_note_is_honest_about_effort_on_chat_upstreams() {
+        let models = ["a".to_string()];
+        let chat = [
+            key(Protocol::Anthropic, &[("m", None)]),
+            key(Protocol::OpenaiChat, &[("m", None)]),
+        ];
+        let note = apply_note(&models, &chat);
+        assert!(note.contains("取决于上游"), "必须写成条件句：{note}");
+        assert!(note.contains('1'), "要报出有几条这样的 Key：{note}");
+        assert!(
+            !note.contains("不会生效") && !note.contains("没有效果"),
+            "不许断言「不生效」—— OpenAI o 系 / gpt-5 系是认这个字段的：{note}"
+        );
+
+        // 对照：没有 Chat Key 时不该出现这句（纯 Anthropic/Responses 池档位确定生效）。
+        let clean = [key(Protocol::OpenaiResponses, &[("m", None)])];
+        assert!(
+            !apply_note(&models, &clean).contains("取决于上游"),
+            "无 Chat Key 时这句是噪音"
         );
     }
 
