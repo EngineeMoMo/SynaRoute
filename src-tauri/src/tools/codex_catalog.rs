@@ -169,30 +169,40 @@ const REQUIRED_KEYS: &[&str] = &[
 /// 是这个仓库记过多次的那类假绿。
 const INSTRUCTIONS_TEMPLATE: &str = include_str!("codex_base_instructions.md");
 
-/// 我们声明的思考档位，**刻意与官方 `gpt-5.5` 那条一字不差**（`low/medium/high/xhigh`）。
+/// 我们声明的思考档位。
 ///
-/// # 🔴 为什么不含 `max` / `ultra`
+/// 🔴 **2026-09-07 按官方二进制实测改成六档**（`codex.exe` 26.901.5280.0，
+/// `codex debug models` 输出）。官方各模型并不一致：
 ///
-/// `ReasoningEffort` 枚举里有它们（官方 `gpt-5.6-*` 就声明了），但我们的
-/// `convert.rs::effort_to_thinking_budget` 只 match `minimal/low/medium/high/xhigh`，
-/// 其余走 `_ => return None` = **不开扩展思考**。也就是说声明 `max` 的后果是
-/// 「用户在 Codex 里选了最高档 → 反而完全不思考」，方向最坏的一种界面撒谎。
-/// 要加它们必须先在 `effort_to_thinking_budget` 里给出真实预算。
-/// 有 `declared_levels_are_all_understood_by_the_converter` 一条测试钉住。
+/// | 模型 | 档位 |
+/// |---|---|
+/// | `gpt-5.6-sol` / `terra` | low/medium/high/xhigh/**max**/**ultra** |
+/// | `gpt-5.6-luna` | low/medium/high/xhigh/**max** |
+/// | `gpt-5.5` / `5.4` / `5.2` | low/medium/high/xhigh |
 ///
-/// # 为什么也不含 `minimal`
+/// 我们一律声明全部六档。少声明对 5.6 系是回退（官方有、我们没有）；多声明对 5.5 系
+/// 的代价是 Codex UI 多出两档、请求时由 `convert.rs` 做区间转换
+/// （Anthropic 算成更高的 `budget_tokens`；Chat Completions 无这些档，钳到 `high`）。
+/// 代价不对称：少声明 = 用户彻底失去那两档；多声明 = 上游侧区间转换，与官方 Codex
+/// 打一个不认 `ultra` 的模型时行为同类。
 ///
-/// 它在转换器里是「不开思考」，语义真实，但官方 10 条基底**全都是 `low` 起**
-/// ——也就是 Codex UI 对 `minimal` 档的呈现没有被官方条目验证过。与官方对齐是这里
-/// 唯一能拿到的保证，不为多一档去赌它长什么样。
+/// 文案逐字抄自官方 `gpt-5.6-sol` 那条（`codex debug models` 输出）。
+///
+/// # 为什么仍不含 `minimal`
+///
+/// 它在转换器里是「不开思考」，语义真实，但官方全部可见条目都从 `low` 起 ——
+/// Codex UI 对 `minimal` 档的呈现没有被官方条目验证过。不为多一档去赌它长什么样。
 const EFFORT_LEVELS: &[(&str, &str)] = &[
-    ("low", "Fast responses with light reasoning"),
-    ("medium", "Balanced reasoning depth for everyday tasks"),
-    ("high", "Deeper reasoning for complex problems"),
-    ("xhigh", "Maximum reasoning depth SynaRoute can map"),
+    ("low", "Fast responses with lighter reasoning"),
+    ("medium", "Balances speed and reasoning depth for everyday tasks"),
+    ("high", "Greater reasoning depth for complex problems"),
+    ("xhigh", "Extra high reasoning depth for complex problems"),
+    ("max", "Maximum reasoning depth for the hardest problems"),
+    ("ultra", "Maximum reasoning with automatic task delegation"),
 ];
 
-/// 默认档位。与官方 `gpt-5.5` 的 `default_reasoning_level` 一致。
+/// 默认档位。官方 10 条基底里 8 条是 `medium`（例外：`gpt-5.6-sol` 与
+/// `gpt-daybreak-blue-latest` 是 `low`）—— 实测于 `codex debug models`，26.901.5280.0。
 const DEFAULT_EFFORT: &str = "medium";
 
 /// 这一组 Key 上，Codex 里选的思考档位能不能**到达**上游。
@@ -1029,13 +1039,40 @@ mod tests {
                  它会走 `_ => return None`（不开思考），也就是用户切档位毫无效果"
             );
         }
-        for banned in ["max", "ultra", "persistent"] {
+        for banned in ["persistent", "minimal"] {
             assert!(
                 !EFFORT_LEVELS.iter().any(|(l, _)| *l == banned),
-                "`{banned}` 在转换器里落到 `_ => None`（不开思考）。要声明它必须先在 \
-                 effort_to_thinking_budget 里给出真实预算"
+                "`{banned}` 不该出现在声明里：persistent 官方条目没有；minimal 在转换器里是「不开思考」，\
+                 且官方可见条目全都从 low 起"
             );
         }
+    }
+
+    /// 🔴 **声明的档位集合必须逐个对上官方实测值。**
+    ///
+    /// 这条 2026-09-07 补上，因为原有判据只比 `EFFORT_LEVELS.len()` 与它自己 ——
+    /// **自我满足的重言式**：把 `max`/`ultra` 整段删掉（= 用户报的那个回退本体，
+    /// 官方 `gpt-5.6-*` 有这两档而我们没有）28 条用例一条都不红（注入实测）。
+    /// 同本仓「判据自己的字面量在测试段里 → 扫全文件会自我满足」那条。
+    ///
+    /// 期望值抄自 `codex debug models`（codex.exe **26.901.5280.0**）：
+    /// `gpt-5.6-sol`/`terra` 六档、`gpt-5.6-luna` 五档（无 ultra）、`gpt-5.5`/`5.4`/`5.2` 四档。
+    /// 我们一律声明六档 —— 少声明对 5.6 系是回退，多声明由 `convert.rs` 区间转换兜住。
+    ///
+    /// ⚠️ 官方日后加档位时这条会红。那**正是它的用途**：红了就去跑一次
+    /// `codex debug models` 对账，而不是把期望值改成当前实现（那样它又变回重言式）。
+    /// 真二进制那条在 `catalog_is_accepted_by_the_real_codex_binary`（`#[ignore]`）。
+    #[test]
+    fn the_declared_levels_match_the_official_binary() {
+        let got: Vec<&str> = EFFORT_LEVELS.iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            got,
+            ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "档位集合与官方实测不符 —— 少了就是相对官方的回退，多了就是凭空声明"
+        );
+        // 顺序也钉住：Codex UI 按数组顺序渲染，乱序会让「极高」出现在「中」前面。
+        assert_eq!(got[4], "max", "max 必须排在 xhigh 之后");
+        assert_eq!(got[5], "ultra", "ultra 是最高档，必须排最后");
     }
 
     /// 🔴 **三种协议都要声明四档**（2026-09-07 反转，用户实报）。

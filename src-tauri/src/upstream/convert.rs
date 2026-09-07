@@ -91,7 +91,7 @@ fn effort_to_thinking_budget(effort: &str, max_tokens: u64) -> Option<u64> {
         "low" => 2048,
         "medium" => 8192,
         "high" => 16384,
-        "xhigh" => 32768,
+        "xhigh" => 32768, "max" => 65536, "ultra" => 131072, // 后两档官方 gpt-5.6-* 声明（26.901.5280.0 实测）
         _ => return None, // 未知档位：不擅自开思考
     };
     // Anthropic 硬约束：`budget_tokens >= 1024` 且 **< max_tokens** → max_tokens > 1024 即可开。
@@ -152,7 +152,7 @@ fn effort_for_chat_completions(effort: &str) -> Option<&'static str> {
         "low" => Some("low"),
         "medium" => Some("medium"),
         "high" => Some("high"),
-        "xhigh" => Some("high"), // Chat API 无 xhigh 档，钳到 high
+        "xhigh" | "max" | "ultra" => Some("high"), // Chat 只认到 high；钳而不是丢（丢 = 选最高档反而按默认思考）
         _ => None,
     }
 }
@@ -1712,7 +1712,51 @@ mod tests {
         );
         // 未知档位与 minimal 仍不开
         assert_eq!(effort_to_thinking_budget("minimal", 64_000), None);
-        assert_eq!(effort_to_thinking_budget("max", 64_000), None);
+        assert_eq!(effort_to_thinking_budget("persistent", 64_000), None);
+        // max / ultra 必须有预算（官方 gpt-5.6-* 声明了它们；落到 `_ => None` = 选最高档反而完全不思考）
+        assert_eq!(
+            effort_to_thinking_budget("max", 200_000),
+            Some(65536),
+            "max 的基准在宽裕窗口下原样给出"
+        );
+        assert_eq!(
+            effort_to_thinking_budget("ultra", 200_000),
+            Some(100_000),
+            "ultra 的基准 131072 被 max_tokens 的一半（100000）钳住"
+        );
+        // 递增必须严格：两档给同一个预算 = 用户切档位没有任何效果。
+        for (lo, hi) in [("low", "medium"), ("medium", "high"), ("high", "xhigh"), ("xhigh", "max"), ("max", "ultra")] {
+            let (a, b) = (
+                effort_to_thinking_budget(lo, 400_000).unwrap(),
+                effort_to_thinking_budget(hi, 400_000).unwrap(),
+            );
+            assert!(a < b, "{lo}({a}) 必须严格小于 {hi}({b})");
+        }
+    }
+
+    /// 🔴 **Chat Completions 侧：高于 high 的档位必须钳到 high，不能丢弃。**
+    ///
+    /// 这条 2026-09-07 补上 —— 此前**没有任何用例**把 `max`/`ultra` 喂进这个函数，
+    /// 于是把那条 match 臂退回只认 `xhigh`（= `max`/`ultra` 落到 `_ => None`）
+    /// 76 条 convert 用例一条都不红（注入实测）。
+    ///
+    /// 丢弃与钳制的差别是用户可感知的：丢弃 = 顶层 `reasoning_effort` 字段整个不发 →
+    /// 上游按它自己的默认档思考（通常是 medium），也就是「用户选了最高档反而降档」。
+    #[test]
+    fn chat_completions_clamps_every_tier_above_high() {
+        for effort in ["xhigh", "max", "ultra"] {
+            assert_eq!(
+                effort_for_chat_completions(effort),
+                Some("high"),
+                "{effort} 必须钳到 high —— 返回 None 会让字段整个不发，上游按默认档思考"
+            );
+        }
+        // 对照：Chat 认得的档位原样透传，别把它们也钳了。
+        for effort in ["minimal", "low", "medium", "high"] {
+            assert_eq!(effort_for_chat_completions(effort), Some(effort));
+        }
+        // 未知值仍返回 None（不落字段，避免严格上游 400）。
+        assert_eq!(effort_for_chat_completions("persistent"), None);
     }
 
     /// 结构化输出约束必须跨协议**双向**保留，且 `json_schema` 的包裹层要正确摊平/包回。

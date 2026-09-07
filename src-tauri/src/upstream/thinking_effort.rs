@@ -78,10 +78,18 @@ fn budget_to_hub(budget: u64) -> &'static str {
 
 /// Claude 的 `output_config.effort` → 中枢档位。
 ///
-/// 🔴 **两套档位的顶端名字不同**：Claude 的最高档叫 `max`，中枢（沿用 OpenAI 口径）
-/// 叫 `xhigh`。原样传 `max` 过去的后果是静默的 —— `effort_to_thinking_budget`
-/// 对未知档位走 `_ => return None`（「不擅自开思考」），也就是**用户选了最高档
-/// 反而完全不思考**，正是本仓 `codex_catalog` 里刻意不声明 `max` 档的同一个坑。
+/// Claude 的档位是 `low/medium/high/max`（4 档，见模块头 CLIProxyAPI 那条取证），
+/// 中枢自 2026-09-07 起是 `minimal/low/medium/high/xhigh/max/ultra`（按官方
+/// `codex debug models` 实测对齐）。**同名档直接对应**，Claude 的顶档 `max` 落中枢的 `max`。
+///
+/// ⚠️ **这里原先是 `"max" => Some("xhigh")`**，理由是「中枢不认 `max`，原样传过去会走
+/// `_ => return None` = 用户选了最高档反而完全不思考」。那个理由**已经不成立** ——
+/// `effort_to_thinking_budget` 现在给 `max` 65536 的预算。改成同名映射更忠实：
+/// Claude 的 `max` 与中枢的 `max` 描述同为「最高推理深度」。
+///
+/// 🔴 **刻意不映到 `ultra`**：那一档官方描述是 "Maximum reasoning with automatic task
+/// delegation" —— 多了「自动任务委派」这个 Claude 档位里压根没有的语义。把顶档对顶档
+/// 硬凑会给用户一个他没要求的行为。
 ///
 /// 未知值返回 `None`（不落字段），而不是猜一个档位：猜错的方向是「用户设了 A、
 /// 实际按 B 执行」，比不生效更难查。
@@ -91,7 +99,7 @@ fn claude_effort_to_hub(effort: &str) -> Option<&'static str> {
         "low" => Some("low"),
         "medium" => Some("medium"),
         "high" => Some("high"),
-        "max" => Some("xhigh"),
+        "max" => Some("max"),
         _ => None,
     }
 }
@@ -122,23 +130,43 @@ mod tests {
         }
     }
 
-    /// 🔴 两套档位的顶端名字不同：Claude 叫 `max`，中枢叫 `xhigh`。
-    /// 原样传 `max` 的后果是 `effort_to_thinking_budget` 走 `_ => None`，
-    /// 也就是**用户选了最高档反而完全不思考** —— 静默、且方向最坏。
+    /// 🔴 **Claude 的顶档 `max` 必须真的到达中枢并开出思考预算。**
+    ///
+    /// 这条测试 2026-09-07 改过一次，改的是**断言的方向**、不是它守的东西：
+    /// 原先断言 `max` 必须被翻成 `xhigh`，理由是「中枢不认 `max`，原样传 = 静默不思考」。
+    /// 中枢现在认了（`effort_to_thinking_budget` 给 65536），故改成同名映射。
+    ///
+    /// 它守的不变量始终是同一个：**用户选了最高档，就必须真的开出最高的预算** ——
+    /// 不管中间那一跳叫什么名字。所以判据落在「预算真的开出来了、且比 high 更高」，
+    /// 而不是落在某一个档位名上（钉名字的判据会在两套档位表变动时制造假红）。
     #[test]
-    fn claude_max_becomes_xhigh_not_max() {
+    fn claude_max_reaches_the_hub_and_opens_a_real_budget() {
         let body = json!({
             "thinking": { "type": "adaptive" },
             "output_config": { "effort": "max" },
         });
-        assert_eq!(request_effort(&body), Some("xhigh"), "max 必须落到中枢的最高档名");
-        assert_ne!(request_effort(&body), Some("max"), "原样传 max = 静默不思考");
-        // 反证这个坑真的存在：把 "max" 原样送进中枢，下游那一步压根不会开思考。
+        // 🔴 **必须精确等于 `max`**，不是「某个够高的档」。
+        //
+        // 第一版写成「预算 > high 就算过」，而 `xhigh`(32768) 与 `ultra` 都满足 ——
+        // 于是把映射改回 `xhigh`（静默降级）或改成 `ultra`（多给了 task delegation）
+        // 两种注入**都不红**（实测）。**钉性质而不钉值，前提是那个性质真的排他。**
+        assert_eq!(
+            request_effort(&body),
+            Some("max"),
+            "Claude 顶档必须落中枢同名档：xhigh 是静默降级，ultra 多了它没要求的自动任务委派"
+        );
+
+        // 端到端：那个档位名送进中枢，必须真的开出思考预算（而不是被 `_ => None` 吞掉）。
         let mut payload = json!({ "_pending_effort": "max" });
-        super::super::convert::apply_pending_thinking(&mut payload, 64_000);
+        super::super::convert::apply_pending_thinking(&mut payload, 400_000);
+        let budget = payload["thinking"]["budget_tokens"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("Claude 顶档必须开出思考预算，实际 payload={payload}"));
+        let mut high = json!({ "_pending_effort": "high" });
+        super::super::convert::apply_pending_thinking(&mut high, 400_000);
         assert!(
-            payload.get("thinking").is_none(),
-            "中枢不认 max —— 这就是为什么必须在这里翻成 xhigh：{payload}"
+            budget > high["thinking"]["budget_tokens"].as_u64().unwrap(),
+            "顶档预算必须高于 high：{budget}"
         );
     }
 
