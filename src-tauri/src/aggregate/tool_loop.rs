@@ -246,37 +246,50 @@ pub(super) async fn run_member_turns(
                 // 自己的开发机**上制造资源尖峰，而收益早在前几个就拿到了（模型一轮真正会读的
                 // 文件通常 2~5 个）。
                 //
-                // 🔴 **为什么用 `chunks` + `join_all`，不用 `StreamExt::buffered`**：
-                // 后者更精确（滑动窗口而非批屏障），但它把这些借用了 `calls` 的 future 塞进
-                // `FuturesOrdered`，推导出的 auto-trait bound 不够 general —— 实测会让
-                // **`mcp.rs` 里两处 `tokio::spawn` 编译失败**（`Send` is not general enough），
-                // 而那两处与本改动毫无关系。批屏障的代价（一批里最慢的拖住下一批）在 4 个一批、
-                // 正常 1~2 批的量级上可以忽略；让一个无关模块编译不过不行。
+                // 🔴 **滑动窗口用信号量，不用 `StreamExt::buffered`**。
+                //
+                // 想要的语义是「同时最多 N 个在跑，谁做完谁立刻让位」，而不是批屏障
+                // （一批里最慢的那个拖住下一批的全部）。两种实现方式：
+                //
+                // - `buffered(N)`：把借用了 `calls` 的 future 塞进 `FuturesOrdered`，
+                //   于是那个具体类型要参与 auto-trait 推导。实测它让 **`mcp.rs` 里两处与本
+                //   改动毫无关系的 `tokio::spawn`** 编译失败（`Send` is not general enough）
+                //   —— 那是 higher-ranked lifetime 推导的已知局限，不是「这条路走不通」。
+                // - **信号量 + `join_all`**（现在这样）：拿到同样的滑动窗口，而且压根不引入
+                //   `FuturesOrdered` 那个类型，推导问题从源头不存在。每个 future 自己在跑之前
+                //   `acquire` 一个许可、跑完自动归还，窗口天然随完成滑动。
+                //
+                // 本仓已经在三处用信号量表达并发上限（`gate.rs` 的聚合闸门是同一手法），
+                // 所以这也不是新概念。
+                //
+                // 🔴 **为什么要有上限**：`grep` 与 `codegraph_query` 都起子进程，在大仓库上单个
+                // 就吃满 IO。一轮放 16 个并发 `rg` 出去，是在**用户自己的开发机**上制造资源
+                // 尖峰，而收益早在前几个就拿到了（模型一轮真正会读的文件通常 2~5 个）。
                 //
                 // 🔴 **顺序必须保持**：两家协议都要求 tool_result 与 tool_use **一一对应**，
-                // 顺序错了上游直接 400。`join_all` 按入参顺序返回、批也按序拼接，故这条成立；
-                // 换成 `FuturesUnordered` / `buffer_unordered`（按完成顺序）会静默打乱配对。
-                let mut results = Vec::with_capacity(calls.len());
-                for batch in calls
-                    .iter()
-                    .enumerate()
-                    .collect::<Vec<_>>()
-                    .chunks(MAX_CONCURRENT_TOOLS)
-                {
-                    let done = join_all(batch.iter().map(|(idx, c)| async move {
-                        if *idx >= MAX_TOOL_CALLS_PER_TURN {
+                // 顺序错了上游直接 400。`join_all` **按入参顺序返回**（与完成顺序无关），
+                // 故这条成立；换成 `FuturesUnordered` / `buffer_unordered`（按完成顺序）
+                // 会静默打乱配对。信号量只影响「什么时候开始跑」，不影响返回顺序。
+                let permits = tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOLS);
+                let results: Vec<_> = join_all(calls.iter().enumerate().map(|(idx, c)| {
+                    let permits = &permits;
+                    async move {
+                        if idx >= MAX_TOOL_CALLS_PER_TURN {
                             // 超限：回一条错误结果，不执行（不起子进程、不读盘、不占字符预算）。
-                            // 模型据此在下一轮减少调用数。
+                            // 模型据此在下一轮减少调用数。**排在 acquire 之前**：被拒的调用
+                            // 不该占用窗口里的一个位置。
                             return crate::agent_tools::over_limit_result(
                                 c,
                                 MAX_TOOL_CALLS_PER_TURN,
                             );
                         }
+                        // `acquire` 只在信号量被 close 时返回 Err，而我们从不 close 它
+                        // —— 真拿不到许可时退化成「不限并发地执行这一个」，比整条调用失败好。
+                        let _permit = permits.acquire().await;
                         crate::agent_tools::execute(env, c).await
-                    }))
-                    .await;
-                    results.extend(done);
-                }
+                    }
+                }))
+                .await;
                 // 事件在**结果收齐之后**按原顺序补落：并发执行时若在各自的 future 里落事件，
                 // 日志顺序会随完成快慢抖动，而折叠键靠「相邻同名」生效 —— 抖动会让本该折叠的
                 // 两条分开、不该折叠的挨到一起。这里按 calls 的顺序走一遍，顺序恒定。

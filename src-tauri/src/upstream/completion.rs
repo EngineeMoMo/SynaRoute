@@ -198,15 +198,20 @@ async fn anthropic_message(
 
     let resp = req.send().await?;
     let status = resp.status();
+    // 🔴 **必须在 `resp.text()` 之前读头** —— 那个调用**消费掉 `resp`**，之后再读恒为 `None`。
+    // 这个值用来武装配额窗口（见 `AppError::Upstream::retry_after`），失效方向是静默的：
+    // 窗口永不武装、聚合每轮白撞一次 429，而代码看起来完全正常。
+    let retry_after = crate::proxy::parse_retry_after(resp.headers());
     // 先读文本再解析：上游可能返回 SSE 流（data: {...}）、HTML 错误页或非标准 JSON，
     // 直接 resp.json() 会得到笼统的「error decoding response body」，看不到上游到底返回了啥。
     let raw = resp.text().await?;
     if !status.is_success() {
         // 传**真实状态码**：消息里拼了响应体，绝不能让重试判定去里面猜（见
         // `is_retriable_upstream_error` 的文档：401 + 响应体含「请检查网络连接」曾被误判可重试）。
-        return Err(AppError::upstream_http(
+        return Err(AppError::upstream_http_after(
             status.as_u16(),
             format!("Anthropic HTTP {status}: {}", truncate_body(&raw)),
+            retry_after,
         ));
     }
     record_usage_from_raw(&raw);
@@ -247,12 +252,15 @@ async fn openai_chat(
 
     let resp = req.send().await?;
     let status = resp.status();
+    // 读头必须排在 `text()` 之前，理由同 `anthropic_message`（那里有全文）。
+    let retry_after = crate::proxy::parse_retry_after(resp.headers());
     let raw = resp.text().await?;
     if !status.is_success() {
         // 传真实状态码，理由同 `anthropic_message`。
-        return Err(AppError::upstream_http(
+        return Err(AppError::upstream_http_after(
             status.as_u16(),
             format!("OpenAI HTTP {status}: {}", truncate_body(&raw)),
+            retry_after,
         ));
     }
     record_usage_from_raw(&raw);

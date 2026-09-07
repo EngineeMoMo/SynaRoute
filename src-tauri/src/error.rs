@@ -25,8 +25,18 @@ pub enum AppError {
     ///
     /// `Display` 输出**刻意保持**原格式（`上游请求错误: {msg}`）——前端文案与
     /// docs 里的实测字符串都按这个格式对过，改了会连带破坏那些判据。
+    /// `retry_after` 是上游 `Retry-After` 头解析出来的秒数（只在它真给了时才是 `Some`）。
+    ///
+    /// 🔴 **为什么是独立字段，而不是从 `msg` 里 parse 出来**：同上面那条「状态码必须是独立
+    /// 字段」的理由 —— 从人类可读文本里反推一个数字，在文案改动时会静默失效。而这个值的
+    /// 用途是**武装配额窗口**（`health::quota_window`），失效方向是「一个撞了配额的 Key
+    /// 每轮都被白打一次」，完全静默。
+    ///
+    /// 转发路径（`proxy.rs`）自己读响应头、不经过这个字段；它存在是为了让**大脑聚合**那条
+    /// 路径也能学到配额 —— 聚合按 `keyId::model` 精确调用、不走故障转移，所以它拿不到
+    /// `proxy.rs` 那两处的好处。
     #[error("上游请求错误: {msg}")]
-    Upstream { status: Option<u16>, msg: String },
+    Upstream { status: Option<u16>, msg: String, retry_after: Option<i64> },
 
     #[error("代理错误: {0}")]
     Proxy(String),
@@ -143,13 +153,30 @@ impl AppError {
     /// 改动最小，也让「有状态码」变成必须显式写出来的事——避免有人图省事一律传 `None`，
     /// 那会把重试判定退回到「连接层失败一律重试」的粗粒度。
     pub fn upstream_msg(msg: impl Into<String>) -> Self {
-        AppError::Upstream { status: None, msg: msg.into() }
+        AppError::Upstream { status: None, msg: msg.into(), retry_after: None }
     }
 
     /// 构造带 HTTP 状态码的上游错误。`status` 用于 [`crate::upstream::is_retriable_upstream_error`]
     /// 判定是否值得重试，**不要**再从 `msg` 里反推。
     pub fn upstream_http(status: u16, msg: impl Into<String>) -> Self {
-        AppError::Upstream { status: Some(status), msg: msg.into() }
+        AppError::Upstream { status: Some(status), msg: msg.into(), retry_after: None }
+    }
+
+    /// 同 [`Self::upstream_http`]，但带上上游 `Retry-After` 头解析出来的秒数。
+    ///
+    /// 单独一个构造器而不是给 `upstream_http` 加参数：那个函数有 15 个调用点，
+    /// 而其中只有「读到了响应头」的少数几处拿得到这个值。加参数会让另外那些被迫写
+    /// `None` —— 而一个到处都是 `None` 的参数，下一个人会照着抄成 `None`。
+    pub fn upstream_http_after(status: u16, msg: impl Into<String>, retry_after: Option<i64>) -> Self {
+        AppError::Upstream { status: Some(status), msg: msg.into(), retry_after }
+    }
+
+    /// 上游要求的等待秒数（只在上游真给了 `Retry-After` 时为 `Some`）。
+    pub fn upstream_retry_after(&self) -> Option<i64> {
+        match self {
+            AppError::Upstream { retry_after, .. } => *retry_after,
+            _ => None,
+        }
     }
 
     /// 上游 HTTP 状态码；非 `Upstream` 变体或连接层失败均返回 `None`。

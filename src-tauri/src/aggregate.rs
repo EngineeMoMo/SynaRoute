@@ -1,12 +1,8 @@
 //! 大脑聚合引擎 V2（FR-013 ~ FR-017）。
 //!
-//! 流程：
-//! 1. 文件检索（retrieval 模块）→ 相关文件上下文
-//! 2. 参与者并行思考（只读：收到 prompt + 文件上下文，输出建议）
-//! 3. 聚合（compressed / full）
-//! 4. 决策者分两阶段：
-//!    - Phase1: 输出修改计划（plan）
-//!    - Phase2: 用户确认后执行修改（apply）
+//! 流程：① 文件检索（retrieval）→ 相关文件上下文；② 参与者并行思考（只读，收 prompt +
+//! 文件上下文、出建议）；③ 聚合（compressed / full）；④ 决策者两阶段 —— Phase1 出修改计划
+//! （plan），Phase2 用户确认后执行（apply）。
 
 use crate::error::{AppError, AppResult};
 use crate::aggregate_phase::{
@@ -24,10 +20,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
 
-/// 决策者输出 → 落盘（解析、六道防线、备份 + 原子写）。
-///
-/// `#[path]` 挂在这里而不是拆成目录模块：`aggregate.rs` 棘轮余量曾为 0，而写路径要补的
-/// 防线比原先那段 `parse_and_apply` 还多。理由同 `lan_guard` / `log_rotate`。
+/// 决策者输出 → 落盘（解析、六道防线、备份 + 原子写）。`#[path]` 挂载而非拆目录模块：
+/// 本文件棘轮余量曾为 0，而写路径要补的防线比原 `parse_and_apply` 还多（同 `lan_guard`）。
 #[path = "aggregate/write.rs"]
 pub(crate) mod write;
 
@@ -1032,10 +1026,9 @@ async fn call_ref(
     let key = store
         .get_key(key_id)
         .ok_or_else(|| AppError::NotFound(key_id.into()))?;
-    // 禁用**且未开「允许大脑聚合使用」**的 Key 不发任何请求：用户禁用常因欠费/出问题
-    // （想止损），而决策者请求内嵌全部成员答案、是整轮最重的一笔。判据与 gather_members 同口径
-    // —— 否则用户在 Key 页禁用决策者后聚合照常烧它的额度，界面日志无任何提示，正是最忌讳的
-    // 静默失效。文案点明三条出路（含那条开关）：只说「已禁用」会把人送去做无效操作。
+    // 禁用**且未开「允许大脑聚合使用」**的 Key 不发任何请求（用户禁用常因欠费想止损，而
+    // 决策者是整轮最重的一笔）。判据与 gather_members 同口径，否则聚合照常烧额度且日志无提示。
+    // 文案点明三条出路（含那条开关）：只说「已禁用」会把人送去做无效操作。
     if !key.enabled && !key.allow_in_aggregate {
         return Err(AppError::Invalid(format!(
             "Key「{}」已被禁用，无法作为决策者/汇总者调用。\
@@ -1066,7 +1059,16 @@ async fn call_ref(
     let req_timeout = Duration::from_millis(budget_ms.saturating_add(5_000));
     let call = upstream::text_completion(&key, &secret, model, prompt, max_tokens, retry, req_timeout);
     let result = match timeout(Duration::from_millis(budget_ms), call).await {
-        Ok(r) => r?,
+        // 🔴 上游说「N 秒后再来」就武装配额窗口。**只在它真给了头时**武装 —— 凭空造窗口会
+        // 误挡偶发限流的好 Key。取证与两个方向的判据见
+        // `an_upstream_retry_after_arms_the_quota_window_from_the_aggregate_path`。
+        Ok(Err(e)) => {
+            if let Some(secs) = e.upstream_retry_after() {
+                crate::health::quota_window::arm(store, category, &key.id, secs);
+            }
+            return Err(e);
+        }
+        Ok(Ok(r)) => r,
         Err(_) => {
             return Err(AppError::upstream_msg(format!(
                 "调用 {} 超时（超过单次预算 {}ms）",
@@ -1075,10 +1077,8 @@ async fn call_ref(
             )));
         }
     };
-    // 上游偶发返回 200 但 content 为空（厂商限流后的降级 / 模型自身弃答）。若原样返回
-    // 空字符串，会被上层当成有效答案继续流转，用户看到「成功但空响应」难以排障。
-    // 显式判空 → 转成错误让调用方(决策者/汇总者/降级独答)按失败路径处理，或让 MCP
-    // 客户端看到明确错误提示。
+    // 上游偶发 200 但 content 为空（厂商限流降级 / 模型弃答）。原样返回空串会被上层当成有效
+    // 答案继续流转，用户看到「成功但空响应」难以排障 → 显式判空转成错误走失败路径。
     if result.trim().is_empty() {
         return Err(AppError::upstream_msg(format!(
             "调用 {} 返回空响应（上游 200 但 content 为空，通常是限流后厂商降级）",
@@ -1787,6 +1787,99 @@ mod tests {
         );
     }
 
+    /// 起一个只会回固定状态码 + 可选 `Retry-After` 的假上游。
+    ///
+    /// 刻意不改 `spawn_scripted`（十几个用例依赖它恒回 200）—— 那个函数的契约是「回这些
+    /// 响应体」，把状态码变成参数会让每个调用点都要多写一个 `200`。
+    async fn spawn_status(status: u16, retry_after: Option<&'static str>) -> String {
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::{Bytes, Incoming};
+        use hyper::service::service_fn;
+        use hyper::{Request, Response};
+        use hyper_util::rt::TokioIo;
+        use std::net::SocketAddr;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<Incoming>| async move {
+                        let _ = req.into_body().collect().await;
+                        let mut b = Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json");
+                        if let Some(ra) = retry_after {
+                            b = b.header("retry-after", ra);
+                        }
+                        let resp = b
+                            .body(
+                                Full::new(Bytes::from(r#"{"error":{"message":"rate limited"}}"#))
+                                    .map_err(|n: std::convert::Infallible| -> std::io::Error {
+                                        match n {}
+                                    })
+                                    .boxed(),
+                            )
+                            .unwrap();
+                        Ok::<_, hyper::Error>(resp)
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// 🔴 **上游给了 `Retry-After` → 聚合必须武装配额窗口**（本轮补的接线）。
+    ///
+    /// `gate.rs` 一直**读**这个窗口，缺的是**写**。而 429 刻意不计熔断（那条规则是对的），
+    /// 于是熔断层也兜不住 —— 修之前的表现是一条撞了配额的 Key **每一轮聚合都白打一次**，
+    /// 每轮重复且完全静默。
+    ///
+    /// **两个方向一起钉**（第二个是这个改动唯一可能引入的误伤方向）：
+    /// ① 上游给了头 → 必须武装；② 上游**没给**头 → **绝不许**凭空造窗口
+    /// （凭空造会把一条只是偶发限流的 Key 挡上一段时间）。
+    ///
+    /// ⚠️ Key id 用 `qw_agg_*` 独有前缀：`quota_window` 是**进程级**表，而套件并行跑 ——
+    /// CLAUDE.md 记过一次「共用短 id 让全量红 8 条」的实测。
+    #[tokio::test]
+    async fn an_upstream_retry_after_arms_the_quota_window_from_the_aggregate_path() {
+        for (retry_after, want_armed, why) in [
+            (Some("42"), true, "上游明说 42 秒后再来，必须武装"),
+            (None, false, "上游没给头 → 不许凭空造窗口（会误挡偶发限流的 Key）"),
+        ] {
+            let upstream = spawn_status(429, retry_after).await;
+            let (_sdir, store) = test_store("agg_qw");
+            let mut key = test_key(&upstream);
+            // 每个分支独有 id，且与别处不撞。
+            key.id = format!("qw_agg_{}", if retry_after.is_some() { "hit" } else { "none" });
+            store.upsert_key(key.clone()).unwrap();
+            store.secrets.write().set(&key.id, "sk-x").unwrap();
+            assert!(!crate::health::quota_window::active(&key.id), "开局不该有窗口");
+
+            let err = call_ref(
+                &store,
+                CategoryType::ClaudeCli,
+                &format!("{}::mock/m", key.id),
+                "在吗",
+                60_000,
+            )
+            .await
+            .expect_err("429 必须是错误");
+            assert!(err.to_string().contains("429"), "错误里应带真实状态码：{err}");
+            assert_eq!(
+                crate::health::quota_window::active(&key.id),
+                want_armed,
+                "{why}（err={err}）"
+            );
+        }
+    }
+
     /// 端到端：模型先要求 read_file → 本地执行 → 结果回填 → 第二轮给出最终答案。
     #[tokio::test]
     async fn tool_loop_executes_tool_then_returns_final_text() {
@@ -2285,15 +2378,31 @@ mod tests {
     ///
     /// ⚠️ **扫的是 `aggregate/tool_loop.rs`**，不是本文件 —— 工具循环搬过去之后这条判据
     /// 曾指着旧路径继续绿（那时它扫到的文件里压根没有那段代码）。本轮实际红过一次才发现。
+    ///
+    /// ⚠️ **判据钉的是「上限存在」这个性质，不是某一种实现手法。** 第一版写死
+    /// `.chunks(MAX_CONCURRENT_TOOLS)`（批屏障），于是把实现换成**更好的**信号量滑动窗口时
+    /// 它当场变红 —— 而那次改动并没有破坏任何一条它想守的东西。钉手法的判据会在有人改进
+    /// 实现时制造假红，同 CLAUDE.md 那条「判据要钉住来源/性质，不要钉住某个写法」。
     #[test]
     fn tool_calls_must_run_concurrently_and_stay_ordered() {
         let src = std::fs::read_to_string("src/aggregate/tool_loop.rs").unwrap();
         let prod = crate::proxy::custom_headers::production_code_only(&src);
+        // 两种表达上限的手法都接受：批屏障（chunks）或滑动窗口（Semaphore）。
+        // 关键是那个常量真的被用在限流上，而不是定义了却没人读。
+        let bounded = prod.contains(".chunks(MAX_CONCURRENT_TOOLS)")
+            || prod.contains("Semaphore::new(MAX_CONCURRENT_TOOLS)");
         assert!(
-            prod.contains(".chunks(MAX_CONCURRENT_TOOLS)"),
+            bounded,
             "一轮里的多个只读工具必须并发执行，且并发度要限流 —— \
              grep/codegraph 都起子进程，16 路齐发是在用户开发机上制造资源尖峰"
         );
+        // 用信号量时还得真的等许可 —— 只 new 一个不 acquire 等于没限流。
+        if prod.contains("Semaphore::new(MAX_CONCURRENT_TOOLS)") {
+            assert!(
+                prod.contains("permits.acquire().await"),
+                "建了信号量却不 acquire = 上限只是个摆设（16 路照旧齐发）"
+            );
+        }
         assert!(
             !prod.contains("buffer_unordered") && !prod.contains("FuturesUnordered"),
             "不许用按完成顺序收集的方式 —— tool_result 与 tool_use 按位置配对，乱序即上游 400"
