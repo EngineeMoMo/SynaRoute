@@ -27,8 +27,57 @@ pub(crate) fn annotate(upstream_err: &str) -> Option<&'static str> {
     if upstream_err.contains("bad_response_status_code") {
         return Some(GATEWAY_UPSTREAM_NOTE);
     }
+    if is_encrypted_reasoning(upstream_err) {
+        return Some(ENCRYPTED_REASONING_NOTE);
+    }
     None
 }
+
+/// Responses 侧「加密的推理内容解不开」。
+///
+/// # 🔴 这一支是**取证钩子**，不是修复
+///
+/// 2026-09-06 专门查过一轮，结论是**我们手上没有真实错误文案**：
+///
+/// - `invalid_encrypted_content`（第三方 README 提到的那个码）在 codex.exe
+///   **0.151.0-alpha.7.2 里 0 命中** —— 它若存在也是**上游 API** 的码，不是 Codex 的；
+/// - codex.exe 里 `failed to decrypt` 那两处**与推理无关**（一处是 agent identity 的
+///   encrypted task id，一处是它自己的 secrets 文件）；
+/// - 但机制是确凿的：`reasoning.encrypted_content` 在 codex.exe 里以 Responses API 的
+///   `include[]` 取值出现，旁边还有一段官方指引原文「with `store: false` or ZDR,
+///   request and replay `reasoning.encrypted_content`」。也就是说 Codex **确实**会
+///   请求并回放这个字段，而我们同协议直通时会把它原样转给**另一个账号**。
+///
+/// 所以本轮**刻意不做字段摘除**（那是 `thinking_rectify` 那条路，而那里「修一个 400 换来
+/// 另一个 400」踩过三次，摘字段的边界必须先有真实响应）。这一支做的是**让真实文案到手**：
+/// 命中就给一段说明，用户会把它连同上游原文一起报上来 —— 那时才有依据决定要不要整流。
+///
+/// 判据刻意宽（`encrypted_content` 出现即认），因为这一支只**追加说明**、不改任何请求，
+/// 误命中的代价是多一段话；而漏掉的代价是用户拿到一句零说明的英文。
+fn is_encrypted_reasoning(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("encrypted_content") || (e.contains("encrypted") && e.contains("reasoning"))
+}
+
+/// # 为什么这条也要一段说明
+///
+/// 与 `THINKING_SIGNATURE_INVALID` **同族**：推理内容由签发它的那个上游账号加密，
+/// 换 Key 之后新账号解不开。区别只在协议 —— 那条是 Anthropic 的 `thinking.signature`，
+/// 这条是 Responses 的 `reasoning.encrypted_content`。
+///
+/// 🔴 文案**不许说「已自动处理」**：我们对这一条什么都没做（理由见 [`is_encrypted_reasoning`]）。
+/// 反过来要**明确请用户把原文报上来** —— 这是我们拿到真实错误形态的唯一途径。
+const ENCRYPTED_REASONING_NOTE: &str =
+    "\n\n【SynaRoute 说明】这条与**加密的推理内容**（Responses 协议的 `reasoning.encrypted_content`）有关，\n\
+     不是密钥或额度问题。它与 Claude 那边的「扩展思考签名校验失败」是同一族：\n\
+     推理内容由**签发它的那个上游账号**加密，续聊时要原样回放给同一个账号；\n\
+     故障转移换了 Key、或你把历史会话切到了另一个上游之后，新账号解不开它。\n\
+     可行动的两条：\n\
+     • **开一个新会话**（历史里没有旧的加密内容就不会再撞）；\n\
+     • 把这个会话**固定在一条 Key** 上（分类页里只启用一条，或设为主 Key 并暂停其余）。\n\
+     注：SynaRoute 对这个字段**不做任何改写**（与思考块不同，那一条我们会自动摘除后重试）。\n\
+     🙏 如果你看到了这段话，请把**上游返回的原始错误文本**一并反馈给我们 ——\
+     这类错误的真实文案我们还没拿到，有了它才能判断能不能自动修掉。";
 
 /// 扩展思考签名校验失败的三种写法。
 ///
@@ -111,6 +160,54 @@ mod tests {
         assert!(
             !note.contains("扩展思考"),
             "别把两支搞混 —— 那会把人指向一个完全无关的方向"
+        );
+    }
+
+    /// 加密推理内容那一支：要认出来、要说清同族关系、**且不许声称我们处理过它**。
+    ///
+    /// 这一支是取证钩子（理由见 `is_encrypted_reasoning` 的文档）。三条断言各对应一种错法：
+    /// 认不出 → 用户拿到一句零说明的英文；说成「已自动处理」→ 用户据此排除掉真相；
+    /// 与思考签名那支混淆 → 指向一个我们并没有对它做的自动修复。
+    #[test]
+    fn encrypted_reasoning_is_recognised_without_claiming_we_fixed_it() {
+        for err in [
+            r#"{"error":{"message":"Invalid value for 'reasoning.encrypted_content'"}}"#,
+            "HTTP 400: could not decrypt encrypted reasoning item",
+            r#"{"error":{"code":"invalid_encrypted_content"}}"#,
+        ] {
+            let note = annotate(err).unwrap_or_else(|| panic!("认不出：{err}"));
+            assert!(note.contains("加密的推理内容"), "{err} → {note}");
+            assert!(
+                note.contains("不做任何改写"),
+                "必须如实说我们没动它 —— 否则用户会排除掉真相所在的方向"
+            );
+            assert!(
+                note.contains("原始错误文本"),
+                "必须请用户把上游原文报上来：那是我们拿到真实形态的唯一途径"
+            );
+            assert!(!note.contains("已自动摘除"), "那是思考块那一支做的事，这一支没做");
+        }
+    }
+
+    /// 两支不许互相串味。
+    ///
+    /// ⚠️ 判据刻意**不是**「加密那支里不许出现『扩展思考签名』」—— 它的说明里就该点出
+    /// 「与那一族同源」，那是有用的上下文（第一版写成不许出现，被自己的文案打回）。
+    /// 真正要分清的是**可行动的那一位**：思考块我们会自动摘除后重试，加密内容我们什么都不做。
+    #[test]
+    fn the_two_families_do_not_cross_annotate() {
+        let thinking = annotate("THINKING_SIGNATURE_INVALID").unwrap();
+        assert!(thinking.contains("已自动摘除"), "思考块那一支要说清我们做过什么");
+        assert!(
+            !thinking.contains("encrypted_content"),
+            "思考签名那支不该提另一个协议的字段"
+        );
+
+        let reasoning = annotate("reasoning.encrypted_content is invalid").unwrap();
+        assert!(reasoning.contains("加密的推理内容"));
+        assert!(
+            !reasoning.contains("已自动摘除"),
+            "加密内容我们什么都没做 —— 说做过就是界面撒谎"
         );
     }
 
