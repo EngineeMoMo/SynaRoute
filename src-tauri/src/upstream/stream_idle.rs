@@ -84,17 +84,33 @@ fn idle_error_event(idle: Duration) -> Bytes {
 /// 返回 `Pin<Box<dyn Stream>>` 而不是 `impl Stream`：`unfold` 产出的类型不是 `Unpin`，
 /// 而 proxy.rs 的跨协议翻译流会对它直接 `.next().await`（要求 Unpin）。装箱是这里唯一
 /// 一次堆分配，发生在每个流开始时、不在数据路径上。
+/// # 🔴 `permit` 为什么搭在这里
+///
+/// 它是每 Key 并发上限（[`crate::concurrency`]）的槽位，本函数**只负责让它活着**。
+/// 挂在这个位置是因为流式请求在拿到 2xx 之后才是真正占用上游那一段（SSE 可达几分钟）——
+/// 在 `send()` 返回时就释放，等于只限制了「同时握手的数量」，而那个上限会**静默地什么都不限**。
+///
+/// 搬进 `unfold` 的状态里而不是让调用方持有：流被 drop（正常结束 / 客户端断开 /
+/// 静默超时注入后终止）时它跟着 drop，不需要在三条终止路径上各写一次释放。
 pub(crate) fn guard<S>(
     stream: S,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + Sync>>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + Sync + 'static,
 {
-    Box::pin(guard_with(stream, IDLE_LIMIT))
+    Box::pin(guard_with(stream, IDLE_LIMIT, Some(permit)))
 }
 
 /// [`guard`] 的可注参数版本（测试用短超时，生产走常量）。
-fn guard_with<S>(stream: S, idle: Duration) -> impl Stream<Item = Result<Bytes, reqwest::Error>>
+///
+/// `permit` 是 `Option` 只为测试方便（起一个真信号量只为验超时逻辑是纯噪音）；
+/// 生产路径恒为 `Some` —— 有源码级判据钉着 `guard` 的调用点必须传一个真 permit。
+fn guard_with<S>(
+    stream: S,
+    idle: Duration,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> impl Stream<Item = Result<Bytes, reqwest::Error>>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + Sync + 'static,
 {
@@ -104,12 +120,14 @@ where
         /// 已注入超时事件：再被 poll 一次就结束，不会重复注入。
         Done,
     }
-    futures_util::stream::unfold(St::Live(Box::pin(stream)), move |st| async move {
+    // permit 跟着状态一起搬。**不许在这里 `let _ = permit;`** —— 那会当场释放槽位，
+    // 让整个并发上限退化成「只限握手」，而那种失效完全静默。
+    futures_util::stream::unfold((St::Live(Box::pin(stream)), permit), move |(st, permit)| async move {
         match st {
             St::Live(mut s) => match tokio::time::timeout(idle, s.next()).await {
-                Ok(Some(item)) => Some((item, St::Live(s))),
+                Ok(Some(item)) => Some((item, (St::Live(s), permit))),
                 Ok(None) => None,
-                Err(_) => Some((Ok(idle_error_event(idle)), St::Done)),
+                Err(_) => Some((Ok(idle_error_event(idle)), (St::Done, permit))),
             },
             St::Done => None,
         }
@@ -129,7 +147,7 @@ mod tests {
     async fn a_stalled_stream_gets_an_error_event_the_breaker_can_see() {
         let live: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from("chunk1"))];
         let stalled = futures_util::stream::iter(live).chain(futures_util::stream::pending());
-        let mut g = Box::pin(guard_with(stalled, Duration::from_millis(50)));
+        let mut g = Box::pin(guard_with(stalled, Duration::from_millis(50), None));
 
         // 正常块原样透传
         let first = g.next().await.expect("第一块该到").expect("不该是错误");
@@ -163,6 +181,7 @@ mod tests {
         let mut g = Box::pin(guard_with(
             futures_util::stream::iter(live),
             Duration::from_secs(30),
+            None,
         ));
         assert_eq!(g.next().await.unwrap().unwrap(), Bytes::from("a"));
         assert_eq!(g.next().await.unwrap().unwrap(), Bytes::from("b"));
@@ -178,10 +197,24 @@ mod tests {
     fn both_streaming_exits_must_go_through_the_idle_guard() {
         let src = std::fs::read_to_string("src/proxy.rs").unwrap();
         let prod = crate::proxy::custom_headers::production_code_only(&src);
+        // ⚠️ **钉「两条出口都套了」这个性质，不钉某一种调用形态。**
+        //
+        // 第一版写死 `guard_stream_idle(resp.bytes_stream())` 这个**逐字**的串，于是任何给
+        // `guard_stream_idle` 加参数的改动都会让它变红 —— 哪怕两条出口仍然都套着。
+        // 我曾据此把「并发限流」判成做不到（那件事需要给这个 guard 传一个 permit），
+        // 而真正的障碍只是这一行断言。同 `tool_calls_must_run_concurrently` 那条：
+        // **钉手法的判据会在有人改进实现时制造假红，而假红的代价是改进被撤回去。**
+        //
+        // 现在按「函数名出现两次 + 每次都吃 `resp.bytes_stream()`」判，加参数不受影响。
         assert_eq!(
-            prod.matches("guard_stream_idle(resp.bytes_stream())").count(),
+            prod.matches("guard_stream_idle(").count(),
             2,
             "同协议直通与跨协议翻译两条流式路径都要套静默超时"
+        );
+        assert_eq!(
+            prod.matches("resp.bytes_stream()").count(),
+            2,
+            "两处字节流都必须交给 guard_stream_idle，不许有第三处裸用"
         );
         assert!(
             !prod.contains("let upstream = resp.bytes_stream();"),

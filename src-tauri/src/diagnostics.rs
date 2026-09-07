@@ -92,6 +92,8 @@ pub(crate) struct DiagnosticsEnv {
     pub(crate) exe_path: String,
     /// 各分类代理的 (运行中, 端口)。
     pub(crate) proxy: Vec<(CategoryType, bool, Option<u16>)>,
+    /// Claude CLI 期望的入口，用来判「环境变量指向别处」。空串 = 拿不到。
+    pub(crate) claude_cli_endpoint: String,
 }
 
 /// 报告里最多附多少条事件。
@@ -188,6 +190,14 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
     }
     let _ = writeln!(r);
 
+    // 客户端环境变量冲突。**必须进报告**：这一类的失效形态是「接入提示说成功、请求一个都
+    // 没到代理」，而排障者拿到报告后看到的是一份完全正确的 config —— 没有这一段，
+    // 「settings.json 写对了为什么不生效」在报告里零线索。只在真有发现时打（同上两条的取舍）。
+    if let Some(section) = crate::tools::env_conflicts::diagnostics_section(&env.claude_cli_endpoint)
+    {
+        let _ = writeln!(r, "{section}");
+    }
+
     let _ = writeln!(r, "## 代理状态");
     for (cat, running, port) in &env.proxy {
         let _ = writeln!(
@@ -210,7 +220,7 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
         for k in keys {
             let _ = writeln!(
                 r,
-                "- [{}] {} | 协议={:?} | 优先级={} | 启用={} | 允许聚合={} | 余额={} | 配额窗口={} | 有密钥={} | 状态={:?} 失败计数={} 熔断至={:?} 延迟={:?}ms | 模型数={} 映射数={}",
+                "- [{}] {} | 协议={:?} | 优先级={} | 启用={} | 允许聚合={} | 余额={} | 配额窗口={} | 在途={}/{} | 有密钥={} | 状态={:?} 失败计数={} 熔断至={:?} 延迟={:?}ms | 模型数={} 映射数={}",
                 k.id,
                 k.name,
                 k.protocol,
@@ -225,6 +235,11 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
                 // 配额窗口不进 `HealthState`（进程级，见其模块头），所以**熔断至那一列看不到它**。
                 // 不打这一位的话，「这条 Key 没被熔断、余额也够，为什么被跳过」在报告里零线索。
                 if crate::health::quota_window::active(&k.id) { "生效中" } else { "无" },
+                // 并发上限也是进程级、也不进 `HealthState`。打「在途/上限」两个数字是因为
+                // 撞满时的表现是**请求变慢**（在我们这边排队），而那与「上游慢」在用户侧
+                // 长得一模一样 —— 没有这一位，排障者会去查上游而真相在代理内部。
+                crate::health::concurrency::in_flight(&k.id),
+                crate::health::concurrency::MAX_INFLIGHT_PER_KEY,
                 k.has_secret,
                 k.health.status,
                 k.health.fail_count,
@@ -406,6 +421,7 @@ mod tests {
             app_version: "9.9.9".into(),
             exe_path: "C:\\test\\synaroute.exe".into(),
             proxy: vec![(CategoryType::ClaudeCli, true, Some(8787))],
+            claude_cli_endpoint: String::new(),
         };
         let report = build_diagnostics_report(&store, &env);
 
@@ -453,6 +469,7 @@ mod tests {
             app_version: "9.9.9".into(),
             exe_path: "C:\\test\\synaroute.exe".into(),
             proxy: vec![(CategoryType::ClaudeCli, false, None)],
+            claude_cli_endpoint: String::new(),
         };
         let once = build_diagnostics_report(&store, &env);
         let twice = crate::tools::redact_config_secrets(&once);

@@ -1637,20 +1637,18 @@ async fn try_stream_to_key(
 
     // 探头阶段超时 = min(Key 自身超时, 故障转移剩余预算)，与非流式的 `effective_to` 同口径。
     //
-    // **只约束探头阶段**（等上游返回响应头/状态码），拿到 2xx 之后一律不再设超时：
-    // 一旦开始转发 SSE，掐断就等于把长回答截断——那是本项目刻意避免的行为。
-    // 而探头阶段不产出任何内容、卡住只是白等，超时让故障转移及时进入下一个候选。
-    //
-    // 为什么必须把 `key_timeout` 也算进来（本轮修的缺口）：此前这里**只用 budget_left**，
-    // 于是 ① 用户为该 Key 设的超时（如 10s）对流式完全无效，仍要等满 90s 总预算；
-    // ② 更糟的是把总预算设成 0（关闭）时 `budget_left` 为 None，流式探头**没有任何超时**
-    // ——上游连上却不回响应头就永久挂着，直到 TCP 自己断。而 Claude Code / Codex 默认都发
-    // `stream:true`，这是主路径。用户为了「别掐断长回答」去关总预算，恰恰会踩中这个组合。
+    // **只约束探头阶段**（等响应头/状态码），拿到 2xx 后一律不再设超时：转发 SSE 期间掐断
+    // 等于截断长回答；而探头阶段不产出内容、卡住只是白等，超时让故障转移及时进下一个候选。
+    // `key_timeout` 必须也算进来（曾修的缺口）：只用 `budget_left` 时 ① 用户为该 Key 设的
+    // 超时对流式完全无效，仍等满总预算；② 总预算设成 0（关闭）时它为 None → 流式探头**零
+    // 超时**，上游连上却不回响应头就永久挂着。而 CC / Codex 默认发 `stream:true`，是主路径。
     let key_to = crate::upstream::key_timeout(key);
     let probe_to = match budget_left {
         Some(b) => key_to.min(b),
         None => key_to,
     };
+    // 并发槽位：满了就在这里排队（不拒绝，理由见 `concurrency` 模块头）。
+    let permit = crate::health::concurrency::acquire(&key.id).await;
     let send_fut = rb.send();
     let resp = match tokio::time::timeout(probe_to, send_fut).await {
         Ok(r) => r.map_err(|e| AppError::upstream_msg(format!("连接 {url} 失败: {e}")))?,
@@ -1760,7 +1758,7 @@ async fn try_stream_to_key(
             // 不再自己拼 detail —— detail 由流开始时那条同步日志负责，补记只往里补用量。
             let req_model2 = requested_model.to_string();
 
-            let byte_stream = crate::upstream::guard_stream_idle(resp.bytes_stream()).map(move |chunk| {
+            let byte_stream = crate::upstream::guard_stream_idle(resp.bytes_stream(), permit).map(move |chunk| {
                 // 闭包持有守卫；闭包被 drop → 守卫 Drop → 通知补记任务。
                 let _ = &end_guard;
                 match chunk {
@@ -1845,7 +1843,7 @@ async fn try_stream_to_key(
                 custom_tools,
                 search_tools,
             );
-            let upstream = crate::upstream::guard_stream_idle(resp.bytes_stream());
+            let upstream = crate::upstream::guard_stream_idle(resp.bytes_stream(), permit);
 
             // 用量补记三要素（与同协议分支同一套定位口径：分类 + key + collapse_key）。
             // 跨协议这条路**不用**尾窗 + `extract_usage_from_sse`：翻译器边收边转，尾窗里
@@ -2405,6 +2403,8 @@ async fn forward_to_key(
         &real_model,
     );
 
+    // 并发槽位。非流式不用搬运它：`resp.bytes()` 在同一作用域 await 完，permit 随函数返回落地。
+    let _permit = crate::health::concurrency::acquire(&key.id).await;
     // 连接层失败（DNS/超时/拒连）仍返回 Err，附带目标 URL 便于定位。
     let resp = rb
         .send()
@@ -2914,9 +2914,10 @@ fn error_resp_with_retry_after(
     builder.body(full_body(bytes)).unwrap()
 }
 
-/// 从上游响应头解析 `Retry-After`（RFC 7231）：既支持「秒数」也支持 HTTP-date。
-/// 解析不出（缺头/格式怪/已过期）返回 None，由调用方回退到自己的退避口径。
-fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<i64> {
+/// 从上游响应头解析 `Retry-After`（RFC 7231）：秒数与 HTTP-date 两种形态；解析不出
+/// （缺头/格式怪/已过期）返回 None，由调用方回退自己的退避口径。`pub(crate)` 供
+/// `upstream::completion` 共用（聚合也要武装配额窗口）—— 抄一份迟早只有一份被修。
+pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<i64> {
     let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
     let raw = raw.trim();
     // 形态一：delta-seconds。
@@ -2929,9 +2930,8 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<i64> {
     Some(delta.clamp(0, MAX_RETRY_AFTER_SECS))
 }
 
-/// `Retry-After` 采纳上限（秒）。上游偶有返回极大值（甚至几小时）的情况；照抄会让客户端
-/// 长时间彻底不再重试，而我们的 Key 可能几秒后就恢复（换 Key、改配置都会立即解除短路）。
-/// 取 300s：足够表达「别急着重试」，又不至于把客户端锁死。
+/// `Retry-After` 采纳上限（秒）。上游偶有返回极大值（几小时）；照抄会让客户端长时间彻底不再
+/// 重试，而我们的 Key 可能几秒后就恢复（换 Key / 改配置都立即解除短路）。300s 是折中。
 const MAX_RETRY_AFTER_SECS: i64 = 300;
 
 #[cfg(test)]

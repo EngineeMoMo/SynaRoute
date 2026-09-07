@@ -11,6 +11,11 @@ pub(crate) mod balance_gate;
 #[path = "quota_window.rs"]
 pub(crate) mod quota_window;
 
+/// 弹性第五层：每 Key 并发上限。前四层都是「出了事之后」，这一层管「别把上游打到失败」。
+/// 挂在这里的理由同 quota_window（同族 + 三个「自然家」余量都是 0）。
+#[path = "concurrency.rs"]
+pub(crate) mod concurrency;
+
 use crate::model::{HealthState, HealthStatus};
 use crate::store::Store;
 use crate::upstream;
