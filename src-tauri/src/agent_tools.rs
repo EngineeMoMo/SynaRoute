@@ -2,31 +2,33 @@
 //!
 //! ## 为什么要有它
 //!
-//! 原先的检索是 [`crate::retrieval::retrieve_detailed`] 在成员调用**之前**跑一次：从 prompt
-//! 抽关键词、猜哪些文件相关、把内容整包塞进 prompt。猜错了就是白填几万 token，猜漏了模型只能
-//! 盲答。给成员一组按需检索的工具，让它自己一步步挖，比一次性猜准得多。
+//! 原先 [`crate::retrieval::retrieve_detailed`] 在成员调用**之前**跑一次：抽关键词、猜哪些
+//! 文件相关、整包塞进 prompt。猜错白填几万 token，猜漏模型只能盲答。给成员一组按需检索的
+//! 工具让它自己挖，比一次性猜准得多。
 //!
 //! ## 边界：只读，永不写盘、永不执行命令
 //!
-//! 与既有设计一致——聚合只出主意，落盘由客户端（Claude Code 等）自己做。故这里没有
-//! `write_file` / `run_command`。唯一起的子进程是 `rg` 与 `codegraph`，都是只读查询。
+//! 聚合只出主意，落盘由客户端自己做，故没有 `write_file` / `run_command`。唯一起的子进程是
+//! `rg` 与 `codegraph`，都是只读查询。
+//!
+//! 成功结果会被 [`crate::aggregate::fence`] 的 nonce 围栏包住（与检索文件共用同一道）。
 //!
 //! ## 三道防线（每个涉及路径的工具都必须过）
 //!
-//! 工具参数来自模型输出，而 prompt 里混着检索到的项目文件内容 —— 即模型可能被内容里的
-//! 注入指令诱导。且**工具结果会进上游请求体**：读到什么就等于把什么发给第三方中转商。
+//! 工具参数来自模型输出，而模型可能被检索内容里的注入指令诱导；且**工具结果会进上游请求体**：
+//! 读到什么就等于把什么发给第三方中转商。
 //!
 //! 1. [`crate::aggregate::write::is_safe_relative_path`]：字符串级，拒 `..`、绝对路径、盘符、UNC
 //! 2. [`crate::aggregate::write::is_within_work_root`]：canonicalize 后仍须在工作目录内，堵链接逃逸
 //! 3. [`crate::retrieval::is_sensitive_path`]：凭据类文件一律拒读
 //!
-//! 第 3 道比前两道更要紧：前两道只防「读到工作目录**外**」，第 3 道防「读到工作目录**内**的
-//! 密钥文件」——`.env` 就在项目里，前两道全部通过。且它要判**两次**：一次按模型给的名字，
-//! 一次按解析链接后的真实落点（`notes.md` → `.env` 这种目录内链接能骗过按名字那一次）。
+//! 第 3 道最要紧：前两道只防「读到工作目录**外**」，它防「读到目录**内**的密钥文件」——
+//! `.env` 就在项目里，前两道全部通过。且要判**两次**：按模型给的名字一次、按解析链接后的
+//! 真实落点一次（`notes.md` → `.env` 这种目录内链接能骗过按名字那次）。
 //!
 //! ## 也承载 MCP `images` 参数的加载
 //!
-//! [`load_images`] 放在这里而不是 `mcp`：图片路径同样来自外部输入、同样要过上面那三道防线，
+//! [`load_images`] 放这里而不是 `mcp`：图片路径同样来自外部输入、同样要过那三道防线，
 //! 而防线实现（[`resolve_readable`]）就在本模块。放两处必然漂移。
 
 use crate::aggregate::write::{is_safe_relative_path, is_within_work_root};
@@ -83,10 +85,13 @@ pub struct ToolEnv {
     /// 做成字段而不是常量：它直接决定每轮历史的增量，是用户控成本最直接的旋钮。
     /// 调小 → 每次看到的片段更短、可能多调几次；调大 → 单次信息更全但额度涨得快。
     result_cap: usize,
+    /// 本轮围栏。**必填**（是 `detect` 的入参而非 `Option`）：缺了它工具结果裸着回去，
+    /// 而 prompt 里已告诉模型「结果会被包起来」—— 两边不一致比都不包更糟。
+    fence: crate::aggregate::fence::Fence,
 }
 
 impl ToolEnv {
-    pub async fn detect(work_dir: &Path) -> Self {
+    pub async fn detect(work_dir: &Path, fence: crate::aggregate::fence::Fence) -> Self {
         let indexed = work_dir.join(".codegraph").is_dir();
         let resolved = crate::codegraph::resolve().await;
         let (codegraph, note) = match (resolved, indexed) {
@@ -105,6 +110,7 @@ impl ToolEnv {
             codegraph,
             codegraph_note: note,
             result_cap: RESULT_CHAR_CAP,
+            fence,
         }
     }
 
@@ -122,6 +128,7 @@ impl ToolEnv {
             codegraph: None,
             codegraph_note: None,
             result_cap: RESULT_CHAR_CAP,
+            fence: crate::aggregate::fence::Fence::new(),
         }
     }
 }
@@ -243,184 +250,10 @@ fn resolve_readable(work_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     Ok(real)
 }
 
-/// 若 `real` 存在任一**敏感命名**的硬链接别名，返回那个敏感名字；否则 `None`。
-///
-/// 硬链接绕过的本质：`.env` 与 `notes.md` 指向同一 inode 时，读 `notes.md` 等于读 `.env`，
-/// 而路径字符串与 canonicalize 结果都是 `notes.md` —— 名字/落点两道判定全部放行。
-/// 唯一可靠判据是比对**文件身份**：这里直接枚举同卷上指向同一文件记录的所有路径名
-/// （Win32 `FindFirstFileNameW`/`FindNextFileNameW`），逐个过 [`is_sensitive_path`]。
-///
-/// **保守 fail-open**：枚举 API 本身失败（非 NTFS 卷、权限不足、路径过长）时返回 `None`。
-/// 理由：这是名字/落点两道判定**之后**的第三道加固，前两道仍在；且枚举失败通常意味着底层
-/// 文件系统根本不支持硬链接、本无此攻击面。宁可放行也不把正常读路径在边缘环境上全拦死。
-#[cfg(windows)]
-/// Windows：枚举文件的全部硬链接名，若存在敏感命名的别名则返回它；否则 `None`。
-///
-/// 实现策略：优先尝试 `FindFirstFileNameW` 精确枚举所有别名（只拒有敏感名的），
-/// 若该 API 不可用（某些环境返回 `ERROR_NOT_SUPPORTED`），退化为检查硬链接数 `nNumberOfLinks`，
-/// 多链接文件一律 fail-closed（与 Unix 策略对齐）。
-#[cfg(windows)]
-fn sensitive_hardlink_alias(real: &Path) -> Option<String> {
-    // 先尝试精确枚举（最优）
-    if let Some(alias) = try_enumerate_hardlinks(real) {
-        return Some(alias);
-    }
-
-    // 枚举不可用时退化为链接数检测（fail-closed）
-    use std::fs::File;
-    use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-    };
-
-    let file = File::open(real).ok()?;
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    let ok = unsafe {
-        GetFileInformationByHandle(
-            HANDLE(file.as_raw_handle() as *mut _),
-            &mut info,
-        )
-        .is_ok()
-    };
-
-    if ok && info.nNumberOfLinks > 1 {
-        Some(format!(
-            "nNumberOfLinks={} (无法枚举别名，为安全起见拒绝所有多链接文件)",
-            info.nNumberOfLinks
-        ))
-    } else {
-        None
-    }
-}
-
-/// 尝试用 `FindFirstFileNameW` 精确枚举硬链接别名。成功时返回第一个敏感名，失败返回 `None`。
-#[cfg(windows)]
-fn try_enumerate_hardlinks(real: &Path) -> Option<String> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows::core::{PCWSTR, PWSTR};
-    use windows::Win32::Foundation::{
-        GetLastError, ERROR_HANDLE_EOF, ERROR_MORE_DATA, HANDLE, MAX_PATH,
-    };
-    use windows::Win32::Storage::FileSystem::{
-        FindClose, FindFirstFileNameW, FindNextFileNameW,
-    };
-
-    // FindXxxFileNameW 返回的是「卷内相对路径」（如 \path\to\.env），不含盘符。
-    // 敏感判定只看**叶子文件名**，卷内相对路径足够取到叶子名，无需拼回盘符。
-
-    // FindFirstFileNameW 不支持 \\?\ 前缀（canonicalize 返回的扩展路径）。
-    // 需要 strip 掉该前缀后再传给 API。
-    let path_str = real.to_string_lossy();
-    let normalized = path_str.strip_prefix(r"\\?\").unwrap_or(&path_str);
-
-    let wide: Vec<u16> = normalized.encode_utf16().chain(std::iter::once(0)).collect();
-
-    // 缓冲区长度（字符数）。先给 MAX_PATH，不够时按 ERROR_MORE_DATA 提示的长度重来。
-    let mut len: u32 = MAX_PATH;
-    let mut buf: Vec<u16> = vec![0u16; len as usize];
-
-    // SAFETY: wide 以 NUL 结尾；buf 容量 = len；handle 成功后必定 FindClose。
-    let handle: HANDLE = loop {
-        let mut try_len = len;
-        let r = unsafe {
-            FindFirstFileNameW(PCWSTR(wide.as_ptr()), 0, &mut try_len, PWSTR(buf.as_mut_ptr()))
-        };
-        match r {
-            Ok(h) => {
-                break h;
-            }
-            Err(_) => {
-                // 缓冲不足：try_len 被写成所需长度，扩容重试一次。其它错误一律放行。
-                let err = unsafe { GetLastError() };
-                if err == ERROR_MORE_DATA && try_len > len {
-                    len = try_len;
-                    buf = vec![0u16; len as usize];
-                    continue;
-                }
-                // API 不可用（ERROR_NOT_SUPPORTED 等），返回 None 让调用方退化到链接数检测
-                return None;
-            }
-        }
-    };
-
-    let mut found: Option<String> = None;
-    loop {
-        // 当前 buf 里是一个卷内相对路径（NUL 结尾）。取叶子名判敏感。
-        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        let rel_path = std::ffi::OsString::from_wide(&buf[..end]);
-        if is_sensitive_path(Path::new(&rel_path)) {
-            let leaf = Path::new(&rel_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| rel_path.to_string_lossy().into_owned());
-            found = Some(leaf);
-            break;
-        }
-        // 下一条别名。
-        let mut next_len = len;
-        let r = unsafe {
-            FindNextFileNameW(handle, &mut next_len, PWSTR(buf.as_mut_ptr()))
-        };
-        if r.is_err() {
-            let e = unsafe { GetLastError() };
-            if e == ERROR_MORE_DATA && next_len > len {
-                len = next_len;
-                buf = vec![0u16; len as usize];
-                // 重试当前这一条（FindNextFileNameW 缓冲不足时不推进游标）。
-                let mut retry_len = len;
-                if unsafe {
-                    FindNextFileNameW(handle, &mut retry_len, PWSTR(buf.as_mut_ptr()))
-                }
-                .is_err()
-                {
-                    break;
-                }
-                continue;
-            }
-            // ERROR_HANDLE_EOF = 枚举结束（正常）；其它错误保守停止。
-            let _ = ERROR_HANDLE_EOF;
-            break;
-        }
-    }
-
-    // SAFETY: handle 来自成功的 FindFirstFileNameW。
-    unsafe {
-        let _ = FindClose(handle);
-    }
-    found
-}
-
-/// macOS/Unix：标准库能可靠拿到 inode 的链接数，但不能从 inode 反查同文件系统上的
-/// 全部路径名。对**常规文件** `nlink > 1` 时无法证明其它名字里没有 `.env`/密钥文件，故 fail-closed。
-///
-/// **目录必须豁免**：Unix 目录的 nlink 天然大于 1（= 子目录数 + 2），macOS 上
-/// `.`/`src`/`sub` 这类普通目录实测 nlink=2~6。若对目录也判 nlink>1，只读工具连
-/// 普通目录都拒 —— 这正是本次 mac CI 抓到的 3 条回归（list_dir / grep / read_file
-/// 全因「路径 `.` 被拒 nlink=6」失败）。
-///
-/// 这不是理论攻击面：`ln .env notes.md` 无需任何特权，canonicalize(notes.md) 仍是
-/// notes.md，按「输入名 + 真实落点」两次敏感判定都会放行。复制文件会得到独立 inode，
-/// 用户确有读取需求时可复制一份；安全工具不该拿无法验证的别名碰运气。
-#[cfg(unix)]
-fn sensitive_hardlink_alias(real: &Path) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-    let md = std::fs::metadata(real).ok()?;
-    // 只防「常规文件被硬链接别名」。目录、符号链接（前面 canonicalize 已处理）、
-    // 特殊文件（socket/FIFO/设备）不在凭据别名攻击面内。
-    if !md.is_file() {
-        return None;
-    }
-    let nlink = md.nlink();
-    (nlink > 1).then(|| format!("nlink={nlink}"))
-}
-
-/// 其它非 Windows/非 Unix 平台（当前 Tauri 桌面目标不会走到）：保守拒绝无法获取元数据的情况
-/// 会误伤所有文件，故维持 no-op；新增平台时必须显式实现并补测试。
-#[cfg(not(any(windows, unix)))]
-fn sensitive_hardlink_alias(_real: &Path) -> Option<String> {
-    None
-}
+/// 硬链接别名检测（三个平台分支 + 各自的 fail-open/closed 论证）。`#[path]` 挂载：本文件余量为 0。
+#[path = "agent_tools/hardlink.rs"]
+mod hardlink;
+use hardlink::sensitive_hardlink_alias;
 
 /// 加载 MCP `images` 参数指定的图片，编码成可直接进请求体的 [`ImagePart`]。
 ///
@@ -506,9 +339,16 @@ pub async fn execute(env: &ToolEnv, call: &ToolInvocation) -> ToolResultMsg {
         }
     };
     match result {
+        // 🔴 围栏包在**截断之后**（反过来会把闭合标签切掉 → 块永不闭合、边界静默消失），
+        //    且**只包成功结果**（错误正文是我们自己的文案，包起来会盖住「这次失败了」）。
+        //    两条各有一条判据 + 注入验证，详见 aggregate::fence 模块头。
         Ok(content) => ToolResultMsg {
             id: call.id.clone(),
-            content: cap_result(content, env.result_cap),
+            content: env.fence.wrap(
+                "tool_result",
+                &format!(" tool=\"{}\"", call.name),
+                &cap_result(content, env.result_cap),
+            ),
             is_error: false,
         },
         Err(msg) => ToolResultMsg {
@@ -1740,6 +1580,71 @@ mod tests {
         // 非匹配行（如 rg 的提示）不该被当成命中
         assert_eq!(split_rg_line("some: note: here"), None);
         assert_eq!(split_rg_line("no colons"), None);
+    }
+
+    /// 🔴 **接线判据：成功的工具结果必须真的被围栏包住。**
+    ///
+    /// [`crate::aggregate::fence`] 里那 5 条只测 `Fence` 自己 —— 把这里的 `env.fence.wrap(..)`
+    /// 换回裸 `cap_result(..)`，它们**照样全绿**，而那正是缺陷本体（工具结果裸着回给模型，
+    /// 而 prompt 里那句说明已经告诉它「结果会被包起来」）。这是本仓第 20 次同类盲区。
+    ///
+    /// 同时钉住三条**边界**：错误结果不包、截断发生在包之前、工具名进属性。
+    #[tokio::test]
+    async fn a_successful_tool_result_is_fenced_and_an_error_one_is_not() {
+        let w = work("fence");
+        std::fs::write(w.join("a.txt"), "hello\n").unwrap();
+        let env = ToolEnv::bare(&w);
+        let id = env.fence.id().to_string();
+
+        let ok = execute(&env, &call("read_file", json!({ "path": "a.txt" }))).await;
+        assert!(!ok.is_error, "{}", ok.content);
+        assert!(
+            ok.content.starts_with(&format!("<tool_result id=\"{id}\"")),
+            "成功结果必须以本轮围栏开标签起头：{}",
+            ok.content
+        );
+        assert!(
+            ok.content.ends_with(&format!("</tool_result id=\"{id}\">")),
+            "必须以闭标签收尾 —— 缺了它模型看不到边界：{}",
+            ok.content
+        );
+        assert!(
+            ok.content.contains("tool=\"read_file\""),
+            "工具名要进属性，供模型分辨这段是哪次调用的产物"
+        );
+        assert!(ok.content.contains("hello"), "正文原样保留");
+
+        // 边界①：错误结果**不包** —— 那是我们自己写的文案，不是不可信内容；
+        // 包起来会让「这次失败了」被一层数据标签盖住，模型更难换方向。
+        let err = execute(&env, &call("read_file", json!({ "path": "../x" }))).await;
+        assert!(err.is_error);
+        assert!(
+            !err.content.contains("<tool_result"),
+            "错误结果不该被围栏包住：{}",
+            err.content
+        );
+    }
+
+    /// 🔴 **截断必须发生在围栏之前，否则闭合标签本身会被切掉。**
+    ///
+    /// 反过来的话模型收到一个永不闭合的块 —— 边界消失、整道防护失效，而失效方向是静默的
+    /// （结果正文常常远超上限，所以这不是边角情形，是**常态**）。
+    #[tokio::test]
+    async fn the_fence_survives_truncation() {
+        let w = work("fencecap");
+        // 远超 result_cap 的内容，保证真的走到截断分支。
+        std::fs::write(w.join("big.txt"), "x".repeat(50_000)).unwrap();
+        let mut env = ToolEnv::bare(&w);
+        env.result_cap = 1_000;
+        let id = env.fence.id().to_string();
+
+        let r = execute(&env, &call("read_file", json!({ "path": "big.txt" }))).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            r.content.ends_with(&format!("</tool_result id=\"{id}\">")),
+            "闭合标签被截断吃掉了 —— 围栏包在了截断之前"
+        );
+        std::fs::remove_dir_all(&w).ok();
     }
 
     #[tokio::test]

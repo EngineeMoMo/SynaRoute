@@ -13,10 +13,10 @@
   ],
   "newFileCapLines": 900,
   "frozen": {
-    "src-tauri/src/agent_tools.rs": 1117,
+    "src-tauri/src/agent_tools.rs": 957,
     "src-tauri/src/aggregate.rs": 1189,
     "src-tauri/src/balance.rs": 1088,
-    "src-tauri/src/lib.rs": 1868,
+    "src-tauri/src/lib.rs": 1867,
     "src-tauri/src/model.rs": 2024,
     "src-tauri/src/proxy.rs": 2936,
     "src-tauri/src/secret.rs": 1126,

@@ -169,7 +169,17 @@ pub(crate) async fn run(
         vec![]
     };
     let file_count = files.len();
-    let file_context = format_file_context(&files);
+    // 本轮围栏：检索文件与工具结果**共用同一个 nonce**，那句说明因此只发一遍。
+    // 建在这里是因为两个消费者（下面的 file_context 与 prepare_tool_env）都要它。
+    let fence = super::fence::Fence::new();
+    let tool_env =
+        prepare_tool_env(store, category, brain, effective_work_dir.as_deref(), &fence).await;
+    let fence_tags: &[&str] = if tool_env.is_some() {
+        &["file", "tool_result"]
+    } else {
+        &["file"]
+    };
+    let file_context = format_file_context(&fence, &files, fence_tags);
     let file_section = if file_context.is_empty() {
         String::new()
     } else {
@@ -213,10 +223,14 @@ pub(crate) async fn run(
 
     // 1. 参与者并行分析（只读）—— 每个成员固定打自己的 Key+模型，失败不换 Key
     //    预算 = 剩余整轮时间 − 决策者保底。
-    let member_prompt = build_member_prompt(prompt, &file_context);
+    // 工具在但没有检索文件时，围栏说明只能挂在 prompt 上（见 build_member_prompt 的文档）。
+    let member_prompt = build_member_prompt(
+        prompt,
+        &file_context,
+        tool_env.as_ref().map(|_| &fence).filter(|_| files.is_empty()),
+    );
     let members_budget =
         upstream_phase_budget_ms(remaining_ms(deadline), decider_floor, PHASE_MIN_BUDGET_MS);
-    let tool_env = prepare_tool_env(store, category, brain, effective_work_dir.as_deref()).await;
     let gathered = gather_members(
         store,
         category,

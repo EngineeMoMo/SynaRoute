@@ -35,6 +35,10 @@ mod round;
 #[path = "aggregate/gate.rs"]
 mod gate;
 
+/// 不可信内容的 nonce 围栏，**检索文件与工具结果共用**（各写一份必然漂移）。
+#[path = "aggregate/fence.rs"]
+pub(crate) mod fence;
+
 /// 喂给模型的 prompt 怎么拼。**检索到的文件用随机 nonce 围栏包起来** ——
 /// 那段安全推理（六道防线挡不住「写什么」被劫持）在它的模块头里。
 #[path = "aggregate/prompt.rs"]
@@ -98,19 +102,15 @@ fn trace_for_ref(
 ///
 /// # 为什么这个两行函数值得存在
 ///
-/// 聚合的每一条 `append_event_full` 此前都把 `key_id` 传成 `None` —— **8 处全是**，
-/// 其中 6 处带着 usage。而 `store.rs` 的累加器键是 `(分类, key_id.unwrap_or_default())`，
-/// 于是这些消耗全部落进 `(分类, "")` 这一个桶：
+/// 聚合的每一条 `append_event_full` 此前都把 `key_id` 传成 `None`（**8 处全是**，6 处带 usage），
+/// 而累加器键是 `(分类, key_id.unwrap_or_default())` → 消耗全落进 `(分类, "")` 一个桶：
+/// 用量页显示「（系统级）」，且 `usage_cost::rows` 查不到 Key → 取不到代表模型与计费倍率
+/// → **花费列恒为「—」**（用户报的正是这个）。
 ///
-/// - 用量页显示成「（系统级）」，用户看不出是哪条 Key 花的钱；
-/// - `usage_cost::rows` 拿空 keyId 查不到 Key → 取不到代表模型、也取不到计费倍率
-///   → **花费列恒为「—」**（用户报的正是这个）。
-///
-/// 而 key_id 在那 6 处**全都在作用域里**（决策者/汇总者是 `keyId::model` 引用，
-/// 成员侧有 `BrainMember.key_id`）—— 不是拿不到，是记账时扔了。
-///
-/// 有 `aggregate_usage_is_never_recorded_without_a_key` 一条源码级判据盯着这件事，
-/// 因为「记得传 key_id」是一条必然会漏的纪律，而漏掉的表现是静默的。
+/// 而 key_id 在那 6 处**全都在作用域里**（决策者/汇总者是 `keyId::model` 引用，成员侧有
+/// `BrainMember.key_id`）—— 不是拿不到，是记账时扔了。有源码级判据
+/// `aggregate_usage_is_never_recorded_without_a_key` 盯着：「记得传 key_id」是必然会漏的
+/// 纪律，而漏掉的表现是静默的。
 fn ref_key_id(reference: &str) -> Option<&str> {
     reference.split_once("::").map(|(key_id, _)| key_id)
 }
@@ -247,7 +247,8 @@ pub async fn run_preview(
                 None,
                 &format!("确认执行 · 检索 · {} · 目录={work_dir}", outcome.summary),
             );
-            format_file_context(&outcome.files)
+            // 只列 file：Phase2 不提供工具（决策者只输出文件内容）。
+            format_file_context(&fence::Fence::new(), &outcome.files, &["file"])
         } else {
             String::new()
         }
@@ -518,10 +519,9 @@ fn image_unsupported_hint(err: &MemberError, had_images: bool) -> String {
 /// 轮次上限、连接层失败）。
 ///
 /// 为什么不用裸 `String`：判「是否 4xx」曾经靠在错误文本里搜 `HTTP 4xx`，而该文本**拼进了
-/// 上游响应体前 400 字符**。上游返 500 但 body 里带 `HTTP 404` 字样时（网关回显原始报文是
-/// 常见形态），会被误判成 4xx → 给用户追加一句「模型可能不支持图片输入」，把排障方向
-/// 引到多模态能力上，而真因是上游 5xx。这与 `is_retriable_upstream_error` 曾经的
-/// 假阳性完全同形，只是后果是误导而非白重试。
+/// 上游响应体前 400 字符**。上游返 500 而 body 里带 `HTTP 404` 字样时（网关回显原始报文是常见
+/// 形态）会被误判成 4xx → 追加一句「模型可能不支持图片输入」，把排障引向多模态能力，而真因
+/// 是上游 5xx。同 `is_retriable_upstream_error` 曾经的假阳性，只是后果是误导而非白重试。
 #[derive(Debug, Clone)]
 pub struct MemberError {
     pub msg: String,
@@ -559,6 +559,7 @@ async fn prepare_tool_env(
     category: CategoryType,
     brain: &BrainConfig,
     work_dir: Option<&str>,
+    fence: &fence::Fence,
 ) -> Option<Arc<crate::agent_tools::ToolEnv>> {
     if !brain.tools_enabled {
         return None;
@@ -582,12 +583,11 @@ async fn prepare_tool_env(
         );
         return None;
     }
-    let env = crate::agent_tools::ToolEnv::detect(path).await;
+    let env = crate::agent_tools::ToolEnv::detect(path, fence.clone()).await;
     // 单次结果上限：0 = 用内置默认（8000）；非 0 时 with_result_cap 自己会 clamp 到 1000~40000。
-    let env = if brain.tool_result_cap_chars == 0 {
-        env
-    } else {
-        env.with_result_cap(brain.tool_result_cap_chars)
+    let env = match brain.tool_result_cap_chars {
+        0 => env,
+        n => env.with_result_cap(n),
     };
     if let Some(note) = &env.codegraph_note {
         store.append_event(category, "aggregate", None, &format!("工具环境 · {note}"));
@@ -1345,7 +1345,7 @@ mod tests {
 
     #[test]
     fn member_prompt_omits_file_section_when_empty() {
-        let out = build_member_prompt("问题X", "");
+        let out = build_member_prompt("问题X", "", None);
         assert!(out.contains("问题X"));
         assert!(!out.contains("## 相关文件"), "无文件时不应有相关文件小节");
     }
@@ -1717,7 +1717,7 @@ mod tests {
     async fn tool_env_with_file(tag: &str) -> (std::path::PathBuf, crate::agent_tools::ToolEnv) {
         let dir = temp_dir(tag);
         std::fs::write(dir.join("main.rs"), "fn main() {\n    answer_42();\n}\n").unwrap();
-        let env = crate::agent_tools::ToolEnv::detect(&dir).await;
+        let env = crate::agent_tools::ToolEnv::detect(&dir, fence::Fence::new()).await;
         (dir, env)
     }
 
@@ -2328,7 +2328,7 @@ mod tests {
         // 一大一小：真实的执行耗时差，让「按完成顺序收集」这个错法有机会暴露。
         std::fs::write(dir.join("big.rs"), "// BIGMARK\n".repeat(20_000)).unwrap();
         std::fs::write(dir.join("small.rs"), "// SMALLMARK\n").unwrap();
-        let env = crate::agent_tools::ToolEnv::detect(&dir).await;
+        let env = crate::agent_tools::ToolEnv::detect(&dir, fence::Fence::new()).await;
         let (sdir, store) = test_store("tool_order_store");
         let key = test_key(&upstream);
         let mut session =
