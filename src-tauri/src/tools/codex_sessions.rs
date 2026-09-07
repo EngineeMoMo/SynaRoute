@@ -38,25 +38,23 @@
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// 回滚清单文件名（落在应用数据目录，受 `SYNAROUTE_DATA_DIR` 隔离）。
 const MANIFEST_FILE: &str = "codex-session-providers.json";
 
-/// 会话目录名。`archived_sessions` 不能漏 —— 漏了的表现是「归档里的旧会话仍 401」，
-/// 而用户不会想到「已归档」与「能不能用」有关系。
-const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
-
-/// 递归深度上限。Codex 的布局是 `sessions/YYYY/MM/DD/`，3 层足够；给到 6 层是留余量。
-///
-/// ⚠️ 它防的是**异常深的真实目录树**，不是符号链接环 —— [`walk`] 用的
-/// `DirEntry::file_type()` 按 std 的语义**不跟随符号链接**，指向目录的链接
-/// `is_dir()` / `is_file()` 双false、直接落进 `_` 被跳过，那种环压根形成不了。
-/// （这条原先写的是「防链接环」，代码审查时按 std 文档核出来是错的。）
-const MAX_DEPTH: usize = 6;
 #[path = "codex_session_ops.rs"] pub(crate) mod ops;
+#[path = "codex_session_fs.rs"] pub(in crate::tools) mod files;
+#[path = "codex_session_view.rs"] pub(in crate::tools) mod view;
+#[path = "codex_session_catalog.rs"] mod catalog; // Desktop 列表索引 local_thread_catalog（第三份 provider 副本）；理由见该文件模块头
+#[path = "codex_session_sync.rs"] pub(crate) mod sync;
+
+// 文件层的原语都在 [`files`] 里。这里再导出一次，让 [`ops`]/[`view`]/[`sync`] 与本模块
+// 用同一个名字 —— 各处 `files::` 前缀写法不一致时，「到底哪份实现」会变成一个要查的问题。
+pub(in crate::tools) use files::{
+    collect_rollouts, read_first_line, rel_of, resolve_in_home, split_eol,
+};
 
 /// 每个 sqlite 库保留几份写前备份。3 份足够回退一次误操作，而不至于让频繁启停把
 /// 备份目录堆成无界增长（每份约 0.5 MB）。
@@ -71,12 +69,18 @@ const SQL_CHUNK: usize = 500;
 const _: () = assert!(SQL_CHUNK < 999, "3.32 之前的 SQLite 绑定参数上限就是 999");
 
 /// 一条会话的首行元数据。**只从 rollout 首行读**，不碰正文。
+///
+/// 展示用的补充字段（标题 / 模型 / 档位 / token）由 [`view`] 从会话库或正文补上 ——
+/// 那些是「让用户认出这是哪条对话」用的，与路由正确性无关，故刻意不混进这一层。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionRef {
     /// 相对 `$CODEX_HOME` 的路径。清单里存的也是它 —— 存绝对路径会在换机器或改
     /// `CODEX_HOME` 之后认领到别人的文件上去。
     pub rel_path: String,
+    /// 🔴 从**文件名**推导（见 [`files::thread_id_from_filename`]），不是首行的
+    /// `payload.id` —— fork 子会话的首行记着**父**会话的 id，拿它去 DELETE 会删错行。
+    /// 推导不出时是空串：那时 sqlite 与索引那两步一律跳过（宁可少做，不能做错）。
     pub thread_id: String,
     /// 首行里记的 provider。缺失时是空串（Codex 早期版本没这个字段），
     /// 空串**参与同步**：它同样会让 `thread/resume` 拿不到我们的 provider。
@@ -85,6 +89,41 @@ pub(crate) struct SessionRef {
     pub cwd: String,
     pub timestamp: String,
     pub bytes: u64,
+    /// 这条 thread 的来源：`user` = 用户自己的对话，其它值（如 `guardian_review`）是
+    /// Codex 内部派生出来的。**不隐藏、只标注** —— 隐藏用户的数据比多显示一行更糟，
+    /// 而不标注的话「我明明只开了 3 个对话，这里怎么有 5 条」无从解释。
+    pub thread_source: String,
+    /// fork 出来的子会话：文件名带两个 UUID，且首行的 `payload.id` 是父会话的 id。
+    pub forked: bool,
+    /// 展示用标题（由 [`view`] 填，扫描层留空）。
+    #[serde(default)]
+    pub title: String,
+    /// 这条对话用的模型与思考档位（由 [`view`] 从会话库补，取不到就留空）。
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub effort: String,
+    #[serde(default)]
+    pub tokens: u64,
+    /// 🔴 **这条对话用的模型，我们现在已经服务不了了。**
+    ///
+    /// 只有代理侧能回答这个问题 —— CodexPlusPlus 之类的启动器没有 Key 池，永远给不出它。
+    /// 用处很具体：用户点开一条旧对话报错，成因可能不是 provider（那一列是绿的），而是他
+    /// 后来删掉了服务 `glm-5.3` 的那条 Key、或改了模型映射。没有这一位的话，那条对话在
+    /// 界面上「一切正常」而实际打开必然降级或失败。
+    ///
+    /// **只在确知时为真**（同 `balance_gate` 的「查不到 ≠ 为零」）：没记模型名、或 Codex
+    /// 分类压根没有启用的 Key 时一律 `false` —— 后者会把整张表刷红，而那只说明用户还没配
+    /// Codex，不说明这些对话有问题。
+    #[serde(default)]
+    pub model_unserviceable: bool,
+    /// Desktop 项目侧栏里这条对话归属的项目名。**空串 = 未归入任何项目**。
+    ///
+    /// 只读自 `.codex-global-state.json`（见 [`view`] 里那个函数的文档：那个文件我们绝不写）。
+    /// 它回答的是一个用户真会问的问题：「这条对话为什么不在我的项目侧栏里」——
+    /// 而那与 provider 正交，看 provider 那一列永远看不出来。
+    #[serde(default)]
+    pub project: String,
 }
 
 /// 扫描结果。`unreadable` 单独计数而不是静默丢掉：Codex 的 rollout 格式已经变过几次
@@ -107,13 +146,19 @@ pub(in crate::tools) struct SyncReport {
     pub changed: usize,
     /// 本来就已经是目标 provider、一个字节都没动的会话数。
     pub already_ok: usize,
-    /// 改写失败而跳过的会话数（文件被占用 / 目录不可写，两者在 Windows 上都映射成
-    /// `PermissionDenied`，分不开 —— 故文案写成覆盖两种情形的条件句，见 [`describe`]）。
+    /// 改写失败而跳过的会话数。成因归类在 [`SyncReport::blame`] 里 ——
+    /// Windows 把「被占用」与「不可写」都映射成 `PermissionDenied`，只有 raw OS error
+    /// 32/33 能把它们分开（见 [`files::blame_from_text`]）。
     pub skipped: usize,
+    /// 跳过项的成因（取第一条的归类）。它决定 [`describe`] 给的是精确指路还是条件句。
+    pub blame: Option<files::IoBlame>,
     pub unreadable: usize,
     /// 路径遏制拒掉的会话数。**刻意与 `unreadable` 分开计数**：一个是路径推导出了问题、
     /// 一个是 Codex 改了 rollout 格式，合成一个数字会让用户拿到指错方向的解释。
     pub path_rejected: usize,
+    /// 改动过的会话里有多少条正文带 `encrypted_content`。**只对这些条目成立**
+    /// （没改过的文件我们不会去流一遍，见 [`files::RewriteInfo`]）。
+    pub encrypted: usize,
     /// sqlite 那半的结果。`None` = 没找到库（正常，新装机器可能还没有）。
     pub sqlite: Option<SqliteOutcome>,
 }
@@ -126,6 +171,8 @@ pub(in crate::tools) struct SyncReport {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(in crate::tools) struct SqliteOutcome {
     pub updated: usize,
+    /// Desktop 列表索引那一份的账（provider 同步 / 清 missing 标记 / 补缺行）。
+    pub catalog: catalog::CatalogReport,
     /// 任一库失败即有值（只留第一条，够给方向了）。
     pub error: Option<String>,
 }
@@ -157,34 +204,20 @@ struct ManifestEntry {
 
 // 扫描（只读首行）
 
-/// 读文件的第一行，**行尾原样保留** —— 改写时要用它把新首行拼回去，归一成 `\n` 会让整份
-/// 文件的行尾与 Codex 自己写的不一致（本仓在行尾上栽过三次，症状都是「看起来改对了、
-/// 实际匹配不上」）。用 `read_line` 而不是读全文：首行实测 50 KB 量级
-/// （`base_instructions` 内嵌在里面），而 rollout 整体可以到几十 MB。
-fn read_first_line(path: &Path) -> io::Result<String> {
-    let mut line = String::new();
-    BufReader::new(File::open(path)?).read_line(&mut line)?;
-    Ok(line)
-}
-
-/// 把一行拆成「正文」与「行尾」。
-fn split_eol(line: &str) -> (&str, &str) {
-    if let Some(body) = line.strip_suffix("\r\n") {
-        (body, "\r\n")
-    } else if let Some(body) = line.strip_suffix('\n') {
-        (body, "\n")
-    } else {
-        (line, "")
-    }
-}
-
 /// 解析首行，只在它确实是 `session_meta` 时返回。
 ///
-/// 🔴 **判定与改写都只针对首行**，依据是 Codex 自己写的 `"ordinal":0`（本机 4 个 rollout
-/// 逐个核过，含一个 fork 出来的子会话）。CodexPlusPlus 遍历全文找 session_meta，那要把
-/// 几十 MB 整个读进内存；而万一 Codex 日后挪走它，我们的表现是**首行认不出 → 跳过并
-/// 计数**，不是静默改错行 —— 失效方向是安全的那一侧。
-fn parse_meta(line: &str) -> Option<(String, String, String, String)> {
+/// 🔴 **判定与改写都只针对首行。** 取证方式：本机 5 个 rollout 的首行逐个 dump 过，
+/// `type` 全部是 `session_meta`（含 2 个 fork 子会话与 1 个 guardian 子代理会话）。
+/// ⚠️ **依据不是 `ordinal == 0`** —— 那 5 个里一个是 `ordinal: 53`（带 `history_base`
+/// 的续接会话）、一个压根没有 `ordinal` 字段。原注释拿它当依据是错的，而它声称核对过，
+/// 属本仓最贵的那类过时注释；行为一直是对的（只看第一行、只认 `type`）。
+///
+/// CodexPlusPlus 遍历全文找 session_meta，那要把几十 MB 整个读进内存；而万一 Codex 日后
+/// 挪走它，我们的表现是**首行认不出 → 跳过并计数**，不是静默改错行 —— 失效方向安全。
+///
+/// 返回的第一项是首行里的 `payload.id`，**只用于判断这是不是 fork 子会话**（子会话那里它
+/// 是父的 id）。真正的 thread id 由 [`files::thread_id_from_filename`] 从文件名推导。
+fn parse_meta(line: &str) -> Option<(String, String, String, String, String)> {
     let (body, _) = split_eol(line);
     let rec: Value = serde_json::from_str(body.trim()).ok()?;
     if rec.get("type").and_then(Value::as_str) != Some("session_meta") {
@@ -192,42 +225,8 @@ fn parse_meta(line: &str) -> Option<(String, String, String, String)> {
     }
     let p = rec.get("payload")?;
     let s = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
-    // `id` 与 `session_id` 在实测样本里同值；`id` 是 CodexPlusPlus 取的那个，跟它一致。
     let id = if p.get("id").is_some() { s("id") } else { s("session_id") };
-    Some((id, s("model_provider"), s("cwd"), s("timestamp")))
-}
-
-/// 递归收集 `sessions/` 与 `archived_sessions/` 下的 `rollout-*.jsonl`。
-///
-/// 目录不存在**不是错误**：干净安装的机器上 `archived_sessions` 常常没有，
-/// 而把它当错误会让整次接入失败在一件无关紧要的事上。
-fn collect_rollouts(home: &Path) -> Vec<(PathBuf, bool)> {
-    let mut out = Vec::new();
-    for dir in SESSION_DIRS {
-        let archived = dir == "archived_sessions";
-        walk(&home.join(dir), 0, archived, &mut out);
-    }
-    out
-}
-
-fn walk(dir: &Path, depth: usize, archived: bool, out: &mut Vec<(PathBuf, bool)>) {
-    if depth > MAX_DEPTH {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        match entry.file_type() {
-            Ok(t) if t.is_dir() => walk(&path, depth + 1, archived, out),
-            Ok(t) if t.is_file() => {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with("rollout-") && name.ends_with(".jsonl") {
-                    out.push((path, archived));
-                }
-            }
-            _ => {}
-        }
-    }
+    Some((id, s("model_provider"), s("cwd"), s("timestamp"), s("thread_source")))
 }
 
 /// 扫描全部会话的首行元数据。
@@ -239,7 +238,7 @@ pub(in crate::tools) fn scan_at(home: &Path) -> ScanReport {
             report.unreadable += 1;
             continue;
         };
-        let Some((thread_id, provider, cwd, timestamp)) = parse_meta(&line) else {
+        let Some((meta_id, provider, cwd, timestamp, thread_source)) = parse_meta(&line) else {
             report.unreadable += 1;
             continue;
         };
@@ -247,7 +246,13 @@ pub(in crate::tools) fn scan_at(home: &Path) -> ScanReport {
             report.path_rejected += 1;
             continue;
         };
+        // 🔴 id 取文件名末尾那个 UUID。取不到 → 空串（sqlite/索引那两步跳过），
+        // 而不是回落到 `meta_id` —— 回落正是 fork 子会话会删错父会话行的那条路。
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let thread_id = files::thread_id_from_filename(&name).unwrap_or_default();
         report.sessions.push(SessionRef {
+            // 首行的 id 与文件名末尾的 id 不同 = 这是从那条会话 fork 出来的分支。
+            forked: !thread_id.is_empty() && !meta_id.is_empty() && thread_id != meta_id,
             rel_path,
             thread_id,
             provider,
@@ -255,86 +260,34 @@ pub(in crate::tools) fn scan_at(home: &Path) -> ScanReport {
             cwd,
             timestamp,
             bytes,
+            thread_source,
+            title: String::new(),
+            model: String::new(),
+            effort: String::new(),
+            tokens: 0,
+            model_unserviceable: false,
+            project: String::new(),
         });
     }
     report
 }
 
-/// 相对 `$CODEX_HOME` 的路径，统一用 `/` 分隔。`None` = 推导不出相对形态。
-///
-/// 🔴 **统一分隔符是为了清单能跨平台读**：`strip_prefix` 保留宿主分隔符，Windows 写出的
-/// 清单在 macOS 上会被当成一个完整文件名（`file_name()` 在 Unix 上只认 `/`）——
-/// `pointer_is_ours` 就是这么在 macOS CI 上连红三个版本的。
-///
-/// 🔴 **失败必须返回 `None`，不许兜底成绝对路径**：那会同时丢掉「换机器不认领别人的
-/// 文件」与 [`resolve_in_home`] 那道遏制（它必然拒绝绝对路径 → 整批会话被算成越界，
-/// 而用户看到的解释指向错误方向）。走到这里说明 [`walk`] 的前缀假设被破坏了。
-fn rel_of(home: &Path, path: &Path) -> Option<String> {
-    Some(
-        path.strip_prefix(home)
-            .ok()?
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/"),
-    )
-}
-
-/// 把清单里的相对路径解析回绝对路径，并**确认它仍在 `home` 之内**。
-///
-/// 清单是 `%APPDATA%\SynaRoute\` 下的普通 JSON，被别人手改之后 `rel_path` 可以写成
-/// `../..`，而我们拿它去**改写文件**。危害受限（目标首行必须是合法 `session_meta`），
-/// 但本仓对同类原语一贯设遏制（`aggregate.rs` 修过两条路径穿透），成本近乎为零。
-///
-/// **刻意不用 `canonicalize`**：它解析符号链接、且对不存在的路径直接失败，而「文件已被
-/// 用户删掉」是还原时的正常情形。三道门的**实际**覆盖面与直觉不符（注入实测）：逐段
-/// `Normal` 那道是唯一挡得住 `..` 的（`Path::starts_with` 按 component 比较、不规范化），
-/// `is_absolute` 与前缀检查对绝对路径互为冗余 —— 别以为去掉第二道还有东西兜着。
-fn resolve_in_home(home: &Path, rel: &str) -> Option<PathBuf> {
-    // 空串必须先挡掉：`Path::new("").components()` 是空迭代器，下面那条 `all()` 对空集
-    // 恒真、`home.join("")` 又恰好等于 home 自身，于是它会通过全部三道门，把
-    // **`$CODEX_HOME` 目录本身**当成一个 rollout 交出去（写这条判据时当场抓到的）。
-    if rel.trim().is_empty() {
-        return None;
-    }
-    let p = Path::new(rel);
-    if p.is_absolute() {
-        return None;
-    }
-    // 逐段只接受普通名字。`.` 也拒掉：同一个文件两种写法会让「首记即锁」认不出是同一条。
-    if !p.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
-        return None;
-    }
-    let joined = home.join(p);
-    joined.starts_with(home).then_some(joined)
-}
-
 
 // 改写单个 rollout（流式，内存 O(1)）
 
-/// 临时文件的进程内序号。光靠 `pid + 时间戳`不够 —— 本机实测 `timestamp_nanos` 的量化
-/// 粒度只有 100ns，同进程并发调用会拿到完全相同的路径，一个的 rename 会顶掉另一个正在写
-/// 的临时文件（`ccswitch::db_copy_path` 上踩过：8 线程 16 万采样里 88% 撞名）。
-/// 也被 [`backup_db`] 与 [`write_manifest`] 复用。
-static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// 与目标文件**同目录**的临时文件路径 —— `std::env::temp_dir()` 可能在别的卷上，而
-/// `fs::rename` 跨卷会失败，原子性全靠它。
-fn tmp_path_for(path: &Path) -> PathBuf {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    path.with_file_name(format!(
-        ".{name}.synaroute-{}-{}.tmp",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ))
-}
-
 /// 把首行的 `model_provider` 改成 `want`（`None` = 把字段整个摘掉）。
 ///
-/// 返回 `Ok(Some(原值))` 表示确实改了，`Ok(None)` 表示无需改动（**一个字节都没写**）——
-/// 后者必须真的不写：照写一遍相同内容会让 mtime 变、惊动 Codex 的文件监听，而且「已经
-/// 对了」这个绝大多数情况会变成每次接入都全量重写几百个文件。判据用 mtime 断言它。
-fn rewrite_first_line(path: &Path, want: Option<&str>) -> AppResult<Option<String>> {
+/// 返回 `Ok(Some(原值, 副产物))` 表示确实改了，`Ok(None)` 表示无需改动（**一个字节都没写**）
+/// —— 后者必须真的不写：照写一遍相同内容会让「已经对了」这个绝大多数情况变成每次接入都
+/// 全量重写几百个文件。
+///
+/// ⚠️ **判据不能只看 mtime**：[`files::replace_first_line`] 现在会把 mtime 原样恢复，
+/// 于是「写了」与「没写」在 mtime 上长得一样。用例改为断言返回值与**首行字节**
+/// （`serde_json` 默认按字母排序键，真实改写必然改变字节形态）。
+fn rewrite_first_line(
+    path: &Path,
+    want: Option<&str>,
+) -> AppResult<Option<(String, files::RewriteInfo)>> {
     let first = read_first_line(path).map_err(|e| AppError::ToolConfig(format!("{e}")))?;
     let (body, eol) = split_eol(&first);
     let mut rec: Value = serde_json::from_str(body.trim())
@@ -368,37 +321,8 @@ fn rewrite_first_line(path: &Path, want: Option<&str>) -> AppResult<Option<Strin
     }
 
     let next_first = format!("{}{eol}", serde_json::to_string(&rec)?);
-    replace_first_line(path, &first, &next_first)?;
-    Ok(Some(original))
-}
-
-/// 用 `next_first` 换掉文件的首行，其余字节**逐字节照搬**。写临时文件后 rename，
-/// 于是任何中途失败都不会留下半个文件（这比对几百 MB 的会话做整份备份现实得多）。
-fn replace_first_line(path: &Path, first: &str, next_first: &str) -> AppResult<()> {
-    let tmp = tmp_path_for(path);
-    let copy = (|| -> io::Result<()> {
-        let mut src = File::open(path)?;
-        // 按**字节**偏移跳过首行：`String::len()` 就是 UTF-8 字节数，而 rollout 是 JSONL
-        // （必然 UTF-8）。带 BOM 的文件在上一步就因 JSON 解析失败被挡掉了。
-        src.seek(SeekFrom::Start(first.len() as u64))?;
-        let mut dst = File::create(&tmp)?;
-        dst.write_all(next_first.as_bytes())?;
-        io::copy(&mut src, &mut dst)?;
-        // 先落盘再 rename：崩在这之间留下的是一个孤立的 .tmp（下次扫描不认它，文件名不以
-        // rollout- 开头），而不是一个内容不完整的 rollout。
-        dst.sync_all()
-    })();
-    if let Err(e) = copy {
-        let _ = fs::remove_file(&tmp);
-        return Err(AppError::ToolConfig(format!(
-            "改写 {} 失败: {e}",
-            path.display()
-        )));
-    }
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        AppError::ToolConfig(format!("替换 {} 失败: {e}", path.display()))
-    })
+    let info = files::replace_first_line(path, &first, &next_first)?;
+    Ok(Some((original, info)))
 }
 
 // 清单
@@ -446,11 +370,7 @@ fn write_manifest(data_dir: &Path, m: &Manifest) -> AppResult<()> {
         .map_err(|e| AppError::ToolConfig(format!("创建数据目录失败: {e}")))?;
     let text = serde_json::to_string_pretty(m)?;
     let path = manifest_path_in(data_dir);
-    let tmp = path.with_file_name(format!(
-        ".{MANIFEST_FILE}.{}-{}.tmp",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
+    let tmp = files::tmp_path_for(&path);
     let write = fs::write(&tmp, text).and_then(|_| fs::rename(&tmp, &path));
     write.map_err(|e| {
         let _ = fs::remove_file(&tmp);
@@ -531,8 +451,11 @@ pub(in crate::tools) fn sync_to_at(
     let mut done_ids: Vec<String> = Vec::new();
     for (path, s) in &todo {
         match rewrite_first_line(path, Some(target)) {
-            Ok(Some(_)) => {
+            Ok(Some((_, info))) => {
                 report.changed += 1;
+                if info.had_encrypted_content {
+                    report.encrypted += 1;
+                }
                 if !s.thread_id.is_empty() {
                     done_ids.push(s.thread_id.clone());
                 }
@@ -545,7 +468,11 @@ pub(in crate::tools) fn sync_to_at(
                     done_ids.push(s.thread_id.clone());
                 }
             }
-            Err(_) => report.skipped += 1,
+            Err(e) => {
+                report.skipped += 1;
+                // 只留第一条的归类：够给方向了，而逐条列举会让提示变成一篇日志。
+                report.blame.get_or_insert(files::blame_from_text(&e.to_string()));
+            }
         }
     }
 
@@ -638,14 +565,36 @@ pub(in crate::tools) fn restore_at(home: &Path, data_dir: &Path) -> AppResult<Op
 
 // sqlite（best-effort：只影响 Desktop 的会话列表，不影响路由）
 
-/// 候选库路径：`$CODEX_HOME/sqlite/*.db` 优先，回落 `state_5.sqlite`。
+/// 候选库路径：`<sqlite 根>/sqlite/*.db` 优先，回落 `<sqlite 根>/state_5.sqlite`。
 ///
 /// 🔴 **两个都要试**。Codex 正在从单文件迁到 `sqlite/` 目录（本机同时存在两者）。
 /// 只改 legacy 那份的表现是：在已迁移的机器上**静默无效** —— 列表照旧显示旧 provider，
 /// 而我们报「已同步」。
+///
+/// 🔴 **sqlite 根不一定等于 `$CODEX_HOME`**：Codex 认 `CODEX_SQLITE_HOME`
+/// （二进制里那句 "`CODEX_SQLITE_HOME` is overridden by an exact requirement for
+/// sqlite_home"，出自 `core/src/config/requirements.rs`）。不认它的表现同样是静默的 ——
+/// 我们对着 `$CODEX_HOME` 下一个陈旧的库写，而 Codex 读的是别处那个。
+/// 目录必须真的存在才采纳，否则一个写错的环境变量会让我们连 legacy 库都找不到。
+///
+/// 判据做成**纯函数**（环境变量的值当入参传进来）：直接在测试里 `set_var` 会污染同进程
+/// 并行跑的其它用例 —— 本仓在进程级状态上栽过好几次（`quota_window` 的表、
+/// `DENIED_TOTAL` 的计数）。`session_db_paths` 必须经它，有源码级判据钉着。
+fn sqlite_root_of(env: Option<std::ffi::OsString>, home: &Path) -> PathBuf {
+    match env {
+        Some(v) if !v.is_empty() && Path::new(&v).is_dir() => PathBuf::from(v),
+        _ => home.to_path_buf(),
+    }
+}
+
+fn sqlite_root(home: &Path) -> PathBuf {
+    sqlite_root_of(std::env::var_os("CODEX_SQLITE_HOME"), home)
+}
+
 fn session_db_paths(home: &Path) -> Vec<PathBuf> {
+    let root = sqlite_root(home);
     let mut out = Vec::new();
-    if let Ok(entries) = fs::read_dir(home.join("sqlite")) {
+    if let Ok(entries) = fs::read_dir(root.join("sqlite")) {
         for e in entries.flatten() {
             let p = e.path();
             let ext = p.extension().and_then(|s| s.to_str()).unwrap_or_default();
@@ -655,7 +604,7 @@ fn session_db_paths(home: &Path) -> Vec<PathBuf> {
         }
         out.sort();
     }
-    let legacy = home.join("state_5.sqlite");
+    let legacy = root.join("state_5.sqlite");
     if legacy.is_file() {
         out.push(legacy);
     }
@@ -679,6 +628,9 @@ fn sync_sqlite(
     if ids.is_empty() {
         return Some(SqliteOutcome::default());
     }
+    // Desktop 列表那份索引（`local_thread_catalog`）要的展示信息 —— 它在**另一个库**里，
+    // 而那个库没有 `threads` 表，所以数据只能从这一侧带过去。取不到就只做 UPDATE 那两步。
+    let catalog_rows = catalog::plan_from(home, target, ids);
     let mut out = SqliteOutcome::default();
     for db in dbs {
         // 备份在**写之前**、且只在真要写的时候做（`ids` 非空已经保证了这一点）。
@@ -692,6 +644,8 @@ fn sync_sqlite(
                 out.error.get_or_insert(e);
             }
         }
+        // 第三份 provider 副本 + Desktop 列表索引的缺行。理由见 `catalog` 模块头。
+        catalog::repair_one(&db, target, &catalog_rows, &mut out.catalog);
     }
     Some(out)
 }
@@ -748,7 +702,7 @@ fn backup_db(db: &Path, data_dir: &Path) -> Result<(), String> {
     let ts = format!(
         "{}-{:04}",
         chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f"),
-        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 10_000
+        files::seq() % 10_000
     );
     fs::copy(db, dir.join(format!("{stem}.{ts}.bak")))
         .map_err(|e| format!("备份 {} 失败: {e}", db.display()))?;
@@ -829,7 +783,7 @@ fn set_threads_provider(db: &Path, provider: &str, ids: &[String]) -> Result<usi
 pub(in crate::tools) fn sync_to(target: &str) -> AppResult<Option<String>> {
     let home = super::codex_paths::codex_home()?;
     let data_dir = crate::store::data_dir::app_data_dir()?;
-    Ok(describe(&sync_to_at(&home, &data_dir, target)?))
+    Ok(describe(&sync::locked_sync(&home, &data_dir, target)?))
 }
 
 /// 把会话同步的结果并进接入成功的那条提示。
@@ -843,6 +797,12 @@ pub(in crate::tools) fn sync_to(target: &str) -> AppResult<Option<String>> {
 ///
 /// 返回 `String` 而不是 `AppResult`：这一层的任何失败都只降级成提示里的一句话。
 pub(in crate::tools) fn append_sync_note(applied: String) -> String {
+    // 用户在会话页关掉了「接入时自动同步」→ 一个字节都不动。这是我们唯一会自动改用户
+    // 对话文件的动作，给它一个关得掉的开关是应该的（同时用 cc-switch 的人有正当理由不让
+    // 我们碰）。**刻意不落提示**：关掉它的人不需要每次接入都被告知一次。
+    if !sync::auto_sync_enabled() {
+        return applied;
+    }
     match sync_to(super::MCP_CLIENT_NAME) {
         Ok(Some(note)) => format!("{applied}；{note}"),
         Ok(None) => applied,
@@ -862,7 +822,8 @@ pub(in crate::tools) fn restore_from_manifest() -> AppResult<Option<String>> {
 /// 🔴 **只说「已指向」，不说「已恢复可用」** —— 见模块头那条已知边界：跨账号的
 /// `encrypted_content` 可能仍然解不开。承诺一件我们保证不了的事，代价是用户按它排除掉
 /// 真正的方向。
-fn describe(r: &SyncReport) -> Option<String> {    let mut parts = Vec::new();
+fn describe(r: &SyncReport) -> Option<String> {
+    let mut parts = Vec::new();
     if r.changed > 0 {
         parts.push(format!(
             "已把 {} 个历史对话指向 SynaRoute（重启 Codex 后生效；若某条旧对话仍报错，\
@@ -870,14 +831,28 @@ fn describe(r: &SyncReport) -> Option<String> {    let mut parts = Vec::new();
             r.changed
         ));
     }
-    if r.skipped > 0 {
-        // 🔴 **条件句**：Windows 把「文件被独占」与「目录不可写」都映射成 `PermissionDenied`，
-        // 分不开。只说「退出 Codex 再试」在只读卷上是无效指路 —— 用户照做后一字不变。
+    if r.encrypted > 0 {
+        // 只说「可能」：我们能确定的只有「这些文件里有 encrypted_content」，续聊到底会不会
+        // 失败取决于上游账号，而那是我们看不到的。给出条数是为了让用户能对上号 ——
+        // 上面那句条件句在没有数字时无从核实，他只会反复怀疑代理。
         parts.push(format!(
-            "{} 个对话未能同步（文件被占用，或其所在目录不可写）\
-             —— 若 Codex 正在运行，请完全退出 Codex 后再点一次接入",
-            r.skipped
+            "其中 {} 条带有原账号加密的推理内容，续聊或压缩时可能报解密失败（新建对话不受影响）",
+            r.encrypted
         ));
+    }
+    if r.skipped > 0 {
+        // 归类得出来就给精确指路，认不出才退回条件句 —— Windows 把两种成因都映射成
+        // `PermissionDenied`，只有 raw OS error 32/33 能分开（见 `files::blame_from_text`）。
+        let why = match r.blame {
+            Some(files::IoBlame::Locked) => {
+                "（文件正被 Codex 占用）—— 完全退出 Codex 后再点一次接入即可"
+            }
+            Some(files::IoBlame::Unwritable) => {
+                "（其所在目录或文件不可写）—— 退出 Codex 没用，请检查 CODEX_HOME 的权限与是否只读卷"
+            }
+            _ => "（文件被占用，或其所在目录不可写）—— 若 Codex 正在运行，请完全退出后再点一次接入",
+        };
+        parts.push(format!("{} 个对话未能同步{why}", r.skipped));
     }
     if r.unreadable > 0 {
         parts.push(format!("{} 个会话文件的首行无法解析，已跳过", r.unreadable));
@@ -894,6 +869,14 @@ fn describe(r: &SyncReport) -> Option<String> {    let mut parts = Vec::new();
             // 只影响列表元数据，所以措辞刻意不像故障 —— 免得用户以为路由没修好。
             parts.push(format!("会话列表元数据未完全同步（不影响路由）：{e}"));
         }
+        // Desktop 列表索引那一份的账。**只报做了什么，不承诺「会话会回到列表」** ——
+        // `has_user_event` 门控可见性这件事我们没有取证（见 `catalog` 模块头）。
+        if db.catalog.inserted > 0 || db.catalog.unmarked_missing > 0 {
+            parts.push(format!(
+                "另修正了 Desktop 会话列表索引（补 {} 条记录、清 {} 个失效标记）",
+                db.catalog.inserted, db.catalog.unmarked_missing
+            ));
+        }
     }
     (!parts.is_empty()).then(|| parts.join("；"))
 }
@@ -901,6 +884,8 @@ fn describe(r: &SyncReport) -> Option<String> {    let mut parts = Vec::new();
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 测试段自己要的 IO trait：生产段搬走 `replace_first_line` 之后不再用它们（见 `files`）。
+    use std::io::{BufReader, Write as _};
 
     /// 夹具目录的进程内序号 —— 同 `tmp_path_for` 的理由：`timestamp_nanos` 在本机的量化
     /// 粒度只有 100ns，并发跑的两条用例会拿到同一个目录并互删对方的文件。本仓在
@@ -918,9 +903,29 @@ mod tests {
         dir
     }
 
+    /// 把短标签扩成 UUID 形态。
+    ///
+    /// 🔴 **夹具的文件名必须以合法 UUID 结尾**：`thread_id` 现在从文件名末 36 个字符推导
+    /// （见 [`files`] 模块头 —— fork 子会话的首行 `payload.id` 是**父**的 id）。用 `t1`
+    /// 这种短标签的话推导不出 id，于是 sqlite 与索引那两步会被静默跳过，
+    /// 而那两步恰恰是好几条用例要测的东西。已经是 36 字符的原样返回（真二进制那条用例
+    /// 要拿同一个 id 去调 app-server）。
+    fn uuid_of(label: &str) -> String {
+        if label.len() == 36 {
+            return label.to_string();
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in label.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        format!("01a05d14-4e5b-7773-b425-{:012x}", h & 0xffff_ffff_ffff)
+    }
+
     /// 造一条 rollout。`eol` 让行尾成为可测维度（Codex 在 Windows 上写的是 `\n`，
     /// 但用户的文件经过别的工具处理后可能变成 `\r\n`，而我们不能替他归一）。
     fn write_rollout(home: &Path, sub: &str, id: &str, provider: &str, eol: &str) -> PathBuf {
+        let id = uuid_of(id);
         let dir = home.join(sub);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("rollout-2026-09-01T21-06-47-{id}.jsonl"));
@@ -956,7 +961,7 @@ mod tests {
         let tail_before = &before[before.iter().position(|b| *b == b'\n').unwrap() + 1..];
 
         let original = rewrite_first_line(&path, Some("synaroute")).unwrap();
-        assert_eq!(original.as_deref(), Some("openai"), "必须如实返回原值");
+        assert_eq!(original.map(|(p, _)| p).as_deref(), Some("openai"), "必须如实返回原值");
 
         let after = fs::read(&path).unwrap();
         let first_end = after.iter().position(|b| *b == b'\n').unwrap();
@@ -967,22 +972,32 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// ② 已经指向我们的会话**一个字节都不许写** —— 判据用 mtime，因为只比内容的话
-    /// 「重写成相同内容」也会绿，而那会让每次接入都全量重写几百个文件、并惊动 Codex
-    /// 自己的文件监听。
+    /// ② 已经指向我们的会话**一个字节都不许写**。
+    ///
+    /// ⚠️ **判据不能只看 mtime 了**：[`files::replace_first_line`] 现在会把 mtime 原样恢复
+    /// （否则一次接入会让用户几百个历史会话文件全部显示为刚修改），于是「写了」与「没写」
+    /// 在 mtime 上长得一模一样 —— 原先那条断言从此对本用例要防的缺陷完全无效。
+    ///
+    /// 替代判据两条，缺一不可：
+    /// ① 返回值必须是 `None`（早退没了就会变成 `Some`）；
+    /// ② **文件字节逐字不变** —— `serde_json` 默认用 `BTreeMap`，重新序列化会把键**按字母
+    ///    排序**，所以哪怕语义相同，一次真实改写也必然改变首行的字节形态。这条比 mtime
+    ///    更难被绕过（连「先备份 mtime 再照写一遍」都躲不过它）。
+    /// mtime 那条断言保留，但它现在守的是**保全**、不再是「有没有写」。
     #[test]
     fn a_session_that_already_points_at_us_is_not_touched_at_all() {
         let home = tmp_home("noop");
         let path = write_rollout(&home, "sessions/2026/09/01", "t1", "synaroute", "\n");
+        let before = fs::read(&path).unwrap();
         let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
 
-        assert_eq!(rewrite_first_line(&path, Some("synaroute")).unwrap(), None);
-        assert_eq!(
-            fs::metadata(&path).unwrap().modified().unwrap(),
-            mtime_before,
-            "无需改动时必须一个字节都不写"
+        assert!(
+            rewrite_first_line(&path, Some("synaroute")).unwrap().is_none(),
+            "无需改动时必须早退"
         );
+        assert_eq!(fs::read(&path).unwrap(), before, "无需改动时必须一个字节都不写");
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime_before);
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -1134,7 +1149,7 @@ mod tests {
         assert_eq!(sync_to_at(&home, &data, "synaroute").unwrap().changed, 2);
         let m = read_manifest(&data).unwrap();
         assert_eq!(m.entries.len(), 2, "两个路径各一条，不许重复记");
-        let rec = m.entries.iter().find(|e| e.rel_path.contains("t1")).unwrap();
+        let rec = m.entries.iter().find(|e| e.rel_path.contains(&uuid_of("t1"))).unwrap();
         assert_eq!(
             rec.original_provider, "openai",
             "必须是接入前那个值，不是中途那手 my-relay"
@@ -1178,7 +1193,8 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let c = rusqlite::Connection::open(path).unwrap();
         c.execute("CREATE TABLE threads (id TEXT, model_provider TEXT)", []).unwrap();
-        c.execute("INSERT INTO threads VALUES ('t1', ?1)", [provider]).unwrap();
+        c.execute("INSERT INTO threads VALUES (?1, ?2)", [&uuid_of("t1"), &provider.to_string()])
+            .unwrap();
     }
 
     /// 测试里读清单的便捷壳：只在「确实加载出来」时给值，其余状态一律 panic ——
@@ -1192,7 +1208,7 @@ mod tests {
     }
 
     fn provider_in_db(path: &Path) -> String {
-        provider_of_id(path, "t1")
+        provider_of_id(path, &uuid_of("t1"))
     }
 
     fn provider_of_id(db: &Path, id: &str) -> String {
@@ -1504,7 +1520,7 @@ mod tests {
             .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("state_5.sqlite."))
             .expect("主库应有一份备份");
         assert_eq!(
-            provider_of_id(main, "t1"),
+            provider_of_id(main, &uuid_of("t1")),
             "openai",
             "备份必须是写之前那一份，否则它什么都救不回来"
         );
@@ -1680,7 +1696,7 @@ mod tests {
         let r = sync_to_at(&home, &data, "synaroute").unwrap();
         assert_eq!(
             r.sqlite,
-            Some(SqliteOutcome { updated: 2, error: None }),
+            Some(SqliteOutcome { updated: 2, error: None, ..Default::default() }),
             "两个库各一行都该被改到"
         );
         assert_eq!(provider_in_db(&fresh), "synaroute");
@@ -1760,6 +1776,39 @@ mod tests {
         );
     }
 
+    /// 🔴 `CODEX_SQLITE_HOME` 必须被认。
+    ///
+    /// Codex 自己认这个变量（二进制里那句 "`CODEX_SQLITE_HOME` is overridden by an exact
+    /// requirement for sqlite_home"，出自 `core/src/config/requirements.rs`）。不认它的表现
+    /// 是**静默的**：我们对着 `$CODEX_HOME` 下那个陈旧的库写，而 Codex 读的是别处那个 ——
+    /// 于是「列表里的 provider 怎么改都不变」，而 rollout 那半明明成功了。
+    ///
+    /// 空串与「指向不存在的目录」都必须回落 `home`：CI 里 `env: { X: "" }` 是常见写法，
+    /// 而一个写错的路径若被采纳，我们连 legacy 库都会找不到（同 `SYNAROUTE_DATA_DIR`
+    /// 那条「空串必须视为未设置」的教训）。
+    #[test]
+    fn the_sqlite_home_override_is_honored_but_only_when_it_exists() {
+        let home = tmp_home("sqhome");
+        let other = home.join("elsewhere");
+        fs::create_dir_all(&other).unwrap();
+
+        assert_eq!(sqlite_root_of(None, &home), home, "没设就用 CODEX_HOME");
+        assert_eq!(sqlite_root_of(Some("".into()), &home), home, "空串必须视为未设置");
+        assert_eq!(
+            sqlite_root_of(Some(home.join("nope").into_os_string()), &home),
+            home,
+            "指向不存在的目录时必须回落，否则连 legacy 库都找不到"
+        );
+        assert_eq!(sqlite_root_of(Some(other.clone().into_os_string()), &home), other);
+
+        // 接线：`session_db_paths` 必须经 `sqlite_root`，否则上面全绿而功能没生效。
+        let src = crate::proxy::custom_headers::production_code_only(include_str!(
+            "codex_sessions.rs"
+        ));
+        assert!(src.contains("let root = sqlite_root(home);"), "库路径必须从 sqlite_root 起算");
+        let _ = fs::remove_dir_all(&home);
+    }
+
     /// 用户可见文案的判据：**只说「已指向」，不说「已恢复可用」**。
     ///
     /// 跨账号恢复时 reasoning 的 `encrypted_content` 可能解不开，所以「旧对话能继续」
@@ -1774,11 +1823,41 @@ mod tests {
         assert!(!note.contains("已恢复"), "不许承诺旧对话恢复可用");
 
         // 被占用时要给**可行动**的出路，而不是只报一个数字。
-        // 未能同步时要给**覆盖两种成因**的条件句，而不是只说「退出 Codex」——
-        // 只读卷/权限受限时那句话是无效指路，用户照做后一字不变。
-        let skipped = describe(&SyncReport { skipped: 2, ..Default::default() }).unwrap();
-        assert!(skipped.contains("退出 Codex"));
-        assert!(skipped.contains("不可写"), "必须同时给出「目录不可写」这一支");
+        //
+        // 🔴 三支各测一次。原先只有一句「覆盖两种成因的条件句」，那是因为 Windows 把
+        // 「被占用」与「不可写」都映射成 `PermissionDenied`、分不开。现在
+        // [`files::blame_from_text`] 能按 raw OS error 32/33 分开它们，于是：
+        // 归类得出来 → 给**精确**指路；认不出 → 才退回条件句。
+        // 精确那两支必须**互不相同**，否则「归类」这件事对用户毫无价值。
+        let locked = describe(&SyncReport {
+            skipped: 2,
+            blame: Some(files::IoBlame::Locked),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(locked.contains("退出 Codex"), "被占用要说退出 Codex: {locked}");
+        assert!(!locked.contains("只读卷"), "已经确定是占用，别再提无关的权限方向");
+
+        let unwritable = describe(&SyncReport {
+            skipped: 2,
+            blame: Some(files::IoBlame::Unwritable),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(unwritable.contains("权限"), "不可写要指向权限: {unwritable}");
+        assert!(
+            unwritable.contains("退出 Codex 没用"),
+            "🔴 必须明说退出 Codex 无效 —— 只读卷上那句是无效指路，用户照做后一字不变"
+        );
+
+        // 认不出成因时退回条件句，两种情形都要提到。
+        let unknown = describe(&SyncReport { skipped: 2, ..Default::default() }).unwrap();
+        assert!(unknown.contains("退出") && unknown.contains("不可写"), "{unknown}");
+
+        // encrypted_content 的条数要单独说，且**只说「可能」** —— 会不会真的失败取决于
+        // 上游账号，那是我们看不到的。
+        let enc = describe(&SyncReport { changed: 2, encrypted: 2, ..Default::default() }).unwrap();
+        assert!(enc.contains("可能"), "不许把「可能解不开」说成一定失败: {enc}");
 
         // 全都已经对了 → 一个字都不说。否则每次接入都多一行无信息量的话，
         // 而那种噪音会把真正要看的提示挤掉。
@@ -1795,6 +1874,7 @@ mod tests {
             sqlite: Some(SqliteOutcome {
                 updated: 0,
                 error: Some("locked".into()),
+                ..Default::default()
             }),
             ..Default::default()
         })
@@ -1881,7 +1961,7 @@ mod tests {
             .spawn()
             .expect("起不来 app-server");
         let mut stdin = child.stdin.take().unwrap();
-        let mut out = io::BufReader::new(child.stdout.take().unwrap());
+        let mut out = BufReader::new(child.stdout.take().unwrap());
 
         let send = |w: &mut std::process::ChildStdin, s: &str| {
             writeln!(w, "{s}").unwrap();
