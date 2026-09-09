@@ -38,6 +38,9 @@ export const sessionsZh: Dict = {
   "sessions.export": "导出 Markdown",
   "sessions.exported": "已导出到",
   "sessions.exportFailed": "导出失败",
+  "sessions.openExports": "打开导出目录",
+  "sessions.openExportsDone": "已打开导出目录：{dir}",
+  "sessions.openExportsFailed": "打开导出目录失败",
   "sessions.delete": "删除",
   "sessions.deleteSelected": "删除选中",
   "sessions.selected": "已选 {n} 条",
@@ -90,10 +93,8 @@ export const sessionsZh: Dict = {
   "sessions.autoSync": "接入时自动同步历史会话",
   "sessions.autoSyncHint":
     "这是 SynaRoute 唯一会主动改你对话文件的自动动作（只改首行那一个字段，正文与文件修改时间都不动）。同时在用别的配置切换工具时可以关掉它，关掉后仍可用上面的按钮手动同步。",
-  "sessions.autoSyncSaved": "已保存",
 
   "sessions.indexTitle": "会话索引",
-  "sessions.indexClean": "session_index.jsonl 里没有失效条目（共 {n} 行）",
   "sessions.indexOrphans":
     "session_index.jsonl 里有 {n} 条指向已不存在会话的记录。它们在 Codex 的会话列表里是点开即报错的死条目，通常来自在别处手删过 rollout 文件。",
   "sessions.indexPrune": "清理失效条目",
@@ -139,6 +140,9 @@ export const sessionsEn: Dict = {
   "sessions.export": "Export Markdown",
   "sessions.exported": "Exported to",
   "sessions.exportFailed": "Export failed",
+  "sessions.openExports": "Open exports folder",
+  "sessions.openExportsDone": "Opened exports folder: {dir}",
+  "sessions.openExportsFailed": "Failed to open exports folder",
   "sessions.delete": "Delete",
   "sessions.deleteSelected": "Delete selected",
   "sessions.selected": "{n} selected",
@@ -192,10 +196,8 @@ export const sessionsEn: Dict = {
   "sessions.autoSync": "Sync past sessions when applying",
   "sessions.autoSyncHint":
     "This is the only automatic action in which SynaRoute modifies your conversation files (only that one field on the first line; the body and the file's modification time stay untouched). Turn it off if you also use another config-switching tool — the manual button above still works.",
-  "sessions.autoSyncSaved": "Saved",
 
   "sessions.indexTitle": "Session index",
-  "sessions.indexClean": "No stale rows in session_index.jsonl ({n} row(s) total)",
   "sessions.indexOrphans":
     "session_index.jsonl has {n} row(s) pointing at sessions that no longer exist. In Codex's session list those are dead entries that error out when opened, usually left behind by deleting rollout files elsewhere.",
   "sessions.indexPrune": "Remove stale rows",

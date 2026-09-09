@@ -46,6 +46,7 @@ const MANIFEST_FILE: &str = "codex-session-providers.json";
 
 #[path = "codex_session_ops.rs"] pub(crate) mod ops;
 #[path = "codex_session_fs.rs"] pub(in crate::tools) mod files;
+#[path = "codex_session_history.rs"] pub(in crate::tools) mod history; // 顺 history_base 链拼完整历史（fork 只存分叉点之后的轮次）；理由见该文件模块头
 #[path = "codex_session_view.rs"] pub(in crate::tools) mod view;
 #[path = "codex_session_catalog.rs"] mod catalog; // Desktop 列表索引 local_thread_catalog（第三份 provider 副本）；理由见该文件模块头
 #[path = "codex_session_sqlite.rs"] mod sqlite;

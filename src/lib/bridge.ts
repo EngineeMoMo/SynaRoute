@@ -270,10 +270,20 @@ export const api = {
       mockBridge.deleteCodexSessions(relPaths),
     ),
 
-  /** 导出一条会话为 Markdown 文本（存盘由调用方做）。 */
+  /**
+   * 导出一条会话为 Markdown。**后端直接落盘**到数据目录的 `exports/`，返回完整路径 ——
+   * 不走 blob 下载（依赖 WebView2 的下载行为，失败形态是「点了什么都不发生」）。
+   * 一次导出 = 一个 rollout 文件（**不是**把同一 session id 的父会话与各 fork 合并）。
+   */
   exportCodexSessionMarkdown: (relPath: string) =>
     call<string>("export_codex_session_markdown", { relPath }, () =>
       mockBridge.exportCodexSessionMarkdown(relPath),
+    ),
+
+  /** 在系统文件管理器里打开导出目录（懒创建，故先建再开）。返回打开的绝对路径。 */
+  openCodexExportsDir: () =>
+    call<string>("open_codex_exports_dir", undefined, async () =>
+      "C:\\AppData\\SynaRoute\\exports",
     ),
 
   /** 同步目标下拉的数据源（config / rollout / sqlite 里出现过的 provider id）。 */

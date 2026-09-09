@@ -19,8 +19,8 @@ mod pricing;
 mod proc;
 mod proxy;
 mod retrieval;
-/// 转发诊断响应头（`X-SynaRoute-*`）。独立成模块而不是塞进 proxy.rs：
-/// 那份「头里允许携带什么」的清单需要一个显眼的落脚点，且 proxy.rs 已经 5300+ 行。
+/// 转发诊断响应头（`X-SynaRoute-*`）。独立成模块是因为那份「头里允许携带什么」的清单
+/// 需要一个显眼的落脚点，而 proxy.rs 顶着棘轮基线、余量为 0。
 mod route_meta;
 #[path = "usage_commands.rs"] mod usage_commands; // 用量面板的 IPC 命令；抽出理由见该文件模块注释
 #[path = "client_resync.rs"] mod client_resync; // Key 变更后同步客户端模型清单；来由见该文件模块注释
@@ -32,13 +32,13 @@ mod upstream;
 mod vendors;
 mod usage_store;
 mod usage_cost;
-/// upstream 对外契约守卫。**必须放在 upstream 外面**才能真正验证可见性，
-/// 详见该文件的模块注释。
+/// upstream 对外契约守卫。**必须放在 upstream 外面**才能真正验证可见性（详见该文件注释）。
 #[cfg(test)]
 mod upstream_api_surface;
 /// 性能与内存实测探针（全 `#[ignore]`，不进常规测试；跑法见模块文档）。
 mod perf_probe;
 mod service;
+mod update_watch; // 定时检查更新（30 分钟一轮）；为什么在后端见该文件模块注释
 mod workdirs;
 
 use error::AppResult;
@@ -836,15 +836,14 @@ fn prepare_log_dir(state: tauri::State<AppState>) -> AppResult<String> {
 /// ## 为什么必须由 Rust 端打开，不能让前端调 shell 插件
 ///
 /// 前端原先是 `prepareLogDir()` 拿路径 → `import("@tauri-apps/plugin-shell").open(dir)`。
-/// 那条路**在生产里 100% 失败**：shell 插件对**来自 JS** 的 `open` 调用强制做 scope 正则校验，
+/// 那条路**在生产里 100% 失败**：shell 插件对**来自 JS** 的 `open` 强制做 scope 正则校验，
 /// 未配置时用默认正则 `^((mailto:\w+)|(tel:\w+)|(https?://\w+)).+` —— Windows 路径
-/// `C:\Users\…\logs` 匹配不上，直接返回 `Error::Validation`。于是「打开日志目录」按钮
-/// 一按就报错，而关于页那几个 `https://` 外链却正常（它们匹配得上），
-/// 掩盖了「是路径被拦下」这个真因。
+/// `C:\Users\…\logs` 匹配不上，直接返回 `Error::Validation`。于是这个按钮一按就报错，
+/// 而关于页那几个 `https://` 外链却正常（匹配得上），掩盖了「是路径被拦下」这个真因。
 ///
-/// 而 Rust 端的 `shell.open(path, None)` 传的 scope 是 `None` → **不做正则校验**
-/// （见 tauri-plugin-shell `open::open`：`if let Some(scope) = scope` 才校验）。
-/// 这也是更安全的做法：不必为了放行本地路径去放宽那条防 JS 任意打开文件的正则。
+/// 而 Rust 端的 `shell.open(path, None)` 传的 scope 是 `None` → **不做正则校验**（见
+/// tauri-plugin-shell `open::open`：`if let Some(scope) = scope` 才校验）。这也更安全：
+/// 不必为了放行本地路径去放宽那条防 JS 任意打开文件的正则。
 ///
 /// 顺带把「建目录」与「打开」并成一次 IPC：两步分开时，中间那次失败会让前端拿着
 /// 路径去打开一个还不存在的目录（日志目录是懒创建的）。
@@ -1000,16 +999,16 @@ fn detect_recent_workdirs() -> AppResult<Vec<workdirs::RecentWorkdir>> {
 ///
 /// 🔴 **前端不许传目录进来，这两个命令刻意都不收 `work_dir`**。两条理由：
 /// ① 自动跟随下目录来自会话历史，前端要自己算就得复刻
-///    [`aggregate::write::resolve_writable_work_dir`] 的优先级 —— 本仓已为这类跨语言复刻
-///    栽过多次（`pickPrefs` / `modelSets.ts`），而这里漂移的表现是**静默**的：
-///    前端算出 `undefined` → 后端报「索引状态未知」→ 用户看到一句要他去设置已经设好的目录。
+///    [`aggregate::write::resolve_writable_work_dir`] 的优先级 —— 本仓已为这类跨语言复刻栽过
+///    多次（`pickPrefs` / `modelSets.ts`），而这里漂移是**静默**的：前端算出 `undefined` →
+///    后端报「索引状态未知」→ 用户看到一句要他去设置已经设好的目录。
 /// ② `codegraph_init` 收任意路径就是一个**任意目录写入原语**（会在该目录创建 `.codegraph/`）。
 ///    收回后端自己解析，这个面就没有了。
 ///
-/// 用**写**路径口径（`resolve_writable_work_dir`）而不是 [`aggregate`] 的读路径口径：
-/// 建索引要在项目里创建目录，而读路径带「兜底扫会话历史」，那在写路径上是越权
-/// （见 `write.rs` 里那条 🔴）。代价是「没勾自动跟随也没填目录」时本面板报「未知」，
-/// 而检索本身仍会兜底工作 —— 这个分叉是刻意的，且方向安全（少说而非多说）。
+/// 用**写**路径口径（`resolve_writable_work_dir`）而不是 [`aggregate`] 的读路径口径：建索引要
+/// 在项目里创建目录，而读路径带「兜底扫会话历史」，那在写路径上是越权（见 `write.rs` 那条 🔴）。
+/// 代价是「没勾自动跟随也没填目录」时本面板报「未知」而检索本身仍兜底工作 —— 刻意的分叉，
+/// 方向安全（少说而非多说）。
 fn codegraph_dir(state: &tauri::State<AppState>, category_id: CategoryType) -> Option<String> {
     let brain = state.store.get_brain(category_id);
     aggregate::write::resolve_writable_work_dir(&brain)
@@ -1060,12 +1059,11 @@ pub fn run() {
     // 不启动 UI、不监听端口，把三端客户端配置还原成接入前的样子后立即退出。
     //
     // **为什么必须有**：接入会改写用户的 `~/.claude/settings.json`、
-    // `~/.codex/{config.toml,auth.json}` 与桌面端 gateway 档，而还原只在
-    // 「停止代理 / 切官方」时发生。直接卸载不经过那条路径 —— 卸载器只删自己的文件，
-    // 不会拉起应用执行还原。于是配置留在指向 `127.0.0.1:47100` 的状态，端口已无人监听，
-    // 客户端直接连不上；而用户几乎不可能把「Claude Code 用不了」联想到
-    // 「我昨天卸载了 SynaRoute」。Codex 更糟：`auth.json` 仍是占位 key，
-    // 官方 OAuth 登录不会自动回来。
+    // `~/.codex/{config.toml,auth.json}` 与桌面端 gateway 档，而还原只在「停止代理 / 切官方」时
+    // 发生。直接卸载不经过那条路径（卸载器只删自己的文件、不会拉起应用还原）→ 配置留在指向
+    // `127.0.0.1:47100` 的状态、端口已无人监听、客户端直接连不上，而用户几乎不可能把
+    // 「Claude Code 用不了」联想到「我昨天卸载了 SynaRoute」。Codex 更糟：`auth.json` 仍是
+    // 占位 key，官方 OAuth 登录不会自动回来。
     //
     // 与 `--mcp-stdio` 同样**不初始化 Store**：`tools::restore` 只依赖 CategoryType，
     // 不需要配置；且避免读到 MSIX 虚拟化的错误配置宇宙。
@@ -1133,11 +1131,10 @@ pub fn run() {
     let proxy = Arc::new(ProxyManager::new(store.clone()));
     let mcp = Arc::new(McpManager::new(store.clone()));
 
-    // 注意：MCP 自启动移到下方 setup() 里、跑在 Tauri 托管的异步运行时上。
+    // 注意：MCP 自启动移到下方 setup() 里、跑在 Tauri 托管运行时上（生命周期与应用一致）。
     // 早期版本在此处用 std::thread + 临时 Runtime + block_on(mcp.start())：start() 只 spawn
-    // accept 循环便返回，block_on 随即结束、临时 Runtime 被 drop → accept 任务连同监听器一起
-    // 被取消，端口不再监听，但状态却显示 running（自启动的 MCP 形同虚设）。改用 Tauri 运行时
-    // （生命周期与应用一致）后 accept 循环得以长存。
+    // accept 循环便返回，临时 Runtime 随即 drop → accept 任务连同监听器被取消，
+    // 端口不再监听而状态显示 running（自启动的 MCP 形同虚设）。**别把定时任务改回这个形状。**
 
     // 后台定时健康检查（arch-decisions §6）。间隔由用户配置（AppSettings.health_check_interval_secs，
     // 默认 60s），每轮结束后重新读取最新配置，改设置即时生效、无需重启。设 10s 下限防误配把上游打爆。
@@ -1261,6 +1258,10 @@ pub fn run() {
             }
             service::reconcile_auto_start(&state.store, &PluginAutostart(app.handle()));
 
+            // 定时检查更新（30 分钟一轮，先睡后查）。**必须在 setup 里起**：要 AppHandle 才
+            // 拿得到 updater。为什么不做前端定时器 / 不搭探测的车，见该模块文档。
+            update_watch::spawn_background(app.handle().clone(), state.store.clone());
+
             // 随系统启动时最小化到托盘（FR-025 需求原文要求）。判据是启动参数里有
             // `--autostart`（注册自启动项时带上的），而非「auto_start 为真」——
             // 后者在用户手动双击时也成立，那时把窗口藏起来会让人以为程序没启动。
@@ -1272,8 +1273,7 @@ pub fn run() {
             }
 
             // 内置 MCP 服务器：用户已启用则随应用启动（Q8），端口取自设置（默认 9527，Q7）。
-            // 跑在 Tauri 托管异步运行时上，生命周期与应用一致 ——
-            // 早期用 std::thread + 临时 Runtime + block_on 会让 Runtime drop 掉 accept 循环。
+            // 跑在 Tauri 托管运行时上，理由见上面 run() 里那段注释。
             //
             // 现读而不用上面的快照：三项对账刚改过 settings（虽然都不碰 mcp_enabled），
             // 在 setup 里留一份「对账前的旧快照」正是本项目出过 P0 的形状。
@@ -1343,7 +1343,7 @@ pub fn run() {
             usage_commands::get_pricing_table_date,
             tools::env_conflicts::detect_env_conflicts, tools::env_conflicts::remove_env_conflicts,
             tools::codex::codex_catalog::get_codex_config_model,
-            tools::codex::codex_sessions::ops::list_codex_sessions, tools::codex::codex_sessions::ops::delete_codex_sessions, tools::codex::codex_sessions::ops::export_codex_session_markdown,
+            tools::codex::codex_sessions::ops::list_codex_sessions, tools::codex::codex_sessions::ops::delete_codex_sessions, tools::codex::codex_sessions::ops::export_codex_session_markdown, tools::codex::codex_sessions::ops::open_codex_exports_dir,
             tools::codex::codex_sessions::sync::list_codex_provider_targets, tools::codex::codex_sessions::sync::sync_codex_sessions, tools::codex::codex_sessions::sync::set_codex_session_auto_sync, tools::codex::codex_sessions::sync::audit_codex_session_index, tools::codex::codex_sessions::sync::prune_codex_session_index,
             health::balance_gate::query_key_balance,
             show_main_window_cmd,

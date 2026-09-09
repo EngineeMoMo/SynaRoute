@@ -8,7 +8,7 @@ import type {
   CodexSessionRow,
 } from "@/types";
 import { ToggleRow } from "@/components/ToggleRow";
-import { AlertTriangle, RefreshCw, Trash2, Wand2 } from "lucide-react";
+import { AlertTriangle, FolderOpen, RefreshCw, Trash2, Wand2 } from "lucide-react";
 import { SessionTable } from "@/components/SessionTable";
 
 /**
@@ -194,6 +194,19 @@ export function CodexSessionsPage() {
     }
   };
 
+  // 打开导出目录。回显实际打开的绝对路径：MSIX 虚拟化下打开的可能是包内私有副本，
+  // 用户必须能核对自己看的是哪一份（同 `openLogDir` 那条平行宇宙防线）。
+  //
+  // ⚠️ **必须带一句说明，不能只塞裸路径**：这块 note 区域与「已导出到 X」「已删除 N 条」
+  // 共用，一个没有前缀的绝对路径读不出是什么意思（审查时发现，同 `settings.logOpened` 的做法）。
+  const doOpenExports = async () => {
+    try {
+      setNote(t("sessions.openExportsDone", { dir: await api.openCodexExportsDir() }));
+    } catch (e) {
+      setNote(`${t("sessions.openExportsFailed")}: ${e}`);
+    }
+  };
+
   const srcLabel = useMemo(
     () => (s: string) =>
       s === "config"
@@ -211,14 +224,26 @@ export function CodexSessionsPage() {
           <h1 className="text-xl font-semibold text-text">{t("sessions.title")}</h1>
           <p className="mt-1 max-w-3xl text-sm text-text-muted">{t("sessions.subtitle")}</p>
         </div>
-        <button
-          type="button"
-          onClick={() => void load()}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm text-text hover:bg-surface-hover"
-        >
-          <RefreshCw className="h-4 w-4" />
-          {t("sessions.refresh")}
-        </button>
+        <div className="flex shrink-0 items-center gap-2">
+          {/* 打开导出目录：常驻而不是只在导出成功后才出现 —— 用户上一次导出可能是上次开应用时
+              做的，而那条 note 早就没了，那时他没有任何入口找到自己的文件。 */}
+          <button
+            type="button"
+            onClick={() => void doOpenExports()}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm text-text hover:bg-surface-hover"
+          >
+            <FolderOpen className="h-4 w-4" />
+            {t("sessions.openExports")}
+          </button>
+          <button
+            type="button"
+            onClick={() => void load()}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm text-text hover:bg-surface-hover"
+          >
+            <RefreshCw className="h-4 w-4" />
+            {t("sessions.refresh")}
+          </button>
+        </div>
       </header>
 
       {data && (

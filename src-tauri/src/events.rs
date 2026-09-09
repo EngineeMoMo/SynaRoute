@@ -60,7 +60,7 @@ const COALESCE_MS: u64 = 250;
 
 /// 状态变更的主题。
 ///
-/// `as_str` 与 `min_interval_ms` 都用**穷举 match**：加第 8 个 topic 时编译器会同时点出
+/// `as_str` 与 `min_interval_ms` 都用**穷举 match**：加 topic 时编译器会同时点出
 /// 这两处要改（与本仓 `Protocol::auth_scheme` 同一手法），而不是漏一处然后静默发错。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Topic {
@@ -76,6 +76,10 @@ pub enum Topic {
     Vault,
     /// 有新事件写入运行日志
     Logs,
+    /// 定时检查更新发现了新版本（`update_watch`）。**只在结论变化时**发一次，
+    /// 载荷里不带版本号 —— 前端收到后自己调 `check_for_updates` 拿版本与说明
+    /// （同本模块「载荷里为什么不带业务数据」那条）
+    Update,
 }
 
 // 刻意**没有** Takeover 主题：桌面端「接入被 cc-switch 接管」的判据是外部文件
@@ -92,6 +96,7 @@ impl Topic {
             Topic::Proxy => "proxy",
             Topic::Vault => "vault",
             Topic::Logs => "logs",
+            Topic::Update => "update",
         }
     }
 
@@ -100,10 +105,18 @@ impl Topic {
     /// 只有 `Logs` 需要压制：`append_event_full` 每次转发要走好几次，250ms 合并后最坏仍是
     /// 4 次/秒，而前端对 logs 的反应是**重拉 500 条事件** —— 那比现在 2s 一次还糟。
     /// 1500ms 让最坏情况退化到「比现状略好」，而空闲时是 0（立刻推）。
+    ///
+    /// `Update` 刻意也是 0：它的限速在**上游**（`update_watch` 30 分钟一轮，且只在结论
+    /// 变化时才发），在这里再压一层只会让唯一那次通知延迟到达。
     fn min_interval_ms(&self) -> i64 {
         match self {
             Topic::Logs => 1500,
-            Topic::Config | Topic::Settings | Topic::Health | Topic::Proxy | Topic::Vault => 0,
+            Topic::Config
+            | Topic::Settings
+            | Topic::Health
+            | Topic::Proxy
+            | Topic::Vault
+            | Topic::Update => 0,
         }
     }
 }

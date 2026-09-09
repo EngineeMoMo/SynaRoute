@@ -269,10 +269,15 @@ fn delete_threads_rows(home: &Path, ids: &[String]) -> Option<String> {
 /// 只带对话正文（见模块头）：`developer`/`system` 消息、工具输出、`encrypted_content`
 /// 一概不导出。工具调用只留一行名字 —— 它对「这段对话干了什么」有信息量，而 `arguments`
 /// 里常是本机绝对路径和整段命令，属于用户未必想连同对话一起发出去的东西。
-fn to_markdown(text: &str) -> String {
+///
+/// 入参是 [`history::Assembled`]（已顺 `history_base` 链拼过），不是单个文件的文本 ——
+/// 🔴 **两件事必须落到文件里**：拼进来了几段祖先（否则用户看不出这是一条 fork）、
+/// 以及**拼不完整时的原因**（静默截断正是 `history` 模块要修的缺陷本体）。
+fn to_markdown(asm: &super::history::Assembled) -> String {
     let mut out = String::new();
     let mut head_done = false;
-    for line in text.lines() {
+    for line in std::iter::once(asm.first_line.as_str()).chain(asm.lines.iter().map(String::as_str))
+    {
         let Ok(rec) = serde_json::from_str::<Value>(line) else { continue };
         let payload = rec.get("payload").unwrap_or(&Value::Null);
         let s = |v: &Value, k: &str| {
@@ -282,7 +287,7 @@ fn to_markdown(text: &str) -> String {
             Some("session_meta") if !head_done => {
                 head_done = true;
                 out.push_str(&format!(
-                    "# Codex 会话 {}\n\n- 时间：{}\n- 目录：{}\n- provider：{}\n- 客户端：{} {}\n\n---\n",
+                    "# Codex 会话 {}\n\n- 时间：{}\n- 目录：{}\n- provider：{}\n- 客户端：{} {}\n",
                     s(payload, "id"),
                     s(payload, "timestamp"),
                     s(payload, "cwd"),
@@ -290,6 +295,8 @@ fn to_markdown(text: &str) -> String {
                     s(payload, "originator"),
                     s(payload, "cli_version"),
                 ));
+                out.push_str(&history_note(asm));
+                out.push_str("\n---\n");
             }
             Some("response_item") => match payload.get("type").and_then(Value::as_str) {
                 Some("message") => {
@@ -299,11 +306,16 @@ fn to_markdown(text: &str) -> String {
                         continue;
                     }
                     let body = collect_text(payload.get("content"));
-                    if body.trim().is_empty() {
-                        continue;
+                    match classify_user_text(&role, body.trim()) {
+                        UserText::Injected => continue,
+                        UserText::Interrupted => {
+                            out.push_str("\n> ⏹ 用户打断了这一轮\n");
+                        }
+                        UserText::Real => {
+                            let who = if role == "user" { "用户" } else { "助手" };
+                            out.push_str(&format!("\n## {who}\n\n{}\n", body.trim_end()));
+                        }
                     }
-                    let who = if role == "user" { "用户" } else { "助手" };
-                    out.push_str(&format!("\n## {who}\n\n{}\n", body.trim_end()));
                 }
                 Some("function_call") | Some("custom_tool_call") => {
                     out.push_str(&format!("\n> 🔧 工具调用：`{}`\n", s(payload, "name")));
@@ -314,9 +326,74 @@ fn to_markdown(text: &str) -> String {
         }
     }
     if !head_done {
+        // 首行认不出（Codex 换了格式）时，那句「历史不完整」更不能丢 —— 这条路径上
+        // 我们对这份文件的了解最少，用户最需要知道它可能缺东西。
         out.push_str("# Codex 会话\n\n（首行元数据认不出，以下只有正文）\n");
+        out.push_str(&history_note(asm));
     }
     out
+}
+
+/// 一条 `role: user` 消息到底是什么。
+enum UserText {
+    /// 用户真打的话（或助手的回答）
+    Real,
+    /// Codex 注入的、不该进导出的块
+    Injected,
+    /// 「用户打断了这一轮」——真实信息，但原文是给模型看的指令口吻
+    Interrupted,
+}
+
+/// 🔴 **`role == "user"` 不等于「用户打的」。**
+///
+/// Codex 会以用户身份注入 `<environment_context>`：本机实测 7 处、平均 **1274 字符**，
+/// 内容是 `workspace_roots` 的**本机绝对路径** + `permission_profile` 的整份权限配置。
+/// 那正是模块头说「绝不导出」的那一类（同 developer 消息、工具输出），
+/// 只是它顶着 `user` 这个角色、把既有判据绕过去了。
+///
+/// 这个缺陷本来就在，但**拼装历史把它放大了** —— 一条 fork 拼完会带 2~3 份，
+/// 而它们出现在导出文件最显眼的开头。既然是我的改动放大的，就一起修。
+///
+/// `<turn_aborted>` 反过来：那是**真实**发生的事（用户按了停），但原文是一段给模型的
+/// 说明（"Any running unified exec processes may still be running…"）。
+/// 照搬会让读导出的人以为用户打了这段话，故改成一行标注。
+///
+/// 判据是**前缀**而不是 `contains`：实测那 7 处全部独占整条消息（闭合标签之后 0 字符），
+/// 而用 `contains` 会把「用户自己贴了一段 `<environment_context>` 来提问」也吞掉 ——
+/// 那是真话被当成噪音丢掉，方向比多留一段噪音糟。
+fn classify_user_text(role: &str, trimmed: &str) -> UserText {
+    if trimmed.is_empty() {
+        return UserText::Injected; // 空消息本来也不输出
+    }
+    if role != "user" {
+        return UserText::Real;
+    }
+    if trimmed.starts_with("<environment_context>") {
+        return UserText::Injected;
+    }
+    if trimmed.starts_with("<turn_aborted>") {
+        return UserText::Interrupted;
+    }
+    UserText::Real
+}
+
+/// 头部那两行「继承/不完整」说明。
+///
+/// 🔴 **不完整那句必须出现在导出文件里**，而不只是回给界面一句 toast：导出的 Markdown
+/// 是会被存下来、过几周再翻、或者转发给别人的东西，而 toast 关掉就没了。
+/// 静默截断正是 `history` 模块要修的缺陷本体 —— 只在界面上说一次不算修好。
+fn history_note(asm: &super::history::Assembled) -> String {
+    let mut s = String::new();
+    if asm.inherited > 0 {
+        s.push_str(&format!(
+            "- 历史：本对话由 {} 段先前的记录接续而成（已按时间顺序合并）\n",
+            asm.inherited + 1
+        ));
+    }
+    if let Some(why) = &asm.incomplete {
+        s.push_str(&format!("\n> ⚠️ **本导出的对话不完整**：{why}。以下内容从中途开始。\n"));
+    }
+    s
 }
 
 /// 从 `content` 数组里拼出纯文本。三种 `type` 都要认（`input_text` / `output_text` /
@@ -434,15 +511,46 @@ pub async fn export_codex_session_markdown(rel_path: String) -> Result<String, S
     let home = super::super::codex_paths::codex_home().map_err(|e| e.to_string())?;
     let path = resolve_in_home(&home, &rel_path)
         .ok_or_else(|| format!("路径越界，已拒绝：{rel_path}"))?;
-    let text = fs::read_to_string(&path).map_err(|e| format!("读取失败：{e}"))?;
-    let dir = crate::store::data_dir::app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("exports");
+    // 🔴 **不是 `read_to_string` 这一个文件**：fork 子会话只存分叉点之后的轮次，
+    // 直接导出会得到一份缺开头、而且看不出被截断的对话（见 `history` 模块头）。
+    let asm = super::history::assemble(&home, &path)?;
+    let dir = exports_dir()?;
     fs::create_dir_all(&dir).map_err(|e| format!("建导出目录失败：{e}"))?;
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let out = dir.join(format!("{stem}.md"));
-    fs::write(&out, to_markdown(&text)).map_err(|e| format!("写出失败：{e}"))?;
+    fs::write(&out, to_markdown(&asm)).map_err(|e| format!("写出失败：{e}"))?;
     Ok(out.display().to_string())
+}
+
+/// 导出目录。**唯一事实来源** —— 导出与「打开目录」必须指同一处，两边各拼一次
+/// `join("exports")` 的失效方向是「按钮打开了一个空目录」，而用户会据此判定导出没成功。
+fn exports_dir() -> Result<std::path::PathBuf, String> {
+    Ok(crate::store::data_dir::app_data_dir().map_err(|e| e.to_string())?.join("exports"))
+}
+
+/// 在系统文件管理器里打开导出目录，返回打开的绝对路径（供 UI 回显）。
+///
+/// 🔴 **必须由 Rust 端打开**，理由与 `open_log_dir` 逐字相同：shell 插件对**来自 JS** 的
+/// `open` 强制做 scope 正则校验（默认正则只放行 mailto/tel/http），Windows 路径匹配不上
+/// → `Error::Validation`，表现是「按钮一点就报错」。Rust 端 `shell.open(path, None)`
+/// 传 scope `None` = 不做校验。
+///
+/// **先建目录再打开**：导出目录是懒创建的，用户可能一次都没导出过就点了这个按钮，
+/// 那时直接 open 一个不存在的路径在资源管理器里是一个看不懂的错误框。
+/// 建完再打开的语义是「这里还没有东西」——那是准确且可读的。
+#[tauri::command]
+pub async fn open_codex_exports_dir(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri_plugin_shell::ShellExt;
+    let dir = exports_dir()?;
+    fs::create_dir_all(&dir).map_err(|e| format!("建导出目录失败（{}）：{e}", dir.display()))?;
+    let path = dir.to_string_lossy().into_owned();
+    // `#[allow(deprecated)]` 的理由同 `open_log_dir`：换 tauri-plugin-opener 是独立改动
+    // （新依赖 + 新权限集），不该和这次的功能混在一起。函数在 2.x 全程可用。
+    #[allow(deprecated)]
+    app.shell()
+        .open(path.clone(), None)
+        .map_err(|e| format!("打开导出目录失败（{path}）：{e}"))?;
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -513,7 +621,10 @@ mod tests {
     fn markdown_export_carries_only_the_conversation() {
         let home = tmp_home("md");
         let (rel, id) = write_full_rollout(&home, "t1");
-        let md = to_markdown(&fs::read_to_string(home.join(&rel)).unwrap());
+        // 走 `assemble` 而不是自己 `read_to_string`：那才是导出命令实际走的路径
+        // （单个文件与拼过历史的会话，两者都得只带正文）。
+        let asm = super::super::history::assemble(&home, &home.join(&rel)).unwrap();
+        let md = to_markdown(&asm);
 
         assert!(md.contains(&format!("# Codex 会话 {id}")), "要有元数据抬头: {md}");
         assert!(md.contains("## 用户") && md.contains("帮我排序"));
@@ -528,6 +639,127 @@ mod tests {
         ] {
             assert!(!md.contains(leak), "导出里不该出现 {leak}:\n{md}");
         }
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// 🔴 **`role: user` 的注入块不许进导出。**
+    ///
+    /// Codex 以用户身份注入 `<environment_context>`（本机实测 7 处、均 1274 字符，
+    /// 内含 `workspace_roots` 的本机绝对路径与整份权限配置）。它顶着 `user` 角色，
+    /// 把「跳过 developer/system」那道判据绕过去了。
+    ///
+    /// `<turn_aborted>` 是真实信息但口吻是给模型的说明 → 必须变成一行标注，
+    /// 而**不能**照搬（读导出的人会以为用户打了那段英文）。
+    #[test]
+    fn injected_user_role_blocks_are_not_exported() {
+        let home = tmp_home("inj");
+        let id = uuid_of("inj");
+        let rel = format!("sessions/2026/09/01/rollout-2026-09-01T21-06-47-{id}.jsonl");
+        let lines = [
+            format!("{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}"),
+            // 注入块：独占整条消息，含本机路径
+            "{\"ordinal\":1,\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<environment_context>\\n<workspace_roots><root>C:\\\\Users\\\\LEAKED\\\\secret-project</root></workspace_roots>\\n</environment_context>\"}]}}".into(),
+            "{\"ordinal\":2,\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<turn_aborted>\\nThe user interrupted the previous turn on purpose. Any running unified exec processes may still be running.\\n</turn_aborted>\"}]}}".into(),
+            "{\"ordinal\":3,\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"真实提问\"}]}}".into(),
+        ];
+        fs::write(home.join(&rel), lines.join("\n") + "\n").unwrap();
+        let asm = super::super::history::assemble(&home, &home.join(&rel)).unwrap();
+        let md = to_markdown(&asm);
+
+        assert!(!md.contains("LEAKED"), "注入块里的本机路径进了导出:\n{md}");
+        assert!(!md.contains("environment_context"), "注入块整段都不该在:\n{md}");
+        assert!(
+            !md.contains("unified exec processes"),
+            "turn_aborted 的原文是给模型的指令口吻，不能照搬:\n{md}"
+        );
+        assert!(md.contains("用户打断了这一轮"), "打断这件事是真实信息，要留一行标注:\n{md}");
+        assert!(md.contains("真实提问"), "真话不许被一起丢掉:\n{md}");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// 🔴 **「历史不完整」必须落进 Markdown 文件本身。**
+    ///
+    /// ⚠️ 这条是**注入实测补上来的**：`history` 那侧有一条 `a_missing_parent_is_reported…`，
+    /// 但它只查 `asm.incomplete` 这个字段、**压根不看导出文件**。于是把 `history_note` 里
+    /// 那三行整段删掉，15 条 ops 用例照样全绿 —— 而那时导出的就是一份缺开头、
+    /// 又看不出缺了东西的对话，也就是本轮要修的缺陷原样复发。
+    ///
+    /// 只回界面一句 toast 不算修好：导出的 Markdown 会被存下来、过几周再看、转发给别人，
+    /// 而 toast 关掉就没了。
+    #[test]
+    fn an_incomplete_history_is_disclosed_inside_the_markdown() {
+        let home = tmp_home("disc");
+        let child = uuid_of("child");
+        let gone = uuid_of("gone-parent");
+        // fork 指向一个**不存在**的父 → 拼不完整
+        let rel =
+            format!("sessions/2026/09/01/rollout-2026-09-01T21-06-47-{gone}_{child}.jsonl");
+        let lines = [
+            format!(
+                "{{\"ordinal\":9,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{gone}\",\"history_base\":{{\"thread_id\":\"{gone}\",\"end_ordinal_exclusive\":9}}}}}}"
+            ),
+            "{\"ordinal\":10,\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"中途开始的提问\"}]}}".into(),
+        ];
+        fs::write(home.join(&rel), lines.join("\n") + "\n").unwrap();
+        let asm = super::super::history::assemble(&home, &home.join(&rel)).unwrap();
+        assert!(asm.incomplete.is_some(), "夹具没造出「拼不完整」，这条用例就是空转的");
+        let md = to_markdown(&asm);
+
+        assert!(
+            md.contains("不完整"),
+            "导出文件里必须写明历史不完整 —— 只回界面一句 toast 不算（toast 关掉就没了）:\n{md}"
+        );
+        assert!(md.contains("中途开始"), "手上这份对话照旧要导出:\n{md}");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// 拼进来几段祖先也要写进文件 —— 否则用户看不出这是一条 fork 的合并结果。
+    #[test]
+    fn the_number_of_merged_segments_is_stated() {
+        let home = tmp_home("seg");
+        let p = uuid_of("seg-parent");
+        let c = uuid_of("seg-child");
+        let prel = format!("sessions/2026/09/01/rollout-2026-09-01T21-06-47-{p}.jsonl");
+        fs::write(
+            home.join(&prel),
+            format!("{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{p}\"}}}}\n{{\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"最早那句\"}}]}}}}\n"),
+        )
+        .unwrap();
+        let crel = format!("sessions/2026/09/01/rollout-2026-09-01T21-08-00-{p}_{c}.jsonl");
+        fs::write(
+            home.join(&crel),
+            format!("{{\"ordinal\":2,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{p}\",\"history_base\":{{\"thread_id\":\"{p}\",\"end_ordinal_exclusive\":2}}}}}}\n{{\"ordinal\":3,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"后来那句\"}}]}}}}\n"),
+        )
+        .unwrap();
+        let asm = super::super::history::assemble(&home, &home.join(&crel)).unwrap();
+        let md = to_markdown(&asm);
+        assert!(md.contains("最早那句") && md.contains("后来那句"), "两段都要在:\n{md}");
+        assert!(md.contains("2 段"), "要说明由几段合并而成:\n{md}");
+        assert!(!md.contains("不完整"), "这条是拼完整的，不该报不完整:\n{md}");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// 用户**自己**贴一段 `<environment_context>` 来提问时，不许被当成注入丢掉。
+    ///
+    /// 这是判据用「前缀 + 独占整条」而不是 `contains` 的理由：`contains` 会把真话吞掉，
+    /// 那个方向比多留一段噪音糟。⚠️ 实测那 7 处注入全部独占整条消息（闭合标签后 0 字符），
+    /// 所以「前缀」这个判据对真实数据是够的。
+    #[test]
+    fn a_user_quoting_that_tag_is_still_exported() {
+        let home = tmp_home("quote");
+        let id = uuid_of("quote");
+        let rel = format!("sessions/2026/09/01/rollout-2026-09-01T21-06-47-{id}.jsonl");
+        let lines = [
+            format!("{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}"),
+            "{\"ordinal\":1,\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"这个 <environment_context> 是什么意思？UNIQUE-QUESTION\"}]}}".into(),
+        ];
+        fs::write(home.join(&rel), lines.join("\n") + "\n").unwrap();
+        let asm = super::super::history::assemble(&home, &home.join(&rel)).unwrap();
+        let md = to_markdown(&asm);
+        assert!(
+            md.contains("UNIQUE-QUESTION"),
+            "用户自己提到那个标签的提问被当成注入丢掉了（判据不能用 contains）:\n{md}"
+        );
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -841,22 +1073,80 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// 🔴 接线判据：上面三条都直调内部函数，三个命令没进 `generate_handler!` 它们照样全绿 ——
+    /// 🔴 接线判据：上面几条都直调内部函数，命令没进 `generate_handler!` 它们照样全绿 ——
     /// 而那时用户点按钮只会拿到一句 "command not found"。策略门 `invoke-command-must-exist`
     /// 只查正向（前端调的名字在 Rust 有定义），反向这条没人管，同 `key_flags.rs` 那条。
     #[test]
-    fn the_three_commands_must_be_registered_in_the_handler_list() {
+    fn the_commands_must_be_registered_in_the_handler_list() {
         let lib = include_str!("../lib.rs");
         for cmd in [
             "list_codex_sessions",
             "delete_codex_sessions",
             "export_codex_session_markdown",
+            "open_codex_exports_dir",
         ] {
             assert!(
                 lib.contains(&format!("codex_sessions::ops::{cmd}")),
                 "{cmd} 没进 generate_handler! —— 界面上点它会报 command not found"
             );
         }
+    }
+
+    /// 🔴 **导出目录只能有一处拼法。**
+    ///
+    /// 导出与「打开导出目录」必须指同一处。两边各写一次 `join("exports")` 的失效方向是
+    /// **「按钮打开了一个空目录」** —— 而用户会据此判定导出压根没成功，去查一个不存在的问题。
+    /// 判据钉住「生产段里 `"exports"` 这个字面量只出现一次」，也就是只在 `exports_dir` 里。
+    #[test]
+    fn the_exports_dir_has_a_single_source_of_truth() {
+        let me = crate::proxy::custom_headers::production_code_only(include_str!(
+            "codex_session_ops.rs"
+        ));
+        assert_eq!(
+            me.matches(r#""exports""#).count(),
+            1,
+            "导出目录的拼法必须只有一处（exports_dir）—— 第二处会让「打开目录」指向别处"
+        );
+        // 正向：那一处真的在，且两个消费者都走它（光有上面那条，把整个函数删掉也满足）。
+        assert!(me.contains("fn exports_dir("), "exports_dir 不在了");
+        assert_eq!(
+            me.matches("exports_dir()").count(),
+            3,
+            "定义 1 处 + 导出与打开各调 1 处 = 3；对不上说明有人绕过了它"
+        );
+    }
+
+    /// 前端必须真有调用点，且**打开目录的入口不能只在导出成功后才出现**。
+    ///
+    /// 上一条只证明命令注册了。而「按钮压根没渲染」与「命令没注册」对用户是同一件事：
+    /// 点不到。挂在 header 上（常驻）而不是 note 里 —— 用户上一次导出可能是上次开应用时
+    /// 做的，那条 note 早没了，那时他没有任何入口找到自己的文件。
+    #[test]
+    fn the_page_must_expose_the_open_exports_button() {
+        let page = crate::proxy::custom_headers::production_code_only(include_str!(
+            "../../../src/pages/CodexSessionsPage.tsx"
+        ));
+        assert!(
+            page.contains("api.openCodexExportsDir()"),
+            "页面没调 openCodexExportsDir —— 命令注册了也点不到"
+        );
+        assert!(
+            page.contains(r#"t("sessions.openExports")"#),
+            "按钮没有文案键 —— 界面上会是一个空按钮"
+        );
+        // 常驻：按钮必须落在 `<header>` … `</header>` **之内**。
+        //
+        // ⚠️ 这条第一版写的是「在 `<header>` 与选中项块之间」，注入实测**仍绿** ——
+        // 那个区间跨了统计卡、警告横幅等大半个文件，几乎什么都满足。
+        // 钉边界要钉**元素内部**，不是「在某两个远隔的东西之间」。
+        let open = page.find("<header").expect("页面没有 header");
+        let close = page.find("</header>").expect("header 没闭合");
+        let btn = page.find(r#"t("sessions.openExports")"#).unwrap_or(usize::MAX);
+        assert!(
+            btn > open && btn < close,
+            "「打开导出目录」必须常驻在 header 内，不能藏进选中项/导出结果那些条件块 \
+             （用户上一次导出可能是上次开应用时做的，那时 note 早没了）"
+        );
     }
 }
 

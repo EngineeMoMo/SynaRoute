@@ -17,7 +17,15 @@ const EVENT_NAME = "synaroute://state-changed";
  */
 export const FALLBACK_POLL_MS = 30_000;
 
-export type BackendTopic = "config" | "settings" | "health" | "proxy" | "vault" | "logs";
+export type BackendTopic =
+  | "config"
+  | "settings"
+  | "health"
+  | "proxy"
+  | "vault"
+  | "logs"
+  /** 定时检查更新发现了新版本（后端 `update_watch`，30 分钟一轮）。载荷不带版本号 */
+  | "update";
 
 interface StateChangedPayload {
   topic: BackendTopic;
@@ -90,6 +98,20 @@ export function useBackendEvents() {
   });
   useBackendEvent(["settings"], () => {
     void useStore.getState().loadSettings();
+  });
+
+  // 定时检查更新（后端 `update_watch` 每 30 分钟一轮）敲门后，去取版本号与发布说明。
+  //
+  // 为什么这里还要再查一次：事件只当「敲门」，载荷里刻意不带业务数据（events.rs 模块注释）。
+  // 这一趟只在**真发现新版本**时发生 —— 后端只在结论变化时敲，不是每 30 分钟一次。
+  //
+  // `silent` 必须为 true：这是后台通知触发的，不是用户主动点的。弹一个失败 toast 会在
+  // 用户什么都没做的时候打断他（而手动按钮那条路照旧会把错误显示出来）。
+  //
+  // 挂在 hub 而不是某个页面：横幅在所有页面都显示，挂在某一页上就变成
+  // 「只有开着那一页时才会更新」。
+  useBackendEvent(["update"], () => {
+    void useStore.getState().checkForUpdates({ silent: true });
   });
 
   // `vault` 与 `logs` 刻意**不在 hub 里**处理：
