@@ -27,13 +27,14 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
 > **从没进过 §21.2** —— 后果与重号完全一样（照清单验完就以为收工）。
 > **写完一轮的「仍未真机验证」，最后一步是去 §21.2 给它编号。**
 >
-> ✅ **已发版 v0.1.60（2026-09-09）**：`a571f4b` 已推 master、tag 已推、Release 四平台全绿并
-> publish（Latest / 17 资产 / `latest.json` = 0.1.60）。**0.1.59 那个号作废** —— 它本地出过包
-> 但从未打 tag、从未发 Release。<br>✅ **工作区已清空**：§24.1 那三轮 + 第 26~29 节各轮已全部
-> 提交进 `a571f4b`（77 个文件），只剩 4 个 `scripts/tmp-*` 探针刻意未提交。
-> 「工作区混着三轮未提交工作 / 三轮都未出包」那句**已作废**。
+> ✅ **已发版 v0.1.61（2026-09-09）**：`68e8b8b` 已推 master、tag `v0.1.61` 已推、
+> Release 四平台全绿并 publish（Latest / **17 资产** / `latest.json` = 0.1.61 /
+> **11 个平台条目每个都有签名**）。已核「已发布的那份」setup.exe 签名对内容有效。
+> **0.1.59 那个号作废**（本地出过包但从未打 tag / 从未发 Release）。
+> <br>✅ **本轮已提交**：定时检查更新 + 打开导出目录 + 导出拼完整历史（17 文件，
+> 不含 4 个 `scripts/tmp-*` 探针）。工作区只剩那 4 个探针。
 >
-> 📌 基线（2026-09-09 实测，接手请自己重跑）：`cargo test --lib` **1251 / 0 failed / 7 ignored**、
+> 📌 基线（2026-09-09 实测，接手请自己重跑）：`cargo test --lib` **1273 / 0 failed / 8 ignored**、
 > `npm test` **228 / 31 文件**、clippy 零警告、`cargo check --lib` 干净、gates 全绿零抬高。
 
 - **已修完（换机后）**：重复接入冲掉「接入前备份」（P0 数据丢失级）、短路窗口测试串台 + 重启代理不解除窗口、
@@ -2760,10 +2761,20 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   「判据被自己扫的文本满足」那一族的**字符串版**，此前记的都是注释版。
   <br>**基线**：`cargo test --lib` **1273 / 0 failed / 8 ignored**（连跑 2 次）、
   `npm test` 228 / 31 文件、clippy 干净、`cargo check --lib` 干净、gates 全绿零抬高。
-  <br>✅ **已出包 v0.1.61**（走 `npm run release:build`，三道产物门全绿）：
-  `SynaRoute_0.1.61_x64-setup.exe` 6 894 714 B（sha256 `f7d1286bbdc5f4f9…`）+
-  `msi` 9 912 320 B，两个可更新产物都已签名、keyid `7A46ECB8087DE26F` 与内嵌公钥一致，
-  前端 chunk **7/7**，版本号 6 处一致。**未推 tag、未发 Release。**
+  <br>✅ **已发版 v0.1.61（2026-09-09）**：`68e8b8b` 已推 master、tag `v0.1.61` 已推、
+  Release 工作流**四平台全绿并 publish**（Latest / **17 个资产**，与 v0.1.60 一致 /
+  `latest.json` 的 version = 0.1.61、**11 个平台条目每个都有签名**）。
+  本机产物门也全绿（`setup.exe` 6 894 714 B、`msi` 9 912 320 B、chunk 7/7、版本号 6 处一致）。
+  <br>**并且验了「已发布的那一份」而不只是本机那份**：下载 Release 上的
+  `setup.exe` + `.sig`，keyid 与内嵌 pubkey 一致、签名对**下载到的内容**数学有效、
+  trusted comment 里的文件名也对得上。⚠️ CI 产物与本机产物**字节不同**（不是可复现构建，
+  两台机器 + 不同工具链），故不能拿本机 sha256 去核发布物 —— 要核就核签名。
+  <br>⚠️ **keyid 有两种表示，别误判成换了钥**：`check-signature.mjs` 报
+  `7A46ECB8087DE26F`，而按 minisign 原始字节顺序读是 `6FE27D08B8EC467A` ——
+  同一把钥，字节序相反（那道门做了反转）。
+  <br>📌 **`latest.json` 里 4 个 macOS 条目的 URL 不含版本号**（`/releases/latest/download/
+  SynaRoute_x64.app.tar.gz`）—— 那是**既有形态**，因为 macOS 资产文件名本身不带版本号；
+  已与 v0.1.60 逐条对照确认，不是本版回归。核对时别把它当缺陷。
 
 - **刻意不修的项**（别当成遗漏重复劳动）：SmartScreen 签名告警、`retrieval.rs` 的 `cwd` 白名单、
   请求日志存明文对话（默认关闭）、**后端返回给界面的消息是中文硬编码**（93 个 `.rs` 文件都是
