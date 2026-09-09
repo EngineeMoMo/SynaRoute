@@ -12,6 +12,7 @@ use std::time::SystemTime;
 #[path = "data_dir.rs"] pub(crate) mod data_dir;
 #[path = "log_rotate.rs"] pub(crate) mod log_rotate;
 #[path = "key_flags.rs"] pub(crate) mod key_flags; #[path = "brain_config.rs"] mod brain_config;
+#[path = "key_order.rs"] pub(crate) mod key_order; // 三个排序入口的唯一实现；来由见该文件模块注释
 
 /// 检查 baseUrl 是否含路径后缀（如 `https://api.deepseek.com/anthropic` 中的 `/anthropic`）。
 ///
@@ -55,6 +56,14 @@ pub struct Store {
     /// 使外部写 mtime≤prev)的漏判；len 兼顾粗粒度 mtime(FAT/exFAT/网络盘 2s 分辨率)下
     /// 「同一时间桶内外部增删 Key」致 mtime 相等的漏判——增删 Key 必改变 JSON 字节数。
     config_stamp: RwLock<(Option<SystemTime>, u64)>,
+    /// 🔴 **本次运行是「降级成空配置」起来的 —— 一个字节都不许回写磁盘。**
+    ///
+    /// `config.json` 存在但读不出/解析不了时（杀软独占、盘坏、被截断成半个 JSON），
+    /// 内存里是 `AppConfig::default()`，而磁盘上那份是用户全部的 Key / 映射 / brain。
+    /// 必须是**长驻**标记：原实现只在 `init` 里挡住一次「按需 persist」，
+    /// 此后任何写路径都会把空配置整份盖上去。完整失效链与取证见
+    /// `degraded_load_never_overwrites_the_users_config_on_disk`。
+    config_degraded: std::sync::atomic::AtomicBool,
     /// 日志落盘的**单写者**通道（P1-3）。转发热路径只做一次 channel push 即返回。
     ///
     /// 为什么不再同步写：旧实现每条事件都在 tokio worker 线程上做
@@ -317,9 +326,11 @@ impl Store {
     ///   此前这里直接 `?` 冒泡，一路到 `Store::init().expect()` → **panic**。而 GUI 进程没有
     ///   控制台、Tauri 窗口还没建起来，用户双击图标后「什么都不发生」：没有窗口、没有错误框、
     ///   logs 里连本次启动的自检行都没有（那行在 panic 之后才写）。下次读成功即恢复，
-    ///   典型的间歇性无头案。降级成 load_failed=true 后：不回写磁盘（数据安全，见 persist 的守卫）、
-    ///   窗口照常起来、用户能看到界面与告警，重启即恢复。判据与 secret.rs 对密钥库同类失败的
-    ///   处理口径一致。
+    ///   典型的间歇性无头案。降级成 load_failed=true 后：不回写磁盘、窗口照常起来、
+    ///   用户能看到界面与告警，重启即恢复。判据与 secret.rs 对密钥库同类失败的处理口径一致。
+    ///
+    /// 🔴 **「不回写磁盘」由 [`Store::config_degraded`] + [`Store::persist`] 的守卫保证。**
+    /// 这句话此前写的是「见 persist 的守卫」，而那道守卫当时**并不存在**（详见那条测试）。
     fn load_config_from_disk(config_path: &std::path::Path) -> AppResult<(AppConfig, bool)> {
         if !config_path.exists() {
             tracing::info!("配置文件不存在,使用默认空配置: {:?}", config_path);
@@ -403,6 +414,7 @@ impl Store {
             secrets: RwLock::new(secrets),
             events: RwLock::new(Vec::new()),
             config_stamp: RwLock::new(initial_stamp),
+            config_degraded: std::sync::atomic::AtomicBool::new(load_failed),
             log_tx: Self::spawn_log_writer(),
             log_dropped: std::sync::atomic::AtomicU64::new(0),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -416,8 +428,9 @@ impl Store {
             usage_baseline: RwLock::new(baseline),
             usage_baseline_date: RwLock::new(baseline_date),
         };
-        // P1 防数据销毁：仅在「全新安装(文件不存在)首次 seed」或「成功加载后的迁移」时落盘。
-        // load_failed(文件存在但解析失败)时绝不 persist——否则空配置会覆盖磁盘上的原有数据。
+        // 仅在「全新安装首次 seed」或「成功加载后的迁移」时落盘。
+        // `!load_failed` 现在是冗余的（persist 自己会拒），刻意留着：它表达「这一步在
+        // 降级态本来就不该发生」这个语义边界，不该依赖另一处的守卫成立。
         if needs_persist && !load_failed {
             store.persist()?;
         }
@@ -504,27 +517,18 @@ impl Store {
 
     /// 把**种子里新增的**内置厂商补进老用户的配置。返回补进去的条数。
     ///
-    /// # 为什么必须有这一步
+    /// `builtin_seed()` 只在 `vendors.is_empty()`（全新安装）时注入 —— 少了这一步，
+    /// 往种子里加厂商**老用户永远看不到**，正是本仓反复记录的那类静默失效
+    /// （功能在、测试过，但只对新装用户生效，而老用户是绝大多数）。
     ///
-    /// `builtin_seed()` 只在 `config.vendors.is_empty()`（全新安装）时注入。也就是说
-    /// 往种子里加厂商，**老用户永远看不到** —— 而这正是本仓反复记录的那类静默失效：
-    /// 功能加了、代码在、测试也过，但只对新装用户生效，而老用户是绝大多数。
+    /// 两条边界：**不覆盖同 id 的现有项**（用户可能改过内置厂商的 base_url，
+    /// 覆盖等于冲掉他的配置，只补一条都没有的 id）；**追加在末尾不重排**
+    /// （厂商顺序用户有感知）。
     ///
-    /// # 两条边界
-    ///
-    /// 1. **不覆盖同 id 的现有项**。用户可能改过内置厂商的 base_url（换了区域镜像、
-    ///    走了自己的反代），拿种子覆盖等于把他的配置冲掉。只补「一条都没有」的 id。
-    /// 2. **追加在末尾**，不重排。厂商列表的顺序用户是有感知的（他自己加的排在后面）。
-    ///
-    /// # 为什么不需要「墓碑」记录用户删掉的内置项
-    ///
-    /// 因为**内置厂商删不掉** —— `delete_vendor` 对 `builtin` 直接返 Err
-    /// 「内置厂商不可删除」，`portable.rs` 的 Replace 导入也刻意保留内置项
-    /// （见 `replace_keeps_builtin_vendors_but_clears_custom_ones`）。
-    /// 所以「不在列表里」只可能意味着「这是新增的」，不存在「被用户删过」这个歧义。
-    ///
-    /// ⚠️ **哪天允许删内置厂商了，这里必须同时加墓碑**，否则用户会发现删掉的厂商
-    /// 每次重启都回来、删都删不掉。
+    /// 不需要「墓碑」记录用户删掉的内置项，因为**内置厂商删不掉**：`delete_vendor` 对
+    /// `builtin` 直接返 Err，`portable.rs` 的 Replace 导入也刻意保留内置项。
+    /// 于是「不在列表里」只可能是「新增的」，没有「被删过」这个歧义。
+    /// ⚠️ **哪天允许删内置厂商，这里必须同时加墓碑**，否则删掉的厂商每次重启都回来。
     fn add_new_builtin_vendors(vendors: &mut Vec<Vendor>) -> usize {
         let existing: std::collections::HashSet<String> =
             vendors.iter().map(|v| v.id.clone()).collect();
@@ -913,15 +917,18 @@ impl Store {
 
     /// 按「分类 × Key」聚合 token 用量（用量统计面板用）。
     ///
-    /// 数据源是 `usage_totals` 累加器，口径为「本次运行累计」，**与事件环解耦**：
-    /// 事件环只保留最近 MAX_EVENTS 条，若按环算总量，第 MAX_EVENTS 次请求之后
-    /// 累计值就不再增长（老事件被 drain 掉多少、新事件就补回多少）——一个「累计用量」
-    /// 面板越用数字越小，用户据此估额度会严重低估。
+    /// 数据源是 `usage_totals` 累加器，**与事件环解耦**：事件环只保留最近 MAX_EVENTS 条，
+    /// 若按环算总量，第 MAX_EVENTS 次请求之后累计值就不再增长（老事件被 drain 掉多少、
+    /// 新事件就补回多少）——一个「累计用量」面板越用数字越小，用户据此估额度会严重低估。
     ///
-    /// **刻意不含跨天历史、不落盘**：每日 `.jsonl` 是逐条完整的事实来源，但解析它要
-    /// 读盘 + 反序列化；而每请求写盘正是 P1-3 要避开的热路径开销。面板定位是
-    /// 「本次运行消耗」不是「账单」，重启归零已在副标题里明说。跨天累计留给后续版本
-    /// （若要，按 `effective_log_dir` 的日期文件补一个按日聚合即可）。
+    /// 🔴 **口径是「跨重启累计」，不是「本次运行」**。原注释写着「刻意不含跨天历史、不落盘、
+    /// 重启归零已在副标题里明说」，**那三句今天全错**：`usage.json` 会周期落盘并在启动时
+    /// 加载（有 `usage_totals_survive_restart` 钉住），副标题也已改成「跨重启累计」。
+    ///
+    /// ⚠️ **返回的是「有过累计的桶」，不是「所有配置里的 Key」**。正常采集刻意不建零桶
+    /// （`extract_usage` 对空/全零返回 `None`），所以一条没跑过请求的 Key 在这里**没有条目**。
+    /// 用量页要的是并集，那一步在 `usage_cost::rows` 里做 —— 别在这里补零桶，
+    /// 它会污染 flush 的增量计算。
     pub fn token_usage_by_key(&self) -> Vec<TokenUsageByKey> {
         self.usage_totals
             .read()
@@ -1021,33 +1028,17 @@ impl Store {
         }
     }
 
-    /// 「改内存 → 落盘，失败则回滚」的统一写入路径。
-    ///
-    /// 根治审计发现的 persist-crud（high）：旧写法「先改内存、persist 失败不回滚」会让内存态
-    /// 领先磁盘（如删除后内存 N-1 / 磁盘仍 N），而 mtime 自愈只认「磁盘比内存新」方向，这种
-    /// 「内存比磁盘新」的反向背离永不自愈——UI 稳定显示的条数与磁盘持久背离，直到重启读盘。
-    ///
-    /// 回滚的并发安全（复核第二轮修正）：`snapshot→改内存→persist→回滚` 跨多个独立临界区，
-    /// 对不走本函数的并发写者（后台健康线程 update_health、save_settings / set_mcp_* 等直写
-    /// 方法）敞开。若回滚用内存 snapshot 整份覆盖，会**抹掉这些并发写者在窗口内已提交(已落盘)
-    /// 的变更**（尤以 settings 最毒：reload 刻意不合并 settings，背离永不自愈）。故：
-    /// - 闭包自身返回 Err（如 toggle_key 的 NotFound）：同样走 `rollback_from_disk` 磁盘对账，
-    ///   既撤销闭包可能的部分改动、又不吞并发——不依赖「闭包 Err 分支不改内存」这类脆弱契约。
-    /// - persist 失败：走 `rollback_from_disk` 从磁盘对账（撤销本次未落盘脏改，同时保留并发方
-    ///   已落盘变更），而非内存 snapshot 整份覆盖。snapshot 仅作「连磁盘都读不回来」的兜底。
-    ///
-    /// CRUD 为低频用户操作，整份 clone 成本可忽略。
     /// 同 [`Self::mutate_and_persist`]，但闭包返回 `bool` 表示**是否真的产生了变化**：
     /// `false` 时跳过落盘（幂等写入的快路径），`true` 时落盘且失败走同一套磁盘对账回滚。
     ///
     /// 为什么需要这个变体：`set_active_model` / `set_proxy_port` 这类「后端自管字段专用写入」
     /// 大量是幂等调用（前端每次切页都可能重发同一个值）。无条件 persist 会把 20KB 的整份
-    /// config 反复重写；而若为省这次写盘就退回「裸 persist + 提前 return」的老写法，就又丢掉了
-    /// 落盘失败回滚——两者不该二选一。
+    /// config 反复重写；而为省这次写盘退回「裸 persist + 提前 return」又会丢掉落盘失败回滚
+    /// —— 两者不该二选一。
     ///
     /// 注意：闭包返回 `false` 时**内存改动仍然保留**（本函数不回滚它）。这是刻意的：
     /// 调用方的契约是「返回 false ⟺ 没改任何东西」。若闭包既改了内存又返回 false，
-    /// 会造成内存领先磁盘——正是本函数要防的那件事。所有调用点都遵守该契约。
+    /// 会造成内存领先磁盘 —— 正是本族函数要防的那件事。所有调用点都遵守该契约。
     fn mutate_and_persist_when<F, R>(&self, f: F) -> AppResult<R>
     where
         F: FnOnce(&mut AppConfig) -> (R, bool),
@@ -1086,6 +1077,16 @@ impl Store {
         self.mutate_and_persist_when(|cfg| ((), f(cfg)))
     }
 
+    /// 「改内存 → 落盘，失败则回滚」的统一写入路径（本族的语义定义处）。
+    ///
+    /// 裸 `persist` 那种「先改内存、失败不回滚」会让内存领先磁盘，而 mtime 自愈只认
+    /// 「磁盘比内存新」，反向背离**永不自愈** —— UI 的条数与磁盘持久背离到重启为止。
+    ///
+    /// 🔴 **回滚一律走 `rollback_from_disk` 做磁盘对账，不用内存 snapshot 整份覆盖**：
+    /// `snapshot→改内存→persist→回滚` 跨多个临界区，期间并发写者（后台 `update_health`、
+    /// `save_settings` 等直写方法）可能已提交并落盘；用 snapshot 覆盖会抹掉它们
+    /// （settings 最毒 —— reload 刻意不合并它，背离永不自愈）。闭包自身返回 Err 时同样对账，
+    /// 不依赖「Err 分支没改内存」这种脆弱契约。snapshot 只作「连磁盘都读不回来」的兜底。
     fn mutate_and_persist<F, R>(&self, f: F) -> AppResult<R>
     where
         F: FnOnce(&mut AppConfig) -> AppResult<R>,
@@ -1134,6 +1135,19 @@ impl Store {
     }
 
     fn persist(&self) -> AppResult<()> {
+        // 🔴 **降级态一律拒写**（见 `config_degraded`）。这是唯一的落盘点，守卫只需在这里 ——
+        // 放各调用点等于放 N 处、漏一处就是全量数据丢失。返回 Err 而不是静默 `Ok(())`：
+        // 后者让 UI 说「已保存」，而重启后看到的是原始磁盘配置，用户会以为又丢了一次。
+        // 用 `Other`（Display 是裸 `{0}`）：带前缀的变体会让它读起来像用户填错了参数。
+        if self.config_degraded.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(AppError::Other(
+                "本次运行是在「配置文件读取/解析失败」后降级启动的，内存里不是你的真实配置，\
+                 因此拒绝回写磁盘 —— 否则会用一份空配置覆盖掉 config.json 里的全部 Key 与映射。\
+                 请退出应用，先备份并检查 config.json（可能被杀毒软件/云同步占用，或已损坏），\
+                 修好后重新启动。"
+                    .into(),
+            ));
+        }
         // 仅在序列化期间持读锁；随后释放锁再做阻塞落盘。
         // atomic_write 含进程级互斥 + 最长数百毫秒 sleep 重试，若持锁期间执行，会经
         // parking_lot「写者优先」把后续所有读者（代理转发的 enabled_keys_sorted /
@@ -1625,50 +1639,10 @@ impl Store {
     ///
     /// 幂等：目标已是主（且该分类优先级已连续）时不写盘，返回 `false`。
     /// 托盘每次点击都会调它，避免无意义的落盘与事件噪音。
+    ///
+    /// 实现在 [`key_order`]（**三个排序入口的唯一实现**：设为主 / 上下移 / 拖放）。
     pub fn set_primary_key(&self, category: CategoryType, key_id: &str) -> AppResult<bool> {
-        // 只重排「同分类」的 Key，别的分类一个字节都不动。
-        let ordered_ids: Vec<String> = {
-            let cfg = self.config.read();
-            if !cfg.keys.iter().any(|k| k.id == key_id && k.category_id == category) {
-                return Err(AppError::NotFound(format!(
-                    "分类 {} 下没有 id={key_id} 的 Key",
-                    category.as_str()
-                )));
-            }
-            let mut same: Vec<&ProviderKey> =
-                cfg.keys.iter().filter(|k| k.category_id == category).collect();
-            same.sort_by_key(|k| k.priority);
-            let mut ids: Vec<String> = same.iter().map(|k| k.id.clone()).collect();
-            if let Some(pos) = ids.iter().position(|id| id == key_id) {
-                let target = ids.remove(pos);
-                ids.insert(0, target);
-            }
-            ids
-        };
-
-        // 目标优先级映射，并先判断是否真的需要改（幂等）。
-        let changed = {
-            let cfg = self.config.read();
-            ordered_ids.iter().enumerate().any(|(i, id)| {
-                cfg.keys
-                    .iter()
-                    .find(|k| &k.id == id)
-                    .is_some_and(|k| k.priority != i as i32)
-            })
-        };
-        if !changed {
-            return Ok(false);
-        }
-
-        self.mutate_and_persist(|cfg| {
-            for (i, id) in ordered_ids.iter().enumerate() {
-                if let Some(k) = cfg.keys.iter_mut().find(|k| &k.id == id) {
-                    k.priority = i as i32;
-                }
-            }
-            Ok(())
-        })?;
-        Ok(true)
+        key_order::set_primary(self, category, key_id)
     }
 
     /// 把某 Key 在**同分类内**上移/下移一位，并把整列重编号为连续 `0..n-1`。
@@ -1688,45 +1662,22 @@ impl Store {
     /// 3. **非原子**。`Promise.all` 的几次写各自独立落盘，中途失败就是半套顺序。
     ///
     /// 这里只改 `priority` 一个字段、一次落盘、不过 Key 全量校验，也就没有上面三条。
+    ///
+    /// 实现在 [`key_order`]。**鼠标拖放不走这个函数** —— 跨多位拖动若循环调它，会变成
+    /// N 次落盘 + N 次客户端配置重写 + N 次托盘重建，且中途失败留下半套顺序；
+    /// 那条路走 `key_order::reorder_before`（一次原子重排）。
     pub fn move_key(&self, category: CategoryType, key_id: &str, up: bool) -> AppResult<bool> {
-        // 目标次序在读锁里算好，写锁里只做赋值（与 set_primary_key 同结构）。
-        let ordered_ids: Vec<String> = {
-            let cfg = self.config.read();
-            let mut same: Vec<&ProviderKey> =
-                cfg.keys.iter().filter(|k| k.category_id == category).collect();
-            // 与界面同一口径：按 priority 升序（含未启用的 Key，它们在列表里也占位）。
-            same.sort_by_key(|k| k.priority);
-            let mut ids: Vec<String> = same.iter().map(|k| k.id.clone()).collect();
-            let Some(idx) = ids.iter().position(|id| id == key_id) else {
-                return Err(AppError::NotFound(format!(
-                    "分类 {} 下没有 id={key_id} 的 Key",
-                    category.as_str()
-                )));
-            };
-            let swap_with = if up {
-                if idx == 0 {
-                    return Ok(false); // 已在首位
-                }
-                idx - 1
-            } else {
-                if idx + 1 >= ids.len() {
-                    return Ok(false); // 已在末位
-                }
-                idx + 1
-            };
-            ids.swap(idx, swap_with);
-            ids
-        };
+        key_order::move_one(self, category, key_id, up)
+    }
 
-        self.mutate_and_persist(|cfg| {
-            for (i, id) in ordered_ids.iter().enumerate() {
-                if let Some(k) = cfg.keys.iter_mut().find(|k| &k.id == id) {
-                    k.priority = i as i32;
-                }
-            }
-            Ok(())
-        })?;
-        Ok(true)
+    /// 把某 Key 拖放到 `before_key_id` 之前（`None` = 末尾）。实现与边界见 [`key_order`]。
+    pub fn reorder_key(
+        &self,
+        category: CategoryType,
+        key_id: &str,
+        before_key_id: Option<&str>,
+    ) -> AppResult<bool> {
+        key_order::reorder_before(self, category, key_id, before_key_id)
     }
 
     /// 在**单个写锁临界区内**原地读改某 Key 的健康态，闭包返回「本次是否需要落盘」。
@@ -2491,23 +2442,13 @@ impl Store {
             .filter(|s| !s.is_empty())
     }
 
-    /// 保存全局设置。
-    ///
-    /// 走 `mutate_and_persist`（与 Key CRUD / save_brain 同一套）：落盘失败时磁盘对账回滚，
-    /// 不留「UI 显示已保存、磁盘其实没写」的内存领先态。
-    ///
-    /// **闭包内先做「后端自管字段保留」再整份覆盖**——顺序不能反：那几个字段的值必须取自
-    /// 当前内存态（即最后已提交态），故必须在 `cfg.settings = settings` 之前从 `cfg` 里取走。
     /// 保存**用户偏好**。入参是白名单类型 [`UserPrefs`]，后端自管字段在类型上就不存在。
     ///
-    /// 这里原先是一段 30 行的**黑名单**：逐个字段 `mem::take` 把后端值保留下来，
-    /// 防止前端挂载时的旧快照把运行态顶回去。它出过 P0 —— `auto_start` 不在名单里，
-    /// 于是切主题/切语言会把用户刚关掉的开机自启动重新装回系统。
-    ///
-    /// 黑名单的根本问题是「默认不安全」：日后加一个后端自管字段，忘了补一行就是同形态事故，
-    /// 而且没有任何东西会提醒你。换成白名单后，前端连表达「我要改 mcpPort」都做不到 ——
-    /// 多余的键在反序列化时被 serde 静默丢弃，日后加字段默认就是安全的。
-    ///
+    /// 原先是一段 30 行的**黑名单**：逐个字段 `mem::take` 把后端值保留下来，防止前端挂载时
+    /// 的旧快照把运行态顶回去。它出过 P0 —— `auto_start` 不在名单里，于是切主题/切语言会
+    /// 把用户刚关掉的开机自启动重新装回系统。黑名单「默认不安全」：日后加一个后端自管字段
+    /// 忘了补一行就是同形态事故。换成白名单后，前端连表达「我要改 mcpPort」都做不到
+    /// （多余的键在反序列化时被 serde 静默丢弃），日后加字段默认就是安全的。
     /// 各字段为什么归后端自管，见 [`UserPrefs`] 的文档与各专用写入方法。
     pub fn save_settings(&self, prefs: UserPrefs) -> AppResult<()> {
         self.mutate_and_persist(move |cfg| {
@@ -2860,12 +2801,10 @@ impl Store {
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let config = if config_path.exists() {
-            let raw = std::fs::read(&config_path)?;
-            serde_json::from_slice(&raw).unwrap_or_default()
-        } else {
-            AppConfig::default()
-        };
+        // 🔴 **与生产构造器共用同一个加载器**。原先是 `from_slice(&raw).unwrap_or_default()`：
+        // 把解析失败静默降级成空配置**而不置降级标记**，于是测试构造器到不了降级那条路，
+        // 「降级态不许回写磁盘」这条性质在测试里压根压不到（它长期没有判据就是这个原因）。
+        let (config, load_failed) = Self::load_config_from_disk(&config_path)?;
         // **与生产构造器跑同一套迁移**。少了这一句，测试里构造出来的 Store 与用户机器上
         // 那个不是同一个东西 —— 于是「迁移有没有接上」这类缺陷在测试里根本看不到
         // （实测过：删掉 `add_new_builtin_vendors` 的调用点，全套测试照旧全绿）。
@@ -2882,6 +2821,7 @@ impl Store {
             secrets: RwLock::new(secrets),
             events: RwLock::new(Vec::new()),
             config_stamp: RwLock::new(initial_stamp),
+            config_degraded: std::sync::atomic::AtomicBool::new(load_failed),
             log_tx: Self::spawn_log_writer(),
             log_dropped: std::sync::atomic::AtomicU64::new(0),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -5679,6 +5619,61 @@ mod tests {
         // 直接验证 list 返回 2 条即可(如果内部逻辑错误重载后本地内存丢失了 upsert 前的数据,会崩)。
         assert_eq!(store.list_keys(CategoryType::ClaudeCli).len(), 2);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 🔴 **降级启动之后，磁盘上那份配置一个字节都不许被改** —— 全量数据丢失级。
+    ///
+    /// 隔壁 `corrupt_config_load_preserves_disk_and_flags_failed` 只调
+    /// `load_config_from_disk`，证明的是「加载器会置位」；**它证明不了那个位之后被尊重**。
+    /// 而缺陷恰恰在后半段：`load_failed` 原先只被 `init` 用了一次（挡住迁移那次 persist），
+    /// 此后任何写路径都会把空配置整份盖上去。这不是概率事件 —— 降级后内存里
+    /// `onboarding_done` 必然是 `None`，`init` 自己的 `reconcile_onboarding_flag`
+    /// 就会判定「需要对账」并落盘。一次读不出来 + 一次正常启动 = 用户全部 Key / 映射 /
+    /// 厂商 / brain 配置被空配置覆盖，且 `atomic_write` 是 temp+rename、**不留 `.bak`**。
+    ///
+    /// 判据压三件事：① 构造 Store 这一步本身不许动磁盘（这一条就覆盖了
+    /// `reconcile_onboarding_flag` 那条真实触发路径）；② 之后任何写路径都要被拒且**报错**
+    /// （静默 `Ok(())` 会让 UI 说「已保存」，用户以为生效了）；③ 磁盘内容逐字节不变。
+    #[test]
+    fn degraded_load_never_overwrites_the_users_config_on_disk() {
+        let dir = temp_dir("degraded_no_write");
+        let cfg_path = dir.join("config.json");
+        let sec_path = dir.join("secrets.enc");
+        // 半个 JSON —— 真实形态是被杀软/云同步截断，或磁盘坏道。
+        let original = br#"{"keys":[{"id":"k1","name":"the-users-real-key"#;
+        std::fs::write(&cfg_path, original).unwrap();
+
+        let store = Store::new_at(cfg_path.clone(), sec_path).unwrap();
+        assert!(
+            store.config_degraded.load(std::sync::atomic::Ordering::Relaxed),
+            "解析失败必须置降级位 —— 否则后面所有守卫都形同虚设"
+        );
+        // ① 构造这一步就不许写。`init` 里的 reconcile_onboarding_flag 走的正是这条路。
+        assert_eq!(
+            std::fs::read(&cfg_path).unwrap(),
+            &original[..],
+            "构造 Store 时就把磁盘覆盖了 —— 这是全量数据丢失"
+        );
+
+        // ② 任意写路径都必须被拒，且**报错**而不是静默成功。
+        let err = store
+            .upsert_key(sample_key("new", 0))
+            .expect_err("降级态写入必须失败");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("config.json") && msg.contains("覆盖"),
+            "错误必须说清「为什么拒绝」与「会毁掉什么」，否则用户只会以为应用坏了：{msg}"
+        );
+        // 顺带钉住不许有前缀污染（`Other` 的 Display 是裸 {0}）。
+        assert!(!msg.starts_with("无效参数"), "这不是用户填错了参数：{msg}");
+
+        // ③ 磁盘逐字节不变。
+        assert_eq!(
+            std::fs::read(&cfg_path).unwrap(),
+            &original[..],
+            "降级态下磁盘配置必须逐字节保持原样"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

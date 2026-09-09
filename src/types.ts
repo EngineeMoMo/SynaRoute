@@ -264,11 +264,25 @@ export interface RecentWorkdir {
  * - notIndexed：可执行就绪、项目缺 .codegraph/，给建索引按钮
  * - ready：可用，检索走符号级链路
  */
+/**
+ * codegraph 可用状态。与 Rust `codegraph::CodegraphState` 对齐（tag = state）。
+ *
+ * 🔴 `indexUnknown`（没有可判定的目录）与 `notIndexed`（查过了、确实没索引）**不是一回事**：
+ * 只有前者才允许提示「请先设置工作目录」。两者合并过一次，就是用户报的那个缺陷。
+ */
 export type CodegraphState =
   | { state: "notInstalled" }
   | { state: "stranded"; path: string; version: string }
-  | { state: "notIndexed"; path: string; version: string }
-  | { state: "ready"; path: string; version: string; nodes?: number | null; edges?: number | null };
+  | { state: "indexUnknown"; path: string; version: string }
+  | { state: "notIndexed"; path: string; version: string; dir: string }
+  | {
+      state: "ready";
+      path: string;
+      version: string;
+      dir: string;
+      nodes?: number | null;
+      edges?: number | null;
+    };
 
 /** 聚合成员（FR-014） */
 export interface BrainMember {
@@ -404,6 +418,16 @@ export interface UsageCostRow {
    */
   keyDeleted?: boolean;
   usage: TokenUsage;
+  /**
+   * 这一行**是否真的捕获过上游回报的 usage**。
+   *
+   * 🔴 **不能用「四个 token 数是否全 0」代替它**。行集合是「配置里的 Key ∪ 历史累计桶」，
+   * 所以一条还没跑过请求的新 Key 也会有行（那是刻意的 —— 否则它在表里根本不出现，
+   * 用户报的就是这个）。这一位区分两种处置完全不同的 0：
+   * `false` = 我们还没收到任何用量（金额必须显示「尚无用量」而**不是 $0**，
+   * 且不计进「未计入金额的条数」）；`true` = 真有过消耗，数字是事实。
+   */
+  hasRecordedUsage?: boolean;
   /** 估算成本（纳美元 = 1e-9 USD）。null = 无可用单价 */
   costNano: number | null;
   pricingSource: PricingSource;
@@ -588,8 +612,6 @@ export interface OnboardingState {
   shouldShow: boolean;
   done: boolean;
   totalKeys: number;
-  /** 这台机器上有没有 cc-switch 库。有则把「从 cc-switch 导入」作为默认高亮的主选项 */
-  ccswitchAvailable: boolean;
 }
 
 /** 首启向导第④步的探针结果：自某时刻起有没有真的收到过转发请求。 */
@@ -606,50 +628,6 @@ export interface McpStatus {
   running: boolean;
   port?: number; // 实际绑定端口（可能与配置端口不同——占用时自动 fallback）
   lastError?: string; // 最近一次启动失败原因（成功时为空）
-}
-
-// ---- 从 cc-switch 导入历史 Key ----
-//
-// cc-switch（另一款 Key 切换工具）把各端供应商档存在 ~/.cc-switch/cc-switch.db。
-// SynaRoute 只读它，映射成自己的 Key + 加密密钥。**导入不接入**：不改任何客户端配置。
-
-/** 一条可导入（或明确不可导入）的候选 */
-export interface CcSwitchCandidate {
-  sourceId: string; // cc-switch providers.id，导入时按它回查
-  appType: string; // cc-switch 原值：claude / claude-desktop / codex / gemini
-  categoryId: CategoryType | null; // 映射到的分类；null = 无对应分类
-  name: string;
-  baseUrl: string;
-  protocol: Protocol | null;
-  defaultModel: string | null; // codex 的 config.toml 顶层 model
-  isCurrent: boolean; // 该档在 cc-switch 里是否为当前生效项
-  secretMasked: string; // 掩码（前6…后4 (长度)）；明文不出后端
-  duplicateOf: string | null; // 与 SynaRoute 已有 Key 重复时给出对方名称
-  skipReason: string | null; // 不可导入原因；为 null 才可导入
-}
-
-/** 扫描结果 */
-export interface CcSwitchScanResult {
-  dbPath: string; // 数据来源，供 UI 展示
-  total: number; // 库里 providers 总数
-  candidates: CcSwitchCandidate[];
-}
-
-/** 单条导入结局 */
-export interface CcSwitchImportOutcome {
-  sourceId: string;
-  name: string;
-  status: "imported" | "skipped" | "failed";
-  detail: string;
-  keyId: string | null;
-}
-
-/** 导入汇总 */
-export interface CcSwitchImportReport {
-  imported: number;
-  skipped: number;
-  failed: number;
-  outcomes: CcSwitchImportOutcome[];
 }
 
 // ---- 配置导入 / 导出（FR-021，后端 src-tauri/src/portable.rs）----
@@ -866,6 +844,13 @@ export interface EnvFinding {
   hasValue: boolean;
   /** 它会造成什么 —— 不是重复变量名 */
   note: string;
+  /**
+   * 为什么这一条没有「移除」按钮（`removable` 为真时是空串）。
+   *
+   * 🔴 **文案由后端给，前端不许自己判「这是哪一类」**：`removable: false` 有两个成因、
+   * 处置完全相反（目录类我们刻意不删；process-only 我们删不掉）。两处各判一遍必然漂移。
+   */
+  keepReason: string;
   /**
    * 这一条能不能用「移除」按钮解决。
    *

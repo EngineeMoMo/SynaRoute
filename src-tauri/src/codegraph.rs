@@ -33,7 +33,20 @@ const CLI_TIMEOUT: Duration = Duration::from_secs(20);
 /// 故给 10 分钟；超时只中止本次建索引，不影响其他功能。
 const INIT_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// codegraph 可用性三态 —— 每态对应不同的用户动作，故必须区分「没装」与「装了但项目没索引」。
+/// codegraph 在项目根建的索引目录名。**「已索引」的唯一判据就是它在不在。**
+/// 抽成常量是为了让 `init_project` 的成功判据与 `detect` 的状态判据共用一份 ——
+/// 各写一个字面量的话，上游哪天改了目录名，两处只会有一处被修。
+const INDEX_DIR: &str = ".codegraph";
+
+/// codegraph 可用性状态 —— 每态对应**不同的用户动作**，故这些区分不能合并。
+///
+/// 🔴 **`IndexUnknown` 与 `NotIndexed` 必须分开，合并过一次、是用户报的缺陷本体**：
+/// 旧实现里 `detect(None)` 返回 `NotIndexed`，也就是把「**我没查**」谎报成「我查了，没有」。
+/// 三个后果同时发生且互相印证，用户完全无从判断哪个是真的：徽标写「未索引」（而项目
+/// 可能早就索引过了）、说明写「已安装但当前项目未建索引」（假话）、「建索引」按钮被禁用
+/// 并配一句「请先设置工作目录」（而目录就显示在同一屏的上方）。
+/// 判据：**只有在真的判不出目录时才允许说「请先设置工作目录」** —— 否则那句话把用户
+/// 送去做一个他已经做过的操作，即本仓「指错方向的提示比没有提示更糟」那条。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "state")]
 pub enum CodegraphState {
@@ -42,12 +55,19 @@ pub enum CodegraphState {
     /// 找到了可执行，但它位于**非当前 node 版本**的 npm 全局目录里（nvm 升级后的孤岛），
     /// PATH 调不到。此时 SynaRoute 仍可用绝对路径调用，但要提示用户重装以免终端里用不了。
     Stranded { path: String, version: String },
+    /// 可执行就绪，但**没有可判定的项目目录**（既没勾自动跟随、也没填工作目录，
+    /// 或勾了自动跟随而会话历史里一个项目都扫不到）。索引状态**未知**，不是「没有」。
+    IndexUnknown { path: String, version: String },
     /// 可执行就绪，但目标项目没有 `.codegraph/` 索引 —— 需要跑一次 `init`。
-    NotIndexed { path: String, version: String },
-    /// 就绪：可执行 + 项目已索引。
+    ///
+    /// `dir` 是**实际判定的**项目目录：UI 必须显示它。不显示的代价很具体 ——
+    /// 自动跟随下目录由会话历史决定，用户看到「未索引」时第一个问题就是「哪个项目」。
+    NotIndexed { path: String, version: String, dir: String },
+    /// 就绪：可执行 + 项目已索引。`dir` 同上。
     Ready {
         path: String,
         version: String,
+        dir: String,
         nodes: Option<u64>,
         edges: Option<u64>,
     },
@@ -298,9 +318,9 @@ pub async fn init_project(work_dir: &Path) -> Result<String, String> {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    if !work_dir.join(".codegraph").is_dir() {
+    if !work_dir.join(INDEX_DIR).is_dir() {
         let head: String = text.trim().chars().take(300).collect();
-        return Err(format!("init 未生成 .codegraph/ 目录；输出: {head}"));
+        return Err(format!("init 未生成 {INDEX_DIR}/ 目录；输出: {head}"));
     }
     // 从输出里抓 "N nodes, M edges" 摘要（有则带上，无则给通用成功文案）
     let summary = text
@@ -342,24 +362,46 @@ async fn run_json<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// 判定 codegraph 对某项目的可用状态。`work_dir` 为 None 时只判可执行是否就绪。
+/// 判定 codegraph 对某项目的可用状态。IO 只有两件事：定位可执行、看 `.codegraph/` 在不在。
+/// 状态**决策**本身在 [`classify`] 里，因为那才是能在任何机器上验的部分。
 pub async fn detect(work_dir: Option<&Path>) -> CodegraphState {
-    let Some(r) = resolve().await else {
+    let resolved = resolve().await;
+    let indexed = work_dir.map(|d| d.join(INDEX_DIR).is_dir());
+    classify(resolved, work_dir, indexed)
+}
+
+/// 由「可执行解析结果 + 目录 + 该目录是否已索引」得出状态。**纯函数，不碰 IO。**
+///
+/// 🔴 **抽出来不是为了好看，是为了判据能在没装 codegraph 的机器上真的压到分支。**
+/// 第一版把决策留在 `detect` 里、用例直接调 `detect(None)`，而开发机没装 codegraph →
+/// 提前返回 `NotInstalled` → **注入（把 `IndexUnknown` 改回 `NotIndexed`）照样全绿**，
+/// 也就是缺陷的后端那一半压根没有判据守着。同本仓「注入不变红时先怀疑用例没压到那个分支」。
+///
+/// 🔴 **`indexed == None`（没给目录）必须是 [`CodegraphState::IndexUnknown`]，不许是
+/// `NotIndexed`** —— 我们此时没看过 `.codegraph/`，报「未索引」就是谎报。见枚举上的论证。
+fn classify(
+    resolved: Option<Resolved>,
+    work_dir: Option<&Path>,
+    indexed: Option<bool>,
+) -> CodegraphState {
+    let Some(r) = resolved else {
         return CodegraphState::NotInstalled;
     };
     if !r.on_path {
         // 孤岛：SynaRoute 能用绝对路径调，但用户终端里调不到，需提示重装。
         return CodegraphState::Stranded { path: r.program, version: r.version };
     }
-    let Some(dir) = work_dir else {
-        return CodegraphState::NotIndexed { path: r.program, version: r.version };
+    let (Some(dir), Some(has_index)) = (work_dir, indexed) else {
+        return CodegraphState::IndexUnknown { path: r.program, version: r.version };
     };
-    if !dir.join(".codegraph").is_dir() {
-        return CodegraphState::NotIndexed { path: r.program, version: r.version };
+    let dir = dir.to_string_lossy().to_string();
+    if !has_index {
+        return CodegraphState::NotIndexed { path: r.program, version: r.version, dir };
     }
     CodegraphState::Ready {
         path: r.program,
         version: r.version,
+        dir,
         nodes: None,
         edges: None,
     }
@@ -568,16 +610,19 @@ mod tests {
 
     #[test]
     fn state_serializes_with_tag_for_frontend() {
-        // 前端按 `state` 判分支（未装/孤岛/未索引/就绪各对应不同按钮），故必须带 tag。
+        // 前端按 `state` 判分支（未装/孤岛/未知/未索引/就绪各对应不同 UI），故必须带 tag。
         let s = serde_json::to_value(CodegraphState::NotInstalled).unwrap();
         assert_eq!(s["state"], "notInstalled");
         let s = serde_json::to_value(CodegraphState::NotIndexed {
             path: "codegraph".into(),
             version: "1.5.0".into(),
+            dir: "C:\\workCode\\proj".into(),
         })
         .unwrap();
         assert_eq!(s["state"], "notIndexed");
         assert_eq!(s["version"], "1.5.0");
+        // dir 必须过 IPC：UI 要显示「是哪个项目没索引」。
+        assert_eq!(s["dir"], "C:\\workCode\\proj");
         let s = serde_json::to_value(CodegraphState::Stranded {
             path: "F:\\nvm\\v20.20.0\\node_global\\codegraph.cmd".into(),
             version: "1.5.0".into(),
@@ -585,5 +630,150 @@ mod tests {
         .unwrap();
         assert_eq!(s["state"], "stranded");
         assert!(s["path"].as_str().unwrap().contains("v20.20.0"));
+    }
+
+    #[test]
+    fn index_unknown_is_a_distinct_tag_from_not_indexed() {
+        // 🔴 这两个 tag 合并过一次，就是用户报的缺陷：自动跟随开着、项目明明已索引，
+        // 界面却报「未索引」+ 禁用建索引按钮 + 「请先设置工作目录」（而目录就在上方显示着）。
+        // 前端靠 tag 分流，两者同名则那三条 UI 判据无从区分 —— 故这条钉住它们不同名。
+        let unknown = serde_json::to_value(CodegraphState::IndexUnknown {
+            path: "codegraph".into(),
+            version: "1.5.0".into(),
+        })
+        .unwrap();
+        assert_eq!(unknown["state"], "indexUnknown");
+        let not_indexed = serde_json::to_value(CodegraphState::NotIndexed {
+            path: "codegraph".into(),
+            version: "1.5.0".into(),
+            dir: "C:\\p".into(),
+        })
+        .unwrap();
+        assert_ne!(
+            unknown["state"], not_indexed["state"],
+            "「没查」与「查了没有」必须是两个 tag，否则 UI 只能对其中一种说对话"
+        );
+        // 未知态**不许**带 dir：带了就意味着我们其实知道目录，那就该去判索引而不是报未知。
+        assert!(
+            unknown.get("dir").is_none(),
+            "IndexUnknown 不该有 dir —— 有目录就该判索引"
+        );
+    }
+
+    /// 装了 codegraph 的机器上才有的 `Resolved`，测试里直接造。
+    fn on_path() -> Option<Resolved> {
+        Some(Resolved { program: "codegraph".into(), version: "1.5.0".into(), on_path: true })
+    }
+
+    #[test]
+    fn no_directory_means_unknown_not_unindexed() {
+        // 🔴 缺陷的**后端那一半**：`detect(None)` 曾返回 NotIndexed，把「我没查」谎报成
+        // 「我查了，没有」。前端据此显示未索引徽标 + 禁用按钮 + 「请先设置工作目录」。
+        //
+        // 这条**必须**走 classify 而不是 detect：开发机没装 codegraph，`detect` 会在
+        // resolve 那一步就返回 NotInstalled，于是注入照样全绿（第一版实测如此）。
+        let st = classify(on_path(), None, None);
+        assert_eq!(
+            st,
+            CodegraphState::IndexUnknown { path: "codegraph".into(), version: "1.5.0".into() },
+            "没给目录时我们没看过 .codegraph/，只能报「未知」"
+        );
+        assert!(
+            !matches!(st, CodegraphState::NotIndexed { .. }),
+            "报「未索引」= 谎报，且会让 UI 说出那三句错话"
+        );
+    }
+
+    #[test]
+    fn unindexed_and_ready_both_name_the_project() {
+        // 「哪个项目」是用户看到状态后的第一个问题 —— 自动跟随下目录由会话历史决定，
+        // 界面上不显示的话他无从判断这个结论说的是不是他关心的那个仓库。
+        let dir = Path::new("C:\\workCode\\reviewCode\\jztac-server");
+        let st = classify(on_path(), Some(dir), Some(false));
+        match st {
+            CodegraphState::NotIndexed { dir: d, .. } => {
+                assert_eq!(d, "C:\\workCode\\reviewCode\\jztac-server")
+            }
+            other => panic!("没索引的目录该报 NotIndexed，实得 {other:?}"),
+        }
+        let st = classify(on_path(), Some(dir), Some(true));
+        match st {
+            CodegraphState::Ready { dir: d, .. } => {
+                assert_eq!(d, "C:\\workCode\\reviewCode\\jztac-server")
+            }
+            other => panic!("已索引的目录该报 Ready，实得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn executable_problems_outrank_the_index_question() {
+        // 没装 / 孤岛时索引状态无意义（调不到 codegraph，索引在不在都用不上），
+        // 故这两支必须先返回，且**不许**因为「给了目录」就跳过它们。
+        let dir = Path::new("C:\\p");
+        assert_eq!(classify(None, Some(dir), Some(true)), CodegraphState::NotInstalled);
+        let stranded = Some(Resolved {
+            program: "F:\\nvm\\v20.20.0\\node_global\\codegraph.cmd".into(),
+            version: "1.5.0".into(),
+            on_path: false,
+        });
+        assert!(matches!(
+            classify(stranded, Some(dir), Some(true)),
+            CodegraphState::Stranded { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn detect_delegates_to_classify_and_reads_the_index_dir() {
+        // detect 的那两件 IO 要真的接上 classify。空临时目录 = 没有 .codegraph/，
+        // 故装了 codegraph 的机器必须报 NotIndexed；没装的机器只能是 NotInstalled/Stranded
+        // —— 无论哪种，**都不许是 Ready**（那意味着我们没看目录就宣布就绪）。
+        //
+        // ⚠️ **本条在没装 codegraph 的机器上压不到那个判断**（resolve 就返回 None →
+        // NotInstalled，`indexed` 是什么都不影响结论）。注入实测确认：把 `indexed` 改成恒
+        // `true`，本条照样绿。真正守住那一行的是下面那条源码级判据 —— 别把这条读成有覆盖。
+        let dir = std::env::temp_dir().join(format!(
+            "cg_probe_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let st = detect(Some(&dir)).await;
+        assert!(
+            !matches!(st, CodegraphState::Ready { .. }),
+            "空目录里没有 .codegraph/，不该报就绪；实得 {st:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `detect` 必须真的去问文件系统「`.codegraph/` 在不在」。
+    ///
+    /// [`classify`] 是纯函数，所以「索引到底存不存在」这一位的**真实性**只能由 `detect` 保证，
+    /// 而上面那条行为用例在没装 codegraph 的机器上压不到它（注入实测：改成恒 `true` 仍绿）。
+    /// 失效方向最坏：**未索引的项目被报成就绪**，检索静默退化回按文件匹配而界面说符号级可用。
+    ///
+    /// 用共享的 `production_code_only` 剥注释 —— 本仓已五次栽在「注释里的字面量满足了断言」，
+    /// 而本模块的文档里到处都是 `.codegraph/` 字样，不剥必然自我满足。
+    #[test]
+    fn detect_must_consult_the_filesystem_for_the_index_dir() {
+        let src =
+            crate::proxy::custom_headers::production_code_only(include_str!("codegraph.rs"));
+        let body = src
+            .split_once("pub async fn detect(")
+            .and_then(|(_, rest)| rest.split_once("\nfn classify("))
+            .map(|(b, _)| b.to_string())
+            .expect("detect/classify 改名或换序了 —— 先修判据");
+        // 接受常量名或裸字面量两种写法 —— 判据钉的是「问了文件系统」这个**性质**，
+        // 不是某一种拼法。钉拼法的判据会在有人改进实现时制造假红（本仓为此撤回过一次改进）。
+        let names_the_dir = body.contains("INDEX_DIR") || body.contains(INDEX_DIR);
+        assert!(
+            names_the_dir && body.contains("is_dir()"),
+            "detect 必须用 is_dir() 检查 {INDEX_DIR}/；恒真/恒假地喂给 classify 会让\
+             「未索引」被报成「就绪」，而那是静默的"
+        );
+        // 正向断言：剥完还得剩下东西，否则锚点一变判据就静默退化成什么都没查。
+        assert!(body.len() > 80, "取到的 detect 函数体太短，锚点可能已失效");
     }
 }

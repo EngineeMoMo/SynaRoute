@@ -1,34 +1,17 @@
-//! 大脑聚合成员的**只读**检索工具集。
+//! 大脑聚合成员的**只读**检索工具集。原先一次性猜哪些文件相关、整包塞进 prompt，
+//! 猜错白填几万 token、猜漏模型只能盲答；给成员一组按需检索的工具让它自己挖。
+//! **永不写盘、永不执行命令**（唯一起的子进程是只读的 `rg` / `codegraph`）。
+//! 成功结果会被 [`crate::aggregate::fence`] 的 nonce 围栏包住。
 //!
-//! ## 为什么要有它
+//! 四道防线（每个涉及路径的工具都必须过；工具参数来自模型输出，结果会进上游请求体）：
+//! 1. [`crate::aggregate::write::is_safe_relative_path`]：拒 `..`、绝对路径、盘符、UNC
+//! 2. [`crate::aggregate::write::is_within_work_root`]：canonicalize 后仍须在工作目录内
+//! 3. [`crate::retrieval::is_sensitive_path`]：凭据类拒读（按名字一次、按真实落点一次）
+//! 4. [`crate::aggregate::write::is_vcs_internal`]：`.git/` 等版本库内部一律拒读
 //!
-//! 原先 [`crate::retrieval::retrieve_detailed`] 在成员调用**之前**跑一次：抽关键词、猜哪些
-//! 文件相关、整包塞进 prompt。猜错白填几万 token，猜漏模型只能盲答。给成员一组按需检索的
-//! 工具让它自己挖，比一次性猜准得多。
+//! 第 3、4 道最要紧：前两道只防「读到工作目录外」，它们防「读到目录内的密钥 / 远端凭据」。
 //!
-//! ## 边界：只读，永不写盘、永不执行命令
-//!
-//! 聚合只出主意，落盘由客户端自己做，故没有 `write_file` / `run_command`。唯一起的子进程是
-//! `rg` 与 `codegraph`，都是只读查询。
-//!
-//! 成功结果会被 [`crate::aggregate::fence`] 的 nonce 围栏包住（与检索文件共用同一道）。
-//!
-//! ## 三道防线（每个涉及路径的工具都必须过）
-//!
-//! 工具参数来自模型输出，而模型可能被检索内容里的注入指令诱导；且**工具结果会进上游请求体**：
-//! 读到什么就等于把什么发给第三方中转商。
-//!
-//! 1. [`crate::aggregate::write::is_safe_relative_path`]：字符串级，拒 `..`、绝对路径、盘符、UNC
-//! 2. [`crate::aggregate::write::is_within_work_root`]：canonicalize 后仍须在工作目录内，堵链接逃逸
-//! 3. [`crate::retrieval::is_sensitive_path`]：凭据类文件一律拒读
-//!
-//! 第 3 道最要紧：前两道只防「读到工作目录**外**」，它防「读到目录**内**的密钥文件」——
-//! `.env` 就在项目里，前两道全部通过。且要判**两次**：按模型给的名字一次、按解析链接后的
-//! 真实落点一次（`notes.md` → `.env` 这种目录内链接能骗过按名字那次）。
-//!
-//! ## 也承载 MCP `images` 参数的加载
-//!
-//! [`load_images`] 放这里而不是 `mcp`：图片路径同样来自外部输入、同样要过那三道防线，
+//! [`load_images`] 也在这里：图片路径同样来自外部输入、同样要过那几道防线，
 //! 而防线实现（[`resolve_readable`]）就在本模块。放两处必然漂移。
 
 use crate::aggregate::write::{is_safe_relative_path, is_within_work_root};
@@ -207,6 +190,15 @@ fn resolve_readable(work_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     if !is_safe_relative_path(rel) {
         return Err(format!(
             "路径 `{rel}` 被拒：只接受工作目录下的相对路径，不允许 `..`、绝对路径或盘符/UNC。"
+        ));
+    }
+    // ①′ 版本库内部：`.git/` 等一律拒。与写路径共用同一份名单（`is_vcs_internal`）。
+    // 原先只在写路径上有：`is_sensitive_path` 只看文件名（`.git/config` 的文件名是
+    // `config`），于是模型能把远端凭据整份读出来送进上游请求。取证见那条测试。
+    if let Some(seg) = crate::aggregate::write::is_vcs_internal(rel) {
+        return Err(format!(
+            "路径 `{rel}` 被拒：`{seg}/` 是版本库内部目录，工具一律不读 ——\
+             那里可能含远端凭据（如 `.git/config` 里的 token）。请换其他文件。"
         ));
     }
     let full = work_dir.join(rel);
@@ -1017,6 +1009,46 @@ mod tests {
         // 反例：名字吓人但是源码，必须能读（否则代码审查会漏核心实现）
         std::fs::write(w.join("token_service.rs"), "fn f() {}").unwrap();
         assert!(resolve_readable(&w, "token_service.rs").is_ok());
+        std::fs::remove_dir_all(&w).ok();
+    }
+
+    /// 🔴 **版本库内部一律拒读** —— 写路径把它列为独立一道防线，读路径原先一道都没有。
+    ///
+    /// `is_sensitive_path` 只看**文件名**，而 `.git/config` 的文件名是 `config`，
+    /// 不命中任何敏感名；`IGNORE_DIRS` 里那个 `.git` 只管遍历与 grep 排除，
+    /// 对 `read_file(".git/config")` 完全无效。于是模型能把远端凭据
+    /// （`https://user:token@host/...`）整份读出来送进上游请求体。
+    ///
+    /// 判据与写路径**共用同一份名单**（`aggregate::write::is_vcs_internal`）——
+    /// 抄一份必然只有一处被维护。这里连带钉住「每一段都判」（submodule 形态）
+    /// 与「大小写无关」（Windows 上 `.GIT` 就是 `.git`）。
+    #[test]
+    fn defense_4_rejects_reading_version_control_internals() {
+        let w = work("d4vcs");
+        for f in [
+            ".git/config",
+            ".git/hooks/pre-commit",
+            "sub/mod/.git/config", // submodule / monorepo：不是首段
+            ".hg/hgrc",
+        ] {
+            let p = w.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "url = https://user:tok@example.com/r.git").unwrap();
+            let e = resolve_readable(&w, f).expect_err("版本库内部必须被拒读");
+            assert!(
+                e.contains("版本库内部"),
+                "拒绝原因要点明是版本库内部（而不是笼统的『凭据』）：{e}"
+            );
+        }
+        // 反例：名字里带 git 的普通源码必须能读，否则代码审查会漏实现。
+        std::fs::write(w.join("gitutil.rs"), "fn f() {}").unwrap();
+        assert!(resolve_readable(&w, "gitutil.rs").is_ok(), "普通源码不该被牵连");
+        std::fs::create_dir_all(w.join("gitignore_docs")).unwrap();
+        std::fs::write(w.join("gitignore_docs/readme.md"), "x").unwrap();
+        assert!(
+            resolve_readable(&w, "gitignore_docs/readme.md").is_ok(),
+            "目录名只是以 git 开头、不等于 .git，不该被拒"
+        );
         std::fs::remove_dir_all(&w).ok();
     }
 

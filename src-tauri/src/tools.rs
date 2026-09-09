@@ -1046,25 +1046,18 @@ fn unregister_mcp_codex_at(path: &Path) -> AppResult<(String, bool)> {
 }
 
 
-/// 还原某工具配置（从 .synaroute.bak 恢复）。
+/// 还原某工具配置（从 .synaroute.bak 恢复）。「无备份」不视为错误：还原由「停止代理」
+/// 自动触发，从未接入过的分类本就没有 .bak，此时已处于接入前状态。
 ///
-/// Codex 是双文件语义，但**两个文件的角色不对称**（本版起）：
-/// - `config.toml` 是我们写的 → 从 `.bak` 还原；
-/// - `auth.json` 我们**不再写**，但旧版本（≤0.1.33）写过占位符 → 这里负责把它解除。
+/// Codex 三件事、两道顺序纪律（代价都不对称，方向相反，不能合成一步）：
+/// 1. **假凭据先于 config**：config 还原了、假 key 还在 = 静默把占位符发给官方 OpenAI
+///    （指错方向的 401）；反过来是响亮失败，用户立刻知道要重试。
+/// 2. **目录文件后于 config**：config 还指着我们、目录文件已经没了 = Codex 启动即
+///    `failed to parse model_catalog_json`、一个请求都不发。反过来只剩一份孤立文件，无害。
 ///
-/// **顺序刻意是「先解除假凭据、再还原 config」**，因为两种半途残留的代价不对称：
-/// - 「config 还原了、假 key 还在」= 静默把一个假凭据发给真实 OpenAI，换回一句
-///   指向 platform.openai.com 的 401（用户被引向完全错误的方向）；
-/// - 「假 key 解除了、config 还指着我们」= 客户端连不上，**响亮失败**，用户立刻知道要重试。
-///
-/// 先做危险的那一步，它失败时另一步还没发生。
-///
-/// 「无备份」不视为错误：还原由「停止代理」自动触发，从未接入过的分类本就没有 .bak，
-/// 此时已处于接入前状态，返回成功（无需还原），避免每次停止都弹误报错。
+/// 调用顺序是这两条纪律的**唯一**落点（有源码级判据钉着，两个方向的注入都变红）。
 pub fn restore(category: CategoryType) -> AppResult<String> {
-    // 桌面端不是「从 .bak 还原单文件」那套：接入切了 deploymentMode=3p 并写了 gateway 档，
-    // 还原须把两个 config 复位 1p、删本档 profile、从 _meta 摘掉本档并改 appliedId（镜像
-    // cc-switch 的 restore）。故单独分派。
+    // 桌面端另一套语义（3p + gateway 档 + _meta），故单独分派。
     if category == CategoryType::ClaudeDesktop {
         return restore_claude_desktop();
     }
@@ -1074,13 +1067,10 @@ pub fn restore(category: CategoryType) -> AppResult<String> {
         CategoryType::ClaudeDesktop => unreachable!("桌面端已在上方分派"),
     };
     let mut restored = Vec::new();
-
-    // 先解除 Codex 的假凭据（见上面的顺序判据）。
-    // 失败**不早退**：config 那一步仍要尝试，错误留到最后一起上报 —— 早退会让用户
-    // 停在「假 key 摘不掉、config 也没还原」这个两头皆输的状态。
     let mut deferred: Option<AppError> = None;
+    // ① 假凭据：失败不早退（config 那一步仍要试，否则两头皆输）。
     if category == CategoryType::Codex {
-        match codex::codex_catalog::restore_side_files() {
+        match codex::auth_path().and_then(|p| codex::disarm_legacy_placeholder_auth(&p)) {
             Ok(Some(note)) => restored.push(note),
             Ok(None) => {}
             Err(e) => deferred = Some(e),
@@ -1098,6 +1088,16 @@ pub fn restore(category: CategoryType) -> AppResult<String> {
                 )));
             }
             return Err(e);
+        }
+    }
+
+    // ② 目录文件 + 会话 provider：config 还原失败时上面已经 return，指针还在、文件也还在。
+    if category == CategoryType::Codex {
+        match codex::codex_catalog::restore_side_files() {
+            Ok(Some(note)) => restored.push(note),
+            Ok(None) => {}
+            Err(e) if deferred.is_none() => deferred = Some(e),
+            Err(_) => {}
         }
     }
 
@@ -1447,7 +1447,7 @@ fn preview_claude_cli() -> AppResult<ToolConfigPreview> {
     let (exists, content) = read_preview_text(&path, true)?;
     Ok(ToolConfigPreview {
         category_id: CategoryType::ClaudeCli,
-        summary: "Claude CLI：~/.claude/settings.json。写入 BASE_URL / AUTH_TOKEN(占位) / 发现开关 / ANTHROPIC_MODEL / 顶层 model；不写档位 DEFAULT_*，不写 Codex/桌面端文件。".into(),
+        summary: "Claude CLI：~/.claude/settings.json 写 BASE_URL / AUTH_TOKEN(占位) / 发现开关 / ANTHROPIC_MODEL / 顶层 model，并删除 env 里残留的 ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS,FABLE}_MODEL；MCP 写 ~/.claude.json（不在本列表 —— 由接入时单独登记）。不写 Codex/桌面端文件。".into(),
         mcp_registered: is_mcp_registered(CategoryType::ClaudeCli),
         takeover_warning: None,
         files: vec![ToolConfigFilePreview {

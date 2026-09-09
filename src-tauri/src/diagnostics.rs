@@ -33,7 +33,7 @@ use crate::store::Store;
 /// 真实路径段是词（`v1`/`chat`/`completions`/`openai`）或带点的域名式片段；令牌是 ≥16 位的
 /// 无意义串。**宁可多遮一个长段，也不能漏一个令牌** —— 前者只是报告里少一行线索，
 /// 后者是把用户的付费凭据发给了他正在求助的那个人。
-fn mask_url_credentials(url: &str) -> String {
+pub(crate) fn mask_url_credentials(url: &str) -> String {
     let (scheme, rest) = match url.split_once("://") {
         Some((s, r)) => (format!("{s}://"), r),
         None => (String::new(), url),

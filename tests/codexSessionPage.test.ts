@@ -7,6 +7,8 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { sessionsEn, sessionsZh } from "@/lib/i18n.sessions";
+import { chooseKnownTarget } from "@/pages/CodexSessionsPage";
+import type { CodexProviderTargetList } from "@/types";
 
 const page = readFileSync("src/pages/CodexSessionsPage.tsx", "utf8");
 const rustOps = readFileSync("src-tauri/src/tools/codex_session_ops.rs", "utf8");
@@ -19,6 +21,23 @@ const code = (src: string) =>
     .join("\n");
 
 describe("会话页与后端的两处契约", () => {
+  it("同步目标只能从后端真实候选里选，不得留下空白但可写的幽灵值", () => {
+    const base: CodexProviderTargetList = {
+      current: "openai",
+      ours: "synaroute",
+      prefs: { autoSyncDisabled: false, lastTarget: "stale-provider" },
+      targets: [
+        { id: "openai", sources: ["config"], isCurrent: true },
+        { id: "relay", sources: ["rollout"], isCurrent: false },
+      ],
+    };
+    expect(chooseKnownTarget(base, "also-stale")).toBe("openai");
+    expect(chooseKnownTarget({ ...base, prefs: { ...base.prefs, lastTarget: "relay" } }, "")).toBe(
+      "relay",
+    );
+    expect(chooseKnownTarget({ ...base, targets: [] }, "")).toBe("");
+  });
+
   /**
    * 🔴 「指向别处」这个数字只能有**一个**来源。
    *
@@ -30,11 +49,12 @@ describe("会话页与后端的两处契约", () => {
     const src = code(page);
     expect(src, "必须直接用后端算好的那个数字").toContain("data?.stats.mismatched");
     expect(src, "「模型已失效」的条数同理").toContain("data?.stats.modelGone");
-    // 反向：不许在页面里按 provider 重新过滤出「不一致」的行。
+    // 反向：页面里只有「筛选当前显示行」那一处允许比较 provider 与 currentProvider。
+    // 再出现一次就意味着又在前端算了第二份统计；按语义计数，不用会漏 `(r) =>` 的正则。
     expect(
-      /rows\s*\.filter\([^)]*provider\s*!==/.test(src),
-      "前端不许按 provider 自己再过滤一遍 —— 那就是第二个事实来源",
-    ).toBe(false);
+      src.split(".provider !== data.currentProvider").length - 1,
+      "provider/currentProvider 比较只能用于筛选，第二处就是第二个统计来源",
+    ).toBe(1);
   });
 
   /**

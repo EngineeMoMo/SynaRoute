@@ -140,17 +140,56 @@ mod tests {
     /// `move_key`（上移一格 == 对它调 `set_primary_key`）、`handle_tray_set_primary`
     /// （托盘与界面同一个操作）、`apply_import_config`（整份换 Key，集合必变）。
     ///
-    /// ⚠️ **本判据只数出现次数，不保证「每个变更点都被包住」** —— 它挡的是「有人把某处的
-    /// `sync_after` 删掉」，挡不住「新加一个不过它的变更点」。上面那三处就是这么漏掉的
+    /// ⚠️ **本判据不保证「每个变更点都被包住」** —— 它挡的是「有人把某处的 `sync_after`
+    /// 删掉」，挡不住「新加一个不过它的变更点」。上面那三处就是这么漏掉的
     /// （判据当时是 4、恰好全绿）。加新的 Key/清单变更命令时，人得自己想一遍。
+    ///
+    /// 🔴 **判据钉的是「每个已知入口的函数体里都有它」，不是一个总次数。**
+    /// 原实现 `assert_eq!(count, 7)` 会在两个方向上骗人：加一个**已经接对了**的新入口
+    /// （本轮的 `reorder_key`）让它变红 —— 那是**假红**，而假红的代价是下一个人
+    /// 把数字一改了事、或者把正确的接线撤回去；反过来，把 A 处的调用删掉、B 处抄两遍
+    /// 也能凑回 7，那是**假绿**。逐入口检查两个方向都堵住了。
+    /// （同 CLAUDE.md「判据要钉性质，不要钉某一种写法」那条 —— 本仓已为它栽过六次。）
+    /// ⚠️ **命令搬家时这张表要跟着搬** —— 本判据在本轮真的抓过一次自己：`reorder_key`
+    /// 为腾 lib.rs 的棘轮余量搬进了 `key_order.rs`，表里还写着「在 lib.rs 找」→ 当场变红，
+    /// 提示语直接指出「它被改名或搬走了」。那个失败是**有用**的（不是假红）：
+    /// 命令搬走之后，「它还过没过 sync_after」必须重新被看一眼。
     #[test]
     fn every_key_mutation_command_must_go_through_sync_after() {
-        let src = prod(include_str!("lib.rs"));
-        assert_eq!(
-            src.matches("client_resync::sync_after(").count(),
-            7,
-            "upsert / delete / toggle / set_primary / move / 托盘 set_primary / 导入，七处都要过它"
+        // 排序类命令按本仓「命令跟着实现走」的做法放在 store 的子模块里，故要连它一起扫。
+        let src = format!(
+            "{}\n{}",
+            prod(include_str!("lib.rs")),
+            prod(include_str!("key_order.rs"))
         );
+        // 每个会改写「Key 集合或其顺序」的入口，函数体里必须出现 sync_after。
+        // 加新入口时把它加进这张表 —— 表本身就是那份「人得自己想一遍」的清单。
+        const ENTRIES: &[&str] = &[
+            "fn upsert_key(",
+            "fn delete_key(",
+            "fn toggle_key(",
+            "fn set_primary_key(",
+            "fn move_key(",
+            "fn reorder_key(",
+            "fn apply_import_config(",
+            "fn handle_tray_set_primary(",
+        ];
+        for entry in ENTRIES {
+            let at = src.find(entry).unwrap_or_else(|| {
+                panic!("找不到 `{entry}` —— 它被改名或搬走了，本判据已失效，请更新这张表")
+            });
+            // 从签名扫到下一个 `\nfn ` / `\n#[tauri::command]` 之前，即该函数体。
+            let rest = &src[at + entry.len()..];
+            let end = rest
+                .find("\n#[tauri::command]")
+                .or_else(|| rest.find("\nfn "))
+                .unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains("client_resync::sync_after("),
+                "`{entry}` 会改写 Key 集合/顺序，却没过 client_resync::sync_after —— \
+                 表现是「改了这一种会同步、改那一种不会」，用户得到一个时对时错的心智模型"
+            );
+        }
     }
 
     /// 🔴 只对**正在跑**的分类写：没接入就不许碰用户的 `~/.codex/config.toml` 等文件。

@@ -13,7 +13,10 @@ export const usageZh: Dict = {
   "usage.subtitle": "按分类与 Key 聚合的 token 消耗与花费估算（跨重启累计）",
   "usage.refresh": "刷新",
   "usage.loading": "加载中…",
-  "usage.empty": "暂无用量记录（有转发流量后这里会出现数据）",
+  // 空态改口径：配置了 Key 之后表格就不再是空的（它们会以「尚无用量」的形态出现），
+  // 所以真正的空态只剩「一条 Key 都没配、也没有历史用量」。旧文案「有转发流量后
+  // 这里会出现数据」在那种情形下会让用户以为得先跑一次请求才能看到自己的 Key。
+  "usage.empty": "还没有配置 Key，也没有历史用量记录",
   "usage.input": "输入",
   "usage.output": "输出",
   "usage.cacheRead": "缓存读取",
@@ -67,6 +70,13 @@ export const usageZh: Dict = {
   "usage.estCostExcluded": "＋{n} 行未计入",
   "usage.pricedBy": "按 {model} 估算",
   "usage.tableDate": "单价表核对于 {date}",
+  // ---- 还没捕获过 usage 的行（并集之后新加的 Key 会立刻以这个形态出现）----
+  //
+  // 🔴 绝不显示 $0：那读起来是「已经在服务、而且免费」。也不猜成因 —— 三种可能
+  // （尚未使用 / 流仍在进行 / 上游不回 usage）我们分辨不出，故写成条件句。
+  "usage.noUsageYet": "尚无用量",
+  "usage.noUsageYetHint":
+    "还没有收到上游回报的用量。可能是这条 Key 尚未被使用，或流式回答仍在进行（用量在流结束时才补记），也可能这个中转站不返回 usage 字段。",
 };
 
 export const usageEn: Dict = {
@@ -74,7 +84,7 @@ export const usageEn: Dict = {
   "usage.subtitle": "Token consumption and estimated spend by category and key (cumulative across restarts)",
   "usage.refresh": "Refresh",
   "usage.loading": "Loading…",
-  "usage.empty": "No usage yet (data appears after forwarding traffic)",
+  "usage.empty": "No keys configured and no usage history yet",
   "usage.input": "Input",
   "usage.output": "Output",
   "usage.cacheRead": "Cache read",
@@ -123,4 +133,7 @@ export const usageEn: Dict = {
   "usage.estCostExcluded": "+{n} row(s) excluded",
   "usage.pricedBy": "priced as {model}",
   "usage.tableDate": "Price table verified {date}",
+  "usage.noUsageYet": "No usage yet",
+  "usage.noUsageYetHint":
+    "No usage reported by the upstream yet. This key may not have been used, a streaming reply may still be in flight (usage is recorded when the stream ends), or this provider may not return a usage field.",
 };

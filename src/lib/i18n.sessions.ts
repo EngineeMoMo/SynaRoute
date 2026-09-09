@@ -89,7 +89,7 @@ export const sessionsZh: Dict = {
     "接入时已经自动同步过一次。这个按钮用于补做当时没成功的那些 —— 最常见的成因是接入那一刻 Codex 正开着、文件被独占。",
   "sessions.autoSync": "接入时自动同步历史会话",
   "sessions.autoSyncHint":
-    "这是 SynaRoute 唯一会主动改你对话文件的自动动作（只改首行那一个字段，正文与文件修改时间都不动）。同时在用 cc-switch 之类工具时可以关掉它，关掉后仍可用上面的按钮手动同步。",
+    "这是 SynaRoute 唯一会主动改你对话文件的自动动作（只改首行那一个字段，正文与文件修改时间都不动）。同时在用别的配置切换工具时可以关掉它，关掉后仍可用上面的按钮手动同步。",
   "sessions.autoSyncSaved": "已保存",
 
   "sessions.indexTitle": "会话索引",
@@ -106,12 +106,10 @@ export const sessionsZh: Dict = {
   "env.srcProcess": "本进程",
   "env.remove": "移除这 {n} 个",
   "env.confirmBody":
-    "这会改你的 Windows 用户级环境变量（不只是 SynaRoute 的配置）。移除前会先把当前清单备份成 JSON；已经在运行的程序仍持有旧值，要重启它们才生效。",
+    "这会改你的 Windows 用户级环境变量（不只是 SynaRoute 的配置）。移除前只备份变量名与已脱敏的值；凭据类变量的明文不会写入备份，删除后无法从备份恢复。已经在运行的程序仍持有旧值，要重启它们才生效。",
   "env.confirmOk": "确认移除",
   "env.removed": "已移除 {n} 个。",
   "env.backupAt": "备份：{path}",
-  "env.keepHint":
-    "目录类变量（CODEX_HOME 等）不提供移除 —— 正确的处置是让两侧一致：重启 SynaRoute 让它继承到，或在系统设置里把它去掉。",
 };
 
 export const sessionsEn: Dict = {
@@ -193,7 +191,7 @@ export const sessionsEn: Dict = {
     "Applying already synced once. This button is for finishing whatever failed then — most often because Codex was running and held the files open.",
   "sessions.autoSync": "Sync past sessions when applying",
   "sessions.autoSyncHint":
-    "This is the only automatic action in which SynaRoute modifies your conversation files (only that one field on the first line; the body and the file's modification time stay untouched). Turn it off if you also use something like cc-switch — the manual button above still works.",
+    "This is the only automatic action in which SynaRoute modifies your conversation files (only that one field on the first line; the body and the file's modification time stay untouched). Turn it off if you also use another config-switching tool — the manual button above still works.",
   "sessions.autoSyncSaved": "Saved",
 
   "sessions.indexTitle": "Session index",
@@ -208,10 +206,8 @@ export const sessionsEn: Dict = {
   "env.srcProcess": "this process",
   "env.remove": "Remove {n}",
   "env.confirmBody":
-    "This changes your Windows user-level environment variables, not just SynaRoute's own configuration. The current list is backed up to JSON first; programs already running keep the old values until you restart them.",
+    "This changes your Windows user-level environment variables, not just SynaRoute's configuration. The backup contains only variable names and redacted values; secret values are never written to it and cannot be recovered from it after removal. Programs already running keep the old values until restarted.",
   "env.confirmOk": "Remove",
   "env.removed": "Removed {n}.",
   "env.backupAt": "Backup: {path}",
-  "env.keepHint":
-    "Directory variables (CODEX_HOME and friends) are not offered for removal — the fix is to make both sides agree: restart SynaRoute so it inherits the value, or unset it in system settings.",
 };

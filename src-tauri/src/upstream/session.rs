@@ -669,6 +669,9 @@ impl ToolSession {
 
         let resp = send(&payload).await?;
         let status = resp.status();
+        // 🔴 **必须在 `resp.text()` 之前读头**：那个调用会消费 `resp`。成员路径此前漏了
+        // completion.rs 已有的同一条接线，导致 429 的配额窗口永远不被武装、每轮白打。
+        let retry_after = crate::proxy::parse_retry_after(resp.headers());
         // 同 text_completion：先读文本再解析，否则上游回 HTML 错误页时只能看到笼统的
         // 「error decoding response body」，看不出上游到底说了什么。
         let raw = resp.text().await?;
@@ -691,11 +694,14 @@ impl ToolSession {
             }
             let resp2 = send(&plain).await?;
             let status2 = resp2.status();
+            // 与首个响应同一纪律：text() 会消费 resp2，Retry-After 必须先读。
+            let retry_after2 = crate::proxy::parse_retry_after(resp2.headers());
             let raw2 = resp2.text().await?;
             if !status2.is_success() {
-                return Err(AppError::upstream_http(
+                return Err(AppError::upstream_http_after(
                     status2.as_u16(),
                     format!("{label} HTTP {status2}: {}", truncate_body(&raw2)),
+                    retry_after2,
                 ));
             }
             record_usage_from_raw(&raw2);
@@ -708,9 +714,10 @@ impl ToolSession {
         }
 
         if !status.is_success() {
-            return Err(AppError::upstream_http(
+            return Err(AppError::upstream_http_after(
                 status.as_u16(),
                 format!("{label} HTTP {status}: {}", truncate_body(&raw)),
+                retry_after,
             ));
         }
         // 🔴 状态码是 2xx 不等于成功：上游可能回 200 而正文是一个错误对象

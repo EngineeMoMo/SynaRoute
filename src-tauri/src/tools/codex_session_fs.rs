@@ -313,11 +313,11 @@ pub(in crate::tools) fn display_path(value: &str) -> String {
 /// 理由见模块头（fork 子会话的首行 `payload.id` 是**父**会话的 id，拿它去 DELETE 会删错行）。
 pub(in crate::tools) fn thread_id_from_filename(name: &str) -> Option<String> {
     let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
-    if stem.len() < 36 {
-        return None;
-    }
-    let tail = &stem[stem.len() - 36..];
-    let ok = tail.char_indices().all(|(i, c)| match i {
+    // `str::len()` 是字节数，不能直接 `&stem[len-36..]`：带中文/emoji 的手工改名会把
+    // 偏移落在 UTF-8 续接字节上并 panic。先按字符找起点，再让 ASCII UUID 判据决定收不收。
+    let start = stem.char_indices().rev().nth(35)?.0;
+    let tail = &stem[start..];
+    let ok = tail.len() == 36 && tail.char_indices().all(|(i, c)| match i {
         8 | 13 | 18 | 23 => c == '-',
         _ => c.is_ascii_hexdigit(),
     });

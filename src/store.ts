@@ -17,6 +17,8 @@ import { translate, type Lang } from "@/lib/i18n";
 import { api, isTauri } from "@/lib/bridge";
 import { pickPrefs } from "@/lib/prefs";
 import { reuseUnchanged } from "@/lib/reuseUnchanged";
+// 与后端 key_order::reorder_before / mockData.reorderKey 同语义的顺序变换（三处共用一份判据）
+import { reorderIds } from "@/lib/keyOrdering";
 
 /**
  * 一条余额缓存：查询结果 + **产出它的那份配置的指纹**。
@@ -170,6 +172,13 @@ interface AppState {
   loadVendors: () => Promise<void>;
   toggleKey: (keyId: string, enabled: boolean) => Promise<void>;
   moveKey: (keyId: string, direction: "up" | "down") => Promise<void>;
+  /**
+   * 鼠标拖放重排：把 `keyId` 放到 `beforeKeyId` 之前（`undefined` = 末尾）。
+   *
+   * 与 `moveKey` 并存 —— 上下移按钮是键盘/无障碍路径，不能被拖放替代。
+   * 一次拖放**只发一次** IPC（跨多位是常态，循环调 moveKey 会变成 N 次落盘）。
+   */
+  reorderKey: (keyId: string, beforeKeyId?: string) => Promise<void>;
   /**
    * 三个「切换后要弹成功 toast」的 action 返回 `boolean`：true = 无错。
    *
@@ -502,6 +511,39 @@ export const useStore = create<AppState>((set, get) => ({
       console.error("moveKey failed", e);
       get().showToast("error", String((e as Error)?.message ?? e));
     }
+    await get().loadCategory(cat);
+  },
+
+  // 鼠标拖放重排（用户原话「一个一个点太麻烦了」）。
+  //
+  // 与 moveKey 的两点不同：
+  // ① **一次拖放一次 IPC**。跨多位是这个功能存在的理由，而循环调 moveKey 会变成 N 次落盘
+  //    + N 次客户端配置重写 + N 次托盘重建，中途失败留下半套顺序（详见后端 key_order 模块头）。
+  // ② 顺序变换用共享的 `reorderIds`，与后端 `key_order::reorder_before` 及 mock 三处同语义
+  //    —— 各写一份必然漂移，而漂移的表现是「松手后卡片跳到另一个位置」。
+  async reorderKey(keyId, beforeKeyId) {
+    const cat = get().activeCategory;
+    const ordered = [...get().keys]
+      .filter((k) => k.categoryId === cat)
+      .sort((a, b) => a.priority - b.priority);
+    const nextIds = reorderIds(ordered.map((k) => k.id), keyId, beforeKeyId);
+    // 乐观更新：先按新顺序连续重编号（后端用同一套规则，随后 reload 对齐）。
+    const rank = new Map(nextIds.map((id, i) => [id, i]));
+    set({
+      keys: get().keys.map((k) => {
+        const p = rank.get(k.id);
+        return p === undefined || k.priority === p ? k : { ...k, priority: p };
+      }),
+    });
+    try {
+      await api.reorderKey(cat, keyId, beforeKeyId);
+    } catch (e) {
+      // 失败必须可见（同 toggleKey 那条纪律）：静默吞掉的表现是「拖完看着成了、
+      // 一刷新又弹回去」，而用户拿不到任何线索（主口令锁定、落盘失败都会走到这里）。
+      console.error("reorderKey failed", e);
+      get().showToast("error", String((e as Error)?.message ?? e));
+    }
+    // 成功也 reload：后端才是顺序的事实来源（它会拒绝陈旧锚点、也可能已被别的来源改过）。
     await get().loadCategory(cat);
   },
 

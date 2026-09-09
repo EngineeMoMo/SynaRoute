@@ -33,7 +33,7 @@ export function GettingStarted() {
         ))}
       </ol>
 
-      {/* 「照常使用就行」+ cc-switch 迁移路径 + CLI 版本闸门：
+      {/* 「照常使用就行」+ CLI 版本闸门：
           三段补充信息，不带序号、不在 `data/features.ts` 里，收在 steps 列表尾部。
           间距从步骤的 pb-9 拉到 mt-12（约 48px → 约 48px 留白 + 步骤的 pb-9 = 84px），
           用空间分隔「有序的步骤」与「其余值得一提的」。 */}
@@ -45,12 +45,6 @@ export function GettingStarted() {
           </div>
         </Reveal>
 
-        <Reveal delay={(steps.length + 1) * 70}>
-          <div>
-            <h3 className="text-base font-semibold text-text-primary">{t("steps.fromCcSwitch")}</h3>
-            <p className="mt-1.5 text-sm leading-relaxed text-text-secondary">{t("steps.fromCcSwitchDesc")}</p>
-          </div>
-        </Reveal>
 
         <Reveal delay={(steps.length + 2) * 70}>
           <div>

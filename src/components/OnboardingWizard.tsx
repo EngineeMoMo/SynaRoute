@@ -6,7 +6,6 @@ import {
   Code2,
   Check,
   KeyRound,
-  Download,
   Play,
   Loader2,
   AlertTriangle,
@@ -21,7 +20,6 @@ import { useStore } from "@/store";
 import { useT } from "@/lib/useT";
 import { Button } from "@/components/ui/Button";
 import { KeyEditor } from "@/components/KeyEditor";
-import { CcSwitchImportDialog } from "@/components/CcSwitchImportDialog";
 
 const CLIENTS: { cat: CategoryType; icon: LucideIcon }[] = [
   { cat: "claude-cli", icon: Terminal },
@@ -30,7 +28,6 @@ const CLIENTS: { cat: CategoryType; icon: LucideIcon }[] = [
 ];
 
 interface Props {
-  ccswitchAvailable: boolean;
   /** 必须传 App 的 handleNav 本体：它同时做 setNav 与 setActiveCategory */
   onPickCategory: (k: NavKey) => void;
   onOpenLogs: () => void;
@@ -47,10 +44,10 @@ interface Props {
  * 只能自己去开一个会话试。这一步靠「自向导开始起该分类有没有 route 事件」实时打勾，
  * 并且在收到失败时把失败原因直接摆出来 —— 只说「还没收到请求」帮不了配错的人。
  *
- * 复用而非重写：Key 用 KeyEditor、导入用 CcSwitchImportDialog、启动用 store.startProxy
+ * 复用而非重写：Key 用 KeyEditor、启动用 store.startProxy
  * （它内部 start + applyToolConfig，语义与界面按钮和托盘完全一致）。
  */
-export function OnboardingWizard({ ccswitchAvailable, onPickCategory, onOpenLogs }: Props) {
+export function OnboardingWizard({ onPickCategory, onOpenLogs }: Props) {
   const t = useT();
   const dismissOnboarding = useStore((s) => s.dismissOnboarding);
   const startProxy = useStore((s) => s.startProxy);
@@ -60,7 +57,6 @@ export function OnboardingWizard({ ccswitchAvailable, onPickCategory, onOpenLogs
   const [step, setStep] = useState(1);
   const [cat, setCat] = useState<CategoryType | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
-  const [importOpen, setImportOpen] = useState(false);
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const [probe, setProbe] = useState<FirstRequestProbe | null>(null);
@@ -129,13 +125,13 @@ export function OnboardingWizard({ ccswitchAvailable, onPickCategory, onOpenLogs
   return createPortal(
     <>
       {/* 层级规则：低于命令面板 z-[90] 与 Toast z-[100]；平时 z-[80] 盖住主界面。
-          ⚠️ 子弹窗（KeyEditor / CcSwitchImportDialog）都是 z-50 —— 同一层叠上下文里
+          ⚠️ 子弹窗（KeyEditor）是 z-50 —— 同一层叠上下文里
           z-index 高者恒在上，DOM 后挂载顺序**不能**翻转它（此前注释的「portal 后挂载
           所以能盖住」是错误认知，实测第②步整个编辑器被向导遮罩挡住、鼠标完全点不到）。
           故子弹窗打开期间把向导整体降到 z-40：编辑器浮上来可交互，向导仍盖住主界面。 */}
       <div
         className={`fixed inset-0 flex items-center justify-center bg-black/50 p-4 ${
-          editorOpen || importOpen ? "z-40" : "z-[80]"
+          editorOpen ? "z-40" : "z-[80]"
         }`}
       >
         <div className="flex max-h-[86vh] w-[min(560px,94vw)] flex-col overflow-hidden rounded-lg border border-border bg-surface shadow-2xl">
@@ -206,30 +202,11 @@ export function OnboardingWizard({ ccswitchAvailable, onPickCategory, onOpenLogs
               </div>
             )}
 
-            {/* ── 第②步：加 Key（手工 与 从 cc-switch 导入 并列为主选项）── */}
+            {/* ── 第②步：加 Key ── */}
             {step === 2 && (
               <div className="space-y-3">
                 <p className="text-xs leading-relaxed text-text-secondary">{t("onboarding.s2Desc")}</p>
-                <div className="grid gap-2 sm:grid-cols-2">
-                  {/*
-                    两个选项**并列**、样式同级。检测到 cc-switch 库时把它排在前面并高亮：
-                    对已经在用 cc-switch 的用户，导入比手工填十几个字段快得多；
-                    没装的人则根本看不到这个选项，不会被一个点了会报错的按钮困惑。
-                  */}
-                  {ccswitchAvailable && (
-                    <button
-                      onClick={() => setImportOpen(true)}
-                      className="flex flex-col items-start gap-1.5 rounded-control border-2 border-primary bg-primary/8 px-3.5 py-3 text-left transition-colors hover:bg-primary/12"
-                    >
-                      <Download size={17} className="text-primary" />
-                      <span className="text-sm font-medium text-text-primary">
-                        {t("onboarding.s2Import")}
-                      </span>
-                      <span className="text-[11px] leading-relaxed text-text-muted">
-                        {t("onboarding.s2ImportHint")}
-                      </span>
-                    </button>
-                  )}
+                <div className="grid gap-2">
                   <button
                     onClick={() => setEditorOpen(true)}
                     className="flex flex-col items-start gap-1.5 rounded-control border border-border px-3.5 py-3 text-left transition-colors hover:border-primary hover:bg-surface-hover"
@@ -356,12 +333,6 @@ export function OnboardingWizard({ ccswitchAvailable, onPickCategory, onOpenLogs
           initial={null}
           onClose={() => setEditorOpen(false)}
           onSaved={() => setStep(3)}
-        />
-      )}
-      {importOpen && (
-        <CcSwitchImportDialog
-          onClose={() => setImportOpen(false)}
-          onImported={() => setImportOpen(false)}
         />
       )}
     </>,

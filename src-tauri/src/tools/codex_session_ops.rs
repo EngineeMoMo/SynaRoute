@@ -351,8 +351,8 @@ pub(in crate::tools) fn preview_summary() -> &'static str {
     "Codex：写 ~/.codex/config.toml（model_provider=synaroute、\
      [model_providers.synaroute] 含 base_url/wire_api/bearer 占位、可选顶层 model）\
      与 ~/.codex/synaroute-model-catalog.json（模型目录，还原时整份删除）。\
-     auth.json 仅在无可用凭据 / OAuth 已过期时才写占位并备份原件，其余情况原样保留官方 \
-     ChatGPT 登录态。不写任何 ANTHROPIC_*。\
+     auth.json：已有可用 API key（非占位符）时不碰；否则整份覆盖成占位并备份原件 —— \
+     含一份**仍有效**的 ChatGPT OAuth。不写任何 ANTHROPIC_*。\
      另外会改历史对话的 provider：sessions/ 与 archived_sessions/ 下每个 rollout-*.jsonl \
      的首行 model_provider（只改这一个字段，其余字节逐字不动、文件修改时间也原样保全），\
      以及会话库 threads 表的同名列；原值记在应用数据目录的 codex-session-providers.json，\
@@ -379,11 +379,7 @@ pub(crate) fn diagnostics_line() -> Option<String> {
     if list.rows.is_empty() && list.unreadable == 0 {
         return None;
     }
-    let bad = list
-        .rows
-        .iter()
-        .filter(|r| !list.current_provider.is_empty() && r.provider != list.current_provider)
-        .count();
+    let bad = list.stats.mismatched;
     let mut s = format!(
         "Codex 会话: {} 条，当前 provider={}，指向别处={bad}",
         list.rows.len(),

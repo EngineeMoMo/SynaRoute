@@ -8,6 +8,7 @@ import { vendorEn, vendorZh } from "./i18n.vendor";
 import { fieldsEn, fieldsZh } from "./i18n.fields";
 import { mappingEn, mappingZh } from "./i18n.mapping";
 import { brainRunEn, brainRunZh } from "./i18n.brain"; import { sessionsEn, sessionsZh } from "./i18n.sessions";
+import { orderingEn, orderingZh } from "./i18n.ordering";
 
 export type Lang = "zh" | "en";
 
@@ -148,8 +149,6 @@ const zh: Dict = {
   "onboarding.step4": "验证",
   "onboarding.s1Desc": "先选一个你要接入的客户端。之后随时可以在左侧切换，为其它客户端各配一套。",
   "onboarding.s2Desc": "加一条厂商 Key。多条 Key 会按优先级自动故障转移，现在先配一条就够。",
-  "onboarding.s2Import": "从 cc-switch 导入",
-  "onboarding.s2ImportHint": "检测到本机装有 cc-switch，可直接读取已配好的厂商，免去重填。",
   "onboarding.s2Manual": "手动添加",
   "onboarding.s2ManualHint": "填 Base URL 与密钥；协议会按 Base URL 自动判断。",
   "onboarding.s2Done": "已有 {n} 条 Key，可以继续",
@@ -185,7 +184,7 @@ const zh: Dict = {
     "遇到问题优先提 Issue：附上「运行日志」里的相关条目与 SynaRoute 版本号，能省掉大半来回确认。",
   "about.thanksTitle": "致谢",
   "about.thanksBody":
-    "本项目在配置管理与托盘交互上参考了 cc-switch 的设计；协议转换与工具调用的判据来自对官方客户端的实测反查。感谢这些先行工作。",
+    "协议转换与工具调用的判据来自对官方客户端的实测反查；配置管理与托盘交互的形态参考了同类开源工具的实践。感谢这些先行工作。",
 
   // 顶部更新横幅（原先只有侧栏 Logo 角标，太不显眼）
   "update.bannerTitle": "有新版本 v{version} 可以更新",
@@ -266,27 +265,6 @@ const zh: Dict = {
     "只有已启用的 Key 参与转发与故障转移，按卡片从上到下的顺序依次尝试。停用的 Key 既不转发、也不参与定时健康探测——它不会在别的 Key 失败时被自动启用。",
   "category.trippedKeysTip":
     "熔断是自动的：某条 Key 连续失败后暂停使用一小段时间，期间流量走其他 Key。无需手动处理，倒计时结束会自动恢复；不必停用或删除这条 Key。",
-  "category.ccSwitchImport": "从 cc-switch 导入",
-  // cc-switch 导入弹窗。整个弹窗原先没接 i18n（全是中文字面量），英文界面下一片中文。
-  "ccswitch.title": "从 cc-switch 导入 Key",
-  "ccswitch.scanning": "正在读取 cc-switch 配置库…",
-  "ccswitch.source": "数据来源：{path}（只读，不会修改 cc-switch 的任何数据）",
-  "ccswitch.nothingToImport": "没有可导入的档。",
-  "ccswitch.blockedSummary": "不可导入 {n} 条（官方登录档 / 已存在 / 暂不支持的端）",
-  "ccswitch.pickedCount": "已选 {n} / 可导入 {total}",
-  "ccswitch.importN": "导入选中 {n} 条",
-  "ccswitch.importing": "导入中…",
-  "ccswitch.canClose": "可关闭本窗口",
-  "ccswitch.reportSummary": "导入完成：成功 {ok} · 跳过 {skipped} · 失败 {failed}",
-  // 原文用 <strong> 强调「未接入」；改走词条后不夹 JSX，靠措辞本身把话说重。
-  // ⚠️ 这里**不能写 `**粗体**`**：本条是纯文本渲染，星号会原样显示成 `**尚未接入**`。
-  // 本仓多处词条都是纯文本，写 markdown 记号一律会露出来。
-  "ccswitch.notAppliedNote":
-    "注意：导入的 Key 只是存进了 SynaRoute，尚未接入任何客户端配置，不会自动生效。需要用它时到对应分类里点「启动」。",
-  "ccswitch.isCurrent": "cc-switch 当前生效",
-  "ccswitch.defaultModel": "默认模型 {name}",
-  "category.ccSwitchImportTip":
-    "只读取 cc-switch 的配置库，把其中的 Key 复制过来，不会改动它、也不会覆盖你现有的 Key。导入后不会自动接入，仍需你点「启动」。",
   "category.addKey": "新增厂商 Key",
   "category.mappingGapTitle": "部分模型只有单条 Key 能服务",
   "category.mappingGapSummary": "{count} 个模型是单点：唯一服务者一挂就用不了",
@@ -319,8 +297,6 @@ const zh: Dict = {
   "key.setPrimaryHint": "提为主 Key（优先级最高，故障转移最先使用）",
   "key.protocolSuffix": "协议",
   "key.openSiteTip": "在浏览器打开 {site}（查额度 / 看公告 / 读文档）",
-  "key.moveUp": "上移（提高优先级，故障转移更早使用）",
-  "key.moveDown": "下移（降低优先级）",
   "key.mappingTitle": "模型映射",
   "key.healthCheckLabel": "健康检查：{time}",
   "key.healthProbeFailed": "探测失败",
@@ -466,7 +442,8 @@ const zh: Dict = {
   "brain.cgTitle": "代码索引（codegraph）",
   "brain.cgDescReady": "已就绪：检索按「符号 + 调用链」精确切片，只发相关方法体而非整份文件，省 token 且更适合代码审查。",
   "brain.cgDescNotInstalled": "未安装。装上后检索可按「符号 + 调用链」精确切片（只发相关方法体而非整份文件）；不装则退化为按文件检索。",
-  "brain.cgDescNotIndexed": "已安装但当前项目未建索引。建索引后检索才能走符号级链路。",
+  "brain.cgDescNotIndexed": "已安装，但下面这个项目还没建索引。建索引后检索才能走符号级链路。",
+  "brain.cgDescIndexUnknown": "已安装。尚未判定项目目录，故索引状态未知 —— 请在上方填写工作目录，或开启「自动跟随最近活动项目」。",
   "brain.cgDescStranded": "已安装但不在 PATH 中（常见于 nvm 升级后遗留在旧 node 版本目录）。SynaRoute 仍可用绝对路径调用，但你在终端里调不到；建议在当前 node 版本下重装。",
   "brain.cgInstallHint": "安装命令（需已装 Node.js）：",
   "brain.cgBuildIndex": "为当前项目建索引",
@@ -475,6 +452,7 @@ const zh: Dict = {
   "brain.cgNeedWorkDir": "请先设置工作目录",
   "brain.cgLocalNote": "纯本地：索引落在项目的 .codegraph/ 目录，不上传代码。",
   "brain.cgBadgeNotIndexed": "未索引",
+  "brain.cgBadgeIndexUnknown": "索引状态未知",
   "brain.cgBadgeNotInstalled": "未安装",
 
   // 日志
@@ -484,7 +462,7 @@ const zh: Dict = {
   ...brandPickerZh,
   ...fieldsZh,
   ...mappingZh,
-  ...brainRunZh, ...sessionsZh,
+  ...brainRunZh, ...sessionsZh, ...orderingZh,
   "logs.empty": "暂无事件",
   "logs.searchPlaceholder": "搜索日志（Key 名、模型、错误…）",
   "logs.noMatch": "没有匹配「{q}」的日志",
@@ -847,9 +825,6 @@ const en: Dict = {
     "Pick the client you want to route. You can switch in the sidebar later and set up the others too.",
   "onboarding.s2Desc":
     "Add one provider key. Multiple keys fail over automatically by priority — one is enough for now.",
-  "onboarding.s2Import": "Import from cc-switch",
-  "onboarding.s2ImportHint":
-    "cc-switch was found on this machine — read your existing providers instead of retyping them.",
   "onboarding.s2Manual": "Add manually",
   "onboarding.s2ManualHint": "Enter a base URL and key; the protocol is inferred from the URL.",
   "onboarding.s2Done": "{n} key(s) configured — you can continue",
@@ -887,7 +862,7 @@ const en: Dict = {
     "Prefer opening an issue: include the relevant entries from Logs plus your SynaRoute version — that saves most of the back-and-forth.",
   "about.thanksTitle": "Acknowledgements",
   "about.thanksBody":
-    "Config management and tray interactions draw on cc-switch's design; the protocol-translation and tool-call criteria come from reverse-engineering the official clients. Thanks to that prior work.",
+    "The protocol-translation and tool-call criteria come from reverse-engineering the official clients; config management and tray interactions draw on the practices of comparable open-source tools. Thanks to that prior work.",
 
   // Top update banner (the sidebar logo badge alone was too easy to miss)
   "update.bannerTitle": "Version {version} is available",
@@ -964,24 +939,6 @@ const en: Dict = {
     "Only enabled keys forward traffic and take part in failover, tried top-to-bottom in card order. A disabled key neither forwards nor gets health-probed — it will not be switched on automatically when another key fails.",
   "category.trippedKeysTip":
     "Tripping is automatic: after repeated failures a key is paused briefly and traffic goes to the others. Nothing to do — it recovers on its own when the countdown ends. No need to disable or delete the key.",
-  "category.ccSwitchImport": "Import from cc-switch",
-  "ccswitch.title": "Import keys from cc-switch",
-  "ccswitch.scanning": "Reading cc-switch's config store…",
-  "ccswitch.source": "Source: {path} (read-only — nothing in cc-switch is modified)",
-  "ccswitch.nothingToImport": "Nothing available to import.",
-  "ccswitch.blockedSummary":
-    "{n} not importable (official-login profiles / already present / unsupported client)",
-  "ccswitch.pickedCount": "{n} selected of {total} importable",
-  "ccswitch.importN": "Import {n} selected",
-  "ccswitch.importing": "Importing…",
-  "ccswitch.canClose": "You can close this window",
-  "ccswitch.reportSummary": "Done: {ok} imported · {skipped} skipped · {failed} failed",
-  "ccswitch.notAppliedNote":
-    "Note: imported keys are only stored in SynaRoute. They are not applied to any client config and won't take effect on their own. Press Start in the relevant category when you want to use one.",
-  "ccswitch.isCurrent": "Active in cc-switch",
-  "ccswitch.defaultModel": "default model {name}",
-  "category.ccSwitchImportTip":
-    "Reads cc-switch's config store and copies keys over. It doesn't modify cc-switch, and it won't overwrite your existing keys. Nothing is applied on import — you still press Start yourself.",
   "category.addKey": "Add provider key",
   "category.mappingGapTitle": "Some models are served by a single key",
   "category.mappingGapSummary": "{count} single-point model(s) — unusable once their only key is down",
@@ -1012,8 +969,6 @@ const en: Dict = {
   "key.setPrimaryHint": "Move to the top (priority 0), tried first on failover",
   "key.protocolSuffix": "protocol",
   "key.openSiteTip": "Open {site} in your browser (balance / notices / docs)",
-  "key.moveUp": "Move up (higher priority, tried earlier on failover)",
-  "key.moveDown": "Move down (lower priority)",
   "key.mappingTitle": "Model mapping",
   "key.healthCheckLabel": "Health check: {time}",
   "key.healthProbeFailed": "probe failed",
@@ -1146,7 +1101,8 @@ const en: Dict = {
   "brain.cgTitle": "Code index (codegraph)",
   "brain.cgDescReady": "Ready — retrieval slices by symbol and call chain, sending only the relevant method bodies instead of whole files. Cheaper and better suited to code review.",
   "brain.cgDescNotInstalled": "Not installed. With it, retrieval can slice by symbol and call chain (only relevant method bodies instead of whole files); without it, retrieval falls back to whole-file matching.",
-  "brain.cgDescNotIndexed": "Installed, but this project has no index yet. Symbol-level retrieval needs one.",
+  "brain.cgDescNotIndexed": "Installed, but the project below has no index yet. Symbol-level retrieval needs one.",
+  "brain.cgDescIndexUnknown": "Installed. No project directory resolved yet, so the index state is unknown — set a working directory above, or turn on 「Auto-follow the most recent project」.",
   "brain.cgDescStranded": "Installed but not on PATH (typically left in an old Node version directory after an nvm upgrade). SynaRoute can still call it by absolute path, but your terminal cannot; reinstalling under the current Node version is recommended.",
   "brain.cgInstallHint": "Install command (requires Node.js):",
   "brain.cgBuildIndex": "Build index for this project",
@@ -1155,6 +1111,7 @@ const en: Dict = {
   "brain.cgNeedWorkDir": "Set a working directory first",
   "brain.cgLocalNote": "Fully local: the index lives in the project's .codegraph/ directory. No code is uploaded.",
   "brain.cgBadgeNotIndexed": "No index",
+  "brain.cgBadgeIndexUnknown": "Index state unknown",
   "brain.cgBadgeNotInstalled": "Not installed",
   "brain.autoFollowTitle": "Auto-follow most recent active project",
   "brain.autoFollowDesc": "Read Claude CLI / Codex session history at runtime and use the most recently active project (ignores the working directory field above)",
@@ -1173,7 +1130,7 @@ const en: Dict = {
   ...brandPickerEn,
   ...fieldsEn,
   ...mappingEn,
-  ...brainRunEn, ...sessionsEn,
+  ...brainRunEn, ...sessionsEn, ...orderingEn,
   "logs.empty": "No events yet",
   "logs.searchPlaceholder": "Search logs (key, model, error…)",
   "logs.noMatch": "No logs match “{q}”",

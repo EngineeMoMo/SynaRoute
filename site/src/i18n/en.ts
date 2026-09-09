@@ -304,11 +304,8 @@ export const en: Dict = {
   "steps.afterStart": "Use your tools as usual",
   "steps.afterStartDesc":
     "Go back to Claude Code or Codex and work normally. Requests route through the local proxy; when a key breaks the next one picks up within the same request, and the proxy keeps the accounting plus diagnostic response headers and logs for when you need them.",
-  // 🔴 P1-1 第三条：主动给出 cc-switch 迁移路径（不然熟手看完没找到迁移入口
+  // 🔴 P1-1 第三条：主动给出迁移路径（不然熟手看完没找到迁移入口
   // 会以为「不支持」）。口径：「**功能平级的开源替代**」，不贬不抬不拉踩。
-  "steps.fromCcSwitch": "Coming from cc-switch?",
-  "steps.fromCcSwitchDesc":
-    "SynaRoute can read cc-switch's database and carry the configuration over as-is — keys, vendors, models, mappings and balance-query endpoints are all preserved. Pick \"Import from cc-switch\" in the key editor. Balance queries and model icons are aligned to the values verified on that side.",
   "steps.s3.title": "Hit Start",
   "steps.s3.desc":
     "Starting the local proxy writes its endpoint into the matching client's config file, after backing up the original.",

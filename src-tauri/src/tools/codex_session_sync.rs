@@ -118,6 +118,16 @@ pub(in crate::tools) fn locked_sync(
     super::sync_to_at(home, data_dir, target)
 }
 
+/// 还原是同一批 rollout + 同一份清单的**第三个写者**，必须与两条同步路径共用这把锁。
+/// 少这一环会出现「同步改回 target 后，还原紧接着删掉清单」的不可回滚交错。
+pub(in crate::tools) fn locked_restore(
+    home: &Path,
+    data_dir: &Path,
+) -> AppResult<Option<String>> {
+    let _guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    super::restore_at(home, data_dir)
+}
+
 // ---- 同步目标发现 ----
 
 /// 一个候选目标。`sources` 是它**在哪儿出现过**，用来让用户判断该选哪个。
@@ -346,6 +356,10 @@ pub async fn list_codex_provider_targets() -> Result<TargetList, String> {
     Ok(discover_targets(&home, &data_dir))
 }
 
+fn target_is_known(list: &TargetList, target: &str) -> bool {
+    list.targets.iter().any(|o| o.id == target)
+}
+
 /// 手动把历史会话同步到 `target`。
 ///
 /// 目标形态在这里**必须再校验一次**：命令是前端调的，而它的值最终会被写进用户的 rollout
@@ -358,6 +372,12 @@ pub async fn sync_codex_sessions(target: String) -> Result<String, String> {
     }
     let home = super::super::codex_paths::codex_home().map_err(|e| e.to_string())?;
     let data_dir = crate::store::data_dir::app_data_dir().map_err(|e| e.to_string())?;
+    // 形态合法还不够：必须是后端刚发现并展示给用户的候选。否则直接调 IPC 能把任意
+    // `valid-looking` id 写进全部 rollout，而 config.toml 压根没声明它。
+    let known = discover_targets(&home, &data_dir);
+    if !target_is_known(&known, &target) {
+        return Err(format!("provider id 不在当前可选目标中，未修改任何会话：{target}"));
+    }
     let report = locked_sync(&home, &data_dir, &target).map_err(|e| e.to_string())?;
     // 选过就记下来，下次打开这一页回填它。写失败不影响本次同步的结论。
     let mut prefs = read_prefs_in(&data_dir);

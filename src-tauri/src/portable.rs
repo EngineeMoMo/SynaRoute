@@ -384,7 +384,7 @@ pub fn apply_import(
         }
         (None, None) => {
             warnings.push(
-                "文件不含密钥：导入后各 Key 需重新录入密钥才能转发（或用「从 cc-switch 导入」补）。"
+                "文件不含密钥：导入后各 Key 需重新录入密钥才能转发。"
                     .into(),
             );
             None

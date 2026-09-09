@@ -66,6 +66,24 @@ const TEMP_SUFFIX: &str = ".synaroute.tmp";
 /// 判据按「版本库内部状态，模型没有正当理由写它」而不是按某一家的实现。
 const VCS_DIRS: &[&str] = &[".git", ".hg", ".svn", ".jj", ".bzr"];
 
+/// 解析**可写**的工作目录：只认用户**明确指定过**的那两种来源。
+///
+/// 🔴 **兜底扫描刻意不在这里** —— 读路径上那是便利，写路径上是越权。
+/// [`crate::aggregate::run_preview`] 已经写明「`None` 时刻意不回退实时解析」，
+/// 但那条纪律只挡住了 Phase2 自己再解析一次；Phase1 若把带兜底的结果当 pin 交过去，
+/// 越权照旧发生、只是绕了一圈。完整失效链见
+/// `the_write_root_never_comes_from_the_session_history_fallback`。
+pub(crate) fn resolve_writable_work_dir(brain: &crate::model::BrainConfig) -> Option<String> {
+    if brain.auto_follow_active {
+        if let Ok(list) = crate::workdirs::scan() {
+            if let Some(first) = list.into_iter().next() {
+                return Some(first.path);
+            }
+        }
+    }
+    brain.work_dir.clone().filter(|s| !s.trim().is_empty())
+}
+
 /// Windows 保留设备名（不区分大小写，且**带扩展名也算**：`NUL.txt` 仍是设备）。
 ///
 /// 写它们不报错、`fs::write` 返回 `Ok`，内容进虚空 —— 于是我们向用户报告「已写入
@@ -220,7 +238,13 @@ fn is_safe_write_name(path: &str) -> Result<(), String> {
 ///
 /// 判**每一段**而非只判首段：`sub/project/.git/config` 同样是版本库内部，而 monorepo /
 /// submodule 下这个形态很常见。
-fn is_vcs_internal(path: &str) -> Option<String> {
+///
+/// `pub(crate)`：**读路径也要用它**（`agent_tools::resolve_readable`）。写路径把版本库内部
+/// 列为独立一道防线，而读路径原先一道都没有 —— `is_sensitive_path` 只看**文件名**
+/// （`.git/config` 的文件名是 `config`，不命中任何敏感名），于是模型能把 `.git/config`
+/// 整份读出来送进上游请求，而那里常有 `https://user:token@host/...` 形态的远端凭据。
+/// 同一份名单只能有一处 —— 抄一份必然只有一处被维护。
+pub(crate) fn is_vcs_internal(path: &str) -> Option<String> {
     path.split(['/', '\\'])
         .map(|seg| seg.to_ascii_lowercase())
         .find(|lower| VCS_DIRS.contains(&lower.as_str()))
@@ -402,8 +426,27 @@ struct FileBlock {
 
 /// 解析输出中的 ```file:path\ncontent\n``` 块。
 ///
-/// 围栏解析：用「起始围栏的反引号数量」匹配对应长度的闭合围栏（≥3 个反引号且仅由反引号
-/// 构成），使文件内容里出现的三反引号不会提前截断；找不到闭合围栏则该块 `content = None`。
+/// 围栏解析：起始围栏 ≥3 个反引号，闭合围栏必须**与它等长**且整行只有反引号；
+/// 找不到闭合围栏则该块 `content = None`（报出来但不写）。
+///
+/// 🔴 **两道防线针对同一个缺陷：正文里的围栏会提前闭合，于是写出半个文件并报成功。**
+///
+/// 原实现的闭合判据是「长度 **≥** 起始围栏」，而给决策者的指令是三反引号 —— 于是正文里
+/// 任何一行 ``` 都会截断它。命中面不是边角：`.md` 文件、带 `///` 文档示例的源码、
+/// 本仓自己的 CLAUDE.md 与 docs/* 全部含 ``` 行。六道防线判的是「往哪写」，
+/// 对「写什么被截断了」一道都不管，落盘因此照常成功。
+///
+/// 防线一：指令改成要求四反引号并说明「外层必须比正文里最长的围栏更长」
+/// （见 `aggregate.rs` 的 `exec_prompt`），配上等长闭合判据，四反引号块里的三反引号
+/// 内层围栏再没有机会截断它。
+///
+/// 防线二：模型没照做时，候选闭合行若到**下一个 `file:` 开块**之间还有另一条同长纯反引号
+/// 行，就跳过它继续找。找不到真闭合 → `content = None`、拒写。失效方向刻意是
+/// 「拒写 + 报出来」，不是「猜一个」。
+///
+/// ⚠️ 第一版用「剩下同长围栏的奇偶」兜底，注入实测对**两个相邻合规块**立刻误伤
+/// （第二个块的闭合行让第一个块的 trailing 变成奇数 → 拒写）。那是本仓「判据没压到
+/// 边界」那条：只有一块时奇偶碰巧对，两块才是真实形态。
 ///
 /// **同一路径出现多次时，只有第一块被处理**，其余标 `duplicate`（见 [`DUPLICATE_BLOCK`]）。
 /// 去重放在这里而不是两个消费者里各写一份 —— 那正是本模块头「预览与落盘必须走同一道门」
@@ -423,9 +466,38 @@ fn parse_blocks(output: &str) -> Vec<FileBlock> {
         i += 1;
         let start = i;
         let mut closed = false;
+        // 🔴 **闭合围栏必须与起始等长**，不是「≥ 起始长度」。`≥` 会让一个四反引号块被
+        // 正文里的五反引号行闭合；等长判据下，四反引号块里的三反引号内层围栏再没有
+        // 任何机会截断它 —— 那是本修复的主路径（指令已改成要求四反引号）。
+        let is_close = |l: &str| {
+            let t = l.trim_end();
+            !t.is_empty() && t.len() == fence_len && t.chars().all(|c| c == '`')
+        };
+        let is_opener = |l: &str| {
+            let n = l.chars().take_while(|&c| c == '`').count();
+            n >= 3 && l[n..].starts_with("file:")
+        };
         while i < lines.len() {
-            let l = lines[i].trim_end();
-            if l.len() >= fence_len && !l.is_empty() && l.chars().all(|c| c == '`') {
+            if is_close(lines[i]) {
+                // 🔴 **内层围栏检测（fail-closed 的那一半）**：模型没照「外层比内层长」做时，
+                // 我们分辨不出刚找到的这一行是真闭合还是正文里的一个内层围栏。
+                //
+                // 判据：从这里到**下一个 `file:` 开块**（或输出末尾）之间，若还有另一条
+                // 同长纯反引号行，那这一条就不是真闭合 —— 跳过、继续找。
+                // 两个相邻的合规块（中间没有内层围栏）不会误伤：下一块的开行带 `file:`，
+                // 不是纯反引号，故「到下一个开块之间」是空的。
+                //
+                // 跳过之后若再也找不到真闭合 → 落到下面的 `!closed` 分支，`content = None`、
+                // 拒写。宁可让用户重试一轮，也不能写出半个源文件还报成功。
+                let rest = &lines[i + 1..];
+                let until_next = rest
+                    .iter()
+                    .position(|l| is_opener(l))
+                    .unwrap_or(rest.len());
+                if rest[..until_next].iter().any(|l| is_close(l)) {
+                    i += 1;
+                    continue;
+                }
                 closed = true;
                 break;
             }
@@ -669,6 +741,73 @@ mod tests {
     ///
     /// 另一半同样要钉：磁盘上留下的必须是**第一块**的内容。没有这条断言，「后写的覆盖先写的」
     /// 也能让上面几条通过，而那意味着用户在预览里读到的第一块内容不是最终落盘的东西。
+    /// 🔴 **正文里的三反引号围栏不许截断块。**
+    ///
+    /// 给决策者的指令原先是三反引号，而闭合判据是「≥ 起始长度」—— 于是任何含 ``` 行的
+    /// 文件（`.md`、带 `///` 文档示例的源码、本仓自己的 CLAUDE.md）都会被截在内层围栏，
+    /// 六道防线全部放行，落盘写出半个文件并报成功。
+    ///
+    /// 这条同时压三件事：① 四反引号外层包着三反引号内层时写出**完整**内容（主路径）；
+    /// ② 模型没照做、外层也是三反引号时，必须写出完整内容而不是前缀（取「下一个开块
+    /// 之前的最后一条同长围栏」）；③ 两个相邻合规块不被误伤 —— 第一版的奇偶兜底
+    /// 在两块时立刻把第一块当成歧义拒掉。
+    #[test]
+    fn an_inner_code_fence_must_not_truncate_the_block() {
+        let work = temp_dir("inner_fence");
+
+        // ① 主路径：四反引号外层 + 三反引号内层 → 完整内容。
+        let four = "````file:a.md\n# t\n```rust\nfn x() {}\n```\nend\n````\n";
+        let got = apply(&work, four);
+        assert!(got[0].success, "四反引号外层必须写出完整内容：{}", why(&got[0]));
+        assert_eq!(
+            std::fs::read_to_string(work.join("a.md")).unwrap(),
+            "# t\n```rust\nfn x() {}\n```\nend",
+            "内层围栏必须原样保留在文件里"
+        );
+
+        // ② 模型没照做：外层也是三反引号。必须写出完整内容，不能停在内层围栏。
+        let three = "```file:b.md\n# t\n```rust\nfn x() {}\n```\nend\n```\n";
+        let got = apply(&work, three);
+        assert!(got[0].success, "外层三反引号也必须写出完整内容：{}", why(&got[0]));
+        assert_eq!(
+            std::fs::read_to_string(work.join("b.md")).unwrap(),
+            "# t\n```rust\nfn x() {}\n```\nend",
+            "停在内层围栏 = 写出半个文件并报成功，正是本条要防的"
+        );
+
+        // ③ 闭合必须**等长**，不是 ≥：四反引号块里的五反引号行不许提前闭合。
+        // 这一格是 `==` vs `>=` 唯一能分出胜负的 —— 上面两格里内层都比外层短，
+        // 把判据放宽成 ≥ 它们照样绿（注入实测）。
+        let five = "````file:e.md\nbefore\n`````\nafter\n````\n";
+        let got = apply(&work, five);
+        assert!(got[0].success, "五反引号行提前闭合了：{}", why(&got[0]));
+        assert_eq!(
+            std::fs::read_to_string(work.join("e.md")).unwrap(),
+            "before\n`````\nafter",
+            "正文里更长的围栏必须原样保留"
+        );
+
+        // ⑤ `==` vs `>=` 真正分得出胜负的那一格：只有更长的围栏、没有等长闭合。
+        // `>=` 会把那行当闭合并丢掉；`==` 找不到闭合 → 拒写。上面第 ③ 格有后续等长闭合，
+        // 跳过逻辑在两种判据下都能恢复，故单独不够。
+        let only_longer = "````file:f.md\nbefore\n`````\n";
+        let got = apply(&work, only_longer);
+        assert!(!got[0].success, "`>=` 会把五反引号行当闭合并丢掉：{}", why(&got[0]));
+        assert!(
+            !work.join("f.md").exists(),
+            "没有等长闭合就必须拒写，不能把更长的围栏吞掉当闭合"
+        );
+
+        // ④ 两个相邻合规块（中间没有内层围栏）不许被当成歧义。
+        let two = "```file:c.rs\nfirst\n```\n```file:d.rs\nsecond\n```\n";
+        let got = apply(&work, two);
+        assert!(got[0].success, "第一块被当成歧义拒掉了：{}", why(&got[0]));
+        assert!(got[1].success, "第二块：{}", why(&got[1]));
+        assert_eq!(std::fs::read_to_string(work.join("c.rs")).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(work.join("d.rs")).unwrap(), "second");
+        std::fs::remove_dir_all(&work).ok();
+    }
+
     #[test]
     fn a_path_repeated_in_the_output_is_written_only_once() {
         let work = temp_dir("dup");

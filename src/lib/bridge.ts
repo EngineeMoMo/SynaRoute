@@ -7,8 +7,6 @@ import type {
   BalanceResult,
   BrainConfig,
   CategoryType,
-  CcSwitchImportReport,
-  CcSwitchScanResult,
   CodegraphState,
   CodexSessionList,
   EnvFinding,
@@ -151,12 +149,24 @@ export const api = {
       mockBridge.moveKey(categoryId, keyId, direction),
     ),
 
-  // ---- 从 cc-switch 导入历史 Key（只读对方库；导入后不接入）----
-  scanCcswitch: () =>
-    call<CcSwitchScanResult>("scan_ccswitch", undefined, () => mockBridge.scanCcswitch()),
-  importFromCcswitch: (sourceIds: string[]) =>
-    call<CcSwitchImportReport>("import_from_ccswitch", { sourceIds }, () =>
-      mockBridge.importFromCcswitch(sourceIds),
+  /**
+   * 鼠标拖放重排：把 `keyId` 放到 `beforeKeyId` **之前**；`beforeKeyId` 为 undefined = 放末尾。
+   *
+   * 与 `moveKey` 并列而不是替代它：上下移按钮是键盘/无障碍路径，拖放在辅助技术下不可达。
+   *
+   * **一次拖放一次调用**。跨多位拖动若循环调 `moveKey`，会变成 N 次落盘 + N 次客户端配置
+   * 重写 + N 次托盘重建，中途失败还留下半套顺序 —— 而用户原话就是「一个一个点太麻烦了」，
+   * 也就是说跨多位是常态。
+   *
+   * **传锚点 id 而不是目标下标**：拖动期间顺序可能被别的来源改过（托盘设主、磁盘自愈重载），
+   * 那时下标指向的已不是用户看到的那一条，而锚点仍然表达同一个意图。也**不回传整列 id** ——
+   * 那等于让前端决定顺序，一条陈旧快照会把并发改动整片抹掉。
+   *
+   * 返回是否真的改了（拖回原处 / 拖到自己身上 → false，不写盘）。
+   */
+  reorderKey: (categoryId: CategoryType, keyId: string, beforeKeyId?: string) =>
+    call<boolean>("reorder_key", { categoryId, keyId, beforeKeyId }, () =>
+      mockBridge.reorderKey(categoryId, keyId, beforeKeyId),
     ),
 
   // 拉取模型列表（FR-004）——已保存 Key 按 id 探测
@@ -312,8 +322,9 @@ export const api = {
   /**
    * 按日分桶的用量（最近 90 天，最新在前），供「今日 / 本周 / 近 7 日趋势」。
    *
-   * 不含尚未落盘的增量（最多落后 60s）——「今日」应把本接口的历史与
-   * `getTokenUsage` 的实时总量配合使用，否则刚发的请求要等一分钟才出现。
+   * 🔴 **已含尚未落盘的增量**（后端把 `usage_totals - usage_baseline` 并进当天 UTC 桶）。
+   * 原注释说「不含、应与 getTokenUsage 配合使用」是过时的 —— 那个配合从未实现，
+   * 而后端早就并好了。照它去改 60s 落盘周期解决不了「用量不实时」（那是刷新接线的事）。
    */
   getDailyUsage: () =>
     call<DailyUsageBucket[]>("get_daily_usage", undefined, () => mockBridge.dailyUsage()),
@@ -428,7 +439,6 @@ export const api = {
       shouldShow: true,
       done: false,
       totalKeys: 0,
-      ccswitchAvailable: true,
     })),
   setOnboardingDone: (done: boolean) =>
     call<void>("set_onboarding_done", { done }, async () => {}),
@@ -630,15 +640,17 @@ export const api = {
     call<RecentWorkdir[]>("detect_recent_workdirs", undefined, async () => []),
 
   // ---- codegraph（可选本地代码索引工具） ----
-  // workDir 为空则只判可执行是否就绪，不判项目索引。
-  detectCodegraph: (workDir?: string) =>
-    call<CodegraphState>("detect_codegraph", { workDir }, async () => ({
+  // 🔴 两条都**不传目录**：目录由后端按 resolve_writable_work_dir 判定（自动跟随→会话历史，
+  // 否则→手工 workDir）。前端自己算等于复刻那份优先级，而漂移的表现是静默的
+  // （算出 undefined → 界面提示用户去设置一个他已经设好的目录）。理由全文见 lib.rs::codegraph_dir。
+  detectCodegraph: (categoryId: CategoryType) =>
+    call<CodegraphState>("detect_codegraph", { categoryId }, async () => ({
       state: "notInstalled" as const,
     })),
 
-  // 为指定项目建索引（codegraph init）。大仓库可能耗时分钟级，调用方需给 loading 态。
-  codegraphInit: (workDir: string) =>
-    call<string>("codegraph_init", { workDir }, async () => "浏览器预览模式：未实际建索引"),
+  // 为当前判定的项目建索引（codegraph init）。大仓库可能耗时分钟级，调用方需给 loading 态。
+  codegraphInit: (categoryId: CategoryType) =>
+    call<string>("codegraph_init", { categoryId }, async () => "浏览器预览模式：未实际建索引"),
 
   // ---- MCP 服务器 ----
   mcpStatus: () =>

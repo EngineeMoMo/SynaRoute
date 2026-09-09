@@ -352,6 +352,35 @@ export const mockBridge = {
     return changed;
   },
 
+  // 与后端 key_order::reorder_before 同规则：摘掉 source → 插到锚点之前（锚点 undefined
+  // = 末尾）→ 整列重编号为连续 0,1,2…。顺序没变则返回 false。
+  //
+  // 浏览器预览态必须真的重排：否则 `npm run dev` 下拖完一松手就弹回原位，
+  // 看起来像拖放坏了 —— 而那正是这个功能唯一要验的东西。
+  async reorderKey(categoryId: CategoryType, keyId: string, beforeKeyId?: string) {
+    await delay();
+    const list = store[categoryId] ?? [];
+    if (!list.some((k) => k.id === keyId)) return false;
+    if (beforeKeyId === keyId) return false;
+    if (beforeKeyId && !list.some((k) => k.id === beforeKeyId)) return false;
+    const ordered = [...list].sort((a, b) => a.priority - b.priority);
+    const from = ordered.findIndex((k) => k.id === keyId);
+    const [moved] = ordered.splice(from, 1);
+    // 摘掉之后再定位锚点（先定位会在「往下拖」时偏一格，后端同一条注释）。
+    const at = beforeKeyId ? ordered.findIndex((k) => k.id === beforeKeyId) : -1;
+    if (at < 0) ordered.push(moved);
+    else ordered.splice(at, 0, moved);
+    let changed = false;
+    ordered.forEach((k, i) => {
+      const live = list.find((x) => x.id === k.id);
+      if (live && live.priority !== i) {
+        live.priority = i;
+        changed = true;
+      }
+    });
+    return changed;
+  },
+
   // 与后端 Store::move_key 同规则：与相邻项交换后整列重编号为连续 0,1,2…
   // 已在两端则返回 false（不改动）。
   async moveKey(categoryId: CategoryType, keyId: string, direction: "up" | "down") {
@@ -374,84 +403,6 @@ export const mockBridge = {
     return changed;
   },
 
-  // 浏览器预览态：给出一份覆盖各种分支的假候选（可导入 / 重复 / 官方档 / 不支持端），
-  // 让 UI 的每种状态都能在 npm run dev 下被看到。
-  async scanCcswitch() {
-    await delay();
-    return {
-      dbPath: "C:\\Users\\demo\\.cc-switch\\cc-switch.db",
-      total: 4,
-      candidates: [
-        {
-          sourceId: "demo-claude",
-          appType: "claude",
-          categoryId: "claude-cli" as CategoryType,
-          name: "Sub2API",
-          baseUrl: "https://sub.example.com",
-          protocol: "anthropic" as const,
-          defaultModel: null,
-          isCurrent: true,
-          secretMasked: "sk-abc…1111 (48)",
-          duplicateOf: null,
-          skipReason: null,
-        },
-        {
-          sourceId: "demo-codex",
-          appType: "codex",
-          categoryId: "codex" as CategoryType,
-          name: "公益站",
-          baseUrl: "https://muyuan.example/v1",
-          protocol: "openai_responses" as const,
-          defaultModel: "gpt-5.6-sol",
-          isCurrent: false,
-          secretMasked: "sk-def…3333 (48)",
-          duplicateOf: null,
-          skipReason: null,
-        },
-        {
-          sourceId: "demo-dup",
-          appType: "claude-desktop",
-          name: "百倍（已存在）",
-          categoryId: "claude-desktop" as CategoryType,
-          baseUrl: "https://sub.example.com",
-          protocol: "anthropic" as const,
-          defaultModel: null,
-          isCurrent: false,
-          secretMasked: "sk-abc…1111 (48)",
-          duplicateOf: "百倍",
-          skipReason: "SynaRoute 里已有同站点同密钥的 Key",
-        },
-        {
-          sourceId: "demo-official",
-          appType: "codex",
-          categoryId: "codex" as CategoryType,
-          name: "OpenAI Official",
-          baseUrl: "",
-          protocol: null,
-          defaultModel: null,
-          isCurrent: false,
-          secretMasked: "",
-          duplicateOf: null,
-          skipReason: "ChatGPT 官方登录档（只有 OAuth token，无 API Key）",
-        },
-      ],
-    };
-  },
-  async importFromCcswitch(sourceIds: string[]) {
-    await delay();
-    return {
-      imported: sourceIds.length,
-      skipped: 0,
-      failed: 0,
-      outcomes: sourceIds.map((id) => ({
-        sourceId: id,
-        name: id,
-        status: "imported" as const,
-        detail: "已导入（预览态模拟）",
-        keyId: `k_mock_${id}`,
-      })),
-    };
-  },
   async fetchModels(keyId: string): Promise<ModelInfo[]> {
     await delay(600);
     for (const cat of Object.keys(store) as CategoryType[]) {
@@ -530,7 +481,7 @@ export const mockBridge = {
       return {
         categoryId,
         summary:
-          "Claude 桌面端（3p 部署模式）：两个 claude_desktop_config.json 写 deploymentMode=3p，Claude-3p/configLibrary 里写 gateway 档（inferenceGatewayBaseUrl 指向本机代理 + 占位 key + bearer + 模型清单）并登记进 _meta。凭据预填齐即跳过 get-started。与 cc-switch 用独立档共存。不写 CLI 的 settings.json。",
+          "Claude 桌面端（3p 部署模式）：两个 claude_desktop_config.json 写 deploymentMode=3p，Claude-3p/configLibrary 里写 gateway 档（inferenceGatewayBaseUrl 指向本机代理 + 占位 key + bearer + 模型清单）并登记进 _meta。凭据预填齐即跳过 get-started。用独立档与其它接入工具共存。不写 CLI 的 settings.json。",
         files: [
           {
             path: "%LOCALAPPDATA%/Claude/claude_desktop_config.json",

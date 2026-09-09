@@ -44,8 +44,10 @@
 //!
 //! 这些发现会进诊断报告（用户会发给别人）与界面。名字里带 `TOKEN`/`KEY`/`SECRET`/`PASSWORD`
 //! 的一律只报「已设置」，绝不带值 —— 同 `lan_guard` 那条「明文令牌进事件等于同时进了三个
-//! 用户会分享出去的地方」。URL 与目录类**要**带值，那正是「指向哪里」这个答案本身；
-//! 诊断报告出口那道 `redact_config_secrets` 是第二层防线，不是唯一一层。
+//! 用户会分享出去的地方」。URL 与目录类**要**带值，那正是「指向哪里」这个答案本身，
+//! 但 URL 必须先过 [`crate::diagnostics::mask_url_credentials`]：中转站会把付费令牌放在路径段
+//! 或 query 里，而报告开头明确保证「不含任何 API 密钥明文」。整段遮掉会丢诊断价值，
+//! 只遮凭据部分才能同时守住两边。
 
 use serde::Serialize;
 
@@ -74,6 +76,48 @@ pub struct EnvFinding {
     /// 白名单（走 [`classify`]）认不出它 → 点了返回「没有可移除的项」。
     /// 那正是本仓最忌的「界面能点、点了没反应」。
     pub removable: bool,
+    /// 🔴 **为什么这一条没有「移除」按钮** —— `removable` 为真时是空串。
+    ///
+    /// `removable == false` 有**两个成因，处置完全相反**：
+    /// - 目录类：我们**刻意不删**（删掉会破坏用户自己配的 Codex 布局），正确处置是对齐两侧；
+    /// - process-only：我们**删不掉**（HKCU 里没有这一条，值来自 HKLM 或父 shell），
+    ///   正确处置是去那个真正的来源把它去掉。
+    ///
+    /// 前端原先用一句固定文案解释「为什么不给删」，内容只覆盖目录类那一种。于是最常见的
+    /// 那个形态（用户在系统设置里设了 `ANTHROPIC_API_KEY`，SynaRoute 启动时继承到 →
+    /// process 与 user 各一条）会显示「目录类变量不提供移除 —— 重启 SynaRoute 让它继承到」，
+    /// 而用户需要的恰恰是**把它去掉**。方向正好相反，属本仓「指错方向的提示比没有提示更糟」。
+    ///
+    /// 判据放后端：前端再判一次「这是哪一类」就是同一事实两处各判一遍，必然漂移
+    /// （`removable` 自己就是为了消除那种漂移才加的）。
+    pub keep_reason: String,
+}
+
+/// 目录类为什么不给删。两句话都要有：**不删的理由** + **该怎么办**。
+const KEEP_DIRECTORY: &str = "目录类变量不提供移除 —— 删掉会破坏你自己配的 Codex 布局。\
+    正确处置是让两侧一致：重启 SynaRoute 让它继承到，或在系统设置里把它去掉。";
+
+/// process-only 为什么删不掉。🔴 **绝不能说成「重启让我们继承到」** —— 那是目录类的处置，
+/// 对一条会顶掉配置的凭据/地址变量来说方向正好相反（用户要的是让它消失）。
+const KEEP_PROCESS_ONLY: &str = "这一条不在 Windows 用户级环境变量里，本应用删不掉 ——\
+    它来自系统级（HKLM）变量或启动 SynaRoute 的那个父进程（终端 / 脚本 / 启动器）。\
+    去那个来源把它去掉，然后重启 SynaRoute 与客户端。";
+
+/// 环境变量名是否相等。Windows 原生语义是大小写不敏感；Unix 原生语义相反，不能一刀切。
+///
+/// 🔴 这不是为了让测试跨平台变绿：Windows 会让客户端读到 `Anthropic_Api_Key`，注册表枚举却
+/// 保留原始大小写，若这里裸 `==`，横幅会在它唯一该说话的那次静默不出现。
+fn env_name_eq(a: &str, b: &str) -> bool {
+    if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b }
+}
+
+fn env_name_has_affixes(name: &str, prefix: &str, suffix: &str) -> bool {
+    if cfg!(windows) {
+        let n = name.to_ascii_uppercase();
+        n.starts_with(prefix) && n.ends_with(suffix)
+    } else {
+        name.starts_with(prefix) && name.ends_with(suffix)
+    }
 }
 
 /// 这个名字的值是凭据吗（决定要不要遮掉）。
@@ -93,8 +137,16 @@ fn shown_value(name: &str, raw: &str) -> (String, bool) {
     if is_secret_name(name) {
         return (String::new(), true);
     }
-    let clipped: String = v.chars().take(MAX_VALUE_CHARS).collect();
-    (clipped, true)
+    // URL 也可能把凭据放在 path/query 里，不能因为变量名不含 TOKEN/KEY 就原样外发。
+    // 先遮再截：反过来 120 字符截断可能切掉供 mask 判别的完整路径段。
+    let safe = if env_name_eq(name, "ANTHROPIC_BASE_URL")
+        || env_name_eq(name, "OPENAI_BASE_URL")
+    {
+        crate::diagnostics::mask_url_credentials(v)
+    } else {
+        v.to_string()
+    };
+    (safe.chars().take(MAX_VALUE_CHARS).collect(), true)
 }
 
 /// Claude 侧那些会顶掉 `settings.json` 的 `env` 块的变量。
@@ -176,15 +228,21 @@ fn classify(
             value: shown.clone(),
             has_value: has,
             note,
-            // classify 认的都是「多余的设置」，删掉即恢复我们写的那份。
-            removable: true,
+            // 非 process-only：HKCU 真有对应项，删除它才是可逆且可验证的动作。
+            removable: source == "user",
+            keep_reason: if source == "user" {
+                String::new()
+            } else {
+                // 删不掉，不是不想删 —— 必须把用户指向**真正的来源**。
+                KEEP_PROCESS_ONLY.to_string()
+            },
         })
     };
     // 空值一律不报：`set FOO=` 留下的空变量对客户端没有影响，报它是纯噪音。
     if !has {
         return None;
     }
-    if name == "ANTHROPIC_BASE_URL" {
+    if env_name_eq(name, "ANTHROPIC_BASE_URL") {
         // 🔴 判据是「指向别处」而不是「存在」—— 等于我们入口是完全正常的形态。
         if !expected_base_url.is_empty() && value.trim().trim_end_matches('/') == expected_base_url.trim_end_matches('/') {
             return None;
@@ -198,16 +256,16 @@ fn classify(
             ),
         );
     }
-    if let Some((_, why)) = ANTHROPIC_EXACT.iter().find(|(n, _)| *n == name) {
+    if let Some((_, why)) = ANTHROPIC_EXACT.iter().find(|(n, _)| env_name_eq(n, name)) {
         return mk("conflict", (*why).to_string());
     }
-    if name.starts_with("ANTHROPIC_DEFAULT_") && name.ends_with("_MODEL") {
+    if env_name_has_affixes(name, "ANTHROPIC_DEFAULT_", "_MODEL") {
         return mk(
             "conflict",
             "档位模型的环境变量版。接入时我们只清得掉 settings.json 里的同名键，环境变量清不掉 —— 它会绕过 SynaRoute 的档位映射。".into(),
         );
     }
-    if name == "OPENAI_API_KEY" || name == "OPENAI_BASE_URL" {
+    if env_name_eq(name, "OPENAI_API_KEY") || env_name_eq(name, "OPENAI_BASE_URL") {
         // 见模块头 ①：有取证支撑「通常无害」，故不报成 conflict，也不建议默认删。
         return mk(
             "notice",
@@ -271,6 +329,7 @@ fn directory_mismatches(
             note,
             // 🔴 目录变量**不给删**：正确处置是对齐两侧，删掉会破坏用户自己配的 Codex 布局。
             removable: false,
+            keep_reason: KEEP_DIRECTORY.to_string(),
         });
     }
     out
@@ -408,15 +467,19 @@ fn remove_from(
     let mut failed = Vec::new();
     for name in &want {
         match remove_user_env_value(name) {
-            Ok(true) => {
+            Ok(RemoveStatus::Removed) => {
                 // 本进程那份也去掉，免得我们自己 spawn 的子进程（MCP stdio）继续继承它。
                 std::env::remove_var(name);
                 removed.push(name.clone());
             }
-            // 平台上没有「用户级环境变量」这个概念（非 Windows）—— **不能报成已移除**。
-            // 报成功而实际什么都没持久化，是最坏的一种界面撒谎：用户重启客户端后问题照旧，
-            // 而他已经相信这一步做完了。
-            Ok(false) => failed.push(format!("{name}：本平台无法持久移除用户级环境变量")),
+            Ok(RemoveStatus::Missing) => failed.push(format!(
+                "{name}：Windows 用户级环境变量里没有这一条；它可能来自系统级变量或启动 SynaRoute 的父进程，本应用不能替你持久删除"
+            )),
+            // 非 Windows 没有「用户级环境变量」这个单一可写来源。
+            #[cfg(not(windows))]
+            Ok(RemoveStatus::Unsupported) => {
+                failed.push(format!("{name}：本平台无法持久移除用户级环境变量"));
+            }
             Err(e) => failed.push(format!("{name}：{e}")),
         }
     }
@@ -424,32 +487,38 @@ fn remove_from(
         broadcast_env_change();
     }
     Ok(RemovalResult {
-        note: "已改的是「用户级环境变量」。已经在运行的程序（包括 Codex / Claude Code）仍持有旧值，要重启它们才生效。".into(),
+        note: "已改的是「Windows 用户级环境变量」。已经在运行的程序仍持有旧值，要重启它们才生效；若重启客户端后仍读到旧值，请注销并重新登录 Windows（或重启资源管理器）。".into(),
         removed,
         backup_path: path.display().to_string(),
         failed,
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoveStatus {
+    Removed,
+    Missing,
+    #[cfg(not(windows))]
+    Unsupported,
+}
+
 #[cfg(windows)]
-fn remove_user_env_value(name: &str) -> std::io::Result<bool> {
+fn remove_user_env_value(name: &str) -> std::io::Result<RemoveStatus> {
     use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
     let key = winreg::RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey_with_flags("Environment", KEY_SET_VALUE)?;
     match key.delete_value(name) {
-        Ok(()) => Ok(true),
-        // 只在进程级有、用户级没有时走到这 —— 那不是失败，但也**没有**持久移除任何东西。
-        // 返回 `true` 是对的：进程级那一份下面会被删掉，而这次操作确实达成了目的。
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Ok(()) => Ok(RemoveStatus::Removed),
+        // process-only 可能来自 HKLM 或父 shell；这不是「已经持久移除」，必须单独上报。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RemoveStatus::Missing),
         Err(e) => Err(e),
     }
 }
 
 /// 非 Windows 没有「用户级环境变量」这个单一可写来源（`~/.profile` 之类不是）。
-/// 返回 `false` 让调用方**如实报「没能移除」**，而不是假装成功。
 #[cfg(not(windows))]
-fn remove_user_env_value(_name: &str) -> std::io::Result<bool> {
-    Ok(false)
+fn remove_user_env_value(_name: &str) -> std::io::Result<RemoveStatus> {
+    Ok(RemoveStatus::Unsupported)
 }
 
 /// 广播 `WM_SETTINGCHANGE`，让 Explorer 重读环境块。
@@ -602,6 +671,86 @@ mod tests {
         assert!(sec.contains("已设置，值不外发"));
     }
 
+    /// URL 变量既要保留「指向哪里」的诊断价值，又绝不能把路径/query 里的中转令牌外发。
+    #[test]
+    fn url_values_mask_embedded_credentials_before_leaving_the_module() {
+        const PATH_TOKEN: &str = "9f3c7a1b8e2d4f6a";
+        let f = detect_from(
+            &pairs(&[(
+                "ANTHROPIC_BASE_URL",
+                &format!("https://relay.example/v1/{PATH_TOKEN}/chat?key=plain-secret"),
+            )]),
+            &[],
+            "http://127.0.0.1:47100",
+        );
+        assert_eq!(f.len(), 1);
+        let rendered = format!("{}\n{}\n{}", f[0].value, f[0].note, render_section(&f));
+        assert!(!rendered.contains(PATH_TOKEN), "路径令牌泄露：{rendered}");
+        assert!(!rendered.contains("plain-secret"), "query 值泄露：{rendered}");
+        assert!(rendered.contains("relay.example"), "host 必须保留，排障才有价值：{rendered}");
+    }
+
+    /// Windows 原生环境变量名大小写不敏感；Unix 原生语义相反。夹具按宿主平台断言，
+    /// 不为让测试跨平台变绿而放宽另一边的生产判据。
+    #[test]
+    fn environment_variable_names_follow_the_host_platform_semantics() {
+        let mixed = detect_from(&pairs(&[("Anthropic_Api_Key", "sk-x")]), &[], "");
+        if cfg!(windows) {
+            assert_eq!(names(&mixed), vec!["Anthropic_Api_Key:process:conflict"]);
+            assert!(mixed[0].value.is_empty(), "混合大小写的凭据名仍必须遮值");
+        } else {
+            assert!(mixed.is_empty(), "Unix 上这个名字不是客户端会读的 ANTHROPIC_API_KEY");
+        }
+    }
+
+    /// 只存在于 process 的条目可能来自 HKLM 或父 shell，不能给一个实际只删 HKCU 的按钮。
+    #[test]
+    fn process_only_conflicts_are_not_offered_as_persistently_removable() {
+        let f = detect_from(&pairs(&[("ANTHROPIC_API_KEY", "sk-x")]), &[], "");
+        assert_eq!(f.len(), 1);
+        assert!(!f[0].removable, "本应用不知道这条来自 HKLM 还是父 shell，不能谎报可删");
+        let user = detect_from(&[], &pairs(&[("ANTHROPIC_API_KEY", "sk-x")]), "");
+        assert!(user[0].removable, "HKCU 里的那份确实能被本应用持久删除");
+    }
+
+    /// 🔴 **「为什么不给删」的两个成因必须给出不同、且不互换的指路。**
+    ///
+    /// `removable: false` 有两种：目录类是我们**刻意不删**（处置 = 对齐两侧，「重启让我们
+    /// 继承到」是对的）；process-only 是我们**删不掉**（处置 = 去 HKLM/父进程把它去掉）。
+    /// 上一版前端用一句固定文案覆盖两者，内容只对目录类成立 —— 于是最常见的那个形态
+    /// （系统设置里设了 `ANTHROPIC_API_KEY`，我们启动时继承到）被告知「重启 SynaRoute
+    /// 让它继承到」，而用户要的恰恰是**让它消失**。方向正好相反，属本仓
+    /// 「指错方向的提示比没有提示更糟」。
+    ///
+    /// 判据同时钉住**不许互换**：process-only 那句里出现「继承到」就是把目录类的处置
+    /// 抄了过来。这一条比「两句不相等」紧 —— 后者被一次复制粘贴就能满足。
+    #[test]
+    fn the_two_reasons_for_not_offering_removal_do_not_swap_advice() {
+        let dir_case = detect_from(&pairs(&[("CODEX_HOME", "D:\\a")]), &[], "");
+        let dir = dir_case.iter().find(|f| f.name == "CODEX_HOME").expect("目录类那条必须在");
+        let proc_only = detect_from(&pairs(&[("ANTHROPIC_API_KEY", "sk-x")]), &[], "");
+
+        for f in [dir, &proc_only[0]] {
+            assert!(!f.removable && !f.keep_reason.is_empty(), "不给删就必须说清为什么：{f:?}");
+        }
+        assert_ne!(dir.keep_reason, proc_only[0].keep_reason, "两个成因不能共用一句话");
+
+        // 目录类：「对齐两侧」是正确处置，那句话该在。
+        assert!(dir.keep_reason.contains("一致"), "目录类要说清正确处置是对齐两侧：{}", dir.keep_reason);
+        // 🔴 process-only：绝不能出现目录类那句「重启让它继承到」——方向相反。
+        let po = &proc_only[0].keep_reason;
+        assert!(!po.contains("继承到"), "🔴 把目录类的处置抄给了 process-only，方向正好相反：{po}");
+        assert!(po.contains("删不掉"), "必须说清是删不掉，不是不想删：{po}");
+        assert!(
+            po.contains("HKLM") || po.contains("系统级"),
+            "必须把用户指向真正的来源，否则他无处可去：{po}"
+        );
+
+        // removable 的那些不带理由 —— 界面上多一句解释是纯噪音。
+        let ok = detect_from(&[], &pairs(&[("ANTHROPIC_API_KEY", "sk-x")]), "");
+        assert!(ok[0].keep_reason.is_empty(), "可移除的条目不该带「为什么不给删」");
+    }
+
     /// 空值不报：`set FOO=` 留下的空变量对客户端没有影响，报它是纯噪音。
     #[test]
     fn empty_values_are_not_reported() {
@@ -711,7 +860,9 @@ mod tests {
         let blocked = base.join("backups");
         std::fs::write(&blocked, b"I am a file, not a directory").unwrap();
         // 发现清单做入参 —— 不碰真实环境（套件并行跑，`set_var` 会串台）。
-        let found = detect_from(&pairs(&[("ANTHROPIC_API_KEY", "sk-x")]), &[], "");
+        // 🔴 必须放在**用户级**那一栏：`removable` 现在只对 HKCU 真有对应项的条目为真，
+        // 而 `remove_from` 对不可移除的条目早退 —— 拿 process-only 当夹具会让本条空转。
+        let found = detect_from(&[], &pairs(&[("ANTHROPIC_API_KEY", "sk-x")]), "");
         assert!(found.iter().any(|f| f.removable), "夹具必须真的有一条可移除的，否则会早退");
         assert!(
             remove_from(&found, &["ANTHROPIC_API_KEY".into()], &blocked).is_err(),
@@ -783,32 +934,59 @@ mod tests {
 
     /// 🔴 **「没能移除」不许报成「已移除」** —— 而这一条只能用源码级判据守。
     ///
-    /// `remove_user_env_value` 在非 Windows 上返回 `Ok(false)`（那些平台没有「用户级环境
-    /// 变量」这个单一可写来源）。第一版它返回 `Ok(())`，于是 Linux/macOS 上点「移除」
-    /// 会报「已移除 N 个」而**一个字节都没持久化** —— 用户重启客户端后问题照旧，
+    /// 只有 [`RemoveStatus::Removed`] 才算真的持久移除了。`Missing`（HKCU 里压根没这一条，
+    /// 值来自 HKLM 或父 shell）与 `Unsupported`（非 Windows 没有「用户级环境变量」这个
+    /// 单一可写来源）都**没有持久化任何东西**。最早那版返回 `Ok(())`，于是点「移除」
+    /// 会报「已移除 N 个」而一个字节都没写 —— 用户重启客户端后问题照旧，
     /// 而他已经相信这一步做完了。
     ///
-    /// 为什么不是行为用例：`Ok(false)` 那一支在 Windows 上**编译进来但不可达**
-    /// （本机 `cfg(windows)` 分支恒返回 `Ok(true)`），而 macOS CI 只跑 `cargo check`、
-    /// 不跑测试。注入实测确认了这个盲区：把它改成 `removed.push(..)`，12 条用例照样全绿。
-    /// 所以这里钉**形态**：三段代码必须同时在。
+    /// 为什么不是行为用例：`Unsupported` 那一支在 Windows 上**编译进来但不可达**，
+    /// 而 macOS CI 只跑 `cargo check`、不跑测试。注入实测确认了这个盲区：
+    /// 把它改成 `removed.push(..)`，12 条用例照样全绿。
+    ///
+    /// 🔴 **判据钉性质不钉写法**：上一版写死 `Ok(false) => failed.push(` 这个字面量，
+    /// 于是 bool 改成三态枚举（**更好**，bool 分不出上面那两种成因）时它当场变红 ——
+    /// 而那次改动没有破坏它想守的任何一条。假红的代价是下一个人把改进撤回去。
+    /// 现在钉的是「`removed.push` 只能由成功那一支喂」，任何写法都接受。
     #[test]
     fn a_removal_that_did_not_persist_must_not_be_reported_as_removed() {
         let src = std::fs::read_to_string("src/tools/env_conflicts.rs").unwrap();
         let prod = crate::proxy::custom_headers::production_code_only(&src);
+        let body = prod
+            .split_once("match remove_user_env_value(name)")
+            .expect("分派形态变了 —— 先修判据")
+            .1;
+        let body = &body[..body.find("\n    }").unwrap_or(body.len())];
+        // 正向：必须真的解析到了那个 match（否则下面的「不许出现」是空洞的绿）。
         assert!(
-            prod.contains("Ok(false) => failed.push("),
-            "没能持久移除的必须进 failed，不许进 removed"
+            body.contains("removed.push(") && body.contains("failed.push("),
+            "两种去向都必须在这个 match 里：{body}"
         );
+        // 「没持久化」的每一支都不许喂 removed。
+        for variant in ["Missing", "Unsupported"] {
+            let Some(at) = body.find(variant) else { continue };
+            let arm = &body[at..body[at..].find("\n            ").map(|i| at + i).unwrap_or(body.len())];
+            assert!(
+                !arm.contains("removed.push("),
+                "{variant} 没有持久化任何东西，报成已移除是本模块最坏的一种界面撒谎：{arm}"
+            );
+        }
         assert!(
-            !prod.contains("Ok(false) => removed.push("),
-            "反向：把「什么都没做」报成已移除，是本模块最坏的一种界面撒谎"
+            body.contains("RemoveStatus::Removed") || body.contains("Ok(true)"),
+            "成功那一支必须能被辨认出来，否则无法判断谁喂了 removed：{body}"
         );
         // 返回类型也要钉住 —— 退回 `Result<()>` 就没有「没能移除」这个信号了。
-        assert!(
-            prod.contains("fn remove_user_env_value(name: &str) -> std::io::Result<bool>")
-                && prod.contains("fn remove_user_env_value(_name: &str) -> std::io::Result<bool>"),
-            "两个 cfg 分支都必须返回 bool（成功与否 ≠ 有没有真的持久移除）"
-        );
+        // 同上：钉「两个 cfg 分支都返回带这个信号的类型」，不钉具体是 bool 还是枚举。
+        let sigs: Vec<&str> = prod.match_indices("fn remove_user_env_value").map(|(i, _)| {
+            let s = &prod[i..];
+            &s[..s.find('{').unwrap_or(s.len())]
+        }).collect();
+        assert_eq!(sigs.len(), 2, "windows / 非 windows 两个分支都必须在：{sigs:?}");
+        for sig in &sigs {
+            assert!(
+                sig.contains("RemoveStatus") || sig.contains("bool"),
+                "返回类型必须携带「有没有真的持久移除」这个信号（成功与否 ≠ 已持久化）：{sig}"
+            );
+        }
     }
 }

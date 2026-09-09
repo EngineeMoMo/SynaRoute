@@ -48,6 +48,7 @@ const MANIFEST_FILE: &str = "codex-session-providers.json";
 #[path = "codex_session_fs.rs"] pub(in crate::tools) mod files;
 #[path = "codex_session_view.rs"] pub(in crate::tools) mod view;
 #[path = "codex_session_catalog.rs"] mod catalog; // Desktop 列表索引 local_thread_catalog（第三份 provider 副本）；理由见该文件模块头
+#[path = "codex_session_sqlite.rs"] mod sqlite;
 #[path = "codex_session_sync.rs"] pub(crate) mod sync;
 
 // 文件层的原语都在 [`files`] 里。这里再导出一次，让 [`ops`]/[`view`]/[`sync`] 与本模块
@@ -56,17 +57,13 @@ pub(in crate::tools) use files::{
     collect_rollouts, read_first_line, rel_of, resolve_in_home, split_eol,
 };
 
-/// 每个 sqlite 库保留几份写前备份。3 份足够回退一次误操作，而不至于让频繁启停把
-/// 备份目录堆成无界增长（每份约 0.5 MB）。
-const DB_BACKUP_KEEP: usize = 3;
-
-/// `IN (?,…)` 一批最多放几个 id。SQLite 的绑定参数上限是 32766（3.32 之前 999），
-/// 取 500 留足余量，且远小于任一版本的下限。
-const SQL_CHUNK: usize = 500;
-
-/// 上限由**编译器**保证，不是靠测试：把 `SQL_CHUNK` 调过 999 直接编译不过。
-/// 写成 `const` 断言而不是 `#[test]` 是刻意的 —— 硬保证不该降级成软保证。
-const _: () = assert!(SQL_CHUNK < 999, "3.32 之前的 SQLite 绑定参数上限就是 999");
+// 🔴 `SQL_CHUNK` 的重导出**不能**带 `#[cfg(test)]`：`ops` 与 `catalog` 两个兄弟模块的
+// **生产**代码按 `super::SQL_CHUNK` 用它。带 cfg 的表现极具迷惑性 —— `cargo test --lib`
+// 全绿（测试构型下这行存在），而 `cargo build` / `cargo check` **压根编译不过**，
+// 也就是说整套测试都证明不了产物能构建出来。抓住它的只有 clippy/check，不是任何用例。
+pub(in crate::tools) use sqlite::SQL_CHUNK;
+#[cfg(test)]
+use sqlite::{set_threads_provider, sqlite_root_of, DB_BACKUP_KEEP};
 
 /// 一条会话的首行元数据。**只从 rollout 首行读**，不碰正文。
 ///
@@ -142,6 +139,9 @@ pub(in crate::tools) struct ScanReport {
 /// 同步结果。
 #[derive(Debug, Default)]
 pub(in crate::tools) struct SyncReport {
+    /// 用户正在看的同步目标。**报告必须从这里派生文案**，不能写死 SynaRoute ——
+    /// 手动入口允许选 openai / 自定义 provider，写死会确认一件与实际相反的事。
+    pub target: String,
     /// 真正改过的会话数。
     pub changed: usize,
     /// 本来就已经是目标 provider、一个字节都没动的会话数。
@@ -184,6 +184,10 @@ struct Manifest {
     /// 写清单时的目标 provider，仅用于人读与排障。
     target: String,
     synced_at: String,
+    /// 接入前 config.toml 的根 provider。接入期间**新建**的会话没有逐条原值，
+    /// 停止时按这一个真实快照交还；旧清单缺字段时从 config.toml 的 .bak 再取。
+    #[serde(default)]
+    fallback_provider: String,
     entries: Vec<ManifestEntry>,
 }
 
@@ -199,6 +203,65 @@ struct ManifestEntry {
     /// 回滚会被跳过，而不是让整份清单解析失败（后者会让回滚凭据整个消失）。
     #[serde(default)]
     thread_id: String,
+}
+
+/// 从接入前的 config.toml 快照读根 provider。文件合法但没显式值 = Codex 内置 `openai`；
+/// 快照不存在/损坏则返回 None，**不猜**（还原用户会话时猜错比少改一条糟）。
+fn fallback_provider_from_backup(home: &Path) -> Option<String> {
+    let config = home.join("config.toml");
+    let backup = super::backup_path_for(&config);
+    if backup.is_file() {
+        let text = fs::read_to_string(backup).ok()?;
+        let doc = text.parse::<toml::Value>().ok()?;
+        return Some(
+            doc.get("model_provider")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("openai")
+                .to_string(),
+        );
+    }
+    // 接入前 config.toml 不存在时 `backup_and_write_bytes` 落 created marker；Codex 在
+    // 缺 config 的形态下用内置 openai。它是可证实的默认，不是猜一个自定义 id。
+    super::super::created_marker_path_for(&config)
+        .is_file()
+        .then(|| "openai".to_string())
+}
+
+/// 该往清单里记哪个原值。
+///
+/// 🔴 **绝不能把我们自己的 provider id 记成「原值」。** 手动同步允许把目标选成任意
+/// 已发现的 provider，于是这个序列完全正常：接入（会话被改成 `synaroute`）→ 期间新建
+/// 若干会话（Codex 按 config 写下 `synaroute`）→ 用户在会话页手动同步到 `openai`。
+/// 这一步里那些会话的当前值就是 `synaroute`，裸记下去之后「还原」会把它们改回
+/// `synaroute` —— 而 `restore_one` 同时把 `config.toml` 从 `.bak` 整份交还，
+/// `[model_providers.synaroute]` 那张表**已经不在了**。
+///
+/// 后果是本仓模块头矩阵里最坏的那一行：`model_provider="synaroute"` 但表缺失 →
+/// `Error: Model provider \`synaroute\` not found`，**一个请求都不发**。也就是说
+/// 「还原」这个动作亲手把用户的对话变成打不开的。
+///
+/// 正确的原值是接入前的根 provider（[`Manifest::fallback_provider`]）。取不到时记空串 ——
+/// 空串在还原侧是「把字段整个摘掉」（见 [`rewrite_first_line`]），Codex 对缺字段有默认
+/// 行为（回落 config 的根 provider，而那时它已经是用户自己的了）。宁可交给那个默认，
+/// 也不写一个我们知道会失效的 id。
+fn original_to_record(current: &str, fallback: &str) -> String {
+    if current == super::MCP_CLIENT_NAME {
+        return fallback.to_string();
+    }
+    current.to_string()
+}
+
+/// 旧版清单没有逐条记录「本来就是 target」的会话；只把**清单写成之后新建**的未记录会话
+/// 当成 born-as-target。时间取不到就 fail closed，不拿一个同名旧会话冒充新会话。
+fn born_after_sync(session: &SessionRef, synced_at: &str) -> bool {
+    let Ok(session_ts) = chrono::DateTime::parse_from_rfc3339(&session.timestamp) else {
+        return false;
+    };
+    let Ok(sync_ts) = chrono::DateTime::parse_from_rfc3339(synced_at) else {
+        return false;
+    };
+    session_ts >= sync_ts
 }
 
 
@@ -401,6 +464,7 @@ pub(in crate::tools) fn sync_to_at(
 ) -> AppResult<SyncReport> {
     let scan = scan_at(home);
     let mut report = SyncReport {
+        target: target.to_string(),
         unreadable: scan.unreadable,
         path_rejected: scan.path_rejected,
         ..SyncReport::default()
@@ -430,20 +494,34 @@ pub(in crate::tools) fn sync_to_at(
         // 宁可这次不同步 —— 用户还能去看那份文件，而覆盖之后什么都没了。
         ManifestState::Corrupt(p) => return Err(corrupt_err(&p)),
     };
+    // 清单第一次落盘时锁定「接入前根 provider」。接入期间新建的会话本来就写 target，
+    // 不会进逐条 entries；停止时只有这份快照能如实交还。旧清单留空，restore 再尝试读 .bak。
+    let manifest_was_empty = manifest.target.is_empty() && manifest.entries.is_empty();
+    let mut manifest_changed = false;
+    if manifest.fallback_provider.is_empty() {
+        if let Some(provider) = fallback_provider_from_backup(home) {
+            manifest.fallback_provider = provider;
+            manifest_changed = true;
+        }
+    }
     let mut newly_recorded = false;
     for (_, s) in &todo {
         if !manifest.entries.iter().any(|e| e.rel_path == s.rel_path) {
             manifest.entries.push(ManifestEntry {
                 rel_path: s.rel_path.clone(),
-                original_provider: s.provider.clone(),
+                original_provider: original_to_record(&s.provider, &manifest.fallback_provider),
                 thread_id: s.thread_id.clone(),
             });
             newly_recorded = true;
         }
     }
-    if newly_recorded {
-        manifest.target = target.to_string();
-        manifest.synced_at = chrono::Utc::now().to_rfc3339();
+    if newly_recorded || manifest_changed || manifest_was_empty {
+        // 初次同步即使一条旧会话都没有，也必须落一份清单：此后在接入期间新建的会话
+        // 一出生就是 target、永远不会进 todo；没有这个空清单，停止时完全认不出它们。
+        if manifest_was_empty || manifest.target != target {
+            manifest.target = target.to_string();
+            manifest.synced_at = chrono::Utc::now().to_rfc3339();
+        }
         write_manifest(data_dir, &manifest)?;
     }
 
@@ -497,18 +575,50 @@ pub(in crate::tools) fn sync_to_at(
 /// 照样绿）。门保留：它表达语义边界，不该依赖另一处的副作用成立。真正能让判据变红的注入是
 /// 「没有清单就自己扫一份出来」。
 pub(in crate::tools) fn restore_at(home: &Path, data_dir: &Path) -> AppResult<Option<String>> {
-    let manifest = match read_manifest_state(data_dir) {
+    let mut manifest = match read_manifest_state(data_dir) {
         ManifestState::Loaded(m) => m,
         ManifestState::Missing => return Ok(None),
         // 与同步侧同一条纪律：坏清单不是「没有清单」。这里报错而不是静默什么都不改 ——
         // 后者会让用户以为已经还原干净了，而他的旧对话仍指着一个即将停掉的端口。
         ManifestState::Corrupt(p) => return Err(corrupt_err(&p)),
     };
+    // 兼容旧清单：上线 fallback_provider 之前的文件从 config.toml 首写即锁的 .bak 恢复。
+    if manifest.fallback_provider.is_empty() {
+        manifest.fallback_provider = fallback_provider_from_backup(home).unwrap_or_default();
+    }
+    let known: std::collections::HashSet<String> =
+        manifest.entries.iter().map(|e| e.rel_path.clone()).collect();
+    // 接入期间新建的会话一出生就指向 target，sync_to_at 因 already_ok 早退、从未把它写进清单。
+    // 仅补「清单落盘之后出生 + 当前仍等于 target + 不在清单」这一窄形态；旧的手配会话不猜。
+    let born: Vec<SessionRef> = if manifest.fallback_provider.is_empty() {
+        Vec::new()
+    } else {
+        scan_at(home)
+            .sessions
+            .into_iter()
+            .filter(|s| {
+                !known.contains(s.rel_path.as_str())
+                    && s.provider == manifest.target
+                    && born_after_sync(s, &manifest.synced_at)
+            })
+            .collect()
+    };
+    // born-as-target 也先写进清单，再改文件：若中途失败或 sqlite 被锁，下一次停止还能精确重试。
+    // 这与同步侧「清单必须在改文件之前落盘」是同一条纪律，不能只存在内存里。
+    if !born.is_empty() {
+        manifest.entries.extend(born.into_iter().map(|s| ManifestEntry {
+            rel_path: s.rel_path,
+            original_provider: manifest.fallback_provider.clone(),
+            thread_id: s.thread_id,
+        }));
+        write_manifest(data_dir, &manifest)?;
+    }
+    let restore_entries = manifest.entries.clone();
     let mut restored = 0usize;
     let mut failed = 0usize;
     let mut gone = 0usize;
 
-    for e in &manifest.entries {
+    for e in &restore_entries {
         // 路径遏制：清单被手改成 `../..` 时不许我们去改 `$CODEX_HOME` 之外的文件。
         // 算作 failed 而不是静默跳过 —— 清单留着，排障时能看到这条没处理成功。
         let Some(path) = resolve_in_home(home, &e.rel_path) else {
@@ -531,7 +641,7 @@ pub(in crate::tools) fn restore_at(home: &Path, data_dir: &Path) -> AppResult<Op
     // sqlite 那半也要对称回滚 —— 只做 rollout 不做 sqlite 的话，还原之后 Desktop 的
     // 会话列表会长期标着 synaroute 而实际路由已回到官方，且**永不自愈**（除非用户再
     // 接入一次）。同步那半刻意写了 sqlite，这一半漏掉就是我们自己造的不一致。
-    let db_note = restore_sqlite(home, &manifest.entries);
+    let db_note = restore_sqlite(home, &restore_entries);
 
     // 全部处理完才删清单（同 `restore_one` 还原成功后删 `.bak`）。有失败就留着 ——
     // 用户退出 Codex 后再点一次停止就能补完。
@@ -563,219 +673,9 @@ pub(in crate::tools) fn restore_at(home: &Path, data_dir: &Path) -> AppResult<Op
 }
 
 
-// sqlite（best-effort：只影响 Desktop 的会话列表，不影响路由）
-
-/// 候选库路径：`<sqlite 根>/sqlite/*.db` 优先，回落 `<sqlite 根>/state_5.sqlite`。
-///
-/// 🔴 **两个都要试**。Codex 正在从单文件迁到 `sqlite/` 目录（本机同时存在两者）。
-/// 只改 legacy 那份的表现是：在已迁移的机器上**静默无效** —— 列表照旧显示旧 provider，
-/// 而我们报「已同步」。
-///
-/// 🔴 **sqlite 根不一定等于 `$CODEX_HOME`**：Codex 认 `CODEX_SQLITE_HOME`
-/// （二进制里那句 "`CODEX_SQLITE_HOME` is overridden by an exact requirement for
-/// sqlite_home"，出自 `core/src/config/requirements.rs`）。不认它的表现同样是静默的 ——
-/// 我们对着 `$CODEX_HOME` 下一个陈旧的库写，而 Codex 读的是别处那个。
-/// 目录必须真的存在才采纳，否则一个写错的环境变量会让我们连 legacy 库都找不到。
-///
-/// 判据做成**纯函数**（环境变量的值当入参传进来）：直接在测试里 `set_var` 会污染同进程
-/// 并行跑的其它用例 —— 本仓在进程级状态上栽过好几次（`quota_window` 的表、
-/// `DENIED_TOTAL` 的计数）。`session_db_paths` 必须经它，有源码级判据钉着。
-fn sqlite_root_of(env: Option<std::ffi::OsString>, home: &Path) -> PathBuf {
-    match env {
-        Some(v) if !v.is_empty() && Path::new(&v).is_dir() => PathBuf::from(v),
-        _ => home.to_path_buf(),
-    }
-}
-
-fn sqlite_root(home: &Path) -> PathBuf {
-    sqlite_root_of(std::env::var_os("CODEX_SQLITE_HOME"), home)
-}
-
-fn session_db_paths(home: &Path) -> Vec<PathBuf> {
-    let root = sqlite_root(home);
-    let mut out = Vec::new();
-    if let Ok(entries) = fs::read_dir(root.join("sqlite")) {
-        for e in entries.flatten() {
-            let p = e.path();
-            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or_default();
-            if p.is_file() && matches!(ext, "db" | "sqlite" | "sqlite3") {
-                out.push(p);
-            }
-        }
-        out.sort();
-    }
-    let legacy = root.join("state_5.sqlite");
-    if legacy.is_file() {
-        out.push(legacy);
-    }
-    out
-}
-
-/// 把指定 thread 的 `threads.model_provider` 改成 `target`。
-///
-/// `ids` = **rollout 那半确实改成功的**那些 thread id。空切片 → 一个字节都不写：那意味着
-/// 路由压根没被修好，此时改列表元数据只会制造一个替未完成修复背书的假现场。
-fn sync_sqlite(
-    home: &Path,
-    data_dir: &Path,
-    target: &str,
-    ids: &[String],
-) -> Option<SqliteOutcome> {
-    let dbs = session_db_paths(home);
-    if dbs.is_empty() {
-        return None;
-    }
-    if ids.is_empty() {
-        return Some(SqliteOutcome::default());
-    }
-    // Desktop 列表那份索引（`local_thread_catalog`）要的展示信息 —— 它在**另一个库**里，
-    // 而那个库没有 `threads` 表，所以数据只能从这一侧带过去。取不到就只做 UPDATE 那两步。
-    let catalog_rows = catalog::plan_from(home, target, ids);
-    let mut out = SqliteOutcome::default();
-    for db in dbs {
-        // 备份在**写之前**、且只在真要写的时候做（`ids` 非空已经保证了这一点）。
-        if let Err(e) = backup_db(&db, data_dir) {
-            out.error.get_or_insert(e);
-            continue; // 备份不成就不写这个库 —— 宁可不同步，也不留一个无法回退的改动
-        }
-        match set_threads_provider(&db, target, ids) {
-            Ok(n) => out.updated += n,
-            Err(e) => {
-                out.error.get_or_insert(e);
-            }
-        }
-        // 第三份 provider 副本 + Desktop 列表索引的缺行。理由见 `catalog` 模块头。
-        catalog::repair_one(&db, target, &catalog_rows, &mut out.catalog);
-    }
-    Some(out)
-}
-
-/// 按清单把 `threads.model_provider` 改回原值。返回 `Some(错误)` 表示有库没处理成功。
-///
-/// 原值为空串的条目（rollout 里原本没那个字段，或清单是本字段上线前写的）**跳过** ——
-/// 我们不知道 sqlite 里当时是什么，猜一个写进去比留着旧值更糟。
-///
-/// 🔴 **按原值分组、一组一次连接**：清单可能有上百条，而 [`set_threads_provider`] 每次都
-/// 要 open 一次库并可能等满 `busy_timeout` —— 逐条来在库被锁时最坏是「条目数 × 1.5 秒」，
-/// 那会让「停止代理」这个动作卡上几分钟。
-fn restore_sqlite(home: &Path, entries: &[ManifestEntry]) -> Option<String> {
-    let dbs = session_db_paths(home);
-    if dbs.is_empty() {
-        return None;
-    }
-    let mut groups: std::collections::HashMap<&str, Vec<String>> =
-        std::collections::HashMap::new();
-    for e in entries {
-        if e.thread_id.is_empty() || e.original_provider.is_empty() {
-            continue;
-        }
-        groups
-            .entry(e.original_provider.as_str())
-            .or_default()
-            .push(e.thread_id.clone());
-    }
-    if groups.is_empty() {
-        return None;
-    }
-    let mut first_err = None;
-    for db in dbs {
-        for (provider, ids) in &groups {
-            if let Err(err) = set_threads_provider(&db, provider, ids) {
-                first_err.get_or_insert(err);
-                break; // 同一个库接着试也是同样的错（多半是锁），换下一个库
-            }
-        }
-    }
-    first_err
-}
-
-/// 写之前把库文件备份到 `<data_dir>/backups/codex-sqlite/`，只留最近 [`DB_BACKUP_KEEP`] 份。
-///
-/// 🔴 **`-wal` 也要备份**：WAL 模式下主文件可能不含最新数据，只拷主文件会得到一个旧快照。
-/// 缺 `-wal` 不是错误（Codex 关闭时会 checkpoint 掉它）。
-fn backup_db(db: &Path, data_dir: &Path) -> Result<(), String> {
-    let dir = data_dir.join("backups").join("codex-sqlite");
-    fs::create_dir_all(&dir).map_err(|e| format!("建备份目录失败: {e}"))?;
-    let stem = db.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    // 🔴 秒级时间戳不够：用户连点两下「启动」时两次备份会同名、**后一次覆盖前一次**，
-    // 于是「保留 3 份」实际只有 1 份。加毫秒 + 进程内自增序号（同 `tmp_path_for`）。
-    let ts = format!(
-        "{}-{:04}",
-        chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f"),
-        files::seq() % 10_000
-    );
-    fs::copy(db, dir.join(format!("{stem}.{ts}.bak")))
-        .map_err(|e| format!("备份 {} 失败: {e}", db.display()))?;
-    let wal = PathBuf::from(format!("{}-wal", db.to_string_lossy()));
-    if wal.is_file() {
-        let _ = fs::copy(&wal, dir.join(format!("{stem}-wal.{ts}.bak")));
-    }
-    prune_backups(&dir, &stem);
-    Ok(())
-}
-
-/// 每个库名只留最近 [`DB_BACKUP_KEEP`] 份（同 `log_rotate` 那条：加了保留就必须同时加清理）。
-/// 排序键刻意把 `-wal` 挪到末位 —— 取证见 `tests::old_db_backups_are_pruned` 的文档。
-fn prune_backups(dir: &Path, stem: &str) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let mut mine: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| name(p).starts_with(stem))
-        .collect();
-    // 键 = (时间戳段, is_wal)：时间戳格式定长故字典序即时间序（不依赖 mtime —— 备份刚写完
-    // 可能同秒，而排错方向会删掉最新那份）；is_wal 排在后面让同一轮的两个文件相邻、主文件在前。
-    mine.sort_by_key(|p| {
-        let n = name(p);
-        let wal = n.starts_with(&format!("{stem}-wal."));
-        (n.trim_start_matches(stem).trim_start_matches("-wal").to_string(), wal)
-    });
-    let keep_from = mine.len().saturating_sub(DB_BACKUP_KEEP * 2); // 主文件 + wal
-    for p in &mine[..keep_from] {
-        let _ = fs::remove_file(p);
-    }
-}
-
-fn set_threads_provider(db: &Path, provider: &str, ids: &[String]) -> Result<usize, String> {
-    let conn = rusqlite::Connection::open(db).map_err(|e| format!("{}: {e}", db.display()))?;
-    // Codex 在跑时 WAL 是锁着的 —— 等一小会儿而不是立刻放弃：多数锁只持有毫秒级，
-    // 而这里的失败代价是「列表元数据不同步」，值得为它等一下。
-    let _ = conn.busy_timeout(std::time::Duration::from_millis(1500));
-    // 缺表/缺列 → 当作「这个库不管这件事」，不报错。Codex 的 schema 已经改过多次
-    // （`state_5` 这个数字本身就是版本号），把它当错误会让接入在一件无关的事上失败。
-    let has_col: bool = conn
-        .query_row(
-            "SELECT 1 FROM pragma_table_info('threads') WHERE name = 'model_provider' LIMIT 1",
-            [],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
-    if !has_col {
-        return Ok(0);
-    }
-    // 🔴 **必须分批**：每个 id 是一个绑定参数，而 SQLite 的 `SQLITE_MAX_VARIABLE_NUMBER`
-    // 是 32766（3.32 之前只有 999）。重度用户的会话数到那个量级时整条 UPDATE 会报
-    // `too many SQL variables` —— 而那是「安静失败」（路由不受影响，只有列表不同步）。
-    let mut total = 0usize;
-    for chunk in ids.chunks(SQL_CHUNK) {
-        // `repeat_n` 要 Rust 1.82，而本仓 MSRV 是 1.77（clippy 的 incompatible_msrv 会拦）。
-        let holes = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "UPDATE threads SET model_provider = ?1 \
-             WHERE id IN ({holes}) AND model_provider IS NOT ?1"
-        );
-        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&provider];
-        for id in chunk {
-            params.push(id);
-        }
-        total += conn
-            .execute(&sql, params.as_slice())
-            .map_err(|e| format!("{}: {e}", db.display()))?;
-    }
-    Ok(total)
-}
-
+// SQLite 实现抽到子模块；对兄弟模块重导出唯一的路径发现函数。
+use sqlite::{restore_sqlite, sync_sqlite};
+pub(in crate::tools) use sqlite::session_db_paths;
 
 // 对外入口（解析真实 `$CODEX_HOME` 与数据目录）
 
@@ -814,7 +714,7 @@ pub(in crate::tools) fn append_sync_note(applied: String) -> String {
 pub(in crate::tools) fn restore_from_manifest() -> AppResult<Option<String>> {
     let home = super::codex_paths::codex_home()?;
     let data_dir = crate::store::data_dir::app_data_dir()?;
-    restore_at(&home, &data_dir)
+    sync::locked_restore(&home, &data_dir)
 }
 
 /// 把报告写成一句话。
@@ -825,8 +725,9 @@ pub(in crate::tools) fn restore_from_manifest() -> AppResult<Option<String>> {
 fn describe(r: &SyncReport) -> Option<String> {
     let mut parts = Vec::new();
     if r.changed > 0 {
+        let target = if r.target.is_empty() { "目标 provider" } else { &r.target };
         parts.push(format!(
-            "已把 {} 个历史对话指向 SynaRoute（重启 Codex 后生效；若某条旧对话仍报错，\
+            "已把 {} 个历史对话指向 {target}（重启 Codex 后生效；若某条旧对话仍报错，\
              那是它的推理内容由原账号加密所致，新建对话不受影响）",
             r.changed
         ));
@@ -1120,6 +1021,92 @@ mod tests {
 
         restore_at(&home, &data).unwrap();
         assert_eq!(provider_of(&p), "openai");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// 🔴 接入期间**新建**的会话一出生就写 target，因 `already_ok` 从来进不了逐条清单；
+    /// 停止时必须按接入前 config 快照交还。反面一起钉：接入前就手配成 target 的旧会话
+    /// 不能被误认成 born-as-target（时间戳判据存在的全部理由）。
+    #[test]
+    fn sessions_born_while_applied_restore_to_the_pre_apply_provider() {
+        let home = tmp_home("born_target");
+        let data = home.join("appdata");
+        let config = home.join("config.toml");
+        fs::write(super::super::backup_path_for(&config), "model_provider = \"openai\"\n").unwrap();
+
+        let old = write_rollout(&home, "sessions/2026/09/01", "old", "openai", "\n");
+        let manual = write_rollout(&home, "sessions/2026/09/01", "manual", "synaroute", "\n");
+        assert_eq!(sync_to_at(&home, &data, "synaroute").unwrap().changed, 1);
+
+        let born = write_rollout(&home, "sessions/2026/09/02", "born", "synaroute", "\n");
+        let text = fs::read_to_string(&born).unwrap();
+        fs::write(&born, text.replace("2026-09-01T13:06:47.003Z", "2999-09-02T00:00:00Z")).unwrap();
+
+        let note = restore_at(&home, &data).unwrap().expect("旧会话与接入期间新会话都该还原");
+        assert!(note.contains('2'), "应还原 old + born 两条：{note}");
+        assert_eq!(provider_of(&old), "openai");
+        assert_eq!(provider_of(&born), "openai", "接入期间新建的会话不能留在已删除的 provider 上");
+        assert_eq!(provider_of(&manual), "synaroute", "接入前就指向 target 的手配旧会话不许猜着改");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// 🔴 **手动同步到别的目标之后，还原不许把会话留在我们自己那个已被删掉的 provider 上。**
+    ///
+    /// 会话页那个目标下拉允许选**任意**已发现的 provider，于是这个序列完全正常：
+    /// 接入（会话改成 `synaroute`）→ 期间新建会话（Codex 按 config 写 `synaroute`）→
+    /// 用户手动同步到 `openai`（「我想让旧对话回官方」）。第三步里那条新会话的当前值
+    /// 就是 `synaroute`，裸记进清单之后「还原」会把它改回 `synaroute` ——
+    /// 而 `restore_one` 同时把 `config.toml` 从 `.bak` 整份交还，那张表已经不在了。
+    ///
+    /// 后果是 `codex.rs` 模块头矩阵里最坏的那一行：`Error: Model provider \`synaroute\`
+    /// not found`，**一个请求都不发**。也就是「还原」亲手把用户的对话变成打不开的。
+    ///
+    /// 判据同时钉反面：真正来自别处的原值（这里的 `my-relay`）必须原样保住 ——
+    /// 一律替换成 fallback 会把用户自己配的 provider 也冲掉。
+    #[test]
+    fn restoring_after_a_manual_sync_elsewhere_never_leaves_our_own_provider_behind() {
+        let home = tmp_home("manual_elsewhere");
+        let data = home.join("appdata");
+        let config = home.join("config.toml");
+        fs::write(super::super::backup_path_for(&config), "model_provider = \"openai\"\n").unwrap();
+
+        // ① 接入：把一条历史会话改成我们。
+        let old = write_rollout(&home, "sessions/2026/09/01", "old", "openai", "\n");
+        assert_eq!(sync_to_at(&home, &data, "synaroute").unwrap().changed, 1);
+
+        // ② 接入期间新建一条（Codex 按 config 写下我们的 id），另有一条真来自别处。
+        let born = write_rollout(&home, "sessions/2026/09/02", "born", "synaroute", "\n");
+        let relay = write_rollout(&home, "sessions/2026/09/02", "relay", "my-relay", "\n");
+
+        // ③ 用户在会话页手动同步到 openai —— 此时 born 的当前值正是 `synaroute`。
+        sync_to_at(&home, &data, "openai").unwrap();
+        let m = read_manifest(&data).expect("清单必须在");
+        let of = |tag: &str| {
+            let want = uuid_of(tag);
+            m.entries
+                .iter()
+                .find(|e| e.rel_path.contains(&want))
+                .map(|e| e.original_provider.clone())
+                .unwrap_or_else(|| panic!("清单里没有 {tag}：{:?}", m.entries))
+        };
+        assert_ne!(
+            of("born"),
+            "synaroute",
+            "🔴 绝不能把我们自己的 id 记成原值 —— 还原后那张表已经不在，Codex 一个请求都不发"
+        );
+        assert_eq!(of("born"), "openai", "正确的原值是接入前的根 provider");
+        assert_eq!(of("relay"), "my-relay", "反面：真来自别处的原值必须原样保住");
+
+        // ④ 停止 → 还原。三条都不许留在 `synaroute` 上。
+        restore_at(&home, &data).unwrap();
+        for (tag, path) in [("old", &old), ("born", &born), ("relay", &relay)] {
+            assert_ne!(
+                provider_of(path),
+                "synaroute",
+                "{tag} 还原后仍指向我们（config 里那张表已被交还掉）"
+            );
+        }
+        assert_eq!(provider_of(&relay), "my-relay");
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -1469,8 +1456,9 @@ mod tests {
     /// 在**编译期**钉住（调过 999 直接编译不过）。这里只管「分批这件事还在做」。
     #[test]
     fn the_id_list_must_be_chunked_below_the_most_conservative_sqlite_limit() {
+        // 判据跟着代码搬到 `codex_session_sqlite.rs`（理由同 catalog 那条）。
         let src = crate::proxy::custom_headers::production_code_only(include_str!(
-            "codex_sessions.rs"
+            "codex_session_sqlite.rs"
         ));
         let at = src.find("fn set_threads_provider").expect("函数改名了，请同步本判据");
         let end = src[at..].find("\n}").map(|i| at + i).unwrap_or(src.len());
@@ -1619,6 +1607,7 @@ mod tests {
             &Manifest {
                 target: "synaroute".into(),
                 synced_at: "x".into(),
+                fallback_provider: String::new(),
                 entries: vec![ManifestEntry {
                     rel_path: rel,
                     original_provider: "openai".into(),
@@ -1802,8 +1791,9 @@ mod tests {
         assert_eq!(sqlite_root_of(Some(other.clone().into_os_string()), &home), other);
 
         // 接线：`session_db_paths` 必须经 `sqlite_root`，否则上面全绿而功能没生效。
+        // 判据跟着代码搬到 `codex_session_sqlite.rs`。
         let src = crate::proxy::custom_headers::production_code_only(include_str!(
-            "codex_sessions.rs"
+            "codex_session_sqlite.rs"
         ));
         assert!(src.contains("let root = sqlite_root(home);"), "库路径必须从 sqlite_root 起算");
         let _ = fs::remove_dir_all(&home);

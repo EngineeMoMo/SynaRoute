@@ -4,7 +4,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "@/store";
 import { KeyCard } from "@/components/KeyCard";
 import { ProxyStatusBar } from "@/components/ProxyStatusBar";
-import { CcSwitchImportDialog } from "@/components/CcSwitchImportDialog";
 import { Button } from "@/components/ui/Button";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { api } from "@/lib/bridge";
@@ -12,8 +11,11 @@ import { useT } from "@/lib/useT";
 // 与状态条共用：两份实现必然漂移，而漂移后果是「界面列出的模型后端压根没宣称过 →
 // 转发时被当成客户端自己编的名字放过、静默降级」。完整理由见 modelSets.ts。
 import { discoverableModels, keyExpectedSet, routingPrimaryKey } from "@/lib/modelSets";
+// 鼠标拖放排序的状态机（Pointer Events）。抽成 hook 而不是写在本页里：它是一台
+// 有 5 个监听器要成对拆掉的状态机，混在页面组件里必然漏掉某一条清理。
+import { useKeyDrag } from "@/lib/useKeyDrag";
 import type { EventLogEntry, ProviderKey } from "@/types";
-import { Plus, AlertTriangle, Inbox, X, Database } from "lucide-react";
+import { Plus, AlertTriangle, Inbox, X } from "lucide-react";
 import { EnvConflictBanner } from "@/components/EnvConflictBanner";
 
 /** 分类主页：代理状态条 + 模型映射兜底提示 + Key 卡片列表 */
@@ -34,7 +36,6 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
   const refreshCategory = useStore((s) => s.refreshCategory);
   const t = useT();
   const [gapDialogOpen, setGapDialogOpen] = useState(false);
-  const [importOpen, setImportOpen] = useState(false);
 
   // 兜底轮询（UX#5）。真正的实时性由 App 层的 useBackendEvents 承担：代理启停、
   // 配置落盘、健康态翻转会被后端主动推过来、界面即时跟随。这里退成 30s 只为兜住
@@ -47,6 +48,8 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
     () => [...keys].sort((a, b) => a.priority - b.priority),
     [keys]
   );
+
+  const drag = useKeyDrag(sorted.map((k) => k.id));
 
   // 路由意义上的主 Key（首个**启用** Key）—— 与后端 `enabled_keys_sorted`、状态条、
   // 托盘同口径。卡片徽标据此画，而不是各自用 `priority === 0`：那个判据在
@@ -215,14 +218,6 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
         </Tooltip>
       </div>
 
-      {/* 从 cc-switch 导入历史 Key：只读对方库、导入后不接入（详见 CcSwitchImportDialog） */}
-      {importOpen && (
-        <CcSwitchImportDialog
-          onClose={() => setImportOpen(false)}
-          onImported={() => void refreshCategory()}
-        />
-      )}
-
 
       {/* 桌面端接入被其他工具接管（cc-switch 一被点开就整份重写 _meta.json）：
           档还在磁盘上、代理也在跑，但桌面端实际走的是别人那一档 → 表现为「接入了但不生效」。
@@ -307,53 +302,44 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
           原注释说这里要给右下角常驻的快捷面板悬浮按钮让位 —— 那个 FAB 早已删除
           （见 App.tsx 的说明），理由已不成立。保留这段留白只是让最后一张卡片滚到底时
           不贴着窗口边缘；要改数值请按视觉效果自行决定，不必再顾虑 FAB 重叠。 */}
-      <div className="flex-1 space-y-2 overflow-y-auto px-6 pb-24">
+      {/* `drag.scrollRef` 必须挂在**这个**滚动容器上：拖到视口外时靠它自动滚动，
+          不挂的话长列表里「把末尾那条拖到首位」根本走不到（首位那张卡在视口外）。 */}
+      <div ref={drag.scrollRef} className="flex-1 space-y-2 overflow-y-auto px-6 pb-24">
         {loading && <div className="py-10 text-center text-sm text-text-muted">{t("common.loading")}</div>}
 
         {!loading && sorted.length === 0 && (
           <div className="flex flex-col items-center justify-center gap-3 py-16 text-text-muted">
             <Inbox size={40} />
             <p className="text-sm">{t("category.empty")}</p>
-            <div className="flex gap-2">
+            <div>
               <Button variant="secondary" onClick={onAddKey}>
                 <Plus size={16} /> {t("category.addFirst")}
               </Button>
-              {/* 空列表是最需要「从 cc-switch 导入」的场景：老用户往往已在 cc-switch 里配好了。
-                  文案走 i18n —— 原先这里与下方那个按钮都是硬编码中文，英文界面下会露出中文。 */}
-              <Tooltip content={t("category.ccSwitchImportTip")} side="top">
-                <Button variant="outline" onClick={() => setImportOpen(true)}>
-                  <Database size={16} /> {t("category.ccSwitchImport")}
-                </Button>
-              </Tooltip>
             </div>
-          </div>
-        )}
-
-        {!loading && sorted.length > 0 && (
-          <div className="flex justify-end pb-1">
-            {/* 这个按钮会让人先怕一下：「会覆盖我现有的 Key 吗？会把接入切过去吗？」
-                答案都是不会（只读对方库、导入后不接入），但那只写在点开后的弹窗里 ——
-                在点之前就说清楚，才不用赌一把。 */}
-            <Tooltip content={t("category.ccSwitchImportTip")} side="left">
-              <Button variant="ghost" size="sm" onClick={() => setImportOpen(true)}>
-                <Database size={14} /> {t("category.ccSwitchImport")}
-              </Button>
-            </Tooltip>
           </div>
         )}
 
         {!loading &&
           sorted.map((k, i) => (
-            <KeyCard
-              key={k.id}
-              k={k}
-              onEdit={onEditKey}
-              onDuplicate={onDuplicateKey}
-              isFirst={i === 0}
-              isLast={i === sorted.length - 1}
-              isRoutingPrimary={k.id === routingPrimaryId}
-            />
+            <div key={k.id} ref={(el) => drag.registerCard(k.id, el)}>
+              <KeyCard
+                k={k}
+                onEdit={onEditKey}
+                onDuplicate={onDuplicateKey}
+                isFirst={i === 0}
+                isLast={i === sorted.length - 1}
+                isRoutingPrimary={k.id === routingPrimaryId}
+                onDragHandleDown={drag.onHandleDown}
+                dragging={drag.draggingId === k.id}
+                dropBefore={drag.anchorId === k.id}
+              />
+            </div>
           ))}
+        {/* 拖到列表末尾时的指示线（锚点为 null = 放最后）。没有它，「拖到最后」这个
+            完全正常的意图在界面上没有任何反馈，用户会以为拖出范围了。 */}
+        {drag.draggingId && drag.anchorId === null && (
+          <div aria-hidden className="h-0.5 rounded-full bg-primary" />
+        )}
       </div>
     </div>
   );

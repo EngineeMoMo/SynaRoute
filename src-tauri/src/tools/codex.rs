@@ -63,12 +63,13 @@ use std::path::{Path, PathBuf};
 
 #[path = "codex_paths.rs"] mod codex_paths;
 #[path = "codex_catalog.rs"] pub(crate) mod codex_catalog;
+#[path = "codex_effort.rs"] mod codex_effort;
 #[path = "codex_sessions.rs"] pub(crate) mod codex_sessions;
 #[path = "codex_watch.rs"] pub(crate) mod codex_watch; // config.toml 外部改动监听（轮询 mtime，不引入 notify）；理由见该文件模块头
 pub(crate) use codex_catalog::select_model; // 应用内选 Codex 模型；两个调用点在 lib.rs
 
 use super::{
-    backup_and_write_bytes, prerestore_path_for, read_preview_text, with_rollback,
+    backup_and_write_bytes, backup_path_for, prerestore_path_for, read_preview_text, with_rollback,
     MCP_CLIENT_NAME, PROXY_PLACEHOLDER,
 };
 

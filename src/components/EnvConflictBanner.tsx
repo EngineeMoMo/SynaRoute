@@ -16,13 +16,21 @@ import type { CategoryType, EnvFinding } from "@/types";
 /** 这条发现与用户正在看的分类相关吗。 */
 function relevant(f: EnvFinding, category: CategoryType): boolean {
   if (f.severity !== "conflict") return false;
+  // 🔴 **前缀必须大小写无关地比。** Windows 的环境变量名原生大小写不敏感 —— 客户端读
+  // `ANTHROPIC_API_KEY` 时 `Anthropic_Api_Key` 同样生效，而注册表枚举保留用户写下的原始
+  // 大小写。后端为此走 `env_name_eq`（按宿主平台取语义）把它判成 conflict，而这里若裸
+  // `startsWith`，那条发现会被**这一层**筛掉 → 横幅在它唯一该说话的那次静默不出现，
+  // 用户看到的是「接入说成功、请求一个都没到代理」而应用里一个字都没有。
+  //
+  // ⚠️ 后端修了、前端没跟上，整条链就是断的 —— 那半是静默的（后端 16 条用例全绿）。
+  const name = f.name.toUpperCase();
   // 🔴 **桌面端刻意不报 `ANTHROPIC_*`。** 它压根不读那些环境变量 —— 接入桌面端走的是
   // `deploymentMode=3p` + `configLibrary/{ID}.json`（`tools.rs` 模块头有取证：早期往
   // `claude_desktop_config.json` 写 `baseUrl` 从未生效，因为桌面端「无 baseUrl 概念」）。
   // 在桌面端页面上报它，等于叫用户去删一个与他的故障毫无关系的系统设置，而真正的成因
   // （部署模式没切、配置档没写进去）被这条告警盖住 ——「指错方向的提示比没有提示更糟」。
-  if (f.name.startsWith("ANTHROPIC_")) return category === "claude-cli";
-  if (f.name.startsWith("CODEX_")) return category === "codex";
+  if (name.startsWith("ANTHROPIC_")) return category === "claude-cli";
+  if (name.startsWith("CODEX_")) return category === "codex";
   return false;
 }
 
@@ -129,9 +137,20 @@ export function EnvConflictBanner({ category }: { category: CategoryType }) {
                 </li>
               ))}
             </ul>
-            {/* 报了但不给删的那些（目录类）必须解释清楚 —— 否则用户会找一个不存在的按钮 */}
-            {removable.length < found.length && (
-              <p className="mt-1 opacity-80">{t("env.keepHint")}</p>
+            {/* 报了但不给删的那些必须解释清楚 —— 否则用户会找一个不存在的按钮。
+                🔴 **理由逐条来自后端的 `keepReason`，前端不许自己判「这是哪一类」**：
+                `removable: false` 有两个成因、处置完全相反（目录类是我们刻意不删，正确处置
+                是对齐两侧；process-only 是我们删不掉，正确处置是去 HKLM/父进程把它去掉）。
+                上一版用一句固定文案覆盖，内容只对目录类成立 —— 于是最常见的形态
+                （系统设置里设了 ANTHROPIC_API_KEY，我们启动时继承到）会被告知
+                「重启 SynaRoute 让它继承到」，而用户要的恰恰是让它消失。方向正好相反。
+                去重是因为多条同类只需要说一遍。 */}
+            {Array.from(new Set(found.filter((f) => f.keepReason).map((f) => f.keepReason))).map(
+              (reason) => (
+                <p key={reason} className="mt-1 opacity-80">
+                  {reason}
+                </p>
+              ),
             )}
             {!confirming && removable.length > 0 && (
               <button

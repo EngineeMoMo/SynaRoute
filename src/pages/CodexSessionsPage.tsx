@@ -27,6 +27,16 @@ import { SessionTable } from "@/components/SessionTable";
  * 删除会先把 rollout 备份到应用数据目录（保留 30 天），但仍然走确认框：有备份不等于
  * 可以随手删。
  */
+export function chooseKnownTarget(
+  options: CodexProviderTargetList,
+  previous: string,
+): string {
+  const known = new Set(options.targets.map((o) => o.id));
+  return [previous, options.prefs.lastTarget, options.ours, options.current].find((v) => known.has(v))
+    ?? options.targets[0]?.id
+    ?? "";
+}
+
 export function CodexSessionsPage() {
   const t = useT();
   const [data, setData] = useState<CodexSessionList | null>(null);
@@ -59,9 +69,9 @@ export function CodexSessionsPage() {
       });
       setTargets(tl);
       setAudit(ia);
-      // 选中项优先回填上次选过的，其次是我们自己那个 —— 而不是「当前生效的那个」：
-      // 用户来这一页通常正是因为当前生效的与会话记的不一致。
-      setTarget((prev) => prev || tl.prefs.lastTarget || tl.ours || tl.current);
+      // 只选后端真实列出的 id。`ours` 只是推荐标签，不保证当前 config 声明过它；
+      // 让一个不在 options 里的 value 留在受控 select 中，会显示空白却仍允许写盘。
+      setTarget((prev) => chooseKnownTarget(tl, prev));
       setError(null);
     } catch (e) {
       setError(String(e));

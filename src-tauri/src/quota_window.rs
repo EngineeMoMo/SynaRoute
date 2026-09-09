@@ -86,6 +86,17 @@ pub fn active(key_id: &str) -> bool {
     t.contains_key(key_id)
 }
 
+/// 这条 Key 配额窗口的结束时刻（epoch ms）。不在窗口内 → `None`。
+///
+/// 给 503 闸门算 `Retry-After` 用：`active()` 只回答「挡不挡」，算不出「多久恢复」。
+/// 顺带清过期条目，与 [`active`] 同口径。
+pub fn until_ms(key_id: &str) -> Option<i64> {
+    let now = Utc::now().timestamp_millis();
+    let mut t = table().lock();
+    t.retain(|_, until| *until > now);
+    t.get(key_id).copied()
+}
+
 /// 上游给了 `Retry-After` → 记住它，并在**结论刚变化时**落一条可折叠事件。
 ///
 /// `secs` 直接来自上游响应头（已由调用方解析）。非正值忽略：那既可能是上游填了 0，
@@ -149,6 +160,20 @@ pub(crate) fn reset_for_test() {
     table().lock().clear();
 }
 
+/// 测试专用的串行锁 —— **凡是会 `arm` 或 `reset_for_test` 的用例都必须先拿它**。
+///
+/// 🔴 可见性刻意放到 `crate`：本模块的表是进程级的，而 [`reset_for_test`] 清的是**整张表**。
+/// 于是「别的模块武装了一个窗口 → 本模块某条用例拿锁并清表」会把那个窗口清掉 ——
+/// `model_pool` 那条「配额窗口挡住唯一支持者」用例就是这么在全量下红的（单独跑永远绿，
+/// 又一次只在全量下现形的假绿）。锁提到这里之后两边共用同一把，交错不再可能。
+///
+/// ⚠️ 独有 key id 仍然要给：锁只保证不交错，不保证别的模块看不见你武装的那条。
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    L.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,8 +190,7 @@ mod tests {
     /// 候选挡掉了**。串行锁只保护本模块内部，管不住同进程别的模块。
     /// 单独跑 `cargo test --lib quota_window` 永远绿，这是那类只在全量下现形的假绿。
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let g = L.lock().unwrap_or_else(|e| e.into_inner());
+        let g = super::test_lock();
         reset_for_test();
         g
     }

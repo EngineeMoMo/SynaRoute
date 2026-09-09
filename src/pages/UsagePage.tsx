@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { api } from "@/lib/bridge";
+import { useBackendEvent, FALLBACK_POLL_MS } from "@/lib/useBackendEvents";
+import { usePolling } from "@/lib/usePolling";
 import { useT } from "@/lib/useT";
 import type { TFunc } from "@/lib/i18n";
 import type { DailyUsageBucket, TokenUsage, UnpricedReason, UsageCostRow } from "@/types";
@@ -36,7 +38,18 @@ export function UsagePage() {
   const [tableDate, setTableDate] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
 
+  /**
+   * 在途请求的代际号。**只允许最新那一轮提交结果。**
+   *
+   * 没有它时的竞态：事件推送与兜底轮询几乎同时触发两轮 load，先发的那轮后到
+   * （IPC 之间没有先后保证）→ 它把**更旧**的快照写进 state。表现是「刚发的请求，
+   * 用量数字反而退回去了」，而下一轮才纠正。本仓在 `loadCategory` / 分类页横幅上
+   * 已经为同一形态修过两次。
+   */
+  const genRef = useRef(0);
+
   const load = async () => {
+    const gen = ++genRef.current;
     try {
       // 四个请求并发发，避免标题/趋势慢一拍导致界面闪一下旧值。
       const [next, since, buckets, priceDate] = await Promise.all([
@@ -45,6 +58,8 @@ export function UsagePage() {
         api.getDailyUsage(),
         api.getPricingTableDate(),
       ]);
+      // 过期结果丢弃（见 genRef）。
+      if (gen !== genRef.current) return;
       // **对后端返回做形状校验**，而不是直接塞进 state。
       //
       // 为什么必需：本页多处直接 `.map()` / 解引用 `r.usage.input`。若某条数据缺字段
@@ -58,17 +73,31 @@ export function UsagePage() {
       setTableDate(typeof priceDate === "string" ? priceDate : "");
       setError(null);
     } catch (e) {
+      if (gen !== genRef.current) return;
       setError(String(e));
     }
   };
 
-  useEffect(() => {
-    void load();
-    // 用量随事件变化，但面板是低频查看——进页面拉一次即可，不常驻高频轮询。
-    const id = window.setInterval(() => void load(), 30_000);
-    return () => window.clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  /**
+   * 🔴 **实时性靠后端推送，不靠缩短轮询**（2026-09-09 用户实报「用量统计也不是实时」）。
+   *
+   * 后端在收到 usage 的**同一次调用内**就更新了内存累计（`append_event_full`），
+   * 而 `daily_usage_buckets` 也会把尚未落盘的增量并进当天桶 —— 也就是说数据早就是新的，
+   * **陈旧完全发生在前端**：本页此前只在挂载、手点刷新、以及一个裸 `setInterval(30s)` 时拉数据，
+   * 而全仓早就有 `useBackendEvent`（日志页、分类页都在用），本页从来没接。
+   * 所以改的不是 60s 落盘周期（那只关系到异常退出丢多少历史），而是这里的接线。
+   *
+   * 订阅两个主题，各自对应一类用户可感知的变化：
+   * - `logs`：一次转发记完账就会发（流式在流末补记时也发）→ 用量数字跟着涨。
+   *   后端对该主题限速 1500ms，密集请求下不会把这四个 IPC 打成高频。
+   * - `config`：Key 增删改名、改计费倍率会发 → 表格里的名字/金额跟着变，
+   *   **新加的 Key 也在这时出现**（后端现在为零用量 Key 也产出占位行）。
+   *
+   * 轮询降级为兜底并改用 `usePolling`：它自带「窗口不可见时停表、重新可见立即补一次」，
+   * 而裸 `setInterval` 在最小化到托盘后仍在跑（本应用的常态使用姿势就是丢后台）。
+   */
+  useBackendEvent(["logs", "config"], () => void load());
+  usePolling(() => void load(), FALLBACK_POLL_MS);
 
   /** 总计（token 与估算金额）。金额只累加**有单价**的行，无单价的不计入。 */
   const summary = useMemo(() => {
@@ -80,6 +109,11 @@ export function UsagePage() {
       output += r.usage.output;
       cacheRead += r.usage.cacheRead ?? 0;
       cacheCreation += r.usage.cacheCreation ?? 0;
+      // 🔴 占位行不计入「未计入金额的条数」：那个角标是在说「有 N 行的钱没算进这个总数」，
+      // 而它们压根没有消耗可算。把它们算进去会让一个刚加了 3 条 Key 的用户看到
+      // 「＋3 行未计入」，然后去翻横幅找原因 —— 而横幅里一条也没有（它们没有成因），
+      // 那是一条指向空处的提示。
+      if (!r.hasRecordedUsage) continue;
       if (r.costNano == null) unpriced += 1;
       else costNano += r.costNano;
     }
@@ -102,6 +136,8 @@ export function UsagePage() {
       g[reason.kind] += 1;
       if (reason.kind === "modelNotInTable") models.add(reason.model);
     }
+    // 占位行（还没捕获过 usage）刻意不出现在这里：后端不给它们 unpricedReason，
+    // 因为那张表的每一支都在指挥用户去改配置，而这里没有任何配置需要改。
     return { ...g, models: [...models] };
   }, [rows]);
 
@@ -380,6 +416,26 @@ function StatCard({
  * 键盘与触屏用户完全拿不到那句解释 —— 而这一格恰恰是最需要解释的一格。
  */
 function CostCell({ row, t, tableDate }: { row: UsageCostRow; t: TFunc; tableDate: string }) {
+  // 还没捕获过 usage：显示「尚无用量」而不是 $0.0000。
+  //
+  // 🔴 后者读起来是「已经在服务、而且免费」，而真相是我们一次上游回报都没收到
+  // （可能尚未使用、流仍在进行、或这个中转站不回 usage）。三种成因我们**分辨不出**，
+  // 所以 tooltip 写成条件句、把「取决于什么」如实交给用户，不猜一个原因。
+  if (!row.hasRecordedUsage) {
+    const hint = t("usage.noUsageYetHint");
+    return (
+      <Tooltip content={hint} side="left">
+        <span
+          tabIndex={0}
+          role="note"
+          aria-label={hint}
+          className="cursor-default rounded text-text-muted outline-none focus-visible:ring-1 focus-visible:ring-primary"
+        >
+          {t("usage.noUsageYet")}
+        </span>
+      </Tooltip>
+    );
+  }
   if (row.costNano == null) {
     const hint = unpricedHint(row.unpricedReason, t, tableDate);
     return (

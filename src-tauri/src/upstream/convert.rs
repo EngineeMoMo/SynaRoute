@@ -81,26 +81,25 @@ fn read_reasoning_effort(body: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// OpenAI 推理强度档位 → Anthropic thinking 的 budget_tokens。
-/// 两套机制不同：OpenAI 用离散档位，Anthropic 用 token 预算。取常见推荐区间做映射，
-/// 并按 max_tokens 钳制（budget 必须 < max_tokens，且留出足够输出空间，否则 Anthropic 400）。
-/// minimal → 不开思考（返回 None）；其余档位给递增预算。
+/// OpenAI 离散推理档位 → Anthropic token 预算；按 max_tokens 钳制并尽量保住档位顺序。
 fn effort_to_thinking_budget(effort: &str, max_tokens: u64) -> Option<u64> {
-    let base = match effort.to_ascii_lowercase().as_str() {
-        "minimal" => return None, // 最低档：不启用扩展思考，直接普通回答
-        "low" => 2048,
-        "medium" => 8192,
-        "high" => 16384,
-        "xhigh" => 32768, "max" => 65536, "ultra" => 131072, // 后两档官方 gpt-5.6-* 声明（26.901.5280.0 实测）
-        _ => return None, // 未知档位：不擅自开思考
+    let (rank, base) = match effort.to_ascii_lowercase().as_str() {
+        "minimal" => return None, // 最低档：不启用扩展思考
+        "low" => (0u64, 2048), "medium" => (1, 8192),
+        "high" => (2, 16384), "xhigh" => (3, 32768),
+        "max" => (4, 65536), "ultra" => (5, 131072),
+        _ => return None, // 未知档位不擅自开思考
     };
     // Anthropic 硬约束：`budget_tokens >= 1024` 且 **< max_tokens** → max_tokens > 1024 即可开。
-    // 旧门槛 `< 2048` 是从「cap 取一半后不低于 1024」反推的实现细节，于是 [1025, 2047] 区间明明
-    // 能开却**静默不开思考**；改后最坏是回答被截断，而截断可见（`was_truncated`）。同「最大单次输出」那条。
     if max_tokens <= 1024 {
         return None;
     }
-    Some(base.min(max_tokens / 2).max(1024).min(max_tokens - 1))
+    let cap = (max_tokens / 2).max(1024).min(max_tokens - 1);
+    // 低 max_tokens 下多个 base 会一起撞到 cap。按档位给最高端预留相邻整数，既保住
+    // 「最多一半给思考」又让真实生产区间（≥8192）六档严格递增；不再出现选 max/ultra
+    // 发出同一个 budget 的界面撒谎。极端 [1025,2047] 只有一个合法半窗值，无法区分。
+    let higher = 5 - rank;
+    Some(base.min(cap.saturating_sub(higher)).max(1024).min(max_tokens - 1))
 }
 
 /// 消费 `openai_to_anthropic` 暂存的 `_pending_effort`，在 max_tokens 补齐后补打 thinking。
@@ -1702,13 +1701,13 @@ mod tests {
         assert_eq!(effort_to_thinking_budget("high", 64_000), Some(16384));
         assert_eq!(
             effort_to_thinking_budget("xhigh", 64_000),
-            Some(32_000),
-            "xhigh 的基准 32768 被 max_tokens 的一半（32000）钳住 —— 留一半给回答是刻意的"
+            Some(31_998),
+            "给 max/ultra 在 32000 封顶下各留一个更高整数，六档才不会塌成同值"
         );
         assert_eq!(
             effort_to_thinking_budget("xhigh", 8_000),
-            Some(4000),
-            "预算被 max_tokens 的一半钳住"
+            Some(3998),
+            "4000 封顶下给 max/ultra 各留一个更高整数，xhigh 取 3998"
         );
         // 未知档位与 minimal 仍不开
         assert_eq!(effort_to_thinking_budget("minimal", 64_000), None);
@@ -1724,13 +1723,15 @@ mod tests {
             Some(100_000),
             "ultra 的基准 131072 被 max_tokens 的一半（100000）钳住"
         );
-        // 递增必须严格：两档给同一个预算 = 用户切档位没有任何效果。
-        for (lo, hi) in [("low", "medium"), ("medium", "high"), ("high", "xhigh"), ("xhigh", "max"), ("max", "ultra")] {
-            let (a, b) = (
-                effort_to_thinking_budget(lo, 400_000).unwrap(),
-                effort_to_thinking_budget(hi, 400_000).unwrap(),
-            );
-            assert!(a < b, "{lo}({a}) 必须严格小于 {hi}({b})");
+        // 递增必须在**真实生产区间**里严格：只测 400k 会让 128k / 8k 的塌档假绿。
+        for mt in [8_000u64, 64_000, 128_000, 200_000] {
+            let values: Vec<u64> = ["low", "medium", "high", "xhigh", "max", "ultra"]
+                .iter()
+                .map(|e| effort_to_thinking_budget(e, mt).unwrap())
+                .collect();
+            for pair in values.windows(2) {
+                assert!(pair[0] < pair[1], "max_tokens={mt} 下档位未严格递增：{values:?}");
+            }
         }
     }
 

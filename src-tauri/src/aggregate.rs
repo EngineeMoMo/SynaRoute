@@ -8,9 +8,7 @@ use crate::error::{AppError, AppResult};
 use crate::aggregate_phase::{
     decider_floor_ms, decider_phase_budget_ms, upstream_phase_budget_ms, PHASE_MIN_BUDGET_MS,
 };
-use crate::model::{
-    AggregateMode, BrainConfig, CategoryType, Protocol, RequestTrace,
-};
+use crate::model::{AggregateMode, BrainConfig, CategoryType, Protocol, RequestTrace};
 use crate::retrieval;
 use crate::store::Store;
 use crate::upstream;
@@ -100,17 +98,10 @@ fn trace_for_ref(
 
 /// 从 `keyId::modelName` 引用里取出 keyId。
 ///
-/// # 为什么这个两行函数值得存在
-///
-/// 聚合的每一条 `append_event_full` 此前都把 `key_id` 传成 `None`（**8 处全是**，6 处带 usage），
-/// 而累加器键是 `(分类, key_id.unwrap_or_default())` → 消耗全落进 `(分类, "")` 一个桶：
-/// 用量页显示「（系统级）」，且 `usage_cost::rows` 查不到 Key → 取不到代表模型与计费倍率
-/// → **花费列恒为「—」**（用户报的正是这个）。
-///
-/// 而 key_id 在那 6 处**全都在作用域里**（决策者/汇总者是 `keyId::model` 引用，成员侧有
-/// `BrainMember.key_id`）—— 不是拿不到，是记账时扔了。有源码级判据
-/// `aggregate_usage_is_never_recorded_without_a_key` 盯着：「记得传 key_id」是必然会漏的
-/// 纪律，而漏掉的表现是静默的。
+/// 聚合的每一条 `append_event_full` 此前都把 `key_id` 传成 `None`（8 处全是），
+/// 累加器键是 `(分类, key_id.unwrap_or_default())` → 消耗全落进 `(分类, "")` 一个桶，
+/// 用量页显示「（系统级）」、花费列恒为「—」。而 key_id 在那几处**全都在作用域里**
+/// —— 不是拿不到，是记账时扔了。有源码级判据盯着：「记得传」是必然会漏的纪律。
 fn ref_key_id(reference: &str) -> Option<&str> {
     reference.split_once("::").map(|(key_id, _)| key_id)
 }
@@ -181,7 +172,9 @@ pub async fn run_plan(
     // 取开始而不是结束：检索发生在最开头，决策者手里的就是那一刻的文件内容，
     // 于是「Phase1 跑了 60 秒、用户在这期间改了文件」也能被 Phase2 判出来。
     let plan_started_ms = chrono::Utc::now().timestamp_millis();
-    let work_dir = resolve_work_dir(&brain);
+    // 🔴 读用带兜底的，pin 给 Phase2 的只能是明确指定过的那个（见 `resolve_writable_work_dir`）。
+    let read_dir = resolve_work_dir(&brain);
+    let writable = write::resolve_writable_work_dir(&brain);
     let out = round::run(
         store,
         category,
@@ -191,34 +184,29 @@ pub async fn run_plan(
             prompt,
             // 桌面端 UI 这条路径不接受图片（只有 MCP 的 images 参数会传图，见 run_mcp）。
             images: &[],
-            work_dir,
+            work_dir: read_dir,
         },
     )
     .await?;
+    // 刻意不用 `out.work_dir`（那是**读**那一份的回显，带兜底）。`Some("")` 让 Phase2 走
+    // 「明确无工作目录」那一支：仍跑决策者，但预览恒空、一个文件都不写。
     Ok(AggregateResult::Plan {
         content: out.analysis,
-        work_dir: out.work_dir,
+        work_dir: Some(writable.unwrap_or_default()),
         plan_started_ms,
     })
 }
 
 /// Phase2a: 决策者按已确认的计划输出完整文件内容，解析成**落盘预览** —— 一个字节都不写。
 ///
-/// # 为什么要有这一步
+/// 用户在 Phase1 确认的是**计划文本**，完整文件内容是 Phase2 才生成的。原实现
+/// 「确认执行」一点就直接落盘：用户从未看到将写入的字节，而这是整套功能里唯一不可逆的动作。
+/// 现在拆成「出内容 + 预览」（本函数）与「按原文落盘」（[`run_write`]）两步。
 ///
-/// 用户在 Phase1 确认的是**计划文本**，而完整文件内容是 Phase2 才生成的。原实现里
-/// 「确认执行」一点就直接落盘：用户从未看到将写入的字节，也没有「将改动这 N 个文件」的清单，
-/// 而这是整套功能里唯一不可逆的动作。现在拆成「出内容 + 预览」（本函数）与
-/// 「按原文落盘」（[`run_write`]）两步，中间插一次用户确认。
-///
-/// # `pinned_work_dir` 的三种形态
-///
-/// - `Some(非空)`：Phase1 定下的目录，原样用。
-/// - `Some("")`：Phase1 明确「无工作目录」（用户没配、也没有活跃会话）。仍跑决策者
-///   —— 信息查询类的问题不需要目录 —— 但预览恒空，且不会写任何文件。
-/// - `None`：老前端 / 直接调 IPC。**刻意不回退实时解析**：`resolve_work_dir` 会去扫会话
-///   历史挑一个「最近活跃」的项目，那意味着往一个用户从未指定过的目录写文件。读路径上那是
-///   便利，写路径上是越权。当成「无工作目录」处理。
+/// `pinned_work_dir` 三种形态：`Some(非空)` = Phase1 定下的目录；`Some("")` = Phase1 明确
+/// 「无工作目录」（仍跑决策者、预览恒空、不写任何文件）；`None` = 老前端 / 直接调 IPC，
+/// **刻意不回退实时解析**（`resolve_work_dir` 会去扫会话历史挑一个用户从未指定的项目
+/// —— 读路径上那是便利，写路径上是越权）。当成「无工作目录」处理。
 pub async fn run_preview(
     store: &Arc<Store>,
     category: CategoryType,
@@ -256,10 +244,14 @@ pub async fn run_preview(
         String::new()
     };
 
+    // 🔴 要求四反引号、且外层必须比正文里最长的围栏更长。原先给三反引号，正文里任何
+    // 一行 ``` 都会提前闭合，写出半个文件并报成功。完整取证见 `parse_blocks`。
     let exec_prompt = format!(
         "用户已确认以下修改计划，请执行。\n\
          对于每个需要修改的文件，输出完整的新文件内容，格式如下：\n\
-         ```file:相对路径\n完整文件内容\n```\n\n\
+         ````file:相对路径\n完整文件内容\n````\n\n\
+         围栏用**四个**反引号。若文件内容本身含有反引号围栏（例如 Markdown 的代码块、\
+         或带文档示例的源码），外层围栏必须比正文里出现的最长围栏更长，否则内容会被截断。\n\n\
          ## 用户需求\n{prompt}\n\n\
          ## 确认的计划\n{plan}\n\n\
          {file_section}\
@@ -454,12 +446,14 @@ pub async fn run_mcp(
 
 // ─── 内部辅助 ───────────────────────────────────────────────────────────────
 
-/// 解析实际使用的工作目录。
+/// 解析**读**路径（检索 / 只读工具）的工作目录。
 ///
 /// 优先级：`auto_follow_active` 开启时用会话历史里最近活跃的目录；否则用手工 `work_dir`。
 /// **两者都拿不到时兜底去扫会话历史**——旧实现在此直接返回 None，于是「开了检索但没填目录、
 /// 也没勾自动跟随」这个最常见的默认状态下检索整段跳过、且无任何提示。既然 [`crate::workdirs`]
 /// 已经能从 Claude CLI / Codex / 桌面端会话历史里读出 cwd，就该用它兜底而不是干脆不检索。
+///
+/// 🔴 **返回值不许直接当写入根** —— 用 [`write::resolve_writable_work_dir`]。见那里的论证。
 fn resolve_work_dir(brain: &BrainConfig) -> Option<String> {
     if brain.auto_follow_active {
         if let Ok(list) = crate::workdirs::scan() {
@@ -1057,11 +1051,12 @@ async fn call_ref(
     // 上游瞬时错误仍可按设置做同 Key 重试（upstream_retry），但绝不会换成别的 Key。
     // 单请求 HTTP 超时同样给预算 +5s 余量（勿用 key 的 30s 代理级超时，见 gather_members 注释）。
     let req_timeout = Duration::from_millis(budget_ms.saturating_add(5_000));
-    let call = upstream::text_completion(&key, &secret, model, prompt, max_tokens, retry, req_timeout);
+    let call = async { // 排队算阶段墙钟；超时 drop future 自动取消，不归罪上游
+        let _permit = crate::health::concurrency::acquire(&key.id).await;
+        upstream::text_completion(&key, &secret, model, prompt, max_tokens, retry, req_timeout).await
+    };
     let result = match timeout(Duration::from_millis(budget_ms), call).await {
-        // 🔴 上游说「N 秒后再来」就武装配额窗口。**只在它真给了头时**武装 —— 凭空造窗口会
-        // 误挡偶发限流的好 Key。取证与两个方向的判据见
-        // `an_upstream_retry_after_arms_the_quota_window_from_the_aggregate_path`。
+        // 只在上游真给 Retry-After 时武装；凭空造窗口会误挡偶发限流的好 Key。
         Ok(Err(e)) => {
             if let Some(secs) = e.upstream_retry_after() {
                 crate::health::quota_window::arm(store, category, &key.id, secs);
@@ -1634,6 +1629,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 🔴 **写入根只能来自用户明确指定过的目录，不许来自会话历史兜底。**
+    ///
+    /// 读路径的兜底（`resolve_work_dir` 扫会话历史挑「最近活跃」的项目）是刻意的便利，
+    /// 但那个目录**不许**成为写入根 —— 用户从未为这次操作指定过它。
+    ///
+    /// 触发的是**默认状态**：`retrieval_enabled` 开着、没填 `work_dir`、没勾自动跟随。
+    /// 旧实现里 `run_plan` 把带兜底的结果当 pin 交给 Phase2，于是决策者生成的完整文件内容
+    /// 被写进一个用户从未指定的仓库（同名路径直接覆盖、其余新建，还留下 `.synaroute.bak`）。
+    /// `run_preview` 那条「不回退实时解析」只挡住了 Phase2 自己再解析一次，挡不住这个绕行。
+    ///
+    /// 这条不真跑一轮聚合（那要起上游），而是直接压两个解析函数的差集 + 一条源码级接线：
+    /// `run_plan` 回给前端的 `work_dir` 必须取自 `write::resolve_writable_work_dir`。
+    #[test]
+    fn the_write_root_never_comes_from_the_session_history_fallback() {
+        // 经 serde 构造：`BrainConfig` 没有 `Default`，而逐字段列举会在加字段时到处要改。
+        let brain_with = |extra: serde_json::Value| -> BrainConfig {
+            let mut v = serde_json::json!({
+                "categoryId": "claude-cli",
+                "aggregateMode": "full",
+                "enabled": true,
+            });
+            let (obj, add) = (v.as_object_mut().unwrap(), extra);
+            for (k, val) in add.as_object().unwrap() {
+                obj.insert(k.clone(), val.clone());
+            }
+            serde_json::from_value(v).expect("夹具应能反序列化")
+        };
+
+        // 默认状态：没填目录、没勾自动跟随。
+        let brain = brain_with(serde_json::json!({ "autoFollowActive": false }));
+        assert_eq!(
+            write::resolve_writable_work_dir(&brain),
+            None,
+            "🔴 没有任何明确指定时，可写目录必须是 None —— 兜底扫描的结果不许当写入根"
+        );
+
+        // 明确填了目录 → 认。
+        let explicit =
+            brain_with(serde_json::json!({ "workDir": "C:/work/demo", "autoFollowActive": false }));
+        assert_eq!(
+            write::resolve_writable_work_dir(&explicit).as_deref(),
+            Some("C:/work/demo"),
+            "用户明确填了就必须用它"
+        );
+        // 空白串等于没填（前端清空输入框留下的形态）。
+        let blank = brain_with(serde_json::json!({ "workDir": "   ", "autoFollowActive": false }));
+        assert_eq!(write::resolve_writable_work_dir(&blank), None, "空白串必须等于没填");
+
+        // 接线：Phase1 回给前端的那一位必须来自可写解析，而不是读解析的回显。
+        let src = std::fs::read_to_string("src/aggregate.rs").unwrap();
+        let prod = crate::proxy::custom_headers::production_code_only(&src);
+        let at = prod.find("pub async fn run_plan").expect("函数改名了 —— 先修判据");
+        let body = &prod[at..prod[at..].find("\n}").map(|i| at + i).unwrap_or(prod.len())];
+        assert!(
+            body.contains("write::resolve_writable_work_dir(&brain)"),
+            "run_plan 必须用可写解析算出 pin：{body}"
+        );
+        assert!(
+            !body.contains("work_dir: out.work_dir"),
+            "🔴 不许把读那一份的回显当成 pin 交给 Phase2 —— 那就是绕行越权的本体"
+        );
+    }
+
     /// 🔴 成员路径与决策者/汇总者路径必须**同一个判据**。
     ///
     /// 上面那条只覆盖 `call_ref`（决策者/汇总者）。成员路径在 `gather_members` 里，
@@ -1877,6 +1935,45 @@ mod tests {
                 want_armed,
                 "{why}（err={err}）"
             );
+        }
+    }
+
+    /// 🔴 **成员路径也必须武装配额窗口**。决策者走 `call_ref`，成员走 `ToolSession`，
+    /// 两条 HTTP 链完全独立；只测上一条会让「修了一半」静默复发。
+    ///
+    /// 这条同时压三环：`session.rs` 必须在 `resp.text()` 前读头并塞进 AppError；
+    /// `tool_loop.rs` 必须在转成 MemberError 前 arm；上游没给头时绝不凭空造窗口。
+    #[tokio::test]
+    async fn a_member_retry_after_also_arms_the_quota_window() {
+        for (retry_after, want_armed) in [(Some("37"), true), (None, false)] {
+            let upstream = spawn_status(429, retry_after).await;
+            let (sdir, store) = test_store("member_qw");
+            let mut key = test_key(&upstream);
+            key.id = format!("qw_member_{}", if retry_after.is_some() { "hit" } else { "none" });
+            store.upsert_key(key.clone()).unwrap();
+            let mut session = ToolSession::new(
+                Protocol::Anthropic,
+                &MultimodalPrompt::from_text("在吗"),
+            );
+            let err = run_member_turns(
+                &store,
+                CategoryType::ClaudeCli,
+                &mut session,
+                &ctx_for(&key, "sk", "mock/m"),
+                None,
+                2,
+                60_000,
+                0,
+            )
+            .await
+            .expect_err("429 必须是错误");
+            assert!(err.to_string().contains("429"), "{err}");
+            assert_eq!(
+                crate::health::quota_window::active(&key.id),
+                want_armed,
+                "成员路径必须只在上游真给 Retry-After 时武装（err={err}）"
+            );
+            let _ = std::fs::remove_dir_all(sdir);
         }
     }
 

@@ -911,30 +911,14 @@ async fn handle_request_inner(
             }
             None => None,
         };
-        // 🔴 第二跳的「宁可报错也不悄悄换模型」：这条候选会把用户点名的模型换掉就跳过它。
-        // 循环前那道 `reject_if_unserviceable` 只判一次（那时首选还没失败），降级恰恰发生在这里。
-        // 全部候选都会降级时循环走到尾部，由既有全失败分支回 503 —— 正是我们要的结果。
-        if model_pool::would_silently_substitute(&store, category, &requested_model, key) {
-            last_err = format!(
-                "「{}」不支持 {requested_model}（会被兜底改写成 {}），已跳过：你点名的模型不该被悄悄换掉",
-                key.name,
-                key.resolve_model(&requested_model)
-            );
-            continue;
-        }
-        let started = std::time::Instant::now();
         let next = candidates.get(i + 1);
-        // 上一候选若因思考块签名被拒 → 就地摘掉再给本候选用。刻意放在**共享前段**而不是某条失败
-        // 分支里：失败分支有三条（流式非 2xx / 非流式非 2xx / 连接层），挂一条必然漏掉另两条。
-        crate::upstream::rectify_thinking_signature(&last_err, &mut req_json, &store, category, key);
-        // 故障转移日志：写清「谁失败（客户端要什么/实际打的什么）→ 转给谁」，避免只写「尝试下一个」看不出链路。
+        // 故障转移日志：写清「谁失败（客户端要什么 / 实际上游用什么 / 为什么改）→ 转给谁」。
         let log_failover = |store: &Arc<Store>,
                             failed: &ProviderKey,
                             verb: &str,
                             err: &str,
                             next: Option<&ProviderKey>| {
             let failed_model = fmt_route_model_for_key(failed, &requested_model);
-            // 用 · 分隔 Key 名 / 模型段 / 动词，避免视觉黏连产生「Key 上有 X」误读。
             let detail = match next {
                 Some(n) => {
                     let next_model = fmt_route_model_for_key(n, &requested_model);
@@ -948,7 +932,6 @@ async fn handle_request_inner(
                     failed.name, failed_model, verb, err
                 ),
             };
-            // 有后续时附简短原因；无后续时原因已写在 detail 里，避免重复。
             let detail = if next.is_some() && !err.is_empty() {
                 format!("{detail}（{err}）")
             } else {
@@ -956,6 +939,33 @@ async fn handle_request_inner(
             };
             store.append_event(category, "failover", Some(&failed.id), &detail);
         };
+        // 🔴 第二跳「宁可报错也不悄悄换模型」：循环前 `reject_if_unserviceable` 只判一次
+        // （那时首选还没失败），降级恰恰发生在这里。
+        //
+        // ⚠️ **「全员都被跳过」到不了循环尾** —— 排序第一位是 `Confidence`，而
+        // `may_serve == (confidence != Fallback)`：全员 Fallback 时循环前那道门已经回 503。
+        // 故这一支必然发生在「某个 Native/Unknown 候选已经失败过」之后，`last_err` 非空、
+        // 尾部按那次失败的性质分流。**别在尾部为它加「last_status 为空就回 503」那种守卫**：
+        // 指纹不排他（预算耗尽与连接层失败也是 None，那两种该 529），而且守的是死分支。
+        //
+        // 跳过**必落事件**：否则这一步在日志的 failover 组里完全不可见，排障看不出
+        // 「为什么这条 Key 没被试」。只在还没有真实失败记录时才写 last_err。
+        if model_pool::would_silently_substitute(&store, category, &requested_model, key) {
+            let skip_err = format!(
+                "「{}」不支持 {requested_model}（会被兜底改写成 {}），已跳过：你点名的模型不该被悄悄换掉",
+                key.name,
+                key.resolve_model(&requested_model)
+            );
+            if last_err.is_empty() {
+                last_err = skip_err.clone();
+            }
+            log_failover(&store, key, "跳过", &skip_err, next);
+            continue;
+        }
+        let started = std::time::Instant::now();
+        // 上一候选若因思考块签名被拒 → 就地摘掉再给本候选用。刻意放在**共享前段**
+        // 而不是某条失败分支里：失败分支有三条，挂一条必然漏掉另两条。
+        crate::upstream::rectify_thinking_signature(&last_err, &mut req_json, &store, category, key);
 
         // 分层记账：把这次失败罚到**正确的作用域**（见 [`failure_scope`]）。
         //
@@ -1116,6 +1126,9 @@ async fn handle_request_inner(
                     // 本地配置错误（缺 maxOutputTokens 等）与连接层失败分开处理：前者永不自愈、
                     // 与 Key 无关，不该熔断、不该按临时错误 529 重试（见 config_error 声明）。
                     let is_config_err = matches!(e, AppError::Invalid(_));
+                    // 我们自己的排队超时：临时性（故障转移继续试下一个），**不计熔断**。
+                    // 一条完好、只是正忙的 Key 连撞三次就被熔断 60s —— 见 `AppError::QueueTimeout`。
+                    let is_queue = e.is_queue_timeout();
                     last_err = e.to_string();
                     last_status = None; // 连接层失败：无状态码，按临时错误对待
                     // 连接层失败属临时性，但**配置错误（Invalid）走的也是这个分支**、它永不自愈，
@@ -1126,7 +1139,9 @@ async fn handle_request_inner(
                     config_error = is_config_err;
                     log_request(&store, key, elapsed, String::new(), key.resolve_model(&requested_model), downstream_body.clone(), last_err.clone(), None, false);
                     // 被我们自己的预算掐短的尝试不计熔断（见 budget_truncated_attempt）。
+                    // 排队超时同理：掐它的是本模块自己的信号量，不是上游。
                     if !is_config_err
+                        && !is_queue
                         && !budget_truncated_attempt(
                             elapsed,
                             remaining,
@@ -1276,6 +1291,10 @@ async fn handle_request_inner(
             Err(e) => {
                 // 同流式分支：区分本地配置错误与连接层失败（见 config_error 声明）。
                 let is_config_err = matches!(e, AppError::Invalid(_));
+                // 同流式分支：我们自己的排队超时不计熔断（见 `AppError::QueueTimeout`）。
+                // 🔴 **两条路径必须同口径** —— 只改流式那条，非流式的客户端照旧被误熔断，
+                // 而那半是静默的（本仓「只修了一条路径」栽过多次）。
+                let is_queue = e.is_queue_timeout();
                 last_err = e.to_string();
                 last_status = None; // 连接层失败：无状态码，按临时错误对待
                 // 连接层失败属临时性，但**配置错误（Invalid）走的也是这个分支**、它永不自愈，
@@ -1296,6 +1315,7 @@ async fn handle_request_inner(
                     false,
                 );
                 if !is_config_err
+                    && !is_queue
                     && !budget_truncated_attempt(
                         elapsed,
                         remaining,
@@ -1311,36 +1331,14 @@ async fn handle_request_inner(
 
     store.append_event(category, "error", None, &format!("全部 Key 失败: {last_err}"));
 
-    // 诊断头：把**最后一次**上游状态码带给下游。
-    //
-    // 这是这组头在失败路径上最值钱的一个字段：下游只会看到我们合成的 529 / 或原样回传的
-    // 4xx，看不出「是上游真的 429 了」还是「代理这边判成了配置错误」。有了它，用户贴一条
-    // `x-synaroute-upstream-status: 401` 就直接指向密钥失效，不必先怀疑网络/额度。
-    // 连接层失败无状态码（`last_status` 为 None）→ 头省略，本身也是一个信号。
     meta.upstream_status = last_status;
 
-    // 按「最后一次失败的性质」分流。全部候选失败有两类完全不同的成因，给下游同一个状态码
-    // 是错的：
+    // 全失败分流：临时性（429/408/409/5xx/连接层）→ 529 + Retry-After + 短路窗口；
+    // 硬错误（401/403/404、协议不匹配 501）→ 原样回该码，不带 Retry-After、不武装窗口。
+    // 整池口径看 `saw_transient` 而不是最后一个候选（混合池 k1=429 / k2=401 时尾部
+    // 只看到 401，会把「7 秒后就能用」讲成「密钥错了」）。
     //
-    // - **临时性**（429 限流 / 408 超时 / 409 冲突 / 5xx / 连接层失败）：等一等可能真的会好。
-    //   回 529 `overloaded_error` + `Retry-After`，客户端据此退避重试。（此前用 502 →
-    //   `api_error`，客户端重试行为不确定，实测表现为立刻重发、把失败放大成轮询。）
-    //   并武装短路窗口，挡住窗口内的重发。
-    //
-    // - **硬错误**（401/403/404 等其余 4xx、协议不匹配的 501）：密钥填错、模型名不存在、
-    //   下游要流式而该 Key 协议无法翻译 —— 这些等到宇宙尽头也不会好转。若也回 529，客户端会当
-    //   「上游过载」持续退避重试，界面上呈现「过载」而真实根因是配置错误，方向完全相反；
-    //   而且短路窗口一到期就放行一个真实请求再撞一次 401，如此循环。故**原样回该状态码**、
-    //   **不带 Retry-After**、**不武装短路窗口**：让客户端第一次就拿到确定的失败，
-    //   用户去改配置。
-    //
-    // 429/408/409 之所以划进临时性：它们本就是「稍后重试」语义，且与 Anthropic SDK 的
-    // 重试判据（408/409/429 或 >= 500）一致。
-    //
-    // **整池口径**：`all_failed_is_hard_error` 只看最后一个候选，而 last_status 被每个候选无条件
-    // 覆盖。混合池（k1 撞配额 429+Retry-After / k2 过期 Key 回 401）下尾部只看到 401 → 原样回
-    // 401、丢掉 Retry-After、不武装短路窗口，把「7 秒后就能用」讲成「密钥错了」。故只要**池里
-    // 出现过**临时性失败（saw_transient），整轮就按临时性处置。硬错误码仍在 failover 事件里可见。
+
     let is_hard_error = !saw_transient && all_failed_is_hard_error(config_error, last_status);
 
     if is_hard_error {
@@ -1647,8 +1645,12 @@ async fn try_stream_to_key(
         Some(b) => key_to.min(b),
         None => key_to,
     };
-    // 并发槽位：满了就在这里排队（不拒绝，理由见 `concurrency` 模块头）。
-    let permit = crate::health::concurrency::acquire(&key.id).await;
+    // 并发槽位：满了就排队（不拒绝，理由见 `concurrency` 模块头）。🔴 **排队算进本次预算** ——
+    // 裸 `acquire` 再给 `send()` 完整 `probe_to`，用户配的超时会变成「排队 N 秒 + 探头
+    // probe_to」，且整段排队逃出故障转移 deadline（`budget_left` 是排队前算的）。
+    let (permit, probe_to) = crate::health::concurrency::acquire_with_budget(&key.id, probe_to)
+        .await
+        .map_err(|_| queue_timeout_err(key, probe_to))?;
     let send_fut = rb.send();
     let resp = match tokio::time::timeout(probe_to, send_fut).await {
         Ok(r) => r.map_err(|e| AppError::upstream_msg(format!("连接 {url} 失败: {e}")))?,
@@ -2393,6 +2395,14 @@ async fn forward_to_key(
         Some(b) => key_to.min(b),
         None => key_to,
     };
+    // 并发槽位。非流式不用搬运它：`resp.bytes()` 在同一作用域 await 完，permit 随函数返回落地。
+    // 🔴 **必须排在建 `rb` 之前**：reqwest 的 `.timeout()` 从 `send()` 起算，先建带完整超时的
+    // rb 再排队与流式那条是同一个缺陷（排队时间凭空加在预算之外）。两条路径必须同口径。
+    let (_permit, effective_to) =
+        crate::health::concurrency::acquire_with_budget(&key.id, effective_to)
+            .await
+            .map_err(|_| queue_timeout_err(key, effective_to))?;
+
     // 请求头统一由 apply_upstream_headers 装齐（与流式路径共用同一实现，防两条路径分叉）。
     // **超时留在这里设**：非流式要等上游完整生成，语义与流式刻意不同，故不进公共函数。
     let rb = apply_upstream_headers(
@@ -2402,9 +2412,6 @@ async fn forward_to_key(
         fwd_headers,
         &real_model,
     );
-
-    // 并发槽位。非流式不用搬运它：`resp.bytes()` 在同一作用域 await 完，permit 随函数返回落地。
-    let _permit = crate::health::concurrency::acquire(&key.id).await;
     // 连接层失败（DNS/超时/拒连）仍返回 Err，附带目标 URL 便于定位。
     let resp = rb
         .send()
@@ -2523,27 +2530,18 @@ fn effective_beta_header(
 /// - 529：上游明说「我过载了，稍后再来」。我们自己对下游正是用它表达这个意思
 ///   （见 `STATUS_OVERLOADED`），收到时却判成「Key 坏了」显然口径矛盾。
 ///
-/// **400 也不计入**（2026-07-31 实机复盘的结论）：400 的语义是「这个请求不合法」，
-/// 而请求是下游客户端发的、或经我们的协议转换构造的——它与用哪个 Key 无关，
-/// 换任何 Key 都会同样 400。此前把 400 计入熔断，导致：
-/// - 客户端的空探测请求（`{"messages":[],"model":null}`）连打三次就把**完好的 Key** 熔断；
-/// - 我们自己的跨协议转换 bug（上游报 "model is required" / "Failed to parse request body"）
-///   会把整池好 Key 逐个刷成熔断，进而触发全熔断兜底、把所有 Key 反复重打。
+/// **请求级 4xx 同样不计入**：`400`（请求不合法）与 `422`（实体语义无效，OpenAI 兼容站常用
+/// 它表达 schema 校验失败）错在**请求本身** —— 请求由下游客户端发出或经我们的协议转换构造，
+/// 与用哪个 Key 无关，换任何 Key 都会同样失败。2026-07-31 实机复盘：把 400 计入熔断时，
+/// 客户端的空探测（`{"messages":[],"model":null}`）连打三次就熔断一条**完好的 Key**；
+/// 我们自己的转换 bug（上游报 "model is required"）会把整池好 Key 逐个刷成熔断、
+/// 进而触发全熔断兜底反复重打。那天 68 条失败请求里近半是这两类。
 ///
-/// 实测那天 68 条失败请求里近半是这两类。
+/// 这类只「切下一个 Key 应急」，**不累加 fail_count、不熔断**，下个请求仍优先用它。
+/// 仍然计入的是**确定属于这个 Key** 的故障：401/403 鉴权失败、404 端点或模型不存在。
 ///
-/// 这类只做「切下一个 Key 应急」，但**不累加 fail_count、不熔断**——下个请求仍优先用它。
-///
-/// 仍然计入熔断的是**确定属于这个 Key** 的故障：
-/// 401/403 鉴权失败（密钥错/被封）、404 端点或模型不存在——换 Key 才有意义，
-/// 请求级 4xx：错在**请求本身**（各 Key 打同样失败），与用哪个 Key 无关。
-///
-/// - `400` 请求不合法（客户端发的或我们协议转换构造的）；
-/// - `422` 请求实体语义无效（OpenAI 兼容/中转站常用来表达 schema 校验失败）。
-///
-/// 这两个都**不该计入熔断**（换 Key 白试，还会把完好的 Key 刷成熔断→全熔断兜底），
-/// 也**不是** Key 级硬错误。`failover_verb`、`status_counts_against_breaker` 共用它，
-/// 避免「日志说非 Key 问题、熔断却罚 Key」这类同码两处定性相反（本轮审查确认的 422 矛盾）。
+/// `failover_verb` 与 `status_counts_against_breaker` 共用本函数，避免「日志说非 Key 问题、
+/// 熔断却罚 Key」这类同码两处定性相反（422 那次矛盾就是这么来的）。
 fn is_request_level_4xx(status: u16) -> bool {
     status == 400 || status == 422
 }
@@ -2577,24 +2575,10 @@ fn path_is_auxiliary_endpoint(path: &str) -> bool {
     path.contains("count_tokens")
 }
 
-/// 本次失败是否该计入熔断（惩罚该 Key）。**状态码与请求路径一起判。**
-///
-/// 为什么必须带上路径（2026-08-14 真机复盘）：客户端除了发对话，还会发
-/// `POST /v1/messages/count_tokens` 做 token 计数，而中转站普遍不实现该端点 → 404。
-/// 旧实现只看状态码，于是每一次 token 计数都会：
-///
-/// 1. 打上游 → 404 → `record_live_failure` 给该 Key 累加 fail_count；
-/// 2. 切下一个候选 → 同样 404（**所有**中转站都不实现它）；
-/// 3. 遍历完全池 → 报「全部 Key 失败」并武装短路窗口；
-/// 4. 连续几次后**整池 Key 全部熔断** → 「所有 Key 均在熔断窗口内」。
-///
-/// 而这些 Key 转发真实对话完全正常 —— 真机日志里同一个 Key 在 404 前后各有一条
-/// 「成功返回」。用户视角就是「Key 明明能用，界面却说熔断、说无 Key 可用」。
-///
-/// 判据的本质：熔断要回答的是「**这个 Key** 还能不能服务」。辅助端点的 404 回答的是
-/// 「**这个端点**上游没实现」——与用哪个 Key 无关，换任何 Key 都同样 404，
-/// 与 400「请求不合法」属同一类，故同样只切不罚。
-/// 「这次失败该罚 Key 吗」的布尔版。
+/// 「这次失败该罚 Key 吗」的布尔版。**状态码与请求路径一起判** —— 为什么要带路径，
+/// 取证在 [`path_is_auxiliary_endpoint`] 与 [`failure_scope`] 上（2026-08-14 真机复盘：
+/// 只看状态码时每次 token 计数的 404 都会累加 fail_count，几次之后整池熔断，
+/// 而那些 Key 转发真实对话完全正常）。
 ///
 /// 生产路径已改走 [`failure_scope`]（三个作用域，而不是一个 bool）。本函数保留为
 /// **既有 4 条判据测试的入口**，并作为「Key 级」这一档的可读定义。
@@ -2719,28 +2703,8 @@ fn estimate_count_tokens_local(req_json: &Value) -> u32 {
     crate::upstream::estimate_json_tokens_without_image_transport(req_json)
 }
 
-/// 故障转移日志里的动词：**按真实状态码分类**，让用户一眼看出该去修什么。
-///
-/// 2026-08-02 真机实证的反例（勿退回旧写法）：旧版只分两类 ——
-/// `status_counts_against_breaker` 为真说「失败」、否则一律说「限流/繁忙，暂避」。
-/// 于是一次会话里 400×16 + 502×5 + 503×5 + 504×1 **全被写成「限流/繁忙」，
-/// 而真实 429 一次都没有**。用户据此判断「触发了很多限流」，方向完全错了：
-/// 那 16 个 400 是我们自己没填模型名（见 `resolve_model` 第 6 步），
-/// 11 个 5xx 是上游中转商真的挂了/无可用账号，两者都与限流无关。
-///
-/// 措辞要能直接指向排查方向，不能用一个模糊词盖住三种不同的根因。
-/// 硬错误回给下游的正文。
-///
-/// 两件事：
-///
-/// 1. **前缀按成因分流。** 请求级 4xx（400/422）说「全部 Key 不可用」是**假现场**：
-///    错在请求本身，各 Key 打同样失败（这是 `is_request_level_4xx` 与 `failover_verb`
-///    早就写明的定性 —— 后者的文案就是「请求被拒（非 Key 问题）」）。而下游那句
-///    「全部 Key 不可用」会把用户直接送去查密钥、查额度、查中转站状态，
-///    全是与本次失败无关的方向。
-/// 2. 命中已知形态时附上可行动说明（见 [`crate::upstream::annotate_upstream_error`]）。
-///
-/// 抽成纯函数才测得到：调用点在一个 700 行的 async 转发函数尾部。
+/// 硬错误回给下游的正文。请求级 4xx 说「全部 Key 不可用」是假现场（错在请求本身，
+/// 换 Key 也一样）—— 那句会把用户送去查密钥/额度。命中已知形态时附上可行动说明。
 fn compose_hard_error_body(last_status: Option<u16>, last_err: &str) -> String {
     let prefix = match last_status {
         Some(s) if is_request_level_4xx(s) => "请求被上游拒绝（非 Key 问题，换 Key 也一样）：",
@@ -2753,6 +2717,8 @@ fn compose_hard_error_body(last_status: Option<u16>, last_err: &str) -> String {
     body
 }
 
+/// 故障转移日志里的动词：**按真实状态码分类**。旧版只分「失败 / 限流」，于是一次会话里
+/// 400×16 + 5xx×11 全被写成「限流」（2026-08-02 真机：真实 429 一次都没有）。
 fn failover_verb(status: u16) -> &'static str {
     match status {
         // 真限流：唯一该说「限流」的码
@@ -2912,6 +2878,17 @@ fn error_resp_with_retry_after(
         builder = builder.header("retry-after", secs.max(1).to_string());
     }
     builder.body(full_body(bytes)).unwrap()
+}
+
+/// 排队等不到槽位时的错误。两条转发路径共用一份 —— 各写一遍必然只有一处被修。
+/// 走独立变体而不是 `upstream_msg`：后者会被记进该 Key 的熔断。见 `AppError::QueueTimeout`。
+/// 「在途 N」那一位是排障时唯一能分辨「代理在排队」与「上游慢」的线索。
+fn queue_timeout_err(key: &ProviderKey, waited: std::time::Duration) -> AppError {
+    AppError::QueueTimeout(format!(
+        "等待本 Key 的并发槽位超时（{}ms 内未排到，在途 {}）",
+        waited.as_millis(),
+        crate::health::concurrency::in_flight(&key.id)
+    ))
 }
 
 /// 从上游响应头解析 `Retry-After`（RFC 7231）：秒数与 HTTP-date 两种形态；解析不出
@@ -4715,6 +4692,80 @@ mod tests {
     /// 持续退避重试。可 401 是密钥填错——等到宇宙尽头也不会好转：
     /// - 界面上呈现「过载」，与真实根因（配置错误）方向相反，用户会去查上游而不是查密钥；
     /// - 短路窗口一到期就放行一个真实请求再撞一次 401，无谓消耗；
+    /// 🔴 **「全员被跳过」这条路走不到循环尾** —— 钉住这个**不变量**，而不是给一个死分支
+    /// 加守卫。
+    ///
+    /// 一次审查提出「全部候选都会悄悄换模型时，尾部按 `last_status.is_none()` 判成临时性 →
+    /// 529，客户端对一个永不自愈的配置问题无限退避」。**结论错，前提对**：
+    /// 排序第一位是 `Confidence`，而 `may_serve == (confidence != Fallback)` ——
+    /// 全员 Fallback 时循环**前**那道 `reject_if_unserviceable` 已经回了 503，压根进不了循环。
+    /// 循环内那一支必然发生在某个 Native/Unknown 候选失败之后，此时 `last_err` 非空、
+    /// 尾部按那次真实失败的性质分流，行为是对的。
+    ///
+    /// 我照那条结论加过守卫，被这条用例证伪（实得 529 且**正确** —— 首选是真打了上游、
+    /// 连接层失败，那属临时性）。守卫随即撤掉：给不可达分支加防线不是零成本，
+    /// 它声称的失效形态会被下一个人当成真的。
+    ///
+    /// 这条用例守的是「那道前置门必须挡在循环之前」：把它挪进循环或删掉，
+    /// 请求就会真的落到降级路径上，本用例的 503 断言当场变红。
+    #[tokio::test]
+    async fn an_all_fallback_pool_is_rejected_before_the_loop_not_at_its_tail() {
+        let dir = temp_dir("allskip");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // k1 用映射宣称 `adv-only`，但**处于熔断中**→ 被 rank_candidates 剔除。
+        // k2 只认识 real-a、有 default_model → 对 adv-only 是 Fallback。
+        // 于是「宣称过 + 候选全 Fallback」，正是那道前置门的定义域。
+        let mi = |n: &str| ModelInfo {
+            real_name: n.into(),
+            source: "manual".into(),
+            fetched_at: None,
+            context_window: None,
+            max_output_tokens: None,
+        };
+        let mut k1 = key("as1", 0, "http://127.0.0.1:1");
+        k1.category_id = CategoryType::ClaudeDesktop;
+        k1.models = vec![mi("real-a")];
+        k1.mappings = vec![ModelMapping {
+            id: "m1".into(),
+            expected_name: "adv-only".into(),
+            real_name: "real-a".into(),
+            display_name: None,
+        }];
+        k1.health.breaker_until =
+            Some(chrono::Utc::now().timestamp_millis() + 60_000);
+        let mut k2 = key("as2", 1, "http://127.0.0.1:1");
+        k2.category_id = CategoryType::ClaudeDesktop;
+        k2.models = vec![mi("real-b")];
+        k2.default_model = Some("real-b".into());
+        store.upsert_key(k1).unwrap();
+        store.upsert_key(k2).unwrap();
+        store.secrets.write().set("as1", "x").unwrap();
+        store.secrets.write().set("as2", "y").unwrap();
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeDesktop).await.unwrap();
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"adv-only","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            status, 503,
+            "宣称过、候选全 Fallback → 必须由循环前那道门回 503（而不是落到尾部的 529）。\
+             实得 {status}，body={body}"
+        );
+        assert_ne!(
+            body["error"]["type"], "overloaded_error",
+            "永不自愈的配置问题不能报成过载 —— 那会让客户端无限退避"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// - 带 `Retry-After` 等于明示「稍后会好」，是错误承诺。
     ///
     /// 故硬错误原样回该状态码、不带 `Retry-After`、不武装短路窗口，让客户端第一次就拿到

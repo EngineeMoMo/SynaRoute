@@ -69,6 +69,23 @@ pub(crate) struct UsageCostRow {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) key_deleted: bool,
     pub(crate) usage: crate::model::TokenUsage,
+    /// 这一行**是否真的捕获过上游回报的 usage**。
+    ///
+    /// 🔴 **不能用「四个 token 数是否全 0」代替它**。用户报的问题是「新加的 key 都看不见」：
+    /// 行集合此前是 `usage_totals` 的投影，而正常采集对空/全零 usage 一律返回 `None`
+    /// （见 `upstream::usage::extract_usage`），所以一条**从未产生过可计量用量**的 Key
+    /// 压根没有桶 → 无论刷新多少次、等多久都不出现。现在行集合改成
+    /// 「配置里的 Key ∪ 历史累计桶」，这一位区分两种**处置完全不同**的 0：
+    ///
+    /// - `false`：我们还没收到任何 usage。可能尚未使用、流still在进行、或上游不回 usage。
+    ///   金额必须是「—」而**不是 $0**，且不该计进「算不出金额」的告警条 —— 那条是让用户
+    ///   去改配置的，而这里没有任何配置需要改。
+    /// - `true`：真有过消耗，数字是事实。
+    ///
+    /// 把两者混起来的代价是**界面撒谎**：一条刚建好、还没跑过一次请求的 Key 显示
+    /// 「花费 $0.0000」，用户会据此认为它已经在服务且完全免费。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) has_recorded_usage: bool,
     /// 估算成本（纳美元）。`None` = 没有可用单价，界面显示「—」而不是 0。
     pub(crate) cost_nano: Option<u64>,
     /// 单价来源，界面据此标注精度（exact / family / unknown）。
@@ -105,15 +122,33 @@ fn repr_model_of(k: &crate::model::ProviderKey) -> Option<String> {
 ///
 /// **Key 已删的行走墓碑**（[`usage_keys`]）：算钱要的两样东西只存在于 `ProviderKey` 里，
 /// 而用量是纯累加值、删 Key 之后仍保留 —— 不留墓碑的话那些行的金额永远是「—」。
+///
+/// # 🔴 行集合 = 「配置里的 Key」∪「历史累计桶」（2026-09-09 用户实报「新加的 key 都看不见」）
+///
+/// 此前这里只遍历 `store.token_usage_by_key()`，也就是**只有产生过可计量 usage 的桶**才有行。
+/// 而正常采集刻意不建零桶（`extract_usage` 对空/全零返回 `None`，聚合路径也要
+/// `!usage.is_empty()`），于是一条新 Key 在拿到第一笔上游回报的 usage 之前**根本不存在**
+/// —— 那不是刷新不及时，手动点刷新、重启应用都一样看不到。
+///
+/// 并集必须在后端做：前端只拿到行数组，凭它无法区分「后端没这一行」与「页面还没刷新」，
+/// 而这两者的处置完全不同。占位行带 `has_recorded_usage: false`，金额留空
+/// （**不是 $0**，理由见那个字段的文档）。
+///
+/// 三类历史行原样保留，一条都不能因为并集而消失：已删除 Key 的行（`key_deleted`）、
+/// 空 `key_id` 的旧聚合行、以及任何配置里已经没有对应 Key 的桶。
 pub(crate) fn rows(store: &Store) -> Vec<UsageCostRow> {
     // 顺带把「当前还活着的 Key 的算钱事实」记下来，并拿回合并后的全表。
     // 挂在读路径上的理由 + 只在内容变化时才写盘，见 usage_keys 模块头。
     let today = usage_keys::today_ms(chrono::Utc::now().timestamp_millis());
-    let live: std::collections::BTreeMap<String, usage_keys::KeyFacts> = CategoryType::ALL
-        .iter()
-        .flat_map(|c| store.list_keys(*c))
-        .map(|k| {
-            (
+    // 一趟遍历同时拿两样东西：墓碑要的「算钱事实」，以及并集要的 `(分类, id)` 位置。
+    // 分开遍历两次会让「哪些 Key 算活着」出现两份口径，而它们必须是同一份。
+    let mut live_slots: Vec<(CategoryType, String)> = Vec::new();
+    let mut live: std::collections::BTreeMap<String, usage_keys::KeyFacts> =
+        std::collections::BTreeMap::new();
+    for category in CategoryType::ALL {
+        for k in store.list_keys(category) {
+            live_slots.push((category, k.id.clone()));
+            live.insert(
                 k.id.clone(),
                 usage_keys::KeyFacts {
                     name: k.name.clone(),
@@ -121,17 +156,36 @@ pub(crate) fn rows(store: &Store) -> Vec<UsageCostRow> {
                     multiplier: k.cost_multiplier.clone(),
                     seen_day_ms: today,
                 },
-            )
-        })
-        .collect();
+            );
+        }
+    }
     let facts = usage_keys::sync(
         std::path::Path::new(&store.config_path_display()),
         live,
     );
-    store
-        .token_usage_by_key()
+
+    // 先装历史桶（它们带真实数字），再把「配置里有、但一次 usage 都没捕获过」的 Key 补成占位行。
+    // 顺序不能反 —— 反了会让占位行覆盖掉真实数字。用 `BTreeMap` 顺带得到稳定顺序
+    // （否则同一份数据两次读取的行序可能不同，表格会无故跳动）。
+    let mut slots: std::collections::BTreeMap<(CategoryType, String), (crate::model::TokenUsage, bool)> =
+        store
+            .token_usage_by_key()
+            .into_iter()
+            .map(|r| ((r.category_id, r.key_id), (r.usage, true)))
+            .collect();
+    for slot in live_slots {
+        slots
+            .entry(slot)
+            .or_insert_with(|| (crate::model::TokenUsage::default(), false));
+    }
+
+    slots
         .into_iter()
-        .map(|r| {
+        .map(|((category_id, key_id), (usage, has_recorded_usage))| {
+            let r = crate::model::TokenUsageByKey { category_id, key_id, usage };
+            (r, has_recorded_usage)
+        })
+        .map(|(r, has_recorded_usage)| {
             let key = store.get_key(&r.key_id);
             // Key 已删 → 回落到墓碑（它活着时最后一次被记下的事实）。
             let tomb = if key.is_none() { facts.get(&r.key_id) } else { None };
@@ -149,7 +203,12 @@ pub(crate) fn rows(store: &Store) -> Vec<UsageCostRow> {
 
             // 成因判定的顺序 = 从「最外层的缺失」到「最内层的缺失」，
             // 每一层都排除了它下面那层的可能性，所以不会答出误导性的成因。
-            let unpriced_reason = if cost_nano.is_some() {
+            //
+            // 🔴 占位行（还没捕获过 usage）与「算出来了」一样**没有成因**，故合成一支：
+            // `UnpricedReason` 的每一支都在回答「为什么算不出钱」并给一条可行动的出路，
+            // 而占位行压根没有消耗可算 —— 报任何一支都是把用户送去改一个没问题的配置
+            // （正是那张表要消灭的事）。两者都为 None，但理由不同，写在这里免得被合并掉语义。
+            let unpriced_reason = if !has_recorded_usage || cost_nano.is_some() {
                 None
             } else if r.key_id.is_empty() {
                 Some(UnpricedReason::Aggregate)
@@ -162,6 +221,11 @@ pub(crate) fn rows(store: &Store) -> Vec<UsageCostRow> {
                 }
             };
 
+            // 没有消耗就没有金额可言：占位行的 `cost_nano` 必须是 None。
+            // 不清掉的话 `estimate_cost` 对全零 usage 会算出一个货真价实的 `Some(0)`，
+            // 界面就显示 $0.0000 —— 而那读起来是「已经在用、而且免费」。
+            let cost_nano = if has_recorded_usage { cost_nano } else { None };
+
             UsageCostRow {
                 category_id: r.category_id,
                 // 聚合行（key_id 为空串）不算「已删除」——它压根没有 Key。
@@ -173,6 +237,7 @@ pub(crate) fn rows(store: &Store) -> Vec<UsageCostRow> {
                     .map(|k| k.name.clone())
                     .or_else(|| tomb.map(|t| t.name.clone())),
                 usage: r.usage,
+                has_recorded_usage,
                 cost_nano,
                 pricing_source,
                 multiplier: mult,
@@ -266,10 +331,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `unpriced_reason.is_some()` 与 `cost_nano.is_none()` 必须**严格等价**。
+    /// 在**有过消耗的行**上，`unpriced_reason.is_some()` 与 `cost_nano.is_none()` 严格等价。
     ///
     /// 两个字段各自独立赋值，很容易一边改了另一边没改 —— 而漂移的表现是静默的：
     /// 界面既显示了金额、又在横幅里把它计进「算不出的条数」，或者反过来显示「—」却不给成因。
+    ///
+    /// ⚠️ **等价关系限定在 `has_recorded_usage` 为真的行上**（2026-09-09 并集之后）：
+    /// 占位行两者**同时**为 None，那是刻意的 —— 它既没有金额也没有「算不出的原因」，
+    /// 因为压根没有消耗。下面另有一条专测占位行的用例钉住这个组合。
     #[test]
     fn reason_is_present_exactly_when_cost_is_absent() {
         let (store, dir) = temp_store("reason_equiv");
@@ -298,7 +367,7 @@ mod tests {
             Some(crate::upstream::TokenUsage { input: 5, output: 1, ..Default::default() }),
         );
 
-        for r in rows(&store) {
+        for r in rows(&store).into_iter().filter(|r| r.has_recorded_usage) {
             assert_eq!(
                 r.cost_nano.is_none(),
                 r.unpriced_reason.is_some(),
@@ -406,6 +475,130 @@ mod tests {
         if let (Some(a), Ok(b)) = (stamp, again.modified()) {
             assert_eq!(a, b, "mtime 变了说明重写过（轮询会把盘写爆）");
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 🔴 **用户报的问题**：「新加的 key 都看不见」。
+    ///
+    /// 修之前行集合是 `usage_totals` 的投影，而正常采集刻意不建零桶 → 一条还没产生过
+    /// 可计量用量的 Key **根本没有行**，手动刷新、重启都一样看不到（不是刷新不及时）。
+    ///
+    /// 故障注入判据：把 `rows()` 里补占位行的那段 `or_insert_with` 删掉 → 本测试变红。
+    #[test]
+    fn a_new_key_shows_up_before_it_has_any_usage() {
+        let (store, dir) = temp_store("new_key_row");
+        let mut k = key(CategoryType::ClaudeCli);
+        k.id = "fresh".into();
+        k.name = "刚加的站".into();
+        k.default_model = Some("claude-sonnet-4-5".into());
+        store.upsert_key(k).unwrap();
+        // 刻意**不**产生任何用量事件。
+
+        let rows = rows(&store);
+        let fresh = rows
+            .iter()
+            .find(|r| r.key_id == "fresh")
+            .expect("刚加的 Key 必须立刻出现在用量表里，哪怕它还没跑过一次请求");
+        assert!(!fresh.has_recorded_usage, "还没捕获过 usage → 这一位必须是 false");
+        assert_eq!(fresh.key_name.as_deref(), Some("刚加的站"));
+        assert_eq!(
+            (fresh.usage.input, fresh.usage.output),
+            (0, 0),
+            "占位行的 token 数是 0"
+        );
+        // 🔴 金额必须是「—」而不是 $0：后者读起来是「已经在用、而且免费」。
+        assert_eq!(fresh.cost_nano, None, "没有消耗就没有金额，绝不能算成 Some(0)");
+        // 也不许给「算不出金额」的成因 —— 那些每一支都在指挥用户去改配置，
+        // 而这里没有任何配置需要改。
+        assert_eq!(
+            fresh.unpriced_reason, None,
+            "占位行不该有成因，否则告警条会催用户去修一个没坏的东西"
+        );
+        assert!(!fresh.key_deleted, "它当然还在");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 占位行在**第一笔用量到达后**必须转成真实行，而不是多出一行。
+    ///
+    /// 这是并集实现最容易写错的地方：若并集的键不是 `(分类, key_id)` 而只是 `key_id`，
+    /// 或者补占位时覆盖了已有桶，就会出现「同一条 Key 两行」或「数字被清零」。
+    #[test]
+    fn the_placeholder_row_turns_into_the_real_one_instead_of_duplicating() {
+        let (store, dir) = temp_store("placeholder_promote");
+        let mut k = key(CategoryType::ClaudeCli);
+        k.id = "warmup".into();
+        k.default_model = Some("claude-sonnet-4-5".into());
+        store.upsert_key(k).unwrap();
+
+        assert_eq!(
+            rows(&store).iter().filter(|r| r.key_id == "warmup").count(),
+            1,
+            "前提：占位阶段恰好一行"
+        );
+
+        store.append_event_full(
+            CategoryType::ClaudeCli,
+            "route",
+            Some("warmup"),
+            "转发",
+            None,
+            None,
+            Some(crate::upstream::TokenUsage { input: 1000, output: 100, ..Default::default() }),
+        );
+
+        let rows_now = rows(&store);
+        let mine: Vec<&UsageCostRow> = rows_now.iter().filter(|r| r.key_id == "warmup").collect();
+        assert_eq!(mine.len(), 1, "第一笔用量到达后仍必须只有一行，不能并出第二行");
+        let row = mine[0];
+        assert!(row.has_recorded_usage, "有了真实消耗 → 这一位翻真");
+        assert_eq!((row.usage.input, row.usage.output), (1000, 100), "数字必须是真实值");
+        assert!(row.cost_nano.is_some(), "有消耗且模型在表里 → 必须算出金额");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 并集**不得吃掉历史行**：已删除 Key 的行与空 `key_id` 的旧聚合行都要留着。
+    ///
+    /// 用量是纯累加值，历史不该因为「这条 Key 现在不在配置里」而消失 ——
+    /// 那等于让用户的累计花费凭空变小（本仓在 90 天滚动删桶上修过同族缺陷）。
+    #[test]
+    fn the_union_never_drops_rows_that_have_no_live_key() {
+        let (store, dir) = temp_store("union_history");
+        // ① 一条活着的 Key（会有占位行）
+        let mut k = key(CategoryType::ClaudeCli);
+        k.id = "alive".into();
+        store.upsert_key(k).unwrap();
+        // ② 指向已删除 Key 的历史行
+        store.append_event_full(
+            CategoryType::ClaudeCli,
+            "route",
+            Some("ghost"),
+            "转发",
+            None,
+            None,
+            Some(crate::upstream::TokenUsage { input: 20, output: 2, ..Default::default() }),
+        );
+        // ③ 空 key_id 的旧聚合行
+        store.append_event_full(
+            CategoryType::Codex,
+            "aggregate",
+            None,
+            "聚合",
+            None,
+            None,
+            Some(crate::upstream::TokenUsage { input: 10, output: 1, ..Default::default() }),
+        );
+
+        let rows = rows(&store);
+        let ghost = rows.iter().find(|r| r.key_id == "ghost").expect("已删 Key 的历史行必须保留");
+        assert!(ghost.has_recorded_usage, "它有真实消耗");
+        assert!(ghost.key_deleted, "且要标出「已删除」");
+        let agg = rows.iter().find(|r| r.key_id.is_empty()).expect("旧聚合行必须保留");
+        assert!(agg.has_recorded_usage);
+        assert_eq!(agg.unpriced_reason, Some(UnpricedReason::Aggregate), "成因不受并集影响");
+        assert!(rows.iter().any(|r| r.key_id == "alive"), "活着的 Key 也在");
 
         std::fs::remove_dir_all(&dir).ok();
     }

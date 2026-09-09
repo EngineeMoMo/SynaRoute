@@ -5,7 +5,6 @@ mod agent_tools;
 mod aggregate;
 mod aggregate_phase;
 mod balance;
-mod ccswitch;
 mod codegraph;
 mod crypto;
 mod diagnostics;
@@ -241,27 +240,6 @@ fn move_key(
         let _ = rebuild_tray(&app);
     }
     Ok(changed)
-}
-
-// ============ 从 cc-switch 导入历史 Key ============
-//
-// 只读 cc-switch 的 SQLite 库（先复制到临时文件再打开），把它的供应商档映射成
-// SynaRoute 的 Key + 加密密钥。**导入不接入**：不写任何客户端配置、不改接入状态。
-
-/// 扫描 cc-switch 库，返回可导入候选（含掩码密钥、重复标记、不可导入原因）。
-/// 明文密钥不出后端——前端只拿到掩码。
-#[tauri::command]
-fn scan_ccswitch(state: tauri::State<AppState>) -> AppResult<ccswitch::ScanResult> {
-    ccswitch::scan(&state.store)
-}
-
-/// 按 sourceIds 导入选中的档。逐条独立处理，返回每条结局。
-#[tauri::command]
-fn import_from_ccswitch(
-    state: tauri::State<AppState>,
-    source_ids: Vec<String>,
-) -> AppResult<ccswitch::ImportReport> {
-    ccswitch::import(&state.store, &source_ids)
 }
 
 #[tauri::command]
@@ -503,7 +481,6 @@ fn get_onboarding_state(state: tauri::State<AppState>) -> OnboardingState {
         should_show: !done && total_keys == 0,
         done,
         total_keys,
-        ccswitch_available: ccswitch::db_available(),
     }
 }
 
@@ -1019,23 +996,48 @@ fn detect_recent_workdirs() -> AppResult<Vec<workdirs::RecentWorkdir>> {
     workdirs::scan()
 }
 
-/// 检测 codegraph 可用状态（未安装 / 孤岛 / 未索引 / 就绪）。
-/// `work_dir` 为空则只判可执行是否就绪，不判项目索引。
-#[tauri::command]
-async fn detect_codegraph(work_dir: Option<String>) -> codegraph::CodegraphState {
-    let dir = work_dir
-        .as_deref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from);
-    codegraph::detect(dir.as_deref()).await
+/// 目录解析的**唯一**入口（本文件内两个 codegraph 命令共用）。
+///
+/// 🔴 **前端不许传目录进来，这两个命令刻意都不收 `work_dir`**。两条理由：
+/// ① 自动跟随下目录来自会话历史，前端要自己算就得复刻
+///    [`aggregate::write::resolve_writable_work_dir`] 的优先级 —— 本仓已为这类跨语言复刻
+///    栽过多次（`pickPrefs` / `modelSets.ts`），而这里漂移的表现是**静默**的：
+///    前端算出 `undefined` → 后端报「索引状态未知」→ 用户看到一句要他去设置已经设好的目录。
+/// ② `codegraph_init` 收任意路径就是一个**任意目录写入原语**（会在该目录创建 `.codegraph/`）。
+///    收回后端自己解析，这个面就没有了。
+///
+/// 用**写**路径口径（`resolve_writable_work_dir`）而不是 [`aggregate`] 的读路径口径：
+/// 建索引要在项目里创建目录，而读路径带「兜底扫会话历史」，那在写路径上是越权
+/// （见 `write.rs` 里那条 🔴）。代价是「没勾自动跟随也没填目录」时本面板报「未知」，
+/// 而检索本身仍会兜底工作 —— 这个分叉是刻意的，且方向安全（少说而非多说）。
+fn codegraph_dir(state: &tauri::State<AppState>, category_id: CategoryType) -> Option<String> {
+    let brain = state.store.get_brain(category_id);
+    aggregate::write::resolve_writable_work_dir(&brain)
 }
 
-/// 为指定项目建立 codegraph 索引（`codegraph init <path>`）。
+/// 检测 codegraph 可用状态（未安装 / 孤岛 / 索引未知 / 未索引 / 就绪）。
+///
+/// 返回 `AppResult` 而非裸枚举**不是风格选择**：Tauri 要求「入参含引用的 async 命令必须返回
+/// `Result`」（`State<'_, _>` 就是引用），写成裸枚举编译不过。这一层永远是 `Ok`。
+#[tauri::command]
+async fn detect_codegraph(
+    state: tauri::State<'_, AppState>,
+    category_id: CategoryType,
+) -> AppResult<codegraph::CodegraphState> {
+    let dir = codegraph_dir(&state, category_id).map(std::path::PathBuf::from);
+    Ok(codegraph::detect(dir.as_deref()).await)
+}
+
+/// 为当前判定的项目建立 codegraph 索引（`codegraph init <path>`）。
 /// 会在项目根创建 `.codegraph/`（SQLite 索引，纯本地、不出网）。
 #[tauri::command]
-async fn codegraph_init(work_dir: String) -> AppResult<String> {
-    codegraph::init_project(std::path::Path::new(&work_dir))
+async fn codegraph_init(
+    state: tauri::State<'_, AppState>,
+    category_id: CategoryType,
+) -> AppResult<String> {
+    let dir = codegraph_dir(&state, category_id)
+        .ok_or_else(|| error::AppError::Invalid("未设置工作目录，且未从会话历史检测到活跃项目".into()))?;
+    codegraph::init_project(std::path::Path::new(&dir))
         .await
         .map_err(error::AppError::Invalid)
 }
@@ -1320,8 +1322,6 @@ pub fn run() {
             reveal_secret,
             toggle_key,
             store::key_flags::set_key_allow_in_aggregate,
-            scan_ccswitch,
-            import_from_ccswitch,
             fetch_models,
             fetch_models_draft,
             check_health,
@@ -1389,8 +1389,7 @@ pub fn run() {
             detect_codegraph,
             codegraph_init,
             set_primary_key,
-            move_key,
-            move_key,
+            move_key, store::key_order::reorder_key,
             get_master_password_state,
             unlock_master_password,
             lock_master_password,
@@ -1660,7 +1659,8 @@ fn apply_tray_icon(app: &tauri::AppHandle, tray: &tauri::tray::TrayIcon) {
 }
 
 /// 触发时机：托盘内切换模型后、主窗口改动 Key 模型列表后（前端调 rebuild_tray_menu 命令）。
-fn rebuild_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+/// `pub(crate)` 是因为 `store::key_order::reorder_key` 也要调它（重排可能让主 Key 易主）。
+pub(crate) fn rebuild_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     if let Some(tray) = app.tray_by_id("main") {
         let menu = build_tray_menu(app)?;
         tray.set_menu(Some(menu))?;

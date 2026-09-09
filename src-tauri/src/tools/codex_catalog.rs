@@ -88,10 +88,8 @@ use std::path::{Path, PathBuf};
 
 /// 我们生成的目录文件名，落在 `~/.codex/` 下（与 `config.toml` 同目录）。
 ///
-/// 名字里带 `synaroute` 是[`pointer_is_ours`]的唯一判据：认领指针时只认这个文件名，
-/// 用户自己的目录路径**绝不覆盖**。cc-switch 为此修过一条（#6087）——它早期版本无条件
-/// 把指针指向自己生成的文件、丢弃用户自定义路径，而且**改过的指针不会被还原**，
-/// 只能发公告让用户手动指回去。
+/// 名字里带 `synaroute` 是[`pointer_is_ours`]的唯一判据：只认这个文件名，绝不覆盖用户指针。
+/// 同类工具为此修过 #6087（早期抢用户指针且不能还原，只能发公告手动修）。
 const CATALOG_FILE: &str = "synaroute-model-catalog.json";
 
 /// 自定义条目的 `priority` 起点。
@@ -583,6 +581,8 @@ pub(super) fn wire_into(
     keys: &[ProviderKey],
     catalog_file: &Path,
 ) -> AppResult<()> {
+    // Desktop 26.901 的 hidden 设置默认缺 max，导致 Luna 目录虽声明五档，菜单仍只有四档。
+    super::codex_effort::enable_max(table);
     // 与目录同一次写盘：它是 config.toml 顶层表上的另一个键，分两次写只会多一次备份+落盘。
     disable_remote_compaction(table);
     if can_build(models) {
@@ -759,7 +759,7 @@ pub(super) fn apply_note(models: &[String], keys: &[ProviderKey]) -> String {
         .count();
     let effort = if n_chat > 0 {
         format!(
-            "；推理强度四档已全部声明，但其中 {n_chat} 条 Key 走 Chat Completions 协议 ——\
+            "；推理强度档位已全部声明，但其中 {n_chat} 条 Key 走 Chat Completions 协议 ——\
              档位在那些 Key 上是否生效取决于上游（部分供应商只有「思考开/关」、会忽略它）"
         )
     } else {
@@ -840,46 +840,27 @@ pub(super) fn missing_catalog_warning(path: &str) -> String {
     )
 }
 
-/// 还原时要处理的三件事：`auth.json` 里的占位凭据、我们生成的模型目录，以及历史对话
-/// 里被我们改过的 `model_provider`（见 [`super::codex_sessions`]）。
+/// 还原时「config.toml 交还成功之后」才安全的两件事：模型目录 + 历史对话的 provider。
 ///
-/// 合成一个函数是为了让 `tools::restore` 的 Codex 分支保持**一行**（那个文件棘轮余量为 0），
-/// 也为了不制造第二个「还原副作用」的汇总点 —— 两个汇总点必然漂移，本仓反复吃过这个亏。
-/// 三件事的失败都不早退、都汇总上报——早退会让用户停在「假 key 摘不掉、目录也没删」
-/// 这种两头皆输的状态，那正是原实现在 auth 这一支上已经定下的纪律。
+/// 假凭据的解除**不在这里** —— 它必须排在 config 还原之前（危险步骤优先，见
+/// `tools::restore` 的顺序判据）。本函数只处理反过来做会让 Codex **完全起不来**的那两件：
+/// 目录文件先于 config 删掉 → 指针还在、文件没了 → `failed to parse model_catalog_json`。
 ///
-/// # 指针为什么不在这里删
-///
-/// `config.toml` 的还原是**整份从 `.bak` 恢复**（`restore_one`），`model_catalog_json`
-/// 那一行随之消失。在这里再去解析 toml 删一遍键，是第二个事实来源，且会与 `.bak`
-/// 还原的结果打架（用户接入前本来就有自己的指针时，删掉它就是数据丢失）。
-/// 还原的调用点在 `tools::restore`，故可见性放到 `crate::tools` 而不是 `super`。
+/// 指针本身不在这里删：`config.toml` 是整份从 `.bak` 恢复的，那一行随之消失。
+/// 再去解析 toml 删一遍键，是第二个事实来源，且会与 `.bak` 打架。
 pub(in crate::tools) fn restore_side_files() -> AppResult<Option<String>> {
     let mut notes: Vec<String> = Vec::new();
     let mut failure: Option<AppError> = None;
 
-    match super::auth_path().and_then(|p| super::disarm_legacy_placeholder_auth(&p)) {
-        Ok(Some(note)) => notes.push(note),
-        Ok(None) => {}
-        Err(e) => failure = Some(e),
-    }
-
-    // 目录文件走通用的 `restore_one`：它按 `.synaroute-created` 标记判定「凭空新建 → 整份删除」，
-    // 按 `.bak` 判定「原本存在 → 还原原件」。我们的文件名带 synaroute，正常情况下走前者。
+    // 目录文件走通用的 `restore_one`：`.synaroute-created` → 整份删除；`.bak` → 还原原件。
     match catalog_path().and_then(|p| crate::tools::restore_one(&p).map(|done| (p, done))) {
         Ok((p, true)) => notes.push(format!("已移除模型目录 {}", p.display())),
         Ok((_, false)) => {}
         Err(e) if failure.is_none() => failure = Some(e),
-        // 两个都失败时只上报第一个（auth 那条）：它是更要紧的那一件（假凭据还武装着），
-        // 而目录文件残留是无害的（指针已随 config.toml 的 .bak 一起消失）。
-        // ⚠️ 这与上面注释里「都汇总上报」不是一回事，审查时特意分清：**不早退**是真的
-        //（两件事都会尝试），**都上报**只做到「第一个错误 + 已完成项」。
         Err(_) => {}
     }
 
-    // 历史对话的 provider 改回原值。排在最后：它最不紧急（假凭据与残留文件都更要紧），
-    // 而且它是三件事里**唯一可重试**的 —— 清单在失败时刻意保留，用户退出 Codex 再点一次
-    // 「停止」就能补完。同理它的错误也只在前两件都成功时才成为主错误。
+    // 历史对话的 provider 改回原值。它是两件事里**唯一可重试**的 —— 清单在失败时刻意保留。
     match super::codex_sessions::restore_from_manifest() {
         Ok(Some(note)) => notes.push(note),
         Ok(None) => {}
@@ -1317,6 +1298,46 @@ mod tests {
         );
     }
 
+    /// 🔴 **接入必须补上 Desktop 的 `max` 档** —— 否则本轮修的那个症状原样复发。
+    ///
+    /// Desktop 26.901 在模型目录之外还有**第二层过滤**（`[desktop]` 的
+    /// `enabled-reasoning-efforts`，默认列表里唯独没有 `max`），于是目录声明了六档、
+    /// 菜单仍只显示四档 —— 那正是用户实报的形态。
+    ///
+    /// ⚠️ **这条是注入实测补出来的**：`codex_effort` 那 3 条用例全都**直接调**
+    /// `enable_max`，把 `wire_into` 里那一行摘掉，`tools::codex` 下 **141 条照样全绿**
+    /// （功能整个消失而无人出声）。这是本仓第 23 次同类接线盲区。
+    ///
+    /// 判据走**真实调用路径**而不是源码级 grep：后者能被一句注释里的同形字面量满足
+    /// （本仓已栽过三次），而这一条要求写出来的 table 里真的有那个值。
+    #[test]
+    fn wire_into_must_unlock_the_max_effort_tier_for_desktop() {
+        // 目录名前缀独有 —— 同族用例都这么做（`sr_cat_empty_` / `sr_cat_model_`），
+        // 靠前缀而不是靠时间戳区分，避免本机 100ns 量化粒度下的撞名。
+        let dir = std::env::temp_dir().join(format!("sr_cat_effort_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(CATALOG_FILE);
+        let mut table = toml::value::Table::new();
+        wire_into(&mut table, &["m".into()], &[], &file).unwrap();
+
+        let levels = table
+            .get("desktop")
+            .and_then(toml::Value::as_table)
+            .and_then(|d| d.get("enabled-reasoning-efforts"))
+            .and_then(toml::Value::as_array)
+            .expect("接入必须写下 [desktop].enabled-reasoning-efforts");
+        let got: Vec<&str> = levels.iter().filter_map(toml::Value::as_str).collect();
+        assert!(
+            got.contains(&"max"),
+            "🔴 缺 max —— Desktop 的第二层过滤会把它挡掉，菜单退回四档（用户实报的症状）：{got:?}"
+        );
+        // 顺带钉住「不许把官方默认的其它档位挤掉」：只补一个，不重写整份偏好。
+        for want in ["low", "medium", "high", "xhigh", "ultra"] {
+            assert!(got.contains(&want), "官方默认档位 {want} 被挤掉了：{got:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 🔴 目录路径必须跟随 `CODEX_HOME`，不许自己拼 `dirs::home_dir()/.codex`。
     ///
     /// 这是用户跨机器 401 的确定成因：SynaRoute 写默认目录、Codex 从 `$CODEX_HOME` 读另一份，
@@ -1512,13 +1533,32 @@ mod tests {
     /// 残留的表现是**惰性**的：指针随 config.toml 的 `.bak` 一起消失，所以文件不报错、
     /// 也永不自愈 —— 用户的 `.codex` 目录里从此多一份约 190 KB 的死文件，
     /// 而「凭空造的文件整份删除」正是本仓 restore 的契约。
+    ///
+    /// 🔴 **顺序也要钉**：假凭据必须排在 `restore_one(config)` **之前**（危险步骤优先），
+    /// 目录文件必须排在它**之后**（反过来 Codex 启动即 `failed to parse model_catalog_json`）。
+    /// 把三件事合成一次 `restore_side_files` 调用，无论放前还是放后，两道纪律必破一道。
     #[test]
     fn the_restore_path_must_actually_delete_the_catalog() {
         let tools = std::fs::read_to_string("src/tools.rs").unwrap();
         let tools_prod = crate::proxy::custom_headers::production_code_only(&tools);
+        let at = tools_prod
+            .find("pub fn restore(")
+            .expect("restore 改名了，请同步本判据");
+        let body = &tools_prod[at..];
+        let end = body.find("\n}").unwrap_or(body.len());
+        let restore = &body[..end];
+        let auth = restore
+            .find("disarm_legacy_placeholder_auth")
+            .expect("假凭据必须在 restore 里解除 —— 否则危险步骤被挪走");
+        let config = restore
+            .find("restore_one(&path)")
+            .expect("config.toml 必须在 restore 里还原");
+        let catalog = restore
+            .find("codex::codex_catalog::restore_side_files()")
+            .expect("Codex 的还原分支必须调 restore_side_files —— 否则目录文件永久残留");
         assert!(
-            tools_prod.contains("codex::codex_catalog::restore_side_files()"),
-            "Codex 的还原分支必须调 restore_side_files —— 否则目录文件永久残留"
+            auth < config && config < catalog,
+            "假凭据 ({auth}) 必须先于 config ({config})，目录文件 ({catalog}) 必须后于 config"
         );
         let me = std::fs::read_to_string("src/tools/codex_catalog.rs").unwrap();
         let prod = crate::proxy::custom_headers::production_code_only(&me);
@@ -1527,10 +1567,15 @@ mod tests {
             .expect("找不到 restore_side_files —— 判据失去目标，先修判据");
         let body = &prod[at..];
         let end = body.find("\n}").unwrap_or(body.len());
+        let side = &body[..end];
         assert!(
-            body[..end].contains("catalog_path()") && body[..end].contains("restore_one("),
+            side.contains("catalog_path()") && side.contains("restore_one("),
             "restore_side_files 里必须真的对 catalog_path() 调一次 restore_one —— \
              它是「凭空造的文件整份删除」这条契约在 Codex 侧的唯一落点"
+        );
+        assert!(
+            !side.contains("disarm_legacy_placeholder_auth"),
+            "假凭据的解除不许再进 restore_side_files —— 它必须排在 config 还原之前"
         );
     }
 

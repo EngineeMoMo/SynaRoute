@@ -158,24 +158,36 @@ pub(super) async fn run_member_turns(
             }
             Err(e) => return Err(MemberError::own(e)),
         };
-        let outcome = match session.turn(&up, &tools).await {
+        // 每次真正打模型才占 per-Key 槽；本地 read_file/grep 阶段不占。外层成员 deadline
+        // 包着整个 run_member_turns，排队超过预算时 future 被取消、不会把本地拥塞算成上游失败。
+        let permit = crate::health::concurrency::acquire(&ctx.up.key.id).await;
+        let outcome = session.turn(&up, &tools).await;
+        drop(permit);
+        let outcome = match outcome {
             Ok(o) => o,
-            // 轮内失败：已有正文就交差而不是整次作废（多轮探索的价值就在这里 —— 第 3 轮
-            // 超时/报错，前 2 轮读到的东西仍然值钱）。失败原因写进日志，不静默。
-            Err(e) if !preamble.trim().is_empty() => {
-                store.append_event(
-                    category,
-                    "aggregate",
-                    None,
-                    &format!(
-                        "工具循环中断 · {} · 第 {round}/{rounds} 轮调用失败（{e}），采用已有正文",
-                        ctx.label
-                    ),
-                );
-                return Ok(preamble);
+            Err(e) => {
+                // 🔴 成员与决策者是聚合的两条独立付费路径。决策者在 call_ref 里武装窗口；
+                // 成员必须在 AppError 还保有结构化 retry_after 时就做 —— 转成 MemberError 后
+                // 只剩 msg/status，这一位会永久丢失。429 又刻意不计熔断，不接就每轮白打。
+                if let Some(secs) = e.upstream_retry_after() {
+                    crate::health::quota_window::arm(store, category, &ctx.up.key.id, secs);
+                }
+                if !preamble.trim().is_empty() {
+                    // 轮内失败：已有正文就交差而不是整次作废（多轮探索的价值就在这里 ——
+                    // 第 3 轮报错，前 2 轮读到的东西仍然值钱）。失败原因写日志，不静默。
+                    store.append_event(
+                        category,
+                        "aggregate",
+                        None,
+                        &format!(
+                            "工具循环中断 · {} · 第 {round}/{rounds} 轮调用失败（{e}），采用已有正文",
+                            ctx.label
+                        ),
+                    );
+                    return Ok(preamble);
+                }
+                return Err(MemberError::from_upstream(&e));
             }
-            // 唯一携带上游状态码的失败路径：交给 MemberError 结构化保存，供 4xx 判定使用。
-            Err(e) => return Err(MemberError::from_upstream(&e)),
         };
         match outcome {
             TurnOutcome::Text(t) if !t.trim().is_empty() => return Ok(t),

@@ -27,8 +27,11 @@ pub fn get_usage_since(state: tauri::State<AppState>) -> i64 {
 
 /// 按日分桶的用量（最近 90 天），供「今日 / 本周 / 近 7 日趋势」。
 ///
-/// 不含尚未 flush 的增量（最多落后 60s）：面板把这份历史与 `get_token_usage`
-/// 的实时总量配合使用，故这点延迟不会让「今日」看起来停滞。
+/// 🔴 **已含尚未落盘的增量**（`Store::daily_usage_buckets` 会把 `usage_totals - usage_baseline`
+/// 并进当天的 UTC 桶，只读不抬基线）。原注释写着「不含尚未 flush 的增量（最多落后 60s）、
+/// 面板应与 `get_token_usage` 配合使用」，**那是过时的**：`UsagePage` 从来没那么配合过，
+/// 而实现早就在后端并好了。留着它的代价很具体 —— 排查「用量为什么不实时」的人会去改
+/// 60s 的落盘周期，而那条路一点用都没有（陈旧发生在前端的刷新接线上）。
 #[tauri::command]
 pub fn get_daily_usage(state: tauri::State<AppState>) -> Vec<crate::model::DailyUsageBucket> {
     state.store.daily_usage_buckets()

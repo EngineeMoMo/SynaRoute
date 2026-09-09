@@ -49,6 +49,18 @@ pub enum AppError {
 
     #[error("{0}")]
     Other(String),
+
+    /// 等不到本 Key 的并发槽位。**不是上游失败** —— 是我们自己的第五层弹性把它挡住了。
+    ///
+    /// 独立成变体而不是走 `Upstream { status: None }`：后者会落到候选循环的连接层失败分支，
+    /// 被 `record_live_failure` 计入该 Key 的熔断。一条完好、只是正忙的 Key 连撞三次就被
+    /// 熔断 60s —— 正是 `budget_truncated_attempt` 当初要消除的那类误伤，只是这次掐它的
+    /// 不是故障转移预算而是本模块自己的信号量。
+    ///
+    /// Display 刻意不带「上游」字样：排障时看到「等待本 Key 的并发槽位超时」才知道方向在
+    /// 代理内部；写成「上游请求错误: 等待槽位…」会把人送去查中转站。
+    #[error("{0}")]
+    QueueTimeout(String),
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -190,6 +202,11 @@ impl AppError {
     /// 是否为上游错误（不论有无状态码）。
     pub fn is_upstream(&self) -> bool {
         matches!(self, AppError::Upstream { .. })
+    }
+
+    /// 是否为我们自己的并发槽位排队超时。见 [`AppError::QueueTimeout`]。
+    pub fn is_queue_timeout(&self) -> bool {
+        matches!(self, AppError::QueueTimeout(_))
     }
 }
 

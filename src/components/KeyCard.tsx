@@ -14,7 +14,7 @@ import { balanceFingerprint, formatBalanceAmount, usedPercent } from "@/lib/bala
 import { usePolling } from "@/lib/usePolling";
 import { openExternalUrl } from "@/lib/openExternal";
 import { useT } from "@/lib/useT";
-import { ChevronUp, ChevronDown, RefreshCw, Pencil, Copy, Trash2, ArrowRight, Wallet, ExternalLink } from "lucide-react";
+import { ChevronUp, ChevronDown, GripVertical, RefreshCw, Pencil, Copy, Trash2, ArrowRight, Wallet, ExternalLink } from "lucide-react";
 
 /**
  * 单个厂商 Key 卡片（FR-001/003/006/010/011）。
@@ -27,7 +27,7 @@ import { ChevronUp, ChevronDown, RefreshCw, Pencil, Copy, Trash2, ArrowRight, Wa
  * 若不在 store 里复用未变对象，`prevProps.k === nextProps.k` 恒为 false、memo 恒失效
  * （实测确认过：轮询后 k 引用必变而内容全等）。两者必须成对存在，改一处要想到另一处。
  */
-export const KeyCard = React.memo(function KeyCard({ k, onEdit, onDuplicate, isFirst, isLast, isRoutingPrimary }: {
+export const KeyCard = React.memo(function KeyCard({ k, onEdit, onDuplicate, isFirst, isLast, isRoutingPrimary, onDragHandleDown, dragging, dropBefore }: {
   k: ProviderKey;
   onEdit: (k: ProviderKey) => void;
   /**
@@ -46,6 +46,19 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, onDuplicate, isF
    * 口径与 `routingPrimaryKey` / 后端 `enabled_keys_sorted` / 状态条 / 托盘完全一致。
    */
   isRoutingPrimary: boolean;
+  /**
+   * 拖动把手被按下。**只挂在把手上，整张卡不做 draggable** ——
+   * 卡片里有开关、编辑、复制、删除、余额刷新、可点地址六个交互元素，
+   * 整卡可拖会让它们全部变成「点一下就开始拖」。
+   *
+   * 由父级（CategoryPage）实现：它才掌握完整顺序与滚动容器，能算插入位置。
+   * 必须用 `useCallback` 包稳（本组件是 `memo`，见文件头）。
+   */
+  onDragHandleDown: (keyId: string, e: React.PointerEvent) => void;
+  /** 这张卡正在被拖动（视觉上淡化 + 描边，让用户看清自己在动哪一条）。 */
+  dragging: boolean;
+  /** 松手会插到这张卡**之前**（在卡片上沿画一条指示线）。 */
+  dropBefore: boolean;
 }) {
   // 细粒度订阅：KeyCard 会被渲染 N 份（每个 Key 一份），整店解构时任何无关字段变化
   // （如日志页每 2s 的 events）都会把整列卡片全部重渲染一遍。
@@ -151,11 +164,39 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, onDuplicate, isF
   const hasMore = k.mappings.length === 0 && k.models.length > 3;
 
   return (
-    <Card className="p-0">
+    <Card
+      className={`relative p-0 ${dragging ? "opacity-50 ring-1 ring-primary" : ""}`}
+      /* 拖动中禁用 hover 高亮：卡片正跟着指针「浮起」，再叠一层 hover 会让人以为
+         松手会落在它身上。 */
+    >
+      {/* 插入指示线：画在卡片**上沿**，与「插到这张卡之前」的语义一一对应。
+          用绝对定位的细线而不是真的挪动 DOM —— 挪 DOM 会让 getBoundingClientRect
+          在 pointermove 过程中不断变化，命中判定跟着抖动（后端那条注释同源）。 */}
+      {dropBefore && (
+        <div
+          aria-hidden
+          className="absolute -top-1 left-0 right-0 h-0.5 rounded-full bg-primary"
+        />
+      )}
       <div className="flex items-start gap-3 p-4">
-        {/* 优先级上移/下移（FR-010）：越靠上越优先，故障转移先用它。
-            拖拽在 Tauri WebView 里不稳，改用明确的上/下按钮，点一下与相邻 Key 交换。 */}
-        <div className="mt-0.5 flex flex-col">
+        {/* 优先级调整（FR-010）：越靠上越优先，故障转移先用它。
+            三个控件刻意并存，各自补另一个的短板：
+            - **拖动把手**：跨多位一步到位（用户原话「一个一个点太麻烦了」）；
+            - **上/下按钮**：键盘与辅助技术的唯一路径（拖放在屏幕阅读器下不可达），
+              也是 WebView 里拖放万一出问题时的可靠退路。**不要用拖放替换它们。** */}
+        <div className="mt-0.5 flex flex-col items-center">
+          <Tooltip content={`${t("key.dragHandle")} · ${t("key.dragHandleHint")}`} side="left">
+            <button
+              type="button"
+              aria-label={t("key.dragHandle")}
+              /* `touch-none` 必需：不禁掉浏览器的默认触摸手势，pointermove 会被
+                 滚动/长按选择抢走，表现为「拖一下页面在滚、卡片没动」。 */
+              className="cursor-grab touch-none text-text-muted hover:text-text-secondary active:cursor-grabbing"
+              onPointerDown={(e) => onDragHandleDown(k.id, e)}
+            >
+              <GripVertical size={15} />
+            </button>
+          </Tooltip>
           <Tooltip content={t("key.moveUp")} side="left">
             <button
               className="text-text-muted hover:text-text-secondary disabled:cursor-not-allowed disabled:opacity-30"

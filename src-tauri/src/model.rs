@@ -49,8 +49,6 @@ pub struct CategoryMeta {
     /// 不合规的名字会被它从模型列表里静默过滤掉，全被滤掉时选择器为空、
     /// 打开会话报 ModelsNotDiscoveredError（判据取自 app.asar）
     pub strict_model_id: bool,
-    /// cc-switch 库里对应的 appType
-    pub ccswitch_app_type: &'static str,
 }
 
 const ROW_CLAUDE_CLI: CategoryMeta = CategoryMeta {
@@ -60,7 +58,6 @@ const ROW_CLAUDE_CLI: CategoryMeta = CategoryMeta {
     default_port: 47100,
     tier_rewrite: true,
     strict_model_id: false,
-    ccswitch_app_type: "claude",
 };
 
 const ROW_CLAUDE_DESKTOP: CategoryMeta = CategoryMeta {
@@ -70,7 +67,6 @@ const ROW_CLAUDE_DESKTOP: CategoryMeta = CategoryMeta {
     default_port: 47102,
     tier_rewrite: true,
     strict_model_id: true,
-    ccswitch_app_type: "claude-desktop",
 };
 
 const ROW_CODEX: CategoryMeta = CategoryMeta {
@@ -80,7 +76,6 @@ const ROW_CODEX: CategoryMeta = CategoryMeta {
     default_port: 47101,
     tier_rewrite: false,
     strict_model_id: false,
-    ccswitch_app_type: "codex",
 };
 
 impl CategoryType {
@@ -1524,9 +1519,6 @@ pub struct OnboardingState {
     pub should_show: bool,
     pub done: bool,
     pub total_keys: usize,
-    /// 这台机器上有没有 cc-switch 的库。有则把「从 cc-switch 导入」作为默认高亮的主选项 ——
-    /// 对已经在用 cc-switch 的用户，那是比手工填 13 个字段快得多的路。
-    pub ccswitch_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

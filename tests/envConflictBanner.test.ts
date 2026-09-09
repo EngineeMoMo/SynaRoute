@@ -61,6 +61,26 @@ describe("EnvConflictBanner", () => {
     expect(relevant(conflict("CODEX_HOME"), "claude-cli")).toBe(false);
   });
 
+  /**
+   * 🔴 **前缀判据必须大小写无关** —— 否则后端修了、这一层照旧筛掉。
+   *
+   * Windows 的环境变量名原生大小写不敏感：`Anthropic_Api_Key` 与 `ANTHROPIC_API_KEY`
+   * 是同一个变量，客户端照样读得到。后端为此走 `env_name_eq`（按宿主平台取语义）把它
+   * 判成 conflict；而这里若裸 `startsWith`，那条发现就死在前端 —— 横幅在它唯一该说话的
+   * 那次**静默不出现**，用户看到的是「接入说成功、请求一个都没到代理」，而应用里一个字都没有。
+   *
+   * 这一条守的正是「后端改了、前端没跟上」这半条链，而它是静默的（后端用例全绿）。
+   */
+  it("前缀判据必须大小写无关 —— Windows 上混合大小写的变量名同样生效", () => {
+    for (const name of ["Anthropic_Api_Key", "anthropic_base_url", "AnThRoPiC_AUTH_TOKEN"]) {
+      expect(relevant(conflict(name), "claude-cli"), `${name} 必须被认出来`).toBe(true);
+      expect(relevant(conflict(name), "claude-desktop"), `${name} 在桌面端仍不该报`).toBe(false);
+    }
+    expect(relevant(conflict("Codex_Home"), "codex"), "CODEX_ 那半同理").toBe(true);
+    // 反向：不许因为放宽大小写就把别家的变量也收进来。
+    expect(relevant(conflict("MY_ANTHROPIC_KEY"), "claude-cli"), "仍必须是前缀匹配").toBe(false);
+  });
+
   it("notice 级一条都不上横幅（只进诊断报告）", () => {
     // OPENAI_* 落在 notice 上：我们的 Codex provider 用 experimental_bearer_token、
     // 不读环境变量，报成 conflict 对每个装过 OpenAI SDK 的用户都是假警。
@@ -90,6 +110,34 @@ describe("EnvConflictBanner", () => {
     expect(
       /started\s*[!=]==\s*category\b/.test(body),
       "started 与闭包 category 比是恒真/恒假的，那道守卫等于没写（第一版的缺陷本体）",
+    ).toBe(false);
+  });
+
+  /**
+   * 🔴 **「为什么不给删」必须逐条用后端的 `keepReason`，不许前端用一句固定文案覆盖。**
+   *
+   * `removable: false` 有两个成因、处置**相反**：目录类是我们刻意不删（正确处置是对齐两侧，
+   * 「重启让我们继承到」是对的）；process-only 是我们删不掉（正确处置是去 HKLM / 父进程把
+   * 它去掉）。上一版只有一句 `t("env.keepHint")`，内容只对目录类成立 —— 于是最常见的形态
+   * （用户在系统设置里设了 `ANTHROPIC_API_KEY`，我们启动时继承到 → process 与 user 各一条）
+   * 会被告知「重启 SynaRoute 让它继承到」，而他要的恰恰是**让它消失**。
+   *
+   * 这条判据钉两件事：渲染必须读 `keepReason`；那句已作废的固定文案不许再出现。
+   */
+  it("不给删的理由必须逐条来自后端，不许用一句固定文案覆盖两种相反的处置", () => {
+    const body = code(SRC);
+    expect(
+      body.includes("keepReason"),
+      "必须渲染后端逐条给的 keepReason —— 两个成因的处置方向相反，一句话覆盖不了",
+    ).toBe(true);
+    expect(
+      body.includes("env.keepHint"),
+      "那句固定文案已作废（它只对目录类成立，对 process-only 指的方向是反的）",
+    ).toBe(false);
+    // 反向：前端不许自己判「这是哪一类」—— 同一事实两处各判一遍必然漂移。
+    expect(
+      /keepReason\s*=|CODEX_HOME|CODEX_SQLITE_HOME/.test(body),
+      "前端不许自己按变量名推断类别或自造理由，那一位是后端的单一事实来源",
     ).toBe(false);
   });
 });

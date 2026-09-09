@@ -267,7 +267,6 @@ export default function App() {
           只传 setActiveCategory 会让侧栏高亮与向导选的客户端对不上。 */}
       {onboarding?.shouldShow && (
         <OnboardingWizard
-          ccswitchAvailable={onboarding.ccswitchAvailable}
           onPickCategory={handleNav}
           onOpenLogs={() => handleNav("logs")}
         />

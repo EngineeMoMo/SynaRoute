@@ -36,6 +36,7 @@ export function mockUsageWithCost(
       keyId: r.keyId,
       keyName: store[r.categoryId]?.find((k) => k.id === r.keyId)?.name ?? r.keyId ?? null,
       usage: r.usage,
+      hasRecordedUsage: true,
       costNano: total * (src === "exact" ? 3000 : 15000),
       pricingSource: src,
       multiplier: src === "family" ? "0.3" : "1.0",
@@ -56,6 +57,7 @@ export function mockUsageWithCost(
       keyId: cli[0].id,
       keyName: cli[0].name,
       usage: { input: 42_000, output: 8_800, cacheRead: 12_000, cacheCreation: 3_100 },
+      hasRecordedUsage: true,
       costNano: 760_000_000,
       pricingSource: "family",
       multiplier: "0.3",
@@ -69,6 +71,7 @@ export function mockUsageWithCost(
       keyId: cli[1].id,
       keyName: cli[1].name,
       usage: { input: 9_100, output: 2_200, cacheRead: 0, cacheCreation: 0 },
+      hasRecordedUsage: true,
       costNano: null,
       pricingSource: "unknown",
       multiplier: "1.0",
@@ -82,10 +85,28 @@ export function mockUsageWithCost(
       keyId: cli[2].id,
       keyName: cli[2].name,
       usage: { input: 3_400, output: 900, cacheRead: 0, cacheCreation: 0 },
+      hasRecordedUsage: true,
       costNano: null,
       pricingSource: "unknown",
       multiplier: "1.0",
       unpricedReason: { kind: "noModelName" },
+    });
+  }
+  // 🔴 **零用量的新 Key**（2026-09-09 用户实报「新加的 key 都看不见」）。
+  //
+  // 后端行集合现在是「配置里的 Key ∪ 历史桶」，这类行必须在预览里出现一次 ——
+  // 它的呈现与其余各行都不同（金额显示「尚无用量」而**不是 $0**、不进无价横幅、
+  // 不带 unpricedReason），而没渲染到的分支样式与文案必然做漏。
+  if (cli[3]) {
+    out.push({
+      categoryId: "claude-cli",
+      keyId: cli[3].id,
+      keyName: cli[3].name,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 },
+      hasRecordedUsage: false,
+      costNano: null,
+      pricingSource: "unknown",
+      multiplier: "1.0",
     });
   }
 
@@ -96,6 +117,7 @@ export function mockUsageWithCost(
     keyId: "",
     keyName: null,
     usage: { input: 412_500, output: 29_500, cacheRead: 66_800, cacheCreation: 0 },
+    hasRecordedUsage: true,
     costNano: null,
     pricingSource: "unknown",
     multiplier: "1.0",
@@ -110,6 +132,7 @@ export function mockUsageWithCost(
     keyName: null,
     keyDeleted: true,
     usage: { input: 88_000, output: 5_400, cacheRead: 210_000, cacheCreation: 0 },
+    hasRecordedUsage: true,
     costNano: null,
     pricingSource: "unknown",
     multiplier: "1.0",
@@ -124,6 +147,7 @@ export function mockUsageWithCost(
     keyName: "厂商3（已下线中转）",
     keyDeleted: true,
     usage: { input: 412_000, output: 26_500, cacheRead: 980_000, cacheCreation: 12_000 },
+    hasRecordedUsage: true,
     costNano: 2_140_000_000,
     pricingSource: "family",
     multiplier: "1.4",

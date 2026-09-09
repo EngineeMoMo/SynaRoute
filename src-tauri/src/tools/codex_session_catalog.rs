@@ -681,8 +681,11 @@ mod tests {
     /// 一条数据都拿不到（两张表在两个库里），报告会说「0 条」而没人知道为什么。
     #[test]
     fn the_repair_must_be_wired_into_the_sqlite_sync() {
+        // 🔴 判据跟着代码搬：`sync_sqlite` 已从 `codex_sessions.rs` 移到
+        // `codex_session_sqlite.rs`（为守 900 行门）。扫错文件的表现是**假红**，
+        // 而假红的代价是下一个人把搬家撤回去。同 CLAUDE.md「搬代码时判据要跟着搬」。
         let prod = crate::proxy::custom_headers::production_code_only(include_str!(
-            "codex_sessions.rs"
+            "codex_session_sqlite.rs"
         ));
         assert!(prod.contains("catalog::repair_one("), "sync_sqlite 里没接上这一步");
         assert!(prod.contains("catalog::plan_from("), "没有跨库收集那一步");

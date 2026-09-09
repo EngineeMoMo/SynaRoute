@@ -17,6 +17,8 @@ import { mappingEn, mappingZh } from "@/lib/i18n.mapping";
 import { brainRunEn, brainRunZh } from "@/lib/i18n.brain";
 import sessionsSource from "./i18n.sessions.ts?raw";
 import { sessionsEn, sessionsZh } from "@/lib/i18n.sessions";
+import orderingSource from "./i18n.ordering.ts?raw";
+import { orderingEn, orderingZh } from "@/lib/i18n.ordering";
 
 /**
  * i18n 的结构性判据。**这些浏览器里看不出来**（缺翻译只是显示成另一种语言或原始 key，
@@ -54,6 +56,7 @@ const SOURCES: { name: string; src: string }[] = [
   { name: "i18n.mapping.ts", src: i18nMappingSource },
   { name: "i18n.brain.ts", src: i18nBrainSource },
   { name: "i18n.sessions.ts", src: sessionsSource },
+  { name: "i18n.ordering.ts", src: orderingSource },
 ];
 
 /** 各分片导出的运行时字典，用于校验「分片真的被展开进主词典了」。 */
@@ -65,6 +68,7 @@ const CHUNKS: { name: string; zh: Record<string, string>; en: Record<string, str
   { name: "mapping", zh: mappingZh, en: mappingEn },
   { name: "brainRun", zh: brainRunZh, en: brainRunEn },
   { name: "sessions", zh: sessionsZh, en: sessionsEn },
+  { name: "ordering", zh: orderingZh, en: orderingEn },
 ];
 
 /**

@@ -527,6 +527,7 @@ pub(crate) fn reject_if_unserviceable(
         Some(s) => format!("预计 {s}s 后恢复"),
         None => "恢复时间未知".to_string(),
     };
+    let why = blocked_by(&supporters, requested, now);
     let usable = discoverable_models(candidates);
     let alt = match usable.len() {
         0 => "当前没有其它可用模型".to_string(),
@@ -537,11 +538,11 @@ pub(crate) fn reject_if_unserviceable(
         ),
     };
     // 文案里用剥掉别名前缀的**真实对外名**：CLI 的选择器显示的就是它（`display_name`），
-    // 而带前缀那个串用户从没见过。
+    // 而带前缀那个串用户从没见过。挡因按实际层说 —— 写死「熔断或模型锁」会把配额窗口
+    // 那一支指去查熔断（本仓「指错方向的提示比没有提示更糟」）。
     let msg = format!(
-        "模型 {bare} 当前不可用：本池中能服务它的只有「{who}」，而它们现在都被熔断或\
-         模型锁定挡住（{when}）。{alt}。SynaRoute 刻意不把它悄悄换成别的模型——\
-         那会让你拿到一个并非所选模型的回答。"
+        "模型 {bare} 当前不可用：本池中能服务它的只有「{who}」，而它们现在都被{why}挡住（{when}）。\
+         {alt}。SynaRoute 刻意不把它悄悄换成别的模型——那会让你拿到一个并非所选模型的回答。"
     );
 
     // 落一条可折叠 warning：不落这层的话，用户只在客户端看到 503，而应用里毫无线索。
@@ -572,8 +573,8 @@ pub(crate) fn reject_if_unserviceable(
 /// 单条 Key 的恢复时刻取「Key 级熔断」与「该模型的单模型锁」中**更晚**的那个
 /// （两道门都得过），跨 Key 再取 `min`（任一条回来就够）。
 ///
-/// 全都没有生效的门 → `None`。理论上不会发生（那样它就该在候选里了），
-/// 此时不带 `Retry-After`：给一个凭空的秒数会让客户端按一个假期限退避。
+/// 全都没有生效的门 → `None`。配额窗口是第三层弹性，漏掉它会让「理论上不会发生」成真：
+/// 支持者被窗口挡住、不在候选里，而熔断/模型锁都是空的。
 fn earliest_release_ms(supporters: &[&ProviderKey], requested: &str, now: i64) -> Option<i64> {
     supporters
         .iter()
@@ -581,13 +582,44 @@ fn earliest_release_ms(supporters: &[&ProviderKey], requested: &str, now: i64) -
             let real = k.resolve_model(requested);
             let breaker = k.health.breaker_until.filter(|t| *t > now);
             let lock = k.health.model_locks.get(&real).map(|l| l.until).filter(|t| *t > now);
-            match (breaker, lock) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (Some(a), None) | (None, Some(a)) => Some(a),
-                (None, None) => None,
-            }
+            let quota = crate::health::quota_window::until_ms(&k.id);
+            [breaker, lock, quota].into_iter().flatten().max()
         })
         .min()
+}
+
+/// 支持者此刻被哪几层挡住。文案的单一事实来源 —— 别在调用点再枚举一遍。
+fn blocked_by(supporters: &[&ProviderKey], requested: &str, now: i64) -> String {
+    let mut layers = Vec::new();
+    let mut quota = false;
+    let mut breaker = false;
+    let mut lock = false;
+    for k in supporters {
+        let real = k.resolve_model(requested);
+        if crate::health::quota_window::active(&k.id) {
+            quota = true;
+        }
+        if k.health.breaker_until.filter(|t| *t > now).is_some() {
+            breaker = true;
+        }
+        if k.health.model_locks.get(&real).map(|l| l.until).filter(|t| *t > now).is_some() {
+            lock = true;
+        }
+    }
+    if quota {
+        layers.push("配额窗口");
+    }
+    if breaker {
+        layers.push("熔断");
+    }
+    if lock {
+        layers.push("模型锁定");
+    }
+    if layers.is_empty() {
+        "运行态门槛".into()
+    } else {
+        layers.join("或")
+    }
 }
 
 #[cfg(test)]
@@ -1020,6 +1052,59 @@ mod tests {
         assert_eq!(ev.kind, "warning", "LogsPage 的分组是穷举的，别新造 kind");
         assert!(ev.detail.contains("Key-b"), "要说清是哪条 Key 支持它");
         assert!(ev.detail.contains("opus"), "要给出现在就能用的模型");
+        assert!(ev.detail.contains("熔断"), "这一支真的是熔断挡住的");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 **配额窗口挡住唯一支持者时，503 必须带 Retry-After、文案必须说「配额窗口」。**
+    ///
+    /// 配额窗口是后加的第三层弹性：429 刻意不计熔断、不武装模型锁，唯一被武装的运行态
+    /// 就是它。漏掉这一层的表现是：Retry-After 为空、文案写「熔断或模型锁定」——
+    /// 用户被送去查熔断，客户端立刻重发。既有那条 reject 用例只用 `breaker()` 装夹，
+    /// 这一维此前零覆盖。
+    ///
+    /// ⚠️ 必须拿 [`quota_window::test_lock`]：那个模块的 [`reset_for_test`] 清整张表，
+    /// 不串行化的话它会把本用例刚武装的窗口清掉（全量红、单独跑永远绿）。
+    #[test]
+    fn a_quota_window_on_the_only_supporter_is_a_503_with_retry_after() {
+        let _g = crate::health::quota_window::test_lock();
+        crate::health::quota_window::reset_for_test();
+        let (store, dir) = store_at("reject_qw");
+        let store = std::sync::Arc::new(store); // arm 要 &Arc（它会 append_event）
+        // 🔴 模型名也必须是本用例独有的：`should_announce` 是**进程级**节流，键是
+        // `分类:模型名`。用 `glm` 的话，同进程别的用例先宣告过 → 本用例那条 warning 被
+        // 节流掉、断言「必须留一条 warning」在全量下红而单独跑绿。又一次进程级串台。
+        let want = "qw-rej-only-model";
+        let a = key("qw_rej_a", 0, &[want]);
+        let b = key("qw_rej_b", 1, &["opus"]); // 活着但不认识它
+        store.upsert_key(a.clone()).unwrap();
+        store.upsert_key(b.clone()).unwrap();
+        crate::health::quota_window::arm(&store, CategoryType::ClaudeCli, "qw_rej_a", 45);
+
+        let (cands, fb) = rank_candidates(&[a.clone(), b.clone()], CategoryType::ClaudeCli, want);
+        assert!(!fb, "B 还活着，不该走全池兜底");
+        assert!(cands.iter().all(|k| k.id != "qw_rej_a"), "窗口内的 A 必须被剔除");
+
+        let resp = reject_if_unserviceable(&store, CategoryType::ClaudeCli, want, &cands)
+            .expect("宣称过它、唯一支持者被配额窗口挡住 → 必须 503");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let ra: i64 = resp
+            .headers()
+            .get("retry-after")
+            .expect("必须带 Retry-After，对齐窗口剩余")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((40..=45).contains(&ra), "Retry-After 要对齐窗口剩余，实得 {ra}");
+
+        let ev = store
+            .list_events(CategoryType::ClaudeCli)
+            .into_iter()
+            .find(|e| e.detail.contains(want) && e.kind == "warning")
+            .expect("必须留一条 warning");
+        assert!(ev.detail.contains("配额窗口"), "挡因必须说配额窗口，不能写死熔断：{}", ev.detail);
+        assert!(!ev.detail.contains("熔断"), "这一支没有熔断，写它就是指错方向：{}", ev.detail);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
