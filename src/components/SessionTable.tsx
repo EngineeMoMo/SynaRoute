@@ -30,9 +30,21 @@ export function SessionTable({
 }) {
   const t = useT();
   return (
-    <div className="overflow-x-auto rounded-md border border-border">
+    // 🔴 **`max-h-[70vh]` 是 sticky 表头能生效的前提，不是装饰。**
+    //
+    // CSS 语义：`overflow-x: auto` 会让 `overflow-y` 一并计算成 `auto`，于是**本容器**
+    // （而不是页面）成了 sticky 的 scrollport。而它此前没有任何高度约束 → 永远不竖滚 →
+    // `position: sticky` 没有可贴的边，**一点作用都没有**。
+    //
+    // 实测（2026-09-10，40 行 / 1100×460）：加上限之前，表格顶部滚到视口上方 200px 时
+    // `thead.top` 也是 **-200**（跟着内容滚走）；而 `getComputedStyle` 照样报 `sticky` ——
+    // 类名在、计算值对、行为是空的，正是本仓最在意的那类「界面撒谎」。
+    //
+    // 上限取 70vh 而不是固定像素：会话少时表格是自然高度、整页一起滚（不产生嵌套滚动区）；
+    // 会话多到超过它才在表内滚，而那恰好是表头钉住唯一有价值的时候。
+    <div className="max-h-[70vh] overflow-auto rounded-md border border-border">
       <table className="w-full text-sm">
-        <thead className="bg-surface-hover/60 text-left text-text-muted">
+        <thead className="sticky top-0 z-10 bg-surface text-left text-text-muted shadow-[0_1px_0_0] shadow-border">
           <tr>
             <th className="w-8 px-3 py-2" />
             <th className="px-3 py-2">{t("sessions.colTitle")}</th>

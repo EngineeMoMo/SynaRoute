@@ -133,6 +133,32 @@ pub(in crate::tools) struct CatalogRow {
     /// `threads.source`（本机实测是 `"vscode"`）。取不到就不补这一行 —— 见 [`plan_from`]。
     pub source_kind: String,
     pub provider: String,
+    /// `threads.thread_source`：`user` = 用户自己的对话，其它值（本机实测
+    /// `guardian_review`）是 Codex 内部派生的子代理线程。**只有 `user` 才补进 Desktop 列表**
+    /// —— 理由见 [`repair_one`] 里那道门。
+    pub thread_source: String,
+}
+
+/// 标题的 SQL 表达式：按 catalog 自己的优先级取（`name` 是 Codex 生成的短标题，
+/// 见 `view` 模块头）。抽成函数是为了让判据能直接对着生成的 SQL 断言 ——
+/// grep 源码里有没有 `NULLIF` 只要一处就过，而这里要的是「每个候选列都套上了」。
+///
+/// 🔴 **每列都要套 `NULLIF(c,'')`**：`COALESCE` 只跳过 NULL，而 `name` 完全可能是
+/// **空串**（Codex 异步生成标题，没生成时就是 `''`）。裸 `COALESCE` 那时返回空串 →
+/// 我们往 Desktop 侧栏补一条**没有标题的空行**，用户看到一条点不出名字的记录。
+/// `view::thread_info` 一直是带 NULLIF 的，`plan_from` 这一处漏了 —— 同一件事两份实现漂移。
+fn title_expr_for(cols: &HashSet<String>) -> String {
+    let inner = ["name", "title", "preview", "first_user_message"]
+        .iter()
+        .filter(|c| cols.contains(**c))
+        .map(|c| format!("NULLIF({c}, '')"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if inner.is_empty() {
+        "id".into()
+    } else {
+        format!("COALESCE({inner}, id)")
+    }
 }
 
 /// 从各库的 `threads` 表凑出「要补进 catalog 的那些行」。
@@ -158,14 +184,7 @@ pub(in crate::tools) fn plan_from(home: &Path, target: &str, ids: &[String]) -> 
         if !cols.contains("id") || !cols.contains("source") {
             continue;
         }
-        // 标题按 catalog 自己的优先级取（`name` 是 Codex 生成的短标题，见 `view` 模块头）。
-        let title = ["name", "title", "preview", "first_user_message"]
-            .iter()
-            .filter(|c| cols.contains(**c))
-            .map(|c| (*c).to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let title_expr = if title.is_empty() { "id".into() } else { format!("COALESCE({title}, id)") };
+        let title_expr = title_expr_for(&cols);
         // 时间戳两种形态都可能在：毫秒列优先（更精确），回落秒列。
         let ts = |ms: &str, s: &str| -> String {
             match (cols.contains(ms), cols.contains(s)) {
@@ -175,8 +194,15 @@ pub(in crate::tools) fn plan_from(home: &Path, target: &str, ids: &[String]) -> 
                 (false, false) => "0".into(),
             }
         };
+        // `thread_source` 取不到时给空串 —— 那时**不敢**下「这是内部线程」的结论，
+        // 交给标题形态那道门（见 `repair_one`）。同 `balance_gate` 的「查不到 ≠ 为零」。
+        let src_expr = if cols.contains("thread_source") {
+            "COALESCE(thread_source, '')"
+        } else {
+            "''"
+        };
         let sql = format!(
-            "SELECT id, {title_expr}, COALESCE(cwd, ''), {}, {}, COALESCE(source, '') FROM threads",
+            "SELECT id, {title_expr}, COALESCE(cwd, ''), {}, {}, COALESCE(source, ''), {src_expr} FROM threads",
             ts("created_at_ms", "created_at"),
             ts("updated_at_ms", "updated_at"),
         );
@@ -190,6 +216,7 @@ pub(in crate::tools) fn plan_from(home: &Path, target: &str, ids: &[String]) -> 
                 updated_at: r.get(4)?,
                 source_kind: r.get(5)?,
                 provider: target.to_string(),
+                thread_source: r.get(6)?,
             })
         });
         if let Ok(iter) = rows {
@@ -277,7 +304,7 @@ pub(in crate::tools) fn repair_one(
         .unwrap_or_default();
     let missing: Vec<&CatalogRow> = rows
         .iter()
-        .filter(|r| !existing.contains(&r.thread_id) && !r.source_kind.is_empty())
+        .filter(|r| !existing.contains(&r.thread_id) && !r.source_kind.is_empty() && worth_listing(r))
         .collect();
     if missing.is_empty() {
         return;
@@ -336,6 +363,36 @@ pub(in crate::tools) fn repair_one(
         Ok(()) => report.inserted += inserted,
         Err(e) => report.skipped.push(format!("{}: 提交失败（{e}）", db_path.display())),
     }
+}
+
+/// 这一条值得出现在 **Desktop 的会话列表**里吗。
+///
+/// 🔴 **用户 2026-09-10 实报的缺陷本体**：Codex Desktop 的项目侧栏被十几条一模一样的
+/// 「The following is the Codex agent history whose request action you are as…」刷满，
+/// 真正的对话被挤在中间认不出来。那些是 Codex 自己派生的 `guardian_review` 子代理线程，
+/// 而它们的 `threads.name` 是 **NULL** → `plan_from` 的 COALESCE 回落到 `title`，
+/// 那一列存的就是那段注入文本。
+///
+/// **Codex 自己刻意不把它们放进 catalog。** 本机取证（2026-09-10）：`threads` 有 3 行、
+/// 其中 1 行是 guardian，而 `local_thread_catalog` 只有 **2 行**（两条 `user`）——
+/// 且 `local_thread_catalog_sync_state.initial_build_complete = 1`、
+/// `observation_sequence` 已到 37，也就是它**扫过了、然后决定不收**。
+/// 我们去补它等于把 Codex 刻意排除的东西塞回用户眼前。
+///
+/// 两道判据，**不是冗余**：
+/// - `thread_source == "user"`：权威信号（本机实测 guardian 那行就是 `guardian_review`）。
+///   取不到时是空串 → 这道门放行，因为「读不出来源」不等于「它是内部线程」
+///   （同 `balance_gate` 的三态：查不到 ≠ 为零）。
+/// - 标题形态：兜住上一条放行之后的情形 —— 老 schema 没有 `thread_source` 列时它恒为空串，
+///   而我们仍然不该往侧栏写一句用户读不懂的长英文。
+///
+/// ⚠️ **只管「补不补」，不删已有行**（模块头那条纪律没变）：已经在 catalog 里的行可能是
+/// Codex 自己写的，删它属于「影响范围超出修复」。
+fn worth_listing(r: &CatalogRow) -> bool {
+    if !r.thread_source.is_empty() && r.thread_source != "user" {
+        return false;
+    }
+    !super::view::is_injected_prompt(&r.title)
 }
 
 /// 要插哪些列：必填的九列 + 库里恰好有的那几个可选列。
@@ -428,6 +485,18 @@ mod tests {
             updated_at: 1788270772.0,
             source_kind: "vscode".into(),
             provider: "synaroute".into(),
+            thread_source: "user".into(),
+        }
+    }
+
+    /// 内部派生线程（本机实测的 `guardian_review`）：`thread_source` 非 user，
+    /// 且标题就是 Codex 注入给子代理的那段英文。
+    fn guardian_row(id: &str) -> CatalogRow {
+        CatalogRow {
+            thread_source: "guardian_review".into(),
+            title: "The following is the Codex agent history whose request action you are asked to review"
+                .into(),
+            ..row(id)
         }
     }
 
@@ -634,6 +703,72 @@ mod tests {
         assert_eq!(rep.total(), 0);
         assert!(rep.skipped.is_empty(), "这不该被报成跳过：{rep:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 **Codex 内部派生的线程不许补进 Desktop 列表**（用户 2026-09-10 实报的缺陷本体）。
+    ///
+    /// 症状：Codex Desktop 的项目侧栏被十几条一模一样的「The following is the Codex agent
+    /// history whose request action you are as…」刷满，真正的对话被挤在中间认不出来。
+    ///
+    /// 两道门各自单独验（[`worth_listing`] 的文档写了为什么不是冗余）：
+    /// - `thread_source != "user"` → 不补，**即使标题是干净的**；
+    /// - 老 schema 没有那一列（`thread_source` 为空串）时，靠**标题形态**兜住。
+    ///
+    /// 同一次调用里的正常行必须照旧补上 —— 否则这道门就变成「把整个功能关掉」。
+    #[test]
+    fn codex_internal_threads_never_reach_the_desktop_list() {
+        let dir = tmp("guardian");
+        let db = catalog_db(&dir);
+        // 三条一起喂：正常的 / 内部派生的 / 老 schema 下只能靠标题认出来的。
+        let mut old_schema = guardian_row("t3");
+        old_schema.thread_source = String::new(); // 那一列不存在时读出来就是空串
+        let mut clean_but_derived = row("t4");
+        clean_but_derived.thread_source = "guardian_review".into(); // 标题干净，仅来源可疑
+
+        let mut rep = CatalogReport::default();
+        repair_one(
+            &db,
+            "synaroute",
+            &[row("t1"), guardian_row("t2"), old_schema, clean_but_derived],
+            &mut rep,
+        );
+        assert_eq!(rep.inserted, 1, "只有那条 user 会话该被补进去：{rep:?}");
+
+        let c = Connection::open(&db).unwrap();
+        let ids: Vec<String> = c
+            .prepare("SELECT thread_id FROM local_thread_catalog ORDER BY thread_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids, vec!["t1".to_string()], "侧栏里只该多这一条");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 **标题列是空串时不许当成「有标题」。**
+    ///
+    /// `COALESCE` 只跳过 NULL。而 `threads.name` 完全可能是**空串**（Codex 异步生成标题，
+    /// 没生成时就是 `''`）—— 裸 `COALESCE` 那时返回空串，我们就往侧栏补一条**没有标题的
+    /// 空行**。`view::thread_info` 一直带 `NULLIF`，`plan_from` 这一处漏了。
+    ///
+    /// 判据**直接对着生成出来的 SQL 断言**，不是 grep 源码里有没有 `NULLIF` 那个词 ——
+    /// 后者只要有一处就过，而这里要的是「每个候选列都套上了」。
+    #[test]
+    fn an_empty_name_must_not_win_over_the_real_title() {
+        let cols: HashSet<String> = ["id", "source", "name", "title", "preview", "first_user_message"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let sql = title_expr_for(&cols);
+        for c in ["name", "title", "preview", "first_user_message"] {
+            assert!(
+                sql.contains(&format!("NULLIF({c}, '')")),
+                "候选列 {c} 没套 NULLIF —— 它是空串时会赢过后面真正的标题。生成的是: {sql}"
+            );
+        }
+        // 一列都没有时回落到 id（否则 catalog 的 NOT NULL 那一列会插失败）。
+        assert_eq!(title_expr_for(&HashSet::new()), "id");
     }
 
     /// 🔴 **`source_kind` 取不到就不补那一行。**

@@ -218,7 +218,17 @@ export function CodexSessionsPage() {
   );
 
   return (
-    <div className="space-y-4">
+    // 🔴 **`h-full overflow-y-auto`：整页一起滚。** `App` 的 `<main>` 是
+    // `flex-1 overflow-hidden`，子页面自己不滚动的话内容一长就被裁掉 ——
+    // 用户 2026-09-10 实报的「没有滚动条、页面不自适应」就是这个（此前本页外壳只有
+    // `space-y-4`，一个高度约束都没有）。
+    //
+    // ⚠️ **刻意不用日志页那套「固定头部 + 内层滚动」**（我第一版抄错了）：那套要求头部
+    // 恒定矮，而本页头部有 6 段（统计卡 + 同步区 + 两条横幅 + 索引审计），
+    // 实测 **801px** —— 比 520px 高的窗口整个视口都装不下，于是表格区被压到 16px、
+    // 一行都看不见。头部可能超高的页（设置 / 大脑 / 厂商 / 关于）全是本页这套。
+    <div className="h-full overflow-y-auto">
+      <div className="space-y-4 px-6 py-4">
       <header className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-xl font-semibold text-text">{t("sessions.title")}</h1>
@@ -440,7 +450,7 @@ export function CodexSessionsPage() {
       ) : data.rows.length === 0 ? (
         <p className="text-sm text-text-muted">{t("sessions.empty")}</p>
       ) : (
-        <>
+        <div className="space-y-3">
           <div className="flex flex-wrap items-center gap-3">
             <input
               type="search"
@@ -475,8 +485,9 @@ export function CodexSessionsPage() {
             onToggle={toggle}
             onExport={(r) => void doExport(r)}
           />
-        </>
+        </div>
       )}
+      </div>
     </div>
   );
 }

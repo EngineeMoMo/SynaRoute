@@ -361,6 +361,14 @@ enum UserText {
 /// 判据是**前缀**而不是 `contains`：实测那 7 处全部独占整条消息（闭合标签之后 0 字符），
 /// 而用 `contains` 会把「用户自己贴了一段 `<environment_context>` 来提问」也吞掉 ——
 /// 那是真话被当成噪音丢掉，方向比多留一段噪音糟。
+///
+/// 🔴 **「是不是注入块」这个判据只有一份实现**（[`super::view::is_injected_prompt`]）。
+///
+/// 本函数原先自己写了一份，只认 `<environment_context>`；而展示侧那份还认
+/// `The following is the Codex agent history`（guardian 子代理线程的开头）。
+/// **两份已经漂移，后果是导出泄漏**：导出一条 guardian 会话时，那段注入被判成 `Real`、
+/// 当成用户真话写进 Markdown —— 而本模块头明写「绝不导出」那一类。
+/// 同 CLAUDE.md「语义上必须相等的两个值要派生、不要各写一份」。
 fn classify_user_text(role: &str, trimmed: &str) -> UserText {
     if trimmed.is_empty() {
         return UserText::Injected; // 空消息本来也不输出
@@ -368,7 +376,7 @@ fn classify_user_text(role: &str, trimmed: &str) -> UserText {
     if role != "user" {
         return UserText::Real;
     }
-    if trimmed.starts_with("<environment_context>") {
+    if super::view::is_injected_prompt(trimmed) {
         return UserText::Injected;
     }
     if trimmed.starts_with("<turn_aborted>") {
@@ -674,6 +682,67 @@ mod tests {
         );
         assert!(md.contains("用户打断了这一轮"), "打断这件事是真实信息，要留一行标注:\n{md}");
         assert!(md.contains("真实提问"), "真话不许被一起丢掉:\n{md}");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// 🔴 **导出侧与展示侧的「注入块」判据必须同口径。**
+    ///
+    /// 本轮审查查出的真缺陷：`classify_user_text` 自己写了一份，只认
+    /// `<environment_context>`；而 `view::is_injected_prompt` 还认
+    /// `The following is the Codex agent history`（guardian 子代理线程的开头，本机实测
+    /// `threads.title` 就是它）。**两份已经漂移** → 导出一条 guardian 会话时那段注入被判成
+    /// `Real`、当成用户真话写进 Markdown，而模块头明写「绝不导出」那一类。
+    ///
+    /// 判据钉**行为**（同一个串两侧结论一致），不钉「调了哪个函数」—— 后者会在有人换实现
+    /// 方式时制造假红（同 CLAUDE.md「判据要钉性质不钉写法」）。
+    #[test]
+    fn the_export_and_the_list_agree_on_what_counts_as_injected() {
+        // guardian 那段：两侧都必须判成「注入」。
+        const GUARDIAN: &str =
+            "The following is the Codex agent history whose request action you are asked to review";
+        assert!(
+            super::super::view::is_injected_prompt(GUARDIAN),
+            "展示侧的判据变了？那本条要重新对齐"
+        );
+        assert!(
+            matches!(classify_user_text("user", GUARDIAN), UserText::Injected),
+            "导出侧把 guardian 的注入块当成了用户真话 —— 它会原样写进导出的 Markdown"
+        );
+
+        // 环境块：本来就两侧都认。
+        assert!(matches!(
+            classify_user_text("user", "<environment_context>\n<cwd>C:\\x</cwd>"),
+            UserText::Injected
+        ));
+
+        // 🔴 反向：用户自己引用这两段来提问是**真话**，不许被吞掉（判据是前缀不是 contains）。
+        for real in [
+            "这个 <environment_context> 是什么意思？",
+            "帮我看看 The following is the Codex agent history 这句是谁写的",
+        ] {
+            assert!(
+                matches!(classify_user_text("user", real), UserText::Real),
+                "用 contains 会把用户的真话当噪音丢掉: {real}"
+            );
+        }
+
+        // 导出端到端：guardian 会话导出后，那段注入一个字都不该在。
+        let home = tmp_home("gexp");
+        let id = uuid_of("gexp");
+        let rel = format!("sessions/2026/09/01/rollout-2026-09-01T21-49-02-{id}.jsonl");
+        let lines = [
+            format!("{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"thread_source\":\"guardian_review\"}}}}"),
+            format!("{{\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{GUARDIAN} …整段被审查的历史…\"}}]}}}}"),
+            "{\"ordinal\":2,\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"裁决：拒绝\"}]}}".into(),
+        ];
+        fs::write(home.join(&rel), lines.join("\n") + "\n").unwrap();
+        let asm = super::super::history::assemble(&home, &home.join(&rel)).unwrap();
+        let md = to_markdown(&asm);
+        assert!(
+            !md.contains("The following is the Codex agent history"),
+            "guardian 的注入块进了导出:\n{md}"
+        );
+        assert!(md.contains("裁决：拒绝"), "助手的真实回答不许被一起丢掉:\n{md}");
         let _ = fs::remove_dir_all(&home);
     }
 

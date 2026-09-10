@@ -81,8 +81,12 @@ const ROWS: CodexSessionList["rows"] = [
     bytes: 96_431,
     threadSource: "guardian_review",
     forked: false,
-    title:
-      "The following is the Codex agent history whose request action you are assessing…",
+    // ⚠️ 这里**刻意不再放那段注入文本**（原先是
+    // "The following is the Codex agent history whose request action you are assessing…"）。
+    // 后端 `view::is_injected_prompt` 现在会把它清掉并回落读正文，演示数据留着旧形态
+    // 会让浏览器预览显示一个**后端已经不可能产出**的界面 —— 而预览是本仓验证布局的
+    // 唯一手段，拿它当判据会得出错的结论（本轮就差点）。
+    title: "权限裁决：exec_command",
     model: "gpt-5.6-luna",
     effort: "low",
     tokens: 36_184,

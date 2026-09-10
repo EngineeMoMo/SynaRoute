@@ -37,7 +37,20 @@ use std::path::Path;
 /// 上限存在的理由不是省地方：本机就有一条会话的第一条用户消息是**整段被审查的对话历史**
 /// （guardian 子代理，`first_user_message` 以 "The following is the Codex agent history…"
 /// 开头，长达数千字符）。不截断的话那一行会把整张表挤变形。
+///
+/// ⚠️ **截断不够**：那段注入的前缀远短于 60 字，截完用户看到的仍是同一句英文。
+/// 真正的修法是 [`is_injected_prompt`] —— 整段丢掉、回落到下一条真用户消息。
 const TITLE_MAX_CHARS: usize = 60;
+
+/// Codex 以 `role: user` 注入、**绝不能当标题**的前缀。
+///
+/// 两条都是前缀匹配（同导出侧 `classify_user_text`）：`contains` 会把用户自己贴这段
+/// 来提问的真话吞掉。catalog 补行也走这里 —— Desktop 侧栏的 `display_title` 就是这个字段。
+pub(in crate::tools) fn is_injected_prompt(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with("<environment_context>")
+        || t.starts_with("The following is the Codex agent history")
+}
 
 /// 从正文里找第一条用户消息时最多读多少字节。
 ///
@@ -220,12 +233,17 @@ pub(in crate::tools) fn enrich(
         if let Some(i) = info.get(&r.thread_id) {
             stats.in_db += 1;
             r.title = clip(&i.title);
+            // sqlite 的 `first_user_message` 对 guardian 线程就是那段注入。当标题用
+            // 等于每条内部审查都叫同一个英文长句 —— 截断也救不了（前缀 < 60 字）。
+            if is_injected_prompt(&r.title) {
+                r.title.clear();
+            }
             r.model = i.model.clone();
             r.effort = i.effort.clone();
             r.tokens = i.tokens;
         }
         if r.title.is_empty() {
-            // 库里没有它（fork 子会话），或那几列都是空的 —— 回落到读正文。
+            // 库里没有它（fork 子会话），或那几列都是空的 / 是注入 —— 回落到读正文。
             r.title = cached_title(home, &r.rel_path).unwrap_or_default();
         }
         // 只在「有模型名 + 确实有启用的 Key」时才敢下这个结论。
@@ -338,7 +356,11 @@ fn first_user_message(path: &Path) -> Option<String> {
         }
         budget = budget.saturating_sub(n as u64);
         if let Some(text) = user_text(&line) {
-            return Some(text);
+            // 注入块独占整条 user 消息（本机 7 处 environment_context、guardian 的
+            // 「The following is the Codex agent history…」）。跳过找下一条真的。
+            if !is_injected_prompt(&text) {
+                return Some(text);
+            }
         }
         if budget == 0 {
             // 读够了还没找到就放弃：这只是一行展示文字，不值得为它把几十 MB 读完。
@@ -470,6 +492,80 @@ mod tests {
             "库里没有它就该从正文读第一条**用户**消息（developer 那条不算）"
         );
         assert_eq!((stats.total, stats.in_db, stats.mismatched), (1, 0, 1));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// 🔴 **Codex 以 `role: user` 注入的块不许当标题**（用户 2026-09-10 实报）。
+    ///
+    /// 两个来源都要挡住，而且两条路径不同：
+    /// - **sqlite 那几列**：guardian 线程的 `title`/`first_user_message` 就是那段注入
+    ///   （本机实测 `name` 是 NULL，所以 `COALESCE` 回落到它）→ 命中即清空、回落读正文；
+    /// - **正文扫描**：`<environment_context>` 独占整条 user 消息（本机 7 处、均 1274 字符，
+    ///   内含 `workspace_roots` 的本机绝对路径）→ 跳过它去找下一条真的。
+    ///
+    /// ⚠️ **截断救不了这件事**：两个前缀都远短于 `TITLE_MAX_CHARS`，截完用户看到的仍是
+    /// 同一句英文/同一段环境块。
+    #[test]
+    fn an_injected_user_block_is_never_used_as_the_title() {
+        assert!(is_injected_prompt("<environment_context>\n  <cwd>C:\\x</cwd>"));
+        assert!(is_injected_prompt(
+            "The following is the Codex agent history whose request action you are asked to review"
+        ));
+        // 🔴 判据是**前缀**：用户自己贴这段来提问是真话，不许当噪音丢掉。
+        assert!(
+            !is_injected_prompt("这个 <environment_context> 是什么意思？"),
+            "用 contains 会把用户的真话吞掉"
+        );
+        assert!(!is_injected_prompt("使用java写一个快速排序"));
+
+        // ① 正文扫描要跳过注入块，取下一条真消息。
+        let home = tmp_home("inj");
+        const ENV_LINE: &str = "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<environment_context>\\n  <cwd>C:\\\\work</cwd>\\n</environment_context>\"}]}}\n";
+        write_rollout(
+            &home,
+            // 两个 UUID = fork，库里没有它 → 必然走正文回落那条路
+            "rollout-2026-09-01T21-08-35-01a05d14-4e5b-7773-b425-25ae029f078f_01a05d15-f502-7363-867c-b9ab2203be6f.jsonl",
+            "synaroute",
+            &format!("{ENV_LINE}{USER_LINE}"),
+        );
+        let mut rows = super::super::scan_at(&home).sessions;
+        enrich(&home, &mut rows, "synaroute", &[]);
+        assert_eq!(
+            rows[0].title, "使用java写一个快速排序",
+            "环境块必须被跳过，取下一条真用户消息"
+        );
+        let _ = fs::remove_dir_all(&home);
+
+        // ② 库里的标题是注入块时，也要清掉并回落正文。
+        let home = tmp_home("injdb");
+        let id = "01a05d3b-0017-7ec3-9cff-23ea32293b1b";
+        let rel = format!("sessions/2026/09/01/rollout-2026-09-01T21-49-02-{id}.jsonl");
+        let mut text = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"timestamp\":\"t\",\"cwd\":\"C:/w\",\"thread_source\":\"guardian_review\",\"model_provider\":\"synaroute\"}}}}\n"
+        );
+        text.push_str(USER_LINE);
+        fs::write(home.join(&rel), text).unwrap();
+        let conn = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        conn.execute(
+            "CREATE TABLE threads (id TEXT, name TEXT, title TEXT, first_user_message TEXT, model TEXT, reasoning_effort TEXT, tokens_used INTEGER)",
+            [],
+        )
+        .unwrap();
+        // 本机实测形态：`name` 是 NULL、`title` 是那段注入。
+        conn.execute(
+            "INSERT INTO threads VALUES (?1, NULL, 'The following is the Codex agent history whose request action you are asked to review', 'The following is the Codex agent history', '', '', 0)",
+            [id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut rows = super::super::scan_at(&home).sessions;
+        let stats = enrich(&home, &mut rows, "synaroute", &[]);
+        assert_eq!(stats.in_db, 1, "它在库里，只是标题不能用");
+        assert_eq!(
+            rows[0].title, "使用java写一个快速排序",
+            "库里的标题是注入块 → 清掉并回落读正文，而不是原样显示那句英文"
+        );
         let _ = fs::remove_dir_all(&home);
     }
 
