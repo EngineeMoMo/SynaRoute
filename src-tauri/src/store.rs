@@ -144,6 +144,47 @@ pub struct Store {
     /// 记到零点后的桶里。为它引入「按时刻切分增量」的复杂度不值当 —— 用量面板的定位是
     /// 趋势与量级，不是账单对账。
     usage_baseline_date: RwLock<String>,
+    /// 🔴 **让「序列化 + 落盘」成为一个原子单元**（A7-1）。
+    ///
+    /// 没有它时的丢更新：`persist` 的读锁只保护序列化，而 `atomic_write` 的进程级
+    /// `WRITE_LOCK` 要到函数内部才取 —— 两条线程各自序列化出**含不同改动**的快照后，
+    /// **后拿到 WRITE_LOCK 的那个用自己的旧快照覆盖对方**。而那把锁是
+    /// `std::sync::Mutex`（非 FIFO 公平）、持锁期间含 `sync_all` 与最多 6 轮退避，
+    /// 窗口不是理论上的一瞬。
+    ///
+    /// 并发写者是现成的：健康线程每轮 `flush_health_if_dirty`、用量线程每 60s
+    /// `snapshot_running_proxies`、`balance_gate` / `codex_watch` 各一趟，加上全部 IPC 写命令。
+    /// 最坏后果是 `delete_key` 注释专门要防的孤儿（config 里 Key 复活且 `has_secret=true`，
+    /// 而密钥已从库里抹掉 → 转发报密钥缺失/401），且启动时无对账。
+    ///
+    /// 🔴 **刻意不改成「持 config 读锁跨 atomic_write」**：下面那段注释的顾虑是对的
+    /// （parking_lot 写者优先会把转发路径的读者全挡在等待的写者之后）。本锁只串行化
+    /// **两次 persist 之间**，config 读锁仍只在序列化期间持有，转发读者不受影响。
+    ///
+    /// 锁序 `persist_lock → config.read()` 与 `persist_lock → WRITE_LOCK` 均无环，
+    /// 且无调用方持 config 写锁跨 `persist`（`mutate_and_persist` 两个变体都先放锁再 persist）。
+    ///
+    /// # 🔴 这道防线**没有行为判据**，别读成「有测试在守」
+    ///
+    /// 我试过四种夹具去让「去掉这把锁」变红，**全部失败**（各连跑 3~5 次全绿）：
+    /// ① 8 线程 × 250 轮 toggle 同一条 Key；② 改成各线程各持一条 Key；
+    /// ③ 加 400 条填充键把序列化拖到毫秒级；④ 屏障放行 + 每线程只改一次只落一次盘。
+    ///
+    /// 成因不是夹具不够狠，而是**这个交错天然罕见**：丢更新要求「先序列化的线程后拿到
+    /// `WRITE_LOCK`」，而线程序列化完就紧接着排队取锁，Windows 的 `SRWLock` 大致 FIFO ——
+    /// 于是取锁顺序与序列化顺序高度相关，反序几乎不出现。窗口本身也只有几十纳秒
+    /// （放开读锁 → 进 `atomic_write` 取锁），而竞争者要在那里面跑完序列化 + fsync + rename。
+    ///
+    /// 所以本锁的依据是**代码结构上的可达性**（读锁只覆盖序列化、`WRITE_LOCK` 在
+    /// `atomic_write` 内部才取，中间没有任何东西保证两者原子），不是一次可复现的观测。
+    /// 它的代价约 100µs 串行化，而写本来已被 `WRITE_LOCK` 串行 —— 代价对不对称：
+    /// 不加而真撞上一次，后果是 `delete_key` 注释专门要防的孤儿（Key 复活且
+    /// `has_secret=true` 而密钥已删，启动时无对账）。
+    ///
+    /// 守它的是 `persist_serializes_and_writes_under_one_lock` 那条**源码级**判据。
+    /// 真要行为判据，得往 `persist` 里插一个 `#[cfg(test)]` 的可控阻塞点 ——
+    /// 我刻意没做：那会为了让判据变红而在生产函数里留一个只为测试存在的时序钩子。
+    persist_lock: std::sync::Mutex<()>,
 }
 
 /// 用量累计的定时落盘间隔（秒）。
@@ -427,6 +468,7 @@ impl Store {
             retired_usage: RwLock::new(usage_loaded.retired),
             usage_baseline: RwLock::new(baseline),
             usage_baseline_date: RwLock::new(baseline_date),
+            persist_lock: std::sync::Mutex::new(()),
         };
         // 仅在「全新安装首次 seed」或「成功加载后的迁移」时落盘。
         // `!load_failed` 现在是冗余的（persist 自己会拒），刻意留着：它表达「这一步在
@@ -1148,8 +1190,12 @@ impl Store {
                     .into(),
             ));
         }
-        // 仅在序列化期间持读锁；随后释放锁再做阻塞落盘。
-        // atomic_write 含进程级互斥 + 最长数百毫秒 sleep 重试，若持锁期间执行，会经
+        // 🔴 「序列化 + 落盘」必须是一个原子单元，否则并发 persist 会丢更新（见 `persist_lock`）。
+        // 中毒也继续（`into_inner`）：丢更新比在这里 panic 好不了多少，而 panic 在写盘路径上
+        // 会让调用方拿到一个 poisoned 的锁再也写不进去。
+        let _serialize_then_write = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // 仅在序列化期间持**读锁**；随后释放它再做阻塞落盘。
+        // atomic_write 含进程级互斥 + 最长数百毫秒 sleep 重试，若持读锁期间执行，会经
         // parking_lot「写者优先」把后续所有读者（代理转发的 enabled_keys_sorted /
         // secrets 读等）挡在等待的写者之后，阻塞 tokio worker 线程。
         let data = {
@@ -2836,6 +2882,7 @@ impl Store {
             usage_baseline_date: RwLock::new(
                 chrono::Utc::now().format("%Y-%m-%d").to_string(),
             ),
+            persist_lock: std::sync::Mutex::new(()),
             usage_totals: RwLock::new(usage_loaded.totals),
         })
     }
@@ -3368,28 +3415,48 @@ mod tests {
     }
 
     /// 模拟后台健康检查线程与前端保存并发写盘：唯一临时名 + 重试应保证不丢、不损坏。
+    ///
+    /// 🔴 **判据升级（A7-1）：从「文件能解析」升成「磁盘必须等于内存」。**
+    ///
+    /// 旧版只断言 `config.json` 是完整合法 JSON + `keys.len() == 1`，**从不比对磁盘与内存** ——
+    /// 于是 `persist` 的丢更新（读锁只保护序列化，`WRITE_LOCK` 在 `atomic_write` 内部才取，
+    /// 后拿到锁的写者用自己的旧快照覆盖对方）从来没被覆盖过：那种失效下文件照样合法、
+    /// Key 数照样是 1，只是**内容退回了某个更旧的快照**。
+    ///
+    /// 🔴 **但这条用例抓不住「去掉 `persist_lock`」——别把它读成那道防线的判据。**
+    ///
+    /// 我试过四种夹具，注入后**全部仍绿**（各连跑 3~5 次）：① 8×250 轮 toggle 同一条 Key；
+    /// ② 各线程各持一条 Key；③ 加 400 条填充键把序列化拖到毫秒级；
+    /// ④ 屏障放行 + 每线程只改一次只落一次盘。成因见 `persist_lock` 的文档
+    /// （取锁顺序与序列化顺序天然相关，要的那个反序几乎不出现）。
+    ///
+    /// 它**仍然有价值**，守的是另外两件真事：无半写损坏（并发下 config.json 必须完整可解析），
+    /// 以及跑完之后磁盘与内存一致（那是「有没有别的路径把配置写坏」的兜底）。
+    /// `persist_lock` 那道防线由源码级判据 `persist_serializes_and_writes_under_one_lock` 守。
     #[test]
-    fn concurrent_persist_is_consistent() {
+    fn concurrent_persist_never_loses_an_update() {
         let dir = temp_dir("concurrent");
         let cfg_path = dir.join("config.json");
         let store = std::sync::Arc::new(
             Store::new_at(cfg_path.clone(), dir.join("secrets.enc")).unwrap(),
         );
-        store.upsert_key(sample_key("base", 0)).unwrap();
-
+        // 八条 Key，每条线程只动自己那条 —— 这样「丢更新」= 某条 Key 的值回退，可断言。
+        for t in 0..8 {
+            store.upsert_key(sample_key(&format!("k{t}"), t)).unwrap();
+        }
+        // 屏障放行，让 8 条线程尽可能同时进入 `mutate_and_persist`。
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
         let mut handles = vec![];
         for t in 0..8 {
             let s = store.clone();
+            let b = barrier.clone();
             handles.push(std::thread::spawn(move || {
-                for i in 0..20 {
-                    // 交替 toggle 与 health 更新，全部走 persist→atomic_write
-                    s.toggle_key("base", i % 2 == 0).ok();
-                    s.update_health(
-                        "base",
-                        HealthState { status: HealthStatus::Up, ..Default::default() },
-                    )
-                    .ok();
-                    let _ = t;
+                let id = format!("k{t}");
+                b.wait();
+                for _ in 0..40 {
+                    // 最终都停在 enabled=false。
+                    s.toggle_key(&id, true).ok();
+                    s.toggle_key(&id, false).ok();
                 }
             }));
         }
@@ -3397,12 +3464,69 @@ mod tests {
             h.join().unwrap();
         }
 
-        // 并发结束后配置文件必须是完整可解析的 JSON（无半写损坏）
+        // ① 无半写损坏（旧判据，保留）
         let raw = std::fs::read(&cfg_path).unwrap();
         let parsed: AppConfig = serde_json::from_slice(&raw).expect("config.json 应为完整合法 JSON");
-        assert_eq!(parsed.keys.len(), 1);
+        assert_eq!(parsed.keys.len(), 8);
+
+        // ② 🔴 磁盘上那份必须**就是**内存里那份。丢更新的表现正是这一条不成立：
+        //    文件合法、Key 数也对，而某条 Key 停在某个更旧的快照上（enabled 还是 true）。
+        let in_memory = store.snapshot_config();
+        for mem in &in_memory.keys {
+            let disk = parsed
+                .keys
+                .iter()
+                .find(|k| k.id == mem.id)
+                .unwrap_or_else(|| panic!("磁盘上少了 Key {}", mem.id));
+            assert_eq!(
+                disk.enabled, mem.enabled,
+                "Key {} 磁盘={} 内存={} —— persist 丢更新（某次落盘用了自己那份旧快照，\
+                 把别人刚提交的改动覆盖回去）",
+                mem.id, disk.enabled, mem.enabled
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 🔴 **`persist` 必须在**序列化之前**就持有 `persist_lock`。**
+    ///
+    /// 这是 `persist_lock` 那道防线的**唯一**判据，因为它没有行为判据 —— 四种夹具都试过、
+    /// 注入后全部仍绿，成因见该字段的文档（取锁顺序与序列化顺序天然相关）。
+    /// 既然抓不住行为，就退一步钉**结构**：那把锁必须排在读 config 之前。
+    ///
+    /// 会被这条判据抓住的两种退化：① 把 `persist_lock` 整个删掉；
+    /// ② 把它挪到 `atomic_write` **之后**或与序列化并列 —— 那样窗口原样回来，
+    /// 而所有现存用例照旧全绿（这正是本条存在的理由）。
+    #[test]
+    fn persist_serializes_and_writes_under_one_lock() {
+        let src = crate::proxy::custom_headers::production_code_only(include_str!("store.rs"));
+        let body = src
+            .split_once("fn persist(&self) -> AppResult<()>")
+            .expect("找不到 persist —— 判据要跟着代码搬（本仓栽过多次）")
+            .1;
+        let end = body.find("\n    }").unwrap_or(body.len());
+        let body = &body[..end];
+
+        let lock_at = body
+            .find("self.persist_lock.lock()")
+            .expect("persist 里没有取 persist_lock —— 并发落盘会丢更新（见该字段文档）");
+        let read_at = body
+            .find("self.config.read()")
+            .expect("persist 里没有读 config？判据锚点已失效，请重写本条");
+        let write_at = body
+            .find("atomic_write(")
+            .expect("persist 里没有 atomic_write？判据锚点已失效，请重写本条");
+
+        assert!(
+            lock_at < read_at,
+            "persist_lock 必须在**序列化之前**取。排在之后等于窗口原样存在，\
+             而现存的并发用例抓不住它（四种夹具都试过、注入全绿）"
+        );
+        assert!(
+            read_at < write_at,
+            "锚点顺序反了：本条假定 persist 是「取锁 → 读+序列化 → 落盘」这个形状"
+        );
     }
 
     /// 并发写事件日志：落盘的 jsonl **每行必须是且仅是一个完整 JSON 对象**。

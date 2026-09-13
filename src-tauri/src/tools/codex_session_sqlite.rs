@@ -2,6 +2,7 @@
 //! 从父模块抽出只为守住 900 行门；语义与判据仍由父模块测试段覆盖。
 
 use super::{catalog, files, ManifestEntry, SqliteOutcome};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 // sqlite（best-effort：只影响 Desktop 的会话列表，不影响路由）
@@ -61,6 +62,32 @@ pub(in crate::tools) fn session_db_paths(home: &Path) -> Vec<PathBuf> {
     out
 }
 
+pub(super) fn collect_child_thread_ids(home: &Path) -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    for path in session_db_paths(home) {
+        let Ok(conn) = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+            continue;
+        };
+        for (table, column) in [
+            ("thread_spawn_edges", "child_thread_id"),
+            ("agent_job_items", "assigned_thread_id"),
+        ] {
+            let has_column = conn.query_row(
+                "SELECT 1 FROM pragma_table_info(?1) WHERE name=?2 LIMIT 1",
+                (table, column), |_| Ok(true),
+            ).unwrap_or(false);
+            if !has_column { continue }
+            let sql = format!("SELECT {column} FROM {table} WHERE COALESCE({column},'') <> ''");
+            if let Ok(mut stmt) = conn.prepare(&sql) {
+                if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                    ids.extend(rows.flatten());
+                }
+            }
+        }
+    }
+    ids
+}
+
 /// 把指定 thread 的 `threads.model_provider` 改成 `target`。
 ///
 /// `ids` = **rollout 那半确实改成功的**那些 thread id。空切片 → 一个字节都不写：那意味着
@@ -70,34 +97,64 @@ pub(super) fn sync_sqlite(
     data_dir: &Path,
     target: &str,
     ids: &[String],
+    catalog_rows: &[catalog::CatalogRow],
 ) -> Option<SqliteOutcome> {
     let dbs = session_db_paths(home);
     if dbs.is_empty() {
         return None;
     }
-    if ids.is_empty() {
-        return Some(SqliteOutcome::default());
-    }
-    // Desktop 列表那份索引（`local_thread_catalog`）要的展示信息 —— 它在**另一个库**里，
-    // 而那个库没有 `threads` 表，所以数据只能从这一侧带过去。取不到就只做 UPDATE 那两步。
-    let catalog_rows = catalog::plan_from(home, target, ids);
+    // cleanup-only 必须运行：已有 guardian 污染行常发生在 rollout 全都已是 target 时。
+    let planned_rows = if catalog_rows.is_empty() {
+        catalog::plan_from(home, target, ids)
+    } else {
+        catalog_rows.to_vec()
+    };
     let mut out = SqliteOutcome::default();
     for db in dbs {
-        // 备份在**写之前**、且只在真要写的时候做（`ids` 非空已经保证了这一点）。
-        if let Err(e) = backup_db(&db, data_dir) {
-            out.error.get_or_insert(e);
-            continue; // 备份不成就不写这个库 —— 宁可不同步，也不留一个无法回退的改动
-        }
-        match set_threads_provider(&db, target, ids) {
-            Ok(n) => out.updated += n,
+        let thread_mutation = !ids.is_empty() && threads_would_mutate(&db, target, ids);
+        let catalog_mutation = match catalog::would_mutate(&db, target, &planned_rows) {
+            Ok(value) => value,
             Err(e) => {
                 out.error.get_or_insert(e);
+                continue;
+            }
+        };
+        if !thread_mutation && !catalog_mutation {
+            continue;
+        }
+        if let Err(e) = backup_db(&db, data_dir) {
+            out.error.get_or_insert(e);
+            continue;
+        }
+        if thread_mutation {
+            match set_threads_provider(&db, target, ids) {
+                Ok(n) => out.updated += n,
+                Err(e) => { out.error.get_or_insert(e); }
             }
         }
-        // 第三份 provider 副本 + Desktop 列表索引的缺行。理由见 `catalog` 模块头。
-        catalog::repair_one(&db, target, &catalog_rows, &mut out.catalog);
+        if catalog_mutation {
+            catalog::repair_one(&db, target, &planned_rows, &mut out.catalog);
+        }
     }
     Some(out)
+}
+
+fn threads_would_mutate(db: &Path, target: &str, ids: &[String]) -> bool {
+    if ids.is_empty() { return false }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return true;
+    };
+    ids.chunks(SQL_CHUNK).any(|chunk| {
+        let holes = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let target_pos = chunk.len() + 1;
+        let sql = format!(
+            "SELECT 1 FROM threads WHERE id IN ({holes}) AND model_provider IS NOT ?{target_pos} LIMIT 1"
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = chunk.iter()
+            .map(|id| id as &dyn rusqlite::ToSql).collect();
+        params.push(&target);
+        conn.query_row(&sql, params.as_slice(), |_| Ok(())).is_ok()
+    })
 }
 
 /// 按清单把 `threads.model_provider` 改回原值。返回 `Some(错误)` 表示有库没处理成功。
@@ -139,50 +196,73 @@ pub(super) fn restore_sqlite(home: &Path, entries: &[ManifestEntry]) -> Option<S
     first_err
 }
 
-/// 写之前把库文件备份到 `<data_dir>/backups/codex-sqlite/`，只留最近 [`DB_BACKUP_KEEP`] 份。
-///
-/// 🔴 **`-wal` 也要备份**：WAL 模式下主文件可能不含最新数据，只拷主文件会得到一个旧快照。
-/// 缺 `-wal` 不是错误（Codex 关闭时会 checkpoint 掉它）。
-fn backup_db(db: &Path, data_dir: &Path) -> Result<(), String> {
-    let dir = data_dir.join("backups").join("codex-sqlite");
-    fs::create_dir_all(&dir).map_err(|e| format!("建备份目录失败: {e}"))?;
+fn backup_identity(db: &Path) -> Result<String, String> {
+    let canonical = fs::canonicalize(db).map_err(|e| format!("解析 {} 失败: {e}", db.display()))?;
+    let hash = format!("{:x}", Sha256::digest(canonical.to_string_lossy().as_bytes()));
     let stem = db.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    // 🔴 秒级时间戳不够：用户连点两下「启动」时两次备份会同名、**后一次覆盖前一次**，
-    // 于是「保留 3 份」实际只有 1 份。加毫秒 + 进程内自增序号（同 `tmp_path_for`）。
-    let ts = format!(
-        "{}-{:04}",
-        chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f"),
-        files::seq() % 10_000
-    );
-    fs::copy(db, dir.join(format!("{stem}.{ts}.bak")))
-        .map_err(|e| format!("备份 {} 失败: {e}", db.display()))?;
-    let wal = PathBuf::from(format!("{}-wal", db.to_string_lossy()));
-    if wal.is_file() {
-        fs::copy(&wal, dir.join(format!("{stem}-wal.{ts}.bak")))
-            .map_err(|e| format!("备份 {} 失败: {e}", wal.display()))?;
+    Ok(format!("{stem}-{}", &hash[..12]))
+}
+
+fn online_backup(db: &Path, destination: &Path) -> Result<(), String> {
+    let source = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ).map_err(|e| format!("打开 {} 备份源失败: {e}", db.display()))?;
+    let _ = source.busy_timeout(std::time::Duration::from_millis(1500));
+    let mut output = rusqlite::Connection::open(destination)
+        .map_err(|e| format!("创建 {} 失败: {e}", destination.display()))?;
+    let backup = rusqlite::backup::Backup::new(&source, &mut output)
+        .map_err(|e| format!("初始化 {} 备份失败: {e}", db.display()))?;
+    use rusqlite::backup::StepResult;
+    let mut waits = 0;
+    loop {
+        match backup.step(128).map_err(|e| format!("备份 {} 失败: {e}", db.display()))? {
+            StepResult::Done => break,
+            StepResult::More => waits = 0,
+            StepResult::Busy | StepResult::Locked if waits < 15 => {
+                waits += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            StepResult::Busy | StepResult::Locked => return Err(format!(
+                "备份 {} 超时（数据库持续 Busy/Locked）", db.display()
+            )),
+            _ => return Err(format!("备份 {} 返回未知状态", db.display())),
+        }
     }
-    prune_backups(&dir, &stem);
     Ok(())
 }
 
-/// 每个库名只留最近 [`DB_BACKUP_KEEP`] 份（同 `log_rotate` 那条：加了保留就必须同时加清理）。
-/// 排序键刻意把 `-wal` 挪到末位 —— 取证见 `tests::old_db_backups_are_pruned` 的文档。
-fn prune_backups(dir: &Path, stem: &str) {
+/// 写前用 SQLite Online Backup 生成单文件一致快照；它会把 WAL 中已提交页一并纳入。
+pub(super) fn backup_db(db: &Path, data_dir: &Path) -> Result<(), String> {
+    let dir = data_dir.join("backups").join("codex-sqlite");
+    fs::create_dir_all(&dir).map_err(|e| format!("建备份目录失败: {e}"))?;
+    let identity = backup_identity(db)?;
+    let ts = format!("{}-{:04}", chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f"), files::seq() % 10_000);
+    let final_path = dir.join(format!("{identity}.{ts}.bak"));
+    let temp_path = files::tmp_path_for(&final_path);
+    if let Err(error) = online_backup(db, &temp_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    fs::rename(&temp_path, &final_path).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        format!("提交 {} 备份失败: {e}", db.display())
+    })?;
+    prune_backups(&dir, &identity);
+    Ok(())
+}
+
+/// 每个 canonical 库身份只留最近 [`DB_BACKUP_KEEP`] 份一致快照。
+fn prune_backups(dir: &Path, identity: &str) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut mine: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| name(p).starts_with(stem))
+        .filter(|p| name(p).starts_with(&format!("{identity}.")))
         .collect();
-    // 键 = (时间戳段, is_wal)：时间戳格式定长故字典序即时间序（不依赖 mtime —— 备份刚写完
-    // 可能同秒，而排错方向会删掉最新那份）；is_wal 排在后面让同一轮的两个文件相邻、主文件在前。
-    mine.sort_by_key(|p| {
-        let n = name(p);
-        let wal = n.starts_with(&format!("{stem}-wal."));
-        (n.trim_start_matches(stem).trim_start_matches("-wal").to_string(), wal)
-    });
-    let keep_from = mine.len().saturating_sub(DB_BACKUP_KEEP * 2); // 主文件 + wal
+    mine.sort_by_key(|p| name(p));
+    let keep_from = mine.len().saturating_sub(DB_BACKUP_KEEP);
     for p in &mine[..keep_from] {
         let _ = fs::remove_file(p);
     }

@@ -78,6 +78,18 @@ describe("会话页与后端的两处契约", () => {
     }
   });
 
+  it("willChange 为 0 时也披露本地索引清理与备份", () => {
+    for (const [lang, dict] of [
+      ["zh", sessionsZh],
+      ["en", sessionsEn],
+    ] as const) {
+      const none = dict["sessions.syncConfirmNone"];
+      expect(none, `${lang} 不能把 cleanup-only 说成无动作`).toContain("local_thread_catalog");
+      expect(none, `${lang} 必须披露写库前备份`).toMatch(/备份|back(?:up|ing up)/i);
+      expect(none, `${lang} 必须披露不删对话文件`).toMatch(/不(?:会)?删除|does not delete/i);
+    }
+  });
+
   /**
    * 🔴 确认框里承诺的备份目录，必须**就是后端真的写进去的那个**。
    *

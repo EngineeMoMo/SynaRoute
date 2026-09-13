@@ -18,9 +18,9 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
 > **C-37**（09-09 新增）定时检查更新 —— ⚠️ 那条的第③维（**关窗到托盘后仍在跑**）是这个功能
 > 存在的全部理由，只验前两维等于没验 · **C-38**（09-09 新增）fork 会话导出的 Markdown 完整
 > 且可读 —— ⚠️ 第③维（顺序没跳跃/没重复）**只能靠通读**，那种错看起来完全正常 ·
-> **C-39**（09-10 新增）会话页能滚动 + 表头钉住 + Desktop 侧栏不再新增内部线程条目
-> —— ⚠️ 表头那一维**没有机械判据**（`getComputedStyle` 会骗你：类名在、计算值报 sticky、
-> 行为是空的），且**已插进去的旧条目不会自己消失**（刻意不删）。
+> **C-39**（09-10 新增，09-11 扩展）会话页滚动/表头 + Desktop 内部索引清理：
+> 预置旧 guardian catalog 行后同步一次必须消失，明确 user/fork 保留，rollout/threads/正文不删，
+> 第二次同步真 no-op。⚠️ 表头行为仍没有机械判据（计算值报 sticky 也可能是空操作）。
 >
 > 🔴 **编号曾撞车（2026-09-08 修）**：大脑聚合那批原先也占 C-19~C-23，与 08-30 那批完全
 > 重号；本段旧版写「C-19~C-23 是大脑聚合加固那轮」，**等于把 08-30 那 5 条整批抹掉了**。
@@ -2803,7 +2803,9 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   `local_thread_catalog` 只有 **2 行**，且 `initial_build_complete = 1`、
   `observation_sequence` 已到 37 —— 它扫过了、然后决定不收。我们补它等于把 Codex 刻意
   排除的东西塞回用户眼前。已收进 `catalog::worth_listing`（`thread_source == "user"` 为主，
-  标题形态兜底老 schema）。**只管补不补，不删已有行**（那些可能是 Codex 自己写的）。
+  标题形态兜底老 schema）。插入与清理共用保守来源判据：明确 user/fork/冲突一律保留；
+  只有 known child source、truthy structured source 或 edge/job 正向证据才会按 local host + thread id
+  精确删除 catalog 索引行，且写库前先做一致快照；不删 rollout、threads 或正文。
   <br>⚠️ **本机没复现过这个症状**：`todo` 只收 provider ≠ target 的会话，而本机那条 guardian
   早就是 `synaroute`、压根没进 `todo`。用户那台是从官方登录切过来的 → provider 从 `openai`
   改成 `synaroute` → 进 `done_ids` → 被插入。**在本机取证「catalog 是干净的」什么都不证明。**

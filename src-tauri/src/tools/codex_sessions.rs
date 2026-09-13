@@ -558,7 +558,13 @@ pub(in crate::tools) fn sync_to_at(
     // ④ sqlite 只更新上面真的改成功的那些 thread。**不能无条件全表 UPDATE**：Codex 正在
     // 运行时 rollout 全被独占（`changed == 0`），而 sqlite 未必同时被锁 → 列表会显示这些
     // 对话已属 synaroute 而打开旧对话照旧 401，**替一个没完成的修复背书**。
-    report.sqlite = sync_sqlite(home, data_dir, target, &done_ids);
+    let scanned_ids = scan.sessions.iter().filter_map(|session| {
+        (!session.thread_id.is_empty()).then_some(session.thread_id.clone())
+    }).collect::<Vec<_>>();
+    let mut catalog_rows = catalog::plan_from(home, target, &scanned_ids);
+    catalog::merge_rollout_evidence(&mut catalog_rows, &scan.sessions);
+    catalog::add_child_ids(&mut catalog_rows, &sqlite::collect_child_thread_ids(home));
+    report.sqlite = sync_sqlite(home, data_dir, target, &done_ids, &catalog_rows);
     Ok(report)
 }
 
@@ -771,13 +777,21 @@ fn describe(r: &SyncReport) -> Option<String> {
             // 只影响列表元数据，所以措辞刻意不像故障 —— 免得用户以为路由没修好。
             parts.push(format!("会话列表元数据未完全同步（不影响路由）：{e}"));
         }
-        // Desktop 列表索引那一份的账。**只报做了什么，不承诺「会话会回到列表」** ——
-        // `has_user_event` 门控可见性这件事我们没有取证（见 `catalog` 模块头）。
+        // Desktop 列表索引那一份的账。清理只删索引行，不影响路由或会话数据。
         if db.catalog.inserted > 0 || db.catalog.unmarked_missing > 0 {
             parts.push(format!(
                 "另修正了 Desktop 会话列表索引（补 {} 条记录、清 {} 个失效标记）",
                 db.catalog.inserted, db.catalog.unmarked_missing
             ));
+        }
+        if db.catalog.removed > 0 {
+            parts.push(format!(
+                "从 Codex Desktop 本地会话索引移除 {} 条内部记录（不影响路由，不删除会话、rollout 或正文）",
+                db.catalog.removed
+            ));
+        }
+        if !db.catalog.skipped.is_empty() {
+            parts.push(format!("Desktop 本地会话索引清理未完全完成：{}", db.catalog.skipped.join("；")));
         }
     }
     (!parts.is_empty()).then(|| parts.join("；"))
@@ -934,6 +948,21 @@ mod tests {
     fn provider_of(path: &Path) -> String {
         let line = read_first_line(path).unwrap();
         parse_meta(&line).unwrap().1
+    }
+
+    fn set_rollout_thread_source(path: &Path, source: &str) {
+        let text = fs::read_to_string(path).unwrap();
+        let (first, rest) = text.split_once('\n').unwrap();
+        let mut record: Value = serde_json::from_str(first).unwrap();
+        record["payload"]["thread_source"] = Value::String(source.to_string());
+        fs::write(path, format!("{}\n{rest}", serde_json::to_string(&record).unwrap())).unwrap();
+    }
+
+    fn make_threads_db_with_source(path: &Path, id: &str, source: &str, provider: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = rusqlite::Connection::open(path).unwrap();
+        c.execute("CREATE TABLE threads (id TEXT, model_provider TEXT, source TEXT, thread_source TEXT, cwd TEXT)", []).unwrap();
+        c.execute("INSERT INTO threads VALUES (?1,?2,'vscode',?3,'')", (id, provider, source)).unwrap();
     }
 
     /// ④ 没有清单 → **一个文件都不许改**。
@@ -1264,7 +1293,247 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// ⑬之二 `done_ids` 为空（rollout 那半一条都没成功）时，一个字节都不许写。
+    fn catalog_db_for_cleanup(path: &Path, id: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = rusqlite::Connection::open(path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE local_thread_catalog (host_id TEXT, thread_id TEXT, display_title TEXT,
+               source_created_at REAL, source_updated_at REAL, cwd TEXT, source_kind TEXT,
+               model_provider TEXT, observation_sequence INTEGER, thread_source TEXT,
+               PRIMARY KEY(host_id,thread_id));
+             CREATE TABLE local_thread_catalog_hosts (host_id TEXT, host_kind TEXT);
+             INSERT INTO local_thread_catalog_hosts VALUES ('local','local');
+             CREATE TABLE local_thread_catalog_metadata (catalog_revision INTEGER);
+             INSERT INTO local_thread_catalog_metadata VALUES (4);"
+        ).unwrap();
+        c.execute("INSERT INTO local_thread_catalog VALUES ('local',?1,'title',1,2,'','vscode','synaroute',1,'guardian_review')", [id]).unwrap();
+    }
+
+    /// Online Backup 必须得到 WAL 中的已提交行；删除前快照仍含 guardian。
+    #[test]
+    fn sqlite_backup_is_a_consistent_pre_delete_wal_snapshot() {
+        let home = tmp_home("wal_backup");
+        let data = home.join("appdata");
+        let id = uuid_of("guardian");
+        let rollout = write_rollout(&home, "sessions/2026/09/01", "guardian", "synaroute", "\n");
+        set_rollout_thread_source(&rollout, "guardian_review");
+        let db = home.join("sqlite/catalog.db");
+        catalog_db_for_cleanup(&db, &id);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute("INSERT INTO local_thread_catalog VALUES ('local','wal-only','w',1,2,'','vscode','synaroute',2,'user')", []).unwrap();
+        assert!(PathBuf::from(format!("{}-wal", db.display())).is_file(), "夹具必须真有 WAL");
+        drop(conn);
+
+        let result = sync_to_at(&home, &data, "synaroute").unwrap();
+        assert_eq!(result.sqlite.unwrap().catalog.removed, 1);
+        let backups: Vec<PathBuf> = fs::read_dir(data.join("backups/codex-sqlite")).unwrap()
+            .flatten().map(|entry| entry.path()).collect();
+        assert_eq!(backups.len(), 1, "一致快照应是一个可独立打开的 DB，不是 main+WAL 碎片");
+        let backup = rusqlite::Connection::open(&backups[0]).unwrap();
+        let ids: Vec<String> = backup.prepare("SELECT thread_id FROM local_thread_catalog ORDER BY thread_id")
+            .unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(ids, vec![id, "wal-only".to_string()], "快照必须同时含删除前行和 WAL 已提交行");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// 同名数据库来自不同 canonical 路径时备份身份不能碰撞，也不能互相裁剪。
+    #[test]
+    fn same_named_databases_have_distinct_backup_identities() {
+        let home = tmp_home("backup_identity");
+        let data = home.join("appdata");
+        let a = home.join("a/catalog.db");
+        let b = home.join("b/catalog.db");
+        catalog_db_for_cleanup(&a, "a");
+        catalog_db_for_cleanup(&b, "b");
+        super::sqlite::backup_db(&a, &data).unwrap();
+        super::sqlite::backup_db(&b, &data).unwrap();
+        let names: Vec<String> = fs::read_dir(data.join("backups/codex-sqlite")).unwrap()
+            .flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names.len(), 2);
+        let identities: Vec<String> = names.iter().filter_map(|name| {
+            let end = name.find(".20")?;
+            Some(name[..end].to_string())
+        }).collect();
+        assert_ne!(identities[0], identities[1], "短 hash 必须区分路径");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// 备份失败必须让该 DB 零 mutation。
+    #[test]
+    fn backup_failure_prevents_catalog_cleanup() {
+        let home = tmp_home("cleanup_backup_failure");
+        let id = uuid_of("guardian");
+        let rollout = write_rollout(&home, "sessions/2026/09/01", "guardian", "synaroute", "\n");
+        set_rollout_thread_source(&rollout, "guardian_review");
+        let db = home.join("sqlite/catalog.db");
+        catalog_db_for_cleanup(&db, &id);
+        let data = home.join("appdata");
+        fs::create_dir_all(&data).unwrap();
+        let blocked_backups = data.join("backups");
+        fs::write(&blocked_backups, b"not a directory").unwrap();
+        let result = sync_to_at(&home, &data, "synaroute").unwrap();
+        assert!(result.sqlite.unwrap().error.is_some(), "备份错误必须上报");
+        assert_eq!(rusqlite::Connection::open(&db).unwrap().query_row(
+            "SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id=?1", [&id], |r| r.get::<_, i64>(0)
+        ).unwrap(), 1, "备份失败后内部行必须仍在");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// old schema 的 rollout 来源缺失时，threads.thread_source 必须补证并触发清理。
+    #[test]
+    fn threads_source_fills_missing_rollout_source_for_cleanup() {
+        let home = tmp_home("threads_source_cleanup");
+        let data = home.join("appdata");
+        let id = uuid_of("guardian");
+        write_rollout(&home, "sessions/2026/09/01", "guardian", "synaroute", "\n");
+        make_threads_db_with_source(&home.join("state_5.sqlite"), &id, "guardian_review", "synaroute");
+        let db = home.join("sqlite/catalog.db");
+        catalog_db_for_cleanup(&db, &id);
+        fs::write(home.join("config.toml"), "model_provider='synaroute'\n").unwrap();
+        let mut rows = catalog::plan_from(&home, "synaroute", std::slice::from_ref(&id));
+        assert_eq!(rows.len(), 1, "threads 侧来源没被读到");
+        assert_eq!(rows[0].thread_source, "guardian_review");
+        catalog::merge_rollout_evidence(&mut rows, &scan_at(&home).sessions);
+        assert_eq!(rows[0].thread_source, "guardian_review", "rollout 缺失来源不该抹掉 DB 正向证据");
+        let result = sync_to_at(&home, &data, "synaroute").unwrap();
+        assert_eq!(result.sqlite.as_ref().unwrap().catalog.removed, 1, "{:?}", result.sqlite);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// 已经污染进 Desktop catalog 的 guardian，即使所有 rollout 早已指向 target，下一次同步也要清掉。
+    /// split-DB 夹具同时证明 cleanup 只改 catalog 库，不碰 threads / edge / rollout / index。
+    #[test]
+    fn cleanup_only_sync_removes_guardian_from_split_catalog_and_is_idempotent() {
+        let home = tmp_home("guardian_cleanup_split");
+        let data = home.join("appdata");
+        let guardian_id = uuid_of("guardian");
+        let user_id = uuid_of("user");
+        let guardian = write_rollout(&home, "sessions/2026/09/01", "guardian", "synaroute", "\n");
+        set_rollout_thread_source(&guardian, "guardian_review");
+        let user = write_rollout(&home, "sessions/2026/09/01", "user", "synaroute", "\n");
+        set_rollout_thread_source(&user, "user");
+        let threads_db = home.join("state_5.sqlite");
+        make_threads_db(&threads_db, "synaroute");
+        let edge_db = home.join("sqlite/edges.db");
+        fs::create_dir_all(edge_db.parent().unwrap()).unwrap();
+        let edge = rusqlite::Connection::open(&edge_db).unwrap();
+        edge.execute("CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)", []).unwrap();
+        edge.execute("INSERT INTO thread_spawn_edges VALUES ('parent', ?1)", [&guardian_id]).unwrap();
+        drop(edge);
+        let catalog_db = home.join("sqlite/catalog.db");
+        let catalog = rusqlite::Connection::open(&catalog_db).unwrap();
+        catalog.execute_batch(
+            "CREATE TABLE local_thread_catalog (
+               host_id TEXT NOT NULL, thread_id TEXT NOT NULL, display_title TEXT NOT NULL,
+               source_created_at REAL NOT NULL, source_updated_at REAL NOT NULL, cwd TEXT,
+               source_kind TEXT NOT NULL, model_provider TEXT, observation_sequence INTEGER NOT NULL,
+               thread_source TEXT, PRIMARY KEY(host_id, thread_id));
+             CREATE TABLE local_thread_catalog_hosts (host_id TEXT, host_kind TEXT);
+             INSERT INTO local_thread_catalog_hosts VALUES ('local','local');
+             CREATE TABLE local_thread_catalog_metadata (id INTEGER, catalog_revision INTEGER);
+             INSERT INTO local_thread_catalog_metadata VALUES (1, 10);",
+        ).unwrap();
+        for (id, source) in [(&guardian_id, "guardian_review"), (&user_id, "user")] {
+            catalog.execute(
+                "INSERT INTO local_thread_catalog VALUES ('local',?1,'title',1,2,'C:/work','vscode','synaroute',3,?2)",
+                (id, source),
+            ).unwrap();
+        }
+        drop(catalog);
+        let rollout_before = fs::read(&guardian).unwrap();
+        let user_before = fs::read(&user).unwrap();
+        let threads_before = fs::read(&threads_db).unwrap();
+        let edge_before = fs::read(&edge_db).unwrap();
+        fs::write(home.join("session_index.jsonl"), b"sentinel-index\n").unwrap();
+        let index_before = fs::read(home.join("session_index.jsonl")).unwrap();
+
+        let first = sync_to_at(&home, &data, "synaroute").unwrap();
+        assert_eq!(first.changed, 0);
+        let sqlite = first.sqlite.expect("cleanup-only 也必须运行 SQLite 同步");
+        assert_eq!(sqlite.updated, 0, "cleanup-only 不应伪造 threads 更新");
+        assert_eq!(sqlite.catalog.removed, 1, "只该移除 guardian：{:?}", sqlite.catalog);
+        let catalog = rusqlite::Connection::open(&catalog_db).unwrap();
+        let remaining: Vec<String> = catalog.prepare(
+            "SELECT thread_id FROM local_thread_catalog WHERE host_id='local' ORDER BY thread_id"
+        ).unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(remaining, vec![user_id], "明确 user 必须保留");
+        let revision: i64 = catalog.query_row(
+            "SELECT catalog_revision FROM local_thread_catalog_metadata", [], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(revision, 11, "commit 成功删除 1 行，revision 只增加 1");
+        drop(catalog);
+        assert_eq!(fs::read(&guardian).unwrap(), rollout_before, "cleanup 不许删改 rollout");
+        assert_eq!(fs::read(&user).unwrap(), user_before);
+        assert_eq!(fs::read(&threads_db).unwrap(), threads_before, "cleanup 不许改 threads 库");
+        assert_eq!(fs::read(&edge_db).unwrap(), edge_before, "cleanup 不许改 edge 证据库");
+        assert_eq!(fs::read(home.join("session_index.jsonl")).unwrap(), index_before);
+
+        let backups_before = fs::read_dir(data.join("backups/codex-sqlite")).unwrap().count();
+        let second = sync_to_at(&home, &data, "synaroute").unwrap();
+        assert_eq!(second.sqlite.unwrap().catalog.removed, 0);
+        assert_eq!(fs::read_dir(data.join("backups/codex-sqlite")).unwrap().count(), backups_before,
+            "第二次同步必须是真 no-op，不能再备份");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// 删除证据必须保守：user / fork / unknown 都保留，非 local host 也绝不碰。
+    #[test]
+    fn catalog_cleanup_obeys_user_fork_unknown_and_host_vetoes() {
+        let home = tmp_home("guardian_cleanup_veto");
+        let data = home.join("appdata");
+        let direct = write_rollout(&home, "sessions/2026/09/01", "direct", "synaroute", "\n");
+        set_rollout_thread_source(&direct, "guardian_review");
+        let edge_only = write_rollout(&home, "sessions/2026/09/01", "edge", "synaroute", "\n");
+        let _ = edge_only;
+        let user = write_rollout(&home, "sessions/2026/09/01", "user", "synaroute", "\n");
+        set_rollout_thread_source(&user, "user");
+        let _unknown = write_rollout(&home, "sessions/2026/09/01", "unknown", "synaroute", "\n");
+        let fork_id = uuid_of("fork");
+        let parent_id = uuid_of("parent");
+        let fork_path = write_rollout(&home, "sessions/2026/09/01", "fork", "synaroute", "\n");
+        let text = fs::read_to_string(&fork_path).unwrap();
+        fs::write(&fork_path, text.replace(&fork_id, &parent_id)).unwrap();
+        let db = home.join("sqlite/catalog.db");
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let edge_db = home.join("sqlite/edge.db");
+        let edge_conn = rusqlite::Connection::open(&edge_db).unwrap();
+        edge_conn.execute("CREATE TABLE thread_spawn_edges (child_thread_id TEXT)", []).unwrap();
+        edge_conn.execute("INSERT INTO thread_spawn_edges VALUES (?1)", [uuid_of("edge")]).unwrap();
+        drop(edge_conn);
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch(
+            "CREATE TABLE local_thread_catalog (host_id TEXT, thread_id TEXT, display_title TEXT,
+               source_created_at REAL, source_updated_at REAL, cwd TEXT, source_kind TEXT,
+               model_provider TEXT, observation_sequence INTEGER, thread_source TEXT,
+               PRIMARY KEY(host_id,thread_id));
+             CREATE TABLE local_thread_catalog_hosts (host_id TEXT, host_kind TEXT);
+             INSERT INTO local_thread_catalog_hosts VALUES ('local','local');
+             CREATE TABLE local_thread_catalog_metadata (catalog_revision INTEGER);
+             INSERT INTO local_thread_catalog_metadata VALUES (0);"
+        ).unwrap();
+        for (host, id, source) in [
+            ("local", uuid_of("direct"), "guardian_review"),
+            ("local", uuid_of("edge"), ""),
+            ("remote", uuid_of("direct"), "guardian_review"),
+            ("local", uuid_of("user"), "guardian_review"),
+            ("local", uuid_of("unknown"), ""),
+            ("local", fork_id, "guardian_review"),
+        ] {
+            c.execute("INSERT INTO local_thread_catalog VALUES (?1,?2,'title',1,2,'','vscode','synaroute',1,?3)",
+                (&host, &id, &source)).unwrap();
+        }
+        drop(c);
+        let result = sync_to_at(&home, &data, "synaroute").unwrap();
+        assert_eq!(result.sqlite.unwrap().catalog.removed, 2, "direct 与 edge guardian 可删");
+        let c = rusqlite::Connection::open(&db).unwrap();
+        let left: i64 = c.query_row("SELECT COUNT(*) FROM local_thread_catalog", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 4);
+        assert_eq!(c.query_row("SELECT COUNT(*) FROM local_thread_catalog WHERE host_id='remote'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// ⑬之二 `done_ids` 为空时普通 metadata 不写，但 cleanup-only 必须仍能运行。
     #[test]
     fn an_empty_done_list_leaves_sqlite_untouched() {
         let home = tmp_home("sqlempty");
@@ -1272,7 +1541,7 @@ mod tests {
         let db = home.join("state_5.sqlite");
         make_threads_db(&db, "openai");
 
-        let out = sync_sqlite(&home, &data, "synaroute", &[]).unwrap();
+        let out = sync_sqlite(&home, &data, "synaroute", &[], &[]).unwrap();
         assert_eq!(out, SqliteOutcome::default());
         assert_eq!(provider_in_db(&db), "openai");
         assert!(!data.join("backups").exists(), "没东西要写时连备份都不该产生");
@@ -1504,10 +1773,7 @@ mod tests {
         sync_to_at(&home, &data, "synaroute").unwrap();
         let dir = data.join("backups").join("codex-sqlite");
         let baks: Vec<PathBuf> = fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
-        let main = baks
-            .iter()
-            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("state_5.sqlite."))
-            .expect("主库应有一份备份");
+        let main = baks.first().expect("应有一份一致 SQLite 快照");
         assert_eq!(
             provider_of_id(main, &uuid_of("t1")),
             "openai",
@@ -1516,28 +1782,7 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// ⑯之二 备份数量有上限 —— 加了保留就必须同时加清理（同 `log_rotate` 那条：
-    /// 只做滚动不做清理时，「上限看着在工作、实际只管住第一个文件」）。
-    ///
-    /// ⚠️ 轮数取 `KEEP*2 + 3`：`prune_backups` 的窗口是 `KEEP*2`（按「主文件 + wal」估），
-    /// 而这个夹具**每轮产 2 个文件**（主 + wal）。第一版的夹具没有 wal、每轮只产 1 个，
-    /// 只跑 `KEEP+3 = 6` 轮时恰好等于窗口 → **不裁剪也过**，注入实测仍绿。判据必须压过边界。
-    ///
-    /// # 🔴 为什么排序键要把 `-wal` 挪到末位（2026-09-04 审查发现的真缺陷）
-    ///
-    /// 备份的文件名是 `{stem}.{ts}.bak` 与 `{stem}-wal.{ts}.bak`。裸 `mine.sort()` 比的是
-    /// 整个文件名，而 `-`(0x2D) **小于** `.`(0x2E) —— 于是**全部** wal 备份排在**全部**主文件
-    /// 之前，两类被分成了两段而不是按轮次交错。窗口 `KEEP*2` 从前面删，实际语义就变成
-    /// 「先把所有 wal 删光，wal 不够了才删最旧的主文件」：
-    ///
-    /// - 跑 5 轮 → 10 个文件，删前 4 个全是 wal → 留下 **5 份主文件 + 1 份 wal**
-    ///   （而不是宣称的「3 份」）；
-    /// - 更要紧的是**配对被拆散**：留下的旧主文件没有它的 wal，而 WAL 模式下主文件可能是
-    ///   旧快照 —— 备份 wal 的全部理由就是这个。原注释还写着「方向安全」，那句话在有 wal
-    ///   的库上不成立（这类「声称分析过」的注释比没有注释更贵）。
-    ///
-    /// 键 `(时间戳段, is_wal)` 让同一轮的两个文件相邻、且主文件在前：窗口边界落在一对中间时
-    /// 丢掉的是主文件、留下一个无害的孤儿 wal，而不是反过来。
+    /// ⑯之二 一致快照按 canonical 数据库身份各自保留最近三份，不能无界增长。
     #[test]
     fn old_db_backups_are_pruned() {
         let home = tmp_home("dbprune");
@@ -1546,38 +1791,19 @@ mod tests {
         let db = home.join("state_5.sqlite");
         make_threads_db(&db, "openai");
 
-        let rounds = DB_BACKUP_KEEP * 2 + 3;
-        // 每轮把 rollout 拨回 openai，好让下一轮真的有东西要写（也就真的会备份）。
+        let rounds = DB_BACKUP_KEEP + 3;
         for _ in 0..rounds {
-            // WAL 侧写文件必须在**每轮备份之前**在场，否则本判据压不到「主/wal 配对」这一维。
-            // 每轮重写：rusqlite 打开非 WAL 模式的库时会把这个不合法的 `-wal` 清掉，
-            // 只在循环外写一次的话第 2 轮起就没有 wal 备份了（第一版实测如此）。
-            fs::write(home.join("state_5.sqlite-wal"), b"fake-wal").unwrap();
             rewrite_first_line(&roll, Some("openai")).unwrap();
+            set_threads_provider(&db, "openai", &[uuid_of("t1")]).unwrap();
             sync_to_at(&home, &data, "synaroute").unwrap();
         }
-        let n = fs::read_dir(data.join("backups").join("codex-sqlite"))
-            .unwrap()
-            .flatten()
-            .count();
-        assert!(n > 1, "备份不该互相覆盖（秒级时间戳会让同一秒内的几次备份同名）");
-        assert!(
-            n <= DB_BACKUP_KEEP * 2,
-            "备份数应被裁到上限，实际 {n} 份（跑了 {rounds} 轮；无界增长会把数据目录堆满）"
-        );
-        // 🔴 留下的每一份主文件都必须还有它配对的 wal —— 裸 `sort()` 会先删光所有 wal，
-        // 留下一堆没有 wal 的主文件备份，而那时主文件可能只是个旧快照（见上方文档）。
-        let names: Vec<String> = fs::read_dir(data.join("backups").join("codex-sqlite"))
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        for main in names.iter().filter(|n| n.starts_with("state_5.sqlite.")) {
-            let want = main.replace("state_5.sqlite.", "state_5.sqlite-wal.");
-            assert!(
-                names.contains(&want),
-                "主库备份 {main} 没有配对的 wal（现有：{names:?}）—— 用它恢复会拿到旧快照"
-            );
+        let paths: Vec<PathBuf> = fs::read_dir(data.join("backups/codex-sqlite"))
+            .unwrap().flatten().map(|entry| entry.path()).collect();
+        assert_eq!(paths.len(), DB_BACKUP_KEEP, "每个库身份只保留最近三份一致快照");
+        for path in paths {
+            assert!(rusqlite::Connection::open(path).unwrap().query_row(
+                "PRAGMA integrity_check", [], |r| r.get::<_, String>(0)
+            ).unwrap().eq_ignore_ascii_case("ok"));
         }
         let _ = fs::remove_dir_all(&home);
     }
@@ -1871,6 +2097,28 @@ mod tests {
         })
         .unwrap();
         assert!(db.contains("不影响路由"));
+
+        let cleanup = describe(&SyncReport {
+            sqlite: Some(SqliteOutcome {
+                catalog: catalog::CatalogReport { removed: 2, ..Default::default() },
+                ..Default::default()
+            }),
+            ..Default::default()
+        }).unwrap();
+        assert!(cleanup.contains("Codex Desktop 本地会话索引"));
+        assert!(cleanup.contains("2") && cleanup.contains("不删除会话") && cleanup.contains("正文"));
+
+        let cleanup_error = describe(&SyncReport {
+            sqlite: Some(SqliteOutcome {
+                catalog: catalog::CatalogReport {
+                    skipped: vec!["catalog.db: 备份失败".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        }).unwrap();
+        assert!(cleanup_error.contains("未完全完成") && cleanup_error.contains("备份失败"));
     }
 
     /// 用**真实 codex 二进制**验证「改完 rollout 首行，Codex 就按新值恢复会话」。

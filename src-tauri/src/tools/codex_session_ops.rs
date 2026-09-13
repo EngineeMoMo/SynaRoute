@@ -440,8 +440,11 @@ pub(in crate::tools) fn preview_summary() -> &'static str {
      含一份**仍有效**的 ChatGPT OAuth。不写任何 ANTHROPIC_*。\
      另外会改历史对话的 provider：sessions/ 与 archived_sessions/ 下每个 rollout-*.jsonl \
      的首行 model_provider（只改这一个字段，其余字节逐字不动、文件修改时间也原样保全），\
-     以及会话库 threads 表的同名列；原值记在应用数据目录的 codex-session-providers.json，\
-     还原时按它逐条改回，写库前先备份到 backups/codex-sqlite/。不改任何对话正文。\
+     以及会话库 threads 表的同名列；还会补齐 local_thread_catalog，并可能按 local host + thread id \
+     从 Codex Desktop 本地会话索引精确移除已确认的内部记录。每个实际写入的 SQLite 库都会先备份；\
+     该索引清理不影响路由，也不删除 rollout、threads 或任何对话正文。原值记在应用数据目录的 \
+     codex-session-providers.json，还原时按它逐条改回，写库前先备份到 backups/codex-sqlite/。\
+     不改任何对话正文。\
      这一步可以在「Codex 会话」页关掉（关掉后仍可在那里手动同步）。\
      在会话页手动删除时，会先把 rollout 备份到 backups/codex-sessions-deleted/（保留 30 天），\
      再删掉 rollout 文件、session_index.jsonl 里那一行与 threads 行；\
@@ -1077,6 +1080,9 @@ mod tests {
             "threads",                  // 会话库那一列
             "codex-session-providers.json", // 回滚清单
             "backups/codex-sqlite/",    // 写库前的备份
+            "local_thread_catalog",    // Desktop 本地索引会补行或精确移除已确认的内部记录
+            "每个实际写入的 SQLite 库都会先备份", // 有 mutation 才备份，失败则不写
+            "不删除 rollout、threads 或任何对话正文", // cleanup 只碰 local_thread_catalog
             "session_index.jsonl",      // 手动删除时一并清理
             "backups/codex-sessions-deleted/", // 删除会话前的备份
             "backups/codex-session-index/",    // 清理索引孤儿前的备份

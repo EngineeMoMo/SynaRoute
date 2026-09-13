@@ -73,7 +73,7 @@ export const sessionsZh: Dict = {
   "sessions.syncConfirmBody":
     "将把 {n} 条会话记的 provider 改成 {target}（当前列表里与它不一致的那些）。只改每个 rollout 首行的这一个字段，对话正文与文件修改时间都不动；原值会记进回滚清单，点「停止」时按它逐条改回。",
   "sessions.syncConfirmNone":
-    "当前列表里的 {total} 条会话都已经指向 {target}，无需改动。",
+    "当前列表里的 {total} 条会话都已指向 {target}；仍会检查 local_thread_catalog，并在写库前备份后精确移除已确认的内部索引行。不会删除 rollout、threads 或对话正文。",
   "sessions.syncConfirmOk": "确认同步",
   "sessions.dbNone": "未找到（不影响路由，只影响列表里的标题与模型）",
   "sessions.inDbHint":
@@ -176,7 +176,7 @@ export const sessionsEn: Dict = {
   "sessions.syncConfirmBody":
     "This rewrites the provider recorded in {n} session(s) to {target} (those in the current list that differ from it). Only that one field on each rollout's first line changes; the conversation body and the file's modification time stay untouched. The original values go into the rollback manifest and are restored one by one when you press Stop.",
   "sessions.syncConfirmNone":
-    "All {total} session(s) in the current list already point at {target}; nothing to change.",
+    "All {total} session(s) in the current list already point at {target}; SynaRoute will still inspect local_thread_catalog and, after backing up the database, precisely remove confirmed internal index rows. This does not delete rollouts, threads, or conversation content.",
   "sessions.syncConfirmOk": "Sync",
   "sessions.dbNone": "Not found (routing is unaffected; only titles and models in this list are)",
   "sessions.inDbHint":

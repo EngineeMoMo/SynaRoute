@@ -24,10 +24,10 @@
 //! 2. **清 `missing_candidate`**（UPDATE）—— 那一位是 Codex 给「找不到对应 rollout 的条目」
 //!    打的标记。我们手上恰好有「磁盘上真的存在」这个事实，所以能确定地清掉它。
 //!    CodexPlusPlus 也做同一件事（`SET missing_candidate = 0`）；
-//! 3. **补缺行**（INSERT OR IGNORE）—— 磁盘上有 rollout、`threads` 里也有记录，而 catalog
-//!    里没有它。这一条是「会话从 Desktop 列表里消失」的修法。
+//! 3. **精确清掉已确认的内部索引行**（DELETE 只按 local `host_id` + `thread_id`）—— rollout、
+//!    `threads`、edge/job 证据表、正文与全局状态一律不碰；冲突与未知证据一律保留。
 //!
-//! # 🔴 补缺行为什么要格外小心（以及我们收窄了哪些）
+//! # 🔴 补缺行与清理为什么要格外小心（以及我们收窄了哪些）
 //!
 //! 这张表带着 Codex 自己的账：`observation_sequence`（每条一个递增序号）、
 //! `local_thread_catalog_metadata.catalog_revision`、`local_thread_catalog_sync_state`
@@ -38,12 +38,9 @@
 //! - `host_id` 从 `local_thread_catalog_hosts` 里取真实值，取不到就**不做**
 //!   （不硬编码 `"local"`：那是猜，而猜错会插出一条 Codex 认不出的行）；
 //! - **刻意不写 `local_thread_catalog_sync_state`**。CodexPlusPlus 在「全量同步」时会推进
-//!   那张表的水位线（`update_full_sync_state`），我们**只做定点补行**，不声称自己完成了一轮
-//!   全量对账 —— 推进水位线可能让 Codex 跳过它本该自己做的扫描，那是拿一个未取证的写入去换
-//!   一点整洁；
-//! - **刻意不删任何行**。它的 `repair_..._filtered` 会 `DELETE` 掉「被标成非根」的条目，
-//!   而那依赖 `thread_spawn_edges` 的一套推导。删用户列表里的条目属于「影响范围超出修复」；
-//! - 写之前照旧**备份整库**（父模块的 `backup_db` 已经在做），备份失败就不写那个库。
+//!   那张表的水位线（`update_full_sync_state`），我们只做定点补行/清理，不声称完成全量扫描；
+//! - 删除必须有正向 child 证据且无 user/fork 冲突；catalog 自身的证据只作用于同一个 DB 路径；
+//! - 每个实际 mutation 的库先由父模块做一致 SQLite 快照，备份失败则该库一个字节都不写。
 //!
 //! # 🔴 「修它就能让会话回到列表」这句话我们没有取证
 //!
@@ -67,6 +64,8 @@ pub(in crate::tools) struct CatalogReport {
     pub unmarked_missing: usize,
     /// 补进去的缺行数。
     pub inserted: usize,
+    /// 从 local host 的 Desktop 索引精确移除的已确认内部记录数。
+    pub removed: usize,
     /// 逐库失败原因（被 WAL 锁住、列不齐等），如实上报、不阻断。
     pub skipped: Vec<String>,
 }
@@ -75,7 +74,7 @@ impl CatalogReport {
     /// 三项之和。测试段用它做「一个字节都没写」的整体断言。
     #[cfg(test)]
     pub fn total(&self) -> usize {
-        self.provider_updated + self.unmarked_missing + self.inserted
+        self.provider_updated + self.unmarked_missing + self.inserted + self.removed
     }
 }
 
@@ -137,6 +136,8 @@ pub(in crate::tools) struct CatalogRow {
     /// `guardian_review`）是 Codex 内部派生的子代理线程。**只有 `user` 才补进 Desktop 列表**
     /// —— 理由见 [`repair_one`] 里那道门。
     pub thread_source: String,
+    /// 文件名/首行已确认是 fork；即使 source 像内部线程也不得清理。
+    pub forked: bool,
 }
 
 /// 标题的 SQL 表达式：按 catalog 自己的优先级取（`name` 是 Codex 生成的短标题，
@@ -194,8 +195,6 @@ pub(in crate::tools) fn plan_from(home: &Path, target: &str, ids: &[String]) -> 
                 (false, false) => "0".into(),
             }
         };
-        // `thread_source` 取不到时给空串 —— 那时**不敢**下「这是内部线程」的结论，
-        // 交给标题形态那道门（见 `repair_one`）。同 `balance_gate` 的「查不到 ≠ 为零」。
         let src_expr = if cols.contains("thread_source") {
             "COALESCE(thread_source, '')"
         } else {
@@ -217,6 +216,7 @@ pub(in crate::tools) fn plan_from(home: &Path, target: &str, ids: &[String]) -> 
                 source_kind: r.get(5)?,
                 provider: target.to_string(),
                 thread_source: r.get(6)?,
+                forked: false,
             })
         });
         if let Ok(iter) = rows {
@@ -232,9 +232,129 @@ pub(in crate::tools) fn plan_from(home: &Path, target: &str, ids: &[String]) -> 
     out
 }
 
-/// 对一个库做三件事。任何一步失败都只计入 `skipped`，不阻断其余库。
-///
-/// `rows` 是「磁盘上真的存在、且我们知道其 provider」的会话；`target` 是同步目标。
+fn thread_source_marks_child(source: &str) -> bool {
+    matches!(source.trim().to_ascii_lowercase().as_str(),
+        "guardian_review" | "subagent" | "memory_consolidation")
+}
+
+fn source_kind_marks_child(source: &str) -> bool {
+    let source = source.trim();
+    if matches!(source.to_ascii_lowercase().as_str(),
+        "guardian_review" | "subagent" | "memory_consolidation") {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(source) else { return false };
+    let serde_json::Value::Object(object) = value else { return false };
+    ["sub_agent", "subagent", "internal"].iter().any(|key| {
+        object.get(*key).is_some_and(|value| match value {
+            serde_json::Value::Null => false,
+            serde_json::Value::Bool(flag) => *flag,
+            serde_json::Value::String(text) => !text.trim().is_empty(),
+            serde_json::Value::Array(items) => !items.is_empty(),
+            serde_json::Value::Object(items) => !items.is_empty(),
+            serde_json::Value::Number(_) => true,
+        })
+    })
+}
+
+fn row_has_user_veto(row: &CatalogRow) -> bool {
+    row.forked
+}
+
+fn row_is_confirmed_child(row: &CatalogRow) -> bool {
+    !row.forked
+        && !row.thread_source.trim().eq_ignore_ascii_case("user")
+        && (thread_source_marks_child(&row.thread_source)
+            || source_kind_marks_child(&row.source_kind))
+}
+
+pub(in crate::tools) fn add_child_ids(rows: &mut Vec<CatalogRow>, ids: &HashSet<String>) {
+    for id in ids {
+        if let Some(row) = rows.iter_mut().find(|row| &row.thread_id == id) {
+            if !row.thread_source.trim().eq_ignore_ascii_case("user") {
+                row.source_kind = "subagent".into();
+            }
+        } else {
+            rows.push(CatalogRow {
+                thread_id: id.clone(),
+                title: String::new(),
+                cwd: String::new(),
+                created_at: 0.0,
+                updated_at: 0.0,
+                source_kind: "subagent".into(),
+                provider: String::new(),
+                thread_source: String::new(),
+                forked: false,
+            });
+        }
+    }
+}
+
+/// 先只读判定这个库是否真的需要 mutation；父模块据此决定是否创建备份。
+pub(in crate::tools) fn would_mutate(
+    db_path: &Path,
+    target: &str,
+    rows: &[CatalogRow],
+) -> Result<bool, String> {
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("{}: {e}", db_path.display()))?;
+    let cols = columns_of(&conn, "local_thread_catalog");
+    if cols.is_empty() { return Ok(false) }
+    let Some(host) = host_id(&conn) else { return Ok(false) };
+    for row in rows {
+        let exists: bool = conn.query_row(
+            "SELECT 1 FROM local_thread_catalog WHERE host_id=?1 AND thread_id=?2 LIMIT 1",
+            (&host, &row.thread_id), |_| Ok(true),
+        ).unwrap_or(false);
+        if exists && row_is_confirmed_child(row) { return Ok(true) }
+        if row_has_user_veto(row) { continue }
+        if exists && ((cols.contains("model_provider") && row.provider != target)
+            || cols.contains("missing_candidate")) {
+            let changed: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM local_thread_catalog WHERE host_id=?1 AND thread_id=?2 AND \
+                 (COALESCE(model_provider,'') <> ?3 OR COALESCE(missing_candidate,0) <> 0)",
+                (&host, &row.thread_id, target), |r| r.get(0),
+            ).unwrap_or(0);
+            if changed > 0 { return Ok(true) }
+        }
+        if !exists && supports_repair(&cols) && !row.source_kind.is_empty() && worth_listing(row) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(in crate::tools) fn merge_rollout_evidence(rows: &mut Vec<CatalogRow>, sessions: &[super::SessionRef]) {
+    for session in sessions.iter().filter(|session| !session.thread_id.is_empty()) {
+        let rollout = CatalogRow {
+            thread_id: session.thread_id.clone(),
+            title: session.title.clone(),
+            cwd: session.cwd.clone(),
+            created_at: 0.0,
+            updated_at: 0.0,
+            source_kind: String::new(),
+            provider: session.provider.clone(),
+            thread_source: session.thread_source.clone(),
+            forked: session.forked,
+        };
+        if let Some(row) = rows.iter_mut().find(|row| row.thread_id == session.thread_id) {
+            row.forked |= rollout.forked;
+            let current_user = row.thread_source.trim().eq_ignore_ascii_case("user");
+            let rollout_user = rollout.thread_source.trim().eq_ignore_ascii_case("user");
+            if current_user || rollout_user {
+                row.thread_source = "user".into();
+            } else if row.thread_source.trim().is_empty()
+                || thread_source_marks_child(&rollout.thread_source)
+            {
+                row.thread_source = rollout.thread_source;
+            }
+        } else {
+            rows.push(rollout);
+        }
+    }
+}
+
+/// 对一个库做 provider/missing 更新、精确内部行清理与缺行补齐；结构改动与 revision 同事务。
 pub(in crate::tools) fn repair_one(
     db_path: &Path,
     target: &str,
@@ -251,17 +371,20 @@ pub(in crate::tools) fn repair_one(
         // 这个库不管这件事（本机的 `state_5.sqlite` 就是这种）—— 不是错误。
         return;
     }
-    let ids: Vec<&str> = rows.iter().map(|r| r.thread_id.as_str()).collect();
+    let Some(host) = host_id(&conn) else { return };
 
-    // ① provider：把这一份也改对。
+    let mutable_ids: Vec<&str> = rows.iter().filter(|row| !row_has_user_veto(row))
+        .map(|row| row.thread_id.as_str()).collect();
+
+    // ① provider：只改 local host，避免同库里的远端 catalog 副本被连带改写。
     if cols.contains("model_provider") && cols.contains("thread_id") {
-        for chunk in ids.chunks(super::SQL_CHUNK) {
+        for chunk in mutable_ids.chunks(super::SQL_CHUNK) {
             let holes = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
             let sql = format!(
                 "UPDATE local_thread_catalog SET model_provider = ?1 \
-                 WHERE thread_id IN ({holes}) AND model_provider IS NOT ?1"
+                 WHERE host_id = ?2 AND thread_id IN ({holes}) AND model_provider IS NOT ?1"
             );
-            let mut params: Vec<&dyn rusqlite::ToSql> = vec![&target];
+            let mut params: Vec<&dyn rusqlite::ToSql> = vec![&target, &host];
             for id in chunk {
                 params.push(id);
             }
@@ -274,14 +397,14 @@ pub(in crate::tools) fn repair_one(
 
     // ② `missing_candidate`：我们手上有「rollout 真的在磁盘上」这个事实，所以能确定地清掉它。
     if cols.contains("missing_candidate") && cols.contains("thread_id") {
-        for chunk in ids.chunks(super::SQL_CHUNK) {
+        for chunk in mutable_ids.chunks(super::SQL_CHUNK) {
             let holes = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
             let sql = format!(
                 "UPDATE local_thread_catalog SET missing_candidate = 0 \
-                 WHERE thread_id IN ({holes}) AND COALESCE(missing_candidate, 0) <> 0"
+                 WHERE host_id = ?1 AND thread_id IN ({holes}) AND COALESCE(missing_candidate, 0) <> 0"
             );
-            let params: Vec<&dyn rusqlite::ToSql> =
-                chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let mut params: Vec<&dyn rusqlite::ToSql> = vec![&host];
+            params.extend(chunk.iter().map(|s| s as &dyn rusqlite::ToSql));
             match conn.execute(&sql, params.as_slice()) {
                 Ok(n) => report.unmarked_missing += n,
                 Err(e) => report
@@ -291,22 +414,26 @@ pub(in crate::tools) fn repair_one(
         }
     }
 
-    // ③ 补缺行。列不齐 / 取不到 host_id 一律不做（见模块头）。
-    if !supports_repair(&cols) {
-        return;
-    }
-    let Some(host) = host_id(&conn) else { return };
+    // ③ 删除与插入同属 structural changes，必须与 revision 在同一事务内提交/回滚。
+    if !cols.contains("host_id") || !cols.contains("thread_id") { return }
     let existing: HashSet<String> = conn
         .prepare("SELECT thread_id FROM local_thread_catalog WHERE host_id = ?1")
         .and_then(|mut s| {
             s.query_map([&host], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()
         })
         .unwrap_or_default();
-    let missing: Vec<&CatalogRow> = rows
+    let removable: Vec<&CatalogRow> = rows
         .iter()
-        .filter(|r| !existing.contains(&r.thread_id) && !r.source_kind.is_empty() && worth_listing(r))
+        .filter(|row| existing.contains(&row.thread_id) && row_is_confirmed_child(row))
         .collect();
-    if missing.is_empty() {
+    let missing: Vec<&CatalogRow> = if supports_repair(&cols) {
+        rows.iter()
+            .filter(|r| !existing.contains(&r.thread_id) && !r.source_kind.is_empty() && worth_listing(r))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if missing.is_empty() && removable.is_empty() {
         return;
     }
     let mut seq: i64 = conn
@@ -330,6 +457,19 @@ pub(in crate::tools) fn repair_one(
         }
     };
     let mut inserted = 0usize;
+    let mut removed = 0usize;
+    for row in removable {
+        match tx.execute(
+            "DELETE FROM local_thread_catalog WHERE host_id = ?1 AND thread_id = ?2",
+            (&host, &row.thread_id),
+        ) {
+            Ok(n) => removed += n,
+            Err(e) => {
+                report.skipped.push(format!("{}: 内部索引未清理（{e}）", db_path.display()));
+                return;
+            }
+        }
+    }
     for row in missing {
         seq += 1;
         let vals = insert_values(&insert_cols, &host, row, seq);
@@ -337,30 +477,37 @@ pub(in crate::tools) fn repair_one(
             Ok(n) => inserted += n,
             Err(e) => {
                 report.skipped.push(format!("{}: 补行失败（{e}）", db_path.display()));
-                break;
+                return;
             }
         }
     }
-    // `catalog_revision` 是 Desktop 判「索引变过了」的依据。补了行不推它，界面可能不刷新。
-    // **刻意只推这一个**，不碰 `local_thread_catalog_sync_state` 的水位线（理由见模块头）。
-    if inserted > 0 && columns_of(&tx, "local_thread_catalog_metadata").contains("catalog_revision")
-    {
-        // 🔴 **失败要留痕，不能 `let _ =` 吞掉** —— 上面那句注释说的就是这次失败的后果
-        // （「补了行不推它，界面可能不刷新」）。吞掉它的表现是：我们报「已补 N 条」，
-        // 而 Desktop 列表一点变化都没有，用户手里没有任何线索解释这个矛盾。
-        // 刻意**不**因此回滚：补进去的行本身是对的，少推一个版本号的代价只是「可能要重启
-        // Codex 才看得到」，而回滚会把一次有效的修复整个丢掉。
-        if let Err(e) = tx.execute(
+    let structural = inserted + removed;
+    if structural > 0 {
+        let metadata = columns_of(&tx, "local_thread_catalog_metadata");
+        if !metadata.contains("catalog_revision") {
+            report.skipped.push(format!("{}: 缺 catalog_revision，结构变更已回滚", db_path.display()));
+            return;
+        }
+        match tx.execute(
             "UPDATE local_thread_catalog_metadata SET catalog_revision = catalog_revision + ?1",
-            [inserted as i64],
+            [structural as i64],
         ) {
-            report
-                .skipped
-                .push(format!("{}: 版本号未推进（{e}）—— 可能要重启 Codex 才看到新条目", db_path.display()));
+            Ok(1) => {}
+            Ok(n) => {
+                report.skipped.push(format!("{}: 版本号异常影响 {n} 行，结构变更已回滚", db_path.display()));
+                return;
+            }
+            Err(e) => {
+                report.skipped.push(format!("{}: 版本号未推进（{e}），结构变更已回滚", db_path.display()));
+                return;
+            }
         }
     }
     match tx.commit() {
-        Ok(()) => report.inserted += inserted,
+        Ok(()) => {
+            report.inserted += inserted;
+            report.removed += removed;
+        }
         Err(e) => report.skipped.push(format!("{}: 提交失败（{e}）", db_path.display())),
     }
 }
@@ -379,17 +526,10 @@ pub(in crate::tools) fn repair_one(
 /// `observation_sequence` 已到 37，也就是它**扫过了、然后决定不收**。
 /// 我们去补它等于把 Codex 刻意排除的东西塞回用户眼前。
 ///
-/// 两道判据，**不是冗余**：
-/// - `thread_source == "user"`：权威信号（本机实测 guardian 那行就是 `guardian_review`）。
-///   取不到时是空串 → 这道门放行，因为「读不出来源」不等于「它是内部线程」
-///   （同 `balance_gate` 的三态：查不到 ≠ 为零）。
-/// - 标题形态：兜住上一条放行之后的情形 —— 老 schema 没有 `thread_source` 列时它恒为空串，
-///   而我们仍然不该往侧栏写一句用户读不懂的长英文。
-///
-/// ⚠️ **只管「补不补」，不删已有行**（模块头那条纪律没变）：已经在 catalog 里的行可能是
-/// Codex 自己写的，删它属于「影响范围超出修复」。
+/// 删除只认正向 child 证据（已知 thread_source / truthy structured source / edge/job），
+/// 明确 user、fork 或任何冲突都保留。标题只用于防止旧 schema 的未知来源被**插入**，绝不作为 DELETE 证据。
 fn worth_listing(r: &CatalogRow) -> bool {
-    if !r.thread_source.is_empty() && r.thread_source != "user" {
+    if row_is_confirmed_child(r) || r.forked {
         return false;
     }
     !super::view::is_injected_prompt(&r.title)
@@ -409,7 +549,7 @@ fn insert_columns(cols: &HashSet<String>) -> Vec<&'static str> {
         "observation_sequence",
     ];
     // `source_recency_at` 是 NOT NULL 且有默认值 0；带上它列表排序才对得上。
-    for opt in ["missing_candidate", "source_recency_at", "pending_observed_title"] {
+    for opt in ["missing_candidate", "source_recency_at", "pending_observed_title", "thread_source"] {
         if cols.contains(opt) {
             names.push(opt);
         }
@@ -429,6 +569,7 @@ fn insert_values(cols: &[&str], host: &str, r: &CatalogRow, seq: i64) -> Vec<Sql
             "cwd" => SqlValue::Text(r.cwd.clone()),
             "source_kind" => SqlValue::Text(r.source_kind.clone()),
             "model_provider" => SqlValue::Text(r.provider.clone()),
+            "thread_source" => SqlValue::Text(r.thread_source.clone()),
             "observation_sequence" => SqlValue::Integer(seq),
             // 我们补的行**不是**「观察到的标题待定」，标题是现成的。
             "missing_candidate" | "pending_observed_title" => SqlValue::Integer(0),
@@ -486,6 +627,7 @@ mod tests {
             source_kind: "vscode".into(),
             provider: "synaroute".into(),
             thread_source: "user".into(),
+            forked: false,
         }
     }
 
@@ -595,23 +737,16 @@ mod tests {
             .query_row("SELECT display_title FROM local_thread_catalog WHERE thread_id='new1'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(title, "实现 Java 快速排序", "标题要带过去，否则列表里是一串 uuid");
+        let inserted_source: String = c.query_row(
+            "SELECT thread_source FROM local_thread_catalog WHERE thread_id='new1'", [], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(inserted_source, "user", "catalog 有该列时必须写入来源");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 🔴 **版本号推不动要留痕，不能吞掉。**
-    ///
-    /// `catalog_revision` 是 Desktop 判「索引变过了」的依据。推不动时的表现是：我们报
-    /// 「已补 N 条」，而 Desktop 列表一点变化都没有 —— 用户手里没有任何线索解释这个矛盾。
-    /// 第一版是 `let _ = tx.execute(..)`，注入实测**照样全绿**（8 条用例都没碰这一维）。
-    ///
-    /// 夹具用**视图**：`columns_of` 走 `PRAGMA table_info`，对视图照样报出列名 → 那道门通过；
-    /// 而 SQLite 拒绝对视图 UPDATE → 恰好只让这一步失败。用只读文件之类做不到这么精确
-    /// （会连 INSERT 一起挡掉，那时 `inserted` 是 0、压根走不到这一段）。
-    ///
-    /// **刻意不因此回滚**：补进去的行本身是对的，少推一个版本号只是「可能要重启 Codex 才
-    /// 看得到」，而回滚会把一次有效的修复整个丢掉 —— 所以这条同时断言 `inserted` 仍然是 2。
+    /// revision 失败必须回滚 destructive structural mutation，并且报告只计 committed 行。
     #[test]
-    fn a_revision_bump_that_fails_is_reported_not_swallowed() {
+    fn a_revision_failure_rolls_back_structural_changes() {
         let dir = tmp("revfail");
         // 复用标准夹具（列必须齐，否则 `supports_repair` 那道门会让我们一行都不补、
         // 压根走不到版本号那一段 —— 第一版自建 schema 就是这么失败的）。
@@ -637,11 +772,12 @@ mod tests {
 
         let mut rep = CatalogReport::default();
         repair_one(&db, "synaroute", &[row("old"), row("new1"), row("new2")], &mut rep);
-        assert_eq!(rep.inserted, 2, "补行本身是对的，不许因为推不动版本号而回滚：{rep:?}");
-        assert!(
-            rep.skipped.iter().any(|s| s.contains("版本号")),
-            "推不动版本号必须留痕 —— 否则「已补 N 条」与「列表没变化」这个矛盾无解: {rep:?}"
-        );
+        assert_eq!(rep.inserted, 0, "revision 失败时结构改动必须回滚：{rep:?}");
+        assert!(rep.skipped.iter().any(|s| s.contains("版本号")), "失败必须上报: {rep:?}");
+        let count: i64 = Connection::open(&db).unwrap().query_row(
+            "SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id LIKE 'new%'", [], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(count, 0, "未推进 revision 的新行不得 commit");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -703,6 +839,41 @@ mod tests {
         assert_eq!(rep.total(), 0);
         assert!(rep.skipped.is_empty(), "这不该被报成跳过：{rep:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 已有内部条目必须被精确移除；报告必须说明不影响路由、rollout 与正文。
+    #[test]
+    fn existing_guardian_rows_are_removed_and_disclosed() {
+        let dir = tmp("existing_guardian");
+        let db = catalog_db(&dir);
+        let c = Connection::open(&db).unwrap();
+        c.execute(
+            "INSERT INTO local_thread_catalog (host_id,thread_id,display_title,source_created_at,
+             source_updated_at,cwd,source_kind,model_provider,observation_sequence,thread_source)
+             VALUES ('local','guardian','title',1,2,'','vscode','synaroute',3,'guardian_review')",
+            [],
+        ).unwrap();
+        drop(c);
+        let mut report = CatalogReport::default();
+        repair_one(&db, "synaroute", &[guardian_row("guardian")], &mut report);
+        assert_eq!(report.removed, 1, "已有 guardian 行必须被清掉：{report:?}");
+        assert_eq!(Connection::open(&db).unwrap().query_row(
+            "SELECT COUNT(*) FROM local_thread_catalog", [], |r| r.get::<_, i64>(0)
+        ).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 结构化 source 的 false/null/empty/malformed 不构成删除证据，truthy 标记才构成。
+    #[test]
+    fn structured_source_requires_a_truthy_known_child_marker() {
+        for safe in ["", "{}", "not-json", r#"{"internal":false}"#, r#"{"subagent":null}"#,
+            r#"{"sub_agent":""}"#, r#"{"internal":[]}"#] {
+            assert!(!source_kind_marks_child(safe), "{safe:?} 不是正向证据");
+        }
+        for child in [r#"{"internal":true}"#, r#"{"subagent":{"kind":"review"}}"#,
+            r#"{"sub_agent":"guardian"}"#, "guardian_review", "subagent", "memory_consolidation"] {
+            assert!(source_kind_marks_child(child), "{child:?} 应是正向证据");
+        }
     }
 
     /// 🔴 **Codex 内部派生的线程不许补进 Desktop 列表**（用户 2026-09-10 实报的缺陷本体）。
@@ -786,22 +957,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 🔴 **刻意不推 `local_thread_catalog_sync_state` 的水位线，也不删任何行。**
-    ///
-    /// CodexPlusPlus 在「全量同步」时会做这两件事。我们只做定点补行 —— 声称完成了一轮全量
-    /// 对账可能让 Codex 跳过它本该自己做的扫描，而删条目属于「影响范围超出修复」。
-    /// 判据钉形态：生产段里不许出现那张表，也不许有 DELETE。
+    /// 🔴 **只允许按 local host + thread id 精确 DELETE，且永不写 sync_state。**
     #[test]
-    fn we_neither_advance_the_watermark_nor_delete_rows() {
+    fn destructive_sql_is_scoped_to_the_local_catalog_row() {
         let prod = crate::proxy::custom_headers::production_code_only(include_str!(
             "codex_session_catalog.rs"
         ));
-        assert!(
-            !prod.contains("local_thread_catalog_sync_state"),
-            "不许推那张表的水位线（理由见本测试文档）"
-        );
-        assert!(!prod.contains("DELETE FROM"), "不许删用户列表里的条目");
-        // 正向：确实在做那三件事，否则上面两条是空洞的绿。
+        assert!(!prod.contains("local_thread_catalog_sync_state"), "不许写 full-sync 水位线");
+        let deletes: Vec<&str> = prod.lines().filter(|line| line.contains("DELETE FROM")).collect();
+        assert_eq!(deletes.len(), 1, "只能有一条经审查的 DELETE：{deletes:?}");
+        assert!(deletes[0].contains("local_thread_catalog"));
+        assert!(prod.contains("WHERE host_id = ?1 AND thread_id = ?2"), "DELETE 必须双重精确限定");
+        for forbidden in ["DELETE FROM threads", "DELETE FROM thread_spawn_edges",
+            "DELETE FROM agent_job_items", "DELETE FROM local_thread_catalog_sync_state"] {
+            assert!(!prod.contains(forbidden), "禁止破坏支持表：{forbidden}");
+        }
         assert!(prod.contains("UPDATE local_thread_catalog SET model_provider"));
         assert!(prod.contains("SET missing_candidate = 0"));
         assert!(prod.contains("INSERT OR IGNORE INTO local_thread_catalog"));
@@ -823,7 +993,10 @@ mod tests {
             "codex_session_sqlite.rs"
         ));
         assert!(prod.contains("catalog::repair_one("), "sync_sqlite 里没接上这一步");
-        assert!(prod.contains("catalog::plan_from("), "没有跨库收集那一步");
+        assert!(prod.contains("catalog::plan_from("), "没有跨库收集 threads 那一步");
+        let sessions = crate::proxy::custom_headers::production_code_only(include_str!("codex_sessions.rs"));
+        assert!(sessions.contains("catalog::merge_rollout_evidence("), "sync_to_at 必须把 scan.sessions 交给 cleanup");
+        assert!(sessions.contains("sqlite::collect_child_thread_ids("), "edge/job 正向证据必须接入");
         let me = crate::proxy::custom_headers::production_code_only(include_str!(
             "codex_session_catalog.rs"
         ));
