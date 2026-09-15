@@ -343,15 +343,30 @@ mod tests {
             n, 2,
             "流式与非流式两条「上游给了 Retry-After」分支都必须武装窗口，实际 {n} 处"
         );
-        // 两处都必须紧跟在 retry_after_hint 那一行之后（同一个 if 里）——
+        // 两处都必须紧跟在「更新 retry_after_hint」那一行之后（同一个 if 里）——
         // 挪到别处就可能落在「只有部分状态码走到」的分支里。
-        assert_eq!(
-            prod.matches("retry_after_hint.map_or(s, |cur: i64| cur.min(s)));\r\n")
-                .count()
-                .max(prod.matches("retry_after_hint.map_or(s, |cur: i64| cur.min(s)));\n").count()),
-            2,
-            "retry_after_hint 的两处更新形态变了，本判据要跟着改"
-        );
+        //
+        // 🔴 **钉性质，不钉写法。** 上一版把整行连行尾一起写死
+        // （`retry_after_hint.map_or(s, |cur: i64| cur.min(s)));\r\n`，还要 `.max()` 兜
+        // CRLF/LF 两种形态）。那种判据在**任何**无害改动下都会假红：变量改名、去掉
+        // `|cur: i64|` 的类型标注、`cargo fmt` 把它折行、甚至换一次 checkout 的行尾。
+        // 而本仓已为「钉手法的判据制造假红」付过两次代价（§21.3 那两条被推翻的「刻意不做」），
+        // 假红的代价是**下一个人把正确的改动撤回去**。
+        //
+        // 真正要守的性质是**位置关系**：每处 `arm(` 的紧邻上文里必须有一次
+        // `retry_after_hint` 的赋值。逐个 arm 往上找，不依赖那一行长什么样。
+        for (i, at) in prod.match_indices("quota_window::arm(").enumerate() {
+            let before = &prod[..at.0];
+            // 往上取一小段（足够覆盖「同一个 if 里的前一两行」，不足以跨到别的分支）。
+            let start = before.len().saturating_sub(400);
+            let window = &before[start..];
+            assert!(
+                window.contains("retry_after_hint"),
+                "第 {} 处 quota_window::arm 的紧邻上文里没有 retry_after_hint 的更新 —— \
+                 它可能被挪出了那个 if，于是只有部分状态码会武装窗口",
+                i + 1
+            );
+        }
     }
 }
 

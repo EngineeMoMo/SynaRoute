@@ -1029,7 +1029,12 @@ mod tests {
     ///
     /// 上一版注释还声称「那个我们不写、也读不到」「全仓零写入点，**已核对**」，
     /// 而 `tools.rs` 里写它的那行一直都在。带「已核对」字样的假话比普通过时注释更贵
-    /// —— 它声称做过取证，于是下一个人不会再查。这条判据同时钉死那句话不会复活。
+    /// —— 它声称做过取证，于是下一个人不会再查。
+    ///
+    /// ⚠️ **那句话本身没有机械防线，别以为有**：本判据曾写成「生产段不许出现那两句话」，
+    /// 而那恒真 —— 散文只以注释形态存在，而 `production_code_only` 把注释剥掉了。
+    /// 现在钉的是它**否认的那个代码事实**（`tools.rs` 真的写 `tool_timeout_sec`）。
+    /// 注释本身的准确性只能靠人读，这一点如实写在这里。
     #[test]
     fn the_forward_timeout_must_stay_derived_from_what_we_tell_the_client() {
         assert_eq!(
@@ -1046,10 +1051,26 @@ mod tests {
             line.contains("MCP_TOOL_TIMEOUT_SEC"),
             "必须派生，不许写死字面量（两处各写一个 600 必然漂移）：{line}"
         );
-        // 那两句假话不许回来。
+        // 🔴 **钉那两句假话所否认的那个事实，而不是禁止那两句话本身。**
+        //
+        // 上一版写的是 `!src.contains("我们不写、也读不到")` + `!src.contains("全仓零写入点")`，
+        // 而那**恒真**：那两句话只可能以**注释**形态出现（它们是散文，不是代码），
+        // 而 `production_code_only` 第一件事就是把注释剥掉。于是「假话复活」这个方向
+        // 一个字节都没被守住 —— 判据看着在守、实际什么都没查，正是本仓最贵的那一类
+        // （文档还写着「这条判据同时钉死那句话不会复活」，读到的人不会再自己去查）。
+        //
+        // 可机械验证的是**代码事实**：`tool_timeout_sec` 由 `tools.rs` 写进 config.toml。
+        // 那正是假话否认的东西 —— 谁把那行写入删掉，这条就红，而那时「我们不写它」
+        // 才真的成立、注释也才该改回去。两个方向因此重新对齐。
+        let tools = crate::proxy::custom_headers::production_code_only(include_str!("../tools.rs"));
         assert!(
-            !src.contains("我们不写、也读不到") && !src.contains("全仓零写入点"),
-            "`tool_timeout_sec` 由 tools.rs 写入，别再声称我们不写它"
+            tools.contains(r#"entry.insert("tool_timeout_sec".to_string()"#),
+            "tools.rs 不再写 tool_timeout_sec —— 若真如此，本函数的派生前提与\
+             上面那段「客户端的容忍上限由我们决定」都要重写"
+        );
+        assert!(
+            tools.contains("MCP_TOOL_TIMEOUT_SEC"),
+            "写进 config.toml 的必须是那个常量本身，不能是另一个字面量（否则两个 600 仍会漂移）"
         );
     }
 

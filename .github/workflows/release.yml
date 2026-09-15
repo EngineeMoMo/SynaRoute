@@ -26,11 +26,26 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const tag_name = `v${process.env.PACKAGE_VERSION}`
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            })
+            const existing = releases.find((release) => release.tag_name === tag_name)
+            if (existing) {
+              if (!existing.draft) {
+                throw new Error(`Release ${tag_name} already exists and is published; refusing to create a duplicate.`)
+              }
+              core.info(`Reusing existing draft release ${existing.id} for ${tag_name}.`)
+              return existing.id
+            }
+
             const { data } = await github.rest.repos.createRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              tag_name: `v${process.env.PACKAGE_VERSION}`,
-              name: `SynaRoute v${process.env.PACKAGE_VERSION}`,
+              tag_name,
+              name: `SynaRoute ${tag_name}`,
               // 说明里必须带「v0.1.23 及更早请手动重装」那一段。
               // 官网下载页也有同样一条，但那两条渠道触达的是不同的人 ——
               // 从 Release 页直接下包的人根本不会经过官网。

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, type Dirent } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
@@ -25,7 +25,18 @@ import { execSync } from "node:child_process";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-/** 取产物 CSS 全文。没有 dist 时先构建一次（CI 首跑 / clean checkout）。 */
+/**
+ * 取产物 CSS 全文。
+ *
+ * 🔴 **产物比源码旧就必须重建，不能只在「一个 CSS 都没有」时重建。**
+ *
+ * 上一版的条件是 `files.length === 0`，于是一份**陈旧** `dist/` 会让整组断言恒绿：
+ * 把 `tailwind.config.js` 里 8 / 12 两档删掉（= 缺陷本体）而不重建，读到的仍是旧 CSS、
+ * 里面照样有 `.bg-warning\/8` → 全绿。而 `npm test` 走 `vitest run`、**不构建**
+ * （只有 `npm run build` 才会 `vite build` 再跑 check:tailwind），所以这条路是常态而非边缘。
+ *
+ * 同本仓 `cp -p` 那条教训的同一族：**判据的证据是缓存产物时，必须先证明缓存不比源码旧。**
+ */
 function readBuiltCss(): string {
   const assets = join(ROOT, "dist", "assets");
   const cssFiles = () => {
@@ -35,11 +46,43 @@ function readBuiltCss(): string {
       return [] as string[];
     }
   };
+  /** 源码侧最新的 mtime：tailwind 配置 + 全部会产出类名的源文件。 */
+  const newestSource = (): number => {
+    let newest = 0;
+    const bump = (p: string) => {
+      try {
+        newest = Math.max(newest, statSync(p).mtimeMs);
+      } catch {
+        /* 不存在就跳过 */
+      }
+    };
+    bump(join(ROOT, "tailwind.config.js"));
+    const walk = (dir: string) => {
+      let entries: Dirent[];
+      try {
+        entries = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        const p = join(dir, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (/\.(tsx?|css)$/.test(e.name)) bump(p);
+      }
+    };
+    walk(join(ROOT, "src"));
+    return newest;
+  };
+  const oldestCss = (files: string[]): number =>
+    files.reduce((min, f) => Math.min(min, statSync(join(assets, f)).mtimeMs), Infinity);
+
   let files = cssFiles();
-  if (files.length === 0) {
+  // 取**最旧**的产物与**最新**的源码比：任一片 CSS 落后于任一处源码改动即视为陈旧。
+  if (files.length === 0 || oldestCss(files) < newestSource()) {
     execSync("npm run build", { cwd: ROOT, stdio: "ignore" });
     files = cssFiles();
   }
+  expect(files.length, "构建后仍没有产物 CSS —— 判据失去证据来源").toBeGreaterThan(0);
   return files.map((f) => readFileSync(join(assets, f), "utf8")).join("\n");
 }
 

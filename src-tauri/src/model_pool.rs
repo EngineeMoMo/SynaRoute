@@ -1500,15 +1500,70 @@ mod tests {
     /// `the_two_sse_invariants_must_stay_derived_not_assumed` 的思路：钉来源，不钉结论）。
     #[test]
     fn fetch_models_stays_unreachable_until_someone_wires_the_resync() {
-        let bridge = include_str!("../../src/lib/bridge.ts");
-        // 定义行本身不算调用（`fetchModels: (keyId) => call<...>("fetch_models", ...)`）。
-        let callers = bridge.matches("api.fetchModels(").count()
-            + include_str!("../../src/components/KeyEditor.tsx")
-                .matches("api.fetchModels(")
-                .count();
-        assert_eq!(
-            callers, 0,
-            "有人接上了落盘版模型拉取 —— 请让它一并过 client_resync::sync_after，\
+        // 🔴 **必须扫整棵前端树，不能只扫两个文件。**
+        //
+        // 上一版只读 `bridge.ts` + `KeyEditor.tsx`，而本判据承诺的是「**谁**接上按钮它就变红」
+        // —— 接在 `CategoryPage.tsx` / `KeyCard.tsx` / 任何别的文件里，它照样绿。
+        // 也就是判据的覆盖面比它自己声明的窄，而窄掉的那部分失效是静默的
+        // （同本仓「判据存在 ≠ 判对了维度」）。运行时遍历目录，理由同本文件其它判据用
+        // `read_to_string` 读源码：`include_str!` 是编译期的，列不出目录。
+        //
+        // 排除两个文件：`bridge.ts`（`fetchModels` 的**定义**在这里）与 `mockData.ts`
+        // （演示桩的同名实现）。其余任何一处出现即视为调用点。
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if matches!(
+                    p.extension().and_then(|x| x.to_str()),
+                    Some("ts") | Some("tsx")
+                ) {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(std::path::Path::new("../src"), &mut files);
+        assert!(
+            files.len() > 20,
+            "只扫到 {} 个前端源文件 —— 判据在空转（cwd 或目录结构变了），先修判据",
+            files.len()
+        );
+
+        let mut callers = Vec::new();
+        let mut scanned_definition = false;
+        for f in &files {
+            let name = f.file_name().and_then(|x| x.to_str()).unwrap_or("");
+            let Ok(raw) = std::fs::read_to_string(f) else { continue };
+            let src = crate::proxy::custom_headers::production_code_only(&raw);
+            if name == "bridge.ts" {
+                scanned_definition = src.contains("fetchModels:");
+                continue;
+            }
+            if name == "mockData.ts" {
+                continue;
+            }
+            // 只认**整词** `fetchModels` —— `fetchModelsDraft`（只读探针、不落盘）不算。
+            let mut at = 0usize;
+            while let Some(i) = src[at..].find("fetchModels") {
+                let end = at + i + "fetchModels".len();
+                let next = src[end..].chars().next();
+                if !next.is_some_and(|c| c.is_ascii_alphanumeric()) {
+                    callers.push(format!("{}", f.display()));
+                    break;
+                }
+                at = end;
+            }
+        }
+        assert!(
+            scanned_definition,
+            "bridge.ts 里找不到 `fetchModels:` 定义 —— 判据失去锚点，先修判据"
+        );
+        assert!(
+            callers.is_empty(),
+            "有人接上了落盘版模型拉取（{callers:?}）—— 请让它一并过 client_resync::sync_after，\
              否则拉到的新模型不会出现在 Codex 菜单/桌面端选择器里"
         );
     }
