@@ -28,6 +28,7 @@ use super::tools_meta::{
 // Chat 源头无数据而不出现 —— 能力上限，非遗漏。
 
 #[path = "sse_error.rs"] pub(crate) mod sse_error; // 上游流内 error 的跨协议翻译；来由见该文件模块注释
+#[path = "sse_bounds.rs"] mod sse_bounds; // 工具调用累积的体积上限；来由见该文件模块注释
 
 /// SSE 流的跨协议翻译方向。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +64,7 @@ pub fn sse_direction(downstream: Protocol, upstream: Protocol) -> Option<SseDire
 
 /// 有状态 SSE 翻译器：喂入上游字节块，产出下游协议的 SSE 文本块。
 /// 内部按行缓冲——上游一个 chunk 可能切在半行中间，累积到 `\n` 才处理整行。
+/// 有状态 SSE 翻译器：喂入上游字节块，产出下游协议 SSE 文本块。
 pub struct SseTranslator {
     dir: SseDirection,
     /// 未处理完的上游字节。**缓冲字节而非字符串**：多字节字符可能被 TCP 分段切开，
@@ -120,8 +122,10 @@ pub struct SseTranslator {
     /// `response.output_item.done` 与 `response.completed.output[]` 可能重复携带同一个调用，
     /// 靠它保证同一个工具调用只翻成一个 tool_use 块。
     anthropic_tool_seen: std::collections::HashSet<String>,
-    /// 上游是否因输出上限**截断**。翻译到下游时必须如实转达，否则下游收到「正常结束」的
-    /// 半截回答：既不提示截断、也不触发续写，用户以为模型自己就答这么多。
+    /// 越界的两段状态：先记下**哪一项**越界（先到的赢，它是根因），发出错误事件后置
+    /// `emitted`（此后这条流一个字节都不再翻译）。来由与上限值见 [`sse_bounds`]。
+    limit_hit: Option<sse_bounds::LimitKind>,
+    limit_hit_emitted: bool,
     /// 三个上游形态各自置位：Chat 的 finish_reason=="length"、Responses 的
     /// response.status=="incomplete"、Anthropic 的 stop_reason=="max_tokens"。
     upstream_truncated: bool,
@@ -158,6 +162,8 @@ impl SseTranslator {
             anthropic_next_block: 0,
             anthropic_text_open: None,
             anthropic_tool_seen: std::collections::HashSet::new(),
+            limit_hit: None,
+            limit_hit_emitted: false,
             upstream_truncated: false,
         }
     }
@@ -189,6 +195,7 @@ impl SseTranslator {
     /// 按完整行解码则安全：SSE 协议保证上游按行发 JSON，行内必然是完整的 UTF-8 序列。
     /// 回归测试见 `sse_multibyte_text_survives_arbitrary_chunk_boundaries`。
     pub fn push(&mut self, chunk: &[u8]) -> String {
+        if self.limit_hit_emitted { return String::new() }
         self.buf.extend_from_slice(chunk);
         let mut out = String::new();
         // 逐个完整行处理，保留最后不完整的一段在 buf。
@@ -201,11 +208,14 @@ impl SseTranslator {
             if let Some(ev) = self.process_line(line) {
                 out.push_str(&ev);
             }
+            if let Some(e) = self.take_tool_limit_error() { out.push_str(&e); break }
         }
+        // 行缓冲上限必须查在循环**之外**：上游一个 `\n` 都不发时那个循环压根不进入，
+        // 而那正是这条上限要挡的形态（详见 sse_bounds::MAX_LINE_BYTES）。
+        if let Some(e) = self.line_buffer_error() { out.push_str(&e) }
         out
     }
 
-    /// 本次流累积到的 token 用量；两者皆 0 时返回 `None`（视作上游没给）。
     ///
     /// 给**跨协议流式的用量采集**用。同协议直通那条路走的是「尾窗缓存 + 事后
     /// `extract_usage_from_sse`」，跨协议这条路不能照搬：翻译器边收边转，尾窗里躺的是
@@ -230,6 +240,7 @@ impl SseTranslator {
 
     /// 流结束时冲刷收尾事件（Responses 需要 response.completed；Chat 需 [DONE]）。
     pub fn finish(&mut self) -> String {
+        if self.limit_hit_emitted { return String::new() }
         match self.dir {
             SseDirection::ChatToResponses | SseDirection::AnthropicToResponses => {
                 self.emit_responses_completed(None)
@@ -299,7 +310,7 @@ impl SseTranslator {
         if let Some(t) = delta.and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
             if !t.is_empty() {
                 self.saw_text = true;
-                self.text_accum.push_str(t); // 累积全文，收尾时回填 output_item.done 供 Codex 落盘
+                self.push_text_accum(t); // 累积全文供收尾回填 output_item.done（有上限，见 sse_bounds）
                 let ev = json!({
                     "type": "response.output_text.delta",
                     "item_id": self.msg_id, "output_index": 0, "content_index": 0, "delta": t
@@ -322,7 +333,7 @@ impl SseTranslator {
                         if !n.is_empty() { self.tool_calls[idx].1 = n.to_string(); }
                     }
                     if let Some(a) = f.get("arguments").and_then(|a| a.as_str()) {
-                        self.tool_calls[idx].2.push_str(a);
+                        self.push_tool_args(idx, a);
                     }
                 }
             }
@@ -579,10 +590,12 @@ impl SseTranslator {
         } else {
             call_id.clone()
         };
-        if !self.anthropic_tool_seen.insert(dedup_key) {
+        if !self.register_tool_seen(dedup_key) {
             return String::new();
         }
-        let slot = self.tool_calls.len();
+        // 🔴 **必须过 `reserve_tool_slot`**：这里原先是裸 `tool_calls.push`，就是上限被绕过的
+        // 那条回归本体 —— 而本方向当时没有任何用例压到，故那批注入全绿、缺口一直开着。
+        let Some(slot) = self.reserve_tool_slot() else { return String::new() };
         let id = if call_id.is_empty() {
             format!("call_{}", uuid_like())
         } else {
@@ -648,7 +661,7 @@ impl SseTranslator {
                         }
                     }
                     if let Some(a) = f.get("arguments").and_then(|a| a.as_str()) {
-                        self.tool_calls[idx].2.push_str(a);
+                        self.push_tool_args(idx, a);
                     }
                 }
             }
@@ -670,29 +683,6 @@ impl SseTranslator {
             if let Some(ct) = u.get("completion_tokens").and_then(|t| t.as_u64()) {
                 self.output_tokens = ct;
             }
-        }
-        out
-    }
-
-    /// 把累积的 Chat 风格 `tool_calls` 一次性翻成 Anthropic `tool_use` 块序列。
-    /// 复用 [`SseTranslator::emit_anthropic_tool_block`]（同一套去重/命名/兜底口径），
-    /// 故重复调用安全（第二次全部命中去重、返回空串）。
-    fn flush_anthropic_tool_calls(&mut self) -> String {
-        if self.tool_calls.is_empty() {
-            return String::new();
-        }
-        let pending: Vec<(String, String, String)> = self.tool_calls.clone();
-        let mut out = String::new();
-        for (id, name, args) in pending {
-            if name.is_empty() {
-                continue;
-            }
-            out.push_str(&self.emit_anthropic_tool_block(&json!({
-                "type": "function_call",
-                "call_id": id,
-                "name": name,
-                "arguments": args,
-            })));
         }
         out
     }
@@ -782,7 +772,7 @@ impl SseTranslator {
                         .and_then(|n| n.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let slot = self.tool_calls.len();
+                    let Some(slot) = self.reserve_tool_slot() else { return String::new() };
                     self.tool_calls.push((id.clone(), name.clone(), String::new()));
                     self.block_tool_slot.insert(idx, slot);
                     // Chat 的 tool_calls 增量：首片带 id/name（arguments 随后逐片补）。
@@ -817,7 +807,7 @@ impl SseTranslator {
                     if pj.is_empty() {
                         return String::new();
                     }
-                    self.tool_calls[slot].2.push_str(pj);
+                    self.push_tool_args(slot, pj);
                     let chunk = json!({
                         "object": "chat.completion.chunk",
                         "choices": [ { "index": 0, "finish_reason": Value::Null, "delta": {
@@ -929,7 +919,7 @@ impl SseTranslator {
                             .and_then(|n| n.as_str())
                             .unwrap_or("")
                             .to_string();
-                        let slot = self.tool_calls.len();
+                        let Some(slot) = self.reserve_tool_slot() else { return out };
                         self.tool_calls.push((id, name, String::new()));
                         self.block_tool_slot.insert(idx, slot);
                     }
@@ -961,7 +951,7 @@ impl SseTranslator {
                         if let Some(t) = delta.and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
                             if !t.is_empty() {
                                 self.saw_text = true;
-                                self.text_accum.push_str(t); // 累积全文，供收尾 message output_item.done 落盘
+                                self.push_text_accum(t); // 同上：累积有上限，见 sse_bounds
                                 let e = json!({
                                     "type": "response.output_text.delta",
                                     "item_id": self.msg_id, "output_index": 0, "content_index": 0, "delta": t
@@ -973,7 +963,7 @@ impl SseTranslator {
                     "input_json_delta" => {
                         if let Some(pj) = delta.and_then(|d| d.get("partial_json")).and_then(|p| p.as_str()) {
                             if let Some(&slot) = self.block_tool_slot.get(&idx) {
-                                self.tool_calls[slot].2.push_str(pj);
+                    self.push_tool_args(slot, pj);
                             }
                         }
                     }
@@ -982,7 +972,7 @@ impl SseTranslator {
                     "thinking_delta" if self.thinking_blocks.contains(&idx) => {
                         if let Some(t) = delta.and_then(|d| d.get("thinking")).and_then(|t| t.as_str()) {
                             if !t.is_empty() {
-                                self.reasoning_accum.push_str(t);
+                                self.push_reasoning_accum(t);
                                 out.push_str(&sse(
                                     "response.reasoning_summary_text.delta",
                                     &json!({
@@ -1202,7 +1192,7 @@ impl SseTranslator {
         } else {
             call_id.clone()
         };
-        if !self.anthropic_tool_seen.insert(dedup_key) {
+        if !self.register_tool_seen(dedup_key) {
             return String::new();
         }
         let tool_id = if call_id.is_empty() {
@@ -1249,6 +1239,171 @@ fn sse_data(data: &Value) -> String {
 mod tests {
     use super::*;
     use super::super::testfix::{anthropic_tool_blocks, sse_events};
+
+    /// 🔴 上游能用一条流把工具参数灌到内存耗尽：`arguments` 增量是无上限 `push_str`。
+    ///
+    /// 判据要求**拒绝并终止**，不是截断：截断出的是一段非法 JSON，下游会把它当参数真的
+    /// 拿去执行（同 `tool_slot` 那条「钳制比丢弃更糟」）。
+    #[test]
+    fn unbounded_tool_arguments_terminate_the_stream_instead_of_growing() {
+        let mut t = SseTranslator::new(SseDirection::ChatToAnthropic);
+        // 每片 64 KiB，灌到超过 1 MiB 上限。
+        let chunk = "x".repeat(64 * 1024);
+        let mut out = String::new();
+        for _ in 0..24 {
+            out.push_str(&t.push(
+                format!(
+                    "data: {}\n\n",
+                    json!({ "choices": [ { "delta": { "tool_calls": [ {
+                        "index": 0, "id": "c1", "type": "function",
+                        "function": { "name": "f", "arguments": chunk }
+                    } ] } } ] })
+                )
+                .as_bytes(),
+            ));
+        }
+        assert!(
+            t.tool_calls.iter().all(|c| c.2.len() <= sse_bounds::MAX_TOOL_ARGS_BYTES),
+            "累积长度必须被上限挡住"
+        );
+        assert!(out.contains("invalid_request_error"), "必须给下游一条明确的失败：{out}");
+        // 终止之后不再产出任何东西 —— 否则下游会先收到失败再收到收尾事件，自相矛盾。
+        let after = t.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
+        assert_eq!(after, "", "已终止的流不该再翻译后续增量");
+        assert_eq!(t.finish(), "", "已终止的流不该再补收尾事件");
+    }
+
+    /// Anthropic 上游侧的槽位创建同样要有上限：`content_block_start` 每来一个 tool_use
+    /// 就 push 一个槽位，而块 index 来自上游。
+    #[test]
+    fn anthropic_tool_blocks_cannot_grow_without_bound() {
+        let mut t = SseTranslator::new(SseDirection::AnthropicToChat);
+        let mut out = String::new();
+        for i in 0..300 {
+            out.push_str(&t.push(
+                format!(
+                    "event: content_block_start\ndata: {}\n\n",
+                    json!({ "type": "content_block_start", "index": i,
+                        "content_block": { "type": "tool_use", "id": format!("t{i}"), "name": "f" } })
+                )
+                .as_bytes(),
+            ));
+        }
+        assert!(t.tool_calls.len() <= 256, "槽位数必须有上限，实际 {}", t.tool_calls.len());
+        assert!(out.contains("invalid_request_error"), "越界必须如实报错：{out}");
+    }
+
+    /// 🔴 **Responses→Chat 这条路此前完全没有用例压到，于是槽位上限在它身上压根不生效。**
+    ///
+    /// `chat_tool_call_chunk_from_item` 当初是裸 `tool_calls.push`，不过 `reserve_tool_slot`
+    /// 也不受 `tool_slot`（那个只管 Chat 上游侧的 `index`）约束 —— 上游持续发
+    /// `response.output_item.done`、每条换一个 `call_id` 就绕过去重，我们一直攒。
+    ///
+    /// 它与「镜像方向漏一处」同形，但更隐蔽：那次有测试当场抓住，这次**六个 push 点里
+    /// 只有这一处没有任何用例**，所以上限那批故障注入全绿、缺口一直开着。
+    #[test]
+    fn responses_to_chat_tool_slots_cannot_grow_without_bound() {
+        let mut t = SseTranslator::new(SseDirection::ResponsesToChat);
+        let mut out = String::new();
+        for i in 0..(sse_bounds::MAX_TOOL_SLOTS + 40) {
+            out.push_str(&t.push(
+                format!(
+                    "event: response.output_item.done\ndata: {}\n\n",
+                    json!({ "type": "response.output_item.done", "item": {
+                        "type": "function_call", "call_id": format!("c{i}"),
+                        "name": "f", "arguments": "{}" } })
+                )
+                .as_bytes(),
+            ));
+        }
+        assert!(
+            t.tool_calls.len() <= sse_bounds::MAX_TOOL_SLOTS,
+            "槽位数必须被上限挡住，实际 {}",
+            t.tool_calls.len()
+        );
+        assert!(out.contains("invalid_request_error"), "越界必须如实报错：{out}");
+        // 指对方向：报的必须是「调用数」，不能是笼统的一句或别的项。
+        assert!(out.contains("工具调用数超过"), "必须点名越界项：{out}");
+        assert_eq!(t.finish(), "", "已终止的流不该再补收尾事件");
+    }
+
+    /// 去重集合是**第三份独立累积**，前两条上限一个都管不到它。
+    ///
+    /// 走 `ResponsesToAnthropic`：那条路只调 `register_tool_seen`、**不占 `tool_calls` 槽位**
+    /// （块序号走 `anthropic_next_block`），故它是唯一能把这一维单独压出来的方向 ——
+    /// 在 →Chat 那条路上槽位会先到顶，`note_limit` 记的就成了 `ToolSlots`。
+    #[test]
+    fn the_tool_dedup_set_cannot_grow_without_bound() {
+        let mut t = SseTranslator::new(SseDirection::ResponsesToAnthropic);
+        let mut out = String::new();
+        for i in 0..(sse_bounds::MAX_TOOL_SEEN + 40) {
+            out.push_str(&t.push(
+                format!(
+                    "event: response.output_item.done\ndata: {}\n\n",
+                    json!({ "type": "response.output_item.done", "item": {
+                        "type": "function_call", "call_id": format!("c{i}"),
+                        "name": "f", "arguments": "{}" } })
+                )
+                .as_bytes(),
+            ));
+        }
+        assert!(
+            t.anthropic_tool_seen.len() <= sse_bounds::MAX_TOOL_SEEN,
+            "去重集合必须被上限挡住，实际 {}",
+            t.anthropic_tool_seen.len()
+        );
+        assert!(out.contains("工具调用去重记录超过"), "必须点名是去重记录越界：{out}");
+    }
+
+    /// 🔴 上游开流后**一个 `\n` 都不发**时，此前所有上限一条都执行不到。
+    ///
+    /// `push` 靠找换行切行，参数/槽位那些检查全在行循环**内部**；上游只发字节不发换行
+    /// （畸形网关、把二进制体伪装成 SSE）时循环永不进入，而 `buf` 一直 `extend_from_slice`。
+    /// 故这条判据同时守着「检查点必须在循环之外」。
+    #[test]
+    fn an_unterminated_line_cannot_grow_without_bound() {
+        let mut t = SseTranslator::new(SseDirection::ChatToAnthropic);
+        let mut out = String::new();
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..(sse_bounds::MAX_LINE_BYTES / chunk.len() + 2) {
+            out.push_str(&t.push(&chunk));
+        }
+        assert!(out.contains("invalid_request_error"), "必须给下游一条明确的失败：{out}");
+        assert!(
+            out.contains("上游可能并未在发送 SSE"),
+            "文案要把人指向真实成因，而不是去查工具定义：{out}"
+        );
+        assert_eq!(t.push(&chunk), "", "已终止的流不该再吞后续字节");
+    }
+
+    /// 累积正文（assistant 全文 / thinking 全文）也要有上限。
+    ///
+    /// 累积本身是刻意的（Codex 靠收尾那条 `output_item.done` 落盘），此前没有任何上限。
+    /// 这里直接预填到临界再推一把 —— 真喂 32 MiB 过一遍解析器只会让套件变慢，
+    /// 而**接线**由「生产段不许再有裸 `push_str`」那条源码级判据守着。
+    #[test]
+    fn accumulated_body_text_cannot_grow_without_bound() {
+        for thinking in [false, true] {
+            let mut t = SseTranslator::new(SseDirection::AnthropicToResponses);
+            let field = if thinking { &mut t.reasoning_accum } else { &mut t.text_accum };
+            *field = "x".repeat(sse_bounds::MAX_ACCUM_BYTES - 4);
+            if thinking {
+                t.push_reasoning_accum("abcdefgh");
+            } else {
+                t.push_text_accum("abcdefgh");
+            }
+            let len = if thinking { t.reasoning_accum.len() } else { t.text_accum.len() };
+            assert!(
+                len <= sse_bounds::MAX_ACCUM_BYTES,
+                "累积必须被上限挡住（thinking={thinking}），实际 {len}"
+            );
+            assert_eq!(
+                t.limit_hit,
+                Some(sse_bounds::LimitKind::Accum),
+                "越界项必须记成 Accum（thinking={thinking}）"
+            );
+        }
+    }
 
     /// P3-1：两个 `→Chat` 方向必须发 usage 收尾 chunk。
     ///

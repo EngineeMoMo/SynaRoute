@@ -73,11 +73,36 @@ pub(crate) fn mask_url_credentials(url: &str) -> String {
     out
 }
 
-/// 路径段是否像令牌：≥16 位、只由 token 字符组成、且**不含点**（域名式片段要留着）。
+/// 路径段是否像令牌：≥16 位、只由 token 字符组成。普通短域名式片段保留；足够长的点号串也遮掉，覆盖 JWT 路径令牌。
 fn looks_like_token(seg: &str) -> bool {
-    seg.len() >= 16
-        && !seg.contains('.')
-        && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    let allowed = seg
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
+    seg.len() >= 16 && allowed && (!seg.contains('.') || seg.len() >= 32)
+}
+
+/// 从上游错误正文中移除本次请求实际使用的密钥；上游可能把鉴权值原样回显。
+pub(crate) fn redact_secret(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(secret, "***")
+    }
+}
+
+/// 只在错误响应或 200 包裹错误时遮掉密钥，正常模型正文保持字节不变。
+pub(crate) fn redact_upstream_error_bytes(
+    status: u16,
+    bytes: bytes::Bytes,
+    secret: &str,
+) -> bytes::Bytes {
+    if status >= 400 || crate::upstream::body_is_upstream_error(&bytes).is_some() {
+        return bytes::Bytes::from(redact_secret(
+            &String::from_utf8_lossy(&bytes),
+            secret,
+        ));
+    }
+    bytes
 }
 
 // ==== 诊断报告（UX#12）====
@@ -361,6 +386,15 @@ mod tests {
         assert_eq!(
             mask_url_credentials("https://relay.example.com/v1/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9/completions"),
             "https://relay.example.com/v1/***/completions"
+        );
+    }
+
+    #[test]
+    fn mask_url_credentials_hides_dotted_token_segments() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature-part-123456";
+        assert_eq!(
+            mask_url_credentials(&format!("https://relay.example.com/v1/{jwt}/responses")),
+            "https://relay.example.com/v1/***/responses"
         );
     }
 

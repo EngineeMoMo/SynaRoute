@@ -87,6 +87,10 @@ pub(crate) struct SessionRef {
     pub cwd: String,
     pub timestamp: String,
     pub bytes: u64,
+    /// Codex 的结构化来源标记（如 `{"subagent":...}`）。非空且命中内部来源形态时，
+    /// 与 `thread_source`/edge/job 一样表示内部派生；普通用户 fork 不因此被排除。
+    #[serde(default)]
+    pub source: String,
     /// 这条 thread 的来源：`user` = 用户自己的对话，其它值（如 `guardian_review`）是
     /// Codex 内部派生出来的。**不隐藏、只标注** —— 隐藏用户的数据比多显示一行更糟，
     /// 而不标注的话「我明明只开了 3 个对话，这里怎么有 5 条」无从解释。
@@ -281,7 +285,28 @@ fn born_after_sync(session: &SessionRef, synced_at: &str) -> bool {
 ///
 /// 返回的第一项是首行里的 `payload.id`，**只用于判断这是不是 fork 子会话**（子会话那里它
 /// 是父的 id）。真正的 thread id 由 [`files::thread_id_from_filename`] 从文件名推导。
-fn parse_meta(line: &str) -> Option<(String, String, String, String, String)> {
+fn source_marks_internal(source: &str) -> bool {
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(source) else { return false };
+    ["subagent", "sub_agent", "internal", "agent"].iter().any(|key| {
+        object.get(*key).is_some_and(|value| match value {
+            Value::Null => false,
+            Value::Bool(flag) => *flag,
+            Value::String(text) => !text.trim().is_empty(),
+            Value::Array(items) => !items.is_empty(),
+            Value::Object(items) => !items.is_empty(),
+            Value::Number(_) => true,
+        })
+    })
+}
+
+fn session_is_internal(session: &SessionRef, child_ids: &std::collections::HashSet<String>) -> bool {
+    source_marks_internal(&session.source)
+        || (!session.thread_source.trim().is_empty()
+            && !session.thread_source.trim().eq_ignore_ascii_case("user"))
+        || child_ids.contains(&session.thread_id)
+}
+
+fn parse_meta(line: &str) -> Option<(String, String, String, String, String, String)> {
     let (body, _) = split_eol(line);
     let rec: Value = serde_json::from_str(body.trim()).ok()?;
     if rec.get("type").and_then(Value::as_str) != Some("session_meta") {
@@ -290,7 +315,8 @@ fn parse_meta(line: &str) -> Option<(String, String, String, String, String)> {
     let p = rec.get("payload")?;
     let s = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
     let id = if p.get("id").is_some() { s("id") } else { s("session_id") };
-    Some((id, s("model_provider"), s("cwd"), s("timestamp"), s("thread_source")))
+    let source = p.get("source").map(Value::to_string).unwrap_or_default();
+    Some((id, s("model_provider"), s("cwd"), s("timestamp"), s("thread_source"), source))
 }
 
 /// 扫描全部会话的首行元数据。
@@ -302,7 +328,7 @@ pub(in crate::tools) fn scan_at(home: &Path) -> ScanReport {
             report.unreadable += 1;
             continue;
         };
-        let Some((meta_id, provider, cwd, timestamp, thread_source)) = parse_meta(&line) else {
+        let Some((meta_id, provider, cwd, timestamp, thread_source, source)) = parse_meta(&line) else {
             report.unreadable += 1;
             continue;
         };
@@ -324,6 +350,7 @@ pub(in crate::tools) fn scan_at(home: &Path) -> ScanReport {
             cwd,
             timestamp,
             bytes,
+            source,
             thread_source,
             title: String::new(),
             model: String::new(),
@@ -471,9 +498,14 @@ pub(in crate::tools) fn sync_to_at(
         ..SyncReport::default()
     };
 
-    // ① 先算出「要动哪些」，原值直接取扫描时读到的那个 —— 不必等改写返回。
+    // CodexPlus++ 对齐：只同步根/用户会话。内部派生由 rollout source、thread_source 或
+    // edge/job 证据确认；普通用户 fork 不因 forked 标记单独排除。
+    let child_ids = sqlite::collect_child_thread_ids(home);
     let mut todo: Vec<(PathBuf, &SessionRef)> = Vec::new();
     for s in &scan.sessions {
+        if session_is_internal(s, &child_ids) {
+            continue;
+        }
         if s.provider == target {
             report.already_ok += 1;
             continue;
@@ -558,12 +590,14 @@ pub(in crate::tools) fn sync_to_at(
     // ④ sqlite 只更新上面真的改成功的那些 thread。**不能无条件全表 UPDATE**：Codex 正在
     // 运行时 rollout 全被独占（`changed == 0`），而 sqlite 未必同时被锁 → 列表会显示这些
     // 对话已属 synaroute 而打开旧对话照旧 401，**替一个没完成的修复背书**。
-    let scanned_ids = scan.sessions.iter().filter_map(|session| {
+    let syncable_sessions = scan.sessions.iter()
+        .filter(|session| !session_is_internal(session, &child_ids));
+    let scanned_ids = syncable_sessions.clone().filter_map(|session| {
         (!session.thread_id.is_empty()).then_some(session.thread_id.clone())
     }).collect::<Vec<_>>();
     let mut catalog_rows = catalog::plan_from(home, target, &scanned_ids);
     catalog::merge_rollout_evidence(&mut catalog_rows, &scan.sessions);
-    catalog::add_child_ids(&mut catalog_rows, &sqlite::collect_child_thread_ids(home));
+    catalog::add_child_ids(&mut catalog_rows, &child_ids);
     report.sqlite = sync_sqlite(home, data_dir, target, &done_ids, &catalog_rows);
     Ok(report)
 }
@@ -801,6 +835,7 @@ fn describe(r: &SyncReport) -> Option<String> {
 mod tests {
     use super::*;
     // 测试段自己要的 IO trait：生产段搬走 `replace_first_line` 之后不再用它们（见 `files`）。
+    use serde_json::json;
     use std::io::{BufReader, Write as _};
 
     /// 夹具目录的进程内序号 —— 同 `tmp_path_for` 的理由：`timestamp_nanos` 在本机的量化
@@ -917,6 +952,52 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
+    /// 🔴 **Codex 内部派生的会话不许被改 provider**（用户实报，与 CodexPlusPlus 对齐）。
+    ///
+    /// 它们不是用户的对话：`guardian_review` 之类的子代理线程内容自成一体，改了它们的
+    /// provider 既无收益，又把我们的写入面扩大到用户从没打开过的文件上。
+    ///
+    /// 三种内部证据都要认（缺一条就漏一类）：rollout 首行的结构化 `source`、
+    /// `thread_source`、以及 edge/job 表里的 child id。
+    #[test]
+    fn internal_derived_sessions_keep_their_provider() {
+        let home = tmp_home("derived");
+        let data = home.join("appdata");
+        // ① 明确的用户会话 —— 必须被同步。
+        let user = write_rollout(&home, "sessions/2026/09/01", "user", "openai", "\n");
+        set_rollout_thread_source(&user, "user");
+        // ② thread_source 标着内部来源。
+        let guardian = write_rollout(&home, "sessions/2026/09/01", "guardian", "openai", "\n");
+        set_rollout_thread_source(&guardian, "guardian_review");
+        // ③ 结构化 source（本机实测形态 `{"subagent":{"other":"guardian"}}`）。
+        let structured = write_rollout(&home, "sessions/2026/09/01", "structured", "openai", "\n");
+        set_rollout_source(&structured, json!({ "subagent": { "other": "guardian" } }));
+        // ④ 只有 edge 表能证明它是子线程。
+        let edge_child = write_rollout(&home, "sessions/2026/09/01", "edgechild", "openai", "\n");
+        let edge_db = home.join("sqlite/edges.db");
+        fs::create_dir_all(edge_db.parent().unwrap()).unwrap();
+        let edge = rusqlite::Connection::open(&edge_db).unwrap();
+        edge.execute("CREATE TABLE thread_spawn_edges (child_thread_id TEXT)", []).unwrap();
+        edge.execute("INSERT INTO thread_spawn_edges VALUES (?1)", [uuid_of("edgechild")]).unwrap();
+        drop(edge);
+        // ⑤ 没有任何来源信息 —— 不猜，按用户会话对待（宁可多同步一条，不能漏掉真会话）。
+        let unknown = write_rollout(&home, "sessions/2026/09/01", "unknown", "openai", "\n");
+
+        let report = sync_to_at(&home, &data, "synaroute").unwrap();
+
+        assert_eq!(provider_of(&user), "synaroute", "用户会话必须被同步");
+        assert_eq!(provider_of(&unknown), "synaroute", "来源未知按用户会话对待");
+        for (path, why) in [
+            (&guardian, "thread_source 标着内部来源"),
+            (&structured, "结构化 source 标着 subagent"),
+            (&edge_child, "edge 表证明它是子线程"),
+        ] {
+            assert_eq!(provider_of(path), "openai", "内部派生会话不该被改：{why}");
+        }
+        assert_eq!(report.changed, 2, "只该改那两条真会话：{report:?}");
+        let _ = fs::remove_dir_all(&home);
+    }
+
     /// ③ 清单回滚的是**精确原值**，不是「一律改回 openai」那种猜测。
     ///
     /// 夹具刻意给两条不同的原值（`openai` 与 cc-switch 那类自定义 id）—— 只用一条的话
@@ -948,6 +1029,15 @@ mod tests {
     fn provider_of(path: &Path) -> String {
         let line = read_first_line(path).unwrap();
         parse_meta(&line).unwrap().1
+    }
+
+    /// 写首行的结构化 `payload.source`（Codex 给内部派生线程用的那个形态）。
+    fn set_rollout_source(path: &Path, source: Value) {
+        let text = fs::read_to_string(path).unwrap();
+        let (first, rest) = text.split_once('\n').unwrap();
+        let mut record: Value = serde_json::from_str(first).unwrap();
+        record["payload"]["source"] = source;
+        fs::write(path, format!("{}\n{rest}", serde_json::to_string(&record).unwrap())).unwrap();
     }
 
     fn set_rollout_thread_source(path: &Path, source: &str) {

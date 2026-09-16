@@ -202,7 +202,7 @@ enum LogCmd {
     /// 写一条日志（已序列化好的一行，不含换行符）。
     ///
     /// 在**发送侧**序列化而非写线程侧：序列化要读 `EventLogEntry`，若把整个 entry 送过去，
-    /// 写线程还得持有它的所有权（trace 正文可达 4 万字符，等于把大对象搬进队列）。
+    /// 写线程还得持有它的所有权（trace 正文受 `REQ_LOG_CAP=65536` 字符上限约束，等于把大对象搬进队列）。
     /// 发送侧序列化后只搬一个 String，且序列化失败能就地记警告。
     Line { dir: std::path::PathBuf, line: String },
     /// 刷盘并回执（退出钩子与测试用）。
@@ -912,16 +912,16 @@ impl Store {
 
     /// 事件日志列表（**不含 trace**），供 UI 列表展示。
     ///
-    /// 为什么必须剥掉 trace：日志页每 2s 轮询一次全量列表，而 trace 里的
-    /// `request_body`/`response_body` 各上限 20000 字符 —— 500 条满载约 19 MB。
+    /// 为什么必须剥掉 trace：日志页每 2s 轮询一次全量列表，而 trace 的 request/response 正文
+    /// 各受 `REQ_LOG_CAP=65536` 字符上限约束 —— 500 条满载时正文主体可达数千万字符。
     /// 每 2s 克隆 + 序列化 + 过 IPC + 前端反序列化这么多字节，会把界面拖到卡顿，
     /// 而前端只在**用户展开某一行**时才用 trace（其余时刻整份都是传过去就扔）。
     /// 展开时另走 [`Self::event_trace`] 按 id 单取一条。
     fn strip_trace(e: &EventLogEntry) -> EventLogEntry {
         // 逐字段构造，**不 clone trace**。绝不能用 `..e.clone()`：Rust 函数式更新语法会
-        // 先**完整求值** `e.clone()`（含 request_body/response_body 各上限 20000 字符），
+        // 先**完整求值** `e.clone()`（含 request_body/response_body 各受 65536 字符上限约束），
         // 再从完整克隆里移出剩余字段，被覆盖的那份 trace 克隆随即析构——500 条满载时
-        // 每次列表轮询白分配并释放约 500×2×20000 ≈ 2000 万字符（≈19 MB），每 2s 一轮。
+        // 每次列表轮询白分配并释放约 500×2×65536 字符。
         // 这在排障（开日志）这个最需要界面顺滑的时刻，反而让分配器最忙。
         EventLogEntry {
             id: e.id.clone(),

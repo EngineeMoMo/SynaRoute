@@ -642,6 +642,9 @@ impl ToolSession {
                 payload["tools"] = anthropic_tools(tools);
             }
         }
+        if openai {
+            crate::upstream::validate_openai_tool_schemas(&payload).map_err(AppError::Invalid)?;
+        }
 
         // Prompt caching：
         // - OpenAI 协议**自动**缓存(≥1024 token 前缀,无需任何字段),我们已保证 messages
@@ -668,6 +671,7 @@ impl ToolSession {
         };
 
         let resp = send(&payload).await?;
+        drop(payload);
         let status = resp.status();
         // 🔴 **必须在 `resp.text()` 之前读头**：那个调用会消费 `resp`。成员路径此前漏了
         // completion.rs 已有的同一条接线，导致 429 的配额窗口永远不被武装、每轮白打。

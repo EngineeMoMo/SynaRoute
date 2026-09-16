@@ -120,7 +120,20 @@ fn host_id(db: &Connection) -> Option<String> {
         .filter(|h| !h.trim().is_empty())
 }
 
-/// 一条要补进 catalog 的记录。字段全部来自我们已经读到的东西（rollout 首行 + `threads`）。
+fn catalog_user_ids(db: &Connection, host: &str, cols: &HashSet<String>) -> HashSet<String> {
+    if !cols.contains("thread_id") || !cols.contains("thread_source") {
+        return HashSet::new();
+    }
+    db.prepare(
+        "SELECT thread_id FROM local_thread_catalog WHERE host_id = ?1 \
+         AND LOWER(TRIM(COALESCE(thread_source, ''))) = 'user'",
+    )
+    .and_then(|mut stmt| {
+        stmt.query_map([host], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()
+    })
+    .unwrap_or_default()
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::tools) struct CatalogRow {
     pub thread_id: String,
@@ -306,8 +319,8 @@ pub(in crate::tools) fn would_mutate(
             "SELECT 1 FROM local_thread_catalog WHERE host_id=?1 AND thread_id=?2 LIMIT 1",
             (&host, &row.thread_id), |_| Ok(true),
         ).unwrap_or(false);
-        if exists && row_is_confirmed_child(row) { return Ok(true) }
         if row_has_user_veto(row) { continue }
+        if exists && row_is_confirmed_child(row) { return Ok(true) }
         if exists && ((cols.contains("model_provider") && row.provider != target)
             || cols.contains("missing_candidate")) {
             let changed: i64 = conn.query_row(
@@ -372,7 +385,12 @@ pub(in crate::tools) fn repair_one(
         return;
     }
     let Some(host) = host_id(&conn) else { return };
+    let catalog_users = catalog_user_ids(&conn, &host, &cols);
 
+    // 只按 fork 否决**更新**（provider / missing 都是无损的）。刻意不把 `row_is_confirmed_child`
+    // 也排除掉：那些行随后会被删掉，更新它们无害；而**被 catalog 自身 user 标记救下来**的
+    // 冲突行必须照常同步 —— 排除它会让第三份 provider 副本在那些行上永远是旧值（写这条
+    // 判据的用例当场抓到了这一点）。
     let mutable_ids: Vec<&str> = rows.iter().filter(|row| !row_has_user_veto(row))
         .map(|row| row.thread_id.as_str()).collect();
 
@@ -424,7 +442,11 @@ pub(in crate::tools) fn repair_one(
         .unwrap_or_default();
     let removable: Vec<&CatalogRow> = rows
         .iter()
-        .filter(|row| existing.contains(&row.thread_id) && row_is_confirmed_child(row))
+        .filter(|row| {
+            existing.contains(&row.thread_id)
+                && !catalog_users.contains(&row.thread_id)
+                && row_is_confirmed_child(row)
+        })
         .collect();
     let missing: Vec<&CatalogRow> = if supports_repair(&cols) {
         rows.iter()
@@ -675,6 +697,50 @@ mod tests {
         let mut again = CatalogReport::default();
         repair_one(&db, "synaroute", &[row("t1")], &mut again);
         assert_eq!(again.total(), 0, "第二次不该再写任何东西：{again:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 **A8-6：catalog 行**自己**标着 `user` 时，一律不许删。**
+    ///
+    /// 与 `catalog_cleanup_obeys_user_fork_unknown_and_host_vetoes` 覆盖的**不是**同一条路：
+    /// 那条走的是「rollout 说 user」（由 `merge_rollout_evidence` 把 `thread_source` 抬成
+    /// user）。这里是另一半 —— **rollout 说内部、而 catalog 自己说 user**。
+    ///
+    /// 现实成因：rollout 已被用户删掉/归档、或 Codex 改过 rollout 的来源标记，而 Desktop
+    /// 索引里那一行仍如实记着「这是用户的对话」。此时按 rollout 的证据删，删掉的是**用户
+    /// 真实对话**在列表里的条目 —— 不可自愈（我们不重建 catalog 行），而用户只会看到
+    /// 「我的对话从侧栏消失了」。
+    ///
+    /// 冲突时**一律保留**，与本模块「删除只认正向 child 证据、冲突与未知一律保留」同口径。
+    #[test]
+    fn a_catalog_row_marked_user_is_never_removed_even_if_the_plan_says_internal() {
+        let dir = tmp("userveto");
+        let db = catalog_db(&dir);
+        let c = Connection::open(&db).unwrap();
+        // catalog 自己记着 user；而下面传进去的计划行说它是 guardian_review。
+        c.execute(
+            "INSERT INTO local_thread_catalog (host_id,thread_id,display_title,source_created_at,
+             source_updated_at,cwd,source_kind,model_provider,observation_sequence,thread_source)
+             VALUES ('local','t1','用户自己的对话',1.0,2.0,'C:\\w','vscode','openai',3,'user')",
+            [],
+        )
+        .unwrap();
+        drop(c);
+
+        let mut rep = CatalogReport::default();
+        repair_one(&db, "synaroute", &[guardian_row("t1")], &mut rep);
+        assert_eq!(rep.removed, 0, "catalog 说 user 就不许删：{rep:?}");
+
+        let c = Connection::open(&db).unwrap();
+        let left: i64 = c
+            .query_row("SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id='t1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1, "那一行必须还在");
+        // 否决只针对**删除**：provider 这类无损更新照旧要做（否则第三份副本永远是旧值）。
+        let provider: String = c
+            .query_row("SELECT model_provider FROM local_thread_catalog WHERE thread_id='t1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(provider, "synaroute", "user 否决不该顺带掐掉 provider 同步");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

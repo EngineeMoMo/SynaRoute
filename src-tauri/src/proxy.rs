@@ -699,13 +699,13 @@ async fn handle_request_inner(
         // 成功但换了模型时另落一条 warning（理由见该函数文档）。排在 `trace` 之前：那里会
         // move 掉 `real_model`，放后面就得多一次 clone。
         model_pool::note_silent_downgrade(store, category, &requested_model, key, &real_model);
-        // 链路快照只在「调用模型日志」开关开启时产生（正文可达 2×20000 字符）。
+        // 链路快照只在「调用模型日志」开关开启时产生（正文各受 REQ_LOG_CAP 约束）。
         let trace = req_log.then(|| RequestTrace {
             request_id: request_id.clone(),
             key_name: key.name.clone(),
             vendor: key.vendor.clone(),
             protocol: key.protocol,
-            url,
+            url: crate::diagnostics::mask_url_credentials(&url),
             requested_model: requested_model.clone(),
             real_model,
             request_body: cap(&request_body),
@@ -767,7 +767,7 @@ async fn handle_request_inner(
             key_name: key.name.clone(),
             vendor: key.vendor.clone(),
             protocol: key.protocol,
-            url,
+            url: crate::diagnostics::mask_url_credentials(&url),
             requested_model: requested_model.clone(),
             real_model,
             request_body: cap(&request_body),
@@ -1609,13 +1609,13 @@ async fn try_stream_to_key(
     let payload = if path_takes_sampling_params(path) {
         ensure_anthropic_output_budget(payload, key, &real_model)?
     } else {
-        // 非补全端点（count_tokens 等）不补 max_tokens → 不会触发 apply_pending_thinking。
-        // 若转换阶段暂存过 `_pending_effort`（仅目标 Anthropic + 有 effort + 无 max_tokens 时），
-        // 这里兜底剥掉，杜绝把中转哨兵字段发给上游（真实客户端不走此路径，属纵深防御）。
+        // 非补全端点不补 max_tokens → 不触发 apply_pending_thinking，故兜底剥掉哨兵字段
+        // （为什么绝不能发给上游，见 `strip_pending_effort` 自己的文档）。
         let mut payload = payload;
         crate::upstream::strip_pending_effort(&mut payload);
         payload
     };
+    crate::upstream::validate_tools_for(key.protocol, &payload)?;
     // 跨协议：退回上游协议的补全端点。
     let resource_path: std::borrow::Cow<str> = if downstream == key.protocol {
         std::borrow::Cow::Borrowed(path)
@@ -1653,11 +1653,11 @@ async fn try_stream_to_key(
         .map_err(|_| queue_timeout_err(key, probe_to))?;
     let send_fut = rb.send();
     let resp = match tokio::time::timeout(probe_to, send_fut).await {
-        Ok(r) => r.map_err(|e| AppError::upstream_msg(format!("连接 {url} 失败: {e}")))?,
+        Ok(r) => r.map_err(|e| AppError::upstream_msg(format!("连接 {} 失败: {e}", crate::diagnostics::mask_url_credentials(&url))))?,
         Err(_) => {
             return Err(AppError::upstream_msg(format!(
-                "连接 {url} 超时（{}ms 内未拿到响应头）",
-                probe_to.as_millis()
+                "连接 {} 超时（{}ms 内未拿到响应头）",
+                crate::diagnostics::mask_url_credentials(&url), probe_to.as_millis()
             )))
         }
     };
@@ -1673,7 +1673,7 @@ async fn try_stream_to_key(
         // 轮不到，下游连接一直挂着直到客户端自己超时 —— 而 stream:true 是主路径。
         // 错误体只用于日志与 last_err，读不全无所谓，宁可给个「读取超时」也不能挂住整条链。
         let body = match tokio::time::timeout(probe_to, resp.bytes()).await {
-            Ok(Ok(b)) => String::from_utf8_lossy(&b).to_string(),
+            Ok(Ok(b)) => crate::diagnostics::redact_secret(&String::from_utf8_lossy(&b), secret.as_str()),
             Ok(Err(e)) => format!("（错误体读取失败：{e}）"),
             Err(_) => format!(
                 "（错误体读取超时：{}ms 内未读完，已按失败切换下一个候选）",
@@ -2346,11 +2346,11 @@ async fn forward_to_key(
     let payload = if path_takes_sampling_params(path) {
         ensure_anthropic_output_budget(payload, key, &real_model)?
     } else {
-        // 兜底剥掉可能暂存的 `_pending_effort`（理由同流式路径 else 分支）。
         let mut payload = payload;
         crate::upstream::strip_pending_effort(&mut payload);
         payload
     };
+    crate::upstream::validate_tools_for(key.protocol, &payload)?;
 
     // 发往上游的请求体快照（pretty，方便页面阅读；密钥不在 body 里，安全）。
     //
@@ -2416,11 +2416,11 @@ async fn forward_to_key(
     let resp = rb
         .send()
         .await
-        .map_err(|e| AppError::upstream_msg(format!("连接 {url} 失败: {e}")))?;
+        .map_err(|e| AppError::upstream_msg(format!("连接 {} 失败: {e}", crate::diagnostics::mask_url_credentials(&url))))?;
     let status = resp.status();
     // Retry-After 须在 resp.bytes() 消费响应体之前取（bytes() 拿走所有权）。
     let retry_after = parse_retry_after(resp.headers());
-    let bytes = resp.bytes().await.map_err(|e| AppError::upstream_msg(e.to_string()))?;
+    let bytes = crate::diagnostics::redact_upstream_error_bytes(status.as_u16(), resp.bytes().await.map_err(|e| AppError::upstream_msg(e.to_string()))?, secret.as_str());
 
     // 跨协议响应翻译：上游 2xx 时，把响应体从上游协议翻译回下游客户端期望的协议格式。
     // 请求已翻译（上面的 payload 转换），响应也必须翻译，否则下游客户端收到无法解析的异协议体。
@@ -4987,6 +4987,81 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 🔴 链路快照里的上游 URL 必须过 `mask_url_credentials`。
+    ///
+    /// 中转站把令牌放在**路径里**是常见形态（`https://host/v1/<token>/`）。而这个字段有两个
+    /// 用户会分享出去的落点：`store::write_log_to_file` 把整条 entry 直接 `to_string` 落进
+    /// exe 同级 `logs/*.jsonl`（留 30 天、用户会 tail 并贴出来），以及日志页那一行可截图的值。
+    /// 两条路径上**都没有**脱敏层。
+    ///
+    /// 同一个字段在本仓已被判定为凭据载体两次：`route_meta` 的结构体**刻意不留** url 字段
+    /// （编译期禁掉），`diagnostics` 专门写了 `mask_url_credentials` 并施加在 `base_url` 上。
+    /// trace 是第三处，此前一层都没有。
+    ///
+    /// 判据两侧都要钉：① 令牌不得出现；② host 必须还在 —— 只钉①的话，
+    /// 把整个字段清空也能过，而那会毁掉这个字段的全部排障价值（本仓「过度脱敏」那一族）。
+    #[tokio::test]
+    async fn the_trace_url_never_carries_a_path_token() {
+        let token = "sk-proj-abc123def456ghi789jkl012mno345";
+        let mock = spawn_mock(200, r#"{"ok":true}"#).await;
+        let dir = temp_dir("trace_url_mask");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let mut s = store.get_settings();
+        s.request_log_enabled = true; // 快照只在这个开关开着时才构造
+        store.save_settings(UserPrefs::from(&s)).unwrap();
+
+        // 令牌放在 base_url 的路径段里 —— 就是那些中转站的形态。
+        store.upsert_key(key("k1", 0, &format!("{mock}/{token}"))).unwrap();
+        store.secrets.write().set("k1", "x").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let _ = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({
+                "model": "m",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        // 成功路径落 `route`、失败路径落 `request`，两者都带 trace。只筛一种会让这条判据
+        // 依赖「这次恰好走了哪条路」—— 而本用例要钉的是脱敏，不是路径分类。
+        let all: Vec<_> = store.list_all_events();
+        let trace = all
+            .iter()
+            .filter(|e| e.kind == "route" || e.kind == "request")
+            .find_map(|e| store.event_trace(&e.id))
+            .unwrap_or_else(|| {
+                panic!(
+                    "开了调用模型日志就该有链路快照。全部事件：{:#?}",
+                    all.iter().map(|e| (&e.kind, &e.detail)).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            !trace.url.contains(token),
+            "令牌不得进链路快照 —— 它会落进 logs/*.jsonl 并被用户贴出来。实得 url={}",
+            trace.url
+        );
+        assert!(
+            trace.url.contains("***"),
+            "该段应被遮成 ***（证明遮的是那一段，不是整串被清空）。实得 url={}",
+            trace.url
+        );
+        assert!(
+            trace.url.contains("127.0.0.1"),
+            "host 必须保留 —— 全遮等于毁掉这个字段的排障价值。实得 url={}",
+            trace.url
+        );
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 被**我们自己**的故障转移预算掐短的尝试，不得算进该 Key 的熔断计数。
     ///
     /// 每次尝试的超时是 `min(Key 自身超时, 剩余预算)`。剩余预算更小时，一条完全健康的 Key
@@ -6360,6 +6435,48 @@ mod tests {
             assert!(!value.contains("tok-abc123"), "{name} 泄露了 URL 路径里的令牌: {value}");
             assert!(!value.contains(&host_port), "{name} 泄露了上游地址: {value}");
             assert!(!value.contains("http"), "{name} 里出现了 URL: {value}");
+        }
+
+        pm.stop(CategoryType::ClaudeCli);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 上游错误正文若回显真实鉴权值，HTTP 错误、事件和 trace 都不得把它带回下游或写盘。
+    #[tokio::test]
+    async fn upstream_error_echoed_secret_is_redacted_everywhere() {
+        const SECRET: &str = "vendor-secret-2026-abcdef-123456";
+        let bad = spawn_mock(
+            401,
+            r#"{"error":{"message":"invalid key vendor-secret-2026-abcdef-123456"}}"#,
+        )
+        .await;
+        let dir = temp_dir("error_secret_redact");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let mut settings = store.get_settings();
+        settings.request_log_enabled = true;
+        store.save_settings(UserPrefs::from(&settings)).unwrap();
+        store.upsert_key(key("k1", 0, &bad)).unwrap();
+        store.secrets.write().set("k1", SECRET).unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        let body = resp.text().await.unwrap();
+        assert!(!body.contains(SECRET), "HTTP 错误体泄露了上游回显的真实 Key: {body}");
+
+        for event in store.list_all_events() {
+            assert!(!event.detail.contains(SECRET), "事件 detail 泄露了真实 Key: {event:?}");
+            if let Some(trace) = store.event_trace(&event.id) {
+                assert!(!trace.request_body.contains(SECRET), "trace 请求体泄露了真实 Key");
+                assert!(!trace.response_body.contains(SECRET), "trace 响应体泄露了真实 Key");
+            }
         }
 
         pm.stop(CategoryType::ClaudeCli);

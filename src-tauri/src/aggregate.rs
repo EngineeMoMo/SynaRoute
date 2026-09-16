@@ -51,7 +51,7 @@ use tool_loop::{effective_rounds, tool_call_brief, MAX_CONCURRENT_TOOLS, MAX_TOO
 
 use prompt::{build_member_prompt, build_solo_decider_prompt, format_file_context};
 
-/// 聚合日志里请求/响应体的最大字符数（与调用模型日志同量级，防超大 prompt 撑爆内存日志）。
+/// 聚合日志正文上限。**刻意比 `REQ_LOG_CAP`(65536) 紧 —— 不是同一个量、别派生**（每轮每成员落两份）。
 const AGG_LOG_CAP: usize = 20_000;
 
 /// 截断超长文本，附省略提示（成员答案/汇总产物/决策者入参出参落日志用）。

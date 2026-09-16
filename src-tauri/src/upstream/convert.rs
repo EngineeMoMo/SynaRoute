@@ -14,6 +14,10 @@ use super::util::{extract_text_content, uuid_like};
 mod structured_output;
 use structured_output::*;
 
+// 工具轮次分组（同一轮的调用合并、不同轮隔开）；来由见该文件模块注释。
+#[path = "tool_turns.rs"]
+mod tool_turns;
+
 // ---- 协议字段转换（proxy 跨协议故障转移时使用）----
 //
 // 覆盖范围（本轮从「纯文本」扩展）：
@@ -919,29 +923,26 @@ pub fn responses_to_chat(body: &Value) -> Value {
             messages.push(json!({ "role": "user", "content": s }));
         }
         Some(Value::Array(items)) => {
+            let mut turns = tool_turns::Grouper::default();
             for it in items {
                 // function_call / function_call_output item → 对应 Chat 消息
                 match it.get("type").and_then(|t| t.as_str()) {
                     Some("function_call") => {
                         let call_id = it.get("call_id").or_else(|| it.get("id")).cloned().unwrap_or(json!(""));
-                        messages.push(json!({
-                            "role": "assistant",
-                            "content": Value::Null,
-                            "tool_calls": [ {
-                                "id": call_id,
-                                "type": "function",
-                                "function": {
-                                    // 必须拼回全名（见 join_namespaced_tool_name）：历史里 Codex 把 MCP
-                                    // 工具存成 {name, namespace} 两字段，只取 name 会让模型下一轮照抄短名，
-                                    // 回程拆不出 namespace → Codex 报 unsupported call。
-                                    "name": join_namespaced_tool_name(it),
-                                    "arguments": it.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}"),
-                                }
-                            } ]
+                        turns.call(&mut messages, json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                // 必须拼回全名（见 join_namespaced_tool_name）：历史里 Codex 把 MCP
+                                // 工具存成 {name, namespace} 两字段，只取 name 会让模型下一轮照抄短名，
+                                // 回程拆不出 namespace → Codex 报 unsupported call。
+                                "name": join_namespaced_tool_name(it),
+                                "arguments": it.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}"),
+                            }
                         }));
                     }
                     Some("function_call_output") => {
-                        messages.push(json!({
+                        turns.result(json!({
                             "role": "tool",
                             "tool_call_id": it.get("call_id").cloned().unwrap_or(json!("")),
                             // 🔴 数组形态（Codex 实测占 13%）被 `as_str()` 清成空串，判据见测试段。
@@ -960,24 +961,20 @@ pub fn responses_to_chat(body: &Value) -> Value {
                             .unwrap_or(json!(""));
                         let input_str = it.get("input").and_then(|i| i.as_str()).unwrap_or("");
                         let arguments = json!({ "input": input_str }).to_string();
-                        messages.push(json!({
-                            "role": "assistant",
-                            "content": Value::Null,
-                            "tool_calls": [ {
-                                "id": call_id,
-                                "type": "function",
-                                "function": {
-                                    // 同 function_call：带 namespace 时拼回全名，与请求侧暴露的工具名一致。
-                                    // custom 工具（apply_patch/exec）通常平铺无 namespace，此时等价于取 name。
-                                    "name": join_namespaced_tool_name(it),
-                                    "arguments": arguments,
-                                }
-                            } ]
+                        turns.call(&mut messages, json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                // 同 function_call：带 namespace 时拼回全名，与请求侧暴露的工具名一致。
+                                // custom 工具（apply_patch/exec）通常平铺无 namespace，此时等价于取 name。
+                                "name": join_namespaced_tool_name(it),
+                                "arguments": arguments,
+                            }
                         }));
                     }
                     // custom 工具执行结果回传：同 function_call_output → role:"tool"（含数组形态）。
                     Some("custom_tool_call_output") => {
-                        messages.push(json!({
+                        turns.result(json!({
                             "role": "tool",
                             "tool_call_id": it.get("call_id").cloned().unwrap_or(json!("")),
                             "content": extract_text_content(it.get("output")),
@@ -998,14 +995,10 @@ pub fn responses_to_chat(body: &Value) -> Value {
                             Some(v) => v.to_string(),
                             None => "{}".to_string(),
                         };
-                        messages.push(json!({
-                            "role": "assistant",
-                            "content": Value::Null,
-                            "tool_calls": [ {
-                                "id": call_id,
-                                "type": "function",
-                                "function": { "name": TOOL_SEARCH_TYPE, "arguments": arguments }
-                            } ]
+                        turns.call(&mut messages, json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": { "name": TOOL_SEARCH_TYPE, "arguments": arguments }
                         }));
                     }
                     // Codex 客户端本地检索的结果。该 item **无 `output` 字段**，检索到的工具在
@@ -1049,7 +1042,7 @@ pub fn responses_to_chat(body: &Value) -> Value {
                                 found.join(", ")
                             )
                         };
-                        messages.push(json!({
+                        turns.result(json!({
                             "role": "tool",
                             "tool_call_id": it.get("call_id").cloned().unwrap_or(json!("")),
                             "content": content,
@@ -1065,10 +1058,12 @@ pub fn responses_to_chat(body: &Value) -> Value {
                         }
                         let role = it.get("role").and_then(|r| r.as_str()).unwrap_or("user");
                         let text = responses_content_text(it.get("content"));
+                        turns.flush(&mut messages);
                         messages.push(json!({ "role": role, "content": text }));
                     }
                 }
             }
+            turns.flush(&mut messages);
         }
         _ => {}
     }
@@ -3417,9 +3412,63 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|m| m["tool_calls"][0]["function"]["name"].as_str())
+            .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+            .filter_map(|tc| tc["function"]["name"].as_str())
             .collect();
         assert_eq!(names, vec!["mcp__ns__sub", "apply_patch"]);
+    }
+
+    /// 🔴 用户实报：`tool_use must be followed by a user tool_result turn`。
+    ///
+    /// 并行工具调用（Codex 一轮发多个 function_call）此前被拆成多条 assistant 消息，
+    /// 于是 Anthropic 上游看到 `tool_use` 后面跟的是另一条 assistant 而不是 tool_result。
+    /// 判据钉两件事：**同一轮的调用合并成一条 assistant**，且**结果紧跟其后**。
+    #[test]
+    fn parallel_tool_calls_stay_in_one_assistant_turn_followed_by_results() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "go" }] },
+                { "type": "function_call", "call_id": "c1", "name": "read_file", "arguments": "{\"p\":\"a\"}" },
+                { "type": "function_call", "call_id": "c2", "name": "read_file", "arguments": "{\"p\":\"b\"}" },
+                { "type": "function_call_output", "call_id": "c1", "output": "A" },
+                { "type": "function_call_output", "call_id": "c2", "output": "B" }
+            ]
+        });
+        let chat = responses_to_chat(&body);
+        let msgs = chat["messages"].as_array().unwrap();
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "tool", "tool"],
+            "两个并行调用必须合并成一条 assistant，其后紧跟两条 tool：{msgs:#?}"
+        );
+        let calls = msgs[1]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2, "同一轮的两个调用必须在同一条消息里");
+        assert_eq!(calls[0]["id"], "c1");
+        assert_eq!(calls[1]["id"], "c2");
+        // 每个 tool_result 的 id 必须能在紧邻的那条 assistant 里找到，否则上游照样 400。
+        for (i, id) in ["c1", "c2"].iter().enumerate() {
+            assert_eq!(msgs[2 + i]["tool_call_id"], *id);
+        }
+    }
+
+    /// 连续两轮工具调用不能被合并成一条 assistant —— 那会让第一轮的结果排到第二轮调用后面。
+    #[test]
+    fn a_second_tool_round_opens_a_new_assistant_turn() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [
+                { "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "c1", "output": "1" },
+                { "type": "function_call", "call_id": "c2", "name": "f", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "c2", "output": "2" }
+            ]
+        });
+        let chat = responses_to_chat(&body);
+        let roles: Vec<&str> = chat["messages"].as_array().unwrap()
+            .iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["assistant", "tool", "assistant", "tool"], "两轮必须各自成对");
     }
 
     #[test]

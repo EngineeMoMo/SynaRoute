@@ -31,6 +31,7 @@ mod thinking_effort; // Anthropic 两套 thinking 形态 → 中枢档位；来�
 /// 上游因思考签名验不过而拒绝时的请求整流。放在 `upstream` 而不是 `proxy` 下：
 /// 它修的是「上游对请求体的兼容性要求」，与协议适配同一类事（cc-switch 也放在代理层）。
 mod thinking_rectify;
+mod tool_schema; // 发往 OpenAI 系上游的工具 schema 边界校验；来由见该文件模块注释
 mod tools_meta;
 mod usage;
 mod util;
@@ -60,6 +61,7 @@ pub(crate) use thinking_rectify::rectify_on_signature_error as rectify_thinking_
 pub use convert::{
     apply_pending_thinking, convert_request_owned, convert_response_ext, strip_pending_effort,
 };
+pub use tool_schema::{validate_openai_tool_schemas, validate_tools_for};
 pub use tools_meta::{collect_custom_tools, collect_search_tools, collect_tool_namespaces};
 pub use session::{
     ImagePart, MultimodalPrompt, ToolDef, ToolInvocation, ToolResultMsg, ToolSession, TurnOutcome,

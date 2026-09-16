@@ -1562,7 +1562,7 @@ pub struct EventLogEntry {
     pub usage: Option<TokenUsage>,
     /// 该条是否带链路快照。**列表接口会把 `trace` 正文剥掉**（见 `Store::strip_trace`），
     /// 但前端仍需知道「这行能不能展开看详情」，故单独留一个布尔位——它只有 1 字节，
-    /// 而正文最坏 40000 字符。展开时前端按事件 id 走 `get_event_trace` 单取一条。
+    /// 而正文两段各受 `REQ_LOG_CAP` 约束。展开时前端按事件 id 走 `get_event_trace` 单取一条。
     #[serde(default)]
     pub has_trace: bool,
     /// 调用模型日志的完整链路快照（仅 request 类型有；开关开启时才产生）。
@@ -1592,7 +1592,7 @@ pub struct RequestTrace {
     pub vendor: String,
     /// 目标上游协议：anthropic | openai
     pub protocol: Protocol,
-    /// 实际请求的上游完整 URL
+    /// 上游 URL（已过 `mask_url_credentials`；令牌可能在路径里，这个字段会进日志与日志页）。
     pub url: String,
     /// 下游请求的模型名（映射前）
     pub requested_model: String,

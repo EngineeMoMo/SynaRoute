@@ -63,10 +63,14 @@ export function StatusBarPicker({
   // 静默显示成「自动」会让他以为自己没配过。
   const display = current?.label ?? (value || placeholder || "—");
 
+  const optionSignature = options
+    .map((o) => JSON.stringify([o.value, o.label, o.hint ?? ""]))
+    .join("|");
+
   useEffect(() => {
     if (!open) return;
     setActive(Math.max(0, options.findIndex((o) => o.value === value)));
-  }, [open, options, value]);
+  }, [open, optionSignature, value]);
 
   const pick = (v: string) => {
     setOpen(false);

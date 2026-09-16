@@ -667,10 +667,13 @@ fn display_rel(root: &Path, path: &Path, rel_prefix: &str) -> String {
     }
 }
 
-/// 单次 `grep` 返回的匹配行上限。
-const MAX_MATCH_LINES: usize = 120;
+// grep 命中的筛选与两道体积上限（行数 / 行宽）；来由见该文件模块注释。
+#[path = "agent_grep.rs"]
+mod agent_grep;
+use agent_grep::{cap_match_text, filter_rg_hits, MAX_MATCH_LINES};
+#[cfg(test)]
+use agent_grep::{split_rg_line, MAX_MATCH_CHARS};
 
-/// `grep`：优先用 ripgrep，起不来时降级为纯 Rust 字面量遍历（**并明说降级了**）。
 ///
 /// 关键点：rg **搜所有文件**，`.env` 只要命中就会出现在 stdout 里。故命中结果必须逐条过
 /// [`is_sensitive_path`] 再交给模型 —— 这一层不是减噪，是防凭据外发。
@@ -693,6 +696,9 @@ async fn grep_tool(env: &ToolEnv, args: &Value) -> Result<String, String> {
         "--line-number",
         "--no-heading",
         "--no-messages",
+        "--max-columns",
+        "400",
+        "--max-columns-preview",
         "--color",
         "never",
         // 每文件最多 5 条：防一个匹配密集的文件占满全部配额，牺牲广度。
@@ -762,44 +768,6 @@ async fn grep_tool(env: &ToolEnv, args: &Value) -> Result<String, String> {
     Ok(out_s)
 }
 
-/// 从 rg 的原始 stdout 里筛出可回给模型的命中行。
-/// 返回 (可用行, 被安全策略排除的行数, 是否因命中过多而截断)。
-///
-/// 拆成纯函数不是为了复用，是为了**可验证**：本机不一定装 rg，而「凭据文件的命中不得外发」
-/// 这条判据不该只在恰好装了 rg 的机器上才被测到。
-fn filter_rg_hits(work_dir: &Path, stdout: &str) -> (Vec<String>, usize, bool) {
-    let mut kept: Vec<String> = Vec::new();
-    let mut denied = 0usize;
-    let mut truncated = false;
-    for line in stdout.lines() {
-        let Some((path, num, text)) = split_rg_line(line) else {
-            continue;
-        };
-        if is_sensitive_path(&work_dir.join(path)) {
-            denied += 1;
-            continue;
-        }
-        if kept.len() >= MAX_MATCH_LINES {
-            truncated = true;
-            break;
-        }
-        let shown = path.replace('\\', "/");
-        kept.push(format!("{shown}:{num}: {}", text.trim_end()));
-    }
-    (kept, denied, truncated)
-}
-
-/// 解析 rg 的 `路径:行号:内容`。行号段必须是纯数字，否则说明这行不是匹配行（如提示信息）。
-fn split_rg_line(line: &str) -> Option<(&str, &str, &str)> {
-    let (path, rest) = line.split_once(':')?;
-    let (num, text) = rest.split_once(':')?;
-    if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
-        Some((path, num, text))
-    } else {
-        None
-    }
-}
-
 /// ripgrep 起不来时的兜底：纯 Rust 目录遍历 + **字面量**大小写不敏感匹配。
 ///
 /// 明确在结果头部写出「已降级、不支持正则、glob 被忽略」——静默降级会让模型以为自己的正则
@@ -858,7 +826,7 @@ fn walk_grep(work_dir: &Path, pattern: &str) -> Result<String, String> {
                 if kept.len() >= MAX_MATCH_LINES {
                     break 'outer;
                 }
-                kept.push(format!("{rel}:{}: {}", i + 1, line.trim_end()));
+                kept.push(format!("{rel}:{}: {}", i + 1, cap_match_text(line.trim_end())));
                 per_file += 1;
                 if per_file >= 5 {
                     break;
@@ -1573,6 +1541,36 @@ mod tests {
         assert_eq!(kept.len(), MAX_MATCH_LINES);
         assert!(truncated, "超上限必须报出来，否则模型以为就这么多命中");
         std::fs::remove_dir_all(&w).ok();
+    }
+
+    /// 🔴 行数有上限，**行宽此前没有**：`--max-filesize 2M` 限制的是输入文件，
+    /// 而单行可以就是那 2 MB（minified JS、单行 JSON、base64 资源）。
+    /// 120 行 × 2 MB 会整段进模型上下文与工具结果日志。
+    #[test]
+    fn filter_rg_hits_caps_line_width_not_just_line_count() {
+        let w = work("frh3");
+        let long = "A".repeat(50_000);
+        let stdout = format!("src/bundle.js:1:{long}\n");
+        let (kept, _, _) = filter_rg_hits(&w, &stdout);
+        assert_eq!(kept.len(), 1, "该命中不该被丢掉，只该被截短");
+        assert!(
+            kept[0].chars().count() < MAX_MATCH_CHARS + 100,
+            "单行必须被截短，实际 {} 字符",
+            kept[0].chars().count()
+        );
+        assert!(kept[0].contains("bundle.js:1:"), "路径与行号必须留着，那是可行动的部分");
+        assert!(kept[0].ends_with('…'), "必须显式标出被截断：{}", kept[0]);
+        std::fs::remove_dir_all(&w).ok();
+    }
+
+    /// 截断按**字符**边界，不按字节 —— 切在多字节中间会产出乱码。
+    #[test]
+    fn the_line_cap_respects_char_boundaries() {
+        let out = cap_match_text(&"中".repeat(MAX_MATCH_CHARS + 50));
+        assert_eq!(out.chars().count(), MAX_MATCH_CHARS + 1, "应为上限 + 省略号");
+        assert!(out.ends_with('…'));
+        // 未超限的短行必须原样返回（不能凭空加省略号）。
+        assert_eq!(cap_match_text("short"), "short");
     }
 
     #[tokio::test]
