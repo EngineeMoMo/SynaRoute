@@ -18,7 +18,9 @@ use structured_output::*;
 #[path = "tool_turns.rs"]
 mod tool_turns;
 
-// ---- 协议字段转换（proxy 跨协议故障转移时使用）----
+#[path = "convert_content.rs"]
+mod convert_content;
+use convert_content::*;
 //
 // 覆盖范围（本轮从「纯文本」扩展）：
 // - system：兼容 string 与 block 数组（[{type:"text",text}]）
@@ -509,10 +511,15 @@ pub fn openai_to_anthropic(body: &Value) -> Value {
                     }
                 }
                 _ => {
-                    // user（及未知 role 归一为 user）
-                    let text = extract_text_content(m.get("content"));
-                    if !text.is_empty() {
-                        messages.push(json!({ "role": "user", "content": text }));
+                    // user（及未知 role 归一为 user）。多模态 content 不能只抽文本，否则
+                    // Responses→Chat→Anthropic 会把图片静默删掉。
+                    let content = if role == "user" {
+                        openai_user_content_to_anthropic(m.get("content"))
+                    } else {
+                        Value::String(extract_text_content(m.get("content")))
+                    };
+                    if !content_is_empty(&content) {
+                        messages.push(json!({ "role": "user", "content": content }));
                     }
                 }
             }
@@ -1057,9 +1064,9 @@ pub fn responses_to_chat(body: &Value) -> Value {
                             continue;
                         }
                         let role = it.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-                        let text = responses_content_text(it.get("content"));
+                        let content = responses_content_for_chat(it.get("content"));
                         turns.flush(&mut messages);
-                        messages.push(json!({ "role": role, "content": text }));
+                        messages.push(json!({ "role": role, "content": content }));
                     }
                 }
             }
@@ -1209,19 +1216,6 @@ fn freeform_custom_tool_schema() -> Value {
         },
         "required": ["input"]
     })
-}
-
-/// 抽取 Responses content 分块（input_text / output_text / text）为纯文本。
-fn responses_content_text(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    }
 }
 
 /// Chat Completions 响应体 → Responses 响应体。
@@ -2249,6 +2243,64 @@ mod tests {
         assert_eq!(msgs[0]["content"], "hi there");
     }
 
+    #[test]
+    fn responses_to_chat_preserves_input_images_in_order() {
+        let req = json!({
+            "model": "m",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "before" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,AAAB" },
+                    { "type": "input_image", "image_url": "https://example.test/photo.jpg" },
+                    { "type": "output_text", "text": "after" }
+                ]
+            }]
+        });
+        let chat = responses_to_chat(&req);
+        let parts = chat["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0]["text"], "before");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAAB");
+        assert_eq!(parts[2]["image_url"]["url"], "https://example.test/photo.jpg");
+        assert_eq!(parts[3]["text"], "after");
+    }
+
+    #[test]
+    fn responses_images_survive_the_anthropic_hub_hop() {
+        let req = json!({
+            "model": "claude-opus-4-8",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_image", "image_url": "data:image/jpeg;base64,ZZZ" }]
+            }]
+        });
+        let anthropic = convert_request(&req, Protocol::OpenaiResponses, Protocol::Anthropic);
+        let block = &anthropic["messages"][0]["content"][0];
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["source"]["type"], "base64");
+        assert_eq!(block["source"]["media_type"], "image/jpeg");
+        assert_eq!(block["source"]["data"], "ZZZ");
+    }
+
+    #[test]
+    fn responses_image_without_url_is_disclosed_instead_of_dropped() {
+        let req = json!({
+            "model": "m",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_image", "file_id": "file_1" }]
+            }]
+        });
+        let chat = responses_to_chat(&req);
+        let content = chat["messages"][0]["content"].as_str().unwrap();
+        assert!(content.contains("input_image"));
+        assert!(content.contains("未发送"));
+    }
     #[test]
     fn responses_to_chat_preserves_reasoning() {
         // Codex 发的推理强度（reasoning.effort）必须透传到 Chat 中枢，供下游映射/透传，

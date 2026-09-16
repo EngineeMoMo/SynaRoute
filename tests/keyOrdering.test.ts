@@ -240,9 +240,9 @@ describe("拖放接线（源码级判据）", () => {
     for (const fn of ["fn set_primary(", "fn move_one(", "fn reorder_before("]) {
       expect(c, `${fn} 应在 key_order 里`).toContain(fn);
     }
-    // 三者都必须走同一个落盘函数：各写一份重编号逻辑必然漂移，
+    // 三者都必须走同一个事务变换函数：各写一份重编号逻辑必然漂移，
     // 而漂移的表现是「从拖放得到的顺序」与「从按钮得到的顺序」在同一意图上不一致。
-    expect(c.match(/persist_contiguous\(/g)?.length, "三个入口 + 定义，至少 4 处").toBeGreaterThanOrEqual(4);
+    expect(c.match(/mutate_order\(/g)?.length, "三个入口 + 定义，至少 4 处").toBeGreaterThanOrEqual(4);
     // store.rs 里那两个公开方法必须是**委托**，不许留第二份实现。
     const storeRs = code(read("src-tauri", "src", "store.rs"));
     expect(storeRs).toMatch(/key_order::set_primary\(/);

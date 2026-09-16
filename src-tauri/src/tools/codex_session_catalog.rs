@@ -281,6 +281,21 @@ fn row_is_confirmed_child(row: &CatalogRow) -> bool {
             || source_kind_marks_child(&row.source_kind))
 }
 
+pub(in crate::tools) fn cleanup_rows(
+    home: &Path,
+    target: &str,
+    ids: &[String],
+    sessions: &[super::SessionRef],
+    child_ids: &HashSet<String>,
+) -> Vec<CatalogRow> {
+    let mut rows = plan_from(home, target, ids);
+    merge_rollout_evidence(&mut rows, sessions);
+    add_child_ids(&mut rows, child_ids);
+    rows.into_iter()
+        .filter(|row| child_ids.contains(&row.thread_id) || row_is_confirmed_child(row))
+        .collect()
+}
+
 pub(in crate::tools) fn add_child_ids(rows: &mut Vec<CatalogRow>, ids: &HashSet<String>) {
     for id in ids {
         if let Some(row) = rows.iter_mut().find(|row| &row.thread_id == id) {

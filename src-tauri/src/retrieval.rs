@@ -7,6 +7,7 @@
 //! 4. 合并去重，按相关度排序
 //! 5. 按 max_tokens 限制裁剪内容
 
+use crate::agent_tools::is_sensitive_read_path;
 use crate::error::AppResult;
 use crate::proc::hidden;
 use serde::{Deserialize, Serialize};
@@ -325,7 +326,7 @@ fn filter_sensitive(
     let mut kept = Vec::with_capacity(items.len());
     let mut denied = Vec::new();
     for (p, s) in items {
-        if is_sensitive_path(&p) {
+        if is_sensitive_read_path(&p) {
             denied.push(
                 p.strip_prefix(work_dir)
                     .unwrap_or(&p)
@@ -420,7 +421,7 @@ fn slice_symbol(work_dir: &Path, node: &crate::codegraph::SymbolNode) -> Option<
     const MAX_UNKNOWN_LINES: usize = 40;
 
     let abs = work_dir.join(&node.file_path);
-    if is_sensitive_path(&abs) {
+    if is_sensitive_read_path(&abs) {
         return None;
     }
     let content = std::fs::read_to_string(&abs).ok()?;
@@ -641,7 +642,7 @@ fn pack_symbols(
             break;
         }
         let abs = work_path.join(&n.file_path);
-        if is_sensitive_path(&abs) {
+        if is_sensitive_read_path(&abs) {
             denied += 1;
             continue;
         }
@@ -759,23 +760,58 @@ mod tests {
 
     #[test]
     fn filter_sensitive_partitions_and_reports() {
-        let work = Path::new("/proj");
+        let work = std::env::temp_dir().join(format!("synaroute_filter_{}", std::process::id()));
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::create_dir_all(work.join("keys")).unwrap();
+        std::fs::write(work.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(work.join(".env"), "TOKEN=x\n").unwrap();
+        std::fs::write(work.join("keys/server.pem"), "CERT\n").unwrap();
+        std::fs::write(work.join("src/token_service.rs"), "fn token_service() {}\n").unwrap();
         let items = vec![
             (work.join("src/main.rs"), 1.0f32),
             (work.join(".env"), 0.9),
             (work.join("keys/server.pem"), 0.8),
             (work.join("src/token_service.rs"), 0.7),
         ];
-        let (kept, denied) = filter_sensitive(items, work);
+        let (kept, denied) = filter_sensitive(items, &work);
         let kept_names: Vec<String> = kept
             .iter()
             .map(|(p, _)| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(kept_names, vec!["main.rs", "token_service.rs"]);
         assert_eq!(denied.len(), 2, "被拒文件要能报出来供日志展示: {denied:?}");
+        std::fs::remove_dir_all(&work).ok();
     }
 
     // ---- 符号级切片（不发文件全文的核心）----
+
+    #[tokio::test]
+    async fn automatic_retrieval_rejects_hardlink_aliases_of_credentials() {
+        let dir = std::env::temp_dir().join(format!(
+            "synaroute_retrieval_hardlink_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), "API_KEY=NEEDLE_RETRIEVAL_HARDLINK\\n").unwrap();
+        assert!(
+            std::fs::hard_link(dir.join(".env"), dir.join("notes.rs")).is_ok(),
+            "无法创建硬链接夹具"
+        );
+        let outcome = retrieve_detailed(
+            dir.to_str().unwrap(),
+            "NEEDLE_RETRIEVAL_HARDLINK",
+            10_000,
+        )
+        .await;
+        assert!(
+            outcome.files.iter().all(|f| f.path != "notes.rs"),
+            "自动 retrieval 不得返回硬链接别名: {:?}",
+            outcome.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(outcome.diagnostics.iter().any(|d| d.contains("排除")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn write_temp(name: &str, content: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(

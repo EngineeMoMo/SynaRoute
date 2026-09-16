@@ -1845,13 +1845,14 @@ impl Store {
         let since_ms = *self.usage_since_ms.read();
         let today = Self::utc_date_string(now_ms);
 
-        // 本次增量 = 当前总量 − 基线。同时把基线抬到当前总量。
-        //
-        // 两把锁的顺序：先 totals（读）再 baseline（写），全局唯一顺序，不会与
-        // 热路径（只锁 totals）形成环。
+        // 先锁住桶，再锁 totals → baseline；写盘期间阻止新的 usage 更新，确保一次快照
+        // 对应一份明确的基线。只有写成功后才提交这些 guard 里的状态。
+        let mut buckets = self.daily_buckets.write();
+        let buckets_before = buckets.clone();
+        let previous_retired = self.retired_usage.read().clone();
+        let totals = self.usage_totals.read();
+        let mut baseline = self.usage_baseline.write();
         let delta: Vec<crate::model::TokenUsageByKey> = {
-            let totals = self.usage_totals.read();
-            let mut baseline = self.usage_baseline.write();
             let mut out = Vec::new();
             for ((cat, kid), cur) in totals.iter() {
                 let base = baseline.get(&(*cat, kid.clone())).copied().unwrap_or_default();
@@ -1870,7 +1871,6 @@ impl Store {
                     });
                 }
             }
-            *baseline = totals.clone();
             out
         };
 
@@ -1879,12 +1879,8 @@ impl Store {
             return false;
         }
 
-        let mut buckets = self.daily_buckets.write();
-
         // 记录本次 flush 落在哪天（仅诊断用；分桶判定靠下面的 `today`，不靠它）。
-        // 基线每次 flush 都抬，故增量天然只覆盖两次 flush 之间那一段 ——
-        // 跨零点无需特殊处理，那段增量落进新日期的桶即可。
-        *self.usage_baseline_date.write() = today.clone();
+        // 基线只在写盘成功后抬高，故失败时这份桶与旧基线仍然能原样重试。
 
         // 把增量并进今天的桶（已存在则叠加，否则新建）
         match buckets.iter_mut().find(|b| b.date == today) {
@@ -1910,7 +1906,7 @@ impl Store {
                     .collect();
             }
             None => buckets.push(crate::model::DailyUsageBucket {
-                date: today,
+                date: today.clone(),
                 entries: delta,
             }),
         }
@@ -1924,9 +1920,7 @@ impl Store {
         //
         // 日维度如实丢弃：只累计到 (分类, Key) 粒度，不编造一个假日期把整段历史堆到某天。
         let cutoff_ms = now_ms - 90 * 86_400_000;
-        let mut retired_map: std::collections::BTreeMap<(CategoryType, String), TokenUsage> = self
-            .retired_usage
-            .read()
+        let mut retired_map: std::collections::BTreeMap<(CategoryType, String), TokenUsage> = previous_retired
             .iter()
             .map(|e| ((e.category_id, e.key_id.clone()), e.usage))
             .collect();
@@ -1953,18 +1947,16 @@ impl Store {
             keep
         });
         let retired = if retired_changed {
-            let v: Vec<crate::model::TokenUsageByKey> = retired_map
+            retired_map
                 .into_iter()
                 .map(|((cat, kid), u)| crate::model::TokenUsageByKey {
                     category_id: cat,
                     key_id: kid,
                     usage: u,
                 })
-                .collect();
-            *self.retired_usage.write() = v.clone();
-            v
+                .collect()
         } else {
-            self.retired_usage.read().clone()
+            previous_retired.clone()
         };
 
         // 降序（最新在前，便于面板取「最近 7/30 天」）
@@ -1975,13 +1967,14 @@ impl Store {
             since_ms,
             updated_ms: now_ms,
             daily_buckets: buckets.clone(),
-            retired,
+            retired: retired.clone(),
             entries: Vec::new(), // v2 不再用这个字段
         };
-        drop(buckets);
         let bytes = match serde_json::to_vec_pretty(&snap) {
             Ok(b) => b,
             Err(e) => {
+                *buckets = buckets_before;
+                self.mark_usage_dirty();
                 tracing::warn!("用量统计序列化失败: {e}");
                 return false;
             }
@@ -1992,10 +1985,15 @@ impl Store {
         // 而不是「文件存在但 0 字节」）。缺后者时前半句仍成立、后半句不成立 ——
         // 这正是本轮对抗审查在 `secret::atomic_write` 里补掉的那条数据丢失链。
         if let Err(e) = crate::secret::atomic_write(&self.usage_path, &bytes) {
+            *buckets = buckets_before;
             self.mark_usage_dirty();
             tracing::warn!("用量统计落盘失败（下一轮重试）: {e}");
             return false;
         }
+        // 只有完整快照已经落盘，才提交内存基线与分桶；失败路径会保留旧状态并重试同一增量。
+        *baseline = totals.clone();
+        *self.retired_usage.write() = retired;
+        *self.usage_baseline_date.write() = today;
         true
     }
 
@@ -4130,7 +4128,48 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 磁盘上的 `usage.json` 版本高于本程序时，**原文件必须一个字节都不变**。
+    #[test]
+    fn usage_flush_failure_keeps_baseline_for_the_next_retry() {
+        use crate::model::UsageSnapshot;
+        use crate::upstream::TokenUsage;
+        let dir = temp_dir("usage_flush_retry");
+        let usage_path = dir.join("usage.json");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        store.append_event_full(
+            CategoryType::ClaudeCli,
+            "route",
+            Some("retry-key"),
+            "req",
+            None,
+            None,
+            Some(TokenUsage { input: 7, output: 3, cache_read: 2, cache_creation: 1 }),
+        );
+        let baseline_before = store.usage_baseline.read().clone();
+        let buckets_before = serde_json::to_vec(&*store.daily_buckets.read()).unwrap();
+        let retired_before = store.retired_usage.read().clone();
+        let date_before = store.usage_baseline_date.read().clone();
+
+        // 目录占位会让真实 atomic_write 的 rename 与原地回退都失败，且不依赖权限位。
+        std::fs::create_dir_all(&usage_path).unwrap();
+        assert!(!store.flush_usage_if_dirty(), "写入失败时不能报告成功");
+        assert_eq!(*store.usage_baseline.read(), baseline_before);
+        assert_eq!(serde_json::to_vec(&*store.daily_buckets.read()).unwrap(), buckets_before);
+        assert_eq!(*store.retired_usage.read(), retired_before);
+        assert_eq!(*store.usage_baseline_date.read(), date_before);
+        assert!(store.usage_dirty.load(std::sync::atomic::Ordering::Relaxed));
+
+        std::fs::remove_dir_all(&usage_path).unwrap();
+        assert!(store.flush_usage_if_dirty(), "恢复写入后必须重试同一批增量");
+        let snapshot: UsageSnapshot = serde_json::from_slice(&std::fs::read(&usage_path).unwrap()).unwrap();
+        let row = snapshot.daily_buckets.iter().flat_map(|b| &b.entries)
+            .find(|e| e.key_id == "retry-key").unwrap();
+        assert_eq!(row.usage.input, 7);
+        assert_eq!(row.usage.output, 3);
+        assert!(!store.flush_usage_if_dirty(), "成功提交后不能重复累计");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     ///
     /// 这条防的是一个具体的数据销毁链：将来把 `entries` 改成按日分桶后，
     /// 旧程序（用户降级 / 两台机器同步了这份文件）用旧结构解析新文件 —— serde 忽略

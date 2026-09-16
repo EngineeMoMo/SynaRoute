@@ -200,6 +200,11 @@ impl SseTranslator {
         let mut out = String::new();
         // 逐个完整行处理，保留最后不完整的一段在 buf。
         while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
+            // 完整行也要在 drain 前检查：同一个 chunk 里带换行时，事后检查 buf 已经看不到它。
+            if self.complete_line_too_long(nl.saturating_add(1)) {
+                if let Some(e) = self.take_tool_limit_error() { out.push_str(&e); }
+                break;
+            }
             // raw 是独立的 owned Vec，text 借的是 raw 而非 self，
             // 故下面调 `self.process_line(&mut self, ..)` 不会撞借用检查。
             let raw: Vec<u8> = self.buf.drain(..=nl).collect();
@@ -569,7 +574,7 @@ impl SseTranslator {
         if name.is_empty() {
             return String::new();
         }
-        let arguments = if ity == "custom_tool_call" {
+        let raw_arguments = if ity == "custom_tool_call" {
             let input = item.get("input").and_then(|i| i.as_str()).unwrap_or("");
             json!({ "input": input }).to_string()
         } else {
@@ -579,17 +584,18 @@ impl SseTranslator {
                 None => String::new(),
             }
         };
+        let arguments = if raw_arguments.trim().is_empty() { "{}".to_string() } else { raw_arguments };
+        let arguments = match self.accept_complete_tool_args(&arguments) {
+            Ok(value) => value,
+            Err(event) => return event,
+        };
         let call_id = item
             .get("call_id")
             .or_else(|| item.get("id"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let dedup_key = if call_id.is_empty() {
-            format!("{name}\u{0}{arguments}")
-        } else {
-            call_id.clone()
-        };
+        let dedup_key = sse_bounds::tool_dedup_key(&call_id, &name, &arguments);
         if !self.register_tool_seen(dedup_key) {
             return String::new();
         }
@@ -601,8 +607,7 @@ impl SseTranslator {
         } else {
             call_id
         };
-        let args = if arguments.trim().is_empty() { "{}".to_string() } else { arguments };
-        self.tool_calls.push((id.clone(), name.clone(), args.clone()));
+        self.tool_calls.push((id.clone(), name.clone(), arguments.clone()));
         sse_data(&json!({
             "object": "chat.completion.chunk",
             "choices": [ { "index": 0, "finish_reason": Value::Null, "delta": {
@@ -610,7 +615,7 @@ impl SseTranslator {
                     "index": slot,
                     "id": id,
                     "type": "function",
-                    "function": { "name": name, "arguments": args }
+                    "function": { "name": name, "arguments": arguments }
                 } ]
             } } ]
         }))
@@ -1180,18 +1185,18 @@ impl SseTranslator {
                 None => String::new(),
             }
         };
+        let raw_args = if raw_args.trim().is_empty() { "{}".to_string() } else { raw_args };
+        let raw_args = match self.accept_complete_tool_args(&raw_args) {
+            Ok(value) => value,
+            Err(event) => return event,
+        };
         let call_id = item
             .get("call_id")
             .or_else(|| item.get("id"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        // 去重键：有 call_id 用它（上游保证唯一），否则退化为 name+arguments。
-        let dedup_key = if call_id.is_empty() {
-            format!("{name}\u{0}{raw_args}")
-        } else {
-            call_id.clone()
-        };
+        let dedup_key = sse_bounds::tool_dedup_key(&call_id, &name, &raw_args);
         if !self.register_tool_seen(dedup_key) {
             return String::new();
         }
@@ -1209,8 +1214,8 @@ impl SseTranslator {
             "type": "content_block_start", "index": idx,
             "content_block": { "type": "tool_use", "id": tool_id, "name": name, "input": {} }
         })));
-        // 无参工具兜底成 "{}"：Anthropic 客户端会 JSON.parse 累积的 partial_json，空串会炸。
-        let args = if raw_args.trim().is_empty() { "{}" } else { raw_args.as_str() };
+        // 无参工具已在进入去重集合前兜底成 "{}"，避免空串被下游解析失败。
+        let args = raw_args.as_str();
         out.push_str(&sse("content_block_delta", &json!({
             "type": "content_block_delta", "index": idx,
             "delta": { "type": "input_json_delta", "partial_json": args }
@@ -1240,7 +1245,45 @@ mod tests {
     use super::*;
     use super::super::testfix::{anthropic_tool_blocks, sse_events};
 
-    /// 🔴 上游能用一条流把工具参数灌到内存耗尽：`arguments` 增量是无上限 `push_str`。
+    #[test]
+    fn complete_sse_line_is_limited_before_drain() {
+        let mut t = SseTranslator::new(SseDirection::ResponsesToChat);
+        let line = format!("data: {}\n", "x".repeat(sse_bounds::MAX_LINE_BYTES));
+        let out = t.push(line.as_bytes());
+        assert!(out.contains("单行数据超过"), "完整超大行必须走行上限: {out}");
+        assert!(t.tool_calls.is_empty());
+        assert_eq!(t.finish(), "");
+    }
+
+    #[test]
+    fn complete_responses_tool_arguments_use_the_same_limit() {
+        let mut t = SseTranslator::new(SseDirection::ResponsesToChat);
+        let args = "x".repeat(sse_bounds::MAX_TOOL_ARGS_BYTES + 1);
+        let input = json!({
+            "type": "response.output_item.done",
+            "item": { "type": "function_call", "name": "f", "arguments": args }
+        });
+        let out = t.push(format!("data: {}\n\n", input).as_bytes());
+        assert!(out.contains("单个工具调用的参数超过"), "完整 item 也必须限额: {out}");
+        assert!(t.tool_calls.is_empty(), "超限参数不得进入 tool_calls");
+        assert!(t.anthropic_tool_seen.is_empty(), "超限参数不得进入去重集合");
+        assert_eq!(t.finish(), "");
+    }
+
+    #[test]
+    fn complete_responses_tool_arguments_are_limited_for_anthropic_output_too() {
+        let mut t = SseTranslator::new(SseDirection::ResponsesToAnthropic);
+        let args = "x".repeat(sse_bounds::MAX_TOOL_ARGS_BYTES + 1);
+        let input = json!({
+            "type": "response.output_item.done",
+            "item": { "type": "function_call", "name": "f", "arguments": args }
+        });
+        let out = t.push(format!("event: response.output_item.done\ndata: {}\n\n", input).as_bytes());
+        assert!(out.contains("单个工具调用的参数超过"), "Anthropic 方向也必须限额: {out}");
+        assert!(t.anthropic_tool_seen.is_empty());
+        assert_eq!(t.finish(), "");
+    }
+
     ///
     /// 判据要求**拒绝并终止**，不是截断：截断出的是一段非法 JSON，下游会把它当参数真的
     /// 拿去执行（同 `tool_slot` 那条「钳制比丢弃更糟」）。

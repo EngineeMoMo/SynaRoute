@@ -57,36 +57,27 @@ fn ordered_ids(cfg: &crate::model::AppConfig, category: CategoryType) -> Vec<Str
     same.iter().map(|k| k.id.clone()).collect()
 }
 
-/// 把 `ordered_ids` 表达的顺序落成连续 `priority`，返回**是否真的改了**。
-///
-/// 重编号成连续值是必须的 —— 历史配置里存在「全部 priority 都是 999」的同级状态，
-/// 那时故障转移没有确定的主备顺序（永远先打 `Vec` 里的第一个）。
-///
-/// 幂等判定放在写之前：目标顺序与现状一致就一个字节都不写。托盘/连点箭头/拖回原处
-/// 都会走到这里，无条件落盘等于把 20KB 的 config 反复重写、还带一次客户端配置同步。
-fn persist_contiguous(store: &Store, ordered: &[String]) -> AppResult<bool> {
-    let changed = {
-        let cfg = store.config.read();
-        ordered.iter().enumerate().any(|(i, id)| {
-            cfg.keys
-                .iter()
-                .find(|k| &k.id == id)
-                .is_some_and(|k| k.priority != i as i32)
-        })
-    };
-    if !changed {
-        return Ok(false);
-    }
-    store.mutate_and_persist(|cfg| {
-        for (i, id) in ordered.iter().enumerate() {
+/// 在同一个配置写事务里读取当前顺序、计算变换并提交 priority，避免旧快照覆盖并发操作。
+fn mutate_order<F>(store: &Store, category: CategoryType, transform: F) -> AppResult<bool>
+where
+    F: FnOnce(&mut Vec<String>) -> AppResult<bool>,
+{
+    store.mutate_and_persist_when(|cfg| {
+        let mut ids = ordered_ids(cfg, category);
+        let changed = match transform(&mut ids) {
+            Ok(value) => value,
+            Err(error) => return (Err(error), false),
+        };
+        if !changed {
+            return (Ok(false), false);
+        }
+        for (i, id) in ids.iter().enumerate() {
             if let Some(k) = cfg.keys.iter_mut().find(|k| &k.id == id) {
-                // 只碰 priority。运行态（health / cached_balance）与配置字段一个都不动。
                 k.priority = i as i32;
             }
         }
-        Ok(())
-    })?;
-    Ok(true)
+        (Ok(true), true)
+    })?
 }
 
 /// 该分类下必须存在这条 Key，否则 `NotFound`。
@@ -100,30 +91,17 @@ fn not_found(category: CategoryType, key_id: &str) -> AppError {
     ))
 }
 
-fn require_member(cfg: &crate::model::AppConfig, category: CategoryType, key_id: &str) -> AppResult<()> {
-    if cfg
-        .keys
-        .iter()
-        .any(|k| k.id == key_id && k.category_id == category)
-    {
-        return Ok(());
-    }
-    Err(not_found(category, key_id))
-}
-
 /// 把某 Key 提为该分类的「主 Key」（优先级 0），其余保持原相对顺序顺延。
 pub(crate) fn set_primary(store: &Store, category: CategoryType, key_id: &str) -> AppResult<bool> {
-    let ordered = {
-        let cfg = store.config.read();
-        require_member(&cfg, category, key_id)?;
-        let mut ids = ordered_ids(&cfg, category);
-        if let Some(pos) = ids.iter().position(|id| id == key_id) {
-            let target = ids.remove(pos);
-            ids.insert(0, target);
-        }
-        ids
-    };
-    persist_contiguous(store, &ordered)
+    mutate_order(store, category, |ids| {
+        let Some(pos) = ids.iter().position(|id| id == key_id) else {
+            return Err(not_found(category, key_id));
+        };
+        let original = ids.clone();
+        let target = ids.remove(pos);
+        ids.insert(0, target);
+        Ok(*ids != original)
+    })
 }
 
 /// 把某 Key 在同分类内上移/下移一位。已在两端时返回 `false`。
@@ -133,30 +111,21 @@ pub(crate) fn move_one(
     key_id: &str,
     up: bool,
 ) -> AppResult<bool> {
-    let ordered = {
-        let cfg = store.config.read();
-        require_member(&cfg, category, key_id)?;
-        let mut ids = ordered_ids(&cfg, category);
-        // 上一行已经保证它在这个分类里；找不到就是并发删了，按 NotFound 走。
+    mutate_order(store, category, |ids| {
         let idx = ids
             .iter()
             .position(|id| id == key_id)
             .ok_or_else(|| not_found(category, key_id))?;
         let swap_with = if up {
-            if idx == 0 {
-                return Ok(false); // 已在首位
-            }
+            if idx == 0 { return Ok(false); }
             idx - 1
         } else {
-            if idx + 1 >= ids.len() {
-                return Ok(false); // 已在末位
-            }
+            if idx + 1 >= ids.len() { return Ok(false); }
             idx + 1
         };
         ids.swap(idx, swap_with);
-        ids
-    };
-    persist_contiguous(store, &ordered)
+        Ok(true)
+    })
 }
 
 /// 把 `key_id` 移到 `before_key_id` **之前**；`before_key_id` 为 `None` 则移到末尾。
@@ -172,42 +141,33 @@ pub(crate) fn reorder_before(
     key_id: &str,
     before_key_id: Option<&str>,
 ) -> AppResult<bool> {
-    let ordered = {
-        let cfg = store.config.read();
-        require_member(&cfg, category, key_id)?;
-        // 锚点也必须是同分类的成员。跨分类锚点若被放过，`position` 会找不到它、
-        // 静默退化成「移到末尾」—— 一个用户没有表达过的意图。
+    mutate_order(store, category, |ids| {
+        if !ids.iter().any(|id| id == key_id) {
+            return Err(not_found(category, key_id));
+        }
         if let Some(anchor) = before_key_id {
             if anchor == key_id {
                 return Ok(false);
             }
-            require_member(&cfg, category, anchor)?;
+            if !ids.iter().any(|id| id == anchor) {
+                return Err(not_found(category, anchor));
+            }
         }
-        let mut ids = ordered_ids(&cfg, category);
-        // ⚠️ **这一支今天不可达**，`require_member` 与 `ordered_ids` 读的是同一个读锁下的
-        // 同一份 `cfg`，前者过了就必然找得到。**没有测试守着它**（注入 `.unwrap()`
-        // 实测仍绿 —— 6 条用例全过），写成 `?` 只是不想在 IPC 上留一个 panic 点：
-        // 日后有人把两处拆到不同临界区，失效方向就从「返回错误」变成「panic」。
-        // 别把这句读成「有判据在守」。
+        let original = ids.clone();
         let from = ids
             .iter()
             .position(|id| id == key_id)
             .ok_or_else(|| not_found(category, key_id))?;
         let moved = ids.remove(from);
         match before_key_id {
-            // 摘掉 source **之后**再找锚点位置：先找会在「往下拖」时偏一格。
             Some(anchor) => {
-                let at = ids
-                    .iter()
-                    .position(|id| id == anchor)
-                    .unwrap_or(ids.len());
+                let at = ids.iter().position(|id| id == anchor).unwrap_or(ids.len());
                 ids.insert(at, moved);
             }
             None => ids.push(moved),
         }
-        ids
-    };
-    persist_contiguous(store, &ordered)
+        Ok(*ids != original)
+    })
 }
 
 /// **鼠标拖放**重排的 IPC 命令：把 `key_id` 放到 `before_key_id` 之前（`None` = 末尾）。
@@ -467,10 +427,49 @@ mod tests {
         );
         let via_drag = order(&store, CategoryType::ClaudeCli);
         // 还原后用 move_one 走一遍同样的意图
-        persist_contiguous(&store, &snapshot).unwrap();
+        mutate_order(&store, CategoryType::ClaudeCli, |ids| {
+            let changed = *ids != snapshot;
+            *ids = snapshot.clone();
+            Ok(changed)
+        }).unwrap();
         move_one(&store, CategoryType::ClaudeCli, &snapshot[1], false).unwrap();
         assert_eq!(via_drag, order(&store, CategoryType::ClaudeCli), "拖一格必须与下移一格一致");
-
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_primary_moves_keep_a_serializable_order() {
+        use std::sync::{Arc, Barrier};
+        for round in 0..20 {
+            let (raw_store, dir) = temp_store(&format!("reorder_concurrent_{round}"));
+            let store = Arc::new(raw_store);
+            for (i, id) in ["a", "b", "c"].iter().enumerate() {
+                seed(&store, id, i as i32);
+            }
+            let barrier = Arc::new(Barrier::new(3));
+            let left = Arc::clone(&barrier);
+            let right = Arc::clone(&barrier);
+            let a = Arc::clone(&store);
+            let b = Arc::clone(&store);
+            let t1 = std::thread::spawn(move || {
+                left.wait();
+                set_primary(&a, CategoryType::ClaudeCli, "a")
+            });
+            let t2 = std::thread::spawn(move || {
+                right.wait();
+                set_primary(&b, CategoryType::ClaudeCli, "c")
+            });
+            barrier.wait();
+            t1.join().unwrap().unwrap();
+            t2.join().unwrap().unwrap();
+            let actual = order(&store, CategoryType::ClaudeCli);
+            let serial_a = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+            let serial_b = vec!["a".to_string(), "c".to_string(), "b".to_string()];
+            assert!(
+                actual == serial_a || actual == serial_b,
+                "并发重排必须等价于某个串行顺序，不能保留旧快照: {actual:?}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 }

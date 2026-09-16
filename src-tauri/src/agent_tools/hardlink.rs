@@ -25,7 +25,7 @@ use std::path::Path;
 /// （某些环境返回 `ERROR_NOT_SUPPORTED`）退化为查硬链接数 `nNumberOfLinks`，多链接一律
 /// fail-closed（与 Unix 策略对齐）。
 #[cfg(windows)]
-pub(super) fn sensitive_hardlink_alias(real: &Path) -> Option<String> {
+pub(crate) fn sensitive_hardlink_alias(real: &Path) -> Option<String> {
     // 先尝试精确枚举（最优）
     if let Some(alias) = try_enumerate_hardlinks(real) {
         return Some(alias);
@@ -168,7 +168,7 @@ fn try_enumerate_hardlinks(real: &Path) -> Option<String> {
 /// notes.md，按「输入名 + 真实落点」两次敏感判定都会放行。复制文件会得到独立 inode，
 /// 用户确有读取需求时可复制一份；安全工具不该拿无法验证的别名碰运气。
 #[cfg(unix)]
-pub(super) fn sensitive_hardlink_alias(real: &Path) -> Option<String> {
+pub(crate) fn sensitive_hardlink_alias(real: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     let md = std::fs::metadata(real).ok()?;
     // 只防「常规文件被硬链接别名」。目录、符号链接（前面 canonicalize 已处理）、
@@ -183,6 +183,6 @@ pub(super) fn sensitive_hardlink_alias(real: &Path) -> Option<String> {
 /// 其它非 Windows/非 Unix 平台（当前 Tauri 桌面目标不会走到）：保守拒绝无法获取元数据的情况
 /// 会误伤所有文件，故维持 no-op；新增平台时必须显式实现并补测试。
 #[cfg(not(any(windows, unix)))]
-pub(super) fn sensitive_hardlink_alias(_real: &Path) -> Option<String> {
+pub(crate) fn sensitive_hardlink_alias(_real: &Path) -> Option<String> {
     None
 }

@@ -245,7 +245,19 @@ fn resolve_readable(work_dir: &Path, rel: &str) -> Result<PathBuf, String> {
 /// 硬链接别名检测（三个平台分支 + 各自的 fail-open/closed 论证）。`#[path]` 挂载：本文件余量为 0。
 #[path = "agent_tools/hardlink.rs"]
 mod hardlink;
-use hardlink::sensitive_hardlink_alias;
+pub(crate) use hardlink::sensitive_hardlink_alias;
+
+/// 读取型搜索在真正打开文件前统一判定名字、canonical 落点和硬链接身份。
+/// 文件消失或元数据无法确认时拒绝，避免把 rg 已经读出的敏感内容继续交给模型。
+pub(crate) fn is_sensitive_read_path(path: &Path) -> bool {
+    if is_sensitive_path(path) {
+        return true;
+    }
+    let Ok(real) = path.canonicalize() else {
+        return true;
+    };
+    is_sensitive_path(&real) || sensitive_hardlink_alias(&real).is_some()
+}
 
 /// 加载 MCP `images` 参数指定的图片，编码成可直接进请求体的 [`ImagePart`]。
 ///
@@ -805,7 +817,7 @@ fn walk_grep(work_dir: &Path, pattern: &str) -> Result<String, String> {
                 continue;
             }
             scanned += 1;
-            if is_sensitive_path(&path) {
+            if is_sensitive_read_path(&path) {
                 // 先判敏感再读：不读进内存就不可能外发。
                 continue;
             }
@@ -1509,15 +1521,25 @@ mod tests {
         // rg 搜**所有**文件，`.env` 命中会直接出现在 stdout 里。这一层不是减噪，是防凭据外发。
         // 用合成的 rg 输出验证，故本机没装 rg 也能测到这条判据。
         let w = work("frh");
-        let stdout = concat!(
-            "src/app.rs:12:let t = \"NEEDLE\";\n",
-            ".env:3:API_KEY=NEEDLE\n",
-            "config\\secrets.json:1:{\"k\":\"NEEDLE\"}\n",
-            "keys/server.pem:1:NEEDLE\n",
-            "src\\lib.rs:7:// NEEDLE\n",
-            "这行不是命中格式\n",
+        std::fs::create_dir_all(w.join("src")).unwrap();
+        std::fs::create_dir_all(w.join("config")).unwrap();
+        std::fs::create_dir_all(w.join("keys")).unwrap();
+        std::fs::write(w.join("src/app.rs"), "let t = \"NEEDLE\";\n").unwrap();
+        std::fs::write(w.join(".env"), "API_KEY=NEEDLE\n").unwrap();
+        std::fs::write(w.join("config/secrets.json"), "{\"k\":\"NEEDLE\"}").unwrap();
+        std::fs::write(w.join("keys/server.pem"), "NEEDLE\n").unwrap();
+        std::fs::write(w.join("src/lib.rs"), "// NEEDLE\n").unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+        let stdout = format!(
+            r#"src/app.rs:12:let t = "NEEDLE";
+.env:3:API_KEY=NEEDLE
+config{sep}secrets.json:1:{{"k":"NEEDLE"}}
+keys{sep}server.pem:1:NEEDLE
+src{sep}lib.rs:7:// NEEDLE
+这行不是命中格式
+"#
         );
-        let (kept, denied, truncated) = filter_rg_hits(&w, stdout);
+        let (kept, denied, truncated) = filter_rg_hits(&w, &stdout);
         assert_eq!(denied, 3, "三个凭据类文件的命中都要被排除：{kept:?}");
         assert!(!truncated);
         assert_eq!(
@@ -1532,8 +1554,20 @@ mod tests {
     }
 
     #[test]
+    fn filter_rg_hits_rejects_hardlink_aliases_of_credentials() {
+        let w = work("frh_hardlink");
+        std::fs::write(w.join(".env"), "API_KEY=NEEDLE_HARDLINK\n").unwrap();
+        assert!(try_hard_link(&w.join("notes.rs"), &w.join(".env")), "无法创建硬链接夹具");
+        let (kept, denied, _) = filter_rg_hits(&w, "notes.rs:1:API_KEY=NEEDLE_HARDLINK\n");
+        assert!(kept.is_empty(), "硬链接别名不得进入 rg 结果: {kept:?}");
+        assert_eq!(denied, 1);
+        std::fs::remove_dir_all(&w).ok();
+    }
+    #[test]
     fn filter_rg_hits_caps_match_count() {
         let w = work("frh2");
+        std::fs::create_dir_all(w.join("src")).unwrap();
+        std::fs::write(w.join("src/a.rs"), "hit\n").unwrap();
         let stdout: String = (1..=MAX_MATCH_LINES + 30)
             .map(|i| format!("src/a.rs:{i}:hit\n"))
             .collect();
@@ -1549,6 +1583,8 @@ mod tests {
     #[test]
     fn filter_rg_hits_caps_line_width_not_just_line_count() {
         let w = work("frh3");
+        std::fs::create_dir_all(w.join("src")).unwrap();
+        std::fs::write(w.join("src/bundle.js"), "A\n").unwrap();
         let long = "A".repeat(50_000);
         let stdout = format!("src/bundle.js:1:{long}\n");
         let (kept, _, _) = filter_rg_hits(&w, &stdout);

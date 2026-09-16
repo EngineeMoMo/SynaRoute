@@ -469,6 +469,28 @@ fn write_manifest(data_dir: &Path, m: &Manifest) -> AppResult<()> {
     })
 }
 
+fn catalog_rows_for_sync(
+    home: &Path,
+    target: &str,
+    done_ids: &[String],
+    child_ids: &std::collections::HashSet<String>,
+    sessions: &[SessionRef],
+) -> Vec<catalog::CatalogRow> {
+    let done_set: std::collections::HashSet<&str> = done_ids.iter().map(String::as_str).collect();
+    let successful_sessions = sessions.iter()
+        .filter(|session| done_set.contains(session.thread_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut provider_rows = catalog::plan_from(home, target, done_ids);
+    catalog::merge_rollout_evidence(&mut provider_rows, &successful_sessions);
+    let observed_ids = sessions.iter()
+        .filter_map(|session| (!session.thread_id.is_empty()).then_some(session.thread_id.clone()))
+        .collect::<Vec<_>>();
+    let cleanup_rows = catalog::cleanup_rows(home, target, &observed_ids, sessions, child_ids);
+    provider_rows.extend(cleanup_rows);
+    provider_rows
+}
+
 // 同步
 
 /// 把所有 provider ≠ `target` 的历史会话改成 `target`，并把**原值**记进清单。
@@ -587,17 +609,10 @@ pub(in crate::tools) fn sync_to_at(
         }
     }
 
-    // ④ sqlite 只更新上面真的改成功的那些 thread。**不能无条件全表 UPDATE**：Codex 正在
-    // 运行时 rollout 全被独占（`changed == 0`），而 sqlite 未必同时被锁 → 列表会显示这些
-    // 对话已属 synaroute 而打开旧对话照旧 401，**替一个没完成的修复背书**。
-    let syncable_sessions = scan.sessions.iter()
-        .filter(|session| !session_is_internal(session, &child_ids));
-    let scanned_ids = syncable_sessions.clone().filter_map(|session| {
-        (!session.thread_id.is_empty()).then_some(session.thread_id.clone())
-    }).collect::<Vec<_>>();
-    let mut catalog_rows = catalog::plan_from(home, target, &scanned_ids);
-    catalog::merge_rollout_evidence(&mut catalog_rows, &scan.sessions);
-    catalog::add_child_ids(&mut catalog_rows, &child_ids);
+    // ④ provider/missing 只接受 rollout 那半确实成功的证据；失败的 user session 不能因为
+    // 全量扫描而被 catalog 标成已同步。child cleanup 是独立的 cleanup-only 计划：它不依赖
+    // provider rollout 是否成功，也不能反过来扩大 provider 同步范围。
+    let catalog_rows = catalog_rows_for_sync(home, target, &done_ids, &child_ids, &scan.sessions);
     report.sqlite = sync_sqlite(home, data_dir, target, &done_ids, &catalog_rows);
     Ok(report)
 }
@@ -998,7 +1013,30 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// ③ 清单回滚的是**精确原值**，不是「一律改回 openai」那种猜测。
+    #[test]
+    fn catalog_provider_plan_only_uses_successful_rollouts_but_keeps_cleanup_separate() {
+        let home = tmp_home("catalog_success_evidence");
+        let good = write_rollout(&home, "sessions/2026/09/01", "good", "openai", "\n");
+        let failed = write_rollout(&home, "sessions/2026/09/01", "failed", "openai", "\n");
+        let child = write_rollout(&home, "sessions/2026/09/01", "child", "openai", "\n");
+        set_rollout_thread_source(&child, "guardian_review");
+        let scan = scan_at(&home);
+        let good_id = scan.sessions.iter().find(|s| s.rel_path == rel_of(&home, &good).unwrap()).unwrap().thread_id.clone();
+        let failed_id = scan.sessions.iter().find(|s| s.rel_path == rel_of(&home, &failed).unwrap()).unwrap().thread_id.clone();
+        let child_id = scan.sessions.iter().find(|s| s.rel_path == rel_of(&home, &child).unwrap()).unwrap().thread_id.clone();
+        let rows = catalog_rows_for_sync(
+            &home,
+            "synaroute",
+            std::slice::from_ref(&good_id),
+            &std::collections::HashSet::from([child_id.clone()]),
+            &scan.sessions,
+        );
+        assert!(rows.iter().any(|r| r.thread_id == good_id), "成功 rollout 必须进入 provider 计划");
+        assert!(!rows.iter().any(|r| r.thread_id == failed_id), "失败 rollout 不得被全量扫描带入 provider 计划");
+        assert!(rows.iter().any(|r| r.thread_id == child_id && r.thread_source == "guardian_review"), "child cleanup 必须独立保留");
+        let _ = fs::remove_dir_all(&home);
+    }
+
     ///
     /// 夹具刻意给两条不同的原值（`openai` 与 cc-switch 那类自定义 id）—— 只用一条的话
     /// 「硬编码回 openai」这个错误实现也会绿。

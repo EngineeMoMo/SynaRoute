@@ -24,6 +24,7 @@
 
 use super::{sse, sse_data, SseDirection, SseTranslator};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 /// 单个工具调用的 `arguments` 累计上限。
 ///
@@ -56,7 +57,18 @@ pub(super) const MAX_TOOL_SEEN: usize = 2 * MAX_TOOL_SLOTS;
 /// 故只对真正异常的上游生效。
 pub(super) const MAX_ACCUM_BYTES: usize = 32 * 1024 * 1024;
 
-/// 越界的是**哪一项**。
+/// 去重键只保留 call_id，缺失时用固定长度摘要，不能复制整段不可信参数。
+pub(super) fn tool_dedup_key(call_id: &str, name: &str, arguments: &str) -> String {
+    if !call_id.is_empty() {
+        return call_id.to_string();
+    }
+    let mut digest = Sha256::new();
+    digest.update(name.as_bytes());
+    digest.update([0]);
+    digest.update(arguments.as_bytes());
+    format!("{name}\u{0}#{:x}", digest.finalize())
+}
+
 ///
 /// 🔴 **必须分项，不能退回一个布尔**：行缓冲越界却报「工具参数超限」，会把排障的人送去查
 /// 工具定义，而真实成因是上游压根没在发合法 SSE。同本仓「指错方向的提示比没有提示更糟」。
@@ -76,7 +88,7 @@ impl LimitKind {
             Self::ToolSlots => format!("工具调用数超过 {MAX_TOOL_SLOTS}"),
             Self::ToolSeen => format!("工具调用去重记录超过 {MAX_TOOL_SEEN} 条"),
             Self::LineBuffer => format!(
-                "单行未终止的数据超过 {MAX_LINE_BYTES} 字节（上游可能并未在发送 SSE）"
+                "单行数据超过 {MAX_LINE_BYTES} 字节（上游可能并未在发送 SSE，或发送了超大完整行）"
             ),
             Self::Accum => format!("累积正文超过 {MAX_ACCUM_BYTES} 字节"),
         }
@@ -93,6 +105,26 @@ pub(super) fn append_tool_args(dst: &mut String, chunk: &str) -> bool {
 }
 
 impl SseTranslator {
+    /// 完整 item 的参数也必须走同一条上限；失败时直接返回下游错误事件。
+    pub(super) fn accept_complete_tool_args(&mut self, args: &str) -> Result<String, String> {
+        let mut bounded = String::new();
+        if append_tool_args(&mut bounded, args) {
+            return Ok(bounded);
+        }
+        self.note_limit(LimitKind::ToolArgs);
+        Err(self.take_tool_limit_error().unwrap_or_default())
+    }
+
+    /// 在把完整行复制到临时 Vec 之前检查它的真实字节数。
+    pub(super) fn complete_line_too_long(&mut self, len: usize) -> bool {
+        if len > MAX_LINE_BYTES {
+            self.note_limit(LimitKind::LineBuffer);
+            true
+        } else {
+            false
+        }
+    }
+
     /// 记下越界项。**先到的那一项赢** —— 它是根因，后面那些多半是它的连带。
     fn note_limit(&mut self, kind: LimitKind) {
         if self.limit_hit.is_none() {
@@ -125,8 +157,7 @@ impl SseTranslator {
     /// 登记去重键；`false` = 这个调用不该再翻（重复，**或**去重集合到顶）。
     ///
     /// 🔴 它与 `tool_calls` 是**两份独立累积**：上游每条 item 换一个 `call_id` 就绕过去重，
-    /// 而 `call_id` 缺失时键是 `name\0arguments` —— **整份参数进集合**，
-    /// [`MAX_TOOL_ARGS_BYTES`] 与 [`MAX_TOOL_SLOTS`] 一个都管不到它。
+    /// 而 `call_id` 缺失时键是 `name + SHA-256(arguments)`，不会把整份参数复制进集合。
     pub(super) fn register_tool_seen(&mut self, key: String) -> bool {
         if self.anthropic_tool_seen.len() >= MAX_TOOL_SEEN && !self.anthropic_tool_seen.contains(&key)
         {

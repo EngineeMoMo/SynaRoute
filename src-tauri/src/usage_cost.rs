@@ -451,7 +451,74 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 墓碑文件**只在内容真变了时才写**：`rows()` 被前端轮询调用，
+    #[test]
+    fn protected_usage_keys_files_are_not_overwritten() {
+        use std::collections::BTreeMap;
+        let (_store, dir) = temp_store("usage_keys_protected");
+        let config = dir.join("config.json");
+        let path = usage_keys::file_path(&config);
+        let fact = |name: &str| usage_keys::KeyFacts {
+            name: name.into(),
+            repr_model: Some("claude-sonnet-4-5".into()),
+            multiplier: Some("1.0".into()),
+            seen_day_ms: 1,
+        };
+        let live = BTreeMap::from([(String::from("live"), fact("live"))]);
+
+        std::fs::write(&path, br#"{"version":9999,"keys":{"old":{"name":"old","seenDayMs":1}}}"#).unwrap();
+        let before_future = std::fs::read(&path).unwrap();
+        let visible = usage_keys::sync(&config, live.clone());
+        assert_eq!(std::fs::read(&path).unwrap(), before_future, "未来版本不得被旧程序覆盖");
+        assert!(visible.contains_key("live"), "活 Key 仍应能在本次页面展示");
+
+        std::fs::write(&path, b"{not-json").unwrap();
+        let before_corrupt = std::fs::read(&path).unwrap();
+        let _ = usage_keys::sync(&config, live);
+        assert_eq!(std::fs::read(&path).unwrap(), before_corrupt, "损坏文件不得被空表覆盖");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn usage_keys_atomic_write_failure_can_retry_without_losing_live_facts() {
+        use std::collections::BTreeMap;
+        let (_store, dir) = temp_store("usage_keys_retry");
+        let config = dir.join("config.json");
+        let path = usage_keys::file_path(&config);
+        let live = BTreeMap::from([(String::from("retry"), usage_keys::KeyFacts {
+            name: "retry".into(), repr_model: Some("claude-sonnet-4-5".into()),
+            multiplier: None, seen_day_ms: 1,
+        })]);
+        std::fs::create_dir_all(&path).unwrap();
+        let _ = usage_keys::sync(&config, live.clone());
+        std::fs::remove_dir_all(&path).unwrap();
+        let _ = usage_keys::sync(&config, live);
+        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json["keys"]["retry"]["name"], "retry");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_usage_keys_syncs_merge_instead_of_overwriting() {
+        use std::collections::BTreeMap;
+        let (_store, dir) = temp_store("usage_keys_concurrent");
+        let config = dir.join("config.json");
+        let a = config.clone();
+        let b = config.clone();
+        let t1 = std::thread::spawn(move || usage_keys::sync(&a, BTreeMap::from([(String::from("a"), usage_keys::KeyFacts {
+            name: "a".into(), repr_model: None, multiplier: None, seen_day_ms: 1,
+        })])));
+        let t2 = std::thread::spawn(move || usage_keys::sync(&b, BTreeMap::from([(String::from("b"), usage_keys::KeyFacts {
+            name: "b".into(), repr_model: None, multiplier: None, seen_day_ms: 1,
+        })])));
+        let _ = t1.join().unwrap();
+        let _ = t2.join().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(usage_keys::file_path(&config)).unwrap()).unwrap();
+        assert!(json["keys"].get("a").is_some());
+        assert!(json["keys"].get("b").is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 无脑写会让一个开着用量页的窗口每秒制造一次写入 ——
     /// 与 `usage_dirty` 那条「空闲的应用一个字节都不写盘」纪律直接冲突。
     #[test]

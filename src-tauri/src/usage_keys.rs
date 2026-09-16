@@ -39,6 +39,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// 表内条目上限。key_id 是有限集，正常远小于它；上限只为堵住
 /// 「配置被反复重建导致 id 无限增长」这类只增不减的泄漏（同 `quota_window`）。
@@ -92,23 +93,34 @@ pub(crate) fn file_path(config_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("usage-keys.json"))
 }
 
-/// 读表。**一律不上抛错误**：这是统计辅助数据，缺失/损坏只意味着
-/// 「已删 Key 的金额算不出」，绝不能让用量页整个报错。
-fn load(path: &Path) -> BTreeMap<String, KeyFacts> {
-    let Ok(raw) = std::fs::read(path) else {
-        return BTreeMap::new();
+enum LoadState {
+    Missing,
+    Usable(BTreeMap<String, KeyFacts>),
+    Protected,
+}
+
+/// 进程内串行化「读墓碑 → 合并活 Key → 原子写回」。
+static SYNC_LOCK: Mutex<()> = Mutex::new(());
+
+/// 读表并保留「能不能写回」这个事实。
+fn load(path: &Path) -> LoadState {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LoadState::Missing,
+        Err(e) => {
+            tracing::warn!("usage-keys.json 读取失败，本轮禁止覆盖: {e}");
+            return LoadState::Protected;
+        }
     };
     match serde_json::from_slice::<Snapshot>(&raw) {
-        // 未来版本：只读不写这一条不适用（本文件可从活 Key 重建），但仍不解析
-        // 它的未知维度 —— 按空表处理会让本次运行把它覆盖掉，故直接放弃合并。
-        Ok(s) if s.version <= SNAPSHOT_VERSION => s.keys,
+        Ok(s) if s.version <= SNAPSHOT_VERSION => LoadState::Usable(s.keys),
         Ok(s) => {
-            tracing::warn!("usage-keys.json 版本 {} 高于本程序，本次不使用也不覆盖", s.version);
-            BTreeMap::new()
+            tracing::warn!("usage-keys.json 版本 {} 高于本程序，本轮禁止覆盖", s.version);
+            LoadState::Protected
         }
         Err(e) => {
-            tracing::warn!("usage-keys.json 解析失败，按空表处理: {e}");
-            BTreeMap::new()
+            tracing::warn!("usage-keys.json 解析失败，本轮禁止覆盖: {e}");
+            LoadState::Protected
         }
     }
 }
@@ -122,8 +134,14 @@ pub(crate) fn sync(
     config_path: &Path,
     live: BTreeMap<String, KeyFacts>,
 ) -> BTreeMap<String, KeyFacts> {
+    let _guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = file_path(config_path);
-    let before = load(&path);
+    let before = match load(&path) {
+        LoadState::Missing => BTreeMap::new(),
+        LoadState::Usable(keys) => keys,
+        // 活 Key 的事实仍可供本次页面展示，但绝不能拿它们去覆盖用户的损坏/未来文件。
+        LoadState::Protected => return live,
+    };
     let mut merged = before.clone();
     merged.extend(live);
     if merged.len() > MAX_ENTRIES {
@@ -142,7 +160,7 @@ pub(crate) fn sync(
     let snap = Snapshot { version: SNAPSHOT_VERSION, keys: merged.clone() };
     match serde_json::to_vec_pretty(&snap) {
         Ok(bytes) => {
-            if let Err(e) = std::fs::write(&path, bytes) {
+            if let Err(e) = crate::secret::atomic_write(&path, &bytes) {
                 tracing::warn!("写 usage-keys.json 失败（已删 Key 的金额将算不出）: {e}");
             }
         }

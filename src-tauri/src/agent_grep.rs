@@ -18,7 +18,7 @@
 //! 原样交给模型。判据拆成纯函数是为了**可验证**：本机不一定装 rg，而这条判据不该只在
 //! 恰好装了 rg 的机器上才被测到。
 
-use super::is_sensitive_path;
+use super::is_sensitive_read_path;
 use std::path::Path;
 
 /// 单次 `grep` 返回的匹配行上限。
@@ -48,7 +48,7 @@ pub(super) fn filter_rg_hits(work_dir: &Path, stdout: &str) -> (Vec<String>, usi
         let Some((path, num, text)) = split_rg_line(line) else {
             continue;
         };
-        if is_sensitive_path(&work_dir.join(path)) {
+        if is_sensitive_read_path(&work_dir.join(path)) {
             denied += 1;
             continue;
         }
