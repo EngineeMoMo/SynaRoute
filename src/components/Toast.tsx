@@ -24,20 +24,24 @@ export function Toast() {
   const Icon = isError ? AlertTriangle : CheckCircle2;
 
   return (
-    <div className="pointer-events-none fixed bottom-4 left-1/2 z-[100] -translate-x-1/2">
+    <div className="pointer-events-none fixed bottom-5 left-1/2 z-[100] w-[min(460px,calc(100vw-2rem))] -translate-x-1/2">
       <div
-        className={`pointer-events-auto flex max-w-lg items-start gap-2.5 rounded-control px-4 py-3 text-sm shadow-lg ${
-          isError
-            ? "bg-danger text-white"
-            : "bg-success text-white"
+        className={`pointer-events-auto flex items-start gap-3 rounded-card border bg-surface-overlay/95 px-4 py-3 text-sm shadow-elevated backdrop-blur-md ${
+          isError ? "border-danger/35" : "border-route/30"
         }`}
         role={isError ? "alert" : "status"}
       >
-        <Icon size={16} className="mt-0.5 shrink-0" />
-        <span className="min-w-0 break-words">{toast.msg}</span>
+        <span
+          className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-control ${
+            isError ? "bg-danger/12 text-danger" : "bg-route/12 text-route"
+          }`}
+        >
+          <Icon size={16} />
+        </span>
+        <span className="min-w-0 flex-1 break-words leading-relaxed text-text-primary">{toast.msg}</span>
         <button
           onClick={clearToast}
-          className="ml-1 shrink-0 rounded p-0.5 opacity-80 hover:opacity-100"
+          className="sr-icon-button h-7 w-7 shrink-0"
           aria-label="close"
         >
           <X size={14} />

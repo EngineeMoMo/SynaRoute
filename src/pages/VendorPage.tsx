@@ -3,6 +3,8 @@ import { useStore } from "@/store";
 import { api } from "@/lib/bridge";
 import { Card, CardContent } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import { PageHeader } from "@/components/ui/PageHeader";
 import { Badge } from "@/components/ui/Badge";
 import { BrandIcon, BrandPresetPicker } from "@/components/BrandIcon";
 import { useT } from "@/lib/useT";
@@ -10,7 +12,7 @@ import { protocolLabel, type Protocol, type Vendor } from "@/types";
 import { Building2, Lock, Pencil, Plus, Trash2, ImagePlus, X } from "lucide-react";
 
 const inputCls =
-  "h-9 w-full rounded-control border border-border bg-surface px-3 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-ring";
+  "sr-control h-9 w-full px-3 text-sm focus-visible:outline-none";
 
 /** 自定义图标大小上限（data-URL 存进 config.json，过大会撑胖配置）。约 200KB 原图。 */
 const MAX_ICON_BYTES = 256 * 1024;
@@ -29,6 +31,7 @@ export function VendorPage() {
   const t = useT();
   // editing.id === "" 表示新增；null 表示未在编辑
   const [editing, setEditing] = useState<Draft | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Vendor | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -101,8 +104,10 @@ export function VendorPage() {
     }
   };
 
-  const remove = async (v: Vendor) => {
-    if (!window.confirm(t("vendor.deleteConfirm", { name: v.name }))) return;
+  const requestRemove = (v: Vendor) => setDeleteTarget(v);
+  const confirmRemove = async () => {
+    if (!deleteTarget) return;
+    const v = deleteTarget;
     setBusy(true);
     try {
       await api.deleteVendor(v.id);
@@ -116,22 +121,18 @@ export function VendorPage() {
       showToast("error", msg);
     } finally {
       setBusy(false);
+      setDeleteTarget(null);
     }
   };
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="flex items-center justify-between border-b border-border px-6 py-4">
-        <div>
-          <h1 className="text-lg font-semibold text-text-primary">{t("vendor.title")}</h1>
-          <p className="mt-0.5 text-sm text-text-secondary">{t("vendor.desc")}</p>
-        </div>
-        {!editing && (
-          <Button onClick={startAdd} disabled={busy}>
-            <Plus size={16} /> {t("vendor.add")}
-          </Button>
-        )}
-      </div>
+      <PageHeader
+        icon={Building2}
+        title={t("vendor.title")}
+        description={t("vendor.desc")}
+        actions={!editing && <Button onClick={startAdd} disabled={busy}><Plus size={16} /> {t("vendor.add")}</Button>}
+      />
 
       <div className="space-y-4 p-6">
         {editing && (
@@ -236,7 +237,7 @@ export function VendorPage() {
           </div>
         ) : (
           custom.map((v) => (
-            <VendorRow key={v.id} vendor={v} onEdit={() => startEdit(v)} onDelete={() => remove(v)} disabled={busy} t={t} />
+            <VendorRow key={v.id} vendor={v} onEdit={() => startEdit(v)} onDelete={() => requestRemove(v)} disabled={busy} t={t} />
           ))
         )}
 
@@ -245,6 +246,17 @@ export function VendorPage() {
           <VendorRow key={v.id} vendor={v} disabled={busy} t={t} />
         ))}
       </div>
+      {deleteTarget && (
+        <ConfirmDialog
+          title={t("vendor.delete")}
+          description={t("vendor.deleteConfirm", { name: deleteTarget.name })}
+          confirmLabel={t("vendor.delete")}
+          cancelLabel={t("vendor.cancel")}
+          onConfirm={() => void confirmRemove()}
+          onCancel={() => setDeleteTarget(null)}
+          busy={busy}
+        />
+      )}
     </div>
   );
 }
@@ -287,10 +299,10 @@ function VendorRow({
           </span>
         ) : (
           <div className="flex gap-1">
-            <Button variant="ghost" size="icon" onClick={onEdit} disabled={disabled} title={t("vendor.edit")}>
+            <Button variant="ghost" size="icon" onClick={onEdit} disabled={disabled} title={t("vendor.edit")} aria-label={t("vendor.edit")}>
               <Pencil size={16} />
             </Button>
-            <Button variant="ghost" size="icon" onClick={onDelete} disabled={disabled} title={t("vendor.delete")}>
+            <Button variant="ghost" size="icon" onClick={onDelete} disabled={disabled} title={t("vendor.delete")} aria-label={t("vendor.delete")}>
               <Trash2 size={16} />
             </Button>
           </div>

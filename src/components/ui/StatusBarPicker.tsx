@@ -86,7 +86,7 @@ export function StatusBarPicker({
           type="button"
           disabled={disabled}
           onClick={() => setOpen((o) => !o)}
-          className="flex max-w-[220px] items-center gap-1 rounded-control px-1.5 py-1 text-xs text-text-secondary hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
+          className="flex max-w-[220px] items-center gap-1 rounded-control border border-transparent px-2 py-1 text-xs text-text-secondary transition-all duration-150 hover:border-border hover:bg-surface-hover hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-50"
         >
           <span className="shrink-0 text-text-muted">{label}</span>
           <span className="truncate font-medium text-text-primary">{display}</span>
@@ -105,7 +105,7 @@ export function StatusBarPicker({
             }}
           />
           <div
-            className="absolute left-0 top-full z-50 mt-1 max-h-72 min-w-[220px] overflow-auto rounded-control border border-border bg-surface py-1 shadow-card-hover"
+            className="absolute left-0 top-full z-50 mt-1 max-h-72 min-w-[220px] overflow-auto rounded-control border border-border-strong/70 bg-surface-overlay py-1 shadow-elevated backdrop-blur-sm"
             role="listbox"
             tabIndex={-1}
             onKeyDown={(e) => {
@@ -137,9 +137,9 @@ export function StatusBarPicker({
                 aria-selected={o.value === value}
                 onMouseEnter={() => setActive(i)}
                 onClick={() => pick(o.value)}
-                className={`block w-full px-3 py-1.5 text-left text-xs ${
+                className={`block w-full px-3 py-1.5 text-left text-xs transition-colors focus-visible:bg-surface-hover focus-visible:outline-none ${
                   i === active ? "bg-surface-hover" : ""
-                } ${o.value === value ? "text-primary" : "text-text-primary"}`}
+                } ${o.value === value ? "font-medium text-route" : "text-text-primary"}`}
               >
                 <div className="truncate font-medium">{o.label}</div>
                 {o.hint && <div className="truncate text-[11px] text-text-muted">{o.hint}</div>}

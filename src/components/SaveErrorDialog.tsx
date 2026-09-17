@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { useT } from "@/lib/useT";
+import { DialogBody, DialogFooter, DialogFrame, DialogHeader } from "@/components/ui/DialogFrame";
 
 /**
  * 保存失败的提示**弹窗**。
@@ -44,35 +45,36 @@ export function SaveErrorDialog({
   if (!error) return null;
 
   return (
-    <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4"
-      onMouseDown={(e) => {
+    <DialogFrame
+      size="sm"
+      role="alertdialog"
+      ariaLabel={t("editor.saveFailedTitle")}
+      overlayClassName="z-[60]"
+      className="max-h-[min(420px,85vh)] w-[min(460px,100%)] border-danger/35"
+      onBackdropMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div
-        role="alertdialog"
-        aria-modal="true"
-        aria-label={t("editor.saveFailedTitle")}
-        className="flex max-h-[min(420px,85vh)] w-[min(460px,100%)] flex-col overflow-hidden rounded-card border border-danger/30 bg-surface shadow-2xl"
-      >
-        <div className="flex items-center gap-2 border-b border-border px-4 py-3">
-          <AlertTriangle size={16} className="shrink-0 text-danger" aria-hidden="true" />
+      <DialogHeader>
+        <div className="flex items-center gap-2">
+          <span className="flex h-8 w-8 items-center justify-center rounded-control bg-danger/12 text-danger">
+            <AlertTriangle size={16} aria-hidden="true" />
+          </span>
           <h3 className="text-sm font-semibold text-text-primary">
             {t("editor.saveFailedTitle")}
           </h3>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
-          <p className="whitespace-pre-line text-xs leading-relaxed text-text-secondary">
-            {error}
-          </p>
-        </div>
-        <div className="flex justify-end border-t border-border px-4 py-3">
-          <Button onClick={onClose} autoFocus>
-            {t("common.ok")}
-          </Button>
-        </div>
-      </div>
-    </div>
+      </DialogHeader>
+      <DialogBody>
+        <p className="whitespace-pre-line text-xs leading-relaxed text-text-secondary">
+          {error}
+        </p>
+      </DialogBody>
+      <DialogFooter>
+        <Button onClick={onClose} autoFocus>
+          {t("common.ok")}
+        </Button>
+      </DialogFooter>
+    </DialogFrame>
   );
 }

@@ -338,7 +338,7 @@ export function CommandPalette({ onClose, onNavigate, onEditKey, onAddKey }: Pro
     <div
       // z-[90]：必须夹在弹窗的 z-50 与 Toast 的 z-[100] 之间 ——
       // 低了会被抽屉盖住，高了会挡住执行失败的红色提示。
-      className="fixed inset-0 z-[90] flex items-start justify-center bg-black/30 pt-[12vh]"
+      className="sr-overlay fixed inset-0 z-[90] flex items-start justify-center pt-[12vh]"
       // 遮罩关闭必须用 onMouseDown + target===currentTarget，禁止 onClick={onClose}：
       // 否则在输入框里拖选文字、松手落在遮罩上会误关面板并丢掉已输入的查询。
       onMouseDown={(e) => {
@@ -346,13 +346,13 @@ export function CommandPalette({ onClose, onNavigate, onEditKey, onAddKey }: Pro
       }}
     >
       <div
-        className="flex max-h-[70vh] w-[min(640px,92vw)] flex-col overflow-hidden rounded-lg border border-border bg-surface shadow-2xl"
+        className="sr-dialog flex max-h-[70vh] w-[min(640px,92vw)] flex-col overflow-hidden"
         onKeyDown={onKeyDown}
         role="dialog"
         aria-modal="true"
         aria-label={t("palette.title")}
       >
-        <div className="flex items-center gap-2 border-b border-border px-3.5 py-3">
+        <div className="flex items-center gap-2 border-b border-border/80 px-3.5 py-3">
           <Search size={16} className="shrink-0 text-text-muted" />
           <input
             ref={inputRef}
@@ -384,7 +384,7 @@ export function CommandPalette({ onClose, onNavigate, onEditKey, onAddKey }: Pro
             return (
               <div key={f.it.id}>
                 {showGroup && (
-                  <div className="px-3.5 pb-1 pt-2 text-[10px] font-medium uppercase tracking-wide text-text-muted">
+                  <div className="sr-section-label px-3.5 pb-1 pt-2">
                     {f.it.group}
                   </div>
                 )}
@@ -402,7 +402,7 @@ export function CommandPalette({ onClose, onNavigate, onEditKey, onAddKey }: Pro
                   }}
                   onClick={() => exec(f.it.run)}
                   className={`mx-1.5 flex cursor-pointer items-center gap-2.5 rounded-control px-2.5 py-2 ${
-                    selected ? "bg-primary/12" : ""
+                    selected ? "bg-route/12" : ""
                   }`}
                 >
                   <Icon size={15} className="shrink-0 text-text-secondary" />

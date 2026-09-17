@@ -2,6 +2,8 @@ import { useEffect, useRef } from "react";
 import { X } from "lucide-react";
 import { BrandIcon, BrandPresetPicker, brandLabel } from "@/components/BrandIcon";
 import { useT } from "@/lib/useT";
+import { IconButton } from "@/components/ui/Button";
+import { DialogBody, DialogFooter, DialogFrame, DialogHeader } from "@/components/ui/DialogFrame";
 
 /**
  * 品牌图标挑选器的**弹窗**形态。
@@ -58,60 +60,51 @@ export function BrandPickerDialog({
   if (!open) return null;
 
   return (
-    <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4"
-      onMouseDown={(e) => {
+    <DialogFrame
+      size="md"
+      ariaLabel={t("brandPicker.title")}
+      panelRef={boxRef}
+      overlayClassName="z-[60]"
+      onBackdropMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div
-        ref={boxRef}
-        role="dialog"
-        aria-modal="true"
-        aria-label={t("brandPicker.title")}
-        className="flex max-h-[min(560px,90vh)] w-[min(520px,100%)] flex-col overflow-hidden rounded-card border border-border bg-surface shadow-2xl"
-      >
-        <div className="flex items-center justify-between border-b border-border px-4 py-3">
-          <h3 className="text-sm font-semibold text-text-primary">{t("brandPicker.title")}</h3>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label={t("common.close")}
-            className="rounded p-1 text-text-muted hover:bg-surface-hover hover:text-text-primary"
-          >
-            <X size={16} aria-hidden="true" />
-          </button>
-        </div>
-
-        <div className="min-h-0 flex-1 overflow-hidden px-4 py-3">
-          {/* 弹窗里不再限高到 224px：目录自己吃满剩余高度，一屏能看到的品牌多一倍 */}
-          <BrandPresetPicker
-            value={value}
-            listClassName="max-h-[min(380px,60vh)]"
-            onChange={(next) => {
-              onChange(next);
-              onClose();
-            }}
-          />
-        </div>
-
-        <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-3">
-          <p className="text-[11px] leading-relaxed text-text-muted">
-            {t("editor.iconPresetHint")}
-          </p>
-          <button
-            type="button"
-            onClick={() => {
-              onChange(undefined);
-              onClose();
-            }}
-            className="shrink-0 rounded-control border border-border px-2.5 py-1.5 text-xs text-text-secondary hover:bg-surface-hover"
-          >
-            {t("brandPicker.auto")}
-          </button>
-        </div>
-      </div>
-    </div>
+      <DialogHeader>
+        <h3 className="text-sm font-semibold text-text-primary">{t("brandPicker.title")}</h3>
+        <IconButton
+          variant="ghost"
+          label={t("common.close")}
+          onClick={onClose}
+          className="h-8 w-8"
+          icon={<X size={16} aria-hidden="true" />}
+        />
+      </DialogHeader>
+      <DialogBody className="overflow-hidden">
+        <BrandPresetPicker
+          value={value}
+          listClassName="max-h-[min(380px,60vh)]"
+          onChange={(next) => {
+            onChange(next);
+            onClose();
+          }}
+        />
+      </DialogBody>
+      <DialogFooter className="justify-between">
+        <p className="text-[11px] leading-relaxed text-text-muted">
+          {t("editor.iconPresetHint")}
+        </p>
+        <button
+          type="button"
+          onClick={() => {
+            onChange(undefined);
+            onClose();
+          }}
+          className="sr-control shrink-0 px-2.5 py-1.5 text-xs text-text-secondary hover:text-text-primary"
+        >
+          {t("brandPicker.auto")}
+        </button>
+      </DialogFooter>
+    </DialogFrame>
   );
 }
 

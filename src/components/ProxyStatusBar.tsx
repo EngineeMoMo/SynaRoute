@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Button } from "@/components/ui/Button";
+import { Button, IconButton } from "@/components/ui/Button";
 import { StatusBarPicker } from "@/components/ui/StatusBarPicker";
 import { Tooltip } from "@/components/ui/Tooltip";
 import type { ProxyState } from "@/types";
@@ -129,11 +129,11 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
 
   return (
     // flex-wrap：加了三个下拉后窄窗口必然放不下（应用最小宽度 900），不许它们被挤压变形。
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border bg-surface px-6 py-3">
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border/80 bg-surface/75 px-6 py-2.5 backdrop-blur-md">
       <div className="flex items-center gap-2">
         <span
           className={`inline-block h-2 w-2 rounded-full ${
-            allDown ? "bg-danger" : running ? "bg-success" : "bg-text-muted"
+            allDown ? "bg-danger" : running ? "bg-route" : "bg-text-muted"
           }`}
         />
         <span className="text-sm font-medium text-text-primary">
@@ -183,13 +183,14 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
         </Tooltip>
         {proxy?.port && (
           <Tooltip content={t("proxy.copyEndpoint")} side="bottom">
-            <button
+            <IconButton
+              variant="ghost"
+              size="icon"
+              label={t("proxy.copyEndpoint")}
               onClick={copyEndpoint}
-              aria-label={t("proxy.copyEndpoint")}
-              className="rounded p-1 hover:bg-surface-hover"
-            >
-              <Copy size={12} />
-            </button>
+              className="h-7 w-7"
+              icon={<Copy size={12} />}
+            />
           </Tooltip>
         )}
       </div>

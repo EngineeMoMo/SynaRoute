@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { LanSection } from "@/components/LanSection";
 import { ToggleRow } from "@/components/ToggleRow";
+import { PageHeader } from "@/components/ui/PageHeader";
 import { useT } from "@/lib/useT";
 import { LANGS } from "@/lib/i18n";
 import { openLogDir } from "@/lib/openLogDir";
@@ -465,13 +466,7 @@ export function SettingsPage() {
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="border-b border-border px-6 py-4">
-        {/* 标题配图标（UI-1）：与 BrainPage / LogsPage 同一形制。 */}
-        <div className="flex items-center gap-2">
-          <SettingsIcon size={20} className="text-primary" />
-          <h1 className="text-lg font-semibold text-text-primary">{t("settings.title")}</h1>
-        </div>
-      </div>
+      <PageHeader icon={SettingsIcon} title={t("settings.title")} />
 
       <div className="space-y-4 p-6">
         {/* 版本与更新 */}
@@ -487,7 +482,7 @@ export function SettingsPage() {
                   <div className="flex flex-wrap items-center gap-2 text-sm font-medium text-text-primary">
                     <span>SynaRoute v{version}</span>
                     {updateCheck?.status === "available" && (
-                      <span className="rounded-full bg-primary/15 px-2 py-0.5 text-[11px] font-medium text-primary">
+                      <span className="rounded-full bg-primary/12 px-2 py-0.5 text-[11px] font-medium text-primary">
                         {t("settings.updateAvailable", { version: updateCheck.version ?? "?" })}
                       </span>
                     )}
@@ -547,7 +542,7 @@ export function SettingsPage() {
                     key={o.value}
                     onClick={() => setTheme(o.value)}
                     className={`flex flex-1 flex-col items-center gap-1.5 rounded-control border p-3 transition-colors ${
-                      active ? "border-primary bg-primary/8 text-primary" : "border-border text-text-secondary hover:bg-surface-hover"
+                      active ? "border-route bg-route/12 text-route" : "border-border text-text-secondary hover:border-border-strong hover:bg-surface-hover"
                     }`}
                   >
                     <Icon size={18} />
@@ -578,7 +573,7 @@ export function SettingsPage() {
                       key={l.value}
                       onClick={() => setLang(l.value)}
                       className={`rounded-control border px-3 py-1.5 text-xs transition-colors ${
-                        active ? "border-primary bg-primary/12 text-primary" : "border-border text-text-secondary hover:bg-surface-hover"
+                        active ? "border-route bg-route/12 text-route" : "border-border text-text-secondary hover:border-border-strong hover:bg-surface-hover"
                       }`}
                     >
                       {l.label}
@@ -709,7 +704,7 @@ export function SettingsPage() {
                     type="number"
                     min={1024}
                     max={65535}
-                    className="w-24 shrink-0 rounded-control border border-border bg-background px-2.5 py-1.5 text-xs text-text-primary"
+                    className="w-24 shrink-0 sr-control px-2.5 py-1.5 text-xs"
                     defaultValue={settings?.mcpPort ?? 9527}
                     onBlur={(e) => applyMcp(true, Number(e.target.value) || 9527)}
                   />
@@ -783,7 +778,7 @@ export function SettingsPage() {
                     type="number"
                     min={1024}
                     max={65535}
-                    className="w-24 shrink-0 rounded-control border border-border bg-surface px-2.5 py-1.5 text-xs text-text-primary outline-none focus:border-primary disabled:opacity-50"
+                    className="w-24 shrink-0 rounded-control border border-border bg-surface px-2.5 py-1.5 text-xs text-text-primary outline-none focus:border-route disabled:opacity-50"
                     value={draft}
                     disabled={savingPort === id}
                     onChange={(e) => setPortDrafts((d) => ({ ...d, [id]: e.target.value }))}
@@ -891,7 +886,7 @@ export function SettingsPage() {
                 <div className="text-sm font-medium text-text-primary">{t("settings.probeMsgTitle")}</div>
                 <div className="text-xs text-text-muted">{t("settings.probeMsgDesc")}</div>
                 <textarea
-                  className="min-h-[80px] w-full resize-y rounded-control border border-border bg-surface px-2.5 py-1.5 font-mono text-xs text-text-primary placeholder:text-text-muted"
+                  className="sr-control min-h-[80px] w-full resize-y px-2.5 py-1.5 font-mono text-xs"
                   placeholder={t("settings.probeMsgPlaceholder")}
                   // 草稿优先：编辑期间不受 update() 的异步回填影响（见 probeMsgDraft 的说明）
                   value={probeMsgDraft ?? (settings?.healthProbeTestMessages ?? []).join("\n")}
@@ -976,7 +971,7 @@ export function SettingsPage() {
                 <div className="mt-2 flex items-center gap-2">
                   <input
                     type="text"
-                    className="flex-1 rounded-control border border-border bg-background px-2.5 py-1.5 font-mono text-xs text-text-primary placeholder:text-text-muted"
+                    className="flex-1 sr-control bg-background px-2.5 py-1.5 font-mono text-xs placeholder:text-text-muted"
                     // 草稿优先（见 logDirDraft 的说明）：逐字符落盘会让乱序返回的
                     // saveSettings 把已输入的字符回退掉。
                     value={logDirDraft ?? settings?.logDir ?? ""}
@@ -1146,15 +1141,15 @@ function McpWizard({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6"
+      className="sr-overlay fixed inset-0 z-50 flex items-center justify-center p-6"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="max-h-[85vh] w-full max-w-xl overflow-y-auto rounded-card border border-border bg-surface p-5 shadow-xl">
+      <div className="sr-dialog max-h-[85vh] w-full max-w-xl overflow-y-auto p-5">
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-base font-semibold text-text-primary">{t("settings.mcpWizardTitle")}</h2>
-          <button onClick={onClose} className="rounded p-1 text-text-muted hover:bg-surface-hover hover:text-text-primary">
+          <button onClick={onClose} className="sr-icon-button h-8 w-8" aria-label={t("common.close")}>
             <X size={16} />
           </button>
         </div>
@@ -1195,7 +1190,7 @@ function WizardStep({ n, title, children }: { n: number; title: string; children
   return (
     <div className="mb-4">
       <div className="mb-1.5 flex items-center gap-2">
-        <span className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/15 text-[11px] font-semibold text-primary">{n}</span>
+        <span className="flex h-5 w-5 items-center justify-center rounded-full bg-route/12 text-[11px] font-semibold text-route">{n}</span>
         <span className="text-sm font-medium text-text-primary">{title}</span>
       </div>
       <div className="pl-7">{children}</div>
@@ -1218,8 +1213,9 @@ function WizardCode({ text }: { text: string }) {
       </pre>
       <button
         onClick={copy}
-        className="absolute right-1.5 top-1.5 rounded p-1 text-text-muted hover:bg-surface-hover hover:text-text-primary"
+        className="sr-icon-button absolute right-1.5 top-1.5 h-7 w-7"
         title="copy"
+        aria-label="copy"
       >
         {copied ? <Check size={12} /> : <Copy size={12} />}
       </button>

@@ -188,7 +188,7 @@ export default function App() {
   };
 
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden bg-background text-text-primary">
+    <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-background text-text-primary">
       {/* 更新横幅：整宽置顶、跨所有页面。原先只有侧栏 Logo 右上角一个小角标，不显眼。 */}
       <UpdateBanner onOpenSettings={() => handleNav("settings")} />
 

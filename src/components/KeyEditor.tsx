@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/bridge";
 import { useStore } from "@/store";
 import { useT } from "@/lib/useT";
-import { Button } from "@/components/ui/Button";
+import { Button, IconButton } from "@/components/ui/Button";
 import { Combobox } from "@/components/ui/Combobox";
 import { BrandIcon } from "@/components/BrandIcon";
 import { BrandPickerDialog, BrandPickerTrigger } from "@/components/BrandPickerDialog";
@@ -633,22 +633,20 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex justify-end bg-black/30"
+      className="sr-overlay fixed inset-0 z-50 flex justify-end"
       onMouseDown={(e) => {
         // 仅当在遮罩上真正按下并松开（纯点击外部）才关闭，避免框内拖选文字松手落到遮罩误关
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="flex h-full w-[min(560px,100vw)] flex-col bg-surface shadow-2xl">
+      <div className="flex h-full w-[min(560px,100vw)] flex-col border-l border-border-strong/60 bg-surface-elevated shadow-elevated">
 
         {/* 头 */}
-        <div className="flex items-center justify-between border-b border-border px-5 py-4">
+        <div className="flex items-center justify-between border-b border-border/80 px-5 py-4">
           <h2 className="text-base font-semibold text-text-primary">
             {isNew ? t("editor.titleNew") : t("editor.titleEdit")}
           </h2>
-          <button onClick={onClose} className="rounded p-1 text-text-muted hover:bg-surface-hover">
-            <X size={18} />
-          </button>
+          <IconButton variant="ghost" label={t("common.close")} onClick={onClose} className="h-8 w-8" icon={<X size={18} />} />
         </div>
 
         {/* 表单体 */}
@@ -832,7 +830,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                 </Button>
               </div>
             )}
-            <div className="space-y-0.5 rounded-control border border-border p-2">
+            <div className="space-y-0.5 rounded-control border border-border bg-surface/60 p-2">
               {models.length === 0 ? (
                 <span className="text-xs text-text-muted">{t("editor.noModels")}</span>
               ) : (
@@ -935,7 +933,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
           {/* ---- 余额查询与计费（第④批）----
               默认折叠：绝大多数用户不会配它，展开着会让本已很长的抽屉更难扫读。
               标题行常驻显示「已启用 / 未启用」，折叠状态下也能看出配没配。 */}
-          <div className="rounded-control border border-border">
+          <div className="rounded-control border border-border bg-surface/60">
             <button
               type="button"
               onClick={() => setBalanceOpen((v) => !v)}
@@ -989,8 +987,8 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                             onClick={() => applyBalanceTemplate(tpl)}
                             className={`rounded-control border px-2 py-1 text-[11px] transition-colors ${
                               balance.template === tpl
-                                ? "border-primary bg-primary/10 text-primary"
-                                : "border-border text-text-secondary hover:bg-surface-hover"
+                                ? "border-route/30 bg-route/12 text-route"
+                                : "border-border text-text-secondary hover:border-border-strong hover:bg-surface-hover"
                             }`}
                           >
                             {t(`balance.tpl.${tpl}`)}
@@ -1252,7 +1250,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
         </div>
 
         {/* 底部操作 */}
-        <div className="flex items-center justify-end gap-2 border-t border-border px-5 py-3">
+        <div className="flex items-center justify-end gap-2 border-t border-border/80 bg-surface/60 px-5 py-3">
           <Button variant="ghost" onClick={onClose} disabled={saving}>{t("common.cancel")}</Button>
           <Button onClick={save} disabled={saving}>{saving ? t("common.saving") : t("common.save")}</Button>
         </div>
@@ -1272,8 +1270,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   );
 }
 
-const inputCls =
-  "h-9 w-full rounded-control border border-border bg-surface px-3 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-ring";
+const inputCls = "sr-control h-9 w-full px-3 text-sm placeholder:text-text-muted";
 
 function Field({
   label,

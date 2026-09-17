@@ -130,15 +130,15 @@ export function OnboardingWizard({ onPickCategory, onOpenLogs }: Props) {
           所以能盖住」是错误认知，实测第②步整个编辑器被向导遮罩挡住、鼠标完全点不到）。
           故子弹窗打开期间把向导整体降到 z-40：编辑器浮上来可交互，向导仍盖住主界面。 */}
       <div
-        className={`fixed inset-0 flex items-center justify-center bg-black/50 p-4 ${
+        className={`sr-overlay fixed inset-0 flex items-center justify-center p-4 ${
           editorOpen ? "z-40" : "z-[80]"
         }`}
       >
-        <div className="flex max-h-[86vh] w-[min(560px,94vw)] flex-col overflow-hidden rounded-lg border border-border bg-surface shadow-2xl">
+        <div className="sr-dialog flex max-h-[86vh] w-[min(560px,94vw)] flex-col overflow-hidden">
           {/* 头部：进度指示 */}
-          <div className="border-b border-border px-5 py-4">
+          <div className="border-b border-border/80 px-5 py-4">
             <div className="flex items-center gap-2">
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-control bg-primary text-primary-foreground">
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-control bg-gradient-to-br from-primary to-primary-deep text-primary-foreground shadow-sm shadow-primary/25">
                 <Waypoints size={17} />
               </div>
               <div className="min-w-0 flex-1">
@@ -162,7 +162,7 @@ export function OnboardingWizard({ onPickCategory, onOpenLogs }: Props) {
                     <span
                       className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] font-medium ${
                         done
-                          ? "bg-success text-white"
+                          ? "bg-route text-route-foreground"
                           : active
                             ? "bg-primary text-primary-foreground"
                             : "bg-surface-hover text-text-muted"
@@ -192,7 +192,7 @@ export function OnboardingWizard({ onPickCategory, onOpenLogs }: Props) {
                   <button
                     key={c}
                     onClick={() => pickClient(c)}
-                    className="flex w-full items-center gap-3 rounded-control border border-border px-3.5 py-3 text-left transition-colors hover:border-primary hover:bg-primary/8"
+                    className="sr-control flex w-full items-center gap-3 px-3.5 py-3 text-left hover:border-route hover:bg-route/8"
                   >
                     <Icon size={18} className="shrink-0 text-text-secondary" />
                     <span className="flex-1 text-sm text-text-primary">{t(`nav.${c}`)}</span>
@@ -209,7 +209,7 @@ export function OnboardingWizard({ onPickCategory, onOpenLogs }: Props) {
                 <div className="grid gap-2">
                   <button
                     onClick={() => setEditorOpen(true)}
-                    className="flex flex-col items-start gap-1.5 rounded-control border border-border px-3.5 py-3 text-left transition-colors hover:border-primary hover:bg-surface-hover"
+                    className="sr-control flex flex-col items-start gap-1.5 px-3.5 py-3 text-left hover:border-route"
                   >
                     <KeyRound size={17} className="text-text-secondary" />
                     <span className="text-sm font-medium text-text-primary">
@@ -299,7 +299,7 @@ export function OnboardingWizard({ onPickCategory, onOpenLogs }: Props) {
           </div>
 
           {/* 底部操作条 */}
-          <div className="flex items-center gap-2 border-t border-border px-5 py-3">
+          <div className="flex items-center gap-2 border-t border-border/80 px-5 py-3">
             {step > 1 && (
               <Button size="sm" variant="outline" onClick={() => setStep((s) => s - 1)}>
                 {t("onboarding.back")}

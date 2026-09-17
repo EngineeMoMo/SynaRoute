@@ -15,10 +15,13 @@ export default {
         // 换成「token 不存在」）。绑到 --surface-hover：它比 surface 略深一档，
         // 正是「内嵌/下沉」想要的对比，且深浅主题都已定义、不必新增变量。
         // 判据：`npm run build` 后 dist CSS 里能搜到 `.bg-surface-elevated`。
-        "surface-elevated": "rgb(var(--surface-hover) / <alpha-value>)",
+        "surface-elevated": "rgb(var(--surface-elevated) / <alpha-value>)",
+        "surface-overlay": "rgb(var(--surface-overlay) / <alpha-value>)",
         border: "rgb(var(--border) / <alpha-value>)",
+        "border-strong": "rgb(var(--border-strong) / <alpha-value>)",
         input: "rgb(var(--border) / <alpha-value>)",
         ring: "rgb(var(--primary) / <alpha-value>)",
+        scrim: "rgb(var(--scrim) / <alpha-value>)",
         "text-primary": "rgb(var(--text-primary) / <alpha-value>)",
         "text-secondary": "rgb(var(--text-secondary) / <alpha-value>)",
         "text-muted": "rgb(var(--text-muted) / <alpha-value>)",
@@ -31,13 +34,18 @@ export default {
           deep: "rgb(var(--primary-deep) / <alpha-value>)",
           foreground: "rgb(var(--primary-foreground) / <alpha-value>)",
         },
+        route: {
+          DEFAULT: "rgb(var(--route) / <alpha-value>)",
+          deep: "rgb(var(--route-deep) / <alpha-value>)",
+          foreground: "rgb(var(--route-foreground) / <alpha-value>)",
+        },
         success: "rgb(var(--success) / <alpha-value>)",
         warning: "rgb(var(--warning) / <alpha-value>)",
         danger: "rgb(var(--danger) / <alpha-value>)",
         info: "rgb(var(--info) / <alpha-value>)",
       },
       borderRadius: {
-        card: "16px",
+        card: "14px",
         control: "10px",
         pill: "9999px",
       },
@@ -56,8 +64,9 @@ export default {
         mono: ['"Cascadia Code"', "Consolas", "monospace"],
       },
       boxShadow: {
-        card: "0 1px 2px rgba(0,0,0,.04)",
-        "card-hover": "0 4px 12px rgba(0,0,0,.08)",
+        card: "0 1px 2px rgb(var(--shadow-rgb) / 0.06)",
+        "card-hover": "0 12px 28px -18px rgb(var(--shadow-rgb) / 0.42), 0 3px 10px rgb(var(--shadow-rgb) / 0.08)",
+        elevated: "0 18px 50px -28px rgb(var(--shadow-rgb) / 0.5), 0 4px 14px rgb(var(--shadow-rgb) / 0.12)",
       },
     },
   },

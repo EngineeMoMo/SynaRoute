@@ -117,7 +117,7 @@ export function EnvConflictBanner({ category }: { category: CategoryType }) {
   };
 
   return (
-    <div className="mx-6 mb-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-xs text-warning">
+    <div className="mx-6 mb-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-xs text-warning shadow-sm">
       {found.length > 0 && (
         <div className="flex items-start gap-2">
           <AlertTriangle size={14} className="mt-0.5 shrink-0" />
@@ -157,7 +157,7 @@ export function EnvConflictBanner({ category }: { category: CategoryType }) {
                 type="button"
                 disabled={busy}
                 onClick={() => setConfirming(true)}
-                className="mt-2 rounded-md border border-warning/50 px-2 py-1 disabled:opacity-50"
+                className="mt-2 rounded-control border border-warning/50 px-2 py-1 disabled:opacity-50"
               >
                 {t("env.remove", { n: removable.length })}
               </button>
@@ -170,14 +170,14 @@ export function EnvConflictBanner({ category }: { category: CategoryType }) {
                   <button
                     type="button"
                     onClick={() => void doRemove()}
-                    className="rounded-md bg-warning/12 border border-warning px-2 py-1 font-medium"
+                    className="rounded-control bg-warning/12 border border-warning px-2 py-1 font-medium"
                   >
                     {t("env.confirmOk")}
                   </button>
                   <button
                     type="button"
                     onClick={() => setConfirming(false)}
-                    className="rounded-md border border-warning/50 px-2 py-1"
+                    className="rounded-control border border-warning/50 px-2 py-1"
                   >
                     {t("sessions.cancel")}
                   </button>

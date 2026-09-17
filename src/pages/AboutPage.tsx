@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
-import { Button } from "@/components/ui/Button";
+import { Button, IconButton } from "@/components/ui/Button";
+import { PageHeader } from "@/components/ui/PageHeader";
 import { useT } from "@/lib/useT";
 import { openExternalUrl } from "@/lib/openExternal";
 import { useStore } from "@/store";
@@ -80,23 +81,21 @@ function ContactRow({
       <Icon size={15} className="shrink-0 text-text-secondary" />
       <span className="w-20 shrink-0 text-xs text-text-muted">{label}</span>
       <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-primary">{value}</span>
-      <button
+      <IconButton
+        variant="ghost"
+        label={t("about.copy")}
         onClick={copy}
-        className="shrink-0 rounded p-1 text-text-muted hover:bg-surface-hover hover:text-text-primary"
-        title={t("about.copy")}
-        aria-label={t("about.copy")}
-      >
-        {copied ? <Check size={13} className="text-success" /> : <Copy size={13} />}
-      </button>
+        className="h-8 w-8"
+        icon={copied ? <Check size={13} className="text-success" /> : <Copy size={13} />}
+      />
       {href && (
-        <button
+        <IconButton
+          variant="ghost"
+          label={t("about.openInBrowser")}
           onClick={() => void openExternal(href, (m) => showToast("error", m))}
-          className="shrink-0 rounded p-1 text-text-muted hover:bg-surface-hover hover:text-text-primary"
-          title={t("about.openInBrowser")}
-          aria-label={t("about.openInBrowser")}
-        >
-          <ExternalLink size={13} />
-        </button>
+          className="h-8 w-8"
+          icon={<ExternalLink size={13} />}
+        />
       )}
     </div>
   );
@@ -110,10 +109,7 @@ export function AboutPage() {
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="border-b border-border px-6 py-4">
-        <h1 className="text-lg font-semibold text-text-primary">{t("about.title")}</h1>
-        <p className="mt-1 text-xs text-text-muted">{t("about.subtitle")}</p>
-      </div>
+      <PageHeader icon={Heart} title={t("about.title")} description={t("about.subtitle")} />
 
       <div className="space-y-4 p-6">
         <Card>
@@ -124,7 +120,7 @@ export function AboutPage() {
                 broken image 图标比首字母占位难看得多，且看不出是网络问题。
               */}
               {avatarFailed ? (
-                <div className="flex h-20 w-20 shrink-0 items-center justify-center rounded-full bg-primary/15 text-2xl font-semibold text-primary">
+                <div className="flex h-20 w-20 shrink-0 items-center justify-center rounded-full border border-primary/20 bg-primary/12 text-2xl font-semibold text-primary">
                   {GH_USER.slice(0, 1).toUpperCase()}
                 </div>
               ) : (

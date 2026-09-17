@@ -66,7 +66,7 @@ export function Combobox({
     <div ref={rootRef} className="relative">
       <div className="relative">
         <input
-          className={`${className} pr-8`}
+          className={`${className} pr-8 transition-all duration-150 focus:border-route focus:outline-none focus:ring-2 focus:ring-route/20`}
           value={shownValue}
           placeholder={placeholder}
           onChange={(e) => {
@@ -87,14 +87,14 @@ export function Combobox({
             setOpen((v) => !v);
             setTyping(false);
           }}
-          className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-text-muted hover:text-text-secondary"
+          className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-text-muted transition-colors hover:bg-surface-hover hover:text-text-primary"
         >
           <ChevronDown size={14} className={open ? "rotate-180 transition-transform" : "transition-transform"} />
         </button>
       </div>
 
       {open && (
-        <div className="absolute z-20 mt-1 max-h-48 w-full overflow-y-auto rounded-control border border-border bg-surface py-1 shadow-lg">
+        <div className="absolute z-20 mt-1 max-h-48 w-full overflow-y-auto rounded-control border border-border-strong/70 bg-surface-overlay py-1 shadow-elevated backdrop-blur-sm">
           {filtered.length === 0 ? (
             <div className="px-3 py-2 text-xs text-text-muted">{emptyHint}</div>
           ) : (
@@ -103,7 +103,7 @@ export function Combobox({
                 key={o}
                 type="button"
                 onClick={() => commit(o)}
-                className="flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-xs text-text-primary hover:bg-surface-hover"
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-xs text-text-primary transition-colors hover:bg-surface-hover focus-visible:bg-surface-hover focus-visible:outline-none"
               >
                 <Check size={12} className={o === value ? "text-primary" : "invisible"} />
                 <span className="truncate">{o}</span>

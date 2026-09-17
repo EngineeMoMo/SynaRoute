@@ -3,6 +3,7 @@ import { useStore } from "@/store";
 import { useT } from "@/lib/useT";
 import { api } from "@/lib/bridge";
 import { ArrowUpCircle, RefreshCw, X } from "lucide-react";
+import { Button, IconButton } from "@/components/ui/Button";
 
 /**
  * 顶部全宽「发现新版本」横幅。
@@ -43,8 +44,8 @@ export function UpdateBanner({ onOpenSettings }: { onOpenSettings: () => void })
   };
 
   return (
-    <div className="flex shrink-0 items-center gap-3 bg-primary px-4 py-2 text-primary-foreground shadow-sm">
-      <ArrowUpCircle size={17} className="shrink-0" />
+    <div className="flex shrink-0 items-center gap-3 border-b border-route/30 bg-route/12 px-4 py-2 text-text-primary shadow-sm">
+      <ArrowUpCircle size={17} className="shrink-0 text-route" />
 
       {/* 文案整块可点：跳设置页看更新说明。比单独一个「详情」链接更好点中。 */}
       <button
@@ -56,10 +57,12 @@ export function UpdateBanner({ onOpenSettings }: { onOpenSettings: () => void })
         <span className="ml-2 text-xs opacity-80">{t("update.viewNotes")}</span>
       </button>
 
-      <button
+      <Button
+        variant="secondary"
+        size="sm"
         onClick={() => void install()}
         disabled={installing}
-        className="shrink-0 rounded-control bg-white/95 px-3 py-1 text-xs font-semibold text-primary transition-colors hover:bg-white disabled:opacity-60"
+        className="shrink-0 border-route/20 bg-surface/95 text-route hover:bg-surface"
       >
         {installing ? (
           <span className="flex items-center gap-1.5">
@@ -69,16 +72,15 @@ export function UpdateBanner({ onOpenSettings }: { onOpenSettings: () => void })
         ) : (
           t("update.installNow")
         )}
-      </button>
+      </Button>
 
-      <button
+      <IconButton
+        variant="ghost"
+        label={t("update.later")}
         onClick={() => setDismissedVer(ver)}
-        className="shrink-0 rounded p-1 opacity-80 transition-colors hover:bg-white/15 hover:opacity-100"
-        title={t("update.later")}
-        aria-label={t("update.later")}
-      >
-        <X size={14} />
-      </button>
+        className="h-8 w-8 shrink-0 text-text-secondary hover:bg-route/12 hover:text-text-primary"
+        icon={<X size={14} />}
+      />
     </div>
   );
 }

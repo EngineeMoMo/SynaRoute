@@ -173,11 +173,11 @@ export function Tooltip({
             }}
             role="tooltip"
           >
-            <div className="relative max-w-xs rounded-md bg-gray-900 px-3 py-1.5 text-xs text-white shadow-lg dark:bg-gray-100 dark:text-gray-900">
+            <div className="relative max-w-xs rounded-control border border-border-strong/70 bg-surface-overlay px-3 py-1.5 text-xs font-medium text-text-primary shadow-elevated">
               {content}
               {/* 箭头（纯 CSS 实现，不依赖 SVG） */}
               <div
-                className={`absolute h-0 w-0 border-4 border-gray-900 dark:border-gray-100 ${arrowClass}`}
+                className={`absolute h-0 w-0 border-4 border-surface-overlay ${arrowClass}`}
               />
             </div>
           </div>,

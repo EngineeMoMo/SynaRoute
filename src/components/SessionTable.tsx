@@ -42,7 +42,7 @@ export function SessionTable({
     //
     // 上限取 70vh 而不是固定像素：会话少时表格是自然高度、整页一起滚（不产生嵌套滚动区）；
     // 会话多到超过它才在表内滚，而那恰好是表头钉住唯一有价值的时候。
-    <div className="max-h-[70vh] overflow-auto rounded-md border border-border">
+    <div className="max-h-[70vh] overflow-auto rounded-control border border-border">
       <table className="w-full text-sm">
         <thead className="sticky top-0 z-10 bg-surface text-left text-text-muted shadow-[0_1px_0_0] shadow-border">
           <tr>
@@ -70,7 +70,7 @@ export function SessionTable({
                   />
                 </td>
                 <td className="max-w-[24rem] px-3 py-2">
-                  <div className="truncate text-text" title={r.title || r.relPath}>
+                  <div className="truncate text-text-primary" title={r.title || r.relPath}>
                     {r.title || t("sessions.noTitle")}
                   </div>
                   <div className="mt-0.5 flex flex-wrap items-center gap-1">
@@ -83,7 +83,7 @@ export function SessionTable({
                   </div>
                 </td>
                 <td className="px-3 py-2">
-                  <code className={bad ? "text-danger" : "text-text"}>{r.provider || "—"}</code>
+                  <code className={bad ? "text-danger" : "text-text-primary"}>{r.provider || "—"}</code>
                   {bad && (
                     <Badge variant="danger" className="ml-2">
                       {t("sessions.mismatch")}
@@ -105,7 +105,7 @@ export function SessionTable({
                     <div className="text-xs">{formatTokens(r.tokens)} tokens</div>
                   )}
                 </td>
-                <td className="whitespace-nowrap px-3 py-2 text-text">{formatTime(r.timestamp)}</td>
+                <td className="whitespace-nowrap px-3 py-2 text-text-primary">{formatTime(r.timestamp)}</td>
                 <td className="max-w-[16rem] truncate px-3 py-2 text-text-muted" title={r.cwd}>
                   {r.cwd || "—"}
                   {/* Desktop 项目侧栏的归属。空 = 未归入任何项目，那正是「这条对话为什么
@@ -126,7 +126,7 @@ export function SessionTable({
                     type="button"
                     onClick={() => onExport(r)}
                     title={t("sessions.export")}
-                    className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-text hover:bg-surface-hover"
+                    className="inline-flex items-center gap-1 rounded-control border border-border px-2 py-1 text-xs text-text-primary transition-colors hover:border-border-strong hover:bg-surface-hover"
                   >
                     <Download className="h-3.5 w-3.5" />
                     {t("sessions.export")}

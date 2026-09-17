@@ -63,11 +63,9 @@ export function Sidebar({ active, onSelect, onOpenPalette }: SidebarProps) {
   const updateVer = updateCheck?.version;
 
   const renderGroup = (group: NavItem["group"], title?: string) => (
-    <div className="mb-4">
+    <div className="mb-5">
       {title && (
-        <div className="px-3 pb-1 text-[11px] font-medium uppercase tracking-wider text-text-muted">
-          {title}
-        </div>
+        <div className="sr-section-label px-3 pb-1.5">{title}</div>
       )}
       {NAV.filter((n) => n.group === group).map((item) => {
         const Icon = item.icon;
@@ -78,24 +76,24 @@ export function Sidebar({ active, onSelect, onOpenPalette }: SidebarProps) {
             key={item.key}
             onClick={() => onSelect(item.key)}
             className={cn(
-              "flex w-full items-center gap-2.5 rounded-control px-3 py-2 text-sm transition-colors",
+              "flex w-full items-center gap-2.5 rounded-control border px-3 py-2 text-sm transition-all duration-150 active:scale-[0.99]",
               isActive
-                ? "bg-primary/12 font-medium text-primary"
-                : "text-text-secondary hover:bg-surface-hover hover:text-text-primary"
+                ? "border-route/20 bg-route/12 font-medium text-route"
+                : "border-transparent text-text-secondary hover:border-border hover:bg-surface-hover hover:text-text-primary"
             )}
           >
             <span className="relative shrink-0">
               <Icon size={16} />
               {showDot && (
                 <span
-                  className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-primary ring-2 ring-surface"
+                  className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-route ring-2 ring-surface"
                   aria-hidden
                 />
               )}
             </span>
             <span className="truncate">{t(item.tKey)}</span>
             {showDot && (
-              <span className="ml-auto shrink-0 rounded-full bg-primary/15 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+              <span className="ml-auto shrink-0 rounded-full border border-primary/20 bg-primary/12 px-1.5 py-0.5 text-[10px] font-medium text-primary">
                 {updateVer ? `v${updateVer}` : t("settings.updateBadge")}
               </span>
             )}
@@ -106,15 +104,15 @@ export function Sidebar({ active, onSelect, onOpenPalette }: SidebarProps) {
   );
 
   return (
-    <aside className="flex h-full w-56 shrink-0 flex-col border-r border-border bg-surface">
+    <aside className="flex h-full w-56 shrink-0 flex-col border-r border-border/80 bg-surface/85 backdrop-blur-xl">
       {/* Logo 区 */}
-      <div className="flex items-center gap-2 px-4 py-4">
+      <div className="flex items-center gap-2 border-b border-border/80 px-4 py-4">
         {/*
           这里原先挂着一个「有新版本」角标（ArrowUpCircle）。已移除：它与 Logo 图形挤在同一个
           32px 方块里，实测用户看不见。更新提示改由顶部整宽横幅承担（见 UpdateBanner），
           常驻入口仍保留在下方「设置」导航项的圆点 + 版本徽章上。
         */}
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-control bg-primary text-primary-foreground">
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-control bg-gradient-to-br from-primary to-primary-deep text-primary-foreground shadow-sm shadow-primary/25">
           <Waypoints size={18} />
         </div>
         <div className="min-w-0 leading-tight">
@@ -127,7 +125,7 @@ export function Sidebar({ active, onSelect, onOpenPalette }: SidebarProps) {
         </div>
       </div>
 
-      <nav className="flex-1 overflow-y-auto px-2 py-2">
+      <nav className="flex-1 overflow-y-auto px-2.5 py-3">
         {/*
           命令面板入口（UX#7）。纯快捷键的功能等于没做 —— 没人会去猜一个没有任何视觉线索的
           Ctrl+K。这一条同时承担「告诉用户有这个功能」和「鼠标用户也能用」两件事，
@@ -135,7 +133,7 @@ export function Sidebar({ active, onSelect, onOpenPalette }: SidebarProps) {
         */}
         <button
           onClick={onOpenPalette}
-          className="mb-3 flex w-full items-center gap-2.5 rounded-control px-3 py-2 text-sm text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary"
+          className="mb-4 flex w-full items-center gap-2.5 rounded-control border border-transparent px-3 py-2 text-sm text-text-secondary transition-all duration-150 hover:border-border hover:bg-surface-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-route/50"
         >
           <Search size={16} className="shrink-0" />
           <span className="truncate">{t("palette.launcher")}</span>

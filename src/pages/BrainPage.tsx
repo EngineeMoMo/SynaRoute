@@ -229,7 +229,7 @@ export function BrainPage() {
           /* 加载失败必须**可见且可重试**：原先无 catch，任一 IPC 失败就永久停在
              「加载中…」——没有原因、没有出路，用户只能切页再切回来赌一次。 */
           <div className="p-6">
-            <div className="rounded-card border border-danger/40 bg-danger/8 p-4">
+            <div className="sr-panel border-danger/40 bg-danger/8 p-4">
               <div className="text-sm font-semibold text-danger">{t("brain.loadFailed")}</div>
               <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-control bg-background p-2.5 font-mono text-[11px] text-text-secondary">
                 {loadError}
@@ -328,7 +328,7 @@ export function BrainPage() {
                       return (
                         <div
                           key={m.id}
-                          className="flex items-center gap-2 rounded-control border border-border bg-surface px-2.5 py-2"
+                          className="flex items-center gap-2 rounded-control border border-border bg-surface/70 px-2.5 py-2 transition-colors hover:border-border-strong"
                         >
                           <BrandIcon hint={k?.vendor ?? m.modelName} fallbackLabel={k?.name} iconUrl={k?.icon ?? vendorIcon(k?.vendor)} size={20} />
                           <div className="min-w-0 flex-1">
@@ -623,7 +623,7 @@ function BrainHeader({
 }) {
   const t = useT();
   return (
-    <div className="border-b border-border px-6 py-4">
+    <div className="border-b border-border/80 px-6 py-4">
       <div className="flex items-center gap-2">
         <Brain size={20} className="text-primary" />
         <h1 className="text-lg font-semibold text-text-primary">{t("brain.title")}</h1>
@@ -646,8 +646,8 @@ function BrainHeader({
             onClick={() => setCategory(c.value)}
             className={`rounded-control border px-3 py-1 text-xs transition-colors ${
               category === c.value
-                ? "border-primary bg-primary/12 text-primary"
-                : "border-border text-text-secondary hover:bg-surface-hover"
+                ? "border-route/30 bg-route/12 text-route"
+                : "border-border text-text-secondary hover:border-border-strong hover:bg-surface-hover"
             }`}
           >
             {t(c.tKey)}
@@ -680,7 +680,7 @@ function MemberPicker({
   const k = keys.find((x) => x.id === selKey);
 
   return (
-    <div className="space-y-2 rounded-control border border-dashed border-border p-2.5">
+    <div className="space-y-2 rounded-control border border-dashed border-border-strong/70 bg-surface/40 p-2.5">
       <div className="text-xs font-medium text-text-secondary">{t("brain.addMember")}</div>
       {/* 第一级：选 Key */}
       <div className="flex items-center gap-2">
@@ -734,7 +734,7 @@ function MemberPicker({
                     className={`inline-flex items-center gap-1 rounded-control border px-2 py-1 text-xs transition-colors ${
                       added
                         ? "cursor-default border-border bg-surface-hover text-text-muted"
-                        : "border-border text-text-secondary hover:border-primary hover:bg-primary/10 hover:text-primary"
+                        : "border-border text-text-secondary hover:border-route hover:bg-route/8 hover:text-route"
                     }`}
                   >
                     {added ? <CheckCircle size={11} /> : <Plus size={11} />}
@@ -881,10 +881,10 @@ function ModeOption({
     <button
       onClick={onClick}
       className={`flex-1 rounded-control border p-3 text-left transition-colors ${
-        active ? "border-primary bg-primary/8" : "border-border hover:bg-surface-hover"
+        active ? "border-route/40 bg-route/8" : "border-border hover:border-border-strong hover:bg-surface-hover"
       }`}
     >
-      <div className={`text-sm font-medium ${active ? "text-primary" : "text-text-primary"}`}>
+      <div className={`text-sm font-medium ${active ? "text-route" : "text-text-primary"}`}>
         {title}
       </div>
       <div className="mt-0.5 text-[11px] text-text-muted">{desc}</div>

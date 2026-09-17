@@ -2,6 +2,9 @@ import * as React from "react";
 import { useEffect, useMemo, useState } from "react";
 import { useStore } from "@/store";
 import { Badge } from "@/components/ui/Badge";
+import { Button, IconButton } from "@/components/ui/Button";
+import { InlineAlert } from "@/components/ui/InlineAlert";
+import { PageHeader } from "@/components/ui/PageHeader";
 import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
 import { usePolling } from "@/lib/usePolling";
@@ -150,22 +153,15 @@ export function LogsPage() {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="border-b border-border px-6 py-4">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            {/* 标题配图标（UI-1）：与 BrainPage 的 `<Brain size={20} className="text-primary"/>`
-                同一形制，让各页顶部有一致的识别锚点。 */}
-            <div className="flex items-center gap-2">
-              <ScrollText size={20} className="text-primary" />
-              <h1 className="text-lg font-semibold text-text-primary">{t("logs.title")}</h1>
-            </div>
-            <p className="mt-1 text-xs text-text-muted">{t("logs.subtitle")}</p>
-          </div>
-          {/* 搜索（UX#10）：与下方两维筛选正交叠加，徽标计数会跟着搜索结果走 */}
+      <PageHeader
+        icon={ScrollText}
+        title={t("logs.title")}
+        description={t("logs.subtitle")}
+        actions={
           <div className="relative shrink-0">
             <Search
               size={13}
-              className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-text-muted"
+              className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-text-muted"
             />
             <input
               type="search"
@@ -173,13 +169,14 @@ export function LogsPage() {
               onChange={(e) => setQuery(e.target.value)}
               placeholder={t("logs.searchPlaceholder")}
               aria-label={t("logs.searchPlaceholder")}
-              className="w-56 rounded-control border border-border bg-surface py-1.5 pl-7 pr-2 text-xs text-text-primary placeholder:text-text-muted focus:border-primary focus:outline-none"
+              className="sr-control w-56 py-2 pl-7 pr-2 text-xs placeholder:text-text-muted"
             />
           </div>
-        </div>
+        }
+      />
 
-        {/* 分类筛选：全部 + 三个来源分类（带计数）。日志已合并连续展示，切换活动分类不再裁剪。 */}
-        <div className="mt-3 flex flex-wrap gap-1.5">
+      <div className="shrink-0 border-b border-border/80 px-6 pb-3">
+        <div className="flex flex-wrap gap-1.5">
           <FilterTab
             label={t("logs.filter.allCategories")}
             count={allByCat}
@@ -197,7 +194,6 @@ export function LogsPage() {
           ))}
         </div>
 
-        {/* 类型分组筛选：全部 + 4 个分组（带计数） */}
         <div className="mt-2 flex flex-wrap gap-1.5">
           <FilterTab
             label={t("logs.filter.all")}
@@ -230,12 +226,7 @@ export function LogsPage() {
             {query.trim() ? (
               <>
                 <p className="text-sm">{t("logs.noMatch", { q: query.trim() })}</p>
-                <button
-                  onClick={() => setQuery("")}
-                  className="rounded-control border border-border px-2 py-1 text-xs text-text-secondary hover:bg-surface-hover"
-                >
-                  {t("logs.clearSearch")}
-                </button>
+                <Button variant="outline" size="sm" onClick={() => setQuery("")}>{t("logs.clearSearch")}</Button>
               </>
             ) : (
               <p className="text-sm">{t("logs.empty")}</p>
@@ -271,15 +262,15 @@ function FilterTab({
     <button
       type="button"
       onClick={onClick}
-      className={`flex items-center gap-1.5 rounded-control border px-2.5 py-1 text-xs transition-colors ${
+      className={`flex items-center gap-1.5 rounded-control border px-2.5 py-1 text-xs transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-route/40 ${
         active
-          ? "border-primary bg-primary/10 text-primary"
-          : "border-border text-text-secondary hover:bg-surface-hover"
+          ? "border-route/30 bg-route/12 text-route"
+          : "border-border text-text-secondary hover:border-border-strong hover:bg-surface-hover"
       }`}
     >
       {Icon && <Icon size={12} />}
       <span>{label}</span>
-      <span className={`rounded-full px-1.5 text-[10px] ${active ? "bg-primary/20" : "bg-surface-hover text-text-muted"}`}>
+      <span className={`rounded-full border border-border px-1.5 text-[10px] ${active ? "bg-route/12" : "bg-surface-hover text-text-muted"}`}>
         {count}
       </span>
     </button>
@@ -374,9 +365,9 @@ const LogRow = React.memo(function LogRow({ entry, lang }: { entry: EventLogEntr
   }, [repeat, open, entry.hasTrace, entry.id]);
 
   return (
-    <div className="rounded-control border border-border bg-surface">
+    <div className="sr-panel overflow-hidden">
       <div
-        className={`flex items-center gap-3 px-3 py-2 ${expandable ? "cursor-pointer hover:bg-surface-hover" : ""}`}
+        className={`flex items-center gap-3 px-3 py-2.5 transition-colors ${expandable ? "cursor-pointer hover:bg-surface-hover" : ""}`}
         onClick={expandable ? toggle : undefined}
       >
         {expandable ? (
@@ -450,9 +441,7 @@ function TraceDetail({ trace }: { trace: RequestTrace }) {
     <div className="border-t border-border px-3 py-3 text-xs">
       {/* 截断警告 */}
       {trace.wasTruncated && (
-        <div className="mb-3 flex items-center gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-warning">
-          <span className="font-semibold">{t("logs.trace.truncatedWarning")}</span>
-        </div>
+        <InlineAlert tone="warning" className="mb-3">{t("logs.trace.truncatedWarning")}</InlineAlert>
       )}
       {/* 概要信息栏 */}
       <div className="mb-3 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5">
@@ -508,13 +497,13 @@ function CodeBlock({ title, body, danger }: { title: string; body: string; dange
     <div>
       <div className="mb-1 flex items-center justify-between">
         <span className="text-text-muted">{title}</span>
-        <button
+        <IconButton
+          variant="ghost"
+          label={t("logs.trace.copy")}
           onClick={copy}
-          className="flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-surface-hover hover:text-text-primary"
-          title={t("logs.trace.copy")}
-        >
-          {copied ? <Check size={12} /> : <Copy size={12} />}
-        </button>
+          className="h-7 w-7"
+          icon={copied ? <Check size={12} /> : <Copy size={12} />}
+        />
       </div>
       <pre
         className={`max-h-72 overflow-auto rounded-control border border-border bg-background p-2.5 font-mono text-[11px] leading-relaxed ${

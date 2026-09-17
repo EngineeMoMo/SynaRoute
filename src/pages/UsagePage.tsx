@@ -6,8 +6,11 @@ import { useT } from "@/lib/useT";
 import type { TFunc } from "@/lib/i18n";
 import type { DailyUsageBucket, TokenUsage, UnpricedReason, UsageCostRow } from "@/types";
 import { Badge } from "@/components/ui/Badge";
+import { Button } from "@/components/ui/Button";
+import { InlineAlert } from "@/components/ui/InlineAlert";
+import { PageHeader } from "@/components/ui/PageHeader";
 import { Tooltip } from "@/components/ui/Tooltip";
-import { TrendingUp, AlertTriangle } from "lucide-react";
+import { TrendingUp } from "lucide-react";
 
 /**
  * 用量统计面板：按「分类 × Key」展示 token 消耗**与估算花费**。
@@ -187,35 +190,20 @@ export function UsagePage() {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="border-b border-border px-6 py-4">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <div className="flex items-center gap-2">
-              <TrendingUp size={20} className="text-primary" />
-              <h1 className="text-lg font-semibold text-text-primary">{t("usage.title")}</h1>
-            </div>
-            <p className="mt-1 text-xs text-text-muted">{t("usage.subtitle")}</p>
-            {sinceMs !== null && (
-              <p className="mt-0.5 text-xs text-text-muted" title={t("usage.sinceHint")}>
-                {t("usage.since")}: {new Date(sinceMs).toLocaleString()}
-              </p>
-            )}
-            {/* 单价表的核对日期：这张表是人工核对各厂商定价页得来的，会变旧，
-                而变旧的表现是金额悄悄偏离真实账单。给出日期，用户才能自己判断可信度。 */}
-            {tableDate && (
-              <p className="mt-0.5 text-xs text-text-muted">
-                {t("usage.tableDate", { date: tableDate })}
-              </p>
-            )}
-          </div>
-          <button
-            onClick={() => void load()}
-            className="shrink-0 rounded-control border border-border px-2.5 py-1 text-xs text-text-secondary hover:bg-surface-hover"
-          >
-            {t("usage.refresh")}
-          </button>
-        </div>
+      <PageHeader
+        icon={TrendingUp}
+        title={t("usage.title")}
+        description={
+          <>
+            <p>{t("usage.subtitle")}</p>
+            {sinceMs !== null && <p className="mt-0.5" title={t("usage.sinceHint")}>{t("usage.since")}: {new Date(sinceMs).toLocaleString()}</p>}
+            {tableDate && <p className="mt-0.5">{t("usage.tableDate", { date: tableDate })}</p>}
+          </>
+        }
+        actions={<Button variant="outline" size="sm" onClick={() => void load()}>{t("usage.refresh")}</Button>}
+      />
 
+      <div className="px-6">
         {rows && rows.length > 0 && (
           <>
             {/* 花费概览：今日 / 本周 / 本月（token），加累计估算金额 */}
@@ -269,48 +257,45 @@ export function UsagePage() {
             {/* 有行算不出金额时**按成因**如实说明，并各自指路。
                 旧实现是一句「模型名不在单价表中」—— 对四种成因里的三种都是假话。 */}
             {summary.unpriced > 0 && (
-              <div className="mt-2 flex items-start gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-[11px] leading-relaxed text-warning">
-                <AlertTriangle size={13} className="mt-0.5 shrink-0" />
-                <div>
-                  <div>{t("usage.unpricedBanner", { n: summary.unpriced })}</div>
-                  <ul className="mt-0.5 list-disc space-y-0.5 pl-4">
-                    {unpricedGroups.aggregate > 0 && (
-                      <li>{t("usage.unpricedGroup.aggregate", { n: unpricedGroups.aggregate })}</li>
-                    )}
-                    {unpricedGroups.keyDeleted > 0 && (
-                      <li>{t("usage.unpricedGroup.keyDeleted", { n: unpricedGroups.keyDeleted })}</li>
-                    )}
-                    {unpricedGroups.noModelName > 0 && (
-                      <li>
-                        {t("usage.unpricedGroup.noModelName", { n: unpricedGroups.noModelName })}
-                      </li>
-                    )}
-                    {unpricedGroups.modelNotInTable > 0 && (
-                      <li>
-                        {t("usage.unpricedGroup.modelNotInTable", {
-                          n: unpricedGroups.modelNotInTable,
-                          models: unpricedGroups.models.join(t("common.listSep")),
-                        })}
-                      </li>
-                    )}
-                  </ul>
-                </div>
-              </div>
+              <InlineAlert tone="warning" className="mt-2">
+                <div>{t("usage.unpricedBanner", { n: summary.unpriced })}</div>
+                <ul className="mt-0.5 list-disc space-y-0.5 pl-4">
+                  {unpricedGroups.aggregate > 0 && (
+                    <li>{t("usage.unpricedGroup.aggregate", { n: unpricedGroups.aggregate })}</li>
+                  )}
+                  {unpricedGroups.keyDeleted > 0 && (
+                    <li>{t("usage.unpricedGroup.keyDeleted", { n: unpricedGroups.keyDeleted })}</li>
+                  )}
+                  {unpricedGroups.noModelName > 0 && (
+                    <li>
+                      {t("usage.unpricedGroup.noModelName", { n: unpricedGroups.noModelName })}
+                    </li>
+                  )}
+                  {unpricedGroups.modelNotInTable > 0 && (
+                    <li>
+                      {t("usage.unpricedGroup.modelNotInTable", {
+                        n: unpricedGroups.modelNotInTable,
+                        models: unpricedGroups.models.join(t("common.listSep")),
+                      })}
+                    </li>
+                  )}
+                </ul>
+              </InlineAlert>
             )}
           </>
         )}
       </div>
 
       <div className="flex-1 overflow-y-auto p-6">
-        {error && <div className="text-sm text-danger">{error}</div>}
+        {error && <InlineAlert tone="danger">{error}</InlineAlert>}
         {!rows ? (
           <div className="py-16 text-center text-sm text-text-muted">{t("usage.loading")}</div>
         ) : rows.length === 0 ? (
           <div className="py-16 text-center text-sm text-text-muted">{t("usage.empty")}</div>
         ) : (
-          <div className="overflow-hidden rounded-card border border-border">
+          <div className="sr-panel overflow-hidden">
             <table className="w-full text-left text-sm">
-              <thead className="bg-surface-hover/60 text-xs text-text-muted">
+              <thead className="border-b border-border/80 bg-surface-hover/60 text-xs text-text-muted">
                 <tr>
                   <th className="px-4 py-2 font-medium">{t("usage.colCategory")}</th>
                   <th className="px-4 py-2 font-medium">{t("usage.colKey")}</th>
@@ -323,7 +308,7 @@ export function UsagePage() {
               </thead>
               <tbody className="divide-y divide-border">
                 {rows.map((r) => (
-                  <tr key={`${r.categoryId}/${r.keyId}`} className="hover:bg-surface-hover/40">
+                  <tr key={`${r.categoryId}/${r.keyId}`} className="transition-colors hover:bg-surface-hover/50">
                     <td className="px-4 py-2">
                       <Badge variant="neutral">{t(`nav.${r.categoryId}`)}</Badge>
                     </td>

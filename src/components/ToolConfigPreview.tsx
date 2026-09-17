@@ -3,8 +3,9 @@ import { api } from "@/lib/bridge";
 import { useStore } from "@/store";
 import { useT } from "@/lib/useT";
 import type { ToolConfigPreview as Preview } from "@/types";
-import { Button } from "@/components/ui/Button";
-import { FileCode2, RefreshCw, X, Copy, FolderOpen, AlertTriangle } from "lucide-react";
+import { Button, IconButton } from "@/components/ui/Button";
+import { InlineAlert } from "@/components/ui/InlineAlert";
+import { FileCode2, RefreshCw, X, Copy, FolderOpen } from "lucide-react";
 
 /**
  * 目标工具配置只读预览。
@@ -40,21 +41,19 @@ export function ToolConfigPreviewPanel({ open, onClose }: { open: boolean; onClo
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      className="sr-overlay fixed inset-0 z-50 flex items-center justify-center p-4"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-card border border-border bg-surface shadow-lg">
-        <div className="flex items-center gap-2 border-b border-border px-4 py-3">
-          <FileCode2 size={16} className="text-primary" />
+      <div className="sr-dialog flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden">
+        <div className="flex items-center gap-2 border-b border-border/80 px-4 py-3">
+          <span className="flex h-7 w-7 items-center justify-center rounded-control bg-route/12 text-route"><FileCode2 size={15} /></span>
           <h2 className="flex-1 text-sm font-semibold text-text-primary">{t("toolConfig.title")}</h2>
           <Button size="sm" variant="ghost" onClick={() => void load()} disabled={loading} title={t("common.refresh")}>
             <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
           </Button>
-          <button type="button" onClick={onClose} className="rounded p-1 hover:bg-surface-hover" aria-label={t("common.close")}>
-            <X size={16} />
-          </button>
+          <IconButton variant="ghost" label={t("common.close")} onClick={onClose} className="h-8 w-8" icon={<X size={16} />} />
         </div>
 
         <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3">
@@ -67,10 +66,7 @@ export function ToolConfigPreviewPanel({ open, onClose }: { open: boolean; onClo
                   但桌面端实际走的是别人那一档。这是「接入了但不生效」这类无头案的唯一线索，
                   必须醒目且给出可操作的恢复方式。 */}
               {data.takeoverWarning && (
-                <div className="flex items-start gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2">
-                  <AlertTriangle size={14} className="mt-0.5 shrink-0 text-warning" />
-                  <p className="text-[11px] leading-relaxed text-warning">{data.takeoverWarning}</p>
-                </div>
+                <InlineAlert tone="warning">{data.takeoverWarning}</InlineAlert>
               )}
               {data.files.map((f) => (
                 <div key={f.path} className="rounded-control border border-border bg-surface-elevated">
@@ -80,7 +76,7 @@ export function ToolConfigPreviewPanel({ open, onClose }: { open: boolean; onClo
                     </span>
                     <span
                       className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${
-                        f.exists ? "bg-success/15 text-success" : "bg-warning/15 text-warning"
+                        f.exists ? "bg-success/12 text-success" : "bg-warning/12 text-warning"
                       }`}
                     >
                       {f.exists ? t("toolConfig.exists") : t("toolConfig.missing")}
@@ -89,14 +85,13 @@ export function ToolConfigPreviewPanel({ open, onClose }: { open: boolean; onClo
                       {f.format}
                     </span>
                     {f.exists && f.content && (
-                      <button
-                        type="button"
-                        className="rounded p-1 hover:bg-surface-hover"
-                        title={t("toolConfig.copy")}
+                      <IconButton
+                        variant="ghost"
+                        label={t("toolConfig.copy")}
+                        className="h-7 w-7"
                         onClick={() => void navigator.clipboard?.writeText(f.content ?? "")}
-                      >
-                        <Copy size={12} />
-                      </button>
+                        icon={<Copy size={12} />}
+                      />
                     )}
                   </div>
                   <pre className="max-h-64 overflow-auto p-3 font-mono text-[11px] leading-relaxed text-text-primary">
@@ -108,7 +103,7 @@ export function ToolConfigPreviewPanel({ open, onClose }: { open: boolean; onClo
           )}
         </div>
 
-        <div className="flex items-center justify-end gap-2 border-t border-border px-4 py-3">
+        <div className="flex items-center justify-end gap-2 border-t border-border/80 px-4 py-3">
           <Button size="sm" variant="outline" onClick={onClose}>
             {t("common.close")}
           </Button>

@@ -8,8 +8,11 @@ import type {
   CodexSessionRow,
 } from "@/types";
 import { ToggleRow } from "@/components/ToggleRow";
-import { AlertTriangle, FolderOpen, RefreshCw, Trash2, Wand2 } from "lucide-react";
+import { FolderOpen, RefreshCw, Trash2, Wand2 } from "lucide-react";
 import { SessionTable } from "@/components/SessionTable";
+import { Button } from "@/components/ui/Button";
+import { InlineAlert } from "@/components/ui/InlineAlert";
+import { PageHeader } from "@/components/ui/PageHeader";
 
 /**
  * Codex 会话管理页。
@@ -237,37 +240,25 @@ export function CodexSessionsPage() {
     // 一行都看不见。头部可能超高的页（设置 / 大脑 / 厂商 / 关于）全是本页这套。
     <div className="h-full overflow-y-auto">
       <div className="space-y-4 px-6 py-4">
-      <header className="flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-xl font-semibold text-text">{t("sessions.title")}</h1>
-          <p className="mt-1 max-w-3xl text-sm text-text-muted">{t("sessions.subtitle")}</p>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          {/* 打开导出目录：常驻而不是只在导出成功后才出现 —— 用户上一次导出可能是上次开应用时
-              做的，而那条 note 早就没了，那时他没有任何入口找到自己的文件。 */}
-          <button
-            type="button"
-            onClick={() => void doOpenExports()}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm text-text hover:bg-surface-hover"
-          >
-            <FolderOpen className="h-4 w-4" />
-            {t("sessions.openExports")}
-          </button>
-          <button
-            type="button"
-            onClick={() => void load()}
-            disabled={refreshing}
-            aria-busy={refreshing}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm text-text hover:bg-surface-hover disabled:opacity-50"
-          >
-            <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
-            {refreshing ? t("sessions.refreshing") : t("sessions.refresh")}
-          </button>
-        </div>
-      </header>
+      <PageHeader
+        icon={Wand2}
+        title={t("sessions.title")}
+        description={t("sessions.subtitle")}
+        actions={
+          <>
+            <Button variant="outline" size="sm" onClick={() => void doOpenExports()}>
+              <FolderOpen className="h-4 w-4" /> {t("sessions.openExports")}
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => void load()} disabled={refreshing} aria-busy={refreshing}>
+              <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
+              {refreshing ? t("sessions.refreshing") : t("sessions.refresh")}
+            </Button>
+          </>
+        }
+      />
 
       {data && (
-        <div className="rounded-md border border-border">
+        <div className="rounded-control border border-border">
           <dl className="grid grid-cols-2 gap-x-6 gap-y-2 p-4 text-sm sm:grid-cols-4">
             <Stat label={t("sessions.statTotal")} value={String(data.stats.total)} />
             <Stat label={t("sessions.statActive")} value={String(data.stats.active)} />
@@ -280,7 +271,7 @@ export function CodexSessionsPage() {
           </dl>
           <div className="border-t border-border px-4 py-2 text-xs text-text-muted">
             <span>{t("sessions.statDb")}: </span>
-            <code className="text-text">{data.stats.dbPath || t("sessions.dbNone")}</code>
+            <code className="text-text-primary">{data.stats.dbPath || t("sessions.dbNone")}</code>
             {data.stats.inDb < data.stats.total && (
               <p className="mt-1">
                 {t("sessions.inDbHint", { n: data.stats.inDb, total: data.stats.total })}
@@ -292,14 +283,14 @@ export function CodexSessionsPage() {
 
       {/* 同步区：目标下拉 + 立刻同步 + 自动同步开关 */}
       {targets && (
-        <div className="space-y-3 rounded-md border border-border p-4">
+        <div className="space-y-3 rounded-control border border-border p-4">
           <div className="flex flex-wrap items-end gap-3">
             <label className="flex flex-col gap-1 text-sm">
               <span className="text-text-muted">{t("sessions.targetLabel")}</span>
               <select
                 value={target}
                 onChange={(e) => setTarget(e.target.value)}
-                className="min-w-[18rem] rounded-md border border-border bg-surface px-2 py-1.5 text-sm text-text"
+                className="min-w-[18rem] rounded-control border border-border bg-surface px-2 py-1.5 text-sm text-text-primary"
               >
                 {targets.targets.map((o) => (
                   <option key={o.id} value={o.id}>
@@ -312,42 +303,33 @@ export function CodexSessionsPage() {
                 ))}
               </select>
             </label>
-            <button
-              type="button"
+            <Button
+              size="sm"
               disabled={syncing || !target}
               onClick={() => setConfirmingSync(true)}
-              className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50"
             >
               <Wand2 className="h-4 w-4" />
               {syncing ? t("sessions.syncing") : t("sessions.syncNow")}
-            </button>
+            </Button>
           </div>
           <p className="text-xs text-text-muted">{t("sessions.targetHint")}</p>
           <p className="text-xs text-text-muted">{t("sessions.syncHint")}</p>
           {/* 改用户的对话文件之前先让他看清会动几条、动成什么 —— 同大脑聚合落盘前那一屏预览 */}
           {confirmingSync && (
-            <div className="rounded-md border border-warning/50 bg-warning/8 p-3">
-              <p className="font-medium text-text">{t("sessions.syncConfirmTitle")}</p>
+            <div className="rounded-control border border-warning/50 bg-warning/8 p-3">
+              <p className="font-medium text-text-primary">{t("sessions.syncConfirmTitle")}</p>
               <p className="mt-1 text-sm text-text-muted">
                 {willChange > 0
                   ? t("sessions.syncConfirmBody", { n: willChange, target })
                   : t("sessions.syncConfirmNone", { total: data?.stats.total ?? 0, target })}
               </p>
               <div className="mt-3 flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => void doSync()}
-                  className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground"
-                >
+                <Button size="sm" onClick={() => void doSync()}>
                   {t("sessions.syncConfirmOk")}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setConfirmingSync(false)}
-                  className="rounded-md border border-border px-3 py-1.5 text-sm text-text"
-                >
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => setConfirmingSync(false)}>
                   {t("sessions.cancel")}
-                </button>
+                </Button>
               </div>
             </div>
           )}
@@ -361,33 +343,23 @@ export function CodexSessionsPage() {
       )}
 
       {mismatched > 0 && (
-        <div className="flex gap-2 rounded-md border border-warning/40 bg-warning/8 p-3 text-sm text-text">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
-          <span>{t("sessions.mismatchHint", { n: mismatched })}</span>
-        </div>
+        <InlineAlert tone="warning">{t("sessions.mismatchHint", { n: mismatched })}</InlineAlert>
       )}
 
       {/* 🔴 只有代理侧能给的那一位：provider 对了、模型却没人服务得了 */}
       {modelGone > 0 && (
-        <div className="flex gap-2 rounded-md border border-danger/40 bg-danger/8 p-3 text-sm text-text">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-danger" />
-          <span>{t("sessions.modelGoneHint", { n: modelGone })}</span>
-        </div>
+        <InlineAlert tone="danger">{t("sessions.modelGoneHint", { n: modelGone })}</InlineAlert>
       )}
 
       {/* 索引孤儿：只在真有孤儿时才出现整块（恒 0 的一行是噪音） */}
       {audit && audit.orphans > 0 && (
-        <div className="space-y-2 rounded-md border border-warning/40 bg-warning/8 p-3 text-sm text-text">
+        <div className="space-y-2 rounded-control border border-warning/40 bg-warning/8 p-3 text-sm text-text-primary">
           <p className="font-medium">{t("sessions.indexTitle")}</p>
           <p>{t("sessions.indexOrphans", { n: audit.orphans })}</p>
           <p className="text-xs text-text-muted">{t("sessions.indexBackupNote")}</p>
-          <button
-            type="button"
-            onClick={() => void doPrune()}
-            className="rounded-md border border-border px-3 py-1.5 text-xs text-text hover:bg-surface-hover"
-          >
+          <Button size="sm" variant="outline" onClick={() => void doPrune()}>
             {t("sessions.indexPrune")}
-          </button>
+          </Button>
         </div>
       )}
 
@@ -402,55 +374,42 @@ export function CodexSessionsPage() {
         </p>
       )}
 
-      {note && <p className="rounded-md bg-surface-hover p-3 text-sm text-text">{note}</p>}
+      {note && <p className="rounded-control bg-surface-hover p-3 text-sm text-text-primary">{note}</p>}
       {error && (
-        <p className="rounded-md border border-danger/40 bg-danger/8 p-3 text-sm text-text">
+        <p className="rounded-control border border-danger/40 bg-danger/8 p-3 text-sm text-text-primary">
           {t("sessions.loadFailed")}: {error}
         </p>
       )}
 
       {picked.size > 0 && (
-        <div className="flex flex-wrap items-center gap-3 rounded-md border border-border bg-surface-hover p-3">
-          <span className="text-sm text-text">{t("sessions.selected", { n: picked.size })}</span>
+        <div className="flex flex-wrap items-center gap-3 rounded-control border border-border bg-surface-hover p-3">
+          <span className="text-sm text-text-primary">{t("sessions.selected", { n: picked.size })}</span>
           {/* 勾完再筛选会让选中项藏起来 —— 藏着的条目照样会被删，所以必须点出来有几条 */}
           {hiddenPicked > 0 && (
             <span className="text-xs text-warning">
               {t("sessions.pickedHidden", { n: hiddenPicked })}
             </span>
           )}
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => setConfirming(true)}
-            className="inline-flex items-center gap-1.5 rounded-md bg-danger px-3 py-1.5 text-sm text-white disabled:opacity-50"
-          >
+          <Button variant="danger" size="sm" disabled={busy} onClick={() => setConfirming(true)}>
             <Trash2 className="h-4 w-4" />
             {t("sessions.deleteSelected")}
-          </button>
+          </Button>
         </div>
       )}
 
       {confirming && (
-        <div className="rounded-md border border-danger/50 bg-danger/8 p-4">
-          <p className="font-medium text-text">{t("sessions.confirmTitle")}</p>
+        <div className="rounded-control border border-danger/50 bg-danger/8 p-4">
+          <p className="font-medium text-text-primary">{t("sessions.confirmTitle")}</p>
           <p className="mt-1 text-sm text-text-muted">
             {t("sessions.confirmBody", { n: picked.size })}
           </p>
           <div className="mt-3 flex gap-2">
-            <button
-              type="button"
-              onClick={() => void doDelete()}
-              className="rounded-md bg-danger px-3 py-1.5 text-sm text-white"
-            >
-              {t("sessions.confirmOk")}
-            </button>
-            <button
-              type="button"
-              onClick={() => setConfirming(false)}
-              className="rounded-md border border-border px-3 py-1.5 text-sm text-text"
-            >
-              {t("sessions.cancel")}
-            </button>
+                <Button variant="danger" size="sm" onClick={() => void doDelete()}>
+                  {t("sessions.confirmOk")}
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => setConfirming(false)}>
+                  {t("sessions.cancel")}
+                </Button>
           </div>
         </div>
       )}
@@ -468,7 +427,7 @@ export function CodexSessionsPage() {
               onChange={(e) => setQuery(e.target.value)}
               placeholder={t("sessions.filterPlaceholder")}
               aria-label={t("sessions.filter")}
-              className="min-w-[16rem] flex-1 rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-text"
+              className="min-w-[16rem] flex-1 rounded-control border border-border bg-surface px-2.5 py-1.5 text-sm text-text-primary"
             />
             <label className="flex items-center gap-1.5 text-sm text-text-muted">
               <input type="checkbox" checked={onlyBad} onChange={(e) => setOnlyBad(e.target.checked)} />
@@ -506,7 +465,7 @@ function Stat({ label, value, danger }: { label: string; value: string; danger?:
   return (
     <div>
       <dt className="text-text-muted">{label}</dt>
-      <dd className={`text-lg font-semibold ${danger ? "text-danger" : "text-text"}`}>{value}</dd>
+      <dd className={`text-lg font-semibold ${danger ? "text-danger" : "text-text-primary"}`}>{value}</dd>
     </div>
   );
 }

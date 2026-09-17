@@ -4,7 +4,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "@/store";
 import { KeyCard } from "@/components/KeyCard";
 import { ProxyStatusBar } from "@/components/ProxyStatusBar";
-import { Button } from "@/components/ui/Button";
+import { Button, IconButton } from "@/components/ui/Button";
+import { InlineAlert } from "@/components/ui/InlineAlert";
+import { PageHeader } from "@/components/ui/PageHeader";
+import { DialogBody, DialogFooter, DialogFrame, DialogHeader } from "@/components/ui/DialogFrame";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
@@ -15,7 +18,7 @@ import { discoverableModels, keyExpectedSet, routingPrimaryKey } from "@/lib/mod
 // 有 5 个监听器要成对拆掉的状态机，混在页面组件里必然漏掉某一条清理。
 import { useKeyDrag } from "@/lib/useKeyDrag";
 import type { EventLogEntry, ProviderKey } from "@/types";
-import { Plus, AlertTriangle, Inbox, X } from "lucide-react";
+import { Plus, AlertTriangle, Inbox, X, Waypoints } from "lucide-react";
 import { EnvConflictBanner } from "@/components/EnvConflictBanner";
 
 /** 分类主页：代理状态条 + 模型映射兜底提示 + Key 卡片列表 */
@@ -200,23 +203,24 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
     <div className="flex h-full flex-col">
       <ProxyStatusBar proxy={proxy} />
 
-      <div className="flex items-center justify-between px-6 pb-3 pt-4">
-        <div>
-          <h1 className="text-lg font-semibold text-text-primary">{t(`nav.${activeCategory}`)}</h1>
-          {/* 「共 N 个 · M 个已启用」只报数，没说清「停用」意味着什么 ——
-              用户很容易以为停用的 Key 仍会作为备用被自动启用。 */}
+      <PageHeader
+        icon={Waypoints}
+        title={t(`nav.${activeCategory}`)}
+        description={
           <Tooltip content={t("category.keyCountTip")} side="bottom">
-            <p className="inline-block cursor-default text-xs text-text-muted">
+            <span className="cursor-default text-xs text-text-secondary">
               {t("category.keyCount", { total: keys.length, enabled: keys.filter((k) => k.enabled).length })}
-            </p>
+            </span>
           </Tooltip>
-        </div>
-        <Tooltip content={t("category.addKey")} side="left">
-          <Button size="icon" onClick={onAddKey} aria-label={t("category.addKey")}>
-            <Plus size={18} />
-          </Button>
-        </Tooltip>
-      </div>
+        }
+        actions={
+          <Tooltip content={t("category.addKey")} side="left">
+            <Button size="icon" onClick={onAddKey} aria-label={t("category.addKey")}>
+              <Plus size={18} />
+            </Button>
+          </Tooltip>
+        }
+      />
 
 
       {/* 桌面端接入被其他工具接管（cc-switch 一被点开就整份重写 _meta.json）：
@@ -225,17 +229,15 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
       {/* 密钥库锁定：比其他警告更靠前，因为它让**全部**转发失败，不是某一项配置不完美。
           用 danger 而非 warning，且给出可执行动作。 */}
       {vaultLocked && (
-        <div className="mx-6 mb-2 flex items-start gap-2 rounded-control border border-danger/30 bg-danger/8 px-3 py-2 text-xs text-danger">
-          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
-          <span className="flex-1 leading-relaxed">{t("master.lockedBanner")}</span>
-        </div>
+        <InlineAlert tone="danger" className="mx-6 mb-2">
+          {t("master.lockedBanner")}
+        </InlineAlert>
       )}
 
       {takeover && (
-        <div className="mx-6 mb-2 flex items-start gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-xs text-warning">
-          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
-          <span className="flex-1 leading-relaxed">{takeover}</span>
-        </div>
+        <InlineAlert tone="warning" className="mx-6 mb-2">
+          {takeover}
+        </InlineAlert>
       )}
 
       {/* 环境变量顶掉我们写的配置：与 takeover 同族（都是「接入完成但不生效」），
@@ -246,20 +248,22 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
           （哪个 Key、鉴权还是限流）此前只藏在运行日志页里，用户得先想到去翻。
           放在 vaultLocked / takeover 之后：那两条是「全盘不可用」，这条是「刚刚失败过一次」。 */}
       {recentFailure && (
-        <div className="mx-6 mb-2 flex items-start gap-2 rounded-control border border-danger/30 bg-danger/8 px-3 py-2 text-xs text-danger">
-          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
-          <div className="flex-1 leading-relaxed">
-            <span className="font-medium">{t("category.recentFailure")}</span>
-            <span className="ml-1 break-all">{recentFailure.detail}</span>
-          </div>
-          <button
-            type="button"
-            onClick={onOpenLogs}
-            className="shrink-0 whitespace-nowrap underline underline-offset-2 hover:opacity-80"
-          >
-            {t("category.recentFailureView")}
-          </button>
-        </div>
+        <InlineAlert
+          tone="danger"
+          className="mx-6 mb-2"
+          action={
+            <button
+              type="button"
+              onClick={onOpenLogs}
+              className="whitespace-nowrap font-medium underline underline-offset-2 hover:opacity-80"
+            >
+              {t("category.recentFailureView")}
+            </button>
+          }
+        >
+          <span className="font-medium">{t("category.recentFailure")}</span>
+          <span className="ml-1 break-all">{recentFailure.detail}</span>
+        </InlineAlert>
       )}
 
       {/* 熔断中的 Key（FR-028 常驻告警）：连续失败已自动暂停使用，其他 Key 接管。
@@ -269,15 +273,12 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
         /* 提示补的是横幅文字没答的那个问题：「我要做什么吗？」——答案是不用，
            倒计时结束自动恢复。没有这句，用户会去手动停用/删除那条 Key。 */
         <Tooltip content={t("category.trippedKeysTip")} side="bottom">
-          <div className="mx-6 mb-2 flex items-start gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-xs text-warning">
-            <AlertTriangle size={14} className="mt-0.5 shrink-0" />
-            <div className="flex-1 leading-relaxed">
-              <span className="font-medium">{t("category.trippedKeys")}</span>
-              <span className="ml-1 break-all">
-                {trippedKeys.map((k) => k.name).join(t("common.listSep"))}
-              </span>
-            </div>
-          </div>
+          <InlineAlert tone="warning" className="mx-6 mb-2">
+            <span className="font-medium">{t("category.trippedKeys")}</span>
+            <span className="ml-1 break-all">
+              {trippedKeys.map((k) => k.name).join(t("common.listSep"))}
+            </span>
+          </InlineAlert>
         </Tooltip>
       )}
 
@@ -286,7 +287,7 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
         <button
           type="button"
           onClick={() => setGapDialogOpen(true)}
-          className="mx-6 mb-2 flex items-center gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-left text-xs text-warning hover:bg-warning/12"
+          className="mx-6 mb-2 flex items-center gap-2 rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-left text-xs text-warning transition-colors hover:border-warning/50 hover:bg-warning/12 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-warning/40"
         >
           <AlertTriangle size={14} className="shrink-0" />
           <span className="flex-1 font-medium">{t("category.mappingGapSummary", { count: gaps.length })}</span>
@@ -383,36 +384,41 @@ function detectMappingGaps(enabledKeys: ProviderKey[]): Gap[] {
 function MappingGapDialog({ gaps, onClose }: { gaps: Gap[]; onClose: () => void }) {
   const t = useT();
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onMouseDown={(e) => {
+    <DialogFrame
+      size="md"
+      ariaLabel={t("category.mappingGapTitle")}
+      onBackdropMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="mx-4 flex max-h-[70vh] w-full max-w-lg flex-col rounded-card border border-border bg-surface shadow-xl">
-        <div className="flex items-start justify-between gap-2 border-b border-border px-5 py-4">
-          <div className="flex items-start gap-2">
-            <AlertTriangle size={18} className="mt-0.5 shrink-0 text-warning" />
-            <div>
-              <h2 className="text-base font-semibold text-text-primary">{t("category.mappingGapTitle")}</h2>
-              <p className="mt-0.5 text-xs text-text-muted">{t("category.mappingGapHint")}</p>
-            </div>
+      <DialogHeader>
+        <div className="flex items-start gap-2">
+          <span className="flex h-8 w-8 items-center justify-center rounded-control bg-warning/12 text-warning">
+            <AlertTriangle size={16} />
+          </span>
+          <div>
+            <h2 className="text-base font-semibold text-text-primary">{t("category.mappingGapTitle")}</h2>
+            <p className="mt-0.5 text-xs text-text-muted">{t("category.mappingGapHint")}</p>
           </div>
-          <button onClick={onClose} className="shrink-0 rounded p-1 text-text-muted hover:bg-surface-hover">
-            <X size={18} />
-          </button>
         </div>
-        <div className="flex-1 space-y-1.5 overflow-y-auto px-5 py-4">
-          {gaps.map((g) => (
-            <div key={g.expected} className="rounded-control bg-warning/8 px-3 py-2 text-xs text-text-secondary">
-              {t("category.mappingGapItem", { expected: g.expected, keys: g.owner })}
-            </div>
-          ))}
-        </div>
-        <div className="flex justify-end border-t border-border px-5 py-3">
-          <Button variant="ghost" onClick={onClose}>{t("common.close")}</Button>
-        </div>
-      </div>
-    </div>
+        <IconButton
+          variant="ghost"
+          label={t("common.close")}
+          onClick={onClose}
+          className="h-8 w-8"
+          icon={<X size={17} />}
+        />
+      </DialogHeader>
+      <DialogBody className="space-y-1.5">
+        {gaps.map((g) => (
+          <div key={g.expected} className="rounded-control border border-warning/20 bg-warning/8 px-3 py-2 text-xs text-text-secondary">
+            {t("category.mappingGapItem", { expected: g.expected, keys: g.owner })}
+          </div>
+        ))}
+      </DialogBody>
+      <DialogFooter>
+        <Button variant="ghost" onClick={onClose}>{t("common.close")}</Button>
+      </DialogFooter>
+    </DialogFrame>
   );
 }
