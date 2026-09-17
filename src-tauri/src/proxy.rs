@@ -3956,6 +3956,34 @@ mod tests {
         spawn_mock_with_headers(status, body, &[]).await
     }
 
+    /// 起一个返回固定 SSE body 的 mock 上游，供同协议流式回归使用。
+    async fn spawn_sse_mock(body: &'static str) -> String {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| async move {
+                        let resp = Response::builder()
+                            .status(200)
+                            .header("content-type", "text/event-stream")
+                            .body(full_body(Bytes::from(body)))
+                            .unwrap();
+                        Ok::<_, hyper::Error>(resp)
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
     /// 同 [`spawn_mock`]，但额外附带响应头（用于验证 Retry-After 透传）。
     async fn spawn_mock_with_headers(
         status: u16,
@@ -5655,6 +5683,58 @@ mod tests {
             "同协议 Responses 上游 body 应含注入的 reasoning.effort=high，实际收到:\n{}",
             serde_json::to_string_pretty(&up).unwrap()
         );
+    }
+
+    /// 同协议 Responses 流式 usage 必须从 `response.completed.response.usage` 补记到实际 Key。
+    #[tokio::test]
+    async fn codex_responses_stream_usage_is_backfilled_to_key() {
+        let upstream = spawn_sse_mock(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n\
+             event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n\
+             event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1234,\"output_tokens\":56}}}\n\n\
+             data: [DONE]\n",
+        )
+        .await;
+        let dir = temp_dir("codex_usage_stream");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let mut k = key("usage-responses-e2e", 0, &upstream);
+        k.category_id = CategoryType::Codex;
+        k.protocol = Protocol::OpenaiResponses;
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("usage-responses-e2e", "x").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::Codex).await.unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .json(&json!({
+                "model": "gpt-5",
+                "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let _ = resp.text().await.unwrap();
+
+        let mut usage = None;
+        for _ in 0..50 {
+            usage = store
+                .token_usage_by_key()
+                .into_iter()
+                .find(|r| r.category_id == CategoryType::Codex && r.key_id == "usage-responses-e2e")
+                .map(|r| r.usage);
+            if usage.is_some() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        pm.stop(CategoryType::Codex);
+        std::fs::remove_dir_all(&dir).ok();
+
+        let usage = usage.expect("流末补记应为实际 Responses Key 创建累计桶");
+        assert_eq!((usage.input, usage.output), (1234, 56));
     }
 
     /// 🔴 用户 2026-09-04 实报：Codex 接 sub2api，**「OpenAI Chat」能用、「OpenAI Responses」

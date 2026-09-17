@@ -134,4 +134,14 @@ describe("会话页与后端的两处契约", () => {
       expect(src, `${fn} 没有任何调用点 —— 后端做好了但界面上点不到`).toContain(`api.${fn}(`);
     }
   });
+
+  it("刷新按钮必须显示进行中状态并锁住重复点击", () => {
+    const src = code(page);
+    expect(src).toContain("disabled={refreshing}");
+    expect(src).toContain("aria-busy={refreshing}");
+    expect(src).toContain('refreshing ? "animate-spin" : ""');
+    expect(src).toContain('refreshing ? t("sessions.refreshing") : t("sessions.refresh")');
+    expect(sessionsZh["sessions.refreshing"]).toBe("刷新中…");
+    expect(sessionsEn["sessions.refreshing"]).toBe("Refreshing…");
+  });
 });

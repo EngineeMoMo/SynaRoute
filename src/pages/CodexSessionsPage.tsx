@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/bridge";
 import { useT } from "@/lib/useT";
 import type {
@@ -49,18 +49,24 @@ export function CodexSessionsPage() {
   const [note, setNote] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [confirmingSync, setConfirmingSync] = useState(false);
   const [query, setQuery] = useState("");
   const [onlyBad, setOnlyBad] = useState(false);
   const [onlyGone, setOnlyGone] = useState(false);
+  const loadGeneration = useRef(0);
 
   const load = useCallback(async () => {
+    const generation = ++loadGeneration.current;
+    setRefreshing(true);
+    setError(null);
     try {
       const [next, tl, ia] = await Promise.all([
         api.listCodexSessions(),
         api.listCodexProviderTargets(),
         api.auditCodexSessionIndex(),
       ]);
+      if (generation !== loadGeneration.current) return;
       // 后端返回的形状做一次校验再入 state：本页多处直接解引用 row 字段，而 render 抛异常
       // 会让 React 卸载整棵树 → 整窗口白屏（用量页真机反馈过这种事故）。
       setData({
@@ -72,9 +78,11 @@ export function CodexSessionsPage() {
       // 只选后端真实列出的 id。`ours` 只是推荐标签，不保证当前 config 声明过它；
       // 让一个不在 options 里的 value 留在受控 select 中，会显示空白却仍允许写盘。
       setTarget((prev) => chooseKnownTarget(tl, prev));
-      setError(null);
     } catch (e) {
+      if (generation !== loadGeneration.current) return;
       setError(String(e));
+    } finally {
+      if (generation === loadGeneration.current) setRefreshing(false);
     }
   }, []);
 
@@ -248,10 +256,12 @@ export function CodexSessionsPage() {
           <button
             type="button"
             onClick={() => void load()}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm text-text hover:bg-surface-hover"
+            disabled={refreshing}
+            aria-busy={refreshing}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm text-text hover:bg-surface-hover disabled:opacity-50"
           >
-            <RefreshCw className="h-4 w-4" />
-            {t("sessions.refresh")}
+            <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
+            {refreshing ? t("sessions.refreshing") : t("sessions.refresh")}
           </button>
         </div>
       </header>

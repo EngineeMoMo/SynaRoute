@@ -17,45 +17,37 @@ use serde_json::Value;
 /// [`record_usage`]）——那些依赖协议字段形态，属于 upstream 的职责。
 pub use crate::model::TokenUsage;
 
-/// 从上游响应体里提取 token 用量，**同时兼容两家协议**的字段名。
-///
-/// Anthropic: `usage.{input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens}`
-/// OpenAI:    `usage.{prompt_tokens, completion_tokens}`（缓存在
-///            `prompt_tokens_details.cached_tokens`）
-///
-/// 取不到就返回 `None`（而非 0）：0 会让日志显示「本次 0 token」，看着像 bug；
-/// `None` 表示「这家中转商没给用量」，是如实陈述。
-pub fn extract_usage(body: &Value) -> Option<TokenUsage> {
-    let u = body.get("usage")?;
+/// 解析一个 usage 对象。不同协议的 envelope 在调用方统一处理，这里只负责字段归一化。
+fn parse_usage_object(u: &Value) -> Option<TokenUsage> {
     let num = |keys: &[&str]| -> u64 {
         keys.iter()
             .find_map(|k| u.get(*k).and_then(|v| v.as_u64()))
             .unwrap_or(0)
     };
-    let cache_read = u
+    let anthropic_cache_read = u
         .get("cache_read_input_tokens")
-        .and_then(|v| v.as_u64())
-        .or_else(|| {
-            u.get("prompt_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(|v| v.as_u64())
-        })
+        .and_then(|v| v.as_u64());
+    let chat_cache_read = u
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64());
+    let responses_cache_read = u
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64());
+    let cache_read = anthropic_cache_read
+        .or(chat_cache_read)
+        .or(responses_cache_read)
         .unwrap_or(0);
-    let cache_creation = u
-        .get("cache_creation_input_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    // 输入 token 的**语义归一**（两家协议口径不同，不归一就会重复计缓存）：
-    // - Anthropic `input_tokens`：**不含**缓存命中部分（cache_read_input_tokens 另计）；
-    // - OpenAI `prompt_tokens`：**已含** `prompt_tokens_details.cached_tokens`。
-    //
-    // TokenUsage 是按 Anthropic 语义定义的（见字段注释：input 不含缓存）。走 OpenAI 字段时
-    // 若原样填入，用量页「总计 = input+output+cache_read+cache_creation」会把缓存算两遍，
-    // 而 pricing 又对 input 与 cache_read 各乘一次单价（缓存价通常是满价的 1/10）——
-    // 该行金额可虚高近 10 倍，且同一面板上 Anthropic Key 与 OpenAI Key 口径不一致、无法对照。
-    // 故命中 OpenAI 字段时减去缓存部分（saturating：个别中转商会给出 cached > prompt 的脏数据）。
+    // Anthropic 的 input_tokens 不含缓存；OpenAI Chat/Responses 的输入总量包含缓存。
     let input = match u.get("input_tokens").and_then(|v| v.as_u64()) {
-        Some(anthropic_input) => anthropic_input, // 本就不含缓存，原样用
+        Some(total)
+            if anthropic_cache_read.is_none()
+                && (chat_cache_read.is_some() || responses_cache_read.is_some()) =>
+        {
+            total.saturating_sub(cache_read)
+        }
+        Some(input) => input,
         None => u
             .get("prompt_tokens")
             .and_then(|v| v.as_u64())
@@ -66,16 +58,34 @@ pub fn extract_usage(body: &Value) -> Option<TokenUsage> {
         input,
         output: num(&["output_tokens", "completion_tokens"]),
         cache_read,
-        cache_creation,
+        cache_creation: u
+            .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
     };
     (!usage.is_empty()).then_some(usage)
+}
+
+/// 从上游响应体里提取 token 用量。
+///
+/// 支持顶层 `usage`、Anthropic 的 `message.usage`，以及 OpenAI Responses 的
+/// `response.usage`。取不到或 usage 为空就返回 `None`，不伪造全零用量。
+pub fn extract_usage(body: &Value) -> Option<TokenUsage> {
+    [
+        body.get("usage"),
+        body.get("message").and_then(|m| m.get("usage")),
+        body.get("response").and_then(|r| r.get("usage")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(parse_usage_object)
 }
 
 /// 从**流式** SSE 全文里提取 token 用量。
 ///
 /// 流式的 usage 不在单个 chunk 的固定位置：Anthropic 放在 `message_start`（input）与
-/// `message_delta`（output）两处，OpenAI 放在最后一个带 `usage` 的 chunk。
-/// 故扫描全部 data 行、把见到的最大值取出来（同一字段后出现的值是累计值，取最大即最终值）。
+/// `message_delta`（output）两处，OpenAI Chat 放在最后一个带 `usage` 的 chunk，Responses
+/// 放在 `response.completed.response.usage`。故扫描所有 data 行、把见到的最大值取出来。
 pub fn extract_usage_from_sse(sse: &str) -> Option<TokenUsage> {
     let mut acc = TokenUsage::default();
     for line in sse.lines() {
@@ -89,15 +99,11 @@ pub fn extract_usage_from_sse(sse: &str) -> Option<TokenUsage> {
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             continue;
         };
-        // Anthropic 的 message_start 把 usage 藏在 message 下
-        let candidates = [v.get("usage"), v.get("message").and_then(|m| m.get("usage"))];
-        for c in candidates.into_iter().flatten() {
-            if let Some(u) = extract_usage(&serde_json::json!({ "usage": c })) {
-                acc.input = acc.input.max(u.input);
-                acc.output = acc.output.max(u.output);
-                acc.cache_read = acc.cache_read.max(u.cache_read);
-                acc.cache_creation = acc.cache_creation.max(u.cache_creation);
-            }
+        if let Some(u) = extract_usage(&v) {
+            acc.input = acc.input.max(u.input);
+            acc.output = acc.output.max(u.output);
+            acc.cache_read = acc.cache_read.max(u.cache_read);
+            acc.cache_creation = acc.cache_creation.max(u.cache_creation);
         }
     }
     (!acc.is_empty()).then_some(acc)
@@ -263,6 +269,49 @@ data: [DONE]\n";
         let tail_only = extract_usage_from_sse(tail).expect("尾窗有 output");
         assert_eq!(tail_only.input, 0, "仅尾窗时 input 必为 0（这正是被修的缺陷）");
         assert_eq!(tail_only.cache_read, 0);
+    }
+
+    #[test]
+    fn extract_usage_handles_responses_envelope_and_cache() {
+        let body = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 800,
+                    "output_tokens": 120,
+                    "input_tokens_details": { "cached_tokens": 512 }
+                }
+            }
+        });
+        let u = extract_usage(&body).expect("Responses response.usage 应能取到");
+        assert_eq!((u.input, u.output, u.cache_read, u.cache_creation), (288, 120, 512, 0));
+        assert_eq!(u.input + u.cache_read, 800, "Responses input+cache_read 必须还原原始 input_tokens");
+
+        // 空的顶层候选不能遮住后面的有效 Responses envelope。
+        let wrapped = serde_json::json!({
+            "usage": {},
+            "response": { "usage": { "input_tokens": 12, "output_tokens": 3 } }
+        });
+        let u = extract_usage(&wrapped).expect("空候选后仍应继续尝试 response.usage");
+        assert_eq!((u.input, u.output), (12, 3));
+    }
+
+    #[test]
+    fn extract_usage_from_sse_handles_responses_completed_usage() {
+        let sse = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n\
+            event: response.completed\n\
+            data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1234,\"output_tokens\":56}}}\n\n\
+            data: [DONE]\n";
+        let u = extract_usage_from_sse(sse).expect("Responses completed 事件应能取到嵌套 usage");
+        assert_eq!((u.input, u.output, u.cache_read), (1234, 56, 0));
+    }
+
+    #[test]
+    fn extract_usage_from_head_plus_tail_handles_responses_completed() {
+        let head = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n";
+        let tail = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":900,\"output_tokens\":80}}}\n\ndata: [DONE]\n";
+        let u = extract_usage_from_sse(&format!("{head}{tail}")).expect("尾窗中的 Responses usage 应能恢复");
+        assert_eq!((u.input, u.output), (900, 80));
     }
 
     #[test]

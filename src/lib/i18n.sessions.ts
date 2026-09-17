@@ -18,6 +18,7 @@ export const sessionsZh: Dict = {
   "sessions.subtitle":
     "本地历史对话。每条会话自带一个 provider —— 与当前生效的不一致时，打开它会走错上游",
   "sessions.refresh": "刷新",
+  "sessions.refreshing": "刷新中…",
   "sessions.loading": "加载中…",
   "sessions.empty": "没有找到本地会话（Codex 还没产生过对话，或 CODEX_HOME 指向了别处）",
   "sessions.colTime": "时间",
@@ -119,6 +120,7 @@ export const sessionsEn: Dict = {
   "sessions.subtitle":
     "Local conversation history. Each session carries its own provider — when it differs from the active one, opening it routes to the wrong upstream",
   "sessions.refresh": "Refresh",
+  "sessions.refreshing": "Refreshing…",
   "sessions.loading": "Loading…",
   "sessions.empty":
     "No local sessions found (Codex hasn't created any, or CODEX_HOME points elsewhere)",
