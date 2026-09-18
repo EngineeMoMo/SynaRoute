@@ -5,26 +5,45 @@
 /* ============================================================
    SynaRoute 设计系统 — 色彩 Token（对齐 UI 设计文档 §3.1）
    以 shadcn/ui 的 CSS 变量体系组织，支持浅色/深色主题切换
+
+   🔴 **三方必须同色**：应用图标（src-tauri/icons/icon.png 的靛紫圆角方块）、
+   官网（site/src/styles.css）、本文件。图标是**不可改的锚点** —— 它已经进了
+   安装包、开始菜单、任务栏与所有截图，改它等于换品牌。所以另外两处对齐它。
+
+   2026-09-18 返工记录：上一轮（提交 4ad57ce）把应用改成了暖白底 #F6F8F7 +
+   青绿强调 #0B8476，而图标与官网都是靛紫 #6D5EF7 + 冷灰 zinc。青绿是靛紫的
+   **对比色**，于是「同一个产品的图标、官网、界面」呈现三种互不相干的气质。
+   本轮把应用拉回靛紫 + zinc，中性色数值逐项取自官网那份（含它踩坑得出的修正，
+   例如 --text-secondary 比常见的 #71717A 深一档以便压在浅色底纹上仍达 AA）。
+
+   令牌**只改值、不改名** —— site/tailwind.config.js 直接
+   `import appConfig from "../tailwind.config.js"`，名字不动官网就自动跟随，
+   不会出现「软件一种紫、官网另一种紫」。改动一致性由
+   tests/tokenParity.test.ts 钉住（谁单改一侧就红）。
    ============================================================ */
 
 @layer base {
   :root {
-    /* 中性色 - 浅色 */
-    --background: 246 248 247; /* #F6F8F7 */
+    /* 中性色 - 浅色（zinc，与官网逐项一致） */
+    --background: 250 250 250; /* #FAFAFA */
     --surface: 255 255 255; /* #FFFFFF */
-    --surface-hover: 241 246 244; /* #F1F6F4 */
+    --surface-hover: 244 244 245; /* #F4F4F5 */
     --surface-elevated: 255 255 255; /* #FFFFFF */
-    --surface-overlay: 252 255 254; /* #FCFFFE */
-    --border: 220 230 225; /* #DCE6E1 */
-    --border-strong: 192 211 202; /* #C0D3CA */
-    --text-primary: 20 31 29; /* #141F1D */
-    --text-secondary: 76 94 88; /* #4C5E58 */
-    --text-muted: 114 132 125; /* #72847D */
-    --shadow-rgb: 17 47 39;
-    --scrim: 7 17 18;
+    --surface-overlay: 255 255 255; /* #FFFFFF */
+    --border: 228 228 231; /* #E4E4E7 */
+    --border-strong: 212 212 216; /* #D4D4D8 */
+    --text-primary: 24 24 27; /* #18181B */
+    /* 比常见的 zinc-500 #71717A 深一档。理由同官网：本应用有大量带色底纹的区块
+       （primary/8 的提示、warning/8 的风险条、surface-hover 的内嵌块），底色一浅，
+       #71717A 的 4.83:1 立刻掉到 3.9~4.4 全线不达 AA。深一档后在这些底纹上仍有
+       5:1 以上，肉眼与原色几乎无差别。 */
+    --text-secondary: 100 100 110; /* #64646E */
+    --text-muted: 161 161 170; /* #A1A1AA —— 仅用于装饰/非信息元素，不可作正文 */
+    --shadow-rgb: 24 24 27;
+    --scrim: 24 24 27;
 
     /* 品牌与功能色 */
-    --primary: 109 94 247; /* #6D5EF7 靛紫 */
+    --primary: 109 94 247; /* #6D5EF7 靛紫 —— 与图标、官网同值 */
     /**
      * 渐变的**深**色端（UI-1）。
      *
@@ -41,31 +60,67 @@
     --warning: 245 158 11; /* #F59E0B */
     --danger: 239 68 68; /* #EF4444 */
     --info: 59 130 246; /* #3B82F6 */
-    --route: 11 132 118; /* #0B8476 */
-    --route-deep: 7 91 82; /* #075B52 */
-    --route-foreground: 255 255 255;
+
+    /**
+     * 「路由 / 实时连接」这一支强调色。
+     *
+     * 🔴 **现在它就是品牌靛紫**（`var(--primary)` 的别名，不是复制的数值）。
+     *
+     * 为什么保留这个名字而不是把 66 处 `text-route` / `bg-route/12` 全改成
+     * `primary`：① 语义仍然成立 —— 它表示的是「这条链路活着」这一类信息，
+     * 只是当前与品牌色同值；② 其中 3 个调用点在棘轮冻结文件里（KeyEditor /
+     * BrainPage / SettingsPage），纯改名会动它们的行；③ 将来若要把这一支重新
+     * 分出色相，只改这三行，不必再碰 66 个调用点。
+     *
+     * 用 `var()` 间接而**不是**抄一份数值 —— 抄了就会漂移，而漂移的表现是
+     * 「两个看起来该一样的紫差了几个色阶」，极难被发现。
+     *
+     * ⚠️ 代价：route 与 primary 同值期间两者相邻时没有色相区分。层级改由**亮度**
+     * 承担（primary → primary-deep，深色下 primary 提亮到 #8174FF），
+     * 这就是本轮选定的「单色 + 亮度分层」。
+     */
+    --route: var(--primary);
+    --route-deep: var(--primary-deep);
+    --route-foreground: var(--primary-foreground);
 
     --radius-card: 14px;
     --radius-control: 10px;
+
+    /**
+     * ---- 海拔（四档，值驱动而非公式驱动）----
+     *
+     * 🔴 原先三档都写成 `rgb(var(--shadow-rgb) / 0.06)` 这种**低透明度 + 单一变量**
+     * 的形式，深色下 `--shadow-rgb: 0 0 0` @ 0.06 压在 #0E0E11 上算出来差不到
+     * 1/255 —— **等于一条 CSS 都没写**。官网当年就是这个 bug，表现是全站 30 余处
+     * `hover:shadow-card-hover` 在深色模式下毫无反馈（卡片 hover 没有任何变化）。
+     *
+     * 修法是浅深各给一组**成品阴影**：深色那组把黑影同时加深、加大（alpha 0.4~0.7），
+     * 才能在近黑底上看出一圈暗环。类名 `shadow-card` / `shadow-card-hover` /
+     * `shadow-elevated` 不变，全部调用点自动升级。
+     */
+    --shadow-card: 0 1px 2px rgb(24 24 27 / 0.05), 0 1px 3px rgb(24 24 27 / 0.04);
+    --shadow-card-hover: 0 2px 4px rgb(24 24 27 / 0.05), 0 10px 24px rgb(24 24 27 / 0.09);
+    --shadow-elevated: 0 4px 10px rgb(24 24 27 / 0.05), 0 18px 44px rgb(24 24 27 / 0.11);
+    --shadow-dialog: 0 8px 24px rgb(24 24 27 / 0.1), 0 32px 80px rgb(24 24 27 / 0.18);
   }
 
   .dark {
-    /* 中性色 - 深色 */
-    --background: 10 18 20; /* #0A1214 */
-    --surface: 16 27 29; /* #101B1D */
-    --surface-hover: 27 42 43; /* #1B2A2B */
-    --surface-elevated: 22 35 36; /* #162324 */
-    --surface-overlay: 20 33 35; /* #142123 */
-    --border: 39 61 61; /* #273D3D */
-    --border-strong: 63 88 87; /* #3F5857 */
-    --text-primary: 236 245 243; /* #ECF5F3 */
-    --text-secondary: 170 192 186; /* #AAC0BA */
-    --text-muted: 119 145 138; /* #77918A */
+    /* 中性色 - 深色（zinc，与官网逐项一致） */
+    --background: 14 14 17; /* #0E0E11 */
+    --surface: 24 24 27; /* #18181B */
+    --surface-hover: 35 35 41; /* #232329 */
+    --surface-elevated: 30 30 34; /* #1E1E22 */
+    --surface-overlay: 28 28 32; /* #1C1C20 */
+    --border: 39 39 42; /* #27272A */
+    --border-strong: 63 63 70; /* #3F3F46 */
+    --text-primary: 250 250 250; /* #FAFAFA */
+    --text-secondary: 161 161 170; /* #A1A1AA，在 #18181B 上 8.6:1 */
+    --text-muted: 82 82 91; /* #52525B —— 同浅色：不可作正文 */
     --shadow-rgb: 0 0 0;
     --scrim: 0 0 0;
 
-    /* 品牌与功能色（深色下略微提亮） */
-    --primary: 129 116 255; /* 略亮的靛紫 */
+    /* 品牌与功能色（深色下略微提亮，避免靛紫在近黑底上发闷） */
+    --primary: 129 116 255; /* #8174FF */
     /* 深色模式的 --primary 是 #8174FF（更亮），白字对比度本就更低，
        故这里的渐变深端也相应下压，保证白字仍在 AA 以上。 */
     --primary-deep: 104 92 240; /* #685CF0 */
@@ -74,9 +129,14 @@
     --warning: 245 158 11;
     --danger: 239 68 68;
     --info: 59 130 246;
-    --route: 74 214 189; /* #4AD6BD */
-    --route-deep: 32 162 143; /* #20A28F */
-    --route-foreground: 7 31 27;
+
+    /* route 的别名定义在 :root，深色下自动跟着提亮后的 --primary 走，不必重复。 */
+
+    /* ---- 海拔（深色版）---- 见 :root 里那段说明：深色**不能**沿用浅色那组值。 */
+    --shadow-card: 0 1px 2px rgb(0 0 0 / 0.4);
+    --shadow-card-hover: 0 2px 6px rgb(0 0 0 / 0.45), 0 12px 28px rgb(0 0 0 / 0.55);
+    --shadow-elevated: 0 4px 12px rgb(0 0 0 / 0.5), 0 20px 52px rgb(0 0 0 / 0.6);
+    --shadow-dialog: 0 10px 30px rgb(0 0 0 / 0.55), 0 36px 90px rgb(0 0 0 / 0.7);
   }
 
   * {
@@ -92,9 +152,11 @@
 
   body {
     background-color: rgb(var(--background));
+    /* 两团极淡的品牌光。第二团用 --primary-deep 而非另一个色相 ——
+       单色体系下层次靠明度，不靠再掺一支颜色（那正是上一轮跑偏的起点）。 */
     background-image:
-      radial-gradient(circle at 12% -8%, rgb(var(--primary) / 0.08), transparent 30%),
-      radial-gradient(circle at 92% 8%, rgb(var(--route) / 0.07), transparent 28%);
+      radial-gradient(circle at 12% -8%, rgb(var(--primary) / 0.07), transparent 30%),
+      radial-gradient(circle at 92% 6%, rgb(var(--primary-deep) / 0.05), transparent 28%);
     color: rgb(var(--text-primary));
     font-family: "Segoe UI", "Microsoft YaHei", system-ui, -apple-system,
       sans-serif;
@@ -105,7 +167,7 @@
   }
 
   ::selection {
-    background: rgb(var(--route) / 0.22);
+    background: rgb(var(--primary) / 0.22);
     color: rgb(var(--text-primary));
   }
 
@@ -135,20 +197,20 @@
     border: 1px solid rgb(var(--border));
     border-radius: var(--radius-card);
     background: rgb(var(--surface) / 0.92);
-    box-shadow: 0 1px 2px rgb(var(--shadow-rgb) / 0.06);
+    box-shadow: var(--shadow-card);
     transition: border-color 160ms ease, box-shadow 160ms ease, background-color 160ms ease;
   }
 
   .sr-panel-interactive:hover {
     border-color: rgb(var(--border-strong));
     background: rgb(var(--surface) / 0.98);
-    box-shadow: 0 12px 28px -18px rgb(var(--shadow-rgb) / 0.42), 0 3px 10px rgb(var(--shadow-rgb) / 0.08);
+    box-shadow: var(--shadow-card-hover);
   }
 
   .sr-panel-elevated {
     border-color: rgb(var(--border-strong) / 0.72);
     background: rgb(var(--surface-elevated) / 0.96);
-    box-shadow: 0 18px 50px -28px rgb(var(--shadow-rgb) / 0.5), 0 4px 14px rgb(var(--shadow-rgb) / 0.12);
+    box-shadow: var(--shadow-elevated);
   }
 
   .sr-control {
@@ -165,8 +227,8 @@
   }
 
   .sr-control:focus-visible {
-    border-color: rgb(var(--route));
-    outline: 2px solid rgb(var(--route) / 0.32);
+    border-color: rgb(var(--primary));
+    outline: 2px solid rgb(var(--primary) / 0.32);
     outline-offset: 1px;
   }
 
@@ -199,8 +261,31 @@
     border: 1px solid rgb(var(--border-strong) / 0.72);
     border-radius: calc(var(--radius-card) + 2px);
     background: rgb(var(--surface-overlay) / 0.96);
-    box-shadow: 0 24px 70px -30px rgb(var(--shadow-rgb) / 0.7), 0 8px 24px rgb(var(--shadow-rgb) / 0.16);
+    box-shadow: var(--shadow-dialog);
     backdrop-filter: blur(14px);
+  }
+
+  /**
+   * 弹窗入场：`@starting-style`（WebView2 内核实测 Edge 153，原生支持）。
+   *
+   * 比 keyframes 少一个活动部件 —— 不必声明 animation-name/duration/fill-mode，
+   * 也不会与元素自身可能已有的 transform 打架。
+   *
+   * ⚠️ **退场仍是瞬时的，这是有意的**：React 条件渲染会立刻卸载节点，要让它渐隐
+   * 就得把元素留在 DOM 里配合 `transition-behavior: allow-discrete`，那会牵动每个
+   * 弹窗的开关状态机（其中几个在棘轮冻结文件里）。为一帧的退场动画去改 6 处状态机
+   * 不划算，本轮不做。
+   */
+  .sr-dialog {
+    transition: opacity 180ms cubic-bezier(0.16, 1, 0.3, 1),
+      transform 180ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  @starting-style {
+    .sr-dialog {
+      opacity: 0;
+      transform: translateY(8px) scale(0.985);
+    }
   }
 
   .sr-section-label {
@@ -262,25 +347,132 @@
   .status-shake {
     animation: synaroute-status-shake 0.4s ease-in-out 1;
   }
+
+  /**
+   * 列表错峰进场。
+   *
+   * 延迟从调用点的内联 `--i`（行序号）算，**不生成 N 个类名** ——
+   * 那会让 Tailwind 产出一堆 `delay-[28ms]` 之类的任意值类，且上限写死。
+   * 调用点只多一个 style 属性，零逻辑。
+   *
+   * 上限 12 档（`min()`）：再往后人眼已分辨不出先后，而长列表最后几行会等上
+   * 好几百毫秒才出现，看着像卡了。
+   */
+  /**
+   * ⚠️ fill-mode 是 `backwards` 而**不是** `both`。
+   *
+   * `both` 会让动画播完后继续保留最后一帧的 `transform`（即便那是 `translateY(0)`）。
+   * 一个非 none 的 transform 会把元素变成**定位包含块**与新的层叠上下文，于是卡片内
+   * 那些 `absolute` 的东西（拖拽落点指示线、角标）的参照物在动画结束后悄悄换了一个，
+   * 且只在首屏进场过的卡片上如此 —— 属于极难复现的那类错位。
+   *
+   * `backwards` 只补**延迟期间**的初始帧（避免错峰等待时先闪一下完整卡片），
+   * 播完即完全交还给原样式，不留任何残留。
+   */
+  .sr-enter {
+    animation: synaroute-fade-slide-up 320ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+    animation-delay: calc(min(var(--i, 0), 12) * 28ms);
+  }
+
+  /**
+   * 「链路活着」的流动线：一道极淡的品牌色光沿着 1px 底边扫过。
+   *
+   * 这是本轮唯一一条**常驻**动效，只挂在代理确实运行时的状态条上 ——
+   * 它回答的是一个用户真的会问的问题（「它还在转吗」），不是装饰。
+   * 代理停止时调用点不渲染它，于是界面回到完全静止。
+   *
+   * 动的是 `background-position`（合成属性），不触发布局。
+   */
+  .sr-flow {
+    background-image: linear-gradient(
+      90deg,
+      transparent,
+      rgb(var(--primary) / 0.65),
+      transparent
+    );
+    background-repeat: no-repeat;
+    background-size: 38% 100%;
+    animation: synaroute-flow 2.6s linear infinite;
+  }
+}
+
+/**
+ * ── 视图过渡（View Transitions）────────────────────────────────────────
+ *
+ * WebView2 内核实测 **Edge 153.0.4234.32**，原生支持，无需 polyfill。
+ * 入口统一在 `src/lib/motion.ts` 的 `startViewTransition()`（有一条硬规则
+ * 盯着「不许绕过它」，理由见那个文件）。
+ *
+ * 🔴 **root 组必须设成瞬时**。默认行为是整屏交叉淡化，而切页时侧栏、状态条、
+ * 更新横幅都没变 —— 让它们跟着淡一遍是白花 GPU，且会出现「整个窗口闪一下」。
+ * 把 root 关掉之后，只有显式命名的三组会动：主区内容、页头图标与标题、
+ * 侧栏选中条。
+ */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+/* 主区：旧内容淡出（短），新内容淡入 + 8px 上移（长一点，收尾用回弹曲线）。
+   刻意不对称 —— 等长的交叉淡化会在中间糊成半透明的两层叠影。 */
+::view-transition-old(page-main) {
+  animation: synaroute-vt-out 130ms cubic-bezier(0.4, 0, 1, 1) both;
+}
+::view-transition-new(page-main) {
+  animation: synaroute-vt-in 260ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* 页头图标与标题是**共享元素**：不声明动画，让浏览器做默认的形变补间 ——
+   它们于是从旧位置连续移动到新位置，而不是闪一下重绘。
+   `nav-pill` 同理：侧栏那块选中背景会自己滑到新的导航项上，
+   不需要 JS 算坐标、不需要 FLIP 库。 */
+::view-transition-group(page-title),
+::view-transition-group(page-icon),
+::view-transition-group(nav-pill) {
+  animation-duration: 260ms;
+  animation-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* 图标/标题在形变期间同时交叉淡化，遮住文字重排那一下的锯齿 */
+::view-transition-old(page-title),
+::view-transition-new(page-title),
+::view-transition-old(page-icon),
+::view-transition-new(page-icon) {
+  animation-duration: 260ms;
 }
 
 /**
  * 尊重系统「减少动态效果」。
  *
  * 无限循环的脉冲对前庭敏感 / 注意力障碍用户是实际的可访问性障碍，属 WCAG 2.2
- * 动画相关准则关切的范畴，不是可选装饰。这里整段关掉循环动画（脉冲），
+ * 动画相关准则关切的范畴，不是可选装饰。这里整段关掉循环动画（脉冲、流动线），
  * 一次性入场动效也压到极短而非留着。
  *
  * 放在 @layer utilities **之外**：utilities 层内的媒体查询在某些 Tailwind
  * 版本下会被 layer 顺序影响优先级，放外面确保它一定能盖住上面的声明。
+ *
+ * 视图过渡的主防线在 JS（`motion.ts` 里直接同步调 mutate，压根不开过渡）；
+ * 这里再补一道 CSS —— 万一将来有人绕过那个函数，至少动画是 0。
  */
 @media (prefers-reduced-motion: reduce) {
   .status-pulse,
-  .status-shake {
+  .status-shake,
+  .sr-flow {
     animation: none;
   }
-  .animate-in {
+  .animate-in,
+  .sr-enter {
     animation-duration: 1ms;
+    animation-delay: 0ms;
+  }
+  .sr-dialog {
+    transition: none;
+  }
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none !important;
   }
 }
 
@@ -312,6 +504,32 @@
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+/* 视图过渡用的两支：位移只有 8px —— 切页是高频操作，幅度再大就成了负担。 */
+@keyframes synaroute-vt-out {
+  to {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+}
+
+@keyframes synaroute-vt-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+/* 链路流动：从左侧外面扫到右侧外面。用 background-position 而非 transform，
+   因为要动的是元素**内部**的那道光，元素自身必须留在原位。 */
+@keyframes synaroute-flow {
+  from {
+    background-position: -38% 0;
+  }
+  to {
+    background-position: 138% 0;
   }
 }
 

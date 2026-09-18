@@ -19,6 +19,9 @@ import { ConfigAppliedDialog } from "@/components/ConfigAppliedDialog";
 import { useStore, applyTheme } from "@/store";
 import { useBackendEvents } from "@/lib/useBackendEvents";
 import { makeKeyCopy } from "@/lib/keyCopy";
+// 切页动效统一走这里，不许裸调 document.startViewTransition（有硬规则盯着，
+// 理由见 lib/motion.ts：那个 API 绕过 CSS 的 prefers-reduced-motion 兜底）。
+import { startViewTransition } from "@/lib/motion";
 import { isTauri } from "@/lib/bridge";
 import { requestNotificationPermission } from "@/lib/notifications";
 import { useT } from "@/lib/useT";
@@ -134,11 +137,23 @@ export default function App() {
     return () => mq.removeEventListener("change", handler);
   }, [theme]);
 
+  /**
+   * 切页。包在视图过渡里：主区内容交叉淡化 + 8px 位移，页头图标/标题与侧栏选中条
+   * 作为**共享元素**连续移动（编排见 styles.css 末尾的 ::view-transition-* 段）。
+   *
+   * 🔴 两个状态更新必须在**同一个** mutate 里：分开调会让过渡截到中间态
+   *（页头已经换了、列表还是旧分类的），那比没有过渡更糟。
+   *
+   * 不支持 / 用户要求减少动态效果 / 已有过渡在跑时，`startViewTransition` 直接
+   * 同步执行回调，导航照常生效 —— 动效是附加层，不是功能的前置条件。
+   */
   const handleNav = (key: NavKey) => {
-    setNav(key);
-    if (CATEGORY_KEYS.includes(key)) {
-      setActiveCategory(key as CategoryType);
-    }
+    startViewTransition(() => {
+      setNav(key);
+      if (CATEGORY_KEYS.includes(key)) {
+        setActiveCategory(key as CategoryType);
+      }
+    });
   };
 
   // useCallback 包住（PERF-2）：这两个回调会一路传到 KeyCard 的 props 上，
@@ -199,7 +214,10 @@ export default function App() {
             （React 卸载整棵树，连侧栏都没了）—— 真机反馈的「用量统计整页空白」就是
             这个形态。套上边界后异常收敛成一张可读的错误卡片，侧栏与导航照常可用，
             用户能切走、也能把错误信息截图反馈。`resetKey={nav}` 使切页自动复位。 */}
-        <main className="flex-1 overflow-hidden">
+        {/* `view-transition-name` 挂在 <main> 上而不是各页根节点上：切页时新旧页面是
+            两个不同的组件，只有这个**始终存在的容器**才能被浏览器认成「同一个元素的
+            前后两态」。名字全局唯一（同一时刻只渲染一个 main），重名会让整场过渡被中止。 */}
+        <main className="flex-1 overflow-hidden" style={{ viewTransitionName: "page-main" }}>
           <ErrorBoundary resetKey={nav} label={t(`nav.${nav}`)}>
             {renderMain()}
           </ErrorBoundary>

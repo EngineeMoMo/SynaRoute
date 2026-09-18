@@ -5,6 +5,7 @@ import { usePolling } from "@/lib/usePolling";
 import { useT } from "@/lib/useT";
 import type { TFunc } from "@/lib/i18n";
 import type { DailyUsageBucket, TokenUsage, UnpricedReason, UsageCostRow } from "@/types";
+import { AnimatedNumber } from "@/components/ui/AnimatedNumber";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { InlineAlert } from "@/components/ui/InlineAlert";
@@ -208,12 +209,13 @@ export function UsagePage() {
           <>
             {/* 花费概览：今日 / 本周 / 本月（token），加累计估算金额 */}
             <div className="mt-3 grid grid-cols-4 gap-2">
-              <StatCard label={t("usage.today")} value={fmt(periods.today)} />
-              <StatCard label={t("usage.thisWeek")} value={fmt(periods.week)} />
-              <StatCard label={t("usage.thisMonth")} value={fmt(periods.month)} />
+              <StatCard label={t("usage.today")} value={periods.today} format={fmt} />
+              <StatCard label={t("usage.thisWeek")} value={periods.week} format={fmt} />
+              <StatCard label={t("usage.thisMonth")} value={periods.month} format={fmt} />
               <StatCard
                 label={t("usage.estCost")}
-                value={fmtUsd(summary.costNano)}
+                value={summary.costNano}
+                format={fmtUsd}
                 hint={t("usage.estimateHint")}
                 accent
                 /* 「累计花费」这个标签会被当成总计读。有行没算进去时**必须在这一格上**
@@ -355,12 +357,15 @@ export function UsagePage() {
 function StatCard({
   label,
   value,
+  format,
   hint,
   accent,
   note,
 }: {
   label: string;
-  value: string;
+  /** 原始数值。**不传格式化后的字符串** —— 补间需要能做算术的数。 */
+  value: number;
+  format: (n: number) => string;
   hint?: string;
   accent?: boolean;
   note?: string;
@@ -372,12 +377,14 @@ function StatCard({
       }`}
     >
       <div className="text-[11px] text-text-muted">{label}</div>
+      {/* `tabular-nums` 在这里是**必须**的，不是排版偏好：补间期间每一帧的数字宽度
+          不同，比例字宽会让这一格左右横跳。等宽数字让它只有值在变、位置不动。 */}
       <div
         className={`mt-0.5 font-mono text-lg tabular-nums ${
           accent ? "text-primary" : "text-text-primary"
         }`}
       >
-        {value}
+        <AnimatedNumber value={value} format={format} />
       </div>
       {note && <div className="mt-0.5 text-[10px] leading-tight text-warning">{note}</div>}
     </div>

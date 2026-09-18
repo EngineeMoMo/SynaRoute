@@ -322,7 +322,16 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
 
         {!loading &&
           sorted.map((k, i) => (
-            <div key={k.id} ref={(el) => drag.registerCard(k.id, el)}>
+            // 错峰进场：延迟由内联 `--i`（行序号）算，见 styles.css 的 .sr-enter。
+            // 只在**挂载**时播一次 —— key 稳定，5s 轮询刷新数据不会让它重播。
+            // fill-mode 是 backwards 而非 both：播完不留终态 transform，
+            // 否则卡片会永久成为定位包含块，把拖拽指示线的绝对定位锚点挪走。
+            <div
+              key={k.id}
+              ref={(el) => drag.registerCard(k.id, el)}
+              className="sr-enter"
+              style={{ "--i": i } as React.CSSProperties}
+            >
               <KeyCard
                 k={k}
                 onEdit={onEditKey}

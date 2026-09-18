@@ -129,11 +129,26 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
 
   return (
     // flex-wrap：加了三个下拉后窄窗口必然放不下（应用最小宽度 900），不许它们被挤压变形。
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border/80 bg-surface/75 px-6 py-2.5 backdrop-blur-md">
+    <div className="relative flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border/80 bg-surface/75 px-6 py-2.5 backdrop-blur-md">
+      {/* 「链路活着」的流动线：一道极淡的品牌色光沿底边扫过，只在代理**确实运行**且
+          Key 没有全挂时出现。它回答的是一个用户真会问的问题（「它还在转吗」）——
+          代理停止或全部 Key 不可用时不渲染，界面回到完全静止，静止本身就是信息。
+          动的是 background-position（合成属性），不触发布局。 */}
+      {running && !allDown && (
+        <span aria-hidden className="sr-flow pointer-events-none absolute inset-x-0 bottom-0 h-px" />
+      )}
       <div className="flex items-center gap-2">
+        {/* 🔴 脉冲光晕用 `currentColor`（见 styles.css 的 synaroute-status-pulse），
+            所以这里必须**同时**给文字色 —— 只给 bg-* 的话 currentColor 会取到继承来的
+            深灰，光晕颜色与圆点不一致。稳定态（已停止）不加 status-pulse：一直在动的
+            界面会把注意力从真正要看的地方拽走。 */}
         <span
           className={`inline-block h-2 w-2 rounded-full ${
-            allDown ? "bg-danger" : running ? "bg-route" : "bg-text-muted"
+            allDown
+              ? "bg-danger text-danger status-shake"
+              : running
+                ? "bg-primary text-primary status-pulse"
+                : "bg-text-muted text-text-muted"
           }`}
         />
         <span className="text-sm font-medium text-text-primary">

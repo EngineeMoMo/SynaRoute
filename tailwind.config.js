@@ -63,10 +63,25 @@ export default {
         sans: ['"Segoe UI"', '"Microsoft YaHei"', "system-ui", "sans-serif"],
         mono: ['"Cascadia Code"', "Consolas", "monospace"],
       },
+      /**
+       * 海拔三档，**读 CSS 变量而不是在这里算**。
+       *
+       * 🔴 原先写的是 `rgb(var(--shadow-rgb) / 0.06)` 这种「一个颜色变量 + 低透明度」
+       * 的公式。它在浅色下勉强可见，在深色下**等于一条 CSS 都没写** ——
+       * `--shadow-rgb: 0 0 0` @ 0.06 压在 #0E0E11 上算出来差不到 1/255。
+       * 官网踩过同一个坑，表现是深色模式下所有 `hover:shadow-card-hover` 毫无反馈。
+       *
+       * 公式驱动做不到「浅深两套不同 alpha」，所以改成值驱动：成品阴影定义在
+       * src/styles.css 的 :root / .dark 各一组。类名不变，全部调用点自动升级。
+       *
+       * 判据：`npm run build` 后 dist CSS 里 `.shadow-card` 的值应是 `var(--shadow-card)`，
+       * 且 styles.css 的 `:root` 与 `.dark` 里都能搜到该变量。
+       */
       boxShadow: {
-        card: "0 1px 2px rgb(var(--shadow-rgb) / 0.06)",
-        "card-hover": "0 12px 28px -18px rgb(var(--shadow-rgb) / 0.42), 0 3px 10px rgb(var(--shadow-rgb) / 0.08)",
-        elevated: "0 18px 50px -28px rgb(var(--shadow-rgb) / 0.5), 0 4px 14px rgb(var(--shadow-rgb) / 0.12)",
+        card: "var(--shadow-card)",
+        "card-hover": "var(--shadow-card-hover)",
+        elevated: "var(--shadow-elevated)",
+        dialog: "var(--shadow-dialog)",
       },
     },
   },

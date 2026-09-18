@@ -76,22 +76,37 @@ export function Sidebar({ active, onSelect, onOpenPalette }: SidebarProps) {
             key={item.key}
             onClick={() => onSelect(item.key)}
             className={cn(
-              "flex w-full items-center gap-2.5 rounded-control border px-3 py-2 text-sm transition-all duration-150 active:scale-[0.99]",
+              "relative flex w-full items-center gap-2.5 rounded-control px-3 py-2 text-sm transition-[color] duration-150 active:scale-[0.99]",
               isActive
-                ? "border-route/20 bg-route/12 font-medium text-route"
-                : "border-transparent text-text-secondary hover:border-border hover:bg-surface-hover hover:text-text-primary"
+                ? "font-medium text-primary"
+                : "text-text-secondary hover:bg-surface-hover hover:text-text-primary"
             )}
           >
+            {/* 选中态的背景条是一个**独立元素**，只在选中项上渲染，并带
+                `view-transition-name: nav-pill`。于是切页时浏览器把它当成同一个元素
+                的前后两态，**自己**把它从旧行平滑移动到新行 —— 不需要 JS 算坐标、
+                不需要 FLIP 库、不需要测量 DOM。
+
+                🔴 为什么不直接把名字挂在 <button> 上：那样整个按钮（含图标与文字）
+                都成了共享元素，两个不同的标签会在移动过程中交叉淡化，读起来像重影。
+                只让背景条参与过渡，文字各自淡入淡出，视觉上就是「滑块滑过去」。 */}
+            {isActive && (
+              <span
+                aria-hidden
+                className="absolute inset-0 rounded-control border border-primary/20 bg-primary/12"
+                style={{ viewTransitionName: "nav-pill" }}
+              />
+            )}
             <span className="relative shrink-0">
               <Icon size={16} />
               {showDot && (
                 <span
-                  className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-route ring-2 ring-surface"
+                  className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-primary ring-2 ring-surface"
                   aria-hidden
                 />
               )}
             </span>
-            <span className="truncate">{t(item.tKey)}</span>
+            <span className="relative truncate">{t(item.tKey)}</span>
             {showDot && (
               <span className="ml-auto shrink-0 rounded-full border border-primary/20 bg-primary/12 px-1.5 py-0.5 text-[10px] font-medium text-primary">
                 {updateVer ? `v${updateVer}` : t("settings.updateBadge")}

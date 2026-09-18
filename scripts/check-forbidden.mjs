@@ -444,6 +444,167 @@ const pass = (name, detail) => console.log(`✅ ${name}${detail ? ` —— ${det
   else pass("data-dir-env-name-must-match", "Rust 侧 ENV_OVERRIDE 与冒烟脚本传的变量名一致");
 }
 
+// ---------------------------------------------------------------------------
+// 规则 7：视图过渡必须经 lib/motion.ts
+// ---------------------------------------------------------------------------
+//
+// `document.startViewTransition()` 是 JS API，**绕过** styles.css 里那整段
+// `@media (prefers-reduced-motion: reduce)`：CSS 最多把动画时长压到 0，
+// 改变不了「过渡确实发生了」这件事（期间整棵 DOM 被冻结、点击不响应）。
+//
+// 与官网那条 `reduced-motion-must-go-through-motion-helper` 完全同构，
+// 而官网那条只扫 `site/`，应用侧此前没有任何防线。
+{
+  const HELPER = "src/lib/motion.ts";
+  const WHY =
+    "      视图过渡一律经 lib/motion.ts 的 startViewTransition（它会查 prefers-reduced-motion，\n" +
+    "      并处理「已有过渡在跑」的连点情形）。\n" +
+    "      🔴 漏掉的表现是**静默的**：对不开「减少动态效果」的人（也就是开发者自己）毫无差别，\n" +
+    "      自测永远看不出来。而对前庭敏感 / 晕动症用户，整屏位移是实际的可访问性障碍。";
+  const RE = /\bdocument\s*\.\s*startViewTransition\s*\(/;
+  const hits = [];
+  for (const f of TS) {
+    if (f === HELPER) continue;
+    for (const { n, text } of sliceLines(readFileSync(f, "utf8"), f)) {
+      if (RE.test(text)) hits.push(`      ${f}:${n}  ${text.trim().slice(0, 110)}`);
+    }
+  }
+  // 防空转（同本文件顶部第 2 个判据坑）：helper 自己必须真的调了那个 API。
+  // 否则「helper 被改名/被删、调用点全绕过」时这条门依然全绿 —— 一个恒零命中的门
+  // 是静默无用的。
+  if (!existsSync(HELPER)) {
+    hits.push(`      找不到 ${HELPER} —— 收口点没了，判据空转了`);
+  } else if (!RE.test(readFileSync(HELPER, "utf8"))) {
+    hits.push(`      ${HELPER} 里没有 document.startViewTransition( —— 收口点名存实亡，判据空转了`);
+  }
+  if (hits.length) fail("view-transition-must-go-through-motion-helper", `${WHY}\n${hits.join("\n")}`);
+  else pass("view-transition-must-go-through-motion-helper", `查过 ${TS.length} 个源文件，收口点在 ${HELPER}`);
+}
+
+// ---------------------------------------------------------------------------
+// 规则 8：应用 ↔ 官网 ↔ 图标 三方视觉令牌必须同色
+// ---------------------------------------------------------------------------
+//
+// 对应一个真实发生过的失效（2026-09-17 提交 4ad57ce）：那轮把桌面应用改成暖白底
+// #F6F8F7 + 青绿强调 #0B8476，而应用图标与官网都是靛紫 #6D5EF7 + 冷灰 zinc。
+// 青绿是靛紫的**对比色**，于是「同一个产品的图标、官网、界面」呈现三种互不相干的
+// 气质 —— 而三处**各自都自洽**，单看任何一处都看不出问题，必须并排比才会发现。
+//
+// 🔴 为什么共享 tailwind.config.js **不足以**防住它：
+// site/tailwind.config.js 确实 `import appConfig from "../tailwind.config.js"`，
+// 但那只共享了 Tailwind 层面的**名字绑定**（`primary → rgb(var(--primary))`）。
+// **颜色数值在两份 styles.css 里各写一遍** —— 不能整体 import 应用那份，因为应用
+// base 层有 `body { overflow: hidden }`（桌面端整页不滚动），官网引入后页面直接滚不动
+//（官网那份文件顶部记着这个理由）。所以「名字自动跟随、数值各写一份」＝ 数值会漂移。
+//
+// ⚠️ 这条**本来想写成 vitest**，实测不行：`import css from "../styles.css?raw"` 在
+// Vitest 下返回**空字符串**（CSS 导入被打成空桩，`?raw` 也不例外，实测 LEN: 0），
+// 于是所有 toBe 因两边都 undefined 而全部通过 —— 一个恒真的测试比没有更糟。
+// 放这里反而更对位：令牌漂移正是「任何一处都是缺陷、没有基线可冻结」那类判据。
+{
+  const APP = "src/styles.css";
+  const SITE = "site/src/styles.css";
+  const WHY =
+    "      应用图标是**不可改的锚点**（已进安装包、开始菜单、任务栏与所有截图，改它等于换品牌），\n" +
+    "      官网与桌面应用的颜色数值都必须对齐它。\n" +
+    "      🔴 漂移的表现是「两个看起来该一样的紫差了几个色阶」，三处各自自洽、必须并排比才看得出，\n" +
+    "      正是机械判据该管的那类缺陷（2026-09-17 真实发生过一次，整轮返工）。";
+
+  /** 应用图标 src-tauri/icons/icon.png 的那支靛紫（靛紫圆角方块 + 白色路由节点连线）。 */
+  const ICON_INDIGO = "109 94 247"; // #6D5EF7
+
+  // 必须三方同色的项。刻意**不比**：阴影（两边分层需求不同 —— 应用是信息密集型界面、
+  // 官网有大块留白）、官网独有的 --primary-solid、以及通用语义色 success/warning/danger/info。
+  const SHARED = [
+    "--background",
+    "--surface",
+    "--surface-hover",
+    "--border",
+    "--border-strong",
+    "--text-primary",
+    "--text-secondary",
+    "--text-muted",
+    "--primary",
+    "--primary-deep",
+    "--primary-foreground",
+  ];
+
+  // 取某个选择器块里的自定义属性表。必须**先剥注释** —— 两份文件的注释里都大量出现
+  // `--变量名: 值` 形态的说明文字（同本文件顶部记的第一个判据坑：判据只能看代码）。
+  const varsOf = (css, selector) => {
+    const noComment = css.replace(/\/\*[\s\S]*?\*\//g, "");
+    const esc = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const block = noComment.match(new RegExp(`${esc}\\s*\\{([^}]*)\\}`));
+    if (!block) return {};
+    const out = {};
+    for (const m of block[1].matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)) out[m[1]] = m[2].trim();
+    return out;
+  };
+
+  const problems = [];
+  if (!existsSync(APP) || !existsSync(SITE)) {
+    problems.push(`      找不到 ${APP} 或 ${SITE} —— 解析器与仓库结构脱节`);
+  } else {
+    const appRoot = varsOf(readFileSync(APP, "utf8"), ":root");
+    const siteRoot = varsOf(readFileSync(SITE, "utf8"), ":root");
+    const appDark = varsOf(readFileSync(APP, "utf8"), ".dark");
+    const siteDark = varsOf(readFileSync(SITE, "utf8"), ".dark");
+
+    // 防空转（同本文件顶部第 2 个判据坑）：解析器与文件结构脱节时，下面的比对会因为
+    // 两边都是 undefined 而**全部通过**。先确认真的解析到了东西。
+    if (Object.keys(appRoot).length < 10 || Object.keys(siteRoot).length < 10) {
+      problems.push(
+        `      :root 只解析到 ${Object.keys(appRoot).length}/${Object.keys(siteRoot).length} 个变量 —— 判据空转了，先修解析器`
+      );
+    } else {
+      for (const name of SHARED) {
+        if (appRoot[name] === undefined) problems.push(`      ${APP} 的 :root 缺少 ${name}`);
+        else if (siteRoot[name] === undefined) problems.push(`      ${SITE} 的 :root 缺少 ${name}`);
+        else if (appRoot[name] !== siteRoot[name]) {
+          problems.push(`      浅色 ${name} 漂移：应用 ${appRoot[name]} ≠ 官网 ${siteRoot[name]}`);
+        }
+      }
+      // 深色下两侧各只覆盖一部分（未覆盖的继承 :root）。只比**两边都定义了**的，
+      // 否则会把「一侧刻意不覆盖」误报成漂移。
+      const both = SHARED.filter((n) => appDark[n] !== undefined && siteDark[n] !== undefined);
+      if (both.length < 5) {
+        problems.push(`      .dark 只解析到 ${both.length} 项共同令牌 —— 判据空转了，先修解析器`);
+      }
+      for (const name of both) {
+        if (appDark[name] !== siteDark[name]) {
+          problems.push(`      深色 ${name} 漂移：应用 ${appDark[name]} ≠ 官网 ${siteDark[name]}`);
+        }
+      }
+      // 品牌色必须就是图标那支靛紫
+      if (appRoot["--primary"] !== ICON_INDIGO) {
+        problems.push(
+          `      ${APP} 的 --primary 是 ${appRoot["--primary"]}，而图标是 ${ICON_INDIGO}（#6D5EF7）`
+        );
+      }
+      // --route 必须是 primary 的**别名**而非抄一份数值：抄了会漂移；写成不存在的变量时
+      // `rgb(var(--route) / 0.12)` 会**整条静默失效**（本仓踩过两次同型坑：
+      // `bg-warning/8` 与未注册的 primary.deep）。它有 60+ 处引用、含 3 个棘轮冻结文件。
+      if (appRoot["--route"] !== "var(--primary)") {
+        problems.push(
+          `      ${APP} 的 --route 应为 var(--primary) 别名，实为 ${appRoot["--route"]}（抄数值会漂移）`
+        );
+      }
+      if (appDark["--route"] !== undefined) {
+        problems.push(
+          `      ${APP} 的 .dark 里又定义了一遍 --route —— 别名已在 :root，会跟着提亮后的 --primary 自动走`
+        );
+      }
+    }
+  }
+
+  if (problems.length) fail("visual-tokens-must-match-icon-and-site", `${WHY}\n${problems.join("\n")}`);
+  else
+    pass(
+      "visual-tokens-must-match-icon-and-site",
+      `${SHARED.length} 项令牌三方同色，--primary = #6D5EF7（图标锚点）`
+    );
+}
+
 if (failed) {
   console.log(`\n❌ ${failed} 条硬规则未通过。这些判据没有基线可冻结 —— 只能修。`);
   process.exit(1);
