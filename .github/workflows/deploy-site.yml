@@ -29,7 +29,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # 预渲染脚本(scripts/prerender.mjs)用 CDP 连 Chrome，依赖全局 WebSocket。
+          # 它在 Node 22 才是稳定全局；Node 20 下 `WebSocket is not defined`、预渲染整段崩。
+          node-version: "22"
           cache: npm
           cache-dependency-path: site/package-lock.json
 
@@ -46,8 +48,8 @@ jobs:
         working-directory: site
         run: npm run build
 
-      # 可证伪的构建判据：这三样缺任何一个都说明 postbuild 没跑对，
-      # 与其部署一个深链会 404、自定义域名会掉的站点，不如让 CI 红在这里。
+      # 可证伪的构建判据：这几样缺任何一个都说明 postbuild / prerender 没跑对，
+      # 与其部署一个深链会 404、自定义域名会掉、或又退回 CSR 的站点，不如让 CI 红在这里。
       - name: Verify build output
         working-directory: site
         run: |
@@ -55,7 +57,20 @@ jobs:
           test -f dist/CNAME         || { echo "缺 CNAME：自定义域名会失效"; exit 1; }
           test -f dist/sitemap.xml   || { echo "缺 sitemap.xml"; exit 1; }
           grep -q "synaroute.mofamilys.com" dist/CNAME || { echo "CNAME 内容不对"; exit 1; }
-          echo "构建产物校验通过"
+          # 预渲染落地判据：中英首页与一个文档页必须是「带正文的静态 HTML」，不是空壳。
+          # <main 只有 React 渲染 LangLayout 后才有，原始外壳里没有 —— 若 Chrome 缺失或
+          # 预渲染没跑，这里当场红，而不是静默发布一个 Google 抓到空内容的 CSR 站
+          # （那正是「已抓取-尚未编入索引」的成因）。
+          # 每条路由两份都要在：扁平 `.html` 与目录 `/index.html`，无论 GitHub Pages
+          # 怎么解析无扩展名 URL 都命中真实文件、返 200（内容页此前全是 404 兜底）。
+          for f in \
+            dist/zh.html dist/zh/index.html \
+            dist/en.html dist/en/index.html \
+            dist/zh/docs/cli.html dist/zh/docs/cli/index.html; do
+            test -f "$f"          || { echo "缺预渲染页 $f：预渲染没生成，站点仍是 CSR/404"; exit 1; }
+            grep -q "<main" "$f"  || { echo "$f 只有外壳、没有正文：预渲染没渲染出内容"; exit 1; }
+          done
+          echo "构建产物校验通过（含预渲染正文）"
 
       - uses: actions/configure-pages@v5
 
