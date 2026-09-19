@@ -8,9 +8,10 @@ import type {
   CodexSessionRow,
 } from "@/types";
 import { ToggleRow } from "@/components/ToggleRow";
-import { FolderOpen, RefreshCw, Trash2, Wand2 } from "lucide-react";
+import { FolderOpen, Trash2, Wand2 } from "lucide-react";
 import { SessionTable } from "@/components/SessionTable";
 import { Button } from "@/components/ui/Button";
+import { RefreshButton } from "@/components/ui/RefreshButton";
 import { InlineAlert } from "@/components/ui/InlineAlert";
 import { PageHeader } from "@/components/ui/PageHeader";
 
@@ -52,7 +53,6 @@ export function CodexSessionsPage() {
   const [note, setNote] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [syncing, setSyncing] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
   const [confirmingSync, setConfirmingSync] = useState(false);
   const [query, setQuery] = useState("");
   const [onlyBad, setOnlyBad] = useState(false);
@@ -61,7 +61,6 @@ export function CodexSessionsPage() {
 
   const load = useCallback(async () => {
     const generation = ++loadGeneration.current;
-    setRefreshing(true);
     setError(null);
     try {
       const [next, tl, ia] = await Promise.all([
@@ -84,8 +83,6 @@ export function CodexSessionsPage() {
     } catch (e) {
       if (generation !== loadGeneration.current) return;
       setError(String(e));
-    } finally {
-      if (generation === loadGeneration.current) setRefreshing(false);
     }
   }, []);
 
@@ -249,10 +246,11 @@ export function CodexSessionsPage() {
             <Button variant="outline" size="sm" onClick={() => void doOpenExports()}>
               <FolderOpen className="h-4 w-4" /> {t("sessions.openExports")}
             </Button>
-            <Button variant="outline" size="sm" onClick={() => void load()} disabled={refreshing} aria-busy={refreshing}>
-              <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
-              {refreshing ? t("sessions.refreshing") : t("sessions.refresh")}
-            </Button>
+            <RefreshButton
+              onRefresh={load}
+              idleLabel={t("sessions.refresh")}
+              busyLabel={t("sessions.refreshing")}
+            />
           </>
         }
       />

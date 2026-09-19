@@ -1,9 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
-  Terminal,
-  MonitorSmartphone,
-  Code2,
   Check,
   KeyRound,
   Play,
@@ -13,6 +10,7 @@ import {
   Waypoints,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { CATEGORY_ICONS } from "@/lib/categoryIcons";
 import type { CategoryType, FirstRequestProbe } from "@/types";
 import type { NavKey } from "@/components/Sidebar";
 import { api } from "@/lib/bridge";
@@ -22,9 +20,9 @@ import { Button } from "@/components/ui/Button";
 import { KeyEditor } from "@/components/KeyEditor";
 
 const CLIENTS: { cat: CategoryType; icon: LucideIcon }[] = [
-  { cat: "claude-cli", icon: Terminal },
-  { cat: "claude-desktop", icon: MonitorSmartphone },
-  { cat: "codex", icon: Code2 },
+  { cat: "claude-cli", icon: CATEGORY_ICONS["claude-cli"] },
+  { cat: "claude-desktop", icon: CATEGORY_ICONS["claude-desktop"] },
+  { cat: "codex", icon: CATEGORY_ICONS.codex },
 ];
 
 interface Props {

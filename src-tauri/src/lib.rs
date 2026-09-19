@@ -63,9 +63,18 @@ fn list_keys(state: tauri::State<AppState>, category_id: CategoryType) -> Vec<Pr
     state.store.list_keys(category_id)
 }
 
+/// `sync_after` 成功后重建托盘。Key 的增删/启停/主次变化都会改变托盘「主 Key」子菜单的
+/// 分类清单，而托盘菜单是一次性构建的、不重建就停在旧状态（2026-09-19 用户实报「新启用
+/// 的 Key 托盘里那个分类仍不显示」）。无条件重建：没变化时重画同一份菜单无害，而漏建静默。
+fn resync<T>(app: &tauri::AppHandle, state: &AppState, r: AppResult<T>) -> AppResult<T> {
+    let v = client_resync::sync_after(state, r)?;
+    let _ = rebuild_tray(app);
+    Ok(v)
+}
+
 #[tauri::command]
-fn upsert_key(state: tauri::State<AppState>, key: ProviderKey) -> AppResult<ProviderKey> {
-    client_resync::sync_after(&state, service::save_key(&state.store, key))
+fn upsert_key(app: tauri::AppHandle, state: tauri::State<AppState>, key: ProviderKey) -> AppResult<ProviderKey> {
+    resync(&app, &state, service::save_key(&state.store, key))
 }
 
 /// 桌面端对外模型名**即时**体检（UX#4），供 KeyEditor 边打字边提示。
@@ -82,8 +91,8 @@ fn check_desktop_model_names(key: ProviderKey) -> crate::model::DesktopModelName
 }
 
 #[tauri::command]
-fn delete_key(state: tauri::State<AppState>, key_id: String) -> AppResult<()> {
-    client_resync::sync_after(&state, state.store.delete_key(&key_id))
+fn delete_key(app: tauri::AppHandle, state: tauri::State<AppState>, key_id: String) -> AppResult<()> {
+    resync(&app, &state, state.store.delete_key(&key_id))
 }
 
 /// 按需揭示已存明文密钥（供编辑器"眼睛"查看/续用）。
@@ -113,7 +122,7 @@ fn toggle_key(
     key_id: String,
     enabled: bool,
 ) -> AppResult<()> {
-    if client_resync::sync_after(&state, service::toggle_key(&state.store, &key_id, enabled))? {
+    if resync(&app, &state, service::toggle_key(&state.store, &key_id, enabled))? {
         let store = app.state::<AppState>().store.clone();
         tauri::async_runtime::spawn(async move {
             health::check_one(&store, &key_id).await;
@@ -184,9 +193,8 @@ fn change_master_password(
 
 /// 把某 Key 设为该分类的主 Key（优先级 0）。
 ///
-/// 编排在 [`service::set_primary_key`]（重排规则、日志、幂等语义都在那里）。
-/// 这里只补它做不到的那件事：托盘的「主 Key」子菜单要跟着更新勾选
-/// —— 无论这次是从界面还是从托盘触发的。
+/// 编排在 [`service::set_primary_key`]（重排规则、日志、幂等语义都在那里）；
+/// 收尾走 [`resync`]，托盘「主 Key」子菜单的勾选随之更新（界面/托盘触发皆然）。
 #[tauri::command]
 fn set_primary_key(
     app: tauri::AppHandle,
@@ -194,14 +202,11 @@ fn set_primary_key(
     category_id: CategoryType,
     key_id: String,
 ) -> AppResult<bool> {
-    let changed = client_resync::sync_after(
+    resync(
+        &app,
         &state,
         service::set_primary_key(&state.store, category_id, &key_id, service::PrimarySource::Ui),
-    )?;
-    if changed {
-        let _ = rebuild_tray(&app);
-    }
-    Ok(changed)
+    )
 }
 
 /// 上移 / 下移某 Key 的优先级（相邻交换 + 整列连续重编号）。
@@ -233,13 +238,8 @@ fn move_key(
             )))
         }
     };
-    // 必须过 `sync_after`：重排会改客户端的**默认模型**，理由见 `client_resync` 模块头。
-    let changed = client_resync::sync_after(&state, state.store.move_key(category_id, &key_id, up))?;
-    if changed {
-        // 主 Key 可能因此易主（上移到 0 / 原主被顶下去）→ 托盘勾选要跟上。
-        let _ = rebuild_tray(&app);
-    }
-    Ok(changed)
+    // 重排会改客户端默认模型（见 client_resync 模块头），也可能让主 Key 易主 → resync 收尾。
+    resync(&app, &state, state.store.move_key(category_id, &key_id, up))
 }
 
 #[tauri::command]
@@ -1868,6 +1868,45 @@ fn handle_tray_set_primary(app: &tauri::AppHandle, id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔴 改 Key 的命令必须经 [`resync`] 收尾 —— 它是唯一会顺带重建托盘的路径。
+    ///
+    /// 2026-09-19 用户实报：新启用一条 Key，托盘「主 Key」下那个分类仍不显示。根因是
+    /// `upsert_key`/`toggle_key`/`delete_key` 当时只过 `sync_after`、不碰托盘，而托盘菜单
+    /// 一次性构建、不重建就停在旧状态。这条钉住五个改 Key 的命令都走 `resync`，漏一个的
+    /// 失效方向是静默的（界面改了、托盘不认）。
+    ///
+    /// 源码级判据：读本文件、只看生产段（`mod tests` 之前，否则下面的字面量会自我满足）。
+    #[test]
+    fn key_mutations_rebuild_the_tray_via_resync() {
+        let src = include_str!("lib.rs");
+        let prod = &src[..src.find("mod tests {").expect("应有测试模块作切点")];
+        for cmd in [
+            "fn upsert_key(",
+            "fn delete_key(",
+            "fn toggle_key(",
+            "fn set_primary_key(",
+            "fn move_key(",
+        ] {
+            let at = prod.find(cmd).unwrap_or_else(|| panic!("找不到命令 {cmd}"));
+            let rest = &prod[at..];
+            // 函数体到下一个命令为止（CRLF 无关：不含换行的锚点）。
+            let end = rest[1..]
+                .find("#[tauri::command]")
+                .map(|i| i + 1)
+                .unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains("resync("),
+                "{cmd} 必须经 resync 收尾，否则改 Key 后托盘「主 Key」子菜单不刷新"
+            );
+        }
+        // resync 自己必须真的重建托盘，否则上面的判据空转。
+        let r = prod.find("fn resync<").expect("resync 应存在");
+        assert!(
+            prod[r..].contains("rebuild_tray("),
+            "resync 必须调用 rebuild_tray，否则它只是换名的 sync_after"
+        );
+    }
 
     /// 「随系统启动」的判据必须是启动参数，**不能**是 `auto_start` 配置。
     ///

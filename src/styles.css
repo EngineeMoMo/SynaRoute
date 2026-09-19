@@ -414,23 +414,34 @@
   mix-blend-mode: normal;
 }
 
-/* 主区：旧内容淡出（短），新内容淡入 + 8px 上移（长一点，收尾用回弹曲线）。
-   刻意不对称 —— 等长的交叉淡化会在中间糊成半透明的两层叠影。 */
+/* 主区：旧内容淡出，新内容淡入 + 上移。
+ *
+ * 🔴 **两个时段要交叠成交叉淡化，出场曲线不能加速甩出去**（这是「切换生硬」的成因，
+ * 2026-09-18 用户实报）。旧版出场是 `130ms cubic-bezier(0.4,0,1,1)` —— 那条曲线的第二个
+ * 控制点在 (1,1)，意味着**到结尾还在加速**，于是旧页在 130ms 内被硬甩掉；而入场要 260ms
+ * 才落位，中间那 130ms 是「旧的已经没了、新的还没到」的空档，整体读作「啪」地一顿。
+ *
+ * 改法：出场用**减速**曲线（standard ease，收尾放缓）并拉到 220ms，与 360ms 的入场
+ * 大幅交叠 —— 旧页还在淡出时新页已经在淡入，眼睛看到的是一次平滑的交叉溶解，不是两段拼接。
+ * 仍然刻意不等长（出场略短），等长会在正中间糊成两层半透明叠影。 */
 ::view-transition-old(page-main) {
-  animation: synaroute-vt-out 130ms cubic-bezier(0.4, 0, 1, 1) both;
+  animation: synaroute-vt-out 220ms cubic-bezier(0.4, 0, 0.2, 1) both;
 }
 ::view-transition-new(page-main) {
-  animation: synaroute-vt-in 260ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation: synaroute-vt-in 360ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 /* 页头图标与标题是**共享元素**：不声明动画，让浏览器做默认的形变补间 ——
    它们于是从旧位置连续移动到新位置，而不是闪一下重绘。
    `nav-pill` 同理：侧栏那块选中背景会自己滑到新的导航项上，
-   不需要 JS 算坐标、不需要 FLIP 库。 */
+   不需要 JS 算坐标、不需要 FLIP 库。
+
+   🔴 时长必须与主区入场（360ms）**一致**：共享元素若先于主区内容停下，会先「啪」地
+   定位、再等内容淡入，那一顿正是生硬感的另一半来源。同一条减速曲线让整场编排同步收尾。 */
 ::view-transition-group(page-title),
 ::view-transition-group(page-icon),
 ::view-transition-group(nav-pill) {
-  animation-duration: 260ms;
+  animation-duration: 360ms;
   animation-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
@@ -439,7 +450,7 @@
 ::view-transition-new(page-title),
 ::view-transition-old(page-icon),
 ::view-transition-new(page-icon) {
-  animation-duration: 260ms;
+  animation-duration: 360ms;
 }
 
 /**

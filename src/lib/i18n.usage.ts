@@ -12,6 +12,7 @@ export const usageZh: Dict = {
   "usage.title": "用量统计",
   "usage.subtitle": "按分类与 Key 聚合的 token 消耗与花费估算（跨重启累计）",
   "usage.refresh": "刷新",
+  "usage.refreshing": "刷新中…",
   "usage.loading": "加载中…",
   // 空态改口径：配置了 Key 之后表格就不再是空的（它们会以「尚无用量」的形态出现），
   // 所以真正的空态只剩「一条 Key 都没配、也没有历史用量」。旧文案「有转发流量后
@@ -83,6 +84,7 @@ export const usageEn: Dict = {
   "usage.title": "Usage",
   "usage.subtitle": "Token consumption and estimated spend by category and key (cumulative across restarts)",
   "usage.refresh": "Refresh",
+  "usage.refreshing": "Refreshing…",
   "usage.loading": "Loading…",
   "usage.empty": "No keys configured and no usage history yet",
   "usage.input": "Input",

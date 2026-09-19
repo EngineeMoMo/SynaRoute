@@ -136,11 +136,13 @@ describe("会话页与后端的两处契约", () => {
   });
 
   it("刷新按钮必须显示进行中状态并锁住重复点击", () => {
+    // 忙态/转圈/最短时长/禁用锁现在收在共享 `RefreshButton` 里（见
+    // tests/refreshButton.test.ts）。本页只需把它接上、并传对两条文案 ——
+    // 判据钉**性质**（用了共享按钮 + 传对 label），不钉早先那份手写 JSX 的字面量。
     const src = code(page);
-    expect(src).toContain("disabled={refreshing}");
-    expect(src).toContain("aria-busy={refreshing}");
-    expect(src).toContain('refreshing ? "animate-spin" : ""');
-    expect(src).toContain('refreshing ? t("sessions.refreshing") : t("sessions.refresh")');
+    expect(src, "刷新必须走共享的 RefreshButton，不再各写一份").toContain("<RefreshButton");
+    expect(src, "idle 文案").toContain('idleLabel={t("sessions.refresh")}');
+    expect(src, "busy 文案").toContain('busyLabel={t("sessions.refreshing")}');
     expect(sessionsZh["sessions.refreshing"]).toBe("刷新中…");
     expect(sessionsEn["sessions.refreshing"]).toBe("Refreshing…");
   });

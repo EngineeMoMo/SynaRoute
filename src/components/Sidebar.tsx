@@ -1,12 +1,10 @@
 import { cn } from "@/lib/utils";
 import { useT } from "@/lib/useT";
 import { QuickToggles } from "@/components/QuickToggles";
+import { Kbd } from "@/components/ui/Kbd";
 import { useStore } from "@/store";
 import type { CategoryType } from "@/types";
 import {
-  Terminal,
-  MonitorSmartphone,
-  Code2,
   Brain,
   ScrollText,
   Settings,
@@ -18,6 +16,7 @@ import {
   Search,
   type LucideIcon,
 } from "lucide-react";
+import { CATEGORY_ICONS } from "@/lib/categoryIcons";
 
 export type NavKey =
   | CategoryType
@@ -37,9 +36,9 @@ interface NavItem {
 }
 
 const NAV: NavItem[] = [
-  { key: "claude-cli", tKey: "nav.claude-cli", icon: Terminal, group: "category" },
-  { key: "claude-desktop", tKey: "nav.claude-desktop", icon: MonitorSmartphone, group: "category" },
-  { key: "codex", tKey: "nav.codex", icon: Code2, group: "category" },
+  { key: "claude-cli", tKey: "nav.claude-cli", icon: CATEGORY_ICONS["claude-cli"], group: "category" },
+  { key: "claude-desktop", tKey: "nav.claude-desktop", icon: CATEGORY_ICONS["claude-desktop"], group: "category" },
+  { key: "codex", tKey: "nav.codex", icon: CATEGORY_ICONS.codex, group: "category" },
   { key: "brain", tKey: "nav.brain", icon: Brain, group: "feature" },
   // Codex 专属：本地历史对话（每条自带 provider，与当前不一致时打开会走错上游）
   { key: "sessions", tKey: "nav.sessions", icon: History, group: "feature" },
@@ -148,13 +147,11 @@ export function Sidebar({ active, onSelect, onOpenPalette }: SidebarProps) {
         */}
         <button
           onClick={onOpenPalette}
-          className="mb-4 flex w-full items-center gap-2.5 rounded-control border border-transparent px-3 py-2 text-sm text-text-secondary transition-all duration-150 hover:border-border hover:bg-surface-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-route/50"
+          className="mb-4 flex w-full items-center gap-2.5 rounded-control border border-transparent px-3 py-2 text-sm text-text-secondary transition-all duration-150 hover:border-border hover:bg-surface-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
         >
           <Search size={16} className="shrink-0" />
           <span className="truncate">{t("palette.launcher")}</span>
-          <kbd className="ml-auto shrink-0 rounded border border-border bg-background px-1.5 py-0.5 text-[10px] text-text-muted">
-            Ctrl K
-          </kbd>
+          <Kbd className="ml-auto">Ctrl K</Kbd>
         </button>
 
         {renderGroup("category", t("sidebar.groupTools"))}

@@ -184,12 +184,25 @@ mod tests {
                 .find("\n#[tauri::command]")
                 .or_else(|| rest.find("\nfn "))
                 .unwrap_or(rest.len());
+            // 直接调 `client_resync::sync_after(`，或经 lib.rs 的 `resync(` 包装 —— 后者
+            // 是「sync_after + 重建托盘」的收口（2026-09-19 起五个改 Key 命令都走它），
+            // 下面另有一条断言钉住 `resync` 自己真的调了 sync_after，故认它不留后门。
+            let body = &rest[..end];
             assert!(
-                rest[..end].contains("client_resync::sync_after("),
-                "`{entry}` 会改写 Key 集合/顺序，却没过 client_resync::sync_after —— \
-                 表现是「改了这一种会同步、改那一种不会」，用户得到一个时对时错的心智模型"
+                body.contains("client_resync::sync_after(") || body.contains("resync("),
+                "`{entry}` 会改写 Key 集合/顺序，却既没过 client_resync::sync_after、\
+                 也没经 resync 包装 —— 表现是「改了这一种会同步、改那一种不会」，\
+                 用户得到一个时对时错的心智模型"
             );
         }
+        // 🔴 防空转：`resync` 必须真的把 sync_after 包在里面，否则上面认它就是留了个后门。
+        let lib = prod(include_str!("lib.rs"));
+        let at = lib.find("fn resync<").expect("resync 应在 lib.rs 中定义");
+        let end = lib[at..].find("\nfn ").map(|i| at + i).unwrap_or(lib.len());
+        assert!(
+            lib[at..end].contains("client_resync::sync_after("),
+            "resync 必须调用 client_resync::sync_after，否则它只是个换名的空壳"
+        );
     }
 
     /// 🔴 只对**正在跑**的分类写：没接入就不许碰用户的 `~/.codex/config.toml` 等文件。

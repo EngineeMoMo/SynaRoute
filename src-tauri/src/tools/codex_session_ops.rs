@@ -1209,18 +1209,21 @@ mod tests {
             page.contains(r#"t("sessions.openExports")"#),
             "按钮没有文案键 —— 界面上会是一个空按钮"
         );
-        // 常驻：按钮必须落在 `<header>` … `</header>` **之内**。
+        // 常驻：按钮必须落在页头的 `actions={…}` 里（页头始终渲染），不能落到第一个
+        // 条件渲染块 `{data && …}` 之后。
         //
-        // ⚠️ 这条第一版写的是「在 `<header>` 与选中项块之间」，注入实测**仍绿** ——
-        // 那个区间跨了统计卡、警告横幅等大半个文件，几乎什么都满足。
-        // 钉边界要钉**元素内部**，不是「在某两个远隔的东西之间」。
-        let open = page.find("<header").expect("页面没有 header");
-        let close = page.find("</header>").expect("header 没闭合");
+        // ⚠️ 本页 2026-09 起用 `<PageHeader actions={…}/>` 组件、不再有裸 `<header>` 标签
+        // （Signal Deck 视觉改造），旧判据锚 `<header>`/`</header>` 因此**静默失效**、
+        // 编译不出的那种失效 —— panic「页面没有 header」。改锚元素内部的语义边界：
+        // `actions={` 之后、第一个条件块之前，即「始终渲染的页头动作区」。
+        // 钉边界仍钉**区域内部**，不是「某两个远隔的东西之间」。
+        let actions = page.find("actions={").expect("PageHeader 应有 actions 动作区");
+        let first_cond = page.find("{data &&").unwrap_or(page.len()); // 页头之后的首个条件块
         let btn = page.find(r#"t("sessions.openExports")"#).unwrap_or(usize::MAX);
         assert!(
-            btn > open && btn < close,
-            "「打开导出目录」必须常驻在 header 内，不能藏进选中项/导出结果那些条件块 \
-             （用户上一次导出可能是上次开应用时做的，那时 note 早没了）"
+            btn > actions && btn < first_cond,
+            "「打开导出目录」必须常驻在 PageHeader 的 actions 里，不能藏进 {{data &&…}} \
+             之后的条件块（用户上一次导出可能是上次开应用时做的，那时 note 早没了）"
         );
     }
 }

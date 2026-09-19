@@ -7,7 +7,7 @@ import type { TFunc } from "@/lib/i18n";
 import type { DailyUsageBucket, TokenUsage, UnpricedReason, UsageCostRow } from "@/types";
 import { AnimatedNumber } from "@/components/ui/AnimatedNumber";
 import { Badge } from "@/components/ui/Badge";
-import { Button } from "@/components/ui/Button";
+import { RefreshButton } from "@/components/ui/RefreshButton";
 import { InlineAlert } from "@/components/ui/InlineAlert";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Tooltip } from "@/components/ui/Tooltip";
@@ -201,7 +201,13 @@ export function UsagePage() {
             {tableDate && <p className="mt-0.5">{t("usage.tableDate", { date: tableDate })}</p>}
           </>
         }
-        actions={<Button variant="outline" size="sm" onClick={() => void load()}>{t("usage.refresh")}</Button>}
+        actions={
+          <RefreshButton
+            onRefresh={load}
+            idleLabel={t("usage.refresh")}
+            busyLabel={t("usage.refreshing")}
+          />
+        }
       />
 
       <div className="px-6">

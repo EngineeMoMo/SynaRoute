@@ -128,8 +128,17 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
   };
 
   return (
-    // flex-wrap：加了三个下拉后窄窗口必然放不下（应用最小宽度 900），不许它们被挤压变形。
-    <div className="relative flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border/80 bg-surface/75 px-6 py-2.5 backdrop-blur-md">
+    // 🔴 **两区布局，不是一个大 flex-wrap**（2026-09-19 用户实报「挤压错位」）。
+    //
+    // 旧版把状态指示 + 4 个下拉 + 动作按钮全塞进一个 `flex-wrap` 容器，按钮靠 `ml-auto`
+    // 顶到最右。窄窗口（应用最小宽度 900，而 Codex 分类的控件最多）放不下时整条换行，
+    // 而 `ml-auto` 在换行后**仍把按钮推到那一行的最右**，于是「推理强度」和按钮之间
+    // 裂开一道大空隙 —— 那就是截图里的错位。
+    //
+    // 改成：外层 `items-start` 不换行；左区 `flex-1` 自己 wrap 装所有状态/下拉，
+    // 右区 `shrink-0` 装按钮、钉在右上角。左区超宽时在自己内部换行、按钮岿然不动，
+    // 与第一行顶部对齐，没有空隙。
+    <div className="relative flex items-start gap-3 border-b border-border/80 bg-surface/75 px-6 py-2.5 backdrop-blur-md">
       {/* 「链路活着」的流动线：一道极淡的品牌色光沿底边扫过，只在代理**确实运行**且
           Key 没有全挂时出现。它回答的是一个用户真会问的问题（「它还在转吗」）——
           代理停止或全部 Key 不可用时不渲染，界面回到完全静止，静止本身就是信息。
@@ -137,6 +146,8 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
       {running && !allDown && (
         <span aria-hidden className="sr-flow pointer-events-none absolute inset-x-0 bottom-0 h-px" />
       )}
+      {/* 左区：状态 + 下拉，`min-w-0` 让它在必要时才 wrap，不撑破右区。 */}
+      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-2">
       <div className="flex items-center gap-2">
         {/* 🔴 脉冲光晕用 `currentColor`（见 styles.css 的 synaroute-status-pulse），
             所以这里必须**同时**给文字色 —— 只给 bg-* 的话 currentColor 会取到继承来的
@@ -286,7 +297,11 @@ export function ProxyStatusBar({ proxy }: { proxy: ProxyState | null }) {
         </>
       )}
 
-      <div className="ml-auto flex items-center gap-2">
+      </div>
+
+      {/* 右区：动作按钮，钉在右上角、永不 wrap（`shrink-0`）。之前靠 `ml-auto` 顶右，
+          换行后会与左区裂开空隙 —— 现在它是外层的独立子项，与左区第一行顶部对齐。 */}
+      <div className="flex shrink-0 items-center gap-2">
         <ToolConfigPreviewButton />
         {running ? (
           <>

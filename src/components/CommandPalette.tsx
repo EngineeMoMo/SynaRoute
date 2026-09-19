@@ -2,9 +2,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Search,
-  Terminal,
-  MonitorSmartphone,
-  Code2,
   Brain,
   ScrollText,
   Gauge,
@@ -20,6 +17,8 @@ import {
   CornerDownLeft,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { CATEGORY_ICONS } from "@/lib/categoryIcons";
+import { Kbd } from "@/components/ui/Kbd";
 import type { CategoryType, ProviderKey, ProxyState } from "@/types";
 import type { NavKey } from "@/components/Sidebar";
 import { api } from "@/lib/bridge";
@@ -31,9 +30,7 @@ import { openLogDir } from "@/lib/openLogDir";
 const CATEGORIES: CategoryType[] = ["claude-cli", "claude-desktop", "codex"];
 
 const NAV_ICONS: Record<NavKey, LucideIcon> = {
-  "claude-cli": Terminal,
-  "claude-desktop": MonitorSmartphone,
-  codex: Code2,
+  ...CATEGORY_ICONS,
   brain: Brain,
   sessions: History,
   logs: ScrollText,
@@ -365,9 +362,7 @@ export function CommandPalette({ onClose, onNavigate, onEditKey, onAddKey }: Pro
             aria-controls="palette-list"
             aria-activedescendant={filtered[cursor] ? `palette-opt-${cursor}` : undefined}
           />
-          <kbd className="shrink-0 rounded border border-border bg-background px-1.5 py-0.5 text-[10px] text-text-muted">
-            Esc
-          </kbd>
+          <Kbd>Esc</Kbd>
         </div>
 
         <div ref={listRef} id="palette-list" role="listbox" className="min-h-0 flex-1 overflow-y-auto py-1">

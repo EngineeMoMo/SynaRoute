@@ -18,7 +18,8 @@ import { discoverableModels, keyExpectedSet, routingPrimaryKey } from "@/lib/mod
 // 有 5 个监听器要成对拆掉的状态机，混在页面组件里必然漏掉某一条清理。
 import { useKeyDrag } from "@/lib/useKeyDrag";
 import type { EventLogEntry, ProviderKey } from "@/types";
-import { Plus, AlertTriangle, Inbox, X, Waypoints } from "lucide-react";
+import { Plus, AlertTriangle, Inbox, X } from "lucide-react";
+import { CATEGORY_ICONS } from "@/lib/categoryIcons";
 import { EnvConflictBanner } from "@/components/EnvConflictBanner";
 
 /** 分类主页：代理状态条 + 模型映射兜底提示 + Key 卡片列表 */
@@ -204,7 +205,7 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
       <ProxyStatusBar proxy={proxy} />
 
       <PageHeader
-        icon={Waypoints}
+        icon={CATEGORY_ICONS[activeCategory]}
         title={t(`nav.${activeCategory}`)}
         description={
           <Tooltip content={t("category.keyCountTip")} side="bottom">
