@@ -151,7 +151,10 @@ async function main() {
       mobile: false,
     });
 
-    await cdp.send("Page.navigate", { url: APP_URL });
+    // `?showcase=1`：让 mock 收敛成健康态（无告警横幅、无失败态徽标、余额都查得到）。
+    // 常规预览刻意铺开各种异常态供开发者自检，那不该出现在官网截图里。见 mockData.ts 的 SHOWCASE。
+    const shotUrl = APP_URL + (APP_URL.includes("?") ? "&" : "?") + "showcase=1";
+    await cdp.send("Page.navigate", { url: shotUrl });
     // 等到侧栏渲染出来才算加载完 —— 单纯等 load 事件时 React 可能还没挂载
     for (let i = 0; i < 60; i++) {
       const ready = await cdp.evaluate(`!!document.querySelector('aside, nav')`);

@@ -32,6 +32,39 @@ import { MOCK_ENV_FINDINGS, mockEnvRemoval } from "./mockData.env";
 
 const now = Date.now();
 
+/**
+ * 「展示态」开关（`?showcase=1`）。
+ *
+ * 常规预览的 mock 是**刻意造异常**的：k3 未探测、k4 禁用且状态陈旧、k5 不可达、k6 熔断中，
+ * 余额四种失败态铺开、还有客户端环境变量冲突 —— 这些是给开发者在浏览器里一眼看全所有
+ * 徽标/失败文案用的（各处注释都写了「别删」）。但那正是**官网截图最不该展示**的样子：
+ * 用户第一眼看到满屏告警会以为软件出了问题。
+ *
+ * 官网截图脚本（`site/scripts/capture-shots.mjs`）带上 `?showcase=1`，本文件据此把数据
+ * **收敛成健康态**：只留正常运行的 Key、无环境变量冲突、余额都查得到。异常态一条不删，
+ * 只是展示态下不呈现 —— 两个用途各取所需，互不牺牲。
+ */
+const SHOWCASE =
+  typeof window !== "undefined" &&
+  new URLSearchParams(window.location.search).has("showcase");
+
+/**
+ * 展示态：只留「启用 + 健康(up) + 未熔断」的 Key。
+ *
+ * 还要**统一存活 Key 的模型集**：分类页的「模型单点」告警在「某模型只有一条 Key 能服务」
+ * 时触发，而常规 mock 里 k2 独有 `fable-5` → 即便只剩 k1/k2 也会亮一条告警。展示态下把
+ * 存活 Key 的 models 归一成同一组（主 + 备用同款模型，本就是最常见的健康配置），单点消失。
+ * mappings 一并清空：那是「对外名≠真实名」的映射，展示态的干净 Key 用不到。
+ */
+function forShowcase(list: ProviderKey[]): ProviderKey[] {
+  if (!SHOWCASE) return list;
+  const alive = list.filter(
+    (k) => k.enabled && k.health.status === "up" && !k.health.breakerUntil,
+  );
+  const shared = alive[0]?.models ?? [];
+  return alive.map((k) => ({ ...k, models: shared, mappings: [] }));
+}
+
 /** 主口令模式的浏览器预览态：默认关（与真实默认一致），启用后记住口令用于校验。 */
 let masterMock: MasterPasswordState = { enabled: false, locked: false };
 let masterPw = "";
@@ -276,7 +309,7 @@ const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
 export const mockBridge = {
   async listKeys(categoryId: CategoryType) {
     await delay();
-    return clone(store[categoryId] ?? []);
+    return clone(forShowcase(store[categoryId] ?? []));
   },
   async upsertKey(key: ProviderKey) {
     await delay();
@@ -627,7 +660,8 @@ export const mockBridge = {
    */
   async queryBalance(keyId: string) {
     await delay();
-    const bucket = keyId.split("").reduce((a, c) => a + c.charCodeAt(0), 0) % 4;
+    // 展示态：一律走「正常有余额」那一支（下面桶 0），不铺开失败/超时/号废各态。
+    const bucket = SHOWCASE ? 0 : keyId.split("").reduce((a, c) => a + c.charCodeAt(0), 0) % 4;
     // 桶 1：查询失败（字段找不到）。卡片必须显示这句原因，**且绝不显示成余额 0**。
     if (bucket === 1) {
       return {
@@ -727,7 +761,8 @@ export const mockBridge = {
   // 三条样本各自的用途写在 `mockData.env.ts` 里（别随手删其中任何一条）。
   async detectEnvConflicts() {
     await delay();
-    return MOCK_ENV_FINDINGS;
+    // 展示态无冲突：官网截图不该顶着一条「环境变量冲突」告警横幅。
+    return SHOWCASE ? [] : MOCK_ENV_FINDINGS;
   },
   async removeEnvConflicts(names: string[]) {
     await delay();
