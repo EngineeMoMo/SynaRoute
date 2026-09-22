@@ -37,52 +37,146 @@ use serde_json::Value;
 /// OpenAI 顶层不接受的组合关键字。
 const FORBIDDEN_ROOT_KEYWORDS: [&str; 6] = ["oneOf", "anyOf", "allOf", "enum", "const", "not"];
 
-/// 校验请求体里每个工具的 `parameters` 顶层是不是 OpenAI 能接受的 object schema。
+/// Anthropic 顶层不接受的组合关键字 —— **刻意只有三个，不是照搬上面那六个**。
 ///
-/// 两种承载都覆盖：Chat 嵌套（`function.parameters`）与 Responses 扁平（顶层 `parameters`）。
-/// 没有 `tools`、或某个工具没有 `parameters`（无参工具）时一律放行。
-pub fn validate_openai_tool_schemas(body: &Value) -> Result<(), String> {
+/// 2026-09-20 用户实报的上游原话只点了这三个：
+///
+/// ```text
+/// ***.***.custom.input_schema: input_schema does not support oneOf, allOf,
+/// or anyOf at the top level  （reason: TOOL_SCHEMA_INVALID）
+/// ```
+///
+/// `enum`/`const`/`not` 在 Anthropic 顶层**是否也被拒，没有任何取证**。把它们一起列进来
+/// 是「顺手对齐」，而代价是误拒：一个顶层带 `enum` 的工具会被我们在本地拦下，用户看到的是
+/// 「工具突然不可用」—— 那比上游的 400 更难查，也正是本模块开头论证过不做的事。
+/// 故此处只列证据支持的三个；将来若有新的上游原话点到别的关键字，**带着那句原话**再加。
+const FORBIDDEN_ROOT_KEYWORDS_ANTHROPIC: [&str; 3] = ["oneOf", "anyOf", "allOf"];
+
+/// 一个工具声明里承载入参 schema 的字段名，**按协议而异**。
+///
+/// OpenAI 系叫 `parameters`（Chat 嵌在 `function` 里、Responses 扁平在顶层），
+/// Anthropic 叫 `input_schema`（平铺）。这不是「两个都查一下」的细节：查错字段的表现是
+/// 校验**静默空转** —— 每个工具都走 `continue`、函数返回 `Ok`，与「压根没有校验」
+/// 一模一样，而测试还是绿的。2026-09-20 那条 Anthropic 上游 400 的原话点的正是
+/// `input_schema`，若照搬 `parameters` 去查，这个洞会原样留着。
+const SCHEMA_FIELD_OPENAI: &str = "parameters";
+const SCHEMA_FIELD_ANTHROPIC: &str = "input_schema";
+
+/// 两家协议共用的顶层 schema 判据，差异全部由参数传入。
+///
+/// 抽成一个函数而不是各写一份：两份必然漂移，而漏掉一条的表现是「某个协议悄悄没在查」，
+/// 正是本模块开头那个洞的形状。
+fn validate_tool_schemas(
+    body: &Value,
+    forbidden: &[&str],
+    schema_field: &str,
+    strict_object_root: bool,
+    upstream_label: &str,
+) -> Result<(), String> {
     let Some(tools) = body.get("tools").and_then(Value::as_array) else {
         return Ok(());
     };
     for tool in tools {
-        // Chat 嵌套优先；没有 `function` 子对象时按 Responses 扁平形态读顶层。
+        // Chat 嵌套优先；没有 `function` 子对象时按扁平形态（Responses / Anthropic）读顶层。
         let holder = tool.get("function").unwrap_or(tool);
-        let name = holder.get("name").and_then(Value::as_str).unwrap_or("<unknown>");
-        let Some(schema) = holder.get("parameters") else { continue };
+        let name = holder
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        // 无参工具、以及 Anthropic 的服务端工具（`{type:"web_search_…", name}` 无 schema）
+        // 都落在这里放行。
+        let Some(schema) = holder.get(schema_field) else {
+            continue;
+        };
         let Some(object) = schema.as_object() else {
-            return Err(reject(name, "顶层必须是一个 object schema"));
+            // OpenAI 那侧上游原话明确点了 "schema must have type 'object'"，故拒。
+            // Anthropic 侧没有这句取证，且非 object 压根不可能带那三个关键字 —— 放行，
+            // 让上游去说（同本模块「只拦有证据的形态」）。
+            if strict_object_root {
+                return Err(reject(name, "顶层必须是一个 object schema", upstream_label));
+            }
+            continue;
         };
         // 🔴 **组合关键字要排在 `type` 之前判。** 顶层 union 通常压根不带 `type`
         // （`{"anyOf":[…]}` 就是标准写法），先判 `type` 会给出「必须声明 type=object」——
         // 那句话虽然为真，却把用户引向「加个 type 就行」，而真正要做的是把 union 挪进
         // properties。写这条判据的用例当场抓住了这个顺序（同「指错方向的提示比没有提示更糟」）。
-        if let Some(bad) = FORBIDDEN_ROOT_KEYWORDS.iter().find(|k| object.contains_key(**k)) {
-            return Err(reject(name, &format!("顶层不能带 `{bad}`（把它挪进 properties 里）")));
+        if let Some(bad) = forbidden.iter().find(|k| object.contains_key(**k)) {
+            return Err(reject(
+                name,
+                &format!("顶层不能带 `{bad}`（把它挪进 properties 里）"),
+                upstream_label,
+            ));
         }
-        if object.get("type").and_then(Value::as_str) != Some("object") {
-            return Err(reject(name, "顶层必须声明 `type: \"object\"`"));
+        // `type: "object"` 只对 OpenAI 强制（上游原话里有）。Anthropic 侧不查：没有取证，
+        // 而误拒的方向是「工具突然不可用」，比上游那句 400 更难查。
+        if strict_object_root && object.get("type").and_then(Value::as_str) != Some("object") {
+            return Err(reject(
+                name,
+                "顶层必须声明 `type: \"object\"`",
+                upstream_label,
+            ));
         }
     }
     Ok(())
 }
 
-/// 按上游协议决定要不要校验，命中即返回 [`crate::error::AppError::Invalid`]。
+/// 校验请求体里每个工具的 `parameters` 顶层是不是 OpenAI 能接受的 object schema。
+///
+/// 两种承载都覆盖：Chat 嵌套（`function.parameters`）与 Responses 扁平（顶层 `parameters`）。
+/// 没有 `tools`、或某个工具没有 `parameters`（无参工具）时一律放行。
+pub fn validate_openai_tool_schemas(body: &Value) -> Result<(), String> {
+    validate_tool_schemas(
+        body,
+        &FORBIDDEN_ROOT_KEYWORDS,
+        SCHEMA_FIELD_OPENAI,
+        true,
+        "OpenAI 系",
+    )
+}
+
+/// 校验发往 Anthropic 上游的工具 `input_schema` 顶层没有 union（2026-09-20 用户实报）。
+///
+/// 判据比 OpenAI 那套**窄**，理由见 [`FORBIDDEN_ROOT_KEYWORDS_ANTHROPIC`]。
+pub fn validate_anthropic_tool_schemas(body: &Value) -> Result<(), String> {
+    validate_tool_schemas(
+        body,
+        &FORBIDDEN_ROOT_KEYWORDS_ANTHROPIC,
+        SCHEMA_FIELD_ANTHROPIC,
+        false,
+        "Anthropic",
+    )
+}
+
+/// 按上游协议决定用哪套判据，命中即返回 [`crate::error::AppError::Invalid`]。
 ///
 /// 转发路径统一走它（而不是各自写 `if is_openai() { … map_err … }`）：那三行在两条路径上
 /// 各写一遍必然漂移，而漏掉一条的表现是「非流式被拦住、流式照旧发出去」——
 /// 按客户端而异的分叉，本仓已为同一形态栽过多次。
-pub fn validate_tools_for(upstream: crate::model::Protocol, body: &Value) -> crate::error::AppResult<()> {
-    if !upstream.is_openai() {
-        return Ok(());
-    }
-    validate_openai_tool_schemas(body).map_err(crate::error::AppError::Invalid)
+///
+/// 🔴 **Anthropic 分支是 2026-09-20 补的。** 此前这里是 `if !upstream.is_openai() { return Ok }`
+/// —— 一句「只有 OpenAI 有这个约束」的假设，而用户那条 `TOOL_SCHEMA_INVALID` 证明 Anthropic
+/// 同样拒顶层 union。两条转发路径的调用点本来就把协议传进来了，所以修这个洞**不需要动调用点**，
+/// 只需要这里不再提前放行。
+pub fn validate_tools_for(
+    upstream: crate::model::Protocol,
+    body: &Value,
+) -> crate::error::AppResult<()> {
+    let checked = if upstream.is_openai() {
+        validate_openai_tool_schemas(body)
+    } else if upstream == crate::model::Protocol::Anthropic {
+        validate_anthropic_tool_schemas(body)
+    } else {
+        Ok(())
+    };
+    checked.map_err(crate::error::AppError::Invalid)
 }
 
 /// 报错文案。**必须点名工具** —— 一个工具池里几十个工具，不点名等于没说。
-fn reject(name: &str, why: &str) -> String {
+/// 也必须点名是哪一侧的上游：用户下一步要去改的东西不同。
+fn reject(name: &str, why: &str, upstream_label: &str) -> String {
     format!(
-        "工具 `{name}` 的参数 schema 不被 OpenAI 系上游接受：{why}。\
+        "工具 `{name}` 的参数 schema 不被 {upstream_label}上游接受：{why}。\
          该请求已在本地拒绝，未发往上游。"
     )
 }
@@ -104,9 +198,15 @@ mod tests {
             json!({ "oneOf": [{ "type": "object" }, { "type": "string" }] }),
         );
         let err = validate_openai_tool_schemas(&body).expect_err("必须被拒");
-        assert!(err.contains("mcp__codex_app__automation_update"), "必须点名工具：{err}");
+        assert!(
+            err.contains("mcp__codex_app__automation_update"),
+            "必须点名工具：{err}"
+        );
         assert!(err.contains("oneOf"), "必须说清是哪个关键字：{err}");
-        assert!(err.contains("未发往上游"), "必须说明这是本地拒绝，否则用户会去查中转站");
+        assert!(
+            err.contains("未发往上游"),
+            "必须说明这是本地拒绝，否则用户会去查中转站"
+        );
     }
 
     /// 六个禁用关键字、非 object 的 type、以及压根不是对象的 schema 都要拒。
@@ -150,9 +250,136 @@ mod tests {
                     "required": ["p"] } } }
             ]
         });
-        assert!(validate_openai_tool_schemas(&ok).is_ok(), "合法 schema 被误拒");
-        assert!(validate_openai_tool_schemas(&json!({ "model": "m" })).is_ok(), "没有 tools 不该报错");
-        assert!(validate_openai_tool_schemas(&json!({ "tools": [] })).is_ok(), "空 tools 不该报错");
+        assert!(
+            validate_openai_tool_schemas(&ok).is_ok(),
+            "合法 schema 被误拒"
+        );
+        assert!(
+            validate_openai_tool_schemas(&json!({ "model": "m" })).is_ok(),
+            "没有 tools 不该报错"
+        );
+        assert!(
+            validate_openai_tool_schemas(&json!({ "tools": [] })).is_ok(),
+            "空 tools 不该报错"
+        );
+    }
+
+    fn anthropic_tool(name: &str, schema: Value) -> Value {
+        json!({ "tools": [ { "name": name, "input_schema": schema } ] })
+    }
+
+    /// 🔴 2026-09-20 用户实报的形态：Anthropic 上游拒 `input_schema` 顶层 union。
+    ///
+    /// 上游原话（中转站逐字转发）：
+    /// `input_schema does not support oneOf, allOf, or anyOf at the top level`
+    /// （`reason: TOOL_SCHEMA_INVALID`）。此前 `validate_tools_for` 对非 OpenAI 上游
+    /// 一律提前 `return Ok`，这个 400 只能由上游说出来，且用户看到的是英文 + 掩码后的工具名。
+    ///
+    /// **这条用例同时是字段名的故障注入判据**：body 用的是 `input_schema`，
+    /// 若把 `SCHEMA_FIELD_ANTHROPIC` 写成 `parameters`，校验会静默空转（每个工具
+    /// `continue`、返回 `Ok`）—— 与压根没修一模一样，而只有这条会变红。
+    #[test]
+    fn anthropic_union_root_is_refused_and_names_the_tool() {
+        for bad in ["oneOf", "allOf", "anyOf"] {
+            let body = anthropic_tool(
+                "mcp__codex_app__automation_update",
+                json!({ bad: [{ "type": "object" }, { "type": "string" }] }),
+            );
+            let err =
+                validate_anthropic_tool_schemas(&body).expect_err("Anthropic 顶层 union 必须被拒");
+            assert!(
+                err.contains("mcp__codex_app__automation_update"),
+                "必须点名工具：{err}"
+            );
+            assert!(err.contains(bad), "必须说清是哪个关键字：{err}");
+            assert!(err.contains("Anthropic"), "必须点名是哪一侧上游：{err}");
+            assert!(
+                err.contains("未发往上游"),
+                "必须说明是本地拒绝，否则用户会去查中转站：{err}"
+            );
+        }
+    }
+
+    /// 🔴 **判据不许照搬 OpenAI 那六个。**
+    ///
+    /// `enum`/`const`/`not` 在 Anthropic 顶层是否被拒**没有取证**，拦下它们就是误拒，
+    /// 而误拒的表现是「工具突然不可用」—— 比上游那句 400 更难查。非 object 的根同理放行
+    /// （没有取证，且非 object 压根不可能带那三个关键字）。
+    ///
+    /// 有人「顺手对齐」把 `FORBIDDEN_ROOT_KEYWORDS_ANTHROPIC` 换成那六个时，这条立刻变红。
+    #[test]
+    fn anthropic_judgment_stays_narrower_than_openai() {
+        for tolerated in [
+            json!({ "type": "object", "enum": ["a"] }),
+            json!({ "type": "object", "const": 1 }),
+            json!({ "type": "object", "not": { "type": "string" } }),
+            json!({ "type": "string" }),
+            json!("not-even-an-object"),
+        ] {
+            assert!(
+                validate_anthropic_tool_schemas(&anthropic_tool("t", tolerated.clone())).is_ok(),
+                "没有取证的形态不该在本地拦下（误拒 = 工具突然不可用）：{tolerated}"
+            );
+        }
+        // 对照：同样这些形态在 OpenAI 侧**有**上游原话支持，仍须拒 —— 证明放宽只发生在
+        // Anthropic 一侧，没有把 OpenAI 那套判据一起弄松。
+        for still_bad in [
+            json!({ "type": "object", "enum": ["a"] }),
+            json!({ "type": "string" }),
+        ] {
+            assert!(
+                validate_openai_tool_schemas(&chat_tool("t", still_bad.clone())).is_err(),
+                "OpenAI 侧判据不该被放宽：{still_bad}"
+            );
+        }
+    }
+
+    /// 🔴 反面：合法的 Anthropic 工具声明一个都不许被拦。
+    #[test]
+    fn legitimate_anthropic_schemas_are_never_refused() {
+        let ok = json!({
+            "tools": [
+                { "name": "read_file",
+                  "input_schema": { "type": "object", "properties": { "path": { "type": "string" } },
+                                    "required": ["path"] } },
+                // 嵌套层的 anyOf 是标准写法，只看顶层
+                { "name": "nested",
+                  "input_schema": { "type": "object",
+                                    "properties": { "p": { "anyOf": [{ "type": "string" }, { "type": "number" }] } } } },
+                // Anthropic 服务端工具：没有 input_schema
+                { "type": "web_search_20250305", "name": "web_search" },
+            ]
+        });
+        assert!(
+            validate_anthropic_tool_schemas(&ok).is_ok(),
+            "合法 Anthropic schema 被误拒"
+        );
+        assert!(validate_anthropic_tool_schemas(&json!({ "model": "m" })).is_ok());
+        assert!(validate_anthropic_tool_schemas(&json!({ "tools": [] })).is_ok());
+    }
+
+    /// 🔴 **`validate_tools_for` 的分派判据 —— 这是缺陷本体所在。**
+    ///
+    /// 上面那些用例直调 `validate_anthropic_tool_schemas`，把 `validate_tools_for` 里的
+    /// Anthropic 分支删掉（退回 `if !is_openai() { return Ok }`）它们**照样全绿**，
+    /// 而那正是 2026-09-20 那个洞。本仓已为这类「函数写对了但没接上」的盲区栽过 20 多次。
+    #[test]
+    fn validate_tools_for_dispatches_anthropic_not_just_openai() {
+        use crate::model::Protocol;
+        let bad = anthropic_tool("t", json!({ "oneOf": [{ "type": "object" }] }));
+        assert!(
+            validate_tools_for(Protocol::Anthropic, &bad).is_err(),
+            "Anthropic 上游必须经由 validate_tools_for 拦下顶层 union —— 此前这里直接 return Ok"
+        );
+        // OpenAI 系仍走它自己那套（更严）判据。
+        let bad_openai = chat_tool("t", json!({ "type": "string" }));
+        assert!(validate_tools_for(Protocol::OpenaiChat, &bad_openai).is_err());
+        assert!(validate_tools_for(Protocol::OpenaiResponses, &bad_openai).is_err());
+        // Anthropic 的字段名是 input_schema：同样的坏形态挂在 parameters 上不该由
+        // Anthropic 判据拦（它压根不看那个字段），这钉住两套判据没有互相串味。
+        let anthropic_wrong_field = json!({ "tools": [ { "name": "t",
+            "parameters": { "oneOf": [{ "type": "object" }] } } ] });
+        assert!(validate_tools_for(Protocol::Anthropic, &anthropic_wrong_field).is_ok());
     }
 
     /// 🔴 **接线判据**：两条转发路径与聚合路径都必须真的调它。

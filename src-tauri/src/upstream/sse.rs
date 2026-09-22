@@ -19,13 +19,10 @@ use super::tools_meta::{
 
 // ---- 流式 SSE 跨协议翻译（Task #16）----
 //
-// Codex 下游默认 stream:true 且用 Responses 形态；多数第三方上游只支持 Chat。需把上游的
-// Chat SSE 增量实时重组成 Responses 事件序列（反之亦然）。用「有状态、行缓冲」翻译器：
-// 逐块喂入上游字节，按行切分缓冲不完整行，解析 `data: {json}`，产出下游协议的 SSE 文本。
-//
-// 能力边界（已在方案中说清）：Chat 上游只会产出「文本增量 / tool_call 增量 / finish / usage」，
-// 故覆盖这几类并重组；Responses 独有的 reasoning_summary / image / code_interpreter 等因
-// Chat 源头无数据而不出现 —— 能力上限，非遗漏。
+// Codex 下游默认 stream:true 用 Responses 形态，多数第三方上游只支持 Chat。用「有状态、行缓冲」
+// 翻译器把上游 SSE 增量实时重组成下游协议序列（逐块喂字节、按行切分、解析 `data: {json}`）。
+// 能力边界：Chat 上游只产出「文本 / tool_call / finish / usage」增量，故覆盖这几类；Responses
+// 独有的 reasoning_summary / image 等因 Chat 源头无数据而不出现 —— 能力上限，非遗漏。
 
 #[path = "sse_error.rs"] pub(crate) mod sse_error; // 上游流内 error 的跨协议翻译；来由见该文件模块注释
 #[path = "sse_bounds.rs"] mod sse_bounds; // 工具调用累积的体积上限；来由见该文件模块注释
@@ -85,6 +82,11 @@ pub struct SseTranslator {
     /// （output_tokens），需累积后在收尾（Responses response.completed）时统一归位。
     input_tokens: u64,
     output_tokens: u64,
+    /// 缓存读/写 token（A10-2）：在读上游 usage 的同一处捕获（Anthropic 是
+    /// `cache_*_input_tokens`、OpenAI 系是 `*_tokens_details.cached_tokens`），
+    /// [`accumulated_usage`] 带出。不带的话跨协议流末记账恒为 0，而缓存注入明明产生了命中。
+    cache_read: u64,
+    cache_creation: u64,
     /// Anthropic content block 的 index → tool_calls 槽位下标映射（tool_use 块与 text 块
     /// 共用同一 index 空间，需按 content_block_start 记下 tool_use 块落在哪个槽位）。
     block_tool_slot: std::collections::HashMap<usize, usize>,
@@ -151,6 +153,8 @@ impl SseTranslator {
             tool_calls: Vec::new(),
             input_tokens: 0,
             output_tokens: 0,
+            cache_read: 0,
+            cache_creation: 0,
             block_tool_slot: std::collections::HashMap::new(),
             text_accum: String::new(),
             thinking_blocks: std::collections::HashSet::new(),
@@ -168,12 +172,10 @@ impl SseTranslator {
         }
     }
 
-    /// 在 [`with_namespaces`] 基础上带上两个工具集合：
-    /// - `custom_tools`（Codex 的 apply_patch / exec 等 type:"custom"）→ 回程发 `custom_tool_call`；
-    /// - `search_tools`（Codex 的 `tool_search` 延迟检索器）→ 回程发 `tool_search_call`。
-    ///
-    /// Codex（Responses 下游）跨协议流式时传入。不改写的话 Codex router 认不出这两类调用：
-    /// custom 工具执行失败；检索发不起来 → MCP 工具（`mcp__*`）永远拿不到 schema。
+    /// 在 [`with_namespaces`] 基础上带两个工具集合（Codex/Responses 下游跨协议流式时传入）：
+    /// `custom_tools`（apply_patch/exec 等 type:"custom"）→ 回程发 `custom_tool_call`；
+    /// `search_tools`（`tool_search` 延迟检索器）→ 回程发 `tool_search_call`。不改写则 Codex
+    /// router 认不出：custom 工具执行失败、检索发不起来 → MCP 工具永远拿不到 schema。
     pub fn with_namespaces_and_custom(
         dir: SseDirection,
         tool_namespaces: Vec<String>,
@@ -188,11 +190,9 @@ impl SseTranslator {
 
     /// 喂入一块上游字节，返回应发给下游的 SSE 文本（可能为空）。
     ///
-    /// **缓冲的是字节而不是字符串**，且只对**完整行**解码 —— 这一点是必须的，不是风格问题。
-    /// 原先写的是 `buf.push_str(&String::from_utf8_lossy(chunk))`：对每一块入参各自解码。
-    /// 而上游是流式的，一个 3 字节的中文字符完全可能被 TCP 分段切开、分两次 push 进来，
-    /// 逐块解码时前后两半各自都是非法 UTF-8、各自被替换成 U+FFFD，用户看到的回答里凭空出现「」。
-    /// 按完整行解码则安全：SSE 协议保证上游按行发 JSON，行内必然是完整的 UTF-8 序列。
+    /// **缓冲字节而非字符串**，且只对**完整行**解码 —— 必须如此，非风格问题：一个 3 字节中文字符
+    /// 可能被 TCP 分段切开分两次 push 进来，逐块解码时前后两半各自非法、各被替换成 U+FFFD，
+    /// 用户看到凭空出现的「」。按行解码则安全（SSE 保证按行发 JSON，行内必是完整 UTF-8）。
     /// 回归测试见 `sse_multibyte_text_survives_arbitrary_chunk_boundaries`。
     pub fn push(&mut self, chunk: &[u8]) -> String {
         if self.limit_hit_emitted { return String::new() }
@@ -221,14 +221,19 @@ impl SseTranslator {
         out
     }
 
-    ///
-    /// 给**跨协议流式的用量采集**用。同协议直通那条路走的是「尾窗缓存 + 事后
-    /// `extract_usage_from_sse`」，跨协议这条路不能照搬：翻译器边收边转，尾窗里躺的是
-    /// 已经**转换过**的下游格式，字段名与上游未必一致。而翻译器本来就得读懂上游 usage
-    /// 才能翻译（见 `input_tokens` / `output_tokens` 的写入点），所以直接问它最准，也省一份缓冲。
-    ///
-    /// 判 0 而非判「有没有见过 usage 事件」：token 数为 0 的成功请求实际不存在，
-    /// 而多记一个字段去区分「没给」和「给了 0」不值当。
+    /// A10-2：从 Anthropic message_start 的 usage 捕获缓存读/写；两个方向共用（别各写一份）。
+    fn capture_anthropic_cache(&mut self, usage: &Value) {
+        if let Some(cr) = usage.get("cache_read_input_tokens").and_then(|t| t.as_u64()) {
+            self.cache_read = cr;
+        }
+        if let Some(cc) = usage.get("cache_creation_input_tokens").and_then(|t| t.as_u64()) {
+            self.cache_creation = cc;
+        }
+    }
+
+    /// 给**跨协议流式的用量采集**用。同协议直通走「尾窗缓存 + 事后 `extract_usage_from_sse`」；
+    /// 跨协议不能照搬（尾窗里是已转换的下游格式），而翻译器本来就得读懂上游 usage 才能翻译，
+    /// 直接问它最准。判 0 而非「见过 usage 事件」：token 为 0 的成功请求实际不存在。
     pub fn accumulated_usage(&self) -> Option<crate::model::TokenUsage> {
         if self.input_tokens == 0 && self.output_tokens == 0 {
             return None;
@@ -236,10 +241,10 @@ impl SseTranslator {
         Some(crate::model::TokenUsage {
             input: self.input_tokens,
             output: self.output_tokens,
-            // 翻译器不累积 cache_read：它只在能翻译的字段上做搬运，缓存命中数各协议表述不一，
-            // 硬凑会记出个假数。同协议直通那条路能拿到（原样解析上游 JSON），此处留 0。
-            cache_read: 0,
-            cache_creation: 0,
+            // A10-2：各方向在写入点已按各自协议的字段名捕获缓存读/写（见 `capture_anthropic_cache`
+            // 与 Chat/Responses 的 `cached_tokens` 捕获）；不带出来的话跨协议流末记账恒为 0。
+            cache_read: self.cache_read,
+            cache_creation: self.cache_creation,
         })
     }
 
@@ -389,13 +394,11 @@ impl SseTranslator {
             return out;
         }
         self.started = false;
-        // Codex 的 Responses SSE 解析器（codex-api/src/sse/responses.rs）只在
-        // `response.output_item.done` 事件里把 item 反序列化为 ResponseItem::FunctionCall
-        // 并执行工具；`response.completed` 段只读 id/usage/end_turn，**完全忽略 output[]**。
-        // 故每个累积的工具调用都必须作为独立的 output_item.added + output_item.done 事件流式
-        // 投递（此前只塞进 completed.output → Codex 收不到工具调用、卡死等待，纯文本却正常）。
-        // 字段严格对齐 Codex 的 ResponseItem::FunctionCall：name / arguments（JSON 字符串）/
-        // call_id（必填，用上游 tool_use/tool_call 的 id；缺失则兜底生成，保证工具结果可回配）。
+        // Codex 的 Responses 解析器只在 `output_item.done` 里反序列化 FunctionCall 并执行工具，
+        // `response.completed` 段**完全忽略 output[]**。故每个工具调用必须作为独立的
+        // output_item.added + .done 流式投递（此前塞进 completed.output → Codex 收不到、卡死）。
+        // 字段对齐 ResponseItem::FunctionCall：name / arguments（JSON 串）/ call_id（必填，
+        // 用上游 id，缺失则兜底生成以保证结果可回配）。
         let mut output: Vec<Value> = vec![];
         // output_index：文本消息占 0（若有），工具调用依次往后排。
         let tool_base = if self.saw_text { 1u64 } else { 0 };
@@ -528,13 +531,9 @@ impl SseTranslator {
                     "object": "chat.completion.chunk",
                     "choices": [ { "index": 0, "delta": {}, "finish_reason": finish } ]
                 })));
-                // usage 收尾 chunk。**此前这条方向从不发 usage**：`self.input_tokens` /
-                // `output_tokens` 在本方向被写入却永不读出，下游拿不到任何 token 数字。
-                // 与其它四个方向的能力漂移（各自都发 usage），修掉它。
-                //
-                // Chat Completions 的约定是：最后一个 chunk 带 `usage`、`choices` 为空数组
-                // （OpenAI `stream_options.include_usage` 的形状）。取 Responses 事件里的
-                // usage，取不到时回退到流中累积的字段值。
+                // usage 收尾 chunk（此前这条方向从不发 usage → 与其它四个方向的能力漂移，已修）。
+                // Chat 约定：末 chunk 带 `usage`、`choices` 为空数组（include_usage 形状）。
+                // 取 Responses 事件里的 usage，取不到时回退到流中累积的字段值。
                 let (it, ot) = ev
                     .get("response")
                     .and_then(|r| r.get("usage"))
@@ -599,8 +598,8 @@ impl SseTranslator {
         if !self.register_tool_seen(dedup_key) {
             return String::new();
         }
-        // 🔴 **必须过 `reserve_tool_slot`**：这里原先是裸 `tool_calls.push`，就是上限被绕过的
-        // 那条回归本体 —— 而本方向当时没有任何用例压到，故那批注入全绿、缺口一直开着。
+        // 🔴 **必须过 `reserve_tool_slot`**（原先裸 `tool_calls.push` 就是上限被绕过的回归本体，
+        // 本方向当时无用例压到 → 那批注入全绿、缺口一直开着）。
         let Some(slot) = self.reserve_tool_slot() else { return String::new() };
         let id = if call_id.is_empty() {
             format!("call_{}", uuid_like())
@@ -621,11 +620,9 @@ impl SseTranslator {
         }))
     }
 
-    /// 一个 Chat SSE chunk → Anthropic SSE 事件文本。
-    ///
-    /// 覆盖文本增量与**工具调用**。工具必须翻译，理由同 [`SseTranslator::responses_event_to_anthropic`]：
-    /// Anthropic 下游（Claude CLI / 桌面端）转到 Chat 上游时，模型的 `delta.tool_calls` 增量若被丢弃，
-    /// 下游只见纯文本 → 工具永远不被调用。Chat 的 tool_calls 是**分片增量**（name 与 arguments 逐块到达），
+    /// 一个 Chat SSE chunk → Anthropic SSE 事件文本。覆盖文本增量与**工具调用**。工具必须翻译
+    /// （理由同 [`SseTranslator::responses_event_to_anthropic`]）：丢弃 `delta.tool_calls` 增量则
+    /// 下游只见纯文本、工具永不被调用。Chat 的 tool_calls 是**分片增量**（name/arguments 逐块到达），
     /// 故先按 index 累积到 `tool_calls`，在 finish_reason 到达时才成块发出。
     fn chat_chunk_to_anthropic(&mut self, chunk: &Value) -> String {
         let mut out = String::new();
@@ -688,14 +685,19 @@ impl SseTranslator {
             if let Some(ct) = u.get("completion_tokens").and_then(|t| t.as_u64()) {
                 self.output_tokens = ct;
             }
+            // A10-2：OpenAI Chat 的缓存读在 `prompt_tokens_details.cached_tokens`（无缓存写概念）。
+            if let Some(cr) =
+                u.pointer("/prompt_tokens_details/cached_tokens").and_then(|t| t.as_u64())
+            {
+                self.cache_read = cr;
+            }
         }
         out
     }
 
     /// Anthropic 流收尾：收 text 块 + 补发工具块 + message_delta(stop_reason) + message_stop。
-    ///
-    /// `stop_reason` 必须按是否有工具调用区分：发了 tool_use 块却报 `end_turn`，
-    /// 下游客户端（Claude 桌面端 / CLI）会认为「本轮已结束」而不执行工具。
+    /// `stop_reason` 必须按有无工具调用区分：发了 tool_use 却报 `end_turn`，下游会认为「本轮
+    /// 已结束」而不执行工具。
     fn emit_anthropic_stop(&mut self) -> String {
         if !self.started {
             return String::new();
@@ -704,8 +706,8 @@ impl SseTranslator {
         let mut out = self.flush_anthropic_tool_calls();
         self.started = false;
         out.push_str(&self.close_anthropic_text_block());
-        // 截断优先：被输出上限截断时必须发 max_tokens，否则下游把半截回答当「正常结束」，
-        // 既不提示截断也不触发续写（原先只按有无工具调用二选一，上游的 length/incomplete 被丢弃）。
+        // 截断优先：被上限截断时必须发 max_tokens，否则下游把半截回答当「正常结束」、既不提示
+        // 也不续写（原先只按有无工具调用二选一，length/incomplete 被丢弃）。
         let stop_reason = if self.upstream_truncated {
             "max_tokens"
         } else if self.anthropic_tool_seen.is_empty() {
@@ -736,13 +738,11 @@ impl SseTranslator {
             // 于是 self.input_tokens / output_tokens 永不被写入、也永不发给下游——
             // 下游拿不到任何 token 数字（其它四个方向都发 usage，这是能力漂移）。
             "message_start" => {
-                if let Some(it) = ev
-                    .get("message")
-                    .and_then(|m| m.get("usage"))
-                    .and_then(|u| u.get("input_tokens"))
-                    .and_then(|t| t.as_u64())
-                {
-                    self.input_tokens = it;
+                if let Some(u) = ev.get("message").and_then(|m| m.get("usage")) {
+                    if let Some(it) = u.get("input_tokens").and_then(|t| t.as_u64()) {
+                        self.input_tokens = it;
+                    }
+                    self.capture_anthropic_cache(u);
                 }
                 String::new()
             }
@@ -884,12 +884,11 @@ impl SseTranslator {
                         self.model = m.to_string();
                     }
                 }
-                if let Some(it) = msg
-                    .and_then(|m| m.get("usage"))
-                    .and_then(|u| u.get("input_tokens"))
-                    .and_then(|t| t.as_u64())
-                {
-                    self.input_tokens = it;
+                if let Some(u) = msg.and_then(|m| m.get("usage")) {
+                    if let Some(it) = u.get("input_tokens").and_then(|t| t.as_u64()) {
+                        self.input_tokens = it;
+                    }
+                    self.capture_anthropic_cache(u);
                 }
                 if !self.started {
                     self.started = true;
@@ -1039,13 +1038,10 @@ impl SseTranslator {
         out
     }
 
-    /// 一个 Responses SSE 事件 → Anthropic SSE 事件文本。
-    ///
-    /// 覆盖文本增量、**工具调用**与收尾。工具调用必须翻译（2026-07-30 实机根因）：
-    /// Claude 桌面端（Anthropic 下游）故障转移到 Responses 上游时，上游模型对 MCP 工具的调用
-    /// 走 `response.output_item.added/.done` 的 `function_call` item 投递；早期实现只认
-    /// `output_text.delta` / `completed`，其余落进 `_ => {}` 被静默丢弃 → 桌面端只收到纯文本 +
-    /// end_turn，表现为「模型从不调用 synaroute_ai」，MCP 侧永远等不到 tools/call。
+    /// 一个 Responses SSE 事件 → Anthropic SSE 事件文本。覆盖文本增量、**工具调用**与收尾。
+    /// 工具调用必须翻译（2026-07-30 实机根因）：桌面端故障转移到 Responses 上游时，MCP 工具调用
+    /// 走 `response.output_item.added/.done` 的 `function_call` item；早期实现只认 `output_text`，
+    /// 其余静默丢弃 → 表现为「模型从不调用 synaroute_ai」，MCP 侧永远等不到 tools/call。
     fn responses_event_to_anthropic(&mut self, ev: &Value) -> String {
         let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let mut out = String::new();
@@ -1096,6 +1092,12 @@ impl SseTranslator {
                     }
                     if let Some(ot) = u.get("output_tokens").and_then(|t| t.as_u64()) {
                         self.output_tokens = ot;
+                    }
+                    // A10-2：Responses 的缓存读在 `input_tokens_details.cached_tokens`（无写概念）。
+                    if let Some(cr) =
+                        u.pointer("/input_tokens_details/cached_tokens").and_then(|t| t.as_u64())
+                    {
+                        self.cache_read = cr;
                     }
                 }
                 // 兜底：部分上游只在 completed.output[] 里给工具调用，不发独立 output_item.done
@@ -1158,12 +1160,9 @@ impl SseTranslator {
     }
 
     /// 把一个 Responses 输出 item 翻成 Anthropic 的 `tool_use` 内容块（非工具 item 返回空串）。
-    ///
-    /// 产出完整三段：`content_block_start`（带 id/name）+ `content_block_delta`
-    /// （`input_json_delta` 承载 arguments JSON）+ `content_block_stop`。同时记住
-    /// `stop_reason` 要改成 `tool_use`（见 [`SseTranslator::emit_anthropic_stop`]）。
-    /// 工具名还原：Responses item 可能把名字拆成 `{name, namespace}` 两字段（Codex 范式），
-    /// 而 Anthropic 下游客户端认的是**全名**，故用 [`join_namespaced_tool_name`] 拼回。
+    /// 产出三段（`content_block_start`/`_delta`(input_json_delta)/`_stop`）并记住 `stop_reason`
+    /// 改 `tool_use`。工具名可能被拆成 `{name, namespace}`（Codex 范式），用
+    /// [`join_namespaced_tool_name`] 拼回 Anthropic 认的全名。
     fn emit_anthropic_tool_block(&mut self, item: &Value) -> String {
         let ity = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
         // function_call / custom_tool_call / tool_search_call 都是「模型要调工具」，
@@ -2173,6 +2172,62 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         );
         tr.finish();
         assert!(tr.accumulated_usage().is_none());
+    }
+
+    /// 🔴 **跨协议长流的用量必须照样取到。**
+    ///
+    /// 这条钉的是 `usage.rs` 那个洞的**反面**：同协议直通走「8KB 尾窗 + 事后解析」，
+    /// 长回答会把承载用量的那一行切断（见 `a_realistic_responses_completed_event_survives_the_window`）；
+    /// 而跨协议这条路由翻译器**边收边累积**两个计数器，压根不经过窗口。
+    ///
+    /// 取证意义：2026-09-20 用户日志里 k40（Anthropic 协议 + Codex 的 Responses 下游 =
+    /// 走本路径）那几条成功请求也没有 token 数，需要排除「这里还有第二个洞」。
+    /// 本条用远超 8KB 的正文验证：流首 `message_start` 的 input/cache 不会被长正文冲掉，
+    /// 流末 `message_delta` 的 output 照样记住。
+    ///
+    /// 🔴 **A10-2 回归**：夹具的 message_start 带 `cache_read_input_tokens:145200`，此前只断言
+    /// input/output、缓存数被 `accumulated_usage` 硬编码成 0 且无人发觉。现在断言 `cache_read`
+    /// —— 把捕获或 `accumulated_usage` 的缓存字段改回 0 就会红。
+    #[test]
+    fn cross_protocol_usage_survives_a_realistic_long_stream() {
+        let mut tr = SseTranslator::new(SseDirection::AnthropicToResponses);
+        // 流首：input/cache 在 message_start。
+        tr.push(
+            br#"event: message_start
+data: {"type":"message_start","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":48800,"cache_read_input_tokens":145200}}}
+
+"#,
+        );
+        tr.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
+        // 正文：远超 8KB（模拟 opus 的长回答）。
+        for i in 0..4000 {
+            let chunk = format!(
+                "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"段落{i} 一些足够长的正文用来把窗口撑开\"}}}}\n\n"
+            );
+            tr.push(chunk.as_bytes());
+        }
+        // 流末：output 在 message_delta。
+        tr.push(
+            br#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8003}}
+
+"#,
+        );
+        tr.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        tr.finish();
+
+        let u = tr
+            .accumulated_usage()
+            .expect("长流的用量必须照样取到 —— 取不到就是用量面板恒为 0 的那个洞");
+        assert_eq!(
+            u.input, 48800,
+            "流首 message_start 的 input 不许被长正文冲掉"
+        );
+        assert_eq!(u.output, 8003, "流末 message_delta 的 output 必须记住");
+        assert_eq!(
+            u.cache_read, 145200,
+            "🔴 A10-2：message_start 的 cache_read_input_tokens 必须带出，否则缓存命中被记成 0"
+        );
     }
 
     #[test]

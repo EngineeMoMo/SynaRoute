@@ -97,6 +97,21 @@ pub(crate) fn may_serve(key: &ProviderKey, outward: &str) -> bool {
     confidence(key, outward) != Confidence::Fallback
 }
 
+/// 路由闸门用的「这条 Key 会承接本次请求、不该替它回 503」判据。
+///
+/// = [`may_serve`]（`Native`/`Unknown`，值得一试）**或** `allow_named_model_fallback`
+/// （用户逐条明确授权它把点名的模型兜底改写掉 —— 那不再是「悄悄换」，请求会用这条 Key
+/// 的默认模型成功）。
+///
+/// 🔴 **必须与循环内的 [`would_silently_substitute`] 同源**：闸门（循环**前**）与跳过判据
+/// （循环**内**）分别决定「要不要 503」和「要不要跳过这条候选」，两处对同一个开关的口径
+/// 一旦漂移，就会出现「闸门放行、循环却把唯一候选跳过」或反之。A10-1 的缺陷正是闸门只认
+/// `may_serve`、看不见这个开关：A 熔断、只剩一条开了兜底开关但对该模型仅 `Fallback` 把握的
+/// B 时，闸门在 B 被一试之前就返回 503。
+pub(crate) fn serves_or_substitutes(key: &ProviderKey, outward: &str) -> bool {
+    may_serve(key, outward) || key.allow_named_model_fallback
+}
+
 /// 这条 Key **确定认识**这个对外名（`Confidence::Native`）。
 ///
 /// # 与 [`may_serve`] 的分工：路由 vs 能力断言
@@ -372,6 +387,17 @@ pub(crate) fn would_silently_substitute(
     if bare.is_empty() {
         return false;
     }
+    // 🔴 **逐条 Key 的显式弃权**（2026-09-20 用户要求）：这条 Key 被允许把点名的模型也
+    // 兜底改写掉，于是它不再「会悄悄换模型」——本函数放行，候选照常被使用。
+    //
+    // 判据放在这里（最前面、只看这条 Key 自己）而不是放在调用点包一层 `if`：
+    // 调用点只有一处，但把开关判断留在那里意味着「这条 Key 该不该被跳过」的答案
+    // 分散在两个文件里，而本仓的纪律是判据同源。更要紧的是 `note_silent_downgrade`
+    // **不读这个开关** —— 降级照旧留痕，用户打开开关换来的是「请求能成」，
+    // 不是「这件事从此看不见」。两者刻意不对称，别去「统一」。
+    if key.allow_named_model_fallback {
+        return false;
+    }
     // `Unknown`（原样透传）不算降级：上游很可能认识它，拦下反而误伤。
     // 与 `note_silent_downgrade` 用同一个三态判据，别在这里退化成两态。
     if confidence(key, requested) != Confidence::Fallback {
@@ -489,10 +515,13 @@ pub(crate) fn reject_if_unserviceable(
     // 故它排在最前：下面那次 `enabled_keys_sorted` 会克隆每条 ProviderKey
     // （含 models/mappings/health），而这里是转发热路径。
     //
-    // 🔴 判据是 `may_serve` 而不是「确定认识」：一条压根没配模型信息的 Key 会把名字原样
-    // 透传给上游，上游很可能认识它 —— 对那种情形回 503 是把「我们不知道」当成了
-    // 「一定不行」，方向恰好是误伤（同 `balance_gate` 的「查不到 ≠ 为零」）。
-    if candidates.iter().any(|k| may_serve(k, requested)) {
+    // 🔴 判据是 `serves_or_substitutes` 而不是「确定认识」：一条压根没配模型信息的 Key 会把
+    // 名字原样透传给上游，上游很可能认识它 —— 对那种情形回 503 是把「我们不知道」当成了
+    // 「一定不行」，方向恰好是误伤（同 `balance_gate` 的「查不到 ≠ 为零」）。而开了
+    // `allow_named_model_fallback` 的 Key 会用它的默认模型承接（用户明确授权），同样不该被挡。
+    // 🔴 A10-1：这里若只用 `may_serve` 就看不见那个开关 —— A 熔断、只剩一条开了兜底开关但对
+    // 该模型仅 `Fallback` 把握的 B 时，闸门会在 B 被一试之前返回 503（与循环内跳过判据不一致）。
+    if candidates.iter().any(|k| serves_or_substitutes(k, requested)) {
         return None;
     }
     // ② 我们从没宣称过这个名字 → 客户端自己编的，照旧降级。
@@ -509,9 +538,11 @@ pub(crate) fn reject_if_unserviceable(
     if !discoverable_models(&enabled).iter().any(|m| m == bare) {
         return None;
     }
-    // ③ 宣称过、却没有一条候选可能服务它。
+    // ③ 宣称过、却没有一条候选可能服务它。supporters 与 ① 同源（`serves_or_substitutes`）：
+    // 一条开了兜底开关但被熔断的 Key 会从候选池剔除、却仍在 `enabled` 里，纳入它报错才一致
+    // （「这些 Key 本可承接它、现在都被挡住」），否则那条 Key 明明能兜底却不在「谁支持」里。
     let supporters: Vec<&ProviderKey> =
-        enabled.iter().filter(|k| may_serve(k, requested)).collect();
+        enabled.iter().filter(|k| serves_or_substitutes(k, requested)).collect();
     let now = chrono::Utc::now().timestamp_millis();
     let retry_after = earliest_release_ms(&supporters, requested, now)
         .map(|until| ((until - now) as f64 / 1000.0).ceil() as i64);
@@ -1053,6 +1084,58 @@ mod tests {
         assert!(ev.detail.contains("Key-b"), "要说清是哪条 Key 支持它");
         assert!(ev.detail.contains("opus"), "要给出现在就能用的模型");
         assert!(ev.detail.contains("熔断"), "这一支真的是熔断挡住的");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 **A10-1 回归：循环前的 503 闸门必须认 `allow_named_model_fallback`。**
+    ///
+    /// 复现审查发现的缺陷：A 宣称 opus-5 但被熔断（从候选池剔除，故不在 `candidates` 里），
+    /// 只剩一条开了兜底开关、但对 opus-5 仅 `Fallback` 把握的 B。闸门若只看 `may_serve` 就在
+    /// B 被一试之前返回 503，而循环内的 [`would_silently_substitute`] 明明会放行 B ——
+    /// 「闸门 503 / 循环放行」两处判据漂移，正是本条要消除的。
+    ///
+    /// 两个方向都断言：开关**关**时这个场景确实 503（证明用例真压到了 ①/③、不是空过）;
+    /// 开关**开**时闸门放行。把 ① 改回 `may_serve` 会让「开」这半变红。
+    #[test]
+    fn the_gate_honors_the_named_model_fallback_switch() {
+        let (store, dir) = store_at("gate_namedfb");
+        // adv 宣称 opus-5（让它进并集清单）；不放进 candidates = 模拟它被熔断/锁剔除。
+        let advertiser = key("adv", 0, &["claude-opus-5"]);
+        let mut primary = key("primary", 1, &["gpt-5.6-luna"]); // 不认 opus-5 → Fallback
+        store.upsert_key(advertiser).unwrap();
+        store.upsert_key(primary.clone()).unwrap();
+
+        assert_eq!(
+            confidence(&primary, "claude-opus-5"),
+            Confidence::Fallback,
+            "B 必须落 Fallback，否则 ① 的 may_serve 先放行、本用例压不到开关那一维"
+        );
+
+        // 关（默认）：候选只剩 B、且 B 只有 Fallback 把握 → 宣称过却无人承接 → 503。
+        assert!(!primary.allow_named_model_fallback, "新字段默认必须 false");
+        assert!(
+            reject_if_unserviceable(
+                &store,
+                CategoryType::ClaudeCli,
+                "claude-opus-5",
+                std::slice::from_ref(&primary)
+            )
+            .is_some(),
+            "开关关时这个场景确实会 503 —— 证明用例真的压到了闸门的 ①/③，不是空过"
+        );
+
+        // 开：B 被明确授权兜底承接 → 闸门必须放行（把 ① 改回 may_serve 会让这里变红）。
+        primary.allow_named_model_fallback = true;
+        assert!(
+            reject_if_unserviceable(
+                &store,
+                CategoryType::ClaudeCli,
+                "claude-opus-5",
+                std::slice::from_ref(&primary)
+            )
+            .is_none(),
+            "🔴 A10-1：开了兜底开关的候选在场时，闸门不该在它被一试前返回 503"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1603,6 +1686,81 @@ mod tests {
                 .count(),
             0,
             "映射命中是用户的明确配置，报警等于对他自己配的东西发警告"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 **逐条 Key 的「允许点名模型兜底」开关**（2026-09-20 用户要求）。
+    ///
+    /// 复刻用户实报的现场：`claude-opus-5` 被 k40 宣称支持，而主力 Key 只认
+    /// `gpt-5.6-luna`。默认下主力 Key 被跳过（宁可报错也不悄悄换模型）；打开开关后
+    /// 它照常顶上 —— 用户明确要「有东西顶上，而不是整个请求失败」。
+    ///
+    /// 两个方向都断言：只断言打开那一支，把开关判断整行删掉**照样绿**
+    /// （默认 false 时行为不变），而那正是缺陷本体。
+    #[test]
+    fn the_per_key_switch_decides_whether_a_named_model_may_be_substituted() {
+        let (store, dir) = store_at("namedfb");
+        // 宣称 opus-5 的那条 Key（现实里的 k40）——它让这个名字进入并集清单。
+        let advertiser = key("adv", 0, &["claude-opus-5"]);
+        // 主力 Key：有模型信息，但不认 opus-5 → confidence 落到 Fallback。
+        let mut primary = key("primary", 1, &["gpt-5.6-luna"]);
+        store.upsert_key(advertiser.clone()).unwrap();
+        store.upsert_key(primary.clone()).unwrap();
+
+        // 前提：三道前置门必须都过，否则这条用例压不到开关那一支（同上一条的教训）。
+        assert!(
+            discoverable_models(&[advertiser.clone(), primary.clone()])
+                .iter()
+                .any(|m| m == "claude-opus-5"),
+            "opus-5 必须在并集清单里，否则判据②先挡住、本用例空转"
+        );
+        assert_eq!(
+            confidence(&primary, "claude-opus-5"),
+            Confidence::Fallback,
+            "主力 Key 必须落在 Fallback，否则第一道门先挡住、本用例空转"
+        );
+        assert_ne!(
+            primary.resolve_model("claude-opus-5"),
+            "claude-opus-5",
+            "必须真的发生替换，否则第二道门先挡住、本用例空转"
+        );
+
+        // 关（默认）：跳过这条 Key —— 这是既有保护，不许被开关的加入改掉。
+        assert!(
+            !primary.allow_named_model_fallback,
+            "新字段的默认值必须是 false —— 默认打开等于把 2026-09-01 那个缺陷放回来"
+        );
+        assert!(
+            would_silently_substitute(&store, CategoryType::ClaudeCli, "claude-opus-5", &primary),
+            "默认下必须跳过：宁可报错也不把点名的模型悄悄换成 gpt-5.6-luna"
+        );
+
+        // 开：放行，这条 Key 照常顶上。
+        primary.allow_named_model_fallback = true;
+        store.upsert_key(primary.clone()).unwrap();
+        assert!(
+            !would_silently_substitute(&store, CategoryType::ClaudeCli, "claude-opus-5", &primary),
+            "开关打开后必须放行 —— 否则用户勾了也没用（本次改动的缺陷本体）"
+        );
+
+        // 🔴 **刻意的不对称**：开关只买「请求能成」，不买「这件事看不见」。
+        // `note_silent_downgrade` 不读这个开关，降级照旧留痕。
+        note_silent_downgrade(
+            &store,
+            CategoryType::ClaudeCli,
+            "claude-opus-5",
+            &primary,
+            "gpt-5.6-luna",
+        );
+        assert_eq!(
+            store
+                .list_events(CategoryType::ClaudeCli)
+                .into_iter()
+                .filter(|e| e.kind == "warning")
+                .count(),
+            1,
+            "开了开关也必须留痕：用户要知道回答其实来自 gpt-5.6-luna 而不是 opus-5"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

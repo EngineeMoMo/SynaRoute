@@ -28,6 +28,8 @@ mod sse;
 mod error_hint;
 mod stream_idle;
 mod thinking_effort; // Anthropic 两套 thinking 形态 → 中枢档位；来由见该文件模块注释
+/// 文本模型拒绝图片时的被动剥图整流；与 `thinking_rectify` 同类（上游拒某种请求体→改体自愈）。
+mod media_rectify;
 /// 上游因思考签名验不过而拒绝时的请求整流。放在 `upstream` 而不是 `proxy` 下：
 /// 它修的是「上游对请求体的兼容性要求」，与协议适配同一类事（cc-switch 也放在代理层）。
 mod thinking_rectify;
@@ -57,7 +59,17 @@ pub(crate) use stream_idle::guard as guard_stream_idle;
 // （`proxy::soft_error`）复用它 —— 两侧各写一份的话，迟早只有一处被修。
 pub(crate) use sse::sse_error::upstream_error_message;
 pub(crate) use error_hint::annotate as annotate_upstream_error;
-pub(crate) use thinking_rectify::rectify_on_signature_error as rectify_thinking_signature;
+pub(crate) use media_rectify::rectify_on_image_rejection as rectify_unsupported_image;
+// prompt-caching 注入 + 端点不支持时的自愈记忆。主转发路径（proxy.rs）与大脑聚合
+// （session.rs）共用这一份 —— 判据/记忆两处各写一份必然漂移。
+pub(crate) use cache::{
+    cache_known_unsupported, inject_converted_cache, CacheInjection, looks_like_cache_rejection,
+    mark_cache_unsupported, rollback_injected_cache,
+};
+pub(crate) use thinking_rectify::{
+    rectify_on_budget_error as rectify_thinking_budget,
+    rectify_on_signature_error as rectify_thinking_signature,
+};
 pub use convert::{
     apply_pending_thinking, convert_request_owned, convert_response_ext, strip_pending_effort,
 };

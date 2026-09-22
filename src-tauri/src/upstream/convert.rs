@@ -2423,6 +2423,58 @@ mod tests {
         );
     }
 
+    /// 🔴 **穷举判据：我们这侧绝不可能算出 `budget_tokens >= max_tokens`。**
+    ///
+    /// 2026-09-20 用户实报的上游 400（Codex + opus + Ultra 档，连续四次）：
+    ///
+    /// ```text
+    /// HTTP 400: {"error":{"code":"server_error",
+    ///            "message":"thinking.budget_tokens must be less than max_tokens"}}
+    /// ```
+    ///
+    /// 读代码能看出 [`effort_to_thinking_budget`] 末尾挂着 `.min(max_tokens - 1)`，
+    /// 但「读出来像是对的」与「在整个定义域上都对」是两件事 —— 只有后者能把责任划清。
+    /// 故这里穷举六个档位 × 真实与极端的 max_tokens，逐一断言 Anthropic 那两条硬约束：
+    /// `budget >= 1024` 且 `budget < max_tokens`。
+    ///
+    /// **全绿的含义是排他性的**：违规组合不可能出自本函数，那条 400 只能来自
+    /// 「我们算完之后 max_tokens 又被改小了」。而我们发出的 body 里这两个值是配套的，
+    /// 故改小的一方在我们之外 —— 上游按它自己的策略钳 max_tokens，却没同步钳 budget。
+    /// 这条同时是回归网：将来有人调 base 表或 cap 公式，越界会当场变红。
+    #[test]
+    fn our_thinking_budget_can_never_violate_the_anthropic_constraint() {
+        const LEVELS: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultra"];
+        // 覆盖：不开思考的边界、极小窗、Anthropic 真实档位、远超任何真实值的大窗。
+        let mut maxes: Vec<u64> = vec![
+            0, 1, 1023, 1024, 1025, 1026, 2047, 2048, 2049, 4096, 8192, 16_384, 32_000, 64_000,
+            65_536, 128_000, 131_072, 200_000, 262_144, 400_000, 1_000_000,
+        ];
+        // 再密集扫一段，免得判据只覆盖「凑巧的整数」。
+        maxes.extend((1024..3000).step_by(7));
+        for &max_tokens in &maxes {
+            for level in LEVELS {
+                let Some(budget) = effort_to_thinking_budget(level, max_tokens) else {
+                    // 不开思考是合法结果，但**只许**发生在 max_tokens <= 1024。
+                    // 真实窗口下静默不开思考 = 用户选了 Ultra 却没有思考。
+                    assert!(
+                        max_tokens <= 1024,
+                        "max_tokens={max_tokens} 下 {level} 档不该放弃思考"
+                    );
+                    continue;
+                };
+                assert!(
+                    budget >= 1024,
+                    "{level} 档在 max_tokens={max_tokens} 下算出 budget={budget}，低于 Anthropic 下限 1024"
+                );
+                assert!(
+                    budget < max_tokens,
+                    "🔴 {level} 档在 max_tokens={max_tokens} 下算出 budget={budget} —— \
+                     这正是用户实报那条 400 的形态（budget 必须 < max_tokens）"
+                );
+            }
+        }
+    }
+
     /// P2-2 安全网：strip_pending_effort 幂等，且能兜住不走 apply 的路径。
     #[test]
     fn strip_pending_effort_is_idempotent_and_thorough() {

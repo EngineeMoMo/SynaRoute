@@ -86,6 +86,7 @@ fn bench_key(id: &str, base_url: &str) -> ProviderKey {
         models: vec![],
         mappings: vec![],
         default_model: None,
+        allow_named_model_fallback: false,
         tier_haiku: None,
         tier_sonnet: None,
         tier_opus: None,

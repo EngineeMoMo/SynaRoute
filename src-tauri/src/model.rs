@@ -281,12 +281,10 @@ pub struct ModelMapping {
     pub real_name: String,
     /// 客户端模型菜单里显示的文字。**留空 = 自动用 `real_name`**（见 `advertise::advertised_models`）。
     ///
-    /// 它只影响显示：桌面端走 `inferenceModels[].labelOverride`、CLI 走 `/v1/models` 的
-    /// `display_name`，两者官方语义都是 display-only，**实际发给上游的仍是 `real_name`**。
-    /// 存在的理由是让用户能写「GLM 5.3（思考）」这类带备注的名字；不填也已经解决了
-    /// 「菜单里看不到真实模型名」这个本体问题，故它是可选字段而非必填。
-    ///
-    /// `#[serde(default)]`：老配置读进来是 `None` → 自动显示真实名，无需迁移。
+    /// 只影响显示：桌面端走 `inferenceModels[].labelOverride`、CLI 走 `/v1/models` 的
+    /// `display_name`，官方语义都是 display-only，**实际发上游的仍是 `real_name`**。存在是为让用户
+    /// 写「GLM 5.3（思考）」这类带备注名；可选而非必填。`#[serde(default)]`：老配置读进来是
+    /// `None` → 自动显示真实名，无需迁移。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
 }
@@ -314,16 +312,12 @@ pub struct ModelInfo {
     pub context_window: Option<u32>,
     /// **最大单次输出** token 数（如 Claude 4.5 系的 64000）。
     ///
-    /// ⚠️ **与 `context_window` 是两个不同的能力，不可互相推导**：4.5 系都是 200k 上下文窗口
-    /// 但最大输出只有 64k。只按窗口算会发出近 200k 的 `max_tokens`，官方与严格中转直接 400
-    /// （这是 2026-08-15 审计实测出的 provider-break，详见 docs/14 §17.1）。
-    ///
-    /// 为什么需要这个字段：`budget.rs::CLAUDE_MAX_OUTPUT_TABLE` 是代码内置表，只认 Claude
-    /// 家族片段。第三方中转的自定义模型名（`gpt-5.6-sol`、某些站点的私有别名）认不出来，
-    /// 此前会被 budget 直接拒绝、大脑聚合完全用不了。填了这个字段就能参与聚合。
-    ///
-    /// 留空 = 回退内置表；内置表也认不出才报错。**绝不能在 budget 里给它兜个默认值** ——
-    /// 猜大可能被上游 400，猜小就是静默截断长回答，两边都是赌（见 budget.rs 顶部文档）。
+    /// ⚠️ **与 `context_window` 是两个不同能力、不可互推**：4.5 系都是 200k 窗口但最大输出只 64k，
+    /// 只按窗口算会发近 200k 的 `max_tokens`、被官方与严格中转 400（2026-08-15 审计实测的
+    /// provider-break，详见 docs/14 §17.1）。需要它是因为 `budget.rs::CLAUDE_MAX_OUTPUT_TABLE`
+    /// 内置表只认 Claude 家族片段，第三方中转的自定义名（`gpt-5.6-sol` 等）认不出、此前被 budget
+    /// 直接拒绝、大脑聚合用不了。留空 = 回退内置表；内置表也认不出才报错。**绝不能在 budget 里兜
+    /// 默认值**——猜大被上游 400、猜小静默截断，两边都是赌（见 budget.rs 顶部文档）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
 }
@@ -425,6 +419,18 @@ pub struct ProviderKey {
     /// 也不是本 Key 的真实模型名，则改用此模型转发。为空时退回「该 Key 第一个模型」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// 允许把**用户点名的模型**也兜底改写掉（默认 `false` = 保持既有保护）。逐条 Key 显式打开。
+    ///
+    /// 默认「宁可报错也不悄悄换模型」：故障转移到不认识该模型的 Key 时**跳过它**
+    /// （见 [`crate::proxy::model_pool::would_silently_substitute`]）——来自 2026-09-01 现场：
+    /// 选 `grok-4.6`、唯一支持者连续 400、转移到的 Key 兜底改写成 `glm-5.3` 返回 200，日志绿色
+    /// 「成功」，用户一直以为在用 grok。打开 = 接受该代价换「有东西顶上、不至整请求失败」
+    /// （用户 2026-09-20 明确要求：主力 Key 不认 opus，选 opus 只剩两条会抖的候选，一抖就 502）。
+    /// 不用「配了 default_model 就放行」代替：那次事故走的正是 `default_model` 支，配它的人想的是
+    /// 「杂活随便用」，不是「点名时也可换」——两件事。打开后**降级仍留痕**（`note_silent_downgrade`
+    /// 在成功路径独立调用，与本开关无关，日志照旧落 ⚠「你要 A、实际用 B」）。
+    #[serde(default)]
+    pub allow_named_model_fallback: bool,
     /// 档位快捷映射（取自 cc-switch 的 haiku/sonnet/opus/fable 语义，落到我们的运行时代理）。
     /// Claude Code 按任务发不同家族模型名（含 haiku/sonnet/opus/fable 子串），配了对应档位即改写为上游真实名。
     /// 与 `mappings` 并存：自由映射（精确名）优先级更高，档位作为家族级兜底。
@@ -460,18 +466,11 @@ pub struct ProviderKey {
     pub cost_multiplier: Option<String>,
     /// 这条 Key 的图标**覆盖值**：预设品牌键（`anthropic`/`zhipu`…）或用户上传的 data-URL。
     ///
-    /// ## 为什么 Key 自己要有一个，而不是只用厂商的
-    ///
-    /// 原设计是「Key 的图标一律来自它的厂商」，理由是不想有两个事实来源。真机否掉了这个判断：
-    /// 绝大多数中转站 Key 选的厂商就是内置的**「自定义」**，而内置厂商是只读的
-    /// —— 于是「想给这条 Key 配个 Claude 图标」在界面上是一条走不通的路
-    /// （真机原话：「自定义时是需要能选预设图标，你设置的不能更改 不对」）。
-    ///
-    /// 而且「自定义」下会挂很多条互不相干的 Key（各指不同中转站），
-    /// 把图标记在那个共享的厂商上，语义本来就不对：改一条会连带改掉其余全部。
-    ///
+    /// 为什么 Key 自己要有一个而不是只用厂商的：绝大多数中转站 Key 选的厂商是内置只读的
+    /// 「自定义」，于是「给这条 Key 配个 Claude 图标」在界面上走不通；且「自定义」下挂着很多条
+    /// 互不相干的 Key，把图标记在那个共享厂商上会改一条连带改掉其余全部。
     /// 优先级：**本字段 > 厂商 `icon` > 按名字启发式猜 > 首字母色块**。
-    /// `None` 表示「跟着厂商走」，与旧配置行为完全一致（故老数据无需迁移）。
+    /// `None` 表示「跟着厂商走」，与旧配置行为一致（老数据无需迁移）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
 }
@@ -2147,6 +2146,7 @@ mod tests {
             models,
             mappings,
             default_model: default_model.map(|s| s.to_string()),
+            allow_named_model_fallback: false,
             tier_haiku: None,
             tier_sonnet: None,
             tier_opus: None,

@@ -66,8 +66,7 @@ const zh: Dict = {
   // 文案只承诺**已实现**的能力：最早写「显示在 Key 卡片与快捷面板上」是空头承诺（当时没有任何
   // 展示位），随后改成只提「测试查询」；卡片展示已落地故补回那半句，但**仍不提快捷面板/悬浮窗**。
   // 改这句前先确认对应展示位真的存在。
-  "balance.enableHint":
-    "从中转站的计费接口读取剩余额度，配好后显示在这条 Key 的卡片上。各站接口不统一，先用预设模板试，不行再手填取值路径；配好后用下面的「测试查询」验证。",
+  "balance.enableHint": "从中转站的计费接口读取剩余额度，配好后显示在这条 Key 的卡片上。各站接口不统一，先用预设模板试，不行再手填取值路径；配好后用下面的「测试查询」验证。",
   "balance.template": "预设模板",
   "balance.tpl.auto": "自动（推荐）",
   "balance.tpl.custom": "自定义",
@@ -78,12 +77,10 @@ const zh: Dict = {
   "balance.tpl.official": "官方",
   "balance.url": "请求地址",
   "balance.urlAutoPlaceholder": "留空 = 按接口地址自动识别端点",
-  "balance.urlHint":
-    "留空即按本 Key 的接口地址「自动识别」余额端点（DeepSeek / SiliconFlow / OpenRouter / StepFun / Novita / GLM / Kimi / 官方 Anthropic 已内置；认不出的按中转站通用端点试）。自动识别不对时再手填。占位符：{{baseUrl}} 本 Key 的接口地址（含路径）、{{origin}} 只取域名（剥掉路径）、{{apiKey}} 密钥。余额端点在域名根下、而接口地址带路径后缀时（如 DeepSeek 的 /anthropic），要用 {{origin}}。",
+  "balance.urlHint": "留空即按本 Key 的接口地址「自动识别」余额端点（DeepSeek / SiliconFlow / OpenRouter / StepFun / Novita / GLM / Kimi / 官方 Anthropic 已内置；认不出的按中转站通用端点试）。自动识别不对时再手填。占位符：{{baseUrl}} 本 Key 的接口地址（含路径）、{{origin}} 只取域名（剥掉路径）、{{apiKey}} 密钥。余额端点在域名根下、而接口地址带路径后缀时（如 DeepSeek 的 /anthropic），要用 {{origin}}。",
   "balance.accessToken": "Access Token",
   "balance.userId": "用户 ID",
-  "balance.accessTokenHint":
-    "NewAPI 类面板的用量接口认的是「面板登录态」，不是转发用的 API 密钥。在面板的「个人设置」里生成 Access Token，用户 ID 也在那里。",
+  "balance.accessTokenHint": "NewAPI 类面板的用量接口认的是「面板登录态」，不是转发用的 API 密钥。在面板的「个人设置」里生成 Access Token，用户 ID 也在那里。",
   "balance.ofTotal": "共 {total} {unit}",
   // Key 卡片余额行（第④批）
   "balance.cardLabel": "余额",
@@ -98,8 +95,7 @@ const zh: Dict = {
   "balance.intervalHint": "设为 0 关闭自动查询（此时余额也不参与路由）；设为 N 则每 N 分钟查询一次上游余额。代理运行中的分类即使窗口不可见也会在后台按同一间隔刷新。",
   "balance.remainingPath": "取值路径（选填）",
   "balance.remainingPathPlaceholder": "如 data.balance",
-  "balance.remainingPathHint":
-    "留空则自动在返回里找 remaining / balance / quota.remaining / data.balance 等常见字段。支持数组下标，如 balance_infos.0.total_balance。自动找不到时才需手填。",
+  "balance.remainingPathHint": "留空则自动在返回里找 remaining / balance / quota.remaining / data.balance 等常见字段。支持数组下标，如 balance_infos.0.total_balance。自动找不到时才需手填。",
   "balance.overrideTitle": "凭证覆盖（多数站点无需填）",
   "balance.baseUrlOverride": "余额接口地址",
   "balance.baseUrlOverridePlaceholder": "留空则用本 Key 的接口地址",
@@ -333,6 +329,8 @@ const zh: Dict = {
   "editor.defaultModel": "默认兜底模型（选填）",
   "editor.defaultModelPlaceholder": "留空则用本 Key 第一个模型",
   "editor.defaultModelHint": "故障转移到本 Key 时：优先按映射，其次本 Key 原生支持的同名模型；都没有才用此兜底模型；不填则退回本 Key 第一个模型。只对客户端自己发来的模型名生效——应用模型清单里的名字若全部 Key 都服务不了，会直接报错，不会悄悄换成别的模型。",
+  "editor.allowNamedFallback": "允许替我点名的模型兜底",
+  "editor.allowNamedFallbackHint": "默认关闭：你在应用里点名的模型（或模型清单里的名字），若故障转移落到这条 Key 而它不支持，会跳过这条 Key，宁可报错也不悄悄换成别的模型。勾选后这条 Key 会按上面的兜底规则顶上——请求能成功，但回答来自另一个模型，日志里仍会留一条降级警告。只影响这一条 Key。",
   "editor.newKeyHint": "提示：故障转移到本 Key 时，会优先选用与请求同名（含映射期望名）的模型；找不到则用「默认兜底模型」，仍未设置则用模型列表第一个。兜底模型为选填。",
   "editor.errNeedBaseUrl": "请先填写 base_url",
   "editor.errNeedSecret": "请先填写 API 密钥再拉取",
@@ -1002,6 +1000,8 @@ const en: Dict = {
   "editor.defaultModel": "Default fallback model (optional)",
   "editor.defaultModelPlaceholder": "Leave empty to use this key's first model",
   "editor.defaultModelHint": "On failover to this key: mapping first, then a same-named model this key natively supports; only if neither matches is this fallback used; leave empty to fall back to this key's first model. Applies only to model names the client sends on its own — a name from the app's model list that no key can serve returns an error instead of being silently swapped.",
+  "editor.allowNamedFallback": "Let this key substitute models I named",
+  "editor.allowNamedFallbackHint": "Off by default: when you name a model in the app (or pick one from the model list) and failover reaches this key without support for it, this key is skipped — an error is preferred over silently answering with a different model. Check this and the key steps in using the fallback rules above: the request succeeds, but the answer comes from another model, and a downgrade warning is still logged. Affects this key only.",
   "editor.newKeyHint": "Tip: on failover to this key, a model matching the request name (incl. mapping expected names) is preferred; otherwise the default fallback model is used, or the first model in the list if none is set. The fallback model is optional.",
   "editor.errNeedBaseUrl": "Please fill in base_url first",
   "editor.errNeedSecret": "Please enter the API key before fetching",

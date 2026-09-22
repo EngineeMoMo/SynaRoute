@@ -3091,6 +3091,7 @@ tool_timeout_sec = 600
                 })
                 .collect(),
             default_model: None,
+            allow_named_model_fallback: false,
             tier_haiku: None,
             tier_sonnet: None,
             tier_opus: None,

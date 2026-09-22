@@ -22,8 +22,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
-/// 响应体类型：可能是完整缓冲体（Full）或流式体（StreamBody），统一装箱为 BoxBody。
-/// 流式路径用于同协议 SSE 透传（stream:true），缓冲路径用于非流式 / 跨协议。
 #[path = "lan_guard.rs"] pub(crate) mod lan_guard; // 入站鉴权；来由见该文件模块注释
 #[path = "custom_headers.rs"] pub(crate) mod custom_headers; // headers_json 接线 + 保留字段判据
 #[path = "proxy_listen.rs"] pub(crate) mod proxy_listen; // 粘滞端口 + 双栈绑定；来由见该文件模块注释
@@ -35,42 +33,18 @@ use tokio::task::JoinHandle;
 pub(crate) use model_pool::discoverable_models;
 pub(crate) type ResBody = BoxBody<Bytes, std::io::Error>;
 
-/// 把完整字节体装箱为 ResBody（Full 的错误类型是 Infallible，用 `match` 消解）。
 pub(crate) fn full_body(body: Bytes) -> ResBody {
     Full::new(body).map_err(|never| match never {}).boxed()
 }
 
-/// 运行中的代理句柄
 struct RunningProxy {
     port: u16,
     handle: JoinHandle<()>,
-    /// 关闭信号：广播给 accept 循环与所有已建立的连接任务，实现「停止即断连」。
     shutdown: tokio::sync::watch::Sender<bool>,
 }
 
-/// 首选端口被占时，在 [preferred, preferred+RANGE] 内向上兜底寻找可用端口（与 MCP 同策略）。
 const PROXY_PORT_FALLBACK_RANGE: u16 = 20;
 
-/// 「全部 Key 均失败」后的短路窗口（毫秒）：窗口内该分类的新请求**直接返回失败**，
-/// 不再逐个重打上游。
-///
-/// 给上游请求装齐所有请求头：透传下游头 → `anthropic-beta` → 鉴权头 → 版本头（P2-2）。
-///
-/// **为什么必须抽出来**：这段逻辑原先在 `try_stream_to_key` 与 `forward_to_key` 里**逐字重复**
-/// （去空行去注释后 38 行完全一致），且鉴权头另有第三份实现在 `upstream::apply_auth`。
-/// 三份已经分叉：proxy 的两处带 `anthropic-version`，而 `apply_auth` 不带、改由它的三个调用点
-/// 各自补。任何转发前置语义变更（新增鉴权形态、改 beta 头推导、启用 `ProviderKey.headers_json`
-/// 这个自定义请求头预留位）都要同时改 2~5 处，漏一处即「非流式生效、流式不生效」这类
-/// 最难复现的半残缺陷——`anthropic-version` 的现状就是该风险已发生过一次的证据。
-///
-/// 顺序不能变：
-/// 1. 先透传下游客户端头（UA / x-app / x-stainless-*），让中转商识别为真实客户端；
-/// 2. `anthropic-beta` 单独算（1M 上下文要按**落点模型**追加特性），故上一步跳过原值、这里统一设；
-/// 3. 本 Key 的 `headers_json` 自定义头（保留字段已被 `custom_headers` 滤掉）；
-/// 4. **鉴权头最后设**，确保覆盖掉下游或自定义头可能带来的同名头（鉴权必须用本 Key 的密钥）。
-///
-/// ⚠️ **超时不在这里设**：流式与非流式的超时语义刻意不同（流式只约束探头阶段、不掐已建立的
-/// SSE 流），必须留在各自调用点。见 `try_stream_to_key` 与 `forward_to_key` 的相应注释。
 fn apply_upstream_headers(
     mut rb: reqwest::RequestBuilder,
     key: &ProviderKey,
@@ -113,47 +87,12 @@ fn apply_upstream_headers(
     rb
 }
 
-/// 故障转移预算的最小切片：剩余预算低于此值时不再开始新的候选尝试。
-///
-/// 为什么要有下限而不是「有多少用多少」：剩下 200ms 时去打一次上游几乎必然超时，
-/// 既白烧一次额度、又把总耗时再拖长 200ms。5s 是「够一次快速失败（连接被拒/401 立即返回）」
-/// 与「不至于误杀一次正常应答」之间的折中。
 const MIN_ATTEMPT_SLICE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 为什么必须有：`health::select_candidates` 在「所有 Key 都已熔断」时会**忽略熔断窗口、
-/// 把全部 Key 原样返回**（避免单 Key 场景无处可切就自杀）。副作用是熔断在「全坏」这个最需要
-/// 它的场景下形同虚设——`record_live_failure` 攒够 3 次设了 `breaker_until`，但下一个请求照旧
-/// 把所有 Key 完整重打一遍。客户端（Claude 桌面端等）收到 5xx 会自动重发，于是表现为
-/// 「一直轮询」：实测单次故障窗口内 3 条并发链各走完全部候选、共 16 条事件，
-/// 相邻两次「全部 Key 失败」间隔低至 0.2s，白耗上游额度且刷爆日志。
-///
-/// 取 5s：足够把客户端连环重发的尖峰压平（0.2~0.5s 级的重试全部被挡），又短到 Key 恢复后
-/// 几乎无感。任何一次转发成功都会**立即**解除短路（见 `clear_all_failed_gate`），
-/// 故不会延误恢复。
 const ALL_FAILED_SHORT_CIRCUIT_MS: i64 = 5_000;
 
-/// 「全部 Key 均失败」时回给下游的状态码：**529 overloaded_error**，不是 502。
-///
-/// 判据来自 claude.exe v2.1.219 内嵌的官方 gateway 协议规范：529 是「上游过载、稍后重试」的
-/// 专用码，客户端 SDK 见到它会走**退避重试**；而 502 映射成 `api_error`，SDK 的处理是不确定的
-/// （可能立刻重发，可能直接报错终止）。「全部候选都打不通」本质就是「暂时无产能」，语义正是 529。
-///
-/// 用 u16 常量而非 `StatusCode` 关联常量：529 不在 http crate 的预定义列表里（非 IANA 注册码，
-/// 属 Cloudflare/Anthropic 惯例），只能 `from_u16` 构造。
 const STATUS_OVERLOADED: u16 = 529;
 
-/// 各分类的「全部 Key 失败」短路状态。进程内状态，重启即清。
-///
-/// 键是 `{ProxyManager 实例 id}:{分类名}`（见 [`ProxyManager::gate_key`]）。
-/// 生产环境全程只有一个 `ProxyManager`，故等价于「按分类」；而单元测试里每个用例各建一个
-/// `ProxyManager`，于是天然互不干扰——此前只用分类名做键，两条都用 `ClaudeCli` 的 e2e 测试会
-/// 共享同一格：一条武装的 5s 窗口把另一条的请求直接短路，表现为 `proxy_fails_over_bad_to_good`
-/// 偶发变红（同一份代码三次跑出 276/1、276/1、277/0）。
-///
-/// `until_ms`：短路截止时刻（epoch ms）。
-/// `retry_at_ms`：上游 429/503 的 `Retry-After` 换算出的「可再试时刻」（epoch ms），无则 None。
-///   窗口内被短路的响应用它给下游一个**不早于上游要求**的 `Retry-After`，避免下游按 5s 退避
-///   却在上游仍限流时又撞上去。
 #[derive(Clone, Copy)]
 struct GateEntry {
     until_ms: i64,
@@ -166,16 +105,6 @@ fn all_failed_gate() -> &'static Mutex<HashMap<String, GateEntry>> {
     GATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 记一次「全部失败」，武装短路窗口。`retry_after_secs` 为上游给出的退避秒数（若有）。
-///
-/// ## 并发安全（CAS 语义）
-///
-/// 只在以下情况更新窗口：
-/// 1. 窗口不存在（首次武装）
-/// 2. 窗口已过期（自然到期后重新武装）
-/// 3. 新的 `retry_at_ms` 更晚（取更保守的退避时间，避免早到的重试仍然失败）
-///
-/// **不**覆盖仍有效且更严格的窗口，防止并发场景下后完成的请求用更短的退避覆盖先完成的。
 fn arm_all_failed_gate(gate_key: &str, retry_after_secs: Option<i64>) {
     let now = chrono::Utc::now().timestamp_millis();
     let new_until = now + ALL_FAILED_SHORT_CIRCUIT_MS;
@@ -208,8 +137,6 @@ fn arm_all_failed_gate(gate_key: &str, retry_after_secs: Option<i64>) {
     }
 }
 
-/// 短路窗口是否仍有效。有效则返回 `(剩余毫秒>0, 应告知下游的 Retry-After 秒数)`，
-/// 否则 None（并顺手清理过期项）。
 fn all_failed_gate_remaining(gate_key: &str) -> Option<(i64, i64)> {
     let now = chrono::Utc::now().timestamp_millis();
     let mut gate = all_failed_gate().lock();
@@ -232,35 +159,22 @@ fn all_failed_gate_remaining(gate_key: &str) -> Option<(i64, i64)> {
     }
 }
 
-/// 转发成功 → 立即解除短路（Key 恢复后无需等窗口自然到期）。
 fn clear_all_failed_gate(gate_key: &str) {
     all_failed_gate().lock().remove(gate_key);
 }
 
-/// 把「目标时刻」换算成 `Retry-After` 秒数（向上取整）。
-///
-/// 结果天然 ≥ 1：唯一调用方只在 `until_ms > now`（整数毫秒，故 `delta ≥ 1`）时调用，
-/// `ceil(0.001) = 1`。这条下限很重要——`Retry-After: 0` 等于不退避，客户端会立刻重发，
-/// 与短路的目的相反；对**上游给出**的秒数（可能真是 0）由调用方另行夹取，
-/// 最终写响应头前还有一道边界守卫（见 `error_resp_with_retry_after`）。
 fn retry_after_secs_until(target_ms: i64, now_ms: i64) -> i64 {
     let delta = (target_ms - now_ms).max(0);
     ((delta as f64) / 1000.0).ceil() as i64
 }
 
-/// 拼短路窗口键：`{实例命名空间}:{分类名}`。
 fn gate_key_of(ns: u64, category: CategoryType) -> String {
     format!("{ns}:{}", category.as_str())
 }
 
-/// 代理管理器：管理各分类的代理生命周期
 pub struct ProxyManager {
     store: Arc<Store>,
-    /// key 用 CategoryType 而非字符串（P2-8）：字符串键与枚举并存是两套真相，
-    /// 拼错一个字母就是「静默启动到另一个分类」而非编译失败。
     running: Mutex<HashMap<CategoryType, RunningProxy>>,
-    /// 本实例的短路窗口命名空间（见 [`all_failed_gate`]）。生产环境只有一个实例，
-    /// 故与「按分类」等价；测试里每个用例各建一个实例，天然互不干扰。
     gate_ns: u64,
 }
 
@@ -275,7 +189,6 @@ impl ProxyManager {
         }
     }
 
-    /// 该分类在本实例下的短路窗口键。
     fn gate_key(&self, category: CategoryType) -> String {
         gate_key_of(self.gate_ns, category)
     }
@@ -288,7 +201,6 @@ impl ProxyManager {
         self.running.lock().contains_key(&category)
     }
 
-    /// 启动某分类的代理，返回监听端口。
     pub async fn start(&self, category: CategoryType) -> AppResult<u16> {
         if let Some(p) = self.port_of(category) {
             return Ok(p);
@@ -397,17 +309,6 @@ impl ProxyManager {
         }
     }
 
-    /// 停掉**所有**分类的代理，返回实际停掉的分类数。退出应用时用。
-    ///
-    /// 与逐个 `stop()` 的区别，是刻意为「进程退出」这个场景设计的：
-    /// - **广播 shutdown 信号**再 abort —— 这一步是「优雅」的实质：已建立的连接会收到
-    ///   watch 变更、走 `select` 的关闭臂，让 hyper 正常收尾（客户端看到的是干净的连接结束，
-    ///   而非进程被杀时 socket 直接 RST 的「连接被重置」）。accept 循环随后 abort、端口释放。
-    /// - **不 emit 事件**：退出时前端窗口正在拆除，事件泵的接收端可能已经没了，emit 无意义；
-    ///   而逐个 `stop()` 会 emit（那是运行期用户操作，UI 还在）。
-    /// - **不还原客户端配置**：那是 FR-029 的取舍 —— 退出时快照「哪些在跑」，下次启动自动恢复；
-    ///   退出即还原会让下次启动多绕一圈重写，且中间有窗口期客户端指向死端口。
-    ///   调用方（退出处理块）必须**先做运行态快照、再调本函数**，否则快照读到的是空集。
     pub fn stop_all(&self) -> usize {
         // 一次性取走全部句柄，锁内只做 remove、不做 I/O。
         let handles: Vec<RunningProxy> = {
@@ -426,18 +327,6 @@ impl ProxyManager {
     }
 }
 
-/// 处理一次下游工具请求：故障转移路由。
-///
-/// 本函数只做一件事：调 [`handle_request_inner`] 拿响应，再在**唯一出口**挂上
-/// `X-SynaRoute-*` 诊断头（见 [`crate::route_meta`]）。
-///
-/// 为什么要拆这一层，而不是在 inner 里各个 `return` 前分别挂头：inner 有 8 个出口
-/// （模型发现、单模型检索、gateway 侧端点、读体失败、短路窗口、无候选、成功×2、全失败），
-/// 「记得在每个出口调一次」是**必然会漏**的纪律，而漏掉的表现是静默的
-/// —— 没人会因为「少了个响应头」提 bug，只会在下次排障时发现某类请求查不到路由信息。
-/// 收成一个出口后，漏掉这件事在结构上做不到：inner 返回什么，都会经过这里。
-///
-/// `gate_key`：本次请求所属「代理实例 + 分类」的短路窗口键（见 [`all_failed_gate`]）。
 pub(crate) async fn handle_request(
     store: Arc<Store>,
     category: CategoryType,
@@ -457,11 +346,6 @@ pub(crate) async fn handle_request(
     })
 }
 
-/// 转发主体。**不要直接调它** —— 走 [`handle_request`]，否则响应上不会带诊断头。
-///
-/// `meta`：出参。沿路把「命中哪条 Key / 实际打的模型 / 试了几次 / 耗时 / 上游状态码」
-/// 填进去，由 [`handle_request`] 在唯一出口转成响应头。填不满没关系（早退路径本来就没有
-/// 这些信息），`build_headers` 会省略空字段。
 async fn handle_request_inner(
     store: Arc<Store>,
     category: CategoryType,
@@ -939,10 +823,8 @@ async fn handle_request_inner(
             };
             store.append_event(category, "failover", Some(&failed.id), &detail);
         };
-        // 🔴 第二跳「宁可报错也不悄悄换模型」：循环前 `reject_if_unserviceable` 只判一次
         // （那时首选还没失败），降级恰恰发生在这里。
         //
-        // ⚠️ **「全员都被跳过」到不了循环尾** —— 排序第一位是 `Confidence`，而
         // `may_serve == (confidence != Fallback)`：全员 Fallback 时循环前那道门已经回 503。
         // 故这一支必然发生在「某个 Native/Unknown 候选已经失败过」之后，`last_err` 非空、
         // 尾部按那次失败的性质分流。**别在尾部为它加「last_status 为空就回 503」那种守卫**：
@@ -993,7 +875,6 @@ async fn handle_request_inner(
         // 原始 body，下一个候选拿到的就是「上一个候选 resolve 后的模型名」，
         // 那是静默的错路由（不报错、不 panic，只是打错了模型）。
         //
-        // ⚠️ **必须在真正要用的那一刻才构造**，不能提到 `if wants_stream` 之前：
         // 那样非流式分支走到时 req_json 已被 take 空，forward_to_key 会收到 `Null`
         // （表现为发给上游的 body 只剩 `"messages": []`）。初版就是这么写的，
         // 被 codex_effort_injected_end_to_end 等三条既有测试当场抓住。
@@ -1014,7 +895,6 @@ async fn handle_request_inner(
                 .await
             {
                 Ok(StreamAttempt::Streaming { resp, url, real_model, request_body }) => {
-                    // ⚠️ **不在这里 record_live_success**。响应头 2xx 只说明「开流了」，不代表这次
                     // 转发成功：上游可能 200 后在流内发 error 事件（Anthropic 过载最常见形态）。
                     // 曾经在此处同步记成功，而「流内报错补记失败」要等 body 抽干才跑 ——
                     // 于是每次请求都先把 fail_count 清零、再加回 1，BREAKER_THRESHOLD=3 永不达到，
@@ -1160,7 +1040,6 @@ async fn handle_request_inner(
         // 绝不能走缓冲路径返回 application/json——下游按 text/event-stream 解析必失败。
         // 跳过该候选，让故障转移去找可流式的 Key。
         if wants_stream && !can_stream(key) {
-            // ⚠️ 只在**还没有真实失败记录**时才写 last_err/last_status：这个候选根本没被
             // 尝试过，它的「跳过」不能覆盖前面候选的真实失败性质 —— 否则「前面的 Key 全是
             // 429/5xx 临时错误、最后一个候选恰好协议不兼容」时，循环尾部按 last_status 分流
             // 会把整轮判成 501 硬错误：不带 Retry-After、不武装短路窗口、文案只剩「协议
@@ -1292,7 +1171,6 @@ async fn handle_request_inner(
                 // 同流式分支：区分本地配置错误与连接层失败（见 config_error 声明）。
                 let is_config_err = matches!(e, AppError::Invalid(_));
                 // 同流式分支：我们自己的排队超时不计熔断（见 `AppError::QueueTimeout`）。
-                // 🔴 **两条路径必须同口径** —— 只改流式那条，非流式的客户端照旧被误熔断，
                 // 而那半是静默的（本仓「只修了一条路径」栽过多次）。
                 let is_queue = e.is_queue_timeout();
                 last_err = e.to_string();
@@ -1372,24 +1250,6 @@ async fn handle_request_inner(
     ))
 }
 
-/// 这次失败是否由**我们自己**掐短的超时造成（→ 不该算进该 Key 的熔断计数）。
-///
-/// 每次尝试的实际超时是 `min(Key 自身超时, 故障转移剩余预算)`。当剩余预算比 Key 的超时更小时，
-/// 一条**完全健康**的 Key 也会被我们在它答完之前掐断 —— 而那个 Err 走的是连接层分支，
-/// 于是 `record_live_failure` 给它记一次失败。三次之后这条好 Key 被熔断 60 秒。
-///
-/// 真机形态：6 条 Key、per-Key 30s、总预算 10s。前两条各耗 4s 真的坏了，第三条只剩 2s ——
-/// 它 2s 内没答完（正常，它需要 5s），被判失败。用户反复请求几轮后，**池子里最好的那条 Key
-/// 反而先被熔断**，因为它总是排在预算末尾。这是「越排后面越容易被误判」的系统性偏置，
-/// 不是偶发。
-///
-/// 判据要两个条件同时成立，缺一个都会误判：
-/// - `budget < key_timeout`：确实是我们把时间片削短了（预算未开启或比 Key 超时还长时不成立）；
-/// - `elapsed >= budget`：这次尝试**真的用完了**被削短的时间片。少了这条，一个瞬间失败的
-///   DNS 错误也会被当成「我们掐的」而免罚，等于在预算紧张时整池都不再熔断。
-///
-/// 留 50ms 容差：`elapsed` 是错误返回后才测的，与超时触发点之间有调度抖动，
-/// 严格 `>=` 会让恰好卡在边界的那次漏判（漏判方向 = 误罚好 Key，正是要修的）。
 fn budget_truncated_attempt(
     elapsed_ms: u64,
     budget_left: Option<std::time::Duration>,
@@ -1402,53 +1262,17 @@ fn budget_truncated_attempt(
     elapsed_ms.saturating_add(50) >= budget.as_millis() as u64
 }
 
-/// 全 Key 失败后真正要用的 `Retry-After` 秒数（`None` = 没有任何上游给过头）。
-///
-/// `hint` 是**给了头的候选之间**的最小值。问题在于没给头的候选压根不参与那次比较：
-/// 混合池 `[A: 429 Retry-After: 3600（解析时已夹到 300）, B: 500 无头]` 的结论会是
-/// 「等 300 秒」，而 B 的 500 很可能 1 秒后就好了。这与「取最小值」那段注释自己写的判据
-/// （**只要有一个候选恢复就该放行**）直接冲突 —— 同一个误伤（一个撞配额的 Key 拖垮整池），
-/// 只是从「取最大值」换成了「唯一给头的那个替全池发言」这条更隐蔽的路径。
-///
-/// 处置：把「恢复时间未知」当作一个默认候选（= 短路窗口长度）一起参与取最小值。
-/// 「未知」的正确近似既不是无穷远、也不是立刻，而是「按本项目自己的短路窗口再探一次」：
-/// 早到的重试若仍失败，窗口会再武装一次，代价只是一次探路请求。
-///
-/// 两个方向都必须成立（故测试各钉一条）：
-/// - `3600 + 无头` → 窗口长度（不被拖到 300）；
-/// - `1 + 无头` → 1（不被拖长到窗口长度）。取 `min` 而非直接换成窗口长度即为此。
-///
-/// `None` 时不凭空造值：调用方另有「全无头就退避一个窗口长度」的兜底，
-/// 在这里返回 `Some(gate)` 会让「上游从没提过退避」与「上游说了正好一个窗口」不可区分。
 fn effective_retry_after_hint(hint: Option<i64>, saw_transient_without_hint: bool) -> Option<i64> {
     let gate_secs = (ALL_FAILED_SHORT_CIRCUIT_MS / 1000).max(1);
     hint.map(|s| if saw_transient_without_hint { s.min(gate_secs) } else { s })
 }
 
-/// 529 的 `StatusCode`。529 非 IANA 注册码（Cloudflare/Anthropic 惯例的「过载」码），
-/// http crate 无关联常量，只能 `from_u16` 构造；它对 100~999 恒成功，故 expect 不会触发。
 fn overloaded_status() -> StatusCode {
     StatusCode::from_u16(STATUS_OVERLOADED).expect("529 是合法 HTTP 状态码")
 }
 
-/// 临时性 4xx：`稍后重试` 语义，与 Anthropic SDK 的重试判据一致（408/409/429 或 >=500）。
-///
-/// **单一事实来源**：尾部分流（[`all_failed_is_hard_error`]）与熔断计数
-/// （[`status_counts_against_breaker`]）都引用它。这两处此前各写各的名单已经漂移过一次
-/// （尾部把 408/409 与非 500/502/503/504 的 5xx 判为临时，熔断却把它们算进惩罚，
-/// 于是一次超时/Cloudflare 52x 就把完好的 Key 熔断 60s）。共用一个常量杜绝再漂移。
 const TRANSIENT_4XX: [u16; 3] = [408, 409, 429];
 
-/// 全 Key 失败后的「硬错误」判定（决定尾部分流）。
-///
-/// - **硬错误** → 原样回状态码（config_error 无码时回 400）、**不**武装短路窗口、**不**带
-///   Retry-After：401/403/404 等 4xx、协议不匹配的 501、以及本地配置错误（缺 maxOutputTokens 等，
-///   `config_error=true` 而 `last_status=None`）—— 都永不自愈，包装成 529 只会让客户端无限退避。
-/// - **临时性**（429/408/409/5xx/连接层失败）→ 回 529 + Retry-After + 武装短路窗口。
-///
-/// `config_error` 契约：**只反映最后一次失败的性质**。两个上游状态码失败分支都会把它复位为
-/// false，否则「配置错 Key 优先 + 后续 Key 撞 429/5xx」时它会被前一候选的 Invalid 粘住，
-/// 把一整轮临时故障误判成硬错误（回裸状态码、丢掉 Retry-After 与短路窗口）。
 fn all_failed_is_hard_error(config_error: bool, last_status: Option<u16>) -> bool {
     config_error
         || matches!(
@@ -1457,49 +1281,23 @@ fn all_failed_is_hard_error(config_error: bool, last_status: Option<u16>) -> boo
         )
 }
 
-/// 模型发现 / gateway side endpoints：代理自己应答的非转发端点。
 #[path = "proxy/models_endpoint.rs"] mod models_endpoint; // 显示名这一维的取证见该文件模块注释
 use models_endpoint::{handle_gateway_side_endpoints, handle_list_models, handle_retrieve_model};
 
-/// 流式响应尾部滑动窗口大小。SSE 的 usage 统计在最末几个事件里，只需留住尾巴，
-/// 不缓存全文 —— 既不牺牲首字节延迟，也不让长会话的响应体常驻内存。
 const TAIL_WINDOW_BYTES: usize = 8192;
 
-/// 流式响应**头部**窗口大小。Anthropic 把 input_tokens / cache_read / cache_creation 放在流首的
-/// `message_start` 事件里；只留尾窗时，任何 >8KB 的回答会把它挤掉 → input/缓存 token 记成 0
-/// （日志与「额度花在哪」面板把占比常 >90% 的输入/缓存显示为 ~0）。故另留头部 8KB：一旦攒够
-/// 就不再增长（message_start 是第一个事件，必在其中），流末与尾窗合并取 usage。
 const HEAD_WINDOW_BYTES: usize = 8192;
 
-/// 日志正文的截断口径（头尾各留，理由见模块头 —— 只留头部会丢掉 `tools`）。
 #[path = "proxy/log_cap.rs"] mod log_cap;
 use log_cap::{cap, cap_to};
 
-/// 流式转发的尝试结果。
 enum StreamAttempt {
-    /// 上游 2xx：已构建好流式响应，直接返回给下游（不再切换 Key）。
-    /// 附带诊断快照供调用模型日志：实际请求的上游 URL、映射后模型名、
-    /// **转换后发往上游的请求体**（含 reasoning→thinking 等映射结果，供排障核对）。
-    /// 响应体因是真流式（边收边发）无法完整留存，日志侧标注说明。
-    ///
-    /// 这里**不带** token 用量：流是边收边发的，`log_success` 同步执行时流才刚开始，
-    /// 那一刻上游还没吐出末尾的 usage 事件。用量由流内的尾部窗口在流结束后
-    /// 异步补记（同 collapse key 合并进同一条日志），不走这个返回值。
     Streaming {
         resp: Response<ResBody>,
         url: String,
         real_model: String,
         request_body: String,
     },
-    /// 上游有响应但非 2xx：缓冲错误体，调用方据此切换下一个 Key。
-    /// `retry_after`：上游 `Retry-After` 头解析出的秒数（429/503 常带），无则 None。
-    ///
-    /// `request_body` = **转换后发往上游的**请求体快照，与 `Streaming` 那份同一口径。
-    /// 此前这个变体不带它，调用方只能退而记 `downstream_body`（客户端原样发来的那份）——
-    /// 而链路快照的界面标签写的是「上游请求」。跨协议 Key 上两者根本不是一回事：
-    /// 排查「为什么这个 Key 回 400」时，看到的是一份 Anthropic 请求体，
-    /// 而我们实际发出去的是 OpenAI Responses 格式，映射结果、`max_tokens` 补写、
-    /// reasoning→thinking 转换全都看不见 —— 恰恰是 400 最常见的成因所在。
     HttpError {
         status: u16,
         body: String,
@@ -1510,13 +1308,54 @@ enum StreamAttempt {
     },
 }
 
-/// 同协议流式转发：把上游 SSE 响应边收边发透传给下游。
-///
-/// 与 forward_to_key 的差异：
-/// - 不设总超时（长回答会被 30s 掐断），仅设连接超时；流本身靠客户端断开或上游结束收尾。
-/// - 先 send() 探状态码：非 2xx 缓冲错误体返回 HttpError（首字节未发，切换安全）；
-///   2xx 则用 bytes_stream() 逐块转发，content-type 沿用上游真实值（保 text/event-stream）。
-/// - 仅在下游协议与 Key 协议一致时调用；跨协议走另一条流（`SseTranslator` + `sse_error`）。
+fn inject_cache_if_converted(payload: &mut Value, downstream: Protocol, key: &ProviderKey) -> crate::upstream::CacheInjection {
+    if key.protocol != Protocol::Anthropic || downstream == Protocol::Anthropic
+        || crate::upstream::cache_known_unsupported(&key.base_url) {
+        return Default::default();
+    }
+    crate::upstream::inject_converted_cache(payload)
+}
+
+fn rectify_cache_rejection(
+    status: u16, upstream_err: &str, payload: &mut Value, store: &Store,
+    category: CategoryType, key: &ProviderKey, injection: &crate::upstream::CacheInjection,
+) -> bool {
+    if !matches!(status, 400 | 422) || key.protocol != Protocol::Anthropic
+        || !crate::upstream::looks_like_cache_rejection(upstream_err)
+        || crate::upstream::rollback_injected_cache(payload, injection) == 0 {
+        return false;
+    }
+    crate::upstream::mark_cache_unsupported(&key.base_url);
+    store.append_event(category, "failover", Some(&key.id), &format!(
+        "已撤销本次注入的缓存断点后重试 · {} · 本进程后续不再向该端点注入缓存", key.name));
+    true
+}
+
+fn http_error_attempt(
+    status: u16,
+    body: String,
+    url: String,
+    real_model: String,
+    retry_after: Option<i64>,
+    req_log: bool,
+    payload: &Value,
+) -> StreamAttempt {
+    StreamAttempt::HttpError {
+        status,
+        body,
+        url,
+        real_model,
+        retry_after,
+        // 与成功路径同一口径：开关关闭时不构造（pretty-print 整个请求体不便宜）。
+        // 失败路径**比成功路径更需要**这份快照 —— 排 400/422 靠的就是核对我们到底发了什么。
+        request_body: if req_log {
+            serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string())
+        } else {
+            String::new()
+        },
+    }
+}
+
 // 参数多但每个都是这条转发链必需的运行时上下文（store/分类写日志、key/path/body/model 定位请求、
 // headers 透传客户端身份）。抽成 struct 只是换个地方传同样的东西，还要动全部调用点 ——
 // 与 `Store::append_event_full`、`aggregate::run_member_turns` 同样的取舍。
@@ -1606,7 +1445,9 @@ async fn try_stream_to_key(
     // 允许省略）。转换器不知道目标 Key/真实模型，绝不能在里面回退 4096；这里才有完整信息，
     // 因而只在补全端点按「模型最大输出 ∩ 窗口」补。count_tokens 的 schema 不收 max_tokens，
     // 必须跳过，否则严格 Anthropic 上游 400。
-    let payload = if path_takes_sampling_params(path) {
+    // `mut`：拿到 budget 400 时要就地整流 `thinking.budget_tokens` 再重发一次（见下方
+    // `rectify_thinking_budget`，与非流式路径同口径）。
+    let mut payload = if path_takes_sampling_params(path) {
         ensure_anthropic_output_budget(payload, key, &real_model)?
     } else {
         // 非补全端点不补 max_tokens → 不触发 apply_pending_thinking，故兜底剥掉哨兵字段
@@ -1616,6 +1457,8 @@ async fn try_stream_to_key(
         payload
     };
     crate::upstream::validate_tools_for(key.protocol, &payload)?;
+    // 跨协议转换出来的 Anthropic 请求打 prompt-caching 断点（省长会话重发；判据见函数文档）。
+    let cache_injection = inject_cache_if_converted(&mut payload, downstream, key);
     // 跨协议：退回上游协议的补全端点。
     let resource_path: std::borrow::Cow<str> = if downstream == key.protocol {
         std::borrow::Cow::Borrowed(path)
@@ -1631,7 +1474,11 @@ async fn try_stream_to_key(
     // **不在 RequestBuilder 上调 `.timeout()`**：reqwest 的那个超时覆盖「整个请求含读完 body」，
     // 对 SSE 流等于给长回答设了硬上限，会把回答截断。流式的超时只能套在**探头阶段**，
     // 见下面的 `probe_to`。
-    let rb = apply_upstream_headers(client.post(&url).json(&payload), key, &secret, fwd_headers, &real_model);
+    // 首发与「同 Key 重试」逐字节同构：都走这个闭包（reqwest 的 RequestBuilder 不可复用，
+    // 每次必须重建）。见下方 budget 400 整流处的重发。
+    let send_once = |body: &Value| {
+        apply_upstream_headers(client.post(&url).json(body), key, &secret, fwd_headers, &real_model).send()
+    };
 
     // 探头阶段超时 = min(Key 自身超时, 故障转移剩余预算)，与非流式的 `effective_to` 同口径。
     //
@@ -1651,49 +1498,63 @@ async fn try_stream_to_key(
     let (permit, probe_to) = crate::health::concurrency::acquire_with_budget(&key.id, probe_to)
         .await
         .map_err(|_| queue_timeout_err(key, probe_to))?;
-    let send_fut = rb.send();
-    let resp = match tokio::time::timeout(probe_to, send_fut).await {
-        Ok(r) => r.map_err(|e| AppError::upstream_msg(format!("连接 {} 失败: {e}", crate::diagnostics::mask_url_credentials(&url))))?,
-        Err(_) => {
-            return Err(AppError::upstream_msg(format!(
-                "连接 {} 超时（{}ms 内未拿到响应头）",
-                crate::diagnostics::mask_url_credentials(&url), probe_to.as_millis()
-            )))
-        }
-    };
-    let status = resp.status();
+    // 探头：send + 超时。写成宏而非闭包 —— `|body: &Value| async { … }` 返回借用了 body 的
+    // future,higher-ranked lifetime 表达不出「借用活到 future 结束」(实测编译不过);而这里
+    // 只有两个调用点(首发 / 整流后重发),宏就地展开、零借用跨越问题。
+    let deadline = tokio::time::Instant::now() + probe_to;
+    macro_rules! probe {
+        () => {
+            match tokio::time::timeout_at(deadline, send_once(&payload)).await {
+                Ok(r) => r.map_err(|e| AppError::upstream_msg(format!("连接 {} 失败: {e}", crate::diagnostics::mask_url_credentials(&url))))?,
+                Err(_) => {
+                    return Err(AppError::upstream_msg(format!(
+                        "连接 {} 超时（{}ms 内未拿到响应头）",
+                        crate::diagnostics::mask_url_credentials(&url), probe_to.as_millis()
+                    )))
+                }
+            }
+        };
+    }
+    let mut resp = probe!();
+    let mut status = resp.status();
 
-    if !status.is_success() {
-        // 非 2xx：缓冲错误体供切换决策与日志。Retry-After 须在读 body（消费 resp）之前取。
-        let retry_after = parse_retry_after(resp.headers());
-        // **读错误体也必须有超时**（与探头同一口径）。此前这里是裸 `resp.bytes().await`：
-        // shared_client 只设了 connect_timeout、没有响应超时，而故障转移的 deadline 只管
-        // 「不再开始新尝试」、管不到已开始的这一次。于是上游发完 429/5xx 响应头就停止发 body
-        // （半开连接 / LB 中途丢弃 / chunked 不收尾）时，这个候选**永久阻塞**，后续候选一个都
-        // 轮不到，下游连接一直挂着直到客户端自己超时 —— 而 stream:true 是主路径。
-        // 错误体只用于日志与 last_err，读不全无所谓，宁可给个「读取超时」也不能挂住整条链。
-        let body = match tokio::time::timeout(probe_to, resp.bytes()).await {
+    // 非 2xx 处理 + 「同 Key 立即重试(仅思考预算 400)」。
+    //
+    // 越界）→ 就地降/关预算再打一次这条 Key。作用于**转换后**的 `payload`（候选循环前段的
+    // `req_json` 里没有这个字段，见非流式路径的完整说明）。`rectify_thinking_budget` 幂等,
+    // 故最多重试一次、天然终止。重发成功(2xx)就 fall through 到下面开流。
+    //
+    // **读错误体必须带超时**（与探头同口径）：shared_client 无响应超时,上游发完响应头就
+    // 停发 body（半开连接 / LB 中途丢弃 / chunked 不收尾）会让这个候选**永久阻塞**,后续
+    // 候选一个都轮不到,而 stream:true 是主路径。读不全无所谓,宁可给「读取超时」占位。
+    let read_err_body = |resp: reqwest::Response| async {
+        match tokio::time::timeout_at(deadline, resp.bytes()).await {
             Ok(Ok(b)) => crate::diagnostics::redact_secret(&String::from_utf8_lossy(&b), secret.as_str()),
             Ok(Err(e)) => format!("（错误体读取失败：{e}）"),
-            Err(_) => format!(
-                "（错误体读取超时：{}ms 内未读完，已按失败切换下一个候选）",
-                probe_to.as_millis()
-            ),
-        };
-        return Ok(StreamAttempt::HttpError {
-            status: status.as_u16(),
-            body,
-            url,
-            real_model,
-            retry_after,
-            // 与成功路径同一口径：开关关闭时不构造（pretty-print 整个请求体不便宜）。
-            // 失败路径**比成功路径更需要**这份快照 —— 排 400/422 靠的就是核对我们到底发了什么。
-            request_body: if req_log {
-                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
-            } else {
-                String::new()
-            },
-        });
+            Err(_) => format!("（错误体读取超时：{}ms 内未读完，已按失败切换下一个候选）", probe_to.as_millis()),
+        }
+    };
+    if !status.is_success() {
+        // Retry-After 须在读 body（消费 resp）之前取。
+        let retry_after = parse_retry_after(resp.headers());
+        let body = read_err_body(resp).await;
+        // 整流链（同 Key 立即重试）：预算 400 或图片 400，命中任一就改 payload 重发一次。
+        // `||` 短路保证每趟最多一个命中、只重发一次（详见非流式路径同款说明）。
+        if tokio::time::Instant::now() < deadline && (crate::upstream::rectify_thinking_budget(status.as_u16(), &body, &mut payload, store, category, key)
+            || crate::upstream::rectify_unsupported_image(status.as_u16(), &body, &mut payload, store, category, key)
+            || rectify_cache_rejection(status.as_u16(), &body, &mut payload, store, category, key, &cache_injection))
+        {
+            resp = probe!();
+            status = resp.status();
+            // 重发成功则落到下面开流；这里只在「重发后仍失败」时收尾。
+            if !status.is_success() {
+                let retry_after = parse_retry_after(resp.headers());
+                let body = read_err_body(resp).await;
+                return Ok(http_error_attempt(status.as_u16(), body, url, real_model, retry_after, req_log, &payload));
+            }
+        } else {
+            return Ok(http_error_attempt(status.as_u16(), body, url, real_model, retry_after, req_log, &payload));
+        }
     }
 
     // 2xx：同协议原样透传；跨协议用 SseTranslator 逐块重组事件流。
@@ -1862,22 +1723,13 @@ async fn try_stream_to_key(
                 translator: crate::upstream::SseTranslator,
                 upstream: S,
                 finished: bool,
-                /// 只补记一次。上游结束会走两遍 `None` 分支（第一遍冲刷收尾事件、
-                /// 第二遍才真终止），不设这个闩会补记两次 —— 第二次把同一行的用量
-                /// 又写一遍，虽然值相同，但下次改成累加式补记时就是静默翻倍。
                 usage_recorded: bool,
-                /// 上游**原始**字节的尾窗（≤8KB），只用来判「流内有没有 error 事件」。
-                /// 必须存原始字节而不是翻译后的输出：翻译器会把它不认识的 error 事件整个丢掉
-                /// （sse.rs 六个方向函数无一读 error），翻译后的流里根本查不到错误痕迹。
                 raw_tail: Vec<u8>,
-                /// 健康记账只做一次（Drop 与终止分支可能都会走到）。
                 health_recorded: bool,
                 store: std::sync::Arc<Store>,
                 category: CategoryType,
                 key_id: String,
                 req_model: String,
-                /// 发往上游的真实模型名。只用于流末按模型衰减第二层的模型锁
-                /// （`req_model` 是对外名，锁的键不是它）。
                 real_model: String,
             }
 
@@ -1893,7 +1745,6 @@ async fn try_stream_to_key(
             }
 
             impl<S> StreamState<S> {
-                /// 上游原始尾窗，只保留末 8KB（终止性 error 事件必在流末）。
                 fn push_raw(&mut self, bytes: &[u8]) {
                     self.raw_tail.extend_from_slice(bytes);
                     if self.raw_tail.len() > TAIL_WINDOW_BYTES {
@@ -1902,17 +1753,10 @@ async fn try_stream_to_key(
                     }
                 }
 
-                /// 本次流内是否出现上游 error 事件（判据与同协议分支共用同一个函数）。
                 fn saw_upstream_error(&self) -> bool {
                     crate::upstream::sse_stream_errored(&String::from_utf8_lossy(&self.raw_tail))
                 }
 
-                /// 流末按「有无流内 error」二选一记账。理由同同协议分支：拿到 200 响应头只代表
-                /// 开流，早记成功会清零 fail_count 让后续失败补记永远够不到熔断阈值。
-                /// 此前**跨协议这条路连失败检测都没有**（翻译器丢掉 error 后照常冲刷 completed，
-                /// 下游拿到一条「成功完成的空回答」，健康态也被记成功）。
-                /// 与同协议分支共用 `record_stream_end`：失败时那条可见事件两条路都要落，
-                /// 各写一遍二选一必然漏掉一条（本仓已栽 10 次的接线盲区）。
                 fn record_health(&mut self) {
                     if self.health_recorded {
                         return;
@@ -1928,7 +1772,6 @@ async fn try_stream_to_key(
                     );
                 }
 
-                /// 流终止时把翻译器累积的用量补进「流开始时已写下的那一行」。
                 fn record_usage(&mut self) {
                     if self.usage_recorded {
                         return;
@@ -2049,27 +1892,16 @@ async fn try_stream_to_key(
     })
 }
 
-/// 一次转发的完整结果：既供路由决策（bytes/ok），也供调用模型日志（url/model/body 快照）。
 struct ForwardOutcome {
-    /// 上游返回体字节（成功时用于回给下游）
     bytes: Bytes,
-    /// 实际请求的上游完整 URL
     url: String,
-    /// 映射后实际发往上游的模型名
     real_model: String,
-    /// 发往上游的请求体（已做模型映射+协议转换；不含鉴权头）
     request_body: String,
-    /// 上游 HTTP 状态码
     status: u16,
-    /// 是否 2xx
     ok: bool,
-    /// 上游 `Retry-After` 头解析出的秒数（429/503 常带），无则 None。
     retry_after: Option<i64>,
 }
 
-/// 按下游请求 path 判定下游客户端使用的协议：
-/// `/messages` → Anthropic（Claude CLI/桌面端）；`/responses` → OpenAI Responses（Codex）；
-/// 其余（`/chat/completions` 等）→ OpenAI Chat。用于选择请求/响应的跨协议转换方向。
 fn downstream_protocol(path: &str) -> Protocol {
     if path.contains("/messages") {
         Protocol::Anthropic
@@ -2080,24 +1912,6 @@ fn downstream_protocol(path: &str) -> Protocol {
     }
 }
 
-/// 方案 A：为 Codex 注入「默认推理强度」。
-///
-/// 背景：Codex Desktop 对自定义 provider **不下发** `reasoning.effort`（实测 body 里
-/// 只有 `reasoning:{summary:auto}`，effort 缺失），故用户在 Codex UI 里设的强度传不到上游。
-/// 本函数在转发前，按分类配置（active_efforts["codex"]）把 effort 注入进 payload 的
-/// `reasoning.effort`，后续转换链（responses_to_chat 透传 → openai_to_anthropic 映射 thinking，
-/// 或原生 Responses 上游直接用）即可让强度生效。
-///
-/// 严格的不影响边界：
-/// - **仅下游为 OpenAI Responses（Codex）时注入**：其它下游（Claude Code /messages、
-///   /chat/completions 客户端）根本不经过这里的判断，零影响。
-/// - **上游协议不限**：Anthropic / Chat 上游经转换链映射 thinking / reasoning_effort；
-///   同协议 Responses 上游直通、也补默认 effort——经 SynaRoute 转发的一律是自定义 provider，
-///   Codex 对自定义 provider 不下发 effort，故此路径同样需要补，否则接 Responses 协议第三方
-///   中转商时配置的推理强度不生效（这正是方案 A 的前提，不区分上游协议）。
-/// - **已有 effort 则不覆盖**：只在缺失时补默认，将来 Codex 真发了 effort 也不破坏；
-///   若确实接了 OpenAI 官方 Responses 端点，官方客户端会自带 effort，has_effort 命中即跳过。
-/// - 配置为空 / 未设 → 完全不注入，保持现状。
 fn inject_default_effort(
     store: &Arc<Store>,
     category: CategoryType,
@@ -2141,32 +1955,10 @@ fn inject_default_effort(
     }
 }
 
-/// Key 上配的采样参数（temperature / top_p）是否该注入本次请求。
-///
-/// **只有「补全端点」该注入**。Claude CLI / 桌面端做 token 计数会发
-/// `POST /v1/messages/count_tokens`，body 只含 model/messages、无采样字段，
-/// 同协议直通会原样发到上游的 count_tokens 端点 —— 而该端点的 schema **不含**
-/// temperature/top_p，严格上游（Anthropic 官方）会以 400「extra inputs
-/// not permitted」拒绝，客户端 token 计数功能失效。老配置里普遍存着
-/// `temperature: 1.0`（KeyEditor 曾预填该值，2026-09-04 起不再预填），故不是边角场景。
-///
-/// 判据用「路径**不含** count_tokens」而非「等于补全路径」：各端补全路径形态不同
-/// （/v1/messages、/chat/completions、/responses，还可能带 ?beta= 等 query），
-/// 用黑名单挡掉已知的非补全子路径最稳，将来新增补全端点也不会被误挡。
 fn path_takes_sampling_params(path: &str) -> bool {
     !path.contains("count_tokens")
 }
 
-/// 为跨协议到 Anthropic 的请求补**协议必填**的 `max_tokens`，但只在客户端本来没给时。
-///
-/// 代理的总原则仍是「不替客户端决定输出长度」：
-/// - 目标不是 Anthropic → 原样返回；
-/// - 客户端已经给了上限 → 原样返回（即使值不理想，也不擅自覆盖）；
-/// - 客户端没给且目标是 Anthropic → 这是协议唯一不允许省略的字段，按实际目标模型的
-///   最大输出能力与窗口（若已有）计算一个合法值。
-///
-/// 计算放这里而不是 `convert.rs`：转换器只有 JSON/协议，没有 `ProviderKey` 和已经解析过的
-/// `real_model`，在那层只能瞎填 4096；那正是审计发现的跨协议静默截断。
 fn ensure_anthropic_output_budget(
     mut payload: Value,
     key: &ProviderKey,
@@ -2202,24 +1994,6 @@ fn ensure_anthropic_output_budget(
     Ok(payload)
 }
 
-/// 把 Key 上配置的采样参数（temperature / top_p）注入请求体。
-///
-/// **输出 token 上限刻意不在此列**（产品定调，2026-08-14）：代理相对 cc-switch 的增量只有
-/// 路由与自动故障转移，**不替客户端决定它没要求过的输出长度**。客户端没发 `max_tokens`
-/// 时，那是「由客户端/上游自己的默认值决定」，而不是「等着代理填一个」——
-/// 此前用 Key 上的值（新建 Key 默认 8192）补进去，等于悄悄给每个请求加了个上限，
-/// 用户看到长回答被截断只会去查上游，永远查不到是代理加的。
-/// `KeyParams.max_tokens` 现在**无任何请求路径读它**（2026-08-15 定调后大脑聚合也按模型窗口现算，见 `upstream/budget.rs`），仅兼容旧配置。
-///
-/// 客户端**显式**发的输出上限一律原样保留：同协议直通不动，跨协议由
-/// `convert.rs` 负责改名（`max_output_tokens` ↔ `max_tokens` ↔ `max_completion_tokens`）。
-/// 故障转移换到别的 Key 也不改——每个候选都从同一份原始 body 生成，
-/// 不会出现「同一问题落到 A Key 完整、落到 B Key 被切断」。
-///
-/// **口径：只在下游未显式给出时注入**，与 [`inject_default_effort`] 的「已有则不覆盖」一致。
-/// 客户端显式发的值代表用户当下的意图（如 Claude Code 针对某次对话调的 temperature），
-/// 优先级高于 Key 上配的默认值；Key 参数的定位是「这个 Key 的缺省」，不是「强制覆盖」。
-/// ⚠️ 另有**两种情形一个字段都不注入**（thinking 在场 / Responses 上游），见函数体 `skip_sampling`。
 fn apply_key_params(payload: &mut Value, params: &crate::model::KeyParams, upstream: Protocol) {
     let Some(obj) = payload.as_object_mut() else { return };
 
@@ -2250,16 +2024,6 @@ fn apply_key_params(payload: &mut Value, params: &crate::model::KeyParams, upstr
     }
 }
 
-/// `f32` → JSON number，**不带 f32→f64 拓宽噪声**。
-///
-/// `Value::from(0.2f32)` 会得到 `0.20000000298023224` —— 因为 0.2 在 f32 里本就是个近似值，
-/// 直接拓宽成 f64 会把那串二进制误差如实展开。于是发给上游的 JSON 里躺着
-/// `"temperature": 0.20000000298023224`，虽然数值上等价，但它会**原样出现在日志页的请求体快照里**，
-/// 用户看到自己填的 0.2 变成一串小数会怀疑参数被篡改（本项目最不该制造的那类误导）。
-///
-/// 借 Rust 的 `f32` Display 给出「能往返的最短十进制表示」（0.2f32 → "0.2"），再按 f64 解析。
-/// 与 KeyEditor 里 token 单位换算刻意走十进制字符串 + BigInt 是同一条纪律：
-/// **人填进去的十进制，出去时还得是那个十进制**。
 fn f32_to_json(v: f32) -> Value {
     v.to_string()
         .parse::<f64>()
@@ -2270,10 +2034,6 @@ fn f32_to_json(v: f32) -> Value {
         .unwrap_or(Value::Null)
 }
 
-/// 转发到单个 Key：套用模型映射 + 协议适配。
-/// 返回完整 outcome（含发往上游的请求体、响应体、状态），供路由与调用模型日志共用。
-/// 注意：非 2xx 不再直接返回 Err，而是照常返回 outcome（ok=false），
-/// 由调用方决定是否切换——这样失败也能被完整记进调用模型日志。
 // 同 `try_stream_to_key`：参数均为必需的运行时上下文，不为消警告做无收益的重构。
 #[allow(clippy::too_many_arguments)]
 async fn forward_to_key(
@@ -2343,7 +2103,8 @@ async fn forward_to_key(
     // 跨协议转换（下游协议 → 上游 Key 协议；同协议时 convert_request 内部直接返回克隆）
     let payload = crate::upstream::convert_request_owned(payload, downstream, key.protocol);
     // 与流式路径同进同退：补 Anthropic 必填的 max_tokens（见那里的完整说明）。
-    let payload = if path_takes_sampling_params(path) {
+    // `mut`：下面拿到 budget 400 时要就地整流 `thinking.budget_tokens` 再重发一次。
+    let mut payload = if path_takes_sampling_params(path) {
         ensure_anthropic_output_budget(payload, key, &real_model)?
     } else {
         let mut payload = payload;
@@ -2351,6 +2112,9 @@ async fn forward_to_key(
         payload
     };
     crate::upstream::validate_tools_for(key.protocol, &payload)?;
+    // 跨协议转换出来的 Anthropic 请求打 prompt-caching 断点（省长会话重发；判据见函数文档）。
+    // 在日志快照之前，让快照如实反映我们发出去的 body。
+    let cache_injection = inject_cache_if_converted(&mut payload, downstream, key);
 
     // 发往上游的请求体快照（pretty，方便页面阅读；密钥不在 body 里，安全）。
     //
@@ -2364,12 +2128,6 @@ async fn forward_to_key(
     //
     // 历史：`downstream_body` 那处早先已加守卫，但**同类的这处与流式那处当时漏了**
     // （docs/14 效率整治表已就此勘误）。三处必须同进同退。
-    let request_body = if req_log {
-        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
-    } else {
-        String::new()
-    };
-
     // 目标 URL + 鉴权。
     // 同协议：原样保留下游路径 + query（count_tokens 等子路径正确透传）。
     // 跨协议：只能映射主补全端点（其它子路径无跨协议等价物，退回该上游协议的补全端点）。
@@ -2396,7 +2154,6 @@ async fn forward_to_key(
         None => key_to,
     };
     // 并发槽位。非流式不用搬运它：`resp.bytes()` 在同一作用域 await 完，permit 随函数返回落地。
-    // 🔴 **必须排在建 `rb` 之前**：reqwest 的 `.timeout()` 从 `send()` 起算，先建带完整超时的
     // rb 再排队与流式那条是同一个缺陷（排队时间凭空加在预算之外）。两条路径必须同口径。
     let (_permit, effective_to) =
         crate::health::concurrency::acquire_with_budget(&key.id, effective_to)
@@ -2405,22 +2162,46 @@ async fn forward_to_key(
 
     // 请求头统一由 apply_upstream_headers 装齐（与流式路径共用同一实现，防两条路径分叉）。
     // **超时留在这里设**：非流式要等上游完整生成，语义与流式刻意不同，故不进公共函数。
-    let rb = apply_upstream_headers(
-        client.post(&url).json(&payload).timeout(effective_to),
-        key,
-        &secret,
-        fwd_headers,
-        &real_model,
-    );
-    // 连接层失败（DNS/超时/拒连）仍返回 Err，附带目标 URL 便于定位。
-    let resp = rb
+    let deadline = tokio::time::Instant::now() + effective_to;
+    let send_once = |body: &Value| {
+        apply_upstream_headers(
+            client.post(&url).json(body).timeout(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            key,
+            &secret,
+            fwd_headers,
+            &real_model,
+        )
         .send()
+    };
+    let mut resp = send_once(&payload)
         .await
         .map_err(|e| AppError::upstream_msg(format!("连接 {} 失败: {e}", crate::diagnostics::mask_url_credentials(&url))))?;
-    let status = resp.status();
+    let mut status = resp.status();
     // Retry-After 须在 resp.bytes() 消费响应体之前取（bytes() 拿走所有权）。
-    let retry_after = parse_retry_after(resp.headers());
-    let bytes = crate::diagnostics::redact_upstream_error_bytes(status.as_u16(), resp.bytes().await.map_err(|e| AppError::upstream_msg(e.to_string()))?, secret.as_str());
+    let mut retry_after = parse_retry_after(resp.headers());
+    let mut bytes = crate::diagnostics::redact_upstream_error_bytes(status.as_u16(), resp.bytes().await.map_err(|e| AppError::upstream_msg(e.to_string()))?, secret.as_str());
+
+    // max_tokens 钳小后越界，见 `rectify_on_budget_error`）→ 就地降/关预算再打一次这条 Key。
+    // 必须在这里、作用于**转换后**的 `payload`：`thinking.budget_tokens` 是转换链算出来的，
+    // 候选循环前段的 `req_json`（Codex 下游是 `reasoning.effort`）里没有它 —— 挂那里对
+    // Codex→Anthropic（这条错误唯一的发生场景）恒 no-op（2026-09-21 审查抓出的缺陷）。
+    // 只重试一次：`rectify_on_budget_error` 幂等（降到下限后返回 false），这里天然终止。
+    // 整流链（同 Key 立即重试）：预算 400 或图片 400 命中任一就改 payload 重发一次。
+    // `||` 短路 → 每趟最多一个命中 → 总共只重发一次；两者判据互斥（预算查 budget_tokens，
+    // 图片查 image+unsupported），顺序不影响。都幂等（改完再遇同错无可改、返回 false）。
+    if !status.is_success() && tokio::time::Instant::now() < deadline && {
+        let err = String::from_utf8_lossy(&bytes).into_owned();
+        crate::upstream::rectify_thinking_budget(status.as_u16(), &err, &mut payload, store, category, key)
+            || crate::upstream::rectify_unsupported_image(status.as_u16(), &err, &mut payload, store, category, key)
+            || rectify_cache_rejection(status.as_u16(), &err, &mut payload, store, category, key, &cache_injection)
+    } {
+        resp = send_once(&payload)
+            .await
+            .map_err(|e| AppError::upstream_msg(format!("连接 {} 失败: {e}", crate::diagnostics::mask_url_credentials(&url))))?;
+        status = resp.status();
+        retry_after = parse_retry_after(resp.headers());
+        bytes = crate::diagnostics::redact_upstream_error_bytes(status.as_u16(), resp.bytes().await.map_err(|e| AppError::upstream_msg(e.to_string()))?, secret.as_str());
+    }
 
     // 跨协议响应翻译：上游 2xx 时，把响应体从上游协议翻译回下游客户端期望的协议格式。
     // 请求已翻译（上面的 payload 转换），响应也必须翻译，否则下游客户端收到无法解析的异协议体。
@@ -2453,6 +2234,9 @@ async fn forward_to_key(
         bytes
     };
 
+    let request_body = if req_log {
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
+    } else { String::new() };
     Ok(ForwardOutcome {
         request_body,
         url,
@@ -2464,34 +2248,7 @@ async fn forward_to_key(
     })
 }
 
-/// 判断某个下游请求头是否应被剔除、不透传给上游。
-/// 剔除项：鉴权（用 Key 自己的）、路由/长度类（reqwest 按目标重算）、
-/// hop-by-hop（RFC 7230）、content-type（reqwest .json() 自带）、
-/// accept-encoding（避免上游返回压缩体导致响应快照乱码）。
-/// 1M 上下文对应的 Anthropic beta 特性名。
-///
-/// **判据来源**（反查而非文档推测）：`claude.exe` v2.1.219 内嵌的 beta 特性注册表
-/// （offset ≈ 186988648）里成对出现 `long_context` → `context-1m-2025-08-07`，
-/// 与 `interleaved_thinking` → `interleaved-thinking-2025-05-14` 等同一张表。
 const BETA_CONTEXT_1M: &str = "context-1m-2025-08-07";
-
-/// 计算发往上游的 `anthropic-beta` 头：在下游原值基础上**按需追加** 1M 上下文特性。
-///
-/// ## 为什么代理要代劳
-///
-/// Claude Code 只对**它认识的**模型名发 `context-1m-2025-08-07`。经 SynaRoute 路由时，
-/// 客户端看到的是我们的对外名（`claude-opus-4-8`、或非合规名被包成 `claude-synaroute-*`），
-/// 客户端不认识 → 不会发这个头 → 即使上游模型真支持 1M，实际仍按默认窗口截断，
-/// 用户配了大 `contextWindow` 却完全不生效（又一个「看起来配了、实际没用上」）。
-///
-/// 故判据取「**本次实际要打的真实模型**的 `contextWindow` ≥ 1M」——不是看客户端要什么，
-/// 而是看请求最终落在哪个模型上。桌面端侧的 `supports1m` 是同一份数据的另一面
-/// （见 `tools::build_desktop_model_entries`），两端口径因此天然一致。
-///
-/// ## 必须追加而非替换
-///
-/// 下游原值里带着 `claude-code-20250219` 等特性，那是中转商识别「真实 Claude Code 客户端」
-/// 的依据（部分分组只放行 CC）。整体覆盖会让这些请求被拒。已存在同名特性时不重复追加。
 fn effective_beta_header(
     fwd_headers: &[(String, String)],
     key: &ProviderKey,
@@ -2522,34 +2279,10 @@ fn effective_beta_header(
 // 「哪些头是代理自有的」已移到 `custom_headers::is_reserved` —— 它同时是自定义头的
 // 黑名单，两个用途必须共用一份清单（否则加新头时只改一处，另一处静默成洞）。
 
-/// 上游返回某状态码时，是否该「计入熔断」（惩罚该 Key）。
-///
-/// 429（限流）与 5xx（网关/后端临时故障）都是**临时性**、Key 本身没坏：
-/// - 429 requests-per-minute：这一分钟请求满了，下一分钟自动恢复，不该把好 Key 熔断 60s。
-/// - 502/503/504：中转商网关抖动，同样短暂。
-/// - 529：上游明说「我过载了，稍后再来」。我们自己对下游正是用它表达这个意思
-///   （见 `STATUS_OVERLOADED`），收到时却判成「Key 坏了」显然口径矛盾。
-///
-/// **请求级 4xx 同样不计入**：`400`（请求不合法）与 `422`（实体语义无效，OpenAI 兼容站常用
-/// 它表达 schema 校验失败）错在**请求本身** —— 请求由下游客户端发出或经我们的协议转换构造，
-/// 与用哪个 Key 无关，换任何 Key 都会同样失败。2026-07-31 实机复盘：把 400 计入熔断时，
-/// 客户端的空探测（`{"messages":[],"model":null}`）连打三次就熔断一条**完好的 Key**；
-/// 我们自己的转换 bug（上游报 "model is required"）会把整池好 Key 逐个刷成熔断、
-/// 进而触发全熔断兜底反复重打。那天 68 条失败请求里近半是这两类。
-///
-/// 这类只「切下一个 Key 应急」，**不累加 fail_count、不熔断**，下个请求仍优先用它。
-/// 仍然计入的是**确定属于这个 Key** 的故障：401/403 鉴权失败、404 端点或模型不存在。
-///
-/// `failover_verb` 与 `status_counts_against_breaker` 共用本函数，避免「日志说非 Key 问题、
-/// 熔断却罚 Key」这类同码两处定性相反（422 那次矛盾就是这么来的）。
 fn is_request_level_4xx(status: u16) -> bool {
     status == 400 || status == 422
 }
 
-/// 重试同一个只是白试，连续几次后熔断掉它，避免每个请求都从它开始。
-///
-/// ⚠️ **404 要配合 [`path_is_auxiliary_endpoint`] 一起判**，别单看状态码。见
-/// [`failure_counts_against_breaker`]。
 fn status_counts_against_breaker(status: u16) -> bool {
     // 只有「确定属于这个 Key」的硬错误才罚：与尾部 all_failed_is_hard_error 用同一套判据
     // （见 TRANSIENT_4XX 注释）——4xx 里除请求级（400/422，见 is_request_level_4xx）与
@@ -2562,29 +2295,10 @@ fn status_counts_against_breaker(status: u16) -> bool {
         && !TRANSIENT_4XX.contains(&status)
 }
 
-/// **辅助端点**（非补全）：上游不实现它是常态，不该据此判定 Key 坏了。
-///
-/// 目前只有 token 计数一个。它是 Anthropic 官方 API 的辅助端点，
-/// 而**绝大多数中转站不实现**（实测返回 `404 Invalid URL (POST /v1/messages/count_tokens)`）。
-///
-/// 与 [`path_takes_sampling_params`] 的判据刻意一致（都是「路径含 count_tokens」），
-/// 但语义不同、故不复用同一个函数：那个回答「该注入采样参数吗」，
-/// 这个回答「失败了该罚 Key 吗」。将来若两者的名单分叉（例如新增一个
-/// 「要注参数但不算辅助」的端点），共用一个函数会让改动波及到不相干的那条判据。
 fn path_is_auxiliary_endpoint(path: &str) -> bool {
     path.contains("count_tokens")
 }
 
-/// 「这次失败该罚 Key 吗」的布尔版。**状态码与请求路径一起判** —— 为什么要带路径，
-/// 取证在 [`path_is_auxiliary_endpoint`] 与 [`failure_scope`] 上（2026-08-14 真机复盘：
-/// 只看状态码时每次 token 计数的 404 都会累加 fail_count，几次之后整池熔断，
-/// 而那些 Key 转发真实对话完全正常）。
-///
-/// 生产路径已改走 [`failure_scope`]（三个作用域，而不是一个 bool）。本函数保留为
-/// **既有 4 条判据测试的入口**，并作为「Key 级」这一档的可读定义。
-///
-/// 标 `#[cfg(test)]` 的理由同 `health::is_candidate`：从编译期阻止有人把生产调用点切回
-/// 这条**丢掉模型级作用域**的路径 —— 那种回退不报错，只是 404 又开始熔断整条 Key。
 #[cfg(test)]
 fn failure_counts_against_breaker(status: u16, path: &str) -> bool {
     matches!(failure_scope(status, path), FailureScope::Key)
@@ -3673,6 +3387,7 @@ mod tests {
             has_secret: true,
             enabled: true,
             allow_in_aggregate: false,
+            allow_named_model_fallback: false,
             priority,
             headers_json: None,
             params: KeyParams::default(),
@@ -5534,6 +5249,568 @@ mod tests {
             up.get("thinking").and_then(|t| t.get("budget_tokens")).is_some(),
             "上游 body 应含 thinking.budget_tokens（xhigh 注入 + 映射），实际收到:\n{}",
             serde_json::to_string_pretty(&up).unwrap()
+        );
+    }
+
+    /// 首个请求回 `budget_tokens must be less than max_tokens` 的 400、其余回 200，
+    /// 并捕获每次收到的请求体。`sse` 为真时 200 走 text/event-stream（流式路径）。
+    async fn spawn_budget_reject_then_ok_mock(
+        captured: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+        sse: bool,
+    ) -> String {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let cap = captured.clone();
+                let hits = hits.clone();
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let cap = cap.clone();
+                        let hits = hits.clone();
+                        async move {
+                            let bytes = req.into_body().collect().await.unwrap().to_bytes();
+                            cap.lock().push(String::from_utf8_lossy(&bytes).to_string());
+                            let n = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if n == 0 {
+                                let resp = Response::builder()
+                                    .status(400)
+                                    .header("content-type", "application/json")
+                                    .body(full_body(Bytes::from_static(
+                                        br#"{"type":"error","error":{"type":"invalid_request_error","message":"thinking.budget_tokens must be less than max_tokens"}}"#,
+                                    )))
+                                    .unwrap();
+                                return Ok::<_, hyper::Error>(resp);
+                            }
+                            let (ct, body): (&str, &'static [u8]) = if sse {
+                                ("text/event-stream", b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"claude\",\"content\":[],\"usage\":{\"input_tokens\":3}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+                            } else {
+                                ("application/json", br#"{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":3,"output_tokens":1}}"#)
+                            };
+                            let resp = Response::builder()
+                                .status(200)
+                                .header("content-type", ct)
+                                .body(full_body(Bytes::from_static(body)))
+                                .unwrap();
+                            Ok::<_, hyper::Error>(resp)
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// 🔴 **真实链路复现 2026-09-20 用户实报的 budget 400（本轮第一版修错了位置）。**
+    ///
+    /// Codex（下游 /v1/responses，body 里是 `reasoning.effort` 而非 `thinking`）→ Anthropic
+    /// 上游。上游第一次回 `budget_tokens must be less than max_tokens`（模拟中转把 max_tokens
+    /// 钳小后越界）。断言:同一条 Key **立即重试**、第二次收到的 body 里 `thinking.budget_tokens`
+    /// 被降到 1024,且 `max_tokens` 两次不变。
+    ///
+    /// **这条是缺陷本体的证人**:第一版把整流挂在候选循环前段的 `req_json` 上,而 Codex 的
+    /// `req_json` 里没有 `thinking`(budget 是转换后才算出的),guard 恒 return false、整流恒
+    /// no-op。单元测试喂 `thinking.type=enabled` 照样全绿,只有走真实转发链路的本测试能抓住。
+    #[tokio::test]
+    async fn codex_budget_400_is_rectified_on_the_nonstreaming_path() {
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let upstream = spawn_budget_reject_then_ok_mock(captured.clone(), false).await;
+
+        let dir = temp_dir("budget_e2e_ns");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let mut k = key("k1", 0, &upstream);
+        k.category_id = CategoryType::Codex;
+        k.protocol = Protocol::Anthropic;
+        store.upsert_key(k).unwrap();
+        // 🔴 密钥不能用单字符 "x"：错误体脱敏会把 `max_tokens` 里的 `x` 也掩成 `ma***_tokens`,
+        // 于是整流判据 `contains("max_tokens")` 匹配不上、重试不触发（真实密钥是长随机串,不会撞）。
+        store.secrets.write().set("k1", "sk-test-realistic-secret-000").unwrap();
+        store.set_active_effort(CategoryType::Codex, "xhigh").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::Codex).await.unwrap();
+        let _ = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .json(&json!({
+                "model": "claude-opus-4-7",
+                "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+                "reasoning": {"summary": "auto"},
+                "max_output_tokens": 8192,
+                "stream": false
+            }))
+            .send().await.unwrap();
+        pm.stop(CategoryType::Codex);
+        let bodies = captured.lock().clone();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(bodies.len(), 2, "上游应收到 2 个请求(首个 400、整流后重试),实际 {}", bodies.len());
+        let first: Value = serde_json::from_str(&bodies[0]).unwrap();
+        let second: Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert!(
+            first["thinking"]["budget_tokens"].as_u64().is_some_and(|v| v > 1024),
+            "前提:第一次应发大于下限的预算(xhigh),否则压不到整流。实际 {:?}",
+            first["thinking"]["budget_tokens"]
+        );
+        assert_eq!(
+            second["thinking"]["budget_tokens"].as_u64(), Some(1024),
+            "🔴 整流后第二次预算必须降到 1024 —— 挂在 req_json 上时这里等于第一次(整流没生效)。实际:\n{}",
+            serde_json::to_string_pretty(&second).unwrap()
+        );
+        assert_eq!(first["max_tokens"], second["max_tokens"], "max_tokens 两次不该变");
+    }
+
+    /// 🔴 **A10-7 回归：非流式整流后，链路快照记的是最终发出的 payload，不是首发。**
+    ///
+    /// `request_body` 快照若在首发前生成，日志里的「上游请求」会显示首发的大预算，而响应属于
+    /// 整流后的重试 —— 排障者看到的是一个从没成功、也没最终失败的假现场。快照必须序列化整流
+    /// **之后**的 `payload`（`budget_tokens` 已降到 1024）。把那行快照移到整流块之前会让这条变红。
+    #[tokio::test]
+    async fn nonstreaming_retry_snapshot_reflects_the_rectified_payload() {
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let upstream = spawn_budget_reject_then_ok_mock(captured.clone(), false).await;
+
+        let dir = temp_dir("budget_e2e_snapshot");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        // 链路快照只在「调用模型日志」开关开启时构造。
+        let mut s = store.get_settings();
+        s.request_log_enabled = true;
+        store.save_settings(UserPrefs::from(&s)).unwrap();
+
+        let mut k = key("k1", 0, &upstream);
+        k.category_id = CategoryType::Codex;
+        k.protocol = Protocol::Anthropic;
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("k1", "sk-test-realistic-secret-000").unwrap();
+        store.set_active_effort(CategoryType::Codex, "xhigh").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::Codex).await.unwrap();
+        let _ = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .json(&json!({
+                "model": "claude-opus-4-7",
+                "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+                "reasoning": {"summary": "auto"},
+                "max_output_tokens": 8192,
+                "stream": false
+            }))
+            .send().await.unwrap();
+        pm.stop(CategoryType::Codex);
+
+        let all = store.list_all_events();
+        // 一次成功转发记 kind="route"（带链路快照）；失败才是 "request"。这里是整流后成功。
+        let trace = all
+            .iter()
+            .filter(|e| e.kind == "route")
+            .find_map(|e| store.event_trace(&e.id))
+            .expect("开了调用模型日志，成功的整流重试必须留下链路快照");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let snap: Value = serde_json::from_str(&trace.request_body)
+            .expect("快照应是可解析的请求体 JSON");
+        assert_eq!(
+            snap["thinking"]["budget_tokens"].as_u64(), Some(1024),
+            "🔴 A10-7：快照必须反映整流后最终发出的 payload（budget 已降到 1024），\
+             而不是首发的大预算。实得快照：\n{}",
+            trace.request_body
+        );
+    }
+
+    /// 同上,流式路径(stream:true)。两条路径各写一段重试逻辑,必须各有 e2e 钉住
+    /// （漏一条的表现是「按客户端而异」—— 本仓反复栽的双路径分叉）。
+    #[tokio::test]
+    async fn codex_budget_400_is_rectified_on_the_streaming_path() {
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let upstream = spawn_budget_reject_then_ok_mock(captured.clone(), true).await;
+
+        let dir = temp_dir("budget_e2e_stream");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let mut k = key("k1", 0, &upstream);
+        k.category_id = CategoryType::Codex;
+        k.protocol = Protocol::Anthropic;
+        store.upsert_key(k).unwrap();
+        // 见非流式那条:密钥不能用 "x"（会把 max_tokens 脱敏成 ma***_tokens、整流判据失配）。
+        store.secrets.write().set("k1", "sk-test-realistic-secret-000").unwrap();
+        store.set_active_effort(CategoryType::Codex, "xhigh").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::Codex).await.unwrap();
+        let _ = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .json(&json!({
+                "model": "claude-opus-4-7",
+                "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+                "reasoning": {"summary": "auto"},
+                "max_output_tokens": 8192,
+                "stream": true
+            }))
+            .send().await.unwrap();
+        pm.stop(CategoryType::Codex);
+        let bodies = captured.lock().clone();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(bodies.len(), 2, "流式:上游应收到 2 个请求(首个 400、整流后重试),实际 {}", bodies.len());
+        let second: Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert_eq!(
+            second["thinking"]["budget_tokens"].as_u64(), Some(1024),
+            "🔴 流式整流后第二次预算必须降到 1024。实际:\n{}",
+            serde_json::to_string_pretty(&second).unwrap()
+        );
+    }
+
+    /// 🔴 接线判据:预算整流必须在**两个**转发函数里各调一次(转换后、发送处)。
+    /// 上面两条 e2e 靠真实链路证明「有效」,这条静态钉住「两条路径都接了」——
+    /// 漏一条的表现是静默的(那个客户端的这条 400 不自愈)。
+    #[test]
+    fn budget_rectify_is_wired_into_both_forward_paths() {
+        let src = crate::proxy::custom_headers::production_code_only(include_str!("proxy.rs"));
+        // 预算整流与图片整流各恰好接在流式 + 非流式两条转发路径（整流链的两个成员）。
+        assert_eq!(
+            src.matches("rectify_thinking_budget(").count(),
+            2,
+            "预算整流应恰好接在流式 + 非流式两条转发路径各一次(不多不少)"
+        );
+        assert_eq!(
+            src.matches("rectify_unsupported_image(").count(),
+            2,
+            "图片整流应恰好接在流式 + 非流式两条转发路径各一次 —— 漏一条=那个客户端的图片400不自愈"
+        );
+        // 候选循环前段(req_json)绝不能出现任一整流 —— 那正是本轮修掉的错误位置(对 Codex 恒 no-op)。
+        let loop_seg = src.split("fn try_stream_to_key").next().unwrap_or("");
+        assert!(
+            !loop_seg.contains("rectify_thinking_budget(")
+                && !loop_seg.contains("rectify_unsupported_image("),
+            "🔴 预算/图片整流不许挂在候选循环前段(req_json 上对 Codex 恒 no-op)"
+        );
+    }
+
+    /// 🔴 **A10-6 接线判据：同 Key 重试与首发共享同一个绝对 deadline，不许各自重新计时。**
+    ///
+    /// 挙动で赤くするには retry を実際にタイムアウトさせる必要があり、上游が正常に速く返す限り
+    /// 両実装とも成功してしまう —— 分離が脆い。故ソースレベルで「deadline を一度だけ計算し、
+    /// 首発と重试の两个 `send_once`/`probe!` がそれを共有する」という**性质**を钉付けする。
+    ///
+    /// 失效方向：retry ブロックで `Instant::now() + probe_to`（流式）/ `+ effective_to`（非流式）
+    /// を再计算 → 首发で预算末尾近くまで使い切った后、retry がまた丸ごと一份の超时を得る、
+    /// 「排队と转发计入剩余预算」の约束を突破する。それを钉住すため、この 2 つの
+    /// deadline 计算式が各 1 回だけであることを断言（retry で再计算すれば 2 回になり赤くなる）。
+    #[test]
+    fn same_key_retry_shares_one_absolute_deadline() {
+        let src = crate::proxy::custom_headers::production_code_only(include_str!("proxy.rs"));
+        // 流式：probe_to から deadline を作るのは try_stream_to_key の首部で 1 回だけ。
+        assert_eq!(
+            src.matches("Instant::now() + probe_to").count(),
+            1,
+            "🔴 A10-6：流式 deadline は一度だけ计算し首发/重试で共有 —— retry で再计算すると 2 回になる"
+        );
+        // 非流式：effective_to から deadline を作るのも 1 回だけ。
+        assert_eq!(
+            src.matches("Instant::now() + effective_to").count(),
+            1,
+            "🔴 A10-6：非流式 deadline も一度だけ计算し首发/重试で共有"
+        );
+        // 両方の retry 送信は共有 deadline 経由（timeout_at(deadline …) と
+        // deadline.saturating_duration_since(…)）。この参照が消えると deadline 共有が壊れている。
+        assert!(
+            src.contains("timeout_at(deadline")
+                && src.contains("deadline.saturating_duration_since"),
+            "🔴 A10-6：两条路径的发送都必须经过共享 deadline（流式 timeout_at、非流式 saturating_duration_since）"
+        );
+    }
+
+    /// 首个请求回「模型不支持图片」400、其余回 200,捕获每次请求体(非流式)。
+    async fn spawn_image_reject_then_ok_mock(
+        captured: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+    ) -> String {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let cap = captured.clone();
+                let hits = hits.clone();
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let cap = cap.clone();
+                        let hits = hits.clone();
+                        async move {
+                            let bytes = req.into_body().collect().await.unwrap().to_bytes();
+                            cap.lock().push(String::from_utf8_lossy(&bytes).to_string());
+                            let n = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if n == 0 {
+                                let resp = Response::builder()
+                                    .status(400)
+                                    .header("content-type", "application/json")
+                                    .body(full_body(Bytes::from_static(
+                                        br#"{"type":"error","error":{"type":"invalid_request_error","message":"this model does not support image input"}}"#,
+                                    )))
+                                    .unwrap();
+                                return Ok::<_, hyper::Error>(resp);
+                            }
+                            let resp = Response::builder()
+                                .status(200)
+                                .header("content-type", "application/json")
+                                .body(full_body(Bytes::from_static(
+                                    br#"{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":3,"output_tokens":1}}"#,
+                                )))
+                                .unwrap();
+                            Ok::<_, hyper::Error>(resp)
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// 🔴 真实链路:文本模型收到图片 → 上游 400 → 同 Key 剥图重试。
+    ///
+    /// Codex 发带图请求 → Anthropic 上游(转换后图片是 `{"type":"image"}`)。上游第一次回
+    /// 「does not support image input」。断言:第二次请求体里图片块已变占位文本、收到 2 个请求。
+    /// 与预算整流共用同一重试点(`||` 串接),这条钉住图片那一支真的接上了真实链路。
+    #[tokio::test]
+    async fn unsupported_image_is_stripped_and_retried_on_the_real_path() {
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let upstream = spawn_image_reject_then_ok_mock(captured.clone()).await;
+
+        let dir = temp_dir("image_e2e");
+        let store = std::sync::Arc::new(
+            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+        );
+        let mut k = key("k1", 0, &upstream);
+        k.category_id = CategoryType::Codex;
+        k.protocol = Protocol::Anthropic;
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("k1", "sk-test-realistic-secret-000").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::Codex).await.unwrap();
+        // Codex 带图请求(Responses input_image),转换后 → Anthropic image 块。
+        let _ = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .json(&json!({
+                "model": "claude-opus-4-7",
+                "input": [{"type":"message","role":"user","content":[
+                    {"type":"input_text","text":"看图"},
+                    {"type":"input_image","image_url":"data:image/png;base64,AAAA"}
+                ]}],
+                "max_output_tokens": 1024,
+                "stream": false
+            }))
+            .send().await.unwrap();
+        pm.stop(CategoryType::Codex);
+        let bodies = captured.lock().clone();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(bodies.len(), 2, "上游应收到 2 个请求(首个 400、剥图后重试),实际 {}", bodies.len());
+        let first: Value = serde_json::from_str(&bodies[0]).unwrap();
+        let second: Value = serde_json::from_str(&bodies[1]).unwrap();
+        // 前提:第一次确实带了图片块(否则压不到剥图)。
+        let first_has_image = first["messages"].as_array().unwrap().iter().any(|m| {
+            m["content"].as_array().map(|c| c.iter().any(|b| b["type"] == "image")).unwrap_or(false)
+        });
+        assert!(first_has_image, "前提:第一次应含 image 块。实际:\n{}", serde_json::to_string_pretty(&first).unwrap());
+        // 第二次:没有任何 image 块了(全变占位文本)。
+        let second_has_image = second["messages"].as_array().unwrap().iter().any(|m| {
+            m["content"].as_array().map(|c| c.iter().any(|b| b["type"] == "image")).unwrap_or(false)
+        });
+        assert!(!second_has_image, "🔴 剥图后第二次不该再有 image 块。实际:\n{}", serde_json::to_string_pretty(&second).unwrap());
+    }
+
+    /// 同时捕获 body 与 headers 的 200 mock（缓存注入 e2e 要两者都断言）。
+    async fn spawn_body_and_headers_mock(
+        bodies: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+        headers: CapturedHeaders,
+    ) -> String {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let (bcap, hcap) = (bodies.clone(), headers.clone());
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let (bcap, hcap) = (bcap.clone(), hcap.clone());
+                        async move {
+                            let hs: Vec<(String, String)> = req.headers().iter()
+                                .map(|(k, v)| (k.as_str().to_ascii_lowercase(), v.to_str().unwrap_or("").to_string()))
+                                .collect();
+                            hcap.lock().push(hs);
+                            let b = req.into_body().collect().await.unwrap().to_bytes();
+                            bcap.lock().push(String::from_utf8_lossy(&b).to_string());
+                            let resp = Response::builder().status(200)
+                                .header("content-type", "application/json")
+                                .body(full_body(Bytes::from_static(br#"{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":3,"output_tokens":1}}"#)))
+                                .unwrap();
+                            Ok::<_, hyper::Error>(resp)
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// 🔴 **A10-4 回归（缓存侧）：只有 400/422 才触发缓存回退。**
+    ///
+    /// `rectify_cache_rejection` 的白名单是「误重试」防线：401/429/5xx 的正文即便含
+    /// `cache_control` 字样，也不该被当成「端点不支持缓存」去撤断点重发 + 记住该端点不支持
+    /// —— 那会把鉴权/限流误当兼容性问题，还污染进程级的 `cache_unsupported` 记忆。
+    /// 其余条件全部满足（Anthropic Key、命中缓存文案、有真注入可回退），唯一变量是 status；
+    /// 把 `matches!(status, 400 | 422)` 改成 `!is_success` 会让这条变红。
+    #[test]
+    fn cache_rectify_only_fires_on_validation_status_codes() {
+        let dir = temp_dir("cache_status");
+        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        let mut k = key("k1", 0, "https://relay.test/v1");
+        k.protocol = Protocol::Anthropic;
+        let err = r#"{"error":{"message":"unexpected field cache_control"}}"#;
+
+        // 非白名单 status：即便正文命中缓存文案、且有真注入可回退，也必须一律不触发。
+        for status in [401u16, 403, 429, 500, 502, 503] {
+            let mut p = json!({"system":"s","messages":[{"role":"user","content":"hi"}]});
+            let injection = crate::upstream::inject_converted_cache(&mut p);
+            let injected = p.clone();
+            assert!(
+                !rectify_cache_rejection(status, err, &mut p, &store, CategoryType::ClaudeCli, &k, &injection),
+                "status={status} 不是请求校验错误 → 不该回退缓存"
+            );
+            assert_eq!(p, injected, "status={status} 时不该撤断点");
+            assert!(
+                !crate::upstream::cache_known_unsupported(&k.base_url),
+                "status={status} 不该把端点记成不支持缓存"
+            );
+        }
+
+        // 400：条件全满足 → 触发，撤掉断点、记住端点。这一半证明上面的 false 来自 status 而非别的短路。
+        let mut p = json!({"system":"s","messages":[{"role":"user","content":"hi"}]});
+        let injection = crate::upstream::inject_converted_cache(&mut p);
+        assert!(
+            rectify_cache_rejection(400, err, &mut p, &store, CategoryType::ClaudeCli, &k, &injection),
+            "400 + 缓存文案 + 有注入 → 必须触发回退"
+        );
+        assert!(crate::upstream::cache_known_unsupported(&k.base_url), "400 触发后应记住端点不支持");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 缓存注入(省钱):Codex(Responses)→ Anthropic 上游,转换出来的请求体应被打上
+    /// `cache_control` 断点,且请求头带 prompt-caching beta。这是长会话不再全价重发的关键。
+    #[tokio::test]
+    async fn converted_anthropic_request_gets_cache_breakpoints_and_beta_header() {
+        let bodies = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let headers: CapturedHeaders = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let upstream = spawn_body_and_headers_mock(bodies.clone(), headers.clone()).await;
+
+        let dir = temp_dir("cache_e2e_conv");
+        let store = std::sync::Arc::new(Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
+        let mut k = key("k1", 0, &upstream);
+        k.category_id = CategoryType::Codex;    // 下游 Responses
+        k.protocol = Protocol::Anthropic;        // 上游 Anthropic → 跨协议
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("k1", "sk-test-realistic-secret-000").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::Codex).await.unwrap();
+        // 带 tools 的请求(Codex 常态):tools 末尾断点不依赖 content 是否为块数组,是最稳的锚。
+        let _ = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .json(&json!({
+                "model":"claude-opus-4-7",
+                "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+                "tools":[
+                    {"type":"function","name":"a","description":"d","parameters":{"type":"object"}},
+                    {"type":"function","name":"b","description":"d","parameters":{"type":"object"}}
+                ],
+                "max_output_tokens":1024,"stream":false
+            }))
+            .send().await.unwrap();
+        pm.stop(CategoryType::Codex);
+        let body: Value = serde_json::from_str(&bodies.lock()[0]).unwrap();
+        let hs = headers.lock()[0].clone();
+        std::fs::remove_dir_all(&dir).ok();
+
+        // tools 末尾那个应带 cache_control(缓存整个工具声明);前面的不带(否则浪费断点)。
+        let tools = body["tools"].as_array().expect("转换后应有 tools");
+        assert!(
+            tools.last().unwrap().get("cache_control").is_some(),
+            "🔴 转换出来的 Anthropic 请求应在 tools 末尾打 cache_control 断点。实际:\n{}",
+            serde_json::to_string_pretty(&body).unwrap()
+        );
+        assert!(
+            tools.first().unwrap().get("cache_control").is_none(),
+            "非末尾 tool 不该带断点(浪费额度)"
+        );
+        // 请求头应带 prompt-caching beta。
+        let beta = hs.iter().find(|(h, _)| h == "anthropic-beta").map(|(_, v)| v.as_str()).unwrap_or("");
+        assert!(
+            !beta.contains("prompt-caching-2024-07-31"),
+            "缓存注入不额外增加旧版 beta 头,实际 anthropic-beta={beta:?}"
+        );
+    }
+
+    /// 🔴 反面:Claude Code 直通(Anthropic→Anthropic)客户端自带断点,**不许**被重复注入
+    /// (否则叠上 Anthropic 4 断点上限)。断言我们不额外加断点 —— 客户端发几个就几个。
+    #[tokio::test]
+    async fn direct_anthropic_passthrough_is_not_reinjected() {
+        let bodies = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let headers: CapturedHeaders = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let upstream = spawn_body_and_headers_mock(bodies.clone(), headers.clone()).await;
+
+        let dir = temp_dir("cache_e2e_direct");
+        let store = std::sync::Arc::new(Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
+        let mut k = key("k1", 0, &upstream);
+        k.category_id = CategoryType::ClaudeCli; // 下游 Anthropic
+        k.protocol = Protocol::Anthropic;         // 上游 Anthropic → 同协议直通
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("k1", "sk-test-realistic-secret-000").unwrap();
+
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        // 客户端自己在**倒数第二**块打了一个断点(Claude Code 的形态)。
+        let _ = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .json(&json!({
+                "model":"claude-opus-4-7","max_tokens":1024,
+                "messages":[{"role":"user","content":[
+                    {"type":"text","text":"a","cache_control":{"type":"ephemeral"}},
+                    {"type":"text","text":"b"}
+                ]}]
+            }))
+            .send().await.unwrap();
+        pm.stop(CategoryType::ClaudeCli);
+        let body: Value = serde_json::from_str(&bodies.lock()[0]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        // 直通:断点数应与客户端发的**一致**(只有第一块那 1 个),末块不该被我们额外注入。
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        let cc_count = blocks.iter().filter(|b| b.get("cache_control").is_some()).count();
+        assert_eq!(
+            cc_count, 1,
+            "🔴 直通请求不许被重复注入断点(会叠爆 4 上限)。实际断点数={cc_count},body:\n{}",
+            serde_json::to_string_pretty(&body).unwrap()
+        );
+        assert!(
+            blocks.last().unwrap().get("cache_control").is_none(),
+            "末块不该被我们注入 —— 那是只对跨协议转换请求做的事"
         );
     }
 

@@ -60,17 +60,10 @@ const BALANCE_TEMPLATES: Record<string, { url: string; method: string; auth: str
   // 此前这里写的是 `/v1/usage` —— 那是某个站的自定义脚本路径，被我误当成通用默认值，
   // 结果新用户一开开关就 404。
   generic: { url: "{{baseUrl}}/user/balance", method: "GET", auth: "bearer" },
-  // 中转站（NewAPI 的 OpenAI 兼容计费层）：`GET /v1/dashboard/billing/subscription`，
-  // 认的是**转发用的 API Key**，不需要另去面板拿 access token —— 故它比下面的 newapi
-  // 模板好用得多，绝大多数中转站首选这条。
-  //
-  // **实测来源**（2026-08-16，sotamodel.net）：
-  //   /user/balance                        → 200 但 Content-Type: text/html（是网页，不是 API）
-  //   /api/user/self                       → 200 JSON，但报 "invalid access token"（要面板登录态）
-  //   /v1/dashboard/billing/subscription   → 401 JSON `{"error":{…,"type":"new_api_error"}}`
-  //                                          ← 只有这条认 API Key
-  // 用户此前选 generic 一直失败，正是因为缺这个模板。返回里的余额字段是
-  // `hard_limit_usd`，已补进后端候选链（见 balance.rs REMAINING_CANDIDATES 末尾）。
+  // 中转站（NewAPI 的 OpenAI 兼容计费层）：`GET /v1/dashboard/billing/subscription`，认**转发用的
+  // API Key**、无需面板 access token，故比下面的 newapi 好用、多数中转站首选。实测（2026-08-16
+  // sotamodel.net）：`/user/balance` 返 text/html 网页、`/api/user/self` 要面板登录态、只有这条认
+  // API Key。返回的余额字段 `hard_limit_usd` 已补进后端候选链（balance.rs REMAINING_CANDIDATES 末尾）。
   relay: { url: "{{origin}}/v1/dashboard/billing/subscription", method: "GET", auth: "bearer" },
   // NewAPI 系面板：认的是**面板登录态**（access token + 用户 id），不是转发用的 API Key。
   // 只在 relay 模板取不到值时才需要它（要用户去面板复制 access token 与用户 id）。
@@ -171,6 +164,8 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const [models, setModels] = useState<ModelInfo[]>(initial?.models ?? []);
   const [mappings, setMappings] = useState<ModelMapping[]>(initial?.mappings ?? []);
   const [defaultModel, setDefaultModel] = useState(initial?.defaultModel ?? "");
+  // 允许把「用户点名的模型」也兜底改写掉。默认 false = 保持既有保护（宁可报错也不悄悄换模型）。
+  const [allowNamedFallback, setAllowNamedFallback] = useState(initial?.allowNamedModelFallback ?? false);
   // 四档快捷映射放一个对象：它们总是一起读、一起落盘，四个 useState 只会让
   // 「加第五档」变成四处改动（而 mythos 迟早会有人问）。字段名与 ProviderKey 的 tier* 对应。
   const [tiers, setTiers] = useState<TierValues>({
@@ -397,16 +392,10 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
       setBalanceProbe({ ok: false, queriedAt: Date.now(), error: t("editor.errNeedBaseUrl2") });
       return;
     }
-    // 与 `save` 完全同一道校验，不只是判空。
-    //
-    // 上面那句「与保存同一口径」此前是**假的**：`save` 拦 `isValidHttpUrl`，这里只拦空串。
-    // 于是 `api.foo.com`（缺协议头）、`ftp://x`、`foo` 这类**保存会被拒**的地址，
-    // 从「测试查询」这条路径照样落盘 —— 而它同样调 `upsert_key`，落的是同一张表。
-    // 后果不是「测试失败」这么轻：用户没点保存却多了一条 Key，且这条 Key 每次转发都因
-    // URL 无法解析而失败，回到编辑器点保存时才第一次看到「地址格式无效」，
-    // 完全对不上「这条 Key 是怎么进来的」。
-    //
-    // 校验放在 upsert 之前而不是之后：一旦落盘就已经造成了脏数据，事后报错也收不回来。
+    // 与 `save` 完全同一道校验（`isValidHttpUrl`），不只是判空 —— 此前这里只拦空串，于是
+    // `api.foo.com`（缺协议头）/`ftp://x`/`foo` 这类保存会被拒的地址从「测试查询」照样落盘
+    // （同调 `upsert_key`、同一张表）：用户没点保存却多了一条每次转发都失败的 Key，回编辑器点
+    // 保存才第一次看到「地址格式无效」。校验放在 upsert 之前——落盘后就是脏数据、报错也收不回。
     if (!isValidHttpUrl(baseUrl)) {
       setBalanceProbe({ ok: false, queriedAt: Date.now(), error: t("editor.errInvalidBaseUrl") });
       return;
@@ -441,13 +430,11 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
       // 的 balanceLoading 去重门。若此刻自动轮询恰好在途，后端 in-flight 哨兵会返回一条
       // 带 `transient: true` 的**伪失败**（压根没打上游）；无条件写缓存会把它盖到卡片上，
       // 甚至可能覆盖轮询随后落盘的真实成功值。
-      // 判 `ok` 已经涵盖了这种情况（伪失败的 ok 必为 false），store 那侧另有 `transient` 显式门
-      // 作为第二道；这里保持「只有成功才入共享缓存」这条更强的约束不变。
-      // 伪失败只在编辑器内经 setBalanceProbe 展示即可。
+      // 判 `ok` 已涵盖伪失败（其 ok 必为 false），store 侧另有 `transient` 门作第二道；保持
+      // 「只有成功才入共享缓存」不变，伪失败只在编辑器内经 setBalanceProbe 展示。
       if (result.ok) {
-        // 指纹用**刚落盘的那条**算（`saved` 而非 `draft`/`initial`）：那才是产出本结果的配置，
-        // 也正是卡片重新渲染后会算出的指纹 —— 两者一致，卡片才会判成缓存有效而不再发一次
-        // 一模一样的请求。用 draft 算会在新建时差一个 id、指纹对不上，白发两个请求。
+        // 指纹用**刚落盘的那条**算（`saved` 而非 `draft`）：那才是产出本结果、也是卡片重渲染后会
+        // 算出的指纹，一致才不再重发一样的请求。用 draft 在新建时差一个 id、白发两个请求。
         setBalanceResult(keyId, balanceFingerprint(saved), result);
       }
       // 新建的 Key 已经落盘了，把编辑器的「初始态」对齐过去。否则用户接着点「保存」
@@ -493,13 +480,9 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     // persistedId，此后再点「保存」走 update；读 initial 会在「调用方不回填 initial」时
     // 二次 insert（首启向导真机复现过），见 persistedId 的声明注释。
     id: persistedId,
-    // 编辑已有 Key 时用**它自己的分类**，不是当前页的分类。
-    //
-    // 编辑器 UI 根本不提供「改分类」，所以这里取 initial 才是语义正确的。
-    // 原先写 activeCategory 一直没出事，只因为编辑器过去只能从当前分类页打开 ——
-    // 那是个**载荷性的巧合**：一旦出现「编辑器已开着、再切到别的分类」的路径
-    // （命令面板就能造出来），用户一保存就会把这条 Key 静默搬到另一个分类去，
-    // 旧分类少一条、新分类多一条，且优先级顺序全乱。
+    // 编辑已有 Key 时用**它自己的分类**、不是当前页的：UI 不提供「改分类」，取 initial 才语义正确。
+    // 原先写 activeCategory 没出事只因编辑器过去只能从当前分类页打开（载荷性巧合）——「编辑器已开、
+    // 再切到别的分类」（命令面板可造）时一保存就把这条 Key 静默搬走、两边计数与优先级全乱。
     categoryId: initial?.categoryId ?? activeCategory,
     name: name.trim(),
     vendor,
@@ -521,6 +504,9 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     models,
     mappings: mappings.filter((m) => m.expectedName && m.realName),
     defaultModel: defaultModel.trim() || undefined,
+    // 点名模型也允许兜底：必须落进保存载荷，否则勾了之后保存一次就被静默清掉
+    // （同 allowInAggregate 那条的教训）。只在为真时落字段，老配置与未勾的 Key 保持原样。
+    allowNamedModelFallback: allowNamedFallback || undefined,
     // 档位仅 Claude CLI/桌面端有意义；Codex 一律不落，避免 claude-*opus* 类名字被误改写路由
     // （即使该 Key 早前存过档位，此处也强制清空）。
     tierHaiku: activeCategory === "codex" ? undefined : tiers.haiku.trim() || undefined,
@@ -928,6 +914,20 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
               onChange={setDefaultModel}
             />
             <p className="mt-1 text-[11px] leading-relaxed text-text-muted">{t("editor.defaultModelHint")}</p>
+            {/* 允许把「点名的模型」也兜底改写掉。默认关 = 保持「宁可报错也不悄悄换模型」的保护。
+                紧贴兜底模型放：这个开关决定的正是上面那个兜底在何时生效，隔开会让两者看不出关系。 */}
+            <label className="mt-2 flex cursor-pointer items-start gap-2">
+              <input
+                type="checkbox"
+                className="mt-0.5 shrink-0"
+                checked={allowNamedFallback}
+                onChange={(e) => setAllowNamedFallback(e.target.checked)}
+              />
+              <span className="text-[11px] leading-relaxed">
+                <span className="text-text">{t("editor.allowNamedFallback")}</span>
+                <span className="mt-0.5 block text-text-muted">{t("editor.allowNamedFallbackHint")}</span>
+              </span>
+            </label>
           </Field>
 
           {/* ---- 余额查询与计费（第④批）----

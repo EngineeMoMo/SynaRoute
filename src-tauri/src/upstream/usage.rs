@@ -8,7 +8,6 @@
 
 use serde_json::Value;
 
-
 /// `TokenUsage` 的**定义已移至 [`crate::model`]**（它是领域观测量，不是上游协议细节；
 /// 留在这里会让 `model.rs` 反向依赖本模块，`model` 对 upstream 的依赖原本仅此一处）。
 ///
@@ -24,9 +23,7 @@ fn parse_usage_object(u: &Value) -> Option<TokenUsage> {
             .find_map(|k| u.get(*k).and_then(|v| v.as_u64()))
             .unwrap_or(0)
     };
-    let anthropic_cache_read = u
-        .get("cache_read_input_tokens")
-        .and_then(|v| v.as_u64());
+    let anthropic_cache_read = u.get("cache_read_input_tokens").and_then(|v| v.as_u64());
     let chat_cache_read = u
         .get("prompt_tokens_details")
         .and_then(|d| d.get("cached_tokens"))
@@ -81,11 +78,119 @@ pub fn extract_usage(body: &Value) -> Option<TokenUsage> {
     .find_map(parse_usage_object)
 }
 
+/// 按字段取较大者合入累加器。
+///
+/// 取 max 而非累加是本模块既有语义：同一次请求的用量会在多处重复出现
+/// （Anthropic 的 message_start/message_delta、头尾窗重叠的短流），累加会静默翻倍。
+fn merge_max(acc: &mut TokenUsage, u: &TokenUsage) {
+    acc.input = acc.input.max(u.input);
+    acc.output = acc.output.max(u.output);
+    acc.cache_read = acc.cache_read.max(u.cache_read);
+    acc.cache_creation = acc.cache_creation.max(u.cache_creation);
+}
+
+/// 从 `text[start]` 处的 `{` 开始做平衡扫描，返回完整的那个 JSON 对象切片。
+///
+/// 必须识别字符串态：`output[]` 正文里带 `{`/`}` 的代码片段极常见，不跳字符串会在
+/// 半个花括号上收尾，拿到一段解析不了的垃圾。对象没闭合（被截断）时返回 `None` ——
+/// **不猜、不补**，宁可这一处取不到用量。
+fn balanced_object(text: &str, start: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    if bytes.get(start) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, &c) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return text.get(start..=i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 直接从（可能被截断的）SSE 原文里抠出 `"usage": {…}` 对象并合入累加器。
+///
+/// # 🔴 它修的洞（2026-09-20 用户实报，诊断日志逐条取证）
+///
+/// 现象是一份对照：同一台机器、同一个上游、同一个模型，
+/// **codex 分类 20 条成功请求的 token 数全为空，claude-desktop 的 10 条全都有**，
+/// 而同期余额真实下降 —— 钱在烧，用量面板恒为 0。
+///
+/// 成因是**协议结构差异撞上按字节滑动的尾窗**（`proxy.rs` 的 `TAIL_WINDOW_BYTES`）：
+///
+/// - Anthropic 把用量分散在 `message_start`（input/cache）与 `message_delta`（output）
+///   两个**小事件**里，它们必然完整落进窗口 → 逐行解析拿得到。
+/// - Responses 只有唯一的 `response.completed` 携带用量，而那个事件**裹着 `output[]` 全文**，
+///   长回答时一行就几十万字节。窗口留下的正是它被切断的尾部：`usage` 的字节明明就在窗口里，
+///   但那一行既没有 `data:` 前缀（循环首步 `strip_prefix` 失败 → `continue`）、
+///   也不是完整 JSON（`from_str` 失败 → `continue`），于是**整行被丢掉**。
+///
+/// Codex 走 Responses，这就是它用量恒为 0 的全部原因。它对短回答不复现
+/// （`response.completed` 没超过 8KB 时整行完好），所以既有用例一直是绿的 ——
+/// 那些用例用的是几百字节的 `response.completed`，正是这个盲区的形状。
+///
+/// 判据刻意做得窄：只认 `"usage"` 紧跟 `:` 再紧跟 `{` 的形态，且对象必须闭合。
+/// 失效方向是**退回现状**（这一处取不到用量），不会记出假数。
+fn scan_usage_objects(text: &str, acc: &mut TokenUsage) {
+    const KEY: &str = "\"usage\"";
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(KEY) {
+        let after_key = from + rel + KEY.len();
+        from = after_key;
+        // `"usage"` 之后必须是 `:` 再是 `{`（中间只容空白）。不满足就不是我们要的那个键。
+        let Some(rest) = text.get(after_key..) else {
+            break;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        if !rest.starts_with('{') {
+            continue;
+        }
+        let off = text.len() - rest.len();
+        let Some(obj) = balanced_object(text, off) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(obj) else {
+            continue;
+        };
+        if let Some(u) = parse_usage_object(&v) {
+            merge_max(acc, &u);
+        }
+    }
+}
+
 /// 从**流式** SSE 全文里提取 token 用量。
 ///
 /// 流式的 usage 不在单个 chunk 的固定位置：Anthropic 放在 `message_start`（input）与
 /// `message_delta`（output）两处，OpenAI Chat 放在最后一个带 `usage` 的 chunk，Responses
 /// 放在 `response.completed.response.usage`。故扫描所有 data 行、把见到的最大值取出来。
+///
+/// 逐行解析**之后**还要扫一遍原文（[`scan_usage_objects`]）：按字节滑动的尾窗会把一行
+/// 从中间切开，而 Responses 的用量恰好只在那一个被切开的大事件里。两步都按字段取 max，
+/// 重复命中同一处用量不会翻倍。
 pub fn extract_usage_from_sse(sse: &str) -> Option<TokenUsage> {
     let mut acc = TokenUsage::default();
     for line in sse.lines() {
@@ -100,15 +205,13 @@ pub fn extract_usage_from_sse(sse: &str) -> Option<TokenUsage> {
             continue;
         };
         if let Some(u) = extract_usage(&v) {
-            acc.input = acc.input.max(u.input);
-            acc.output = acc.output.max(u.output);
-            acc.cache_read = acc.cache_read.max(u.cache_read);
-            acc.cache_creation = acc.cache_creation.max(u.cache_creation);
+            merge_max(&mut acc, &u);
         }
     }
+    // 逐行解析漏掉的（半截行、窗口首片没有 `data:` 前缀）由原文扫描兜住。
+    scan_usage_objects(sse, &mut acc);
     (!acc.is_empty()).then_some(acc)
 }
-
 
 tokio::task_local! {
     /// 当前 async 任务的 token 用量累加器。
@@ -174,7 +277,10 @@ mod tests {
             }
         });
         let u = extract_usage(&a).expect("Anthropic usage 应能取到");
-        assert_eq!((u.input, u.output, u.cache_read, u.cache_creation), (1200, 340, 900, 150));
+        assert_eq!(
+            (u.input, u.output, u.cache_read, u.cache_creation),
+            (1200, 340, 900, 150)
+        );
         assert_eq!(u.total(), 1540);
 
         // OpenAI（缓存在 prompt_tokens_details.cached_tokens 里，无 cache_creation 等价字段）
@@ -193,10 +299,17 @@ mod tests {
             }
         });
         let u = extract_usage(&o).expect("OpenAI usage 应能取到");
-        assert_eq!((u.input, u.output, u.cache_read, u.cache_creation), (288, 120, 512, 0));
+        assert_eq!(
+            (u.input, u.output, u.cache_read, u.cache_creation),
+            (288, 120, 512, 0)
+        );
         // **不变式**：OpenAI 形态下 input + cache_read 必须等于上游给的 prompt_tokens。
         // 这条比具体数字更能钉住语义 —— 谁把归一去掉，它立刻变红。
-        assert_eq!(u.input + u.cache_read, 800, "input+cache_read 必须还原成 prompt_tokens");
+        assert_eq!(
+            u.input + u.cache_read,
+            800,
+            "input+cache_read 必须还原成 prompt_tokens"
+        );
         // Anthropic 形态**不做**减法（input_tokens 本就不含缓存），上面已断言 1200 原样保留。
 
         // 脏数据兜底：个别中转商给出 cached > prompt，减法不得下溢 panic。
@@ -229,7 +342,10 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":420}}\n\
 data: [DONE]\n";
         let u = extract_usage_from_sse(sse).expect("SSE 应能取到用量");
         assert_eq!(u.input, 1500, "input 在 message_start 里");
-        assert_eq!(u.output, 420, "output 取累计后的最终值，不是首个 chunk 的 1");
+        assert_eq!(
+            u.output, 420,
+            "output 取累计后的最终值，不是首个 chunk 的 1"
+        );
 
         // OpenAI 形态：usage 在最后一个 chunk
         let sse2 = "\
@@ -267,7 +383,10 @@ data: [DONE]\n";
         assert_eq!(u.output, 880, "output 来自尾窗 message_delta");
         // 只有尾窗（模拟未修复前）：input/cache 丢失，坐实缺陷方向。
         let tail_only = extract_usage_from_sse(tail).expect("尾窗有 output");
-        assert_eq!(tail_only.input, 0, "仅尾窗时 input 必为 0（这正是被修的缺陷）");
+        assert_eq!(
+            tail_only.input, 0,
+            "仅尾窗时 input 必为 0（这正是被修的缺陷）"
+        );
         assert_eq!(tail_only.cache_read, 0);
     }
 
@@ -284,8 +403,15 @@ data: [DONE]\n";
             }
         });
         let u = extract_usage(&body).expect("Responses response.usage 应能取到");
-        assert_eq!((u.input, u.output, u.cache_read, u.cache_creation), (288, 120, 512, 0));
-        assert_eq!(u.input + u.cache_read, 800, "Responses input+cache_read 必须还原原始 input_tokens");
+        assert_eq!(
+            (u.input, u.output, u.cache_read, u.cache_creation),
+            (288, 120, 512, 0)
+        );
+        assert_eq!(
+            u.input + u.cache_read,
+            800,
+            "Responses input+cache_read 必须还原原始 input_tokens"
+        );
 
         // 空的顶层候选不能遮住后面的有效 Responses envelope。
         let wrapped = serde_json::json!({
@@ -310,26 +436,171 @@ data: [DONE]\n";
     fn extract_usage_from_head_plus_tail_handles_responses_completed() {
         let head = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n";
         let tail = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":900,\"output_tokens\":80}}}\n\ndata: [DONE]\n";
-        let u = extract_usage_from_sse(&format!("{head}{tail}")).expect("尾窗中的 Responses usage 应能恢复");
+        let u = extract_usage_from_sse(&format!("{head}{tail}"))
+            .expect("尾窗中的 Responses usage 应能恢复");
         assert_eq!((u.input, u.output), (900, 80));
+    }
+
+    /// 🔴 **Codex（Responses 协议）长回答的用量必须还能取到。**
+    ///
+    /// 上面那条用例的 `response.completed` 只有几百字节，于是一直是绿的 —— 而真实形态
+    /// 完全不同：Responses 把**全部**用量放在唯一的终止事件 `response.completed` 里，
+    /// 而那个事件**携带 `output[]` 全文**。长回答时它单独一行就远超 8KB 尾窗，
+    /// 于是尾窗里躺的是那一行的**片段**（从某个字符串中间截断）。
+    ///
+    /// 片段的致命之处：`usage` 的字节其实**就在窗口里**（它序列化在 `output` 之后），
+    /// 但整行 `serde_json::from_str` 解析失败 → `continue` → 返回 `None` → 用量记不到。
+    ///
+    /// 这解释了 2026-09-20 用户实报的现象：同一台机器上 codex 分类 20 条成功请求
+    /// token 全空，而 claude-desktop 同上游同模型 10 条全都有 —— 因为 Anthropic 把用量
+    /// 分散在 `message_start`(input) 与 `message_delta`(output) 两个**小**事件里，
+    /// 两个都必然落进窗口。差异不在 Key、不在上游，在协议的用量承载形态。
+    #[test]
+    fn a_realistic_responses_completed_event_survives_the_window() {
+        // 真实形态：response.completed 携带 output[] 全文。40KB 正文是常见长度。
+        let long_text = "x".repeat(40_000);
+        let completed = format!(
+            "event: response.completed\n\
+             data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"r1\",\
+             \"output\":[{{\"type\":\"message\",\"content\":[{{\"type\":\"output_text\",\
+             \"text\":\"{long_text}\"}}]}}],\
+             \"usage\":{{\"input_tokens\":12345,\"output_tokens\":678}}}}}}\n\n"
+        );
+        let head = "event: response.created\n\
+                    data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n";
+        let full = format!("{head}{completed}data: [DONE]\n");
+
+        // 复刻 proxy.rs 的窗口口径：头 8KB + '\n' + 尾 8KB（HEAD/TAIL_WINDOW_BYTES）。
+        const W: usize = 8192;
+        let b = full.as_bytes();
+        let head_win = String::from_utf8_lossy(&b[..W.min(b.len())]).to_string();
+        let tail_win = String::from_utf8_lossy(&b[b.len().saturating_sub(W)..]).to_string();
+        let merged = format!("{head_win}\n{tail_win}");
+
+        // 先证明「字节确实在窗口里」—— 失败不是因为数据没留下来。
+        assert!(
+            tail_win.contains("\"input_tokens\":12345"),
+            "前提不成立：用量字节压根没进尾窗，那本条钉的就不是解析问题"
+        );
+
+        let u = extract_usage_from_sse(&merged)
+            .expect("Responses 长回答的用量必须能取到（字节就在窗口里，不能因整行截断而丢）");
+        assert_eq!(u.input, 12_345, "input 来自 response.completed");
+        assert_eq!(u.output, 678, "output 来自 response.completed");
+    }
+
+    /// 🔴 **反面判据：回答正文里的 `usage` 字样不许被当成用量。**
+    ///
+    /// [`scan_usage_objects`] 是在 SSE **原文**里搜 `"usage"`，而 Responses 的
+    /// `response.completed` 裹着 `output[]` 全文 —— 也就是说模型回答的正文就在被扫的字节里。
+    /// 一段讨论 API 用量的对话、或者贴了一份 JSON 的代码块，正文里完全可能出现
+    /// `"usage": {"input_tokens": 999999}` 这样的文本。
+    ///
+    /// 记出假 token 数比记不到**更糟**：记不到是面板显示 0（用户看得出不对），
+    /// 记假数是面板显示一个煞有介事的错值（没人能看出不对）。
+    ///
+    /// 防线来自 JSON 本身：字符串里的引号必然被转义成 `\"`，于是正文里的那段文本在字节上是
+    /// `\"usage\"` —— `e` 后面紧跟的是 `\` 而不是 `"`，搜 `"usage"` 压根不命中。
+    /// 这条用例把这个性质钉死：有人把判据放宽成搜 `usage`（去掉引号）时它立刻变红。
+    #[test]
+    fn prose_mentioning_usage_is_never_counted_as_real_usage() {
+        // 模型回答正文里带一段 JSON（真实场景：用户让它解释 usage 字段）。
+        // 序列化进 output_text 后引号被转义，这正是防线所在。
+        let prose = r#"这是用量字段的形状：{\"usage\": {\"input_tokens\": 999999, \"output_tokens\": 888888}}"#;
+        let sse = format!(
+            "event: response.completed\n\
+             data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"r1\",\
+             \"output\":[{{\"type\":\"message\",\"content\":[{{\"type\":\"output_text\",\
+             \"text\":\"{prose}\"}}]}}],\
+             \"usage\":{{\"input_tokens\":120,\"output_tokens\":34}}}}}}\n\n\
+             data: [DONE]\n"
+        );
+        let u = extract_usage_from_sse(&sse).expect("真实用量必须取到");
+        assert_eq!(
+            u.input, 120,
+            "只能取 response.usage 那一处；正文里那个 999999 是模型写的字，不是用量"
+        );
+        assert_eq!(u.output, 34, "同上：888888 不许被记进来");
+
+        // 被尾窗从正文中间切断时同样不许误报（窗口首片是半截转义字符串）。
+        let b = sse.as_bytes();
+        let tail = String::from_utf8_lossy(&b[b.len().saturating_sub(120)..]).to_string();
+        if let Some(t) = extract_usage_from_sse(&tail) {
+            assert!(
+                t.input != 999_999 && t.output != 888_888,
+                "截断片段里也不许把正文当用量：{t:?}"
+            );
+        }
+    }
+
+    /// 🔴 未闭合的 `usage` 对象宁可取不到，也不许猜。
+    ///
+    /// 尾窗可能正好切在 `usage` 对象中间（`{"input_tokens":12` 就没了）。
+    /// [`balanced_object`] 此时返回 `None` —— 拿半个对象去凑数会记出个偏小的假值，
+    /// 而那是**静默**的。失效方向必须是「这一处取不到」。
+    #[test]
+    fn a_truncated_usage_object_is_dropped_not_guessed() {
+        let mut acc = TokenUsage::default();
+        scan_usage_objects(r#""usage": {"input_tokens": 12345, "output_tok"#, &mut acc);
+        assert!(
+            acc.is_empty(),
+            "对象没闭合就该整个放弃，不许拿已读到的字段凑数：{acc:?}"
+        );
+
+        // 闭合的照常取到 —— 证明上面那条不是因为扫描整体失灵。
+        let mut ok = TokenUsage::default();
+        scan_usage_objects(
+            r#""usage": {"input_tokens": 7, "output_tokens": 8}"#,
+            &mut ok,
+        );
+        assert_eq!((ok.input, ok.output), (7, 8));
     }
 
     #[test]
     fn token_usage_add_and_format() {
-        let mut a = TokenUsage { input: 1200, output: 340, cache_read: 0, cache_creation: 0 };
-        a.add(&TokenUsage { input: 800, output: 60, cache_read: 500, cache_creation: 150 });
-        assert_eq!((a.input, a.output, a.cache_read, a.cache_creation), (2000, 400, 500, 150));
+        let mut a = TokenUsage {
+            input: 1200,
+            output: 340,
+            cache_read: 0,
+            cache_creation: 0,
+        };
+        a.add(&TokenUsage {
+            input: 800,
+            output: 60,
+            cache_read: 500,
+            cache_creation: 150,
+        });
+        assert_eq!(
+            (a.input, a.output, a.cache_read, a.cache_creation),
+            (2000, 400, 500, 150)
+        );
         // 展示：≥10k 用 k 缩写，缓存不为 0 才附加
         assert_eq!(
-            TokenUsage { input: 12_345, output: 400, cache_read: 0, cache_creation: 0 }.fmt_compact(),
+            TokenUsage {
+                input: 12_345,
+                output: 400,
+                cache_read: 0,
+                cache_creation: 0
+            }
+            .fmt_compact(),
             "↑12.3k ↓400"
         );
-        assert!(TokenUsage { input: 10, output: 2, cache_read: 900, cache_creation: 0 }
-            .fmt_compact()
-            .contains("缓存900"));
-        assert!(TokenUsage { input: 10, output: 2, cache_read: 0, cache_creation: 300 }
-            .fmt_compact()
-            .contains("写缓存300"));
+        assert!(TokenUsage {
+            input: 10,
+            output: 2,
+            cache_read: 900,
+            cache_creation: 0
+        }
+        .fmt_compact()
+        .contains("缓存900"));
+        assert!(TokenUsage {
+            input: 10,
+            output: 2,
+            cache_read: 0,
+            cache_creation: 300
+        }
+        .fmt_compact()
+        .contains("写缓存300"));
         assert!(TokenUsage::default().is_empty());
     }
 }

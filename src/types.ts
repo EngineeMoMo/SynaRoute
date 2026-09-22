@@ -103,6 +103,17 @@ export interface DesktopModelNameReport {
   mappings: ModelMapping[];
   /** 默认兜底模型（可选）：故障转移到本 Key 时，请求模型既非映射期望名也非本 Key 真实模型名，则改用它（FR-006） */
   defaultModel?: string;
+  /**
+   * 允许把**用户点名的模型**也兜底改写成本 Key 的模型（默认 false）。
+   *
+   * 关掉时（默认）：故障转移落到这条 Key、而它不认识你点名的那个模型 → **跳过这条 Key**，
+   * 宁可最终报错也不悄悄换模型。这是 2026-09-01 用户实报事故的保护（选 grok-4.6，
+   * 转移后被兜底改成 glm-5.3 并返回 200，日志是绿色「成功」，31 轮都没人发现）。
+   *
+   * 打开时：这条 Key 按它自己的兜底规则顶上，请求会成功但**回答来自另一个模型**，
+   * 同时仍落一条 ⚠ 降级警告事件。适用于「有回答比没回答重要」的场景。
+   */
+  allowNamedModelFallback?: boolean;
   /** 档位快捷映射（取自 cc-switch 的 haiku/sonnet/opus/fable 语义）：Claude Code 按任务发家族模型名，
    *  配了对应档位即在运行时代理改写为上游真实名。与 mappings 并存，精确映射优先级更高。 */
   tierHaiku?: string;

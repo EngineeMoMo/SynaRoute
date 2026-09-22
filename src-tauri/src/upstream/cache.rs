@@ -17,14 +17,14 @@ fn cache_unsupported() -> &'static std::sync::Mutex<std::collections::HashSet<St
     CACHE_UNSUPPORTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
-pub(super) fn cache_known_unsupported(base_url: &str) -> bool {
+pub(crate) fn cache_known_unsupported(base_url: &str) -> bool {
     cache_unsupported()
         .lock()
         .map(|s| s.contains(base_url))
         .unwrap_or(false)
 }
 
-pub(super) fn mark_cache_unsupported(base_url: &str) {
+pub(crate) fn mark_cache_unsupported(base_url: &str) {
     if let Ok(mut s) = cache_unsupported().lock() {
         s.insert(base_url.to_string());
     }
@@ -34,7 +34,7 @@ pub(super) fn mark_cache_unsupported(base_url: &str) {
 ///
 /// 判据保守:必须明确提到 cache 相关字样才回退,否则会把「model is required」这类真正的 400
 /// 也误当成缓存问题去掉缓存重发——那只会白发一次、真问题依旧,且掩盖了根因。
-pub(super) fn looks_like_cache_rejection(body: &str) -> bool {
+pub(crate) fn looks_like_cache_rejection(body: &str) -> bool {
     let b = body.to_ascii_lowercase();
     b.contains("cache_control")
         || b.contains("cache control")
@@ -53,35 +53,119 @@ pub(super) fn looks_like_cache_rejection(body: &str) -> bool {
 /// 必是 tool_result 数组,正是缓存收益最大处,不损失。
 ///
 /// **零信息损失**:只加元数据,模型看到的内容一字不变。
-pub(super) fn inject_anthropic_cache(payload: &mut Value, has_tools: bool) {
-    let ephemeral = json!({ "type": "ephemeral" });
-    // 断点①:tools 末尾
+pub(crate) fn inject_anthropic_cache(payload: &mut Value, has_tools: bool) {
+    inject_breakpoints(payload, has_tools, false);
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CacheInjection(Vec<String>);
+
+fn cache_paths(payload: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    for section in ["tools", "system"] {
+        if let Some(blocks) = payload.get(section).and_then(Value::as_array) {
+            paths.extend((0..blocks.len()).map(|i| format!("/{section}/{i}")));
+        }
+    }
+    if let Some(messages) = payload.get("messages").and_then(Value::as_array) {
+        for (i, msg) in messages.iter().enumerate() {
+            if let Some(blocks) = msg.get("content").and_then(Value::as_array) {
+                paths.extend((0..blocks.len()).map(|j| format!("/messages/{i}/content/{j}")));
+            }
+        }
+    }
+    paths
+}
+
+fn inject_breakpoints(payload: &mut Value, has_tools: bool, system: bool) -> CacheInjection {
+    let paths = cache_paths(payload);
+    let existing = paths.iter().filter(|p| payload.pointer(p).is_some_and(|v| v.get("cache_control").is_some())).count();
+    let mut room = 4usize.saturating_sub(existing);
+    let mut candidates = Vec::new();
     if has_tools {
-        if let Some(arr) = payload.get_mut("tools").and_then(|t| t.as_array_mut()) {
-            if let Some(last) = arr.last_mut() {
-                if let Some(obj) = last.as_object_mut() {
-                    obj.insert("cache_control".into(), ephemeral.clone());
+        if let Some(path) = paths.iter().rev().find(|p| p.starts_with("/tools/")) {
+            candidates.push(path.clone());
+        }
+    }
+    if system {
+        if let Some(path) = paths.iter().rev().find(|p| p.starts_with("/system/")) {
+            candidates.push(path.clone());
+        }
+    }
+    if let Some(path) = paths.iter().rev().find(|p| p.starts_with("/messages/") && payload.pointer(p).is_some_and(|v| {
+        matches!(v.get("type").and_then(Value::as_str), Some("text" | "image" | "tool_result" | "tool_use"))
+    })) {
+        candidates.push(path.clone());
+    }
+    let mut added = CacheInjection::default();
+    for path in candidates {
+        if room == 0 { break; }
+        if let Some(obj) = payload.pointer_mut(&path).and_then(Value::as_object_mut) {
+            if !obj.contains_key("cache_control") {
+                obj.insert("cache_control".into(), json!({"type":"ephemeral"}));
+                added.0.push(path);
+                room -= 1;
+            }
+        }
+    }
+    added
+}
+
+/// 只对代理转换生成的请求使用；整段历史一致归一，避免仅末条变形导致前缀漂移。
+pub(crate) fn inject_converted_cache(payload: &mut Value) -> CacheInjection {
+    if let Some(system) = payload.get_mut("system") {
+        if let Some(text) = system.as_str() {
+            *system = json!([{"type":"text","text":text}]);
+        }
+    }
+    if let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(content) = message.get_mut("content") {
+                if let Some(text) = content.as_str() {
+                    *content = json!([{"type":"text","text":text}]);
                 }
             }
         }
     }
-    // 断点②:最后一条消息的最后一个 content 块(仅当 content 是块数组时)
-    if let Some(msgs) = payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        if let Some(last_msg) = msgs.last_mut() {
-            if let Some(blocks) = last_msg.get_mut("content").and_then(|c| c.as_array_mut()) {
-                if let Some(last_block) = blocks.last_mut() {
-                    if let Some(obj) = last_block.as_object_mut() {
-                        obj.insert("cache_control".into(), ephemeral);
-                    }
-                }
+    inject_breakpoints(payload, true, true)
+}
+
+/// 只撤销本轮增加且未被其他逻辑改写的断点；不认领客户端已有字段。
+pub(crate) fn rollback_injected_cache(payload: &mut Value, injection: &CacheInjection) -> usize {
+    let mut removed = 0;
+    for path in &injection.0 {
+        if let Some(obj) = payload.pointer_mut(path).and_then(Value::as_object_mut) {
+            if obj.get("cache_control") == Some(&json!({"type":"ephemeral"})) {
+                obj.remove("cache_control");
+                removed += 1;
             }
         }
     }
+    removed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rollback_preserves_caller_fields_and_is_idempotent() {
+        let mut p = json!({"system":"stable","tools":[{"name":"user","cache_control":{"type":"ephemeral","ttl":"1h"}},{"name":"ours"}],"messages":[{"role":"user","content":"hello"}]});
+        let injection = inject_converted_cache(&mut p);
+        assert_eq!(p["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(rollback_injected_cache(&mut p,&injection),3);
+        assert_eq!(p["tools"][0]["cache_control"]["ttl"],"1h");
+        assert_eq!(rollback_injected_cache(&mut p,&injection),0);
+    }
+
+    #[test]
+    fn existing_four_breakpoints_are_preserved_without_adding_more() {
+        let mut p = json!({"tools":[{"cache_control":{}},{"cache_control":{}},{"cache_control":{}},{"cache_control":{}}],"system":[{"type":"text","text":"s"}],"messages":[{"content":[{"type":"thinking","thinking":"x"}]}]});
+        let original=p.clone();
+        let injection=inject_converted_cache(&mut p);
+        assert_eq!(p,original);
+        assert_eq!(rollback_injected_cache(&mut p,&injection),0);
+    }
 
     #[test]
     fn inject_anthropic_cache_marks_tools_tail_and_last_message_block() {
