@@ -697,6 +697,24 @@ export interface ImportPreview {
   hasSecrets: boolean;
 }
 
+/**
+ * synaroute:// 深链接一键导入的预览（后端 `deeplink_import::ImportPreview`）。**绝不含密钥**
+ * —— 密钥留后端内存，只以 `hasSecret` 体现。`category`/`protocol` 为 null = URL 没带、需在确认框选。
+ */
+export interface DeeplinkImportPreview {
+  category: CategoryType | null;
+  name: string;
+  protocol: Protocol | null;
+  baseUrl: string;
+  /** 多端点时被忽略的额外端点（确认框注明） */
+  extraEndpoints: string[];
+  hasSecret: boolean;
+  tierHaiku: string | null;
+  tierSonnet: string | null;
+  tierOpus: string | null;
+  tierFable: string | null;
+}
+
 /** 导入结果报告 */
 export interface ImportReport {
   mode: ImportMode;

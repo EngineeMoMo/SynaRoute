@@ -24,6 +24,7 @@ mod retrieval;
 mod route_meta;
 #[path = "usage_commands.rs"] mod usage_commands; // 用量面板的 IPC 命令；抽出理由见该文件模块注释
 #[path = "client_resync.rs"] mod client_resync; // Key 变更后同步客户端模型清单；来由见该文件模块注释
+mod deeplink_import; // synaroute:// 深链接一键导入 Key；解析/预览/落盘编排见该文件模块注释
 mod secret;
 mod store;
 mod tools;
@@ -51,7 +52,7 @@ use tauri::Manager;
 
 /// 全局应用状态
 pub struct AppState {
-    store: Arc<Store>,
+    pub(crate) store: Arc<Store>,
     proxy: Arc<ProxyManager>,
     mcp: Arc<McpManager>,
 }
@@ -66,7 +67,7 @@ fn list_keys(state: tauri::State<AppState>, category_id: CategoryType) -> Vec<Pr
 /// `sync_after` 成功后重建托盘。Key 的增删/启停/主次变化都会改变托盘「主 Key」子菜单的
 /// 分类清单，而托盘菜单是一次性构建的、不重建就停在旧状态（2026-09-19 用户实报「新启用
 /// 的 Key 托盘里那个分类仍不显示」）。无条件重建：没变化时重画同一份菜单无害，而漏建静默。
-fn resync<T>(app: &tauri::AppHandle, state: &AppState, r: AppResult<T>) -> AppResult<T> {
+pub(crate) fn resync<T>(app: &tauri::AppHandle, state: &AppState, r: AppResult<T>) -> AppResult<T> {
     let v = client_resync::sync_after(state, r)?;
     let _ = rebuild_tray(app);
     Ok(v)
@@ -211,16 +212,11 @@ fn set_primary_key(
 
 /// 上移 / 下移某 Key 的优先级（相邻交换 + 整列连续重编号）。
 ///
-/// 为什么收进后端、而不是让前端重编号后并发 `upsert_key`（旧实现）：
-/// 1. **部分写入**。前端对优先级变化的每条各发一次 upsert，桌面端分类里若有一条 Key 的
-///    对外名不合规（老配置/导入后未补映射），那条会被 `reject_desktop_key_with_unusable_model_names`
-///    拒绝，而其余几条已经落盘 → 优先级留下重复值或空洞，顺序变成半调整状态。
-/// 2. **报错方向错**。上面那次拒绝弹出的是「某 Key 模型名不可服务」，与用户刚点的
-///    「调整顺序」毫无关系，读起来像是排序功能坏了。
-/// 3. **陈旧运行态**。整份 upsert 会把打开页面那一刻的 health 快照写回去（熔断被静默解除）。
-///    `upsert_key` 已加守卫沿用库里现值，但排序本来就不该走那条整份替换的路。
-///
-/// 与 `set_primary_key` 并列：重排规则只在 `Store` 里有一份，托盘与界面共用。
+/// 收进后端而非让前端重编号后并发 `upsert_key`（旧实现）的三条理由：① **部分写入** —— 逐条
+/// upsert 时若有一条对外名不合规被 `reject_desktop_key_with_unusable_model_names` 拒，其余已落盘 →
+/// 优先级留重复值/空洞；② **报错方向错** —— 那次拒绝弹「某 Key 模型名不可服务」，与「调整顺序」
+/// 无关、像排序坏了；③ **陈旧运行态** —— 整份 upsert 把旧 health 快照写回（熔断被静默解除）。
+/// 与 `set_primary_key` 并列：重排规则只在 `Store` 里一份，托盘与界面共用。
 #[tauri::command]
 fn move_key(
     app: tauri::AppHandle,
@@ -833,20 +829,12 @@ fn prepare_log_dir(state: tauri::State<AppState>) -> AppResult<String> {
 
 /// 建目录**并**在系统文件管理器里打开它。返回实际打开的绝对路径（供 UI 回显核对）。
 ///
-/// ## 为什么必须由 Rust 端打开，不能让前端调 shell 插件
-///
-/// 前端原先是 `prepareLogDir()` 拿路径 → `import("@tauri-apps/plugin-shell").open(dir)`。
-/// 那条路**在生产里 100% 失败**：shell 插件对**来自 JS** 的 `open` 强制做 scope 正则校验，
-/// 未配置时用默认正则 `^((mailto:\w+)|(tel:\w+)|(https?://\w+)).+` —— Windows 路径
-/// `C:\Users\…\logs` 匹配不上，直接返回 `Error::Validation`。于是这个按钮一按就报错，
-/// 而关于页那几个 `https://` 外链却正常（匹配得上），掩盖了「是路径被拦下」这个真因。
-///
-/// 而 Rust 端的 `shell.open(path, None)` 传的 scope 是 `None` → **不做正则校验**（见
-/// tauri-plugin-shell `open::open`：`if let Some(scope) = scope` 才校验）。这也更安全：
-/// 不必为了放行本地路径去放宽那条防 JS 任意打开文件的正则。
-///
-/// 顺带把「建目录」与「打开」并成一次 IPC：两步分开时，中间那次失败会让前端拿着
-/// 路径去打开一个还不存在的目录（日志目录是懒创建的）。
+/// 🔴 **必须由 Rust 端打开**：前端调 shell 插件的 `open` 会对**来自 JS** 的路径做 scope 正则
+/// 校验（默认正则只放行 mailto/tel/https），Windows 路径 `C:\Users\…\logs` 匹配不上、生产里
+/// 100% 返回 `Error::Validation` —— 按钮一按就报错，而关于页的 `https://` 外链却正常，掩盖真因。
+/// Rust 端 `shell.open(path, None)` 传 scope `None` → 不做校验，也更安全（不必放宽那条防 JS
+/// 任意打开文件的正则）。顺带把「建目录 + 打开」并成一次 IPC：分开时中间失败会让前端去打开一个
+/// 还不存在的懒创建目录。
 #[tauri::command]
 fn open_log_dir(app: tauri::AppHandle, state: tauri::State<AppState>) -> AppResult<String> {
     use tauri_plugin_shell::ShellExt;
@@ -997,18 +985,12 @@ fn detect_recent_workdirs() -> AppResult<Vec<workdirs::RecentWorkdir>> {
 
 /// 目录解析的**唯一**入口（本文件内两个 codegraph 命令共用）。
 ///
-/// 🔴 **前端不许传目录进来，这两个命令刻意都不收 `work_dir`**。两条理由：
-/// ① 自动跟随下目录来自会话历史，前端要自己算就得复刻
-///    [`aggregate::write::resolve_writable_work_dir`] 的优先级 —— 本仓已为这类跨语言复刻栽过
-///    多次（`pickPrefs` / `modelSets.ts`），而这里漂移是**静默**的：前端算出 `undefined` →
-///    后端报「索引状态未知」→ 用户看到一句要他去设置已经设好的目录。
-/// ② `codegraph_init` 收任意路径就是一个**任意目录写入原语**（会在该目录创建 `.codegraph/`）。
-///    收回后端自己解析，这个面就没有了。
-///
-/// 用**写**路径口径（`resolve_writable_work_dir`）而不是 [`aggregate`] 的读路径口径：建索引要
-/// 在项目里创建目录，而读路径带「兜底扫会话历史」，那在写路径上是越权（见 `write.rs` 那条 🔴）。
-/// 代价是「没勾自动跟随也没填目录」时本面板报「未知」而检索本身仍兜底工作 —— 刻意的分叉，
-/// 方向安全（少说而非多说）。
+/// 🔴 **前端不许传目录，两个命令刻意都不收 `work_dir`**：① 前端自算目录要复刻
+/// [`aggregate::write::resolve_writable_work_dir`] 的优先级，本仓为这类跨语言复刻栽过多次，
+/// 且这里漂移**静默**（前端算出 `undefined` → 后端报「索引状态未知」→ 让用户去设一个已设好的目录）；
+/// ② `codegraph_init` 收任意路径 = 任意目录写入原语（会建 `.codegraph/`），收回后端解析就没这个面。
+/// 用**写**路径口径（建索引要在项目里创建目录），代价是「没勾自动跟随也没填目录」时报「未知」而
+/// 检索仍兜底工作 —— 刻意分叉、方向安全（少说而非多说）。
 fn codegraph_dir(state: &tauri::State<AppState>, category_id: CategoryType) -> Option<String> {
     let brain = state.store.get_brain(category_id);
     aggregate::write::resolve_writable_work_dir(&brain)
@@ -1218,10 +1200,17 @@ pub fn run() {
     tools::codex::codex_watch::spawn_background(store.clone());
 
     tauri::Builder::default()
-        // 单实例：再次启动时聚焦已有窗口，避免开多个进程（必须最先注册）
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        // 单实例：再次启动时聚焦已有窗口，避免开多个进程（必须最先注册）。
+        // 🔴 Windows 上深链接是作为**第二次启动的 argv** 到达的（不走 on_open_url），
+        // 由 single-instance 转发到这里 —— 故必须在此扫 args 里的 synaroute:// URL 并处理，
+        // 否则「应用已在跑时点链接」这条最常见的路径完全不生效（且失效是静默的）。
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             show_main_window(app);
+            if let Some(url) = args.iter().find(|a| a.starts_with("synaroute://")) {
+                deeplink_import::handle_deeplink(app, url);
+            }
         }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1232,11 +1221,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![AUTOSTART_FLAG]),
         ))
-        .manage(AppState {
-            store,
-            proxy,
-            mcp,
-        })
+        .manage(AppState { store, proxy, mcp })
         .setup(|app| {
             build_tray(app.handle())?;
             // 状态推送（UX#5）。必须在这里装 —— Store/ProxyManager/后台探测线程都在
@@ -1258,9 +1243,21 @@ pub fn run() {
             }
             service::reconcile_auto_start(&state.store, &PluginAutostart(app.handle()));
 
-            // 定时检查更新（30 分钟一轮，先睡后查）。**必须在 setup 里起**：要 AppHandle 才
-            // 拿得到 updater。为什么不做前端定时器 / 不搭探测的车，见该模块文档。
+            // 定时检查更新（30 分钟一轮，先睡后查）。**必须在 setup 里起**（要 AppHandle 才拿得到 updater）；不做前端定时器 / 不搭探测车的理由见该模块文档。
             update_watch::spawn_background(app.handle().clone(), state.store.clone());
+
+            // 深链接导入（synaroute://）：`register` 让直接跑 exe / tauri dev 也能被唤起、且自愈（安装包也注册；macOS 由 bundle 注册，故此调用返 UnsupportedPlatform、`let _` 忽略）。
+            // `on_open_url` 覆盖冷启动与 macOS 已运行；Windows 已运行走 single-instance 回调（见上），两处同调 `handle_deeplink`。
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let h = app.handle().clone();
+                let _ = app.deep_link().register("synaroute");
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        deeplink_import::handle_deeplink(&h, url.as_str());
+                    }
+                });
+            }
 
             // 随系统启动时最小化到托盘（FR-025 需求原文要求）。判据是启动参数里有
             // `--autostart`（注册自启动项时带上的），而非「auto_start 为真」——
@@ -1319,6 +1316,9 @@ pub fn run() {
             check_desktop_model_names,
             delete_key,
             save_secret,
+            deeplink_import::deeplink_import_peek,
+            deeplink_import::deeplink_import_apply,
+            deeplink_import::deeplink_import_discard,
             reveal_secret,
             toggle_key,
             store::key_flags::set_key_allow_in_aggregate,
@@ -1769,7 +1769,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 /// 显示并聚焦主窗口（从托盘恢复）
-fn show_main_window(app: &tauri::AppHandle) {
+pub(crate) fn show_main_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();

@@ -5,6 +5,7 @@ import type {
   BalanceResult,
   BrainConfig,
   CategoryType,
+  DeeplinkImportPreview,
   EventLogEntry,
   OnboardingState,
   ProviderKey,
@@ -161,6 +162,10 @@ interface AppState {
   // 启动代理后自动写入配置的弹窗提示
   configAppliedCategory: CategoryType | null;
   clearConfigApplied: () => void;
+
+  // synaroute:// 深链接导入的待确认预览（不含密钥）。null = 无待确认
+  deeplinkImport: DeeplinkImportPreview | null;
+  setDeeplinkImport: (p: DeeplinkImportPreview | null) => void;
 
   // 动作
   loadCategory: (c: CategoryType) => Promise<void>;
@@ -359,6 +364,9 @@ export const useStore = create<AppState>((set, get) => ({
 
   configAppliedCategory: null,
   clearConfigApplied: () => set({ configAppliedCategory: null }),
+
+  deeplinkImport: null,
+  setDeeplinkImport: (p) => set({ deeplinkImport: p }),
 
   async loadCategory(c) {
     set({ loading: true });

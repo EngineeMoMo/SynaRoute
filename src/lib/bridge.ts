@@ -16,6 +16,7 @@ import type {
   DailyUsageBucket,
   DesktopModelNameReport,
   EventLogEntry,
+  DeeplinkImportPreview,
   ExportOutcome,
   ImportMode,
   ImportPreview,
@@ -23,6 +24,7 @@ import type {
   MasterPasswordState,
   McpStatus,
   ModelInfo,
+  Protocol,
   ProviderKey,
   ProxyState,
   RecentWorkdir,
@@ -103,6 +105,14 @@ export const api = {
   // 保存密钥（加密存储，NFR-006）
   saveSecret: (keyId: string, secret: string) =>
     call<void>("save_secret", { keyId, secret }, () => mockBridge.saveSecret(keyId, secret)),
+
+  // synaroute:// 深链接一键导入：确认框挂载时拉预览（不含密钥）、确认落盘、取消丢弃。
+  deeplinkImportPeek: () =>
+    call<DeeplinkImportPreview | null>("deeplink_import_peek", undefined, async () => null),
+  deeplinkImportApply: (category: CategoryType, protocol: Protocol) =>
+    call<string>("deeplink_import_apply", { category, protocol }, async () => "mock-imported-id"),
+  deeplinkImportDiscard: () =>
+    call<void>("deeplink_import_discard", undefined, async () => {}),
 
   // 按需揭示已存明文密钥（编辑器"眼睛"查看/续用）
   revealSecret: (keyId: string) =>

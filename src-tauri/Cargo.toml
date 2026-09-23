@@ -1,6 +1,6 @@
 [package]
 name = "synaroute"
-version = "0.1.67"
+version = "0.1.68"
 description = "SynaRoute - 智能 API Key 路由代理与配置管理"
 authors = ["SynaRoute"]
 edition = "2021"
@@ -28,6 +28,9 @@ tauri-plugin-shell = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
+# 深链接一键导入（synaroute://）：网页点「导入到 SynaRoute」→ 唤起本应用弹确认框导入 Key。
+# 必须与 single-instance 配合：应用已在跑时，第二次启动的深链接经 single-instance 回调转发。
+tauri-plugin-deep-link = "2"
 # 开机自启动（FR-025）：注册系统级自启动项。Windows 走注册表 Run 键，跨平台由插件适配。
 tauri-plugin-autostart = "2"
 # 系统通知（FR-028 代理健康告警）：Key 熔断/恢复时弹系统级通知。

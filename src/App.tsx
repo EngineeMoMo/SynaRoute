@@ -16,13 +16,14 @@ import { Toast } from "@/components/Toast";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { ConfigAppliedDialog } from "@/components/ConfigAppliedDialog";
+import { ImportConfirmDialog } from "@/components/ImportConfirmDialog";
 import { useStore, applyTheme } from "@/store";
-import { useBackendEvents } from "@/lib/useBackendEvents";
+import { useBackendEvents, useBackendEvent } from "@/lib/useBackendEvents";
 import { makeKeyCopy } from "@/lib/keyCopy";
 // 切页动效统一走这里，不许裸调 document.startViewTransition（有硬规则盯着，
 // 理由见 lib/motion.ts：那个 API 绕过 CSS 的 prefers-reduced-motion 兜底）。
 import { startViewTransition } from "@/lib/motion";
-import { isTauri } from "@/lib/bridge";
+import { api, isTauri } from "@/lib/bridge";
 import { requestNotificationPermission } from "@/lib/notifications";
 import { useT } from "@/lib/useT";
 import type { CategoryType, ProviderKey } from "@/types";
@@ -44,6 +45,14 @@ export default function App() {
   // 后端状态推送（UX#5）：代理启停、配置落盘、健康态翻转、托盘快切模型等
   // 会由后端主动推过来，界面即时跟随；各页轮询退成 30s 兜底。
   useBackendEvents();
+
+  // synaroute:// 深链接导入：后端收到链接后发信号，这里拉取不含密钥的预览 → 弹确认框。
+  const setDeeplinkImport = useStore((s) => s.setDeeplinkImport);
+  useBackendEvent(["import-request"], () => {
+    void api.deeplinkImportPeek().then((p) => {
+      if (p) setDeeplinkImport(p);
+    });
+  });
   const theme = useStore((s) => s.theme);
   const t = useT();
   const [nav, setNav] = useState<NavKey>("claude-cli");
@@ -267,6 +276,7 @@ export default function App() {
 
       <Toast />
       <ConfigAppliedDialog />
+      <ImportConfirmDialog />
       {/*
         本项目**不做任何形态的悬浮球**（历史上试过两种，都已删除）：
 

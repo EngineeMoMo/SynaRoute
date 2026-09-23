@@ -80,6 +80,10 @@ pub enum Topic {
     /// 载荷里不带版本号 —— 前端收到后自己调 `check_for_updates` 拿版本与说明
     /// （同本模块「载荷里为什么不带业务数据」那条）
     Update,
+    /// 收到一条 `synaroute://` 深链接导入请求，前端应弹确认框。载荷**不带**导入内容
+    /// （尤其密钥）—— 前端收到后调 `deeplink_import_peek` 拉取不含密钥的预览
+    /// （密钥留在后端内存，绝不进事件，见 `deeplink_import` 模块注释）。
+    ImportRequest,
 }
 
 // 刻意**没有** Takeover 主题：桌面端「接入被 cc-switch 接管」的判据是外部文件
@@ -97,6 +101,7 @@ impl Topic {
             Topic::Vault => "vault",
             Topic::Logs => "logs",
             Topic::Update => "update",
+            Topic::ImportRequest => "import-request",
         }
     }
 
@@ -116,7 +121,9 @@ impl Topic {
             | Topic::Health
             | Topic::Proxy
             | Topic::Vault
-            | Topic::Update => 0,
+            | Topic::Update
+            // 深链接导入是用户主动触发的低频事件，不压制（压了只会让确认框迟到）。
+            | Topic::ImportRequest => 0,
         }
     }
 }

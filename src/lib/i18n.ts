@@ -49,6 +49,23 @@ const zh: Dict = {
   "sidebar.groupTools": "目标工具",
   "sidebar.groupFeature": "能力",
   "sidebar.groupSystem": "系统",
+  "import.title": "从网页导入 Key",
+  "import.desc": "一个网页请求把下面这条 Key 导入 SynaRoute。请核对端点和分类后再确认——密钥会被发往该端点。",
+  "import.name": "名称",
+  "import.unnamed": "未命名",
+  "import.endpoint": "端点",
+  "import.category": "分类",
+  "import.protocol": "协议",
+  "import.secret": "密钥",
+  "import.secretYes": "已随链接带入",
+  "import.secretNo": "未带（导入后需手填）",
+  "import.pickCategory": "选择分类",
+  "import.pickProtocol": "选择协议",
+  "import.extraEndpoints": "链接还带了 {n} 个额外端点，仅使用第一个（本应用每条 Key 只支持单端点）。",
+  "import.enabledNote": "导入后该 Key 即启用，会进入故障转移候选池。",
+  "import.action": "导入",
+  "import.importing": "导入中…",
+  "import.done": "已导入「{name}」到 {cat}",
   "nav.claude-cli": "Claude CLI",
   "nav.claude-desktop": "Claude 桌面端",
   "nav.codex": "Codex 桌面端",
@@ -106,12 +123,10 @@ const zh: Dict = {
   "balance.probeNeedSecret": "请先填写 API 密钥，再测试查询（余额查询要拿密钥去打上游）。",
   "balance.keyInactive": "注意：上游报告该密钥当前不可用（is_active=false）。",
   "balance.multiplier": "计费倍率（选填）",
-  "balance.multiplierHint":
-    "中转站常按官方价打折，如 0.3 表示三折。用量页据此估算花费；留空按 1.0（原价）。只是估算，与实际账单可能有差。",
+  "balance.multiplierHint": "中转站常按官方价打折，如 0.3 表示三折。用量页据此估算花费；留空按 1.0（原价）。只是估算，与实际账单可能有差。",
   // 后端对非法倍率静默退回 1.0（不让笔误把金额算成 0），故必须在这里明说 ——
   // 否则用户填了「三折」「30%」以为生效了，用量页却按原价算，金额差 3 倍而无人告知。
-  "balance.multiplierInvalid":
-    "倍率必须是 0 到 {max} 之间的数字（如 0.3）。当前填法无法识别，用量页会按原价 1.0 估算。",
+  "balance.multiplierInvalid": "倍率必须是 0 到 {max} 之间的数字（如 0.3）。当前填法无法识别，用量页会按原价 1.0 估算。",
 
 
 
@@ -149,8 +164,7 @@ const zh: Dict = {
   "onboarding.s2ManualHint": "填 Base URL 与密钥；协议会按 Base URL 自动判断。",
   "onboarding.s2Done": "已有 {n} 条 Key，可以继续",
   "onboarding.s3Desc": "启动本地代理，并把接入配置写进客户端。",
-  "onboarding.s3What":
-    "会做两件事：① 在本机起一个只监听 127.0.0.1 的代理；② 把该客户端的配置指向这个代理（原配置会先自动备份，停止代理时自动还原）。",
+  "onboarding.s3What": "会做两件事：① 在本机起一个只监听 127.0.0.1 的代理；② 把该客户端的配置指向这个代理（原配置会先自动备份，停止代理时自动还原）。",
   "onboarding.s3Action": "启动并接入",
   "onboarding.s3Running": "代理已启动，配置已写入",
   "onboarding.startFailed": "启动失败。常见原因是端口被占用——可在设置里换一个端口再试。",
@@ -164,8 +178,7 @@ const zh: Dict = {
   "about.title": "关于作者",
   "about.subtitle": "SynaRoute 由个人开发者维护，欢迎反馈问题与建议",
   "about.avatarAlt": "{user} 的头像",
-  "about.authorBlurb":
-    "SynaRoute 是一个本地运行的 AI API 路由代理：多 Key 故障转移、模型映射、跨协议转换，配置与密钥都留在你自己的机器上。",
+  "about.authorBlurb": "SynaRoute 是一个本地运行的 AI API 路由代理：多 Key 故障转移、模型映射、跨协议转换，配置与密钥都留在你自己的机器上。",
   "about.viewProfile": "GitHub 主页",
   "about.starRepo": "给项目点个 Star",
   "about.contactTitle": "联系方式与地址",
@@ -176,11 +189,9 @@ const zh: Dict = {
   "about.tbd": "待补充",
   "about.copy": "复制",
   "about.openInBrowser": "在浏览器中打开",
-  "about.issueHint":
-    "遇到问题优先提 Issue：附上「运行日志」里的相关条目与 SynaRoute 版本号，能省掉大半来回确认。",
+  "about.issueHint": "遇到问题优先提 Issue：附上「运行日志」里的相关条目与 SynaRoute 版本号，能省掉大半来回确认。",
   "about.thanksTitle": "致谢",
-  "about.thanksBody":
-    "协议转换与工具调用的判据来自对官方客户端的实测反查；配置管理与托盘交互的形态参考了同类开源工具的实践。感谢这些先行工作。",
+  "about.thanksBody": "协议转换与工具调用的判据来自对官方客户端的实测反查；配置管理与托盘交互的形态参考了同类开源工具的实践。感谢这些先行工作。",
 
   // 顶部更新横幅（原先只有侧栏 Logo 角标，太不显眼）
   "update.bannerTitle": "有新版本 v{version} 可以更新",
@@ -202,16 +213,11 @@ const zh: Dict = {
   "proxy.someKeysDownHint": "当前探测为不可用",
   // 这两条提示要说清「不可用」的口径：它是**健康探测**的结论，而真正裁判可用性的是真实流量
   // （见后端 health::is_candidate）。不说清，用户看到红字会以为代理已经彻底不能用了。
-  "proxy.allKeysDownTip":
-    "这是健康探测的结论，不代表一定转发不了——真正决定可用性的是真实请求。常见原因是网络波动或上游临时故障。若客户端确实报错，去运行日志看具体原因。",
-  "proxy.someKeysDownTip":
-    "这些 Key 的健康探测失败了，转发会自动跳过它们、用其余 Key。不影响正常使用；想确认可在卡片上点刷新重新探测。",
-  "proxy.routeModeTip":
-    "数字是当前已启用的 Key 数。多于 1 个时按卡片顺序依次尝试，某条失败自动换下一条（客户端无感）；只有 1 个时没有备用可切。",
-  "proxy.endpointTip":
-    "代理监听的本机地址。点「启动」时会自动写进客户端配置，通常不用手动填。",
-  "proxy.stopTip":
-    "停止代理并还原客户端配置（连 MCP 大脑聚合一起停）。只想切回官方、但保留大脑聚合，用左边的「切官方」。",
+  "proxy.allKeysDownTip": "这是健康探测的结论，不代表一定转发不了——真正决定可用性的是真实请求。常见原因是网络波动或上游临时故障。若客户端确实报错，去运行日志看具体原因。",
+  "proxy.someKeysDownTip": "这些 Key 的健康探测失败了，转发会自动跳过它们、用其余 Key。不影响正常使用；想确认可在卡片上点刷新重新探测。",
+  "proxy.routeModeTip": "数字是当前已启用的 Key 数。多于 1 个时按卡片顺序依次尝试，某条失败自动换下一条（客户端无感）；只有 1 个时没有备用可切。",
+  "proxy.endpointTip": "代理监听的本机地址。点「启动」时会自动写进客户端配置，通常不用手动填。",
+  "proxy.stopTip": "停止代理并还原客户端配置（连 MCP 大脑聚合一起停）。只想切回官方、但保留大脑聚合，用左边的「切官方」。",
   // 状态条快切（UX#6 / UX#8）。生效时机必须写进文案。🔴 三类各不相同：主 Key **即时**；
   // Codex 模型是**新会话**（它在 session init 读 config.toml）；推理强度是**兜底**（Codex 自己会下发档位）。
   "proxy.primaryKey": "主 Key",
@@ -248,8 +254,7 @@ const zh: Dict = {
   "health.breakerFromLive": "熔断来自实时请求连续失败（非健康探测）——请检查密钥、额度或模型名是否正确。熔断至 {time}",
   "health.latencyTitle": "延迟 {ms}ms",
   "health.stale": "● 状态已过期",
-  "health.staleTitle":
-    "上次探测在 {ago}前失败，之后没再检测过（停用的 Key 不参与定时探测）。这不代表它现在不可用——点右侧刷新按钮重新检测一次。",
+  "health.staleTitle": "上次探测在 {ago}前失败，之后没再检测过（停用的 Key 不参与定时探测）。这不代表它现在不可用——点右侧刷新按钮重新检测一次。",
   "health.agoMinutes": "{n} 分钟",
   "health.agoHours": "{n} 小时",
   "health.agoDays": "{n} 天",
@@ -257,10 +262,8 @@ const zh: Dict = {
   // 分类页
   "category.keyCount": "共 {total} 个 Key · {enabled} 个已启用",
   // 提示语只补「文字本身答不了的问题」，不复述已经写在界面上的话
-  "category.keyCountTip":
-    "只有已启用的 Key 参与转发与故障转移，按卡片从上到下的顺序依次尝试。停用的 Key 既不转发、也不参与定时健康探测——它不会在别的 Key 失败时被自动启用。",
-  "category.trippedKeysTip":
-    "熔断是自动的：某条 Key 连续失败后暂停使用一小段时间，期间流量走其他 Key。无需手动处理，倒计时结束会自动恢复；不必停用或删除这条 Key。",
+  "category.keyCountTip": "只有已启用的 Key 参与转发与故障转移，按卡片从上到下的顺序依次尝试。停用的 Key 既不转发、也不参与定时健康探测——它不会在别的 Key 失败时被自动启用。",
+  "category.trippedKeysTip": "熔断是自动的：某条 Key 连续失败后暂停使用一小段时间，期间流量走其他 Key。无需手动处理，倒计时结束会自动恢复；不必停用或删除这条 Key。",
   "category.addKey": "新增厂商 Key",
   "category.mappingGapTitle": "部分模型只有单条 Key 能服务",
   "category.mappingGapSummary": "{count} 个模型是单点：唯一服务者一挂就用不了",
@@ -353,8 +356,7 @@ const zh: Dict = {
   "brain.enabled": "已启用",
   "brain.disabled": "未启用",
   "brain.subtitle": "多个模型并行解答 → 聚合 → 最终决策者产出答案，提升准确性",
-  "brain.textOnlyNotice":
-    "已支持图片与工具调用。图片：客户端调 synaroute_ai 时传 images（相对 cwd 的路径），最多 4 张、单张 5MB，仅 png/jpg/gif/webp，且参与者模型需支持图片。工具调用默认关闭，需在下方「工具调用」里开启。",
+  "brain.textOnlyNotice": "已支持图片与工具调用。图片：客户端调 synaroute_ai 时传 images（相对 cwd 的路径），最多 4 张、单张 5MB，仅 png/jpg/gif/webp，且参与者模型需支持图片。工具调用默认关闭，需在下方「工具调用」里开启。",
   "brain.enableTitle": "启用大脑聚合",
   "brain.enableDesc": "控制本分类的 synaroute_ai 工具能否调用（关闭时调用会报错）。普通转发不受影响，始终走多 Key 故障转移",
   "brain.mcpConnectTitle": "接入到客户端",
@@ -383,15 +385,12 @@ const zh: Dict = {
   "brain.modeFullDesc": "将各成员完整答案交决策者（信息最全）",
   "brain.concurrency": "并发上限",
   // 成员数超过上限时会怎样，是这个字段唯一的真实疑问（答案：排队分批，不会被丢掉）
-  "brain.concurrencyHint":
-    "同时最多向几个成员发起请求。成员数超过这个值不会被丢掉，而是排队分批跑——调小可减轻上游限流，代价是整轮更慢。",
+  "brain.concurrencyHint": "同时最多向几个成员发起请求。成员数超过这个值不会被丢掉，而是排队分批跑——调小可减轻上游限流，代价是整轮更慢。",
   "brain.memberModelTip": "该成员用这个模型作答。改完记得点页面底部的「保存配置」，否则不生效。",
-  "brain.memberHealthTip":
-    "这条 Key 的健康探测结果。探测为不可用「不会」让整轮聚合失败——只是这个成员可能拿不到结果，其余成员照常作答。",
+  "brain.memberHealthTip": "这条 Key 的健康探测结果。探测为不可用「不会」让整轮聚合失败——只是这个成员可能拿不到结果，其余成员照常作答。",
   "brain.memberRemoveTip": "从参与成员中移除（不会删除这条 Key）。",
   "brain.totalTimeout": "整轮总预算 (ms)",
-  "brain.totalTimeoutHint":
-    "整个聚合一轮的墙钟上限（成员 + 压缩 + 决策者共享，决策者留保底配额）。MCP 客户端超时会自动跟随此值（+余量），无需手动配。问题复杂、模型思考久，把此值调大即可。",
+  "brain.totalTimeoutHint": "整个聚合一轮的墙钟上限（成员 + 压缩 + 决策者共享，决策者留保底配额）。MCP 客户端超时会自动跟随此值（+余量），无需手动配。问题复杂、模型思考久，把此值调大即可。",
   "brain.textOnlyNote": "参与者只做分析、不写文件；决策者的改动需你在结果面板里确认后才落盘。",
   "brain.saveConfig": "保存聚合配置",
   "brain.noMembers": "未选择任何参与成员",
@@ -421,22 +420,16 @@ const zh: Dict = {
   "brain.maxContextTokens": "检索内容 Token 上限",
   "brain.toolsSection": "工具调用",
   "brain.toolsTitle": "允许参与者按需检索",
-  "brain.toolsDesc":
-    "给参与者一组只读工具（读文件 / 正则搜索 / 列目录 / 查符号索引），让它自己决定看哪些文件，而不是靠前置检索猜。",
-  "brain.toolsCost":
-    "会明显增加额度消耗：每一轮工具调用都要把完整对话历史重发一次。建议先在单个分类上试。",
+  "brain.toolsDesc": "给参与者一组只读工具（读文件 / 正则搜索 / 列目录 / 查符号索引），让它自己决定看哪些文件，而不是靠前置检索猜。",
+  "brain.toolsCost": "会明显增加额度消耗：每一轮工具调用都要把完整对话历史重发一次。建议先在单个分类上试。",
   "brain.maxToolRounds": "工具调用轮数上限",
   "brain.toolsRoundsHint": "到上限后会要求模型基于已获得的信息直接出结论，不再调用工具。",
   "brain.toolCtxBudget": "工具历史字符预算",
-  "brain.toolCtxBudgetHint":
-    "工具循环每轮都重发完整历史，累计超过此值就把较早轮次的结果压成占位（不影响最近一轮，也不删消息）。默认 60000（约 3 万 token）；设 0 关闭裁剪。",
+  "brain.toolCtxBudgetHint": "工具循环每轮都重发完整历史，累计超过此值就把较早轮次的结果压成占位（不影响最近一轮，也不删消息）。默认 60000（约 3 万 token）；设 0 关闭裁剪。",
   "brain.toolResultCap": "单次工具结果字符上限",
-  "brain.toolResultCapHint":
-    "单个 read_file / grep 结果最多给这么多字符，调小能直接压低每轮增量，代价是模型可能要多调几次。默认 8000；设 0 用默认。",
-  "brain.toolsWorkDirHint":
-    "需要工作目录：由客户端调用时传 cwd，或在上面开启「自动跟随」/ 填写工作目录。三者都没有时本轮不提供工具（运行日志会写明原因）。",
-  "brain.toolsSafetyHint":
-    "工具只读，永不写文件、不执行命令；限制在工作目录内，且凭据类文件（.env / 密钥 / 证书）一律拒读。",
+  "brain.toolResultCapHint": "单个 read_file / grep 结果最多给这么多字符，调小能直接压低每轮增量，代价是模型可能要多调几次。默认 8000；设 0 用默认。",
+  "brain.toolsWorkDirHint": "需要工作目录：由客户端调用时传 cwd，或在上面开启「自动跟随」/ 填写工作目录。三者都没有时本轮不提供工具（运行日志会写明原因）。",
+  "brain.toolsSafetyHint": "工具只读，永不写文件、不执行命令；限制在工作目录内，且凭据类文件（.env / 密钥 / 证书）一律拒读。",
   "brain.cgTitle": "代码索引（codegraph）",
   "brain.cgDescReady": "已就绪：检索按「符号 + 调用链」精确切片，只发相关方法体而非整份文件，省 token 且更适合代码审查。",
   "brain.cgDescNotInstalled": "未安装。装上后检索可按「符号 + 调用链」精确切片（只发相关方法体而非整份文件）；不装则退化为按文件检索。",
@@ -626,8 +619,7 @@ const zh: Dict = {
   "backup.exportAction": "选择保存位置并导出",
   "backup.exporting": "导出中…",
   "backup.exportDone": "已导出到 {path}",
-  "backup.exportSkipped":
-    "文件已写入，但有 {n} 个 Key 的密钥解不出、未包含在内（密文可能因更换 Windows 账户而失效）。在新机器导入后，需为这些 Key 重新录入密钥。",
+  "backup.exportSkipped": "文件已写入，但有 {n} 个 Key 的密钥解不出、未包含在内（密文可能因更换 Windows 账户而失效）。在新机器导入后，需为这些 Key 重新录入密钥。",
 
   // 配置导入弹窗
   "backup.importTitle": "导入配置",
@@ -642,8 +634,7 @@ const zh: Dict = {
   "backup.modeReplaceDesc": "清空后按文件重建，还原到导出那一刻。会删除本机独有的条目（导入前自动备份现有配置）。",
   "backup.conflictNote": "其中 {n} 个与本机重复，将被文件版本覆盖",
   "backup.suspiciousTitle": "{n} 个条目看起来不是同一个 Key，但会被覆盖",
-  "backup.suspiciousDesc":
-    "它们的内部编号相同，但名称与接口地址都不一样。早期版本的编号按时间生成，两台机器同时创建就可能撞号——继续导入会把左边这条换成右边这条。若不是你预期的，请先取消，在另一台机器上改名或重建该 Key 后重新导出。",
+  "backup.suspiciousDesc": "它们的内部编号相同，但名称与接口地址都不一样。早期版本的编号按时间生成，两台机器同时创建就可能撞号——继续导入会把左边这条换成右边这条。若不是你预期的，请先取消，在另一台机器上改名或重建该 Key 后重新导出。",
   "backup.removeNote": "替换模式将删除本机独有的 {n} 个 Key",
   "backup.importPassword": "导出时设置的口令",
   "backup.importAction": "开始导入",
@@ -681,8 +672,7 @@ const zh: Dict = {
   "settings.mcpWizardCodex": "Codex CLI",
   "settings.mcpWizardCodexStep": "在项目目录执行，把 SynaRoute 加为 MCP 服务器：",
   "settings.mcpWizardCodexHook": "可选：在 AGENTS.md 里加一句，让 Codex 主动调用：",
-  "settings.mcpWizardCodexHookText":
-    "遇到复杂的代码审查、架构设计、疑难排查任务时，优先调用 synaroute_ai 工具，获取多个模型的综合分析后再动手。",
+  "settings.mcpWizardCodexHookText": "遇到复杂的代码审查、架构设计、疑难排查任务时，优先调用 synaroute_ai 工具，获取多个模型的综合分析后再动手。",
   "settings.mcpWizardClaudeHookMatcher": "review|审查|重构",
   "settings.mcpWizardClaudeHookPrompt": "优先调用 synaroute_ai 做多模型分析",
   "settings.mcpWizardClaude": "Claude Code",
@@ -724,6 +714,23 @@ const en: Dict = {
   "sidebar.groupTools": "Target Tools",
   "sidebar.groupFeature": "Features",
   "sidebar.groupSystem": "System",
+  "import.title": "Import a key from the web",
+  "import.desc": "A web page is asking to import the key below into SynaRoute. Review the endpoint and category before confirming — your key will be sent to that endpoint.",
+  "import.name": "Name",
+  "import.unnamed": "Unnamed",
+  "import.endpoint": "Endpoint",
+  "import.category": "Category",
+  "import.protocol": "Protocol",
+  "import.secret": "API key",
+  "import.secretYes": "included in link",
+  "import.secretNo": "not included (add it after import)",
+  "import.pickCategory": "Pick a category",
+  "import.pickProtocol": "Pick a protocol",
+  "import.extraEndpoints": "The link carried {n} extra endpoint(s); only the first is used (each key supports a single endpoint).",
+  "import.enabledNote": "The imported key is enabled and joins the failover pool.",
+  "import.action": "Import",
+  "import.importing": "Importing…",
+  "import.done": "Imported \"{name}\" into {cat}",
   "nav.claude-cli": "Claude CLI",
   "nav.claude-desktop": "Claude Desktop",
   "nav.codex": "Codex Desktop",
@@ -738,8 +745,7 @@ const en: Dict = {
   "balance.sectionTitle": "Balance & cost",
   "balance.on": "Enabled",
   "balance.enable": "Enable balance query",
-  "balance.enableHint":
-    "Reads remaining credit from the provider's billing endpoint and shows it on this key's card. Endpoints vary by provider — try a preset first, then set a value path if needed; verify with \"Test query\" below.",
+  "balance.enableHint": "Reads remaining credit from the provider's billing endpoint and shows it on this key's card. Endpoints vary by provider — try a preset first, then set a value path if needed; verify with \"Test query\" below.",
   "balance.template": "Preset",
   "balance.tpl.auto": "Auto (recommended)",
   "balance.tpl.custom": "Custom",
@@ -750,12 +756,10 @@ const en: Dict = {
   "balance.tpl.official": "Official",
   "balance.url": "Request URL",
   "balance.urlAutoPlaceholder": "Leave empty to auto-detect from the base URL",
-  "balance.urlHint":
-    "Leave empty to auto-detect the balance endpoint from this key's base URL (DeepSeek / SiliconFlow / OpenRouter / StepFun / Novita / GLM / Kimi / official Anthropic are built in; unknown hosts fall back to the common relay endpoint). Fill it in manually only when auto-detection gets it wrong. Placeholders: {{baseUrl}} this key's base URL (path included), {{origin}} scheme+host only (path stripped), {{apiKey}} the secret. Use {{origin}} when the balance endpoint sits at the domain root but the base URL carries a path suffix (e.g. DeepSeek's /anthropic).",
+  "balance.urlHint": "Leave empty to auto-detect the balance endpoint from this key's base URL (DeepSeek / SiliconFlow / OpenRouter / StepFun / Novita / GLM / Kimi / official Anthropic are built in; unknown hosts fall back to the common relay endpoint). Fill it in manually only when auto-detection gets it wrong. Placeholders: {{baseUrl}} this key's base URL (path included), {{origin}} scheme+host only (path stripped), {{apiKey}} the secret. Use {{origin}} when the balance endpoint sits at the domain root but the base URL carries a path suffix (e.g. DeepSeek's /anthropic).",
   "balance.accessToken": "Access Token",
   "balance.userId": "User ID",
-  "balance.accessTokenHint":
-    "NewAPI-style panels authenticate the usage endpoint with the panel session, not the forwarding API key. Generate an Access Token in the panel's personal settings; the User ID is there too.",
+  "balance.accessTokenHint": "NewAPI-style panels authenticate the usage endpoint with the panel session, not the forwarding API key. Generate an Access Token in the panel's personal settings; the User ID is there too.",
   "balance.ofTotal": "of {total} {unit}",
   // Key card balance row (batch ④)
   "balance.cardLabel": "Balance",
@@ -770,22 +774,18 @@ const en: Dict = {
   "balance.intervalHint": "Set to 0 to disable auto-refresh (balance then takes no part in routing); set to N to query balance every N minutes. Categories with a running proxy are also refreshed in the background at the same interval, even when the window is hidden.",
   "balance.remainingPath": "Value path (optional)",
   "balance.remainingPathPlaceholder": "e.g. data.balance",
-  "balance.remainingPathHint":
-    "Leave empty to auto-detect common fields (remaining / balance / quota.remaining / data.balance …). Array indices work too, e.g. balance_infos.0.total_balance. Only needed when auto-detection fails.",
+  "balance.remainingPathHint": "Leave empty to auto-detect common fields (remaining / balance / quota.remaining / data.balance …). Array indices work too, e.g. balance_infos.0.total_balance. Only needed when auto-detection fails.",
   "balance.overrideTitle": "Credential override (rarely needed)",
   "balance.baseUrlOverride": "Balance endpoint",
   "balance.baseUrlOverridePlaceholder": "Empty = use this key's base URL",
-  "balance.overrideHint":
-    "Some providers host the billing panel on a different domain than the forwarding endpoint. Set that domain here.",
+  "balance.overrideHint": "Some providers host the billing panel on a different domain than the forwarding endpoint. Set that domain here.",
   "balance.probe": "Test query",
   "balance.probing": "Querying…",
   "balance.probeOk": "Success: {amount} {unit} remaining",
-  "balance.probeNeedSecret":
-    "Enter the API key first — the balance query needs it to call the provider.",
+  "balance.probeNeedSecret": "Enter the API key first — the balance query needs it to call the provider.",
   "balance.keyInactive": "Note: the provider reports this key as inactive (is_active=false).",
   "balance.multiplier": "Cost multiplier (optional)",
-  "balance.multiplierHint":
-    "Providers often discount official pricing — 0.3 means 30% of list price. The usage page estimates spend from this; empty means 1.0. Estimates only; may differ from your actual bill.",
+  "balance.multiplierHint": "Providers often discount official pricing — 0.3 means 30% of list price. The usage page estimates spend from this; empty means 1.0. Estimates only; may differ from your actual bill.",
   "balance.multiplierInvalid":
     "The multiplier must be a number between 0 and {max} (e.g. 0.3). This value can't be parsed, so the usage page will estimate at list price (1.0).",
 
