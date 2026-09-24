@@ -500,11 +500,11 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   <br>🔴 **`supported_in_api` 必须为 `true`**：`ModelPreset::filter_by_auth` 是
   `chatgpt_mode || supported_in_api`，而我们走 `experimental_bearer_token` →
   `chatgpt_mode = false`。给 false 的表现是模型**静默从选择器里消失**。
-  <br>🔴 **档位一律声明四档，判据是「能不能到达上游」而非「上游会不会认」（2026-09-07 反转，
-  用户实报 `gpt-5.6-luna`）。别照旧版改回去。** 三种协议都送得到：Anthropic → `convert.rs` 算成
-  `thinking.budget_tokens`（**生效由我们保证**）；原生 Responses → 原样透传；
+  <br>🔴 **档位一律声明六档 `low/medium/high/xhigh/max/ultra`，判据是「能不能到达上游」而非「上游会不会认」（2026-09-07 反转，
+  用户实报 `gpt-5.6-luna`）。别照旧版改回四档（补齐到六档的全程见 [docs/14 §27](docs/14-交接与待办清单.md)）。** 三种协议都送得到：Anthropic → `convert.rs` 算成
+  `thinking.budget_tokens`（**生效由我们保证**，`max`→65536、`ultra`→131072）；原生 Responses → 原样透传；
   Chat Completions → `effort_for_chat_completions` **区间转换**成顶层 `reasoning_effort`
-  （无 `xhigh` 档，钳到 `high`）。
+  （Chat 只认到 high，故 `xhigh`/`max`/`ultra` **一律钳到 `high`**——钳而不丢，丢 = 不发字段 = 上游按默认档思考 = 选了最高档反而降档）。
   <br>旧口径是「只要有一条在册 Key 走 Chat 就整组不声明」，依据是 cc-switch 用 22 家预设换来的
   结论：只暴露「思考开/关」的供应商（Kimi/GLM/Qwen/MiniMax/MiMo/SiliconFlow）调档位没有效果。
   🔴 **那条取证是真的，但它支撑不了那个口径** —— 它说的全是**非 GPT 供应商**，而门按 protocol
@@ -519,17 +519,17 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
   官方那类上游上是假话，有判据钉住这一点。5 条注入全变红，含一条打在**真实调用点**上的
   （`apply_note` 必须收到真实 keys —— 11 条 apply_note 用例全都直接调函数并自己传 keys，
   把 `apply_at` 那行改成 `&[]` 它们照样全绿，第 22 次同类接线盲区）。
-  <br>**声明的档位只有 `low/medium/high/xhigh`**，与官方 `gpt-5.5` 一字不差。**不含 `max`/`ultra`**：
-  `effort_to_thinking_budget` 对它们走 `_ => return None` = 不开思考，声明它等于
-  「用户选了最高档反而完全不思考」，方向最坏的界面撒谎。有源码级判据钉住
-  （用 `production_code_only` 剥注释 —— 本仓已三次栽在「注释里的字面量满足了断言」上）。
+  <br>🔴 **勘误（2026-09-07 补齐后）**：本段曾写「声明的档位只有 `low/medium/high/xhigh`、**不含 `max`/`ultra`**，因为
+  `effort_to_thinking_budget` 对它们走 `_ => return None` = 不开思考」——**那个理由已作废，别再照它改回四档**。同日就把 `EFFORT_LEVELS`
+  补到官方六档、给 `max`/`ultra` 真实预算（见上一条与 [docs/14 §27](docs/14-交接与待办清单.md)）。官方 per-model 档位数其实不一（5.6 系六档、5.5 系四档），我们一律声明六档：
+  少声明 = 用户彻底失去那两档，多声明 = 靠三条区间转换兜住。判据 `the_declared_levels_match_the_official_binary` 拿**官方二进制实测值**逐个对账（不是与 `EFFORT_LEVELS.len()` 自比 = 重言式），用 `production_code_only` 剥注释。
   <br>**`tool_mode` 把 docs/13 那 900 条统计对上了官方名字**：官方基底实测
   `gpt-5.6-*` = `"code_mode_only"`（exec 沙箱那 241 条）、`gpt-5.5`/`5.4`/`5.2` = **`null`**
   （顶层 tools 那 73 条）。`claude-opus-4-7` 那 18 条走的就是 `null` 形态，我们一律发 `null`。
   也就是说工具承载形态从「受模型名支配」变成**我们显式声明**。
   <br>🔴 **基线是「Codex 今天对未知模型用的那份 fallback metadata」，不是官方 GPT 条目**。
   逐字段对着 `model_info_from_slug` 抄，**只改四项**（`visibility` none→list、
-  档位 []→四档、`priority` 99→50+i、`context_window` 恒 272000→有取证时用真实值）。
+  档位 []→六档、`priority` 99→50+i、`context_window` 恒 272000→有取证时用真实值）。
   **刻意没改**：`apply_patch_tool_type` 保持 `null`（fallback 就是 None，也就是说非 GPT 模型
   今天**没有** apply_patch 工具、一直用 shell 改文件；给 `"freeform"` 是新增一个未验证的工具，
   而本轮判据是「不退化」不是「顺手增强」）、`include_skills/plugin/apps_usage_instructions`
