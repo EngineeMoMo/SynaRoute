@@ -131,6 +131,8 @@ export interface DesktopModelNameReport {
    * 0.30000000000000004，用户在界面上看到这种数字会以为程序坏了。
    */
   costMultiplier?: string;
+  /** 花费预算上限（美元，累计口径）。空/未设 = 不限。达到后用量页标红告警 + 路由降级（兜底不剔除）。与 Rust `budget_usd` 对齐。 */
+  budgetUsd?: number;
   /**
    * 这条 Key 的图标**覆盖值**：预设品牌键（`anthropic`/`zhipu`…）或上传的 data-URL。
    *
@@ -419,24 +421,15 @@ export type UnpricedReason =
 export interface UsageCostRow {
   categoryId: CategoryType;
   keyId: string;
-  /** Key 可读名；Key 已删除时从墓碑还原，只有连墓碑也没有时才是 null */
+  /** Key 可读名；已删除时从墓碑还原，连墓碑也没有才是 null。 */
   keyName: string | null;
-  /**
-   * 这一行的 Key 已经不在配置里了。
-   *
-   * 🔴 `keyName` 现在对已删 Key 也有值（后端从 `usage-keys.json` 墓碑还原），
-   * 所以界面**必须**靠这一位区分「还在用」和「已删除」—— 光看名字两者一模一样。
-   */
+  /** 🔴 这一行的 Key 已不在配置里。`keyName` 对已删 Key 也有值，故界面必须靠这一位区分「还在用 / 已删除」。 */
   keyDeleted?: boolean;
   usage: TokenUsage;
   /**
-   * 这一行**是否真的捕获过上游回报的 usage**。
-   *
-   * 🔴 **不能用「四个 token 数是否全 0」代替它**。行集合是「配置里的 Key ∪ 历史累计桶」，
-   * 所以一条还没跑过请求的新 Key 也会有行（那是刻意的 —— 否则它在表里根本不出现，
-   * 用户报的就是这个）。这一位区分两种处置完全不同的 0：
-   * `false` = 我们还没收到任何用量（金额必须显示「尚无用量」而**不是 $0**，
-   * 且不计进「未计入金额的条数」）；`true` = 真有过消耗，数字是事实。
+   * 🔴 是否真的捕获过上游回报的 usage —— **不能用「四个 token 全 0」代替**。
+   * 行集合是「配置里的 Key ∪ 历史累计桶」，故新 Key 也有行；`false` = 尚无用量
+   * （金额显示「尚无用量」而**不是 $0**、不计进「未计入」条数），`true` = 真有过消耗。
    */
   hasRecordedUsage?: boolean;
   /** 估算成本（纳美元 = 1e-9 USD）。null = 无可用单价 */
@@ -448,6 +441,10 @@ export interface UsageCostRow {
   unpricedReason?: UnpricedReason;
   /** 实际用来估算的代表模型名。界面显示「按 X 估算」，让偏差的来源可见。 */
   pricedByModel?: string;
+  /** 用户为这条 Key 设的花费预算（美元）。界面据此画「$已花 / $预算」；未设则不画。 */
+  budgetUsd?: number;
+  /** 🔴 累计估算花费是否已达/超预算。后端单一事实来源，前端不自己比。 */
+  overBudget?: boolean;
 }
 
 /**

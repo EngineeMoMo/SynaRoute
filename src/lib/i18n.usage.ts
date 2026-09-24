@@ -78,6 +78,13 @@ export const usageZh: Dict = {
   "usage.noUsageYet": "尚无用量",
   "usage.noUsageYetHint":
     "还没有收到上游回报的用量。可能是这条 Key 尚未被使用，或流式回答仍在进行（用量在流结束时才补记），也可能这个中转站不返回 usage 字段。",
+  // ---- 每 Key 花费预算（累计口径）----
+  // 判据在后端（usage_cost::budget_status 与 over_budget 那一位），前端只渲染，不自己比大小。
+  "budget.label": "花费预算（美元，选填）",
+  "budget.hint": "累计估算花费达到它时：用量页标红提醒，路由也会优先用别的 Key（仍会在其它 Key 都不可用时兜底，不会因此让请求失败）。留空 = 不限。只是估算，与实际账单可能有差。",
+  "budget.invalid": "请填一个大于 0 的数字（美元），或留空表示不限。",
+  "usage.overBudget": "超预算",
+  "usage.overBudgetBanner": "有 {n} 条 Key 的累计估算花费已达/超过你设的预算：{keys}",
 };
 
 export const usageEn: Dict = {
@@ -138,4 +145,10 @@ export const usageEn: Dict = {
   "usage.noUsageYet": "No usage yet",
   "usage.noUsageYetHint":
     "No usage reported by the upstream yet. This key may not have been used, a streaming reply may still be in flight (usage is recorded when the stream ends), or this provider may not return a usage field.",
+  // ---- Per-key spend budget (cumulative) ----
+  "budget.label": "Budget (USD, optional)",
+  "budget.hint": "When estimated cumulative spend reaches it, the usage page flags this key and routing prefers other keys (still used as a fallback if no other key is available, so requests won't fail because of it). Empty = no limit. Estimates only; may differ from your actual bill.",
+  "budget.invalid": "Enter a positive number (USD), or leave empty for no limit.",
+  "usage.overBudget": "Over budget",
+  "usage.overBudgetBanner": "{n} key(s) reached or exceeded the budget you set: {keys}",
 };

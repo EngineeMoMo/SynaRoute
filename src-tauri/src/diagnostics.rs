@@ -9,6 +9,11 @@
 use crate::model::CategoryType;
 use crate::store::Store;
 
+// 可靠性总览的结构化快照 + IPC。`#[path]` 挂这里纯为棘轮（`lib.rs` 余量 0、本文件有余量），
+// 且它读的每一位运行态，下面的文本报告都已汇过一遍。
+#[path = "resilience.rs"]
+pub(crate) mod resilience;
+
 /// 遮掉 URL 里可能就是凭据的部分：`user:pass@`、像令牌的路径段、全部 query 值。
 ///
 /// # 🔴 为什么需要它（审查发现）

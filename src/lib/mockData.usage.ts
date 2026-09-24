@@ -41,6 +41,9 @@ export function mockUsageWithCost(
       pricingSource: src,
       multiplier: src === "family" ? "0.3" : "1.0",
       pricedByModel: src === "exact" ? "claude-opus-5" : "claude-opus-9-9",
+      // 预算「未超」形态：并排显示「$已花 / $预算」（muted），验证进度可读。
+      budgetUsd: src === "exact" ? 100 : undefined,
+      overBudget: false,
     };
   });
 
@@ -62,6 +65,9 @@ export function mockUsageWithCost(
       pricingSource: "family",
       multiplier: "0.3",
       pricedByModel: "claude-sonnet",
+      // 预算「已超」形态：$0.76 ≥ 设的 $0.5 → 金额标红 + 「超预算」徽标 + 顶部告警条。
+      budgetUsd: 0.5,
+      overBudget: true,
     });
   }
   if (cli[1]) {

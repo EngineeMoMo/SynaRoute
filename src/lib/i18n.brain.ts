@@ -1,4 +1,4 @@
-// 大脑聚合「运行面板」的本地化词条（Phase1 计划 → Phase2a 预览 → Phase2b 落盘）。
+// 大脑聚合「运行面板」+「一键会诊入口」的本地化词条（Phase1 计划 → Phase2a 预览 → Phase2b 落盘）。
 //
 // 从 i18n.ts 拆出来的（那边冻结在棘轮上、余量为 0）。粒度按**界面区块**分，
 // 与 i18n.fields.ts / i18n.mapping.ts 同一口径。
@@ -34,6 +34,13 @@ export const brainRunZh: Dict = {
   "brain.runCreate": "新建",
   "brain.runRejectedTag": "已拒绝",
   "brain.runRejectedCount": "{n} 项被安全防线拒绝，不会写入。",
+  // 一键会诊入口（BrainQuickStart）：未配置时把招牌能力做成一键可发起
+  "brain.consultTitle": "大脑会诊",
+  "brain.consultDesc":
+    "把同一个需求同时问多个模型，再由决策者综合出一份答案。首次点击会自动配好成员与决策者并保存，随后即可直接发起。",
+  "brain.consultCost": "将同时咨询 {n} 个模型，每个都会消耗对应 Key 的额度，比单次调用更慢。",
+  "brain.consultStart": "一键配置并开始会诊",
+  "brain.consultStarting": "配置中…",
 };
 
 export const brainRunEn: Dict = {
@@ -62,4 +69,11 @@ export const brainRunEn: Dict = {
   "brain.runCreate": "new",
   "brain.runRejectedTag": "rejected",
   "brain.runRejectedCount": "{n} item(s) were rejected by the safety checks and will not be written.",
+  "brain.consultTitle": "Brain Consultation",
+  "brain.consultDesc":
+    "Ask several models the same request, then let the decider synthesize one answer. The first click auto-configures the members and a decider and saves them, so you can start right away.",
+  "brain.consultCost":
+    "Consults {n} model(s) at once; each spends its own key's quota and is slower than a single call.",
+  "brain.consultStart": "Configure & start consultation",
+  "brain.consultStarting": "Configuring…",
 };

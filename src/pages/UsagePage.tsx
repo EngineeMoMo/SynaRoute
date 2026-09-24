@@ -145,6 +145,12 @@ export function UsagePage() {
     return { ...g, models: [...models] };
   }, [rows]);
 
+  /** 超预算的 Key 名（后端已判好 `overBudget`，前端只汇总展示、不自己比大小）。 */
+  const overBudgetKeys = useMemo(
+    () => (rows ?? []).filter((r) => r.overBudget).map((r) => r.keyName || r.keyId),
+    [rows],
+  );
+
   /**
    * 按日聚合的 token 总量，供「今日 / 本周 / 本月」与趋势图。
    *
@@ -290,6 +296,18 @@ export function UsagePage() {
                 </ul>
               </InlineAlert>
             )}
+
+            {/* 超预算告警：后端已按每 Key 的 budgetUsd 判好 overBudget，这里只汇总。
+                tone=danger（红），与「算不出金额」那条 warning（橙）区分开 —— 一个是钱到顶了、
+                要行动，一个只是估不出、无害。 */}
+            {overBudgetKeys.length > 0 && (
+              <InlineAlert tone="danger" className="mt-2">
+                {t("usage.overBudgetBanner", {
+                  n: String(overBudgetKeys.length),
+                  keys: overBudgetKeys.join(t("common.listSep")),
+                })}
+              </InlineAlert>
+            )}
           </>
         )}
       </div>
@@ -324,6 +342,9 @@ export function UsagePage() {
                       {r.keyName || r.keyId || t("usage.systemLevel")}
                       {r.keyDeleted && (
                         <span className="ml-1 text-text-muted">{t("usage.keyDeletedTag")}</span>
+                      )}
+                      {r.overBudget && (
+                        <span className="ml-1 font-medium text-danger">{t("usage.overBudget")}</span>
                       )}
                     </td>
                     <td className="px-4 py-2 text-right font-mono tabular-nums">{fmt(r.usage.input)}</td>
@@ -460,9 +481,13 @@ function CostCell({ row, t, tableDate }: { row: UsageCostRow; t: TFunc; tableDat
     : base;
   return (
     <Tooltip content={hint} side="left">
-      <span className="cursor-default">
+      <span className={`cursor-default ${row.overBudget ? "font-medium text-danger" : ""}`}>
         {fmtUsd(row.costNano)}
         {isEstimate && <span className="ml-0.5 text-warning">≈</span>}
+        {/* 设了预算就并排显示「已花 / $预算」，让进度一眼可见；超了整串标红。 */}
+        {row.budgetUsd != null && (
+          <span className="ml-0.5 text-text-muted">{` / $${row.budgetUsd}`}</span>
+        )}
       </span>
     </Tooltip>
   );

@@ -37,6 +37,7 @@ import type {
   Vendor,
 } from "@/types";
 import type { UserPrefs } from "@/lib/prefs";
+import type { ResilienceOverview } from "@/lib/resilience";
 import { mockBridge } from "./mockData";
 
 /** 是否运行在 Tauri 环境内 */
@@ -358,6 +359,10 @@ export const api = {
    */
   getUsageWithCost: () =>
     call<UsageCostRow[]>("get_usage_with_cost", undefined, () => mockBridge.usageWithCost()),
+
+  /** 可靠性总览：五层弹性的当前状态 + 近期事件构成。只读快照，前端轮询它。 */
+  resilienceOverview: () =>
+    call<ResilienceOverview>("resilience_overview", undefined, () => mockBridge.resilienceOverview()),
 
   /**
    * 内置单价表的核对日期（`YYYY-MM-DD`）。

@@ -92,7 +92,7 @@ fn bench_key(id: &str, base_url: &str) -> ProviderKey {
         tier_opus: None,
         balance_query: None,
         cached_balance: None,
-        cost_multiplier: None,
+        cost_multiplier: None, budget_usd: None,
         icon: None,
         health: HealthState::default(),
     }

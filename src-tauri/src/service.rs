@@ -1489,7 +1489,7 @@ pub(crate) mod tests {
             tier_opus: None,
             balance_query: None,
             cached_balance: None,
-            cost_multiplier: None,
+            cost_multiplier: None, budget_usd: None,
             icon: None,
             health: HealthState::default(),
         }

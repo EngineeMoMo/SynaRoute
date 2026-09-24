@@ -414,8 +414,8 @@ pub(crate) fn would_silently_substitute(
 
 /// 从全部 Key 里挑出本次请求的候选，并排好序。返回 `(候选, 是否走了兜底)`。
 ///
-/// 排序键 `(服务把握, 余额已耗尽, priority)` —— 三位都是「越靠前越该先用」，
-/// [`Confidence`] 的变体顺序与 `bool: Ord`（`false` 在前）各自给出前两位。
+/// 排序键 `(服务把握, 余额已耗尽, 超预算, priority)` —— 四位都是「越靠前越该先用」，
+/// [`Confidence`] 的变体顺序与 `bool: Ord`（`false` 在前）各自给出前三位。
 ///
 /// # 🔴 「服务把握」摆在 `priority` 之前，是本模块的全部意义
 ///
@@ -437,10 +437,11 @@ pub(crate) fn would_silently_substitute(
 /// 原样返回全部启用 Key（熔断本为「多 Key 快速切换」而设，无处可切时不应自杀成 503）。
 /// **兜底也继承同一排序**（降级不剔除，同 `balance_gate`）：无处可切时，最有把握的那条
 /// 仍该排在最前。该语义有多条测试锁住，改这里前先读那两处的文档。
-pub(crate) fn rank_candidates(
+pub(crate) fn rank_candidates_budgeted(
     all: &[ProviderKey],
     category: CategoryType,
     requested_model: &str,
+    over_budget: &std::collections::HashSet<String>,
 ) -> (Vec<ProviderKey>, bool) {
     // 先按引用收集（零克隆），排序只动指针。
     let mut enabled: Vec<&ProviderKey> =
@@ -454,6 +455,9 @@ pub(crate) fn rank_candidates(
         (
             confidence(k, requested_model),
             crate::health::balance_gate::is_exhausted(k),
+            // 超预算降级（不剔除，同 `balance_gate`）：累计估算花费已达用户设的上限的 Key 排到
+            // 同把握里的后面，但仍在池子里 —— 软上限，别为一个「估算」把请求直接打失败。
+            over_budget.contains(&k.id),
             k.priority,
         )
     });
@@ -480,6 +484,18 @@ pub(crate) fn rank_candidates(
     // 全部被运行态挡住 → 兜底：忽略门槛全部纳入。此时才克隆全部（罕见路径）。
     let used_fallback = !enabled.is_empty();
     (enabled.into_iter().cloned().collect(), used_fallback)
+}
+
+/// 3 参便捷包装：不带预算维度（等价于「无 Key 超预算」）。**仅测试用** ——
+/// 生产路径一律走 [`rank_candidates_budgeted`]（`Store::candidates_for` 现算超预算集合传入）。
+/// 加 `#[cfg(test)]` 免得它在生产构型下成为 dead_code（clippy `-D warnings` 会拦）。
+#[cfg(test)]
+pub(crate) fn rank_candidates(
+    all: &[ProviderKey],
+    category: CategoryType,
+    requested_model: &str,
+) -> (Vec<ProviderKey>, bool) {
+    rank_candidates_budgeted(all, category, requested_model, &std::collections::HashSet::new())
 }
 
 /// 我们宣称过的模型名，全池临时服务不了时 → 响亮地报错，而不是悄悄换一个模型。
@@ -1230,13 +1246,64 @@ mod tests {
     fn candidates_for_must_delegate_to_this_module() {
         let src = prod(include_str!("store.rs"));
         assert!(
-            src.contains("model_pool::rank_candidates("),
-            "candidates_for 必须调 rank_candidates —— 自己写一份排序必然与本模块漂移，\
+            src.contains("model_pool::rank_candidates_budgeted("),
+            "candidates_for 必须调 rank_candidates_budgeted —— 自己写一份排序必然与本模块漂移，\
              而漂移的表现是「用户选的模型时而生效时而不生效」"
         );
         assert!(
             !src.contains("balance_gate::is_exhausted(k), k.priority"),
             "store.rs 里不该再留旧的两位排序键 —— 那意味着模型维度被整个丢掉了"
+        );
+    }
+
+    /// 🔴 超预算的 Key 在路由里**降级但不剔除**（同 `balance_gate` 的耗尽处理）。
+    ///
+    /// 软上限：设了预算只是「尽量别超」，不是「超了就不能用」—— 全部超预算时仍要有候选，
+    /// 否则用户「一条都用不了」。故兜底那条路继承同一顺序。
+    #[test]
+    fn an_over_budget_key_is_demoted_but_never_removed() {
+        use std::collections::HashSet;
+        let cheap = key("cheap", 0, &["glm"]); // 优先级最高，但超预算
+        let rich = key("rich", 1, &["glm"]); // 优先级低，未超
+        let over: HashSet<String> = ["cheap".to_string()].into_iter().collect();
+        let (got, fb) =
+            rank_candidates_budgeted(&[cheap, rich], CategoryType::ClaudeCli, "glm", &over);
+        let ids: Vec<&str> = got.iter().map(|k| k.id.as_str()).collect();
+        assert_eq!(ids, vec!["rich", "cheap"], "超预算的必须后移，但不能被剔除");
+        assert!(!fb, "这不是兜底路径");
+
+        // 全部超预算 → 仍全部保留，顺序退回优先级（降级不剔除）。
+        let all: HashSet<String> = ["cheap".into(), "rich".into()].into_iter().collect();
+        let (got2, _) = rank_candidates_budgeted(
+            &[key("cheap", 0, &["glm"]), key("rich", 1, &["glm"])],
+            CategoryType::ClaudeCli,
+            "glm",
+            &all,
+        );
+        let ids2: Vec<&str> = got2.iter().map(|k| k.id.as_str()).collect();
+        assert_eq!(ids2, vec!["cheap", "rich"], "都超预算也不清空，顺序退回优先级");
+    }
+
+    /// 🔴 接线判据：排序键必须真的读「超预算」这一位，且 `candidates_for` 必须现算它并传进来。
+    ///
+    /// 上面那条行为用例直接给 `rank_candidates_budgeted` 传集合，抓不住「store.rs 忘了算 /
+    /// 忘了传」这半 —— 而那正是缺陷本体（闸门看着在、实际永远收到空集、静默失效）。同 balance_gate。
+    #[test]
+    fn the_budget_gate_must_be_wired_into_routing() {
+        let here = prod(include_str!("model_pool.rs"));
+        assert_eq!(
+            here.matches("over_budget.contains(&k.id)").count(),
+            1,
+            "排序键里必须有且仅有一处「超预算降级」"
+        );
+        let store = prod(include_str!("store.rs"));
+        assert!(
+            store.contains("usage_cost::over_budget_ids"),
+            "candidates_for 必须现算超预算集合 —— 否则闸门永远收到空集、静默失效"
+        );
+        assert!(
+            store.contains("rank_candidates_budgeted("),
+            "candidates_for 必须把超预算集合传给 rank_candidates_budgeted"
         );
     }
 

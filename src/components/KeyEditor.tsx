@@ -9,6 +9,8 @@ import { BrandPickerDialog, BrandPickerTrigger } from "@/components/BrandPickerD
 import { SaveErrorDialog } from "@/components/SaveErrorDialog";
 import { MAX_COST_MULTIPLIER, isValidCostMultiplier } from "@/lib/costMultiplier";
 import { CostMultiplierField } from "@/components/CostMultiplierField";
+import { isValidBudget, parseBudget } from "@/lib/budget";
+import { BudgetField } from "@/components/BudgetField";
 import { CustomHeadersField } from "@/components/CustomHeadersField";
 import { ModelMappingSection, type TierValues } from "@/components/ModelMappingSection";
 import type {
@@ -186,6 +188,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
   const [probing, setProbing] = useState(false);
   // 计费倍率（如 "0.3" = 官方价三折）。存字符串，避免 0.1+0.2 那类浮点显示。
   const [costMultiplier, setCostMultiplier] = useState(initial?.costMultiplier ?? "");
+  const [budget, setBudget] = useState(initial?.budgetUsd != null ? String(initial.budgetUsd) : "");
   const [headersJson, setHeadersJson] = useState(initial?.headersJson ?? "");
   /** 这条 Key 的图标覆盖（预设键或 data-URL）；undefined = 跟着厂商走。 */
   const [icon, setIcon] = useState<string | undefined>(initial?.icon);
@@ -528,25 +531,20 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
           }
         : undefined,
     costMultiplier: costMultiplier.trim() || undefined,
+    budgetUsd: parseBudget(budget),
     headersJson: headersJson.trim() || undefined,
     icon,
   });
 
   /**
-   * 桌面端对外模型名的**即时**体检（UX#4）—— 提供给 `ModelMappingSection`。
+   * 桌面端对外模型名的**即时**体检（UX#4），给 `ModelMappingSection` 用。
    *
-   * 为什么值得单开一条 IPC：对外名不合规会被 Claude 桌面端**静默过滤掉**，全被过滤则模型
-   * 选择器为空、打开会话报 ModelsNotDiscoveredError（本项目记录过的最难排查的症状之一）。
-   * 此前只在「保存」那一刻拦，用户可能已经填完整个表单（13 个字段）才被拒。
-   * 判据**不在前端复刻**（理由与代价见 `bridge.ts` 那条命令的文档）。
-   *
-   * 🔴 **入参是 mappings 而不是无参**：调用方有两种用法 —— 常规体检传当前值，
-   * 「求一个合规对外名」时传一份把 `expectedName` 置成 `realName` 的探测副本。
-   * 而 draft 必须由这里拼（体检的输入源是 `serviceable_models()`，与保存拦截同一个集合；
-   * 两边各拼一份就会出现「界面说没问题、保存却被拒」的自相矛盾）。
-   *
-   * 防抖、cancelled 竞态、以及「失败只清空、绝不阻断保存」都在 `ModelMappingSection` 里 ——
-   * 那三条约束服务的是那一区的显示，跟着它走。
+   * 单开一条 IPC：对外名不合规会被桌面端**静默过滤**，全滤则选择器为空、报
+   * ModelsNotDiscoveredError（最难排查的症状之一）；只在保存那刻拦则用户可能已填完整表单才被拒。
+   * 判据**不在前端复刻**（见 `bridge.ts`）。入参是 mappings 而非无参：常规体检传当前值、
+   * 「求合规对外名」传一份 `expectedName = realName` 的副本；draft 必由这里拼（与保存拦截同一个
+   * `serviceable_models()` 集合，各拼一份会「界面说没问题、保存却被拒」）。防抖 / cancelled /
+   * 「失败只清空不阻断保存」都在 `ModelMappingSection`。
    */
   const probeDesktopNames = (mappings: ModelMapping[]) =>
     api.checkDesktopModelNames({ ...buildDraftKey(), mappings });
@@ -569,6 +567,7 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
     if (!isValidCostMultiplier(costMultiplier)) {
       return setError(t("balance.multiplierInvalid", { max: String(MAX_COST_MULTIPLIER) }));
     }
+    if (!isValidBudget(budget)) return setError(t("budget.invalid"));
 
     const key = buildDraftKey();
 
@@ -1239,9 +1238,10 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                   </>
                 )}
 
-                {/* 计费倍率：与余额查询无关，但同属「钱」这一类，放一起用户好找。
-                    即使不开余额查询也能配（用量页靠它算金额）。 */}
+                {/* 计费倍率 + 花费预算：与余额查询无关，但同属「钱」这一类，放一起用户好找。
+                    即使不开余额查询也能配（用量页靠倍率算金额、按预算标红告警并在路由里降级）。 */}
                 <CostMultiplierField value={costMultiplier} onChange={setCostMultiplier} t={t} />
+                <BudgetField value={budget} onChange={setBudget} t={t} />
                 <CustomHeadersField value={headersJson} onChange={setHeadersJson} t={t} />
               </div>
             )}

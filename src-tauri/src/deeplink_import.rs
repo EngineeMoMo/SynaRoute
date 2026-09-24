@@ -152,6 +152,7 @@ pub(crate) fn apply_pending(
         balance_query: None,
         cached_balance: None,
         cost_multiplier: None,
+        budget_usd: None, // 深链接不带预算（URL 格式里没有这一项）；用户之后在 Key 编辑器里设
         icon: None,
     };
 

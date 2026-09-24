@@ -7,7 +7,7 @@ import { brandPickerEn, brandPickerZh } from "./i18n.brandPicker";
 import { vendorEn, vendorZh } from "./i18n.vendor";
 import { fieldsEn, fieldsZh } from "./i18n.fields";
 import { mappingEn, mappingZh } from "./i18n.mapping";
-import { brainRunEn, brainRunZh } from "./i18n.brain"; import { sessionsEn, sessionsZh } from "./i18n.sessions";
+import { brainRunEn, brainRunZh } from "./i18n.brain"; import { sessionsEn, sessionsZh } from "./i18n.sessions"; import { resilienceEn, resilienceZh } from "./i18n.resilience";
 import { orderingEn, orderingZh } from "./i18n.ordering";
 
 export type Lang = "zh" | "en";
@@ -453,7 +453,7 @@ const zh: Dict = {
   ...brandPickerZh,
   ...fieldsZh,
   ...mappingZh,
-  ...brainRunZh, ...sessionsZh, ...orderingZh,
+  ...brainRunZh, ...sessionsZh, ...orderingZh, ...resilienceZh,
   "logs.empty": "暂无事件",
   "logs.searchPlaceholder": "搜索日志（Key 名、模型、错误…）",
   "logs.noMatch": "没有匹配「{q}」的日志",
@@ -1130,7 +1130,7 @@ const en: Dict = {
   ...brandPickerEn,
   ...fieldsEn,
   ...mappingEn,
-  ...brainRunEn, ...sessionsEn, ...orderingEn,
+  ...brainRunEn, ...sessionsEn, ...orderingEn, ...resilienceEn,
   "logs.empty": "No events yet",
   "logs.searchPlaceholder": "Search logs (key, model, error…)",
   "logs.noMatch": "No logs match “{q}”",

@@ -10,7 +10,8 @@ import { Badge } from "@/components/ui/Badge";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { HealthBadge } from "@/components/HealthBadge";
 import { BrandIcon } from "@/components/BrandIcon";
-import { BrainRunPanel } from "@/components/BrainRunPanel";
+import { BrainQuickStart } from "@/components/BrainQuickStart";
+import { computeQuickFill } from "@/lib/brainQuickStart";
 import { CodegraphPanel } from "@/components/CodegraphPanel";
 import { useT } from "@/lib/useT";
 import { formatRelativeTime } from "@/lib/utils";
@@ -177,30 +178,16 @@ export function BrainPage() {
 
   // 一键快速配置：可参与聚合的 Key 各取首个模型加为成员，并自动选第一个作决策者。
   // 解决空白配置无从下手的门槛；已有配置时只补齐缺的（幂等，不覆盖用户已调的选择）。
+  // 计算收在 `computeQuickFill` —— BrainQuickStart 的「一键开始」共用同一份，避免两处漂移。
   const quickFill = () => {
     if (!config) return;
-    // 候选：能参与聚合且有已知模型的 Key。口径必须含 `allowInAggregate` ——「全部禁用 + 勾了
-    // 允许聚合」正是该开关设想的典型用法，只认 enabled 会报「请先启用」而它其实已经可用。
-    const usable = keys.filter((k) => (k.enabled || k.allowInAggregate) && k.models.length > 0);
-    if (usable.length === 0) {
+    const patch = computeQuickFill(config, keys);
+    if (!patch) {
       showToast("error", t("brain.quickFillNoKeys"));
       return;
     }
-    // 成员：每个可用 Key 首个模型，跳过已在成员里的（幂等）。
-    const existing = new Set(config.members.map((m) => `${m.keyId}::${m.modelName}`));
-    const added = [...config.members];
-    for (const k of usable) {
-      const model = k.models[0].realName;
-      const ref = `${k.id}::${model}`;
-      if (!existing.has(ref)) {
-        added.push({ id: `bm_${k.id}_${model}`, keyId: k.id, modelName: model });
-        existing.add(ref);
-      }
-    }
-    // 决策者：未选则默认第一个可用 Key 的首个模型。
-    const decider = config.deciderRef || `${usable[0].id}::${usable[0].models[0].realName}`;
-    update({ members: added, deciderRef: decider, enabled: true });
-    showToast("success", t("brain.quickFillDone", { n: added.length }));
+    update(patch);
+    showToast("success", t("brain.quickFillDone", { n: patch.members.length }));
   };
 
   // 就地改成员模型（无需删了重加）。避免与同 Key 下已有成员重复。
@@ -266,6 +253,20 @@ export function BrainPage() {
             <Switch checked={config.enabled} onCheckedChange={(v) => update({ enabled: v })} />
           </CardContent>
         </Card>
+
+        {/* 一键会诊入口：未就绪→显眼的「一键配置并开始」；就绪→运行面板本体
+            （原在页尾、且只有配全了才出现，新用户看不到任何「开始」入口，故上移到这里）。 */}
+        <BrainQuickStart
+          category={category}
+          config={config}
+          keys={keys}
+          onReady={(c) => {
+            // 落盘期间用户可能已切走分类：过期结果不许覆盖当前页（同 loadBrain 的代际防串台）。
+            if (c.categoryId !== categoryRef.current) return;
+            setConfig(c);
+            setSaved(true);
+          }}
+        />
 
         {/* 接入到客户端：配好聚合后一键把 synaroute MCP 写进对应客户端配置（本分类），
             免去绕到「配置预览」弹窗底部。这是「客户端能不能调 synaroute_ai」的关键一步。 */}
@@ -601,11 +602,6 @@ export function BrainPage() {
             <span className="text-xs text-warning">{t("brain.noDecider")}</span>
           )}
         </div>
-
-        {/* 运行聚合面板 */}
-        {config.enabled && config.deciderRef && (
-          <BrainRunPanel category={category} />
-        )}
       </div>
     </div>
   );

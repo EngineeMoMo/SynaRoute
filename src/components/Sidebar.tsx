@@ -11,6 +11,7 @@ import {
   Building2,
   UserRound,
   Gauge,
+  ShieldCheck,
   History,
   Waypoints,
   Search,
@@ -24,6 +25,7 @@ export type NavKey =
   | "sessions"
   | "logs"
   | "usage"
+  | "resilience"
   | "vendors"
   | "settings"
   | "about";
@@ -44,6 +46,7 @@ const NAV: NavItem[] = [
   { key: "sessions", tKey: "nav.sessions", icon: History, group: "feature" },
   { key: "logs", tKey: "nav.logs", icon: ScrollText, group: "feature" },
   { key: "usage", tKey: "nav.usage", icon: Gauge, group: "feature" },
+  { key: "resilience", tKey: "nav.resilience", icon: ShieldCheck, group: "feature" },
   { key: "vendors", tKey: "nav.vendors", icon: Building2, group: "system" },
   { key: "settings", tKey: "nav.settings", icon: Settings, group: "system" },
   { key: "about", tKey: "nav.about", icon: UserRound, group: "system" },

@@ -421,14 +421,11 @@ pub struct ProviderKey {
     pub default_model: Option<String>,
     /// 允许把**用户点名的模型**也兜底改写掉（默认 `false` = 保持既有保护）。逐条 Key 显式打开。
     ///
-    /// 默认「宁可报错也不悄悄换模型」：故障转移到不认识该模型的 Key 时**跳过它**
-    /// （见 [`crate::proxy::model_pool::would_silently_substitute`]）——来自 2026-09-01 现场：
-    /// 选 `grok-4.6`、唯一支持者连续 400、转移到的 Key 兜底改写成 `glm-5.3` 返回 200，日志绿色
-    /// 「成功」，用户一直以为在用 grok。打开 = 接受该代价换「有东西顶上、不至整请求失败」
-    /// （用户 2026-09-20 明确要求：主力 Key 不认 opus，选 opus 只剩两条会抖的候选，一抖就 502）。
-    /// 不用「配了 default_model 就放行」代替：那次事故走的正是 `default_model` 支，配它的人想的是
-    /// 「杂活随便用」，不是「点名时也可换」——两件事。打开后**降级仍留痕**（`note_silent_downgrade`
-    /// 在成功路径独立调用，与本开关无关，日志照旧落 ⚠「你要 A、实际用 B」）。
+    /// 默认「宁可报错也不悄悄换模型」：转移到不认识该模型的 Key 时**跳过它**
+    /// （`crate::proxy::model_pool::would_silently_substitute`）。2026-09-01 现场：选 `grok-4.6`、唯一支持者
+    /// 连续 400、转移到的 Key 改写成 `glm-5.3` 返 200、日志绿「成功」，用户一直以为在用 grok。打开 = 接受该
+    /// 代价换「有东西顶上、不至整请求失败」（2026-09-20 用户要求：主力不认 opus 时选 opus 只剩两条会抖候选、一抖 502）。
+    /// **不用「配了 default_model 就放行」代替**（那次正走此支，意图「杂活随便用」非「点名可换」）；打开后降级仍留痕（`note_silent_downgrade` 独立落 ⚠）。
     #[serde(default)]
     pub allow_named_model_fallback: bool,
     /// 档位快捷映射（取自 cc-switch 的 haiku/sonnet/opus/fable 语义，落到我们的运行时代理）。
@@ -464,6 +461,9 @@ pub struct ProviderKey {
     /// 真正参与运算时才 parse 一次（见 `pricing::calculate_cost_nano`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_multiplier: Option<String>,
+    /// 花费预算上限（美元，累计口径；空=不限）。达到后用量页标红告警，并在路由里把这条 Key 降级（仍兜底、不剔除）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
     /// 这条 Key 的图标**覆盖值**：预设品牌键（`anthropic`/`zhipu`…）或用户上传的 data-URL。
     ///
     /// 为什么 Key 自己要有一个而不是只用厂商的：绝大多数中转站 Key 选的厂商是内置只读的
@@ -2152,7 +2152,7 @@ mod tests {
             tier_opus: None,
             balance_query: None,
             cached_balance: None,
-            cost_multiplier: None,
+            cost_multiplier: None, budget_usd: None,
             icon: None,
             health: HealthState::default(),
         }

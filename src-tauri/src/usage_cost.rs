@@ -101,6 +101,15 @@ pub(crate) struct UsageCostRow {
     /// 跑多个档位模型时偏差恰恰来自这里。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) priced_by_model: Option<String>,
+    /// 用户为这条 Key 设的花费预算（美元，累计口径）。None = 未设 / 已删 Key（墓碑不存预算）。
+    /// 界面据此画「$已花 / $预算」进度条。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) budget_usd: Option<f64>,
+    /// 累计估算花费是否已达/超过预算。仅在设了预算、且算得出金额时可能为 true。
+    /// 🔴 **单一事实来源**：前端不自己比大小，直接渲染这一位 —— 两处各算一遍必然漂移
+    /// （表头说超了、进度条没红，或反过来）。判定口径见 [`budget_status`]。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) over_budget: bool,
 }
 
 /// 这条 Key 的**代表模型**：优先用户配的兜底模型，否则模型列表首个。
@@ -113,6 +122,72 @@ fn repr_model_of(k: &crate::model::ProviderKey) -> Option<String> {
         .clone()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| k.models.first().map(|m| m.real_name.clone()))
+}
+
+/// 累计估算花费（纳美元）相对预算（美元）的关系。返回 `(要回显给界面的预算, 是否超支)`。
+///
+/// 🔴 **预算无效一律视同未设**：`None` / `≤0` / 非有限（NaN/Inf）都返回 `(None, false)`，
+/// 不让一个笔误（把预算填成 0）把每条 Key 都标成超支。同 `balance_gate` 那条
+/// 「查不到 ≠ 为零」的口径：宁可不管，也不误伤。
+/// **没花过钱（`cost_nano == None`）不算超支** —— 一条还没跑过请求的新 Key，哪怕设了预算也不该标红。
+fn budget_status(cost_nano: Option<u64>, budget: Option<f64>) -> (Option<f64>, bool) {
+    let Some(b) = budget.filter(|b| b.is_finite() && *b > 0.0) else {
+        return (None, false);
+    };
+    // 达到即算超（`>=`）：预算的语义是「别超过这个数」，正好等于它已经该提醒了。
+    let over = cost_nano.is_some_and(|c| c as f64 / 1e9 >= b);
+    (Some(b), over)
+}
+
+/// 这条**活着的** Key 的累计估算花费是否已达/超过它设的预算。
+///
+/// 路由降级（`Store::candidates_for` → `model_pool::rank_candidates_budgeted`）与用量页
+/// **共用这一套** `estimate_cost` + [`budget_status`] —— 不另立第二份「怎么算花费 / 算不算超」，
+/// 否则「用量页标红了、路由却没降级」这类漂移必然出现，且失效是静默的。
+///
+/// `usage` 是该 Key 的累计 token（调用方从 `store.token_usage_by_key()` 取）。预算无效
+/// （None/≤0/NaN）时 `budget_status` 返回 `false`，故本函数对没设预算的 Key 恒为 false。
+pub(crate) fn key_over_budget(
+    usage: &crate::model::TokenUsage,
+    key: &crate::model::ProviderKey,
+) -> bool {
+    let (cost, _) = crate::pricing::estimate_cost(
+        usage,
+        repr_model_of(key).as_deref(),
+        key.cost_multiplier.as_deref(),
+    );
+    budget_status(cost, key.budget_usd).1
+}
+
+/// 某分类下**累计估算花费已达/超预算**的 Key id 集合（路由降级用，`Store::candidates_for` 调）。
+///
+/// 放这里而不是 `store.rs`：那边在棘轮上余量为 0，而本模块本就持有「花费怎么算」的全部口径
+/// （[`key_over_budget`] → `estimate_cost` + [`budget_status`]）。现算不缓存、永远新鲜，不像余额要打网络。
+///
+/// 🔴 **无预算 Key 时必须廉价早退**（`category_has_budget`：一次 `config.read` + `any`，不 clone）。
+/// 这是**每请求**路径（`candidates_for` → `proxy`），而下面的 `list_keys` 会 clone 全部 Key
+/// （约 180 个 ModelInfo，正是 `candidates_for` 文档里点名要避开的那次浪费）+ `token_usage_by_key`
+/// clone 全量用量 + 一次磁盘 stat。绝大多数用户不设预算，不早退 = 每请求白付这三笔。
+pub(crate) fn over_budget_ids(
+    store: &Store,
+    category: CategoryType,
+) -> std::collections::HashSet<String> {
+    if !store.category_has_budget(category) {
+        return std::collections::HashSet::new();
+    }
+    let usage: std::collections::HashMap<String, crate::model::TokenUsage> = store
+        .token_usage_by_key()
+        .into_iter()
+        .filter(|r| r.category_id == category)
+        .map(|r| (r.key_id, r.usage))
+        .collect();
+    store
+        .list_keys(category)
+        .into_iter()
+        .filter(|k| k.budget_usd.is_some())
+        .filter(|k| usage.get(&k.id).is_some_and(|u| key_over_budget(u, k)))
+        .map(|k| k.id)
+        .collect()
 }
 
 /// 按「分类 × Key」聚合的用量 **+ 成本估算**。
@@ -226,6 +301,10 @@ pub(crate) fn rows(store: &Store) -> Vec<UsageCostRow> {
             // 界面就显示 $0.0000 —— 而那读起来是「已经在用、而且免费」。
             let cost_nano = if has_recorded_usage { cost_nano } else { None };
 
+            // 花费预算：只认活着的 Key（墓碑不存预算），预算无效或还没花过钱都不标超支。
+            let (budget_usd, over_budget) =
+                budget_status(cost_nano, key.as_ref().and_then(|k| k.budget_usd));
+
             UsageCostRow {
                 category_id: r.category_id,
                 // 聚合行（key_id 为空串）不算「已删除」——它压根没有 Key。
@@ -243,6 +322,8 @@ pub(crate) fn rows(store: &Store) -> Vec<UsageCostRow> {
                 multiplier: mult,
                 unpriced_reason,
                 priced_by_model: cost_nano.is_some().then_some(hint).flatten(),
+                budget_usd,
+                over_budget,
             }
         })
         .collect()
@@ -699,6 +780,55 @@ mod tests {
         let r = rows(&store).into_iter().find(|r| r.key_id == "blank").unwrap();
         assert!(r.cost_nano.is_some(), "空白兜底模型应回退到 models[0]");
         assert_eq!(r.priced_by_model.as_deref(), Some("claude-sonnet-4-5"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 🔴 **用户要的功能**：给 Key 设花费预算，累计估算花费到顶就标红/告警。
+    ///
+    /// 纯函数边界 + 端到端各覆盖一半：`budget_status` 判无效预算/未花钱不误伤，
+    /// `rows()` 把它接到真实 Key 上。故障注入：把 `over` 恒置 false → e2e 变红；
+    /// 把预算无效那道门去掉（`Some(0.0)` 也当有效）→ 边界断言变红。
+    #[test]
+    fn a_budget_flags_the_row_once_cumulative_cost_reaches_it() {
+        // 纯函数：达到即超、没花过钱不超、无效预算视同未设。
+        assert_eq!(budget_status(Some(5_000_000_000), Some(3.0)), (Some(3.0), true), "$5 ≥ $3");
+        assert_eq!(budget_status(Some(2_000_000_000), Some(3.0)), (Some(3.0), false), "$2 < $3");
+        assert_eq!(budget_status(Some(3_000_000_000), Some(3.0)), (Some(3.0), true), "达到即算超");
+        assert_eq!(budget_status(None, Some(3.0)), (Some(3.0), false), "还没花过钱不算超");
+        assert_eq!(budget_status(Some(9_000_000_000), None), (None, false), "没设预算不触发");
+        assert_eq!(budget_status(Some(9_000_000_000), Some(0.0)), (None, false), "预算 0 视同未设");
+        assert_eq!(budget_status(Some(9_000_000_000), Some(-1.0)), (None, false), "负预算视同未设");
+        assert_eq!(budget_status(Some(9_000_000_000), Some(f64::NAN)), (None, false), "NaN 视同未设");
+
+        // 端到端：设了 $0.001 的极低预算，跑一笔真实用量后必被标红并回显预算值。
+        let (store, dir) = temp_store("budget_flag");
+        let mut k = key(CategoryType::ClaudeCli);
+        k.id = "capped".into();
+        k.default_model = Some("claude-sonnet-4-5".into());
+        k.budget_usd = Some(0.001);
+        store.upsert_key(k).unwrap();
+        store.append_event_full(
+            CategoryType::ClaudeCli,
+            "route",
+            Some("capped"),
+            "转发",
+            None,
+            None,
+            Some(crate::upstream::TokenUsage { input: 100_000, output: 10_000, ..Default::default() }),
+        );
+        let row = rows(&store).into_iter().find(|r| r.key_id == "capped").unwrap();
+        assert_eq!(row.budget_usd, Some(0.001), "预算值要回显给界面画进度条");
+        assert!(row.over_budget, "累计花费已超过 $0.001 预算，必须标红");
+
+        // 占位行（设了预算但还没花过钱）不许标红。
+        let mut fresh = key(CategoryType::ClaudeCli);
+        fresh.id = "fresh".into();
+        fresh.budget_usd = Some(1.0);
+        store.upsert_key(fresh).unwrap();
+        let frow = rows(&store).into_iter().find(|r| r.key_id == "fresh").unwrap();
+        assert_eq!(frow.budget_usd, Some(1.0), "未花钱也要回显预算（进度条显示 $0 / $1）");
+        assert!(!frow.over_budget, "还没产生花费的新 Key 不该被标成超预算");
 
         std::fs::remove_dir_all(&dir).ok();
     }

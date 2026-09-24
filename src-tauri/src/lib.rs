@@ -1372,7 +1372,7 @@ pub fn run() {
             get_effective_log_dir,
             prepare_log_dir,
             open_log_dir,
-            export_diagnostics,
+            export_diagnostics, diagnostics::resilience::resilience_overview,
             export_config,
             pick_and_preview_import,
             apply_import_config,

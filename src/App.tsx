@@ -6,6 +6,7 @@ import { BrainPage } from "@/pages/BrainPage";
 import { LogsPage } from "@/pages/LogsPage";
 import { CodexSessionsPage } from "@/pages/CodexSessionsPage";
 import { UsagePage } from "@/pages/UsagePage";
+import { ReliabilityPage } from "@/pages/ReliabilityPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { AboutPage } from "@/pages/AboutPage";
 import { VendorPage } from "@/pages/VendorPage";
@@ -203,6 +204,7 @@ export default function App() {
     if (nav === "sessions") return <CodexSessionsPage />;
     if (nav === "logs") return <LogsPage />;
     if (nav === "usage") return <UsagePage />;
+    if (nav === "resilience") return <ReliabilityPage />;
     if (nav === "vendors") return <VendorPage />;
     if (nav === "settings") return <SettingsPage />;
     if (nav === "about") return <AboutPage />;

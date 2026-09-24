@@ -2225,27 +2225,23 @@ impl Store {
         })
     }
 
-    /// 路由候选：一次读锁内完成「筛分类+启用 → 排序 → 剔除被运行态挡住的」，
-    /// **只对最终入选者克隆**。返回 (候选列表, 是否触发了兜底)。
+    /// 路由候选：一把读锁内完成「筛分类+启用 → 排序 → 剔除被运行态挡住的」，**只对最终入选者克隆**。
+    /// 返回 (候选列表, 是否触发兜底)。
     ///
-    /// 排序键与兜底语义的**全部**判据在 [`crate::proxy::model_pool::rank_candidates`]
-    /// —— 含「能原生服务本次模型 > 余额未耗尽 > priority」这个三位键为什么要这么排。
-    /// 本函数只负责在一把读锁内把 `cfg.keys` 借给它，那是它必须留在 `Store` 上的唯一理由。
-    ///
-    /// 为什么不用 `enabled_keys_sorted` + `health::select_candidates`：那条路径克隆**两轮全量
-    /// 启用 Key**（前者在筛选排序**之前**就 `.cloned()`，后者拿到 Vec 后再 `.cloned()`）。
-    /// `ProviderKey` 带 `models`/`mappings` 两个 Vec，6 条 Key × 各 30 个 ModelInfo 就是单请求
-    /// 克隆约 180 个 ModelInfo 两轮 —— 纯浪费，且**随 Key 数与模型数线性放大**（配得越全越慢）。
+    /// 排序键与兜底语义的**全部**判据在 [`crate::proxy::model_pool::rank_candidates_budgeted`]（四位键
+    /// 「能原生服务 > 余额未耗尽 > 超预算 > priority」为何这么排都在那）；本函数只在读锁内把 `cfg.keys`
+    /// 借给它 —— 那是它必须留在 `Store` 上的唯一理由。不走 `enabled_keys_sorted` + `health::select_candidates`：
+    /// 那条路克隆**两轮**全量启用 Key（各 `.cloned()` 一次），单请求约 180 个 ModelInfo ×2 纯浪费、随 Key×模型线性放大。
     ///
     /// `requested_model`：客户端要的对外模型名。传空串则不叠加模型维度的两条判据。
-    pub fn candidates_for(
-        &self,
-        category: CategoryType,
-        requested_model: &str,
-    ) -> (Vec<ProviderKey>, bool) {
+    pub fn candidates_for(&self, category: CategoryType, requested_model: &str) -> (Vec<ProviderKey>, bool) {
+        let over = crate::usage_cost::over_budget_ids(self, category);
         let cfg = self.config.read();
-        crate::proxy::model_pool::rank_candidates(&cfg.keys, category, requested_model)
+        crate::proxy::model_pool::rank_candidates_budgeted(&cfg.keys, category, requested_model, &over)
     }
+
+    /// 本分类有无 Key 设了预算 —— 供 over_budget_ids 廉价早退（不 clone / 不碰磁盘 / 不扫用量）。
+    pub fn category_has_budget(&self, category: CategoryType) -> bool { self.config.read().keys.iter().any(|k| k.category_id == category && k.budget_usd.is_some()) }
 
     /// 某分类下启用 Key 的 id 列表（按优先级升序）。
     ///
@@ -2961,7 +2957,7 @@ mod tests {
             tier_opus: None,
             balance_query: None,
             cached_balance: None,
-            cost_multiplier: None,
+            cost_multiplier: None, budget_usd: None,
             icon: None,
             health: HealthState::default(),
         }

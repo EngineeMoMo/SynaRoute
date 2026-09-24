@@ -21,6 +21,7 @@ import type {
 } from "@/types";
 import type { UserPrefs } from "@/lib/prefs";
 import { mockUsageWithCost } from "./mockData.usage";
+import { mockResilienceOverview } from "./mockData.resilience";
 import { MOCK_VENDORS } from "./mockData.vendors";
 import { mockEvents } from "./mockData.events";
 import {
@@ -642,6 +643,12 @@ export const mockBridge = {
   async usageWithCost(): Promise<UsageCostRow[]> {
     await delay();
     return mockUsageWithCost(store, await this.tokenUsage());
+  },
+
+  /** 可靠性总览的 mock（逐 Key 铺开每种弹性状态，见 mockData.resilience）。 */
+  async resilienceOverview() {
+    await delay();
+    return mockResilienceOverview(store);
   },
 
   /**
