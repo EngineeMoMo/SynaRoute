@@ -261,6 +261,37 @@ Hero 的平台徽标、首页下载区、下载页三处都读同一份数据，
 三处一起改：`vite.config.ts` 的 `base` 改成 `"/SynaRoute/"`、
 `config/site.ts` 的 `url`、`scripts/postbuild.mjs` 的 `SITE_URL`，并删掉 `public/CNAME`。
 
+## SEO / 预渲染 / sitemap（收到 Google「站点地图 404」先读这一节）
+
+官网是 GitHub Pages 上的 SPA。**没有预渲染时，除首页外每条内容路由都真返 HTTP 404**
+（Pages 无对应文件、只用 404.html 兜底并带 404 状态），首页又是空壳 CSR、正文全靠 JS ——
+两者叠加 → Google 判「已抓取尚未编入索引」，曾排第一的页掉出索引。这是 `17e7bbc` 修的。
+
+机制：`scripts/prerender.mjs` 用 CDP 连系统 Chrome，把每条路由渲染成带完整正文的静态 HTML，
+**双写** `<route>.html` + `<route>/index.html`（无论 Pages 如何解析无扩展名 URL 都命中真实
+文件、返 200）；`build` 管线在 postbuild 后接入它。SPA 仍在其上启动。
+
+🔴 **路由清单有两份，加/删页面必须两处一起改**：`scripts/postbuild.mjs`（生成 sitemap）与
+`scripts/prerender.mjs` 各写一份 `LANGS`/`PATHS`（prerender 顶部注释也写了「两处一起改」）。
+只改一份的失效方向都**静默**：只进 sitemap 不进 prerender → sitemap 里那条真 404（正是本节要
+防的）；只进 prerender 不进 sitemap → 页在但 Google 发现不了。
+
+🔴 **`deploy-site.yml` 那道「双份 HTML 必须含 `<main>`」的可证伪判据别删**：Chrome 缺失时
+prerender 会静默退回 CSR 空壳，那句 `grep -q "<main"` 是唯一会拦住空壳上线的东西。
+
+**收到 GSC「站点地图中的网页无法被编入索引 · 未找到(404)」报告时，先量线上、别急着改 prerender：**
+
+1. 逐条量 sitemap 里 URL 的真实状态：
+   `curl -s -o /dev/null -w "%{http_code}" -A "Googlebot/2.1" <url>`。全 200 = 站点没坏。
+2. GSC 索引报告**滞后 1~4 周**，修复后不会立刻转绿，要在报告页点「**验证修复**」促其重爬；
+   也可用「网址检查」查一条被报的 404，显示「网址可用」即证实修复已生效、只差重爬。
+3. 拿报告里**具体** 404 URL 列表再分流：当前 sitemap 里的（现返 200）= 滞后；
+   `mofamilys.com` 顶点域 = DNS 问题（顶点域无 A 记录，只有 `synaroute` 子域指向 GH Pages）；
+   别的老路径 / 带 `.html` / 带参数 = 另查。
+4. 记住「代码里存在一条能产生该症状的路径 ≠ 用户此刻遇到的就是它」—— 那条 404 路径已被 SSG
+   修好返 200，再动 prerender 就是打错方向。2026-09-24 实测：全部 18 条 URL 线上返 200、
+   首页 `/zh` 有真实 `<main>`（105KB），那次报告是 GSC 滞后数据，不是站点又坏了。
+
 ## 文案准则
 
 官网只写能在代码里取证的事实。具体禁区写在 `src/i18n/zh.ts` 顶部的注释里，
