@@ -4,8 +4,8 @@
 //!
 //! | 模式 | 密钥来源 | 换机可用 | 需要输口令 |
 //! |---|---|---|---|
-//! | **DPAPI**（默认） | Windows `CryptProtectData`，绑当前用户账户 | ❌ 解不出 | 否 |
-//! | **主口令**（FR-018 可选增强） | Argon2id 从用户口令派生（[`crate::crypto`]） | ✅ | 每次启动解锁一次 |
+//! | **系统保护**（Windows/macOS 默认） | Windows DPAPI / macOS Keychain | ❌ | 否 |
+//! | **主口令**（Linux 强制，其他平台可选） | Argon2id 从用户口令派生（[`crate::crypto`]） | ✅ | 每次启动解锁一次 |
 //!
 //! 模式记录在密钥库文件自身（`master` 字段在即为主口令模式），**它是唯一事实来源**；
 //! `settings.master_password_enabled` 只是给 UI 看的镜像，启动时按库对账。
@@ -54,6 +54,7 @@ struct SecretVault {
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MasterPasswordState {
+    pub required: bool,
     /// 是否处于主口令模式（判据是密钥库里有 `master` 头部，不看 settings）
     pub enabled: bool,
     /// 是否已锁定（主口令模式但本次进程还没解锁）。DPAPI 模式恒 `false`
@@ -201,7 +202,11 @@ impl SecretStore {
     }
 
     pub fn master_state(&self) -> MasterPasswordState {
-        MasterPasswordState { enabled: self.is_master_mode(), locked: self.is_locked() }
+        MasterPasswordState {
+            required: cfg!(all(not(windows), not(target_os = "macos"))),
+            enabled: self.is_master_mode(),
+            locked: self.is_locked(),
+        }
     }
 
     /// 用口令解锁。口令错则**不改变**已解锁状态（避免「输错一次把已解锁的库锁回去」）。
@@ -481,6 +486,9 @@ impl SecretStore {
     ///
     /// 要求已解锁（或当场用给定口令解锁）——否则解不出任何密钥，关闭等于清空密钥库。
     pub fn disable_master_password(&mut self, password: &str) -> AppResult<usize> {
+        if self.master_state().required {
+            return Err(AppError::Invalid("此平台必须使用主口令保护密钥，不能关闭；可修改主口令。".into()));
+        }
         if !self.is_master_mode() {
             return Err(AppError::Invalid("当前不是主口令模式，无需关闭".into()));
         }
@@ -644,11 +652,11 @@ impl SecretStore {
 // |---|---|---|---|
 // | Windows | 系统（DPAPI，绑用户账户） | 系统内核态 | ❌ |
 // | macOS | 系统（Keychain，绑登录态） | 本进程 AES-256-GCM | ❌ |
-// | 其他 Unix | **编译期常量**（仅开发） | 本进程 AES-256-GCM | ⚠️ 等同明文 |
+// | Linux 等 | 用户主口令（强制） | Argon2id + AES-256-GCM | ✅ |
 //
 // **刻意不再叫 `dpapi_*`**：非 Windows 那份从来就不是 DPAPI，而名字说是。
 // 这类「名字与实现不符」正是密钥回退分支的缺陷能长期无人发现的原因之一
-// （详见 `fallback_key` 的发现史）。缓存字段也从 `dpapi_cache` 一并改成 `os_cache`。
+// 缓存字段也从 `dpapi_cache` 一并改成 `os_cache`。
 //
 // 测试名里保留的 `dpapi` 字样（如 `..._falling_back_to_dpapi`）指的是**默认模式**这个概念，
 // 不是特指 Win32 API —— 那些判据跨平台同样成立（mac 上默认模式是 Keychain），故不改名。
@@ -856,62 +864,27 @@ fn to_key32(bytes: &[u8]) -> AppResult<[u8; 32]> {
     Ok(key)
 }
 
-// ---- 其他 Unix（Linux 等）：仅开发用，不可分发 ----
-
 #[cfg(all(not(windows), not(target_os = "macos")))]
-fn os_encrypt(plain: &[u8]) -> AppResult<Vec<u8>> {
-    aes_encrypt(&fallback_key(), plain)
+fn os_encrypt(_plain: &[u8]) -> AppResult<Vec<u8>> {
+    Err(AppError::Crypto("Linux 等平台必须先在「设置 → 安全」启用主口令，才能保存密钥。".into()))
 }
 
 #[cfg(all(not(windows), not(target_os = "macos")))]
-fn os_decrypt(cipher: &[u8]) -> AppResult<Vec<u8>> {
-    aes_decrypt(&fallback_key(), cipher)
-}
-
-/// **非 Windows 非 macOS**（Linux 等）的开发期回退密钥。
-///
-/// ⚠️ **不是生产可用的方案**，且刻意在运行时喊出来。这把密钥是编译进二进制的常量 ——
-/// 谁拿到 `secrets.enc` 加一份程序就能全解出来。Windows 走 DPAPI、macOS 走 Keychain，
-/// 两者都由系统托管密钥；只有这条分支没有系统级密钥保管可用，故仅供本地开发调试。
-/// 若将来要正式支持 Linux，正解是接 Secret Service（libsecret）或强制主口令模式。
-///
-/// **发现史**（说明这条路径从未被走过）：原实现返回 `*b"synaroute-dev-fallback-key-32byte"`
-/// —— 那个字面量是 **33 字节**（名字里写着 32，数错了），于是整个
-/// `#[cfg(not(windows))]` 分支**根本编译不过**。注释声称「开发期在其他平台也能编译」，
-/// 而在 macOS runner 上首次编译即 E0308。这也解释了为什么这个缺陷能长期存在：
-/// Windows 上永远看不到它。
-///
-/// cfg 门刻意与调用方（`os_encrypt`/`os_decrypt` 的第三份实现）**完全一致**：
-/// 写成 `not(windows)` 会让它在 macOS 上变成死代码 → dead_code 警告 → 撞破
-/// 「clippy 零警告」基线。这不是洁癖，是让基线继续能当门禁用。
-#[cfg(all(not(windows), not(target_os = "macos")))]
-fn fallback_key() -> [u8; 32] {
-    // 每进程只喊一次，避免转发热路径把日志刷爆；但一定要喊 ——
-    // 本项目反复防的就是「看起来在加密、其实等于明文」这种静默降级。
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        tracing::error!(
-            "密钥库正在使用**编译期常量**回退密钥（非 Windows 平台）。\
-             这等同于明文存储，仅供开发调试。生产分发前必须接 Keychain 或强制主口令模式。"
-        );
-    });
-
-    // 从固定串取前 32 字节。刻意不改成「凑成 32 字节的新字面量」——
-    // 那样只是把数错的字节数掩盖掉，而这把密钥的问题不在长度、在于它是常量。
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&b"synaroute-dev-fallback-key-32byt"[..32]);
-    key
+fn os_decrypt(_cipher: &[u8]) -> AppResult<Vec<u8>> {
+    Err(AppError::Crypto(
+        "已拒绝读取旧版固定密钥保护的密钥库，原文件未被修改。请退出应用并备份 secrets.enc，将旧文件移出应用数据目录，重启后先启用主口令，再重新录入上游密钥；建议轮换旧密钥。".into(),
+    ))
 }
 
 /// AES-256-GCM，非 Windows 平台的实际加解密实现。
 ///
-/// **macOS 上这是生产路径**（密钥来自 Keychain），其他 Unix 上是开发回退（密钥是常量）。
+/// macOS 系统保护路径（密钥来自 Keychain）；Linux 使用主口令加密模块。
 /// 两者共用同一套密码学实现、只有密钥来源不同 —— 故这段代码的正确性对 macOS 是有效要求，
 /// 不是「反正只在开发时跑」。
 ///
 /// 输出布局 `nonce(12) || ciphertext||tag`。nonce 每次随机（`OsRng`），
 /// 故同一明文两次加密的密文不同 —— 这是 GCM 的硬要求（nonce 重用会泄露密钥流）。
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn aes_encrypt(key: &[u8; 32], plain: &[u8]) -> AppResult<Vec<u8>> {
     use aes_gcm::aead::{Aead, KeyInit, OsRng};
     use aes_gcm::{Aes256Gcm, Nonce};
@@ -926,7 +899,7 @@ fn aes_encrypt(key: &[u8; 32], plain: &[u8]) -> AppResult<Vec<u8>> {
     Ok(out)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn aes_decrypt(key: &[u8; 32], data: &[u8]) -> AppResult<Vec<u8>> {
     use aes_gcm::aead::{Aead, KeyInit};
     use aes_gcm::{Aes256Gcm, Nonce};
@@ -1163,6 +1136,7 @@ mod tests {
 
         // 先造一份**健康**的库（两条密钥），落盘。
         let mut healthy = SecretStore::load(path.clone()).unwrap();
+        healthy.enable_master_password("TestPass123").unwrap();
         healthy.set("k1", "sk-first").unwrap();
         healthy.set("k2", "sk-second").unwrap();
         let on_disk = std::fs::read(&path).unwrap();
@@ -1187,7 +1161,8 @@ mod tests {
             "降级态删 Key 不许碰磁盘 —— 写下去就是把健康库换成空库，用户全部密钥丢失"
         );
         // 重启即恢复：两条密钥都还在。
-        let reopened = SecretStore::load(path.clone()).unwrap();
+        let mut reopened = SecretStore::load(path.clone()).unwrap();
+        reopened.unlock("TestPass123").unwrap();
         assert!(!reopened.is_degraded(), "重新读应当成功");
         let got = |s: &SecretStore, id: &str| s.get(id).unwrap().map(|v| v.to_string());
         assert_eq!(got(&reopened, "k1").as_deref(), Some("sk-first"));
@@ -1289,6 +1264,7 @@ mod tests {
     ///
     /// 逐个覆盖：`set`（更新同一条）/ `remove` / `lock`（**必须清**，否则「立即锁定」名不副实）
     /// / 三个整库迁移 / `unlock`。
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn os_cache_invalidates_on_every_mutation() {
         let dir = temp_dir("cache_invalidate");
@@ -1356,8 +1332,8 @@ mod tests {
     fn master_mode_does_not_cache_and_locked_still_errs() {
         let dir = temp_dir("cache_master_mode");
         let mut s = SecretStore::load(dir.join("secrets.enc")).unwrap();
-        s.set("k1", "sk-secret").unwrap();
         s.enable_master_password("pw-123456").unwrap();
+        s.set("k1", "sk-secret").unwrap();
 
         // 主口令模式：get_caching 不应写缓存
         assert_eq!(
@@ -1396,6 +1372,7 @@ mod tests {
     }
 
     /// 降级态首次写入:必须先把原文件备份成 .enc.corrupt-*,防「空库+新单条」整份覆盖销毁既有密文。
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn degraded_first_persist_backs_up_original() {
         let dir = temp_dir("degraded_backup");
@@ -1460,6 +1437,7 @@ mod tests {
     }
 
     /// 正常路径:文件不存在→空库、无降级标记;写入无备份副作用。
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn fresh_vault_set_get_roundtrip() {
         let dir = temp_dir("fresh");
@@ -1482,6 +1460,7 @@ mod tests {
     // ---- 主口令增强模式（FR-018 可选增强）----
 
     /// 启用主口令：既有 DPAPI 密钥必须全部迁移过去、仍能读出原值，且落盘后重开也能解锁读到。
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn enabling_master_password_migrates_existing_secrets_and_survives_reload() {
         let dir = temp_dir("master_on");
@@ -1525,8 +1504,8 @@ mod tests {
         let dir = temp_dir("master_locked");
         let path = dir.join("secrets.enc");
         let mut store = SecretStore::load(path.clone()).unwrap();
-        store.set("k1", "sk-x").unwrap();
         store.enable_master_password("TestPass123").unwrap();
+        store.set("k1", "sk-x").unwrap();
         drop(store);
 
         let store = SecretStore::load(path).unwrap();
@@ -1564,8 +1543,8 @@ mod tests {
         let dir = temp_dir("master_wrong_pw");
         let path = dir.join("secrets.enc");
         let mut store = SecretStore::load(path).unwrap();
-        store.set("k1", "sk-x").unwrap();
         store.enable_master_password("RightPass123").unwrap();
+        store.set("k1", "sk-x").unwrap();
         assert!(!store.is_locked());
 
         let err = store.unlock("WrongPass999").unwrap_err().to_string();
@@ -1594,13 +1573,14 @@ mod tests {
     }
 
     /// 关闭主口令：全部密钥改回 DPAPI，且必须输对当前口令才能关。
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn disabling_master_password_requires_password_and_migrates_back() {
         let dir = temp_dir("master_off");
         let path = dir.join("secrets.enc");
         let mut store = SecretStore::load(path.clone()).unwrap();
-        store.set("k1", "sk-one").unwrap();
         store.enable_master_password("TestPass123").unwrap();
+        store.set("k1", "sk-one").unwrap();
 
         // 错口令不得关闭（防止有人趁已解锁的机器直接撤掉保护）。
         assert!(store.disable_master_password("WrongPass999").is_err());
@@ -1624,8 +1604,8 @@ mod tests {
         let dir = temp_dir("master_change");
         let path = dir.join("secrets.enc");
         let mut store = SecretStore::load(path.clone()).unwrap();
-        store.set("k1", "sk-one").unwrap();
         store.enable_master_password("OldPass123").unwrap();
+        store.set("k1", "sk-one").unwrap();
         let old_salt = {
             let v: SecretVault = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             v.master.unwrap().kdf.salt
@@ -1673,15 +1653,14 @@ mod tests {
             // 入口 A：启用
             let dir = temp_dir("pw_policy_enable");
             let mut s = SecretStore::load(dir.join("secrets.enc")).unwrap();
-            s.set("k1", "sk-one").unwrap();
             let enable_err = s.enable_master_password(pw).is_err();
             std::fs::remove_dir_all(&dir).ok();
 
             // 入口 B：修改（先用合格口令启用，再尝试改成 pw）
             let dir2 = temp_dir("pw_policy_change");
             let mut s2 = SecretStore::load(dir2.join("secrets.enc")).unwrap();
-            s2.set("k1", "sk-one").unwrap();
             s2.enable_master_password("GoodPass123").unwrap();
+            s2.set("k1", "sk-one").unwrap();
             let change_err = s2.change_master_password("GoodPass123", pw).is_err();
 
             assert!(
@@ -1699,8 +1678,8 @@ mod tests {
         let dir3 = temp_dir("pw_policy_ok");
         let path3 = dir3.join("secrets.enc");
         let mut s3 = SecretStore::load(path3.clone()).unwrap();
-        s3.set("k1", "sk-one").unwrap();
         s3.enable_master_password("GoodPass123").unwrap();
+        s3.set("k1", "sk-one").unwrap();
         s3.change_master_password("GoodPass123", accepted)
             .expect("合格口令必须能修改成功");
         let mut reopened = SecretStore::load(path3).unwrap();
@@ -1714,6 +1693,7 @@ mod tests {
     }
 
     /// 整份重写前必须留备份（唯一一次全量重写密文的操作，写坏就全没了）。
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn mode_switch_backs_up_vault_before_rewriting() {
         let dir = temp_dir("master_backup");
@@ -1778,8 +1758,8 @@ mod tests {
     fn manual_lock_takes_effect_immediately() {
         let dir = temp_dir("master_manual_lock");
         let mut store = SecretStore::load(dir.join("secrets.enc")).unwrap();
-        store.set("k1", "sk-x").unwrap();
         store.enable_master_password("TestPass123").unwrap();
+        store.set("k1", "sk-x").unwrap();
         assert!(store.get("k1").is_ok());
 
         store.lock();
@@ -1798,8 +1778,8 @@ mod tests {
         let dir = temp_dir("master_remove");
         let path = dir.join("secrets.enc");
         let mut store = SecretStore::load(path.clone()).unwrap();
-        store.set("k1", "sk-x").unwrap();
         store.enable_master_password("TestPass123").unwrap();
+        store.set("k1", "sk-x").unwrap();
         // 人为造出「两处都有」的中断态
         store.vault.entries.insert("k1".into(), "stale-dpapi".into());
         store.remove("k1").unwrap();
@@ -1814,6 +1794,7 @@ mod tests {
     /// 不清的后果不是「多占空间」，而是**读出过期密钥**：`get` 按当前模式单边读，切模式后会
     /// 拿到残留的那条旧密文 —— 用户明明更新过密钥，转发却仍用改之前那条、继续报鉴权失败，
     /// 且从 UI 上完全看不出原因。
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn set_clears_stale_cipher_in_the_other_map_both_directions() {
         let dir = temp_dir("set_cross_clear");
@@ -1854,6 +1835,7 @@ mod tests {
     /// 上一把口令派生的密钥，新口令解不开、DPAPI 也解不开，**永久丢失且无任何提示**。
     ///
     /// 取并集后最坏情况是「多试解一条、失败即整体放弃」，不会丢数据。
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn migration_covers_union_of_both_maps_not_just_current_mode() {
         let dir = temp_dir("union_ids");
@@ -1893,4 +1875,51 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn linux_requires_master_password_without_mutating_unprotected_vault() {
+        let dir = temp_dir("linux_required");
+        let path = dir.join("secrets.enc");
+        let mut store = SecretStore::load(path.clone()).unwrap();
+        assert!(store.master_state().required);
+        assert!(store.set("key", "secret-value").is_err());
+        assert!(!path.exists());
+        assert!(store.vault.entries.is_empty());
+        store.enable_master_password("TestPass123").unwrap();
+        store.set("key", "secret-value").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(store.disable_master_password("TestPass123").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let mut reopened = SecretStore::load(path.clone()).unwrap();
+        assert!(reopened.is_locked());
+        assert!(reopened.get("key").is_err());
+        reopened.unlock("TestPass123").unwrap();
+        assert_eq!(reopened.get("key").unwrap().unwrap().as_str(), "secret-value");
+        reopened.change_master_password("TestPass123", "NewPass456").unwrap();
+        reopened.lock();
+        reopened.unlock("NewPass456").unwrap();
+        assert_eq!(reopened.get("key").unwrap().unwrap().as_str(), "secret-value");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn linux_rejects_legacy_and_empty_vault_downgrades_without_data_loss() {
+        let dir = temp_dir("linux_legacy");
+        let path = dir.join("secrets.enc");
+        let mut store = SecretStore::load(path.clone()).unwrap();
+        store.vault.entries.insert("legacy".into(), STANDARD.encode(b"old-ciphertext"));
+        store.persist().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(store.get("legacy").is_err());
+        assert!(store.enable_master_password("TestPass123").is_err());
+        assert!(store.set("legacy", "replacement").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let mut empty = SecretStore::load(dir.join("empty.enc")).unwrap();
+        empty.enable_master_password("TestPass123").unwrap();
+        assert!(empty.disable_master_password("TestPass123").is_err());
+        assert!(empty.is_master_mode());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
 }

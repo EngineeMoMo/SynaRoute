@@ -10,18 +10,20 @@ SynaRoute is a desktop application that runs entirely on your own machine. It ha
 
 ### Where data is stored
 
-All configuration and keys live in a `SynaRoute` folder under your user's application data directory on your computer:
+Config (config.json) and keys (secrets.enc) live in the user data directory: usually %APPDATA%\SynaRoute on Windows, ~/Library/Application Support/SynaRoute on macOS, and $XDG_DATA_HOME/SynaRoute (or ~/.local/share/SynaRoute) on Linux. Logs may be elsewhere; check the actual path in Settings.
+
+SYNAROUTE_DATA_DIR overrides the config and vault directory when set; use the actual configured path. Keys are stored locally, not uploaded to a SynaRoute cloud; upstream requests use them to authenticate to your configured endpoints.
 
 - `config.json` — your key list, model mappings and settings;
 - `secrets.enc` — your encrypted API keys.
 
-Log files are written to a `logs` folder next to the application by default, and can be pointed elsewhere in Settings.
+Logs contain metadata by default; enabling conversation logging includes message bodies and system prompts, so use it only temporarily for troubleshooting. Windows/Linux prefer logs beside the executable, falling back to SynaRoute/logs in the user data directory if unwritable. macOS defaults to ~/Library/Logs/SynaRoute. Custom log directories are supported; check Settings for the active path.
 
 ### How keys are protected
 
-By default they are encrypted at rest with the Windows Data Protection API (DPAPI). The ciphertext is bound to your current Windows account, so copying the file to another machine or account won't decrypt it.
+Windows defaults to account-bound DPAPI; macOS keeps a random encryption key in Keychain. Both can switch to master-password mode. Linux requires a master password and has no fixed-key fallback. Master-password mode uses Argon2id + AES-256-GCM and requires unlocking each launch; forgotten passwords cannot recover keys.
 
-You can also enable master-password mode in Settings, which derives a key from your passphrase with Argon2id and encrypts with AES-GCM instead. With it enabled you unlock on each launch.
+Legacy Linux fixed-key vaults are not automatically migrated or overwritten. Back up before upgrading. If a legacy vault is rejected, quit, move secrets.enc out of the data directory, restart, set a master password and re-enter upstream keys. Rotate old keys and securely remove old backups after verifying the new vault.
 
 To be clear about what this protects against: encryption guards against the file being copied away. It does **not** guard against software already running under your own account.
 
@@ -42,7 +44,7 @@ Settings contains a "Log model calls" switch that is **off by default**. Turning
 
 ### Deleting your data
 
-After uninstalling, delete the `SynaRoute` folder under your application data directory to remove all configuration and keys. If you changed the log directory, delete that too. The application keeps no data anywhere else.
+Before uninstalling, stop the proxy and restore client configuration. Note the data and log directories in Settings, then quit. Remove the SynaRoute data folder (including config, vault and backups), the active log directory, and any previously used custom log directories. Separately remove exported configs, diagnostic reports and client config backups from their saved locations. Deleting only the data directory is not a complete cleanup.
 
 ## 2. This website
 

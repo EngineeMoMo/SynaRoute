@@ -21,6 +21,8 @@ import orderingSource from "./i18n.ordering.ts?raw";
 import { orderingEn, orderingZh } from "@/lib/i18n.ordering";
 import resilienceSource from "./i18n.resilience.ts?raw";
 import { resilienceEn, resilienceZh } from "@/lib/i18n.resilience";
+import securitySource from "./i18n.security.ts?raw";
+import { securityEn, securityZh } from "@/lib/i18n.security";
 
 /**
  * i18n 的结构性判据。**这些浏览器里看不出来**（缺翻译只是显示成另一种语言或原始 key，
@@ -60,6 +62,7 @@ const SOURCES: { name: string; src: string }[] = [
   { name: "i18n.sessions.ts", src: sessionsSource },
   { name: "i18n.ordering.ts", src: orderingSource },
   { name: "i18n.resilience.ts", src: resilienceSource },
+  { name: "i18n.security.ts", src: securitySource },
 ];
 
 /** 各分片导出的运行时字典，用于校验「分片真的被展开进主词典了」。 */
@@ -73,6 +76,7 @@ const CHUNKS: { name: string; zh: Record<string, string>; en: Record<string, str
   { name: "sessions", zh: sessionsZh, en: sessionsEn },
   { name: "ordering", zh: orderingZh, en: orderingEn },
   { name: "resilience", zh: resilienceZh, en: resilienceEn },
+  { name: "security", zh: securityZh, en: securityEn },
 ];
 
 /**

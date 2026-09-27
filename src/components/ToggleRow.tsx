@@ -3,6 +3,7 @@
 // React 组件在模块循环里可能在求值时还是 undefined，属于会偶发、难查的那类故障。
 
 import type { LucideIcon } from "lucide-react";
+import { useId } from "react";
 import { Switch } from "@/components/ui/Switch";
 
 export function ToggleRow({
@@ -33,30 +34,38 @@ export function ToggleRow({
   disabled?: boolean;
   badge?: string;
 }) {
+  const id = useId();
   return (
     <div className={`flex items-start justify-between gap-4 ${disabled ? "opacity-60" : ""}`}>
       <div className="flex gap-2.5">
         {Icon && <Icon size={16} className={`mt-0.5 shrink-0 ${danger ? "text-danger" : "text-text-secondary"}`} />}
         <div>
           <div className="flex items-center gap-2 text-sm font-medium text-text-primary">
-            {title}
+            <span id={`${id}-title`}>{title}</span>
             {badge && (
               <span className="rounded-full border border-border px-1.5 py-0.5 text-[10px] font-normal text-text-muted">
                 {badge}
               </span>
             )}
           </div>
-          <div className="text-xs text-text-muted">{desc}</div>
+          <div id={`${id}-desc`} className="text-xs text-text-secondary">{desc}</div>
           {cost && (
             <div
-              className={`mt-1 text-[11px] leading-relaxed ${checked ? "text-warning" : "text-text-muted"}`}
+              id={`${id}-cost`}
+              className={`mt-1 text-[11px] leading-relaxed ${checked ? "text-warning" : "text-text-secondary"}`}
             >
               {cost}
             </div>
           )}
         </div>
       </div>
-      <Switch checked={checked} onCheckedChange={onChange} disabled={disabled} />
+      <Switch
+        checked={checked}
+        onCheckedChange={onChange}
+        disabled={disabled}
+        aria-labelledby={`${id}-title`}
+        aria-describedby={`${id}-desc${cost ? ` ${id}-cost` : ""}`}
+      />
     </div>
   );
 }

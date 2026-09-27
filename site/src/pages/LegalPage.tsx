@@ -29,7 +29,7 @@ import termsEn from "@/content/en/terms.md?raw";
  * 所以：h1 与日期胶囊由组件出，章节锚点用 toc 的 h2 渲染一行，末尾补一个带邮箱
  * 与另一份条款互链的页尾。正文里那行 `# 标题` 随之剥掉（否则会出现两个标题）。
  */
-const LAST_UPDATED = "2026-08-04";
+const LAST_UPDATED = { privacy: "2026-09-27", terms: "2026-08-04" };
 
 const CONTENT: Record<"privacy" | "terms", Record<Lang, string>> = {
   privacy: { zh: privacyZh, en: privacyEn },
@@ -69,7 +69,7 @@ export default function LegalPage({ kind }: { kind: "privacy" | "terms" }) {
             {t(`${kind}.title`)}
           </h1>
           <p className="mt-4 inline-flex items-center rounded-pill border border-border bg-surface-hover px-3 py-1 text-xs text-text-secondary">
-            {t(`${kind}.updated`, { date: LAST_UPDATED })}
+            {t(`${kind}.updated`, { date: LAST_UPDATED[kind] })}
           </p>
         </header>
 

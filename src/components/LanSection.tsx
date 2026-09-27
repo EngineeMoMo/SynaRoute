@@ -142,7 +142,7 @@ function TokenPanel({
           {shown ? token : "•".repeat(48)}
         </code>
       ) : (
-        <p className="text-[11px] leading-relaxed text-text-muted">{t("lanToken.none")}</p>
+        <p className="text-[11px] leading-relaxed text-text-secondary">{t("lanToken.none")}</p>
       )}
 
       {confirming ? (
@@ -162,7 +162,7 @@ function TokenPanel({
           </div>
         </div>
       ) : (
-        <p className="mt-2 text-[11px] leading-relaxed text-text-muted">{t("lanToken.hint")}</p>
+        <p className="mt-2 text-[11px] leading-relaxed text-text-secondary">{t("lanToken.hint")}</p>
       )}
     </div>
   );

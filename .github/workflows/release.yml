@@ -56,6 +56,10 @@ jobs:
                 '',
                 '---',
                 '',
+                '**Linux security update:** A master password is now required before saving or using API keys; fixed-key fallback has been removed.',
+                'Back up secrets.enc before upgrading. Legacy fixed-key vaults are rejected without overwriting the original file. If affected, quit the app, move the old vault out of the data directory, restart, set a master password and re-enter your upstream keys. Rotate old keys and remove old backups after verifying the new vault.',
+                'Linux 用户：升级前备份 secrets.enc。旧固定密钥库不会自动迁移；如遇拒绝读取，请退出后移出旧库、重启并设置主口令，再重新录入密钥，建议轮换旧密钥。',
+                '',
                 '**Already using SynaRoute?** In-app update works normally from v0.1.26 onward.',
                 '',
                 '**If you are on v0.1.23 or earlier**, in-app updates no longer work on your build:',
@@ -115,6 +119,10 @@ jobs:
 
       - name: install frontend dependencies
         run: npm ci
+
+      - name: Linux vault security regression tests
+        if: matrix.platform == 'ubuntu-22.04'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib secret::tests
 
       - uses: tauri-apps/tauri-action@v0
         env:

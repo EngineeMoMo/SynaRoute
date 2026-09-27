@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { LanSection } from "@/components/LanSection";
 import { ToggleRow } from "@/components/ToggleRow";
+import { MasterPasswordToggle } from "@/components/MasterPasswordToggle";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { useT } from "@/lib/useT";
 import { LANGS } from "@/lib/i18n";
@@ -497,7 +498,7 @@ export function SettingsPage() {
                     </div>
                   )}
                   {updateCheck?.status === "available" && updateCheck.notes && (
-                    <div className="mt-1 max-h-24 overflow-y-auto whitespace-pre-wrap text-[11px] text-text-muted">
+                    <div className="mt-1 max-h-24 overflow-y-auto whitespace-pre-wrap text-[11px] text-text-secondary">
                       {updateCheck.notes}
                     </div>
                   )}
@@ -563,7 +564,7 @@ export function SettingsPage() {
             <div className="flex items-start justify-between gap-4">
               <div className="flex gap-2.5">
                 <Languages size={16} className="mt-0.5 shrink-0 text-text-secondary" />
-                <div className="text-xs text-text-muted">{t("settings.languageDesc")}</div>
+                <div className="text-xs text-text-secondary">{t("settings.languageDesc")}</div>
               </div>
               <div className="flex gap-2">
                 {LANGS.map((l) => {
@@ -594,12 +595,9 @@ export function SettingsPage() {
             {/* 主口令增强（FR-018 可选增强）。开关不直接落盘——启用/关闭都要整库迁移密钥，
                 必须走对话框收口令。checked 取自后端真实状态（密钥库里有无 master 头部），
                 不看 settings 那个镜像字段。 */}
-            <ToggleRow
-              icon={ShieldCheck}
-              title={t("settings.masterPwTitle")}
-              desc={t("settings.masterPwDesc")}
-              checked={master?.enabled ?? false}
-              onChange={(v) => setMasterDialog(v ? "enable" : "disable")}
+            <MasterPasswordToggle
+              state={master}
+              onChange={(enabled) => setMasterDialog(enabled ? "enable" : "disable")}
             />
             {master?.enabled && (
               <div className="ml-[26px] flex flex-wrap items-center gap-2">
@@ -645,7 +643,7 @@ export function SettingsPage() {
                     <div className="text-sm font-medium text-text-primary">
                       {t("settings.orphanTitle", { n: orphanCount })}
                     </div>
-                    <div className="mt-0.5 text-xs leading-relaxed text-text-muted">
+                    <div className="mt-0.5 text-xs leading-relaxed text-text-secondary">
                       {t("settings.orphanDesc")}
                     </div>
                     {pruneConfirm ? (
@@ -697,7 +695,7 @@ export function SettingsPage() {
                     <Plug size={16} className="mt-0.5 shrink-0 text-text-secondary" />
                     <div>
                       <div className="text-sm font-medium text-text-primary">{t("settings.mcpPort")}</div>
-                      <div className="text-xs text-text-muted">{t("settings.mcpPortDesc")}</div>
+                      <div className="text-xs text-text-secondary">{t("settings.mcpPortDesc")}</div>
                     </div>
                   </div>
                   <input
@@ -743,7 +741,7 @@ export function SettingsPage() {
                     <RefreshCw size={14} className={restarting ? "animate-spin" : ""} /> {t("settings.mcpRestart")}
                   </Button>
                 </div>
-                <div className="flex items-start gap-1.5 text-xs text-text-muted">
+                <div className="flex items-start gap-1.5 text-xs text-text-secondary">
                   <Info size={13} className="mt-0.5 shrink-0" />
                   <span>{t("settings.mcpRestartHint")}</span>
                 </div>
@@ -758,7 +756,7 @@ export function SettingsPage() {
             <CardTitle>{t("settings.proxyPortTitle")}</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
-            <div className="flex items-start gap-1.5 text-xs text-text-muted">
+            <div className="flex items-start gap-1.5 text-xs text-text-secondary">
               <Info size={13} className="mt-0.5 shrink-0" />
               <span>{t("settings.proxyPortDesc")}</span>
             </div>
@@ -771,7 +769,7 @@ export function SettingsPage() {
                     <Plug size={16} className="mt-0.5 shrink-0 text-text-secondary" />
                     <div>
                       <div className="text-sm font-medium text-text-primary">{t(`nav.${id}`)}</div>
-                      <div className="font-mono text-xs text-text-muted">http://127.0.0.1:{current}</div>
+                      <div className="font-mono text-xs text-text-secondary">http://127.0.0.1:{current}</div>
                     </div>
                   </div>
                   <input
@@ -830,7 +828,7 @@ export function SettingsPage() {
                 <Activity size={16} className="mt-0.5 shrink-0 text-text-secondary" />
                 <div>
                   <div className="text-sm font-medium text-text-primary">{t("settings.healthTitle")}</div>
-                  <div className="text-xs text-text-muted">{t("settings.healthDesc")}</div>
+                  <div className="text-xs text-text-secondary">{t("settings.healthDesc")}</div>
                 </div>
               </div>
               <select
@@ -854,7 +852,7 @@ export function SettingsPage() {
                   <div className="text-sm font-medium text-text-primary">
                     {t("settings.failoverBudgetTitle")}
                   </div>
-                  <div className="text-xs text-text-muted">
+                  <div className="text-xs text-text-secondary">
                     {t("settings.failoverBudgetDesc")}
                   </div>
                 </div>
@@ -884,7 +882,7 @@ export function SettingsPage() {
             {settings?.healthProbeRealCompletion && (
               <div className="ml-8 space-y-1.5">
                 <div className="text-sm font-medium text-text-primary">{t("settings.probeMsgTitle")}</div>
-                <div className="text-xs text-text-muted">{t("settings.probeMsgDesc")}</div>
+                <div className="text-xs text-text-secondary">{t("settings.probeMsgDesc")}</div>
                 <textarea
                   className="sr-control min-h-[80px] w-full resize-y px-2.5 py-1.5 font-mono text-xs"
                   placeholder={t("settings.probeMsgPlaceholder")}
@@ -967,7 +965,7 @@ export function SettingsPage() {
             <div className="flex gap-2.5">
               <FolderOpen size={16} className="mt-0.5 shrink-0 text-text-secondary" />
               <div className="flex-1">
-                <div className="text-xs text-text-muted">{t("settings.logDesc")}</div>
+                <div className="text-xs text-text-secondary">{t("settings.logDesc")}</div>
                 <div className="mt-2 flex items-center gap-2">
                   <input
                     type="text"
@@ -1034,10 +1032,10 @@ export function SettingsPage() {
                     <ScrollText size={13} /> {t("settings.diagExport")}
                   </Button>
                 </div>
-                <div className="mt-1.5 break-all font-mono text-[11px] text-text-muted">
+                <div className="mt-1.5 break-all font-mono text-[11px] text-text-secondary">
                   {effectiveLogDir || "—"}
                 </div>
-                <div className="mt-1 text-[11px] leading-relaxed text-text-muted">
+                <div className="mt-1 text-[11px] leading-relaxed text-text-secondary">
                   {t("settings.diagDesc")}
                   {/* 「不含密钥」这句单独加粗：它决定用户敢不敢把报告发出去。
                       不能写成 Markdown `**…**`——本页没有 Markdown 渲染器，会显示成字面星号。 */}
@@ -1067,7 +1065,7 @@ export function SettingsPage() {
                 {t("settings.import")}
               </Button>
             </div>
-            <div className="text-xs text-text-muted">{t("settings.backupHint")}</div>
+            <div className="text-xs text-text-secondary">{t("settings.backupHint")}</div>
           </CardContent>
         </Card>
       </div>
@@ -1153,7 +1151,7 @@ function McpWizard({
             <X size={16} />
           </button>
         </div>
-        <p className="mb-4 text-xs text-text-muted">{t("settings.mcpWizardIntro")}</p>
+        <p className="mb-4 text-xs text-text-secondary">{t("settings.mcpWizardIntro")}</p>
 
         <WizardStep n={1} title={t("settings.mcpWizardCodex")}>
           <div className="mb-1 text-xs text-text-secondary">{t("settings.mcpWizardCodexStep")}</div>
@@ -1306,7 +1304,7 @@ function ExportDialog({
         />
         <div>
           <div className="text-sm text-text-primary">{t("backup.includeSecrets")}</div>
-          <div className="mt-0.5 text-[11px] leading-relaxed text-text-muted">
+          <div className="mt-0.5 text-[11px] leading-relaxed text-text-secondary">
             {t("backup.includeSecretsDesc")}
           </div>
         </div>
@@ -1435,7 +1433,7 @@ function ImportDialog({
               {t("backup.backupSaved", { path: report.backupPath })}
             </div>
             {/* 备份路径原先只是显示出来，用户不知道拿它能干什么（docs/15 UX #20）。 */}
-            <div className="text-[11px] leading-relaxed text-text-muted">
+            <div className="text-[11px] leading-relaxed text-text-secondary">
               {t("backup.backupRestoreHint")}
             </div>
             {/* 删过旧密钥时，密钥库的备份必须并列给出并单独说明怎么用：
@@ -1446,7 +1444,7 @@ function ImportDialog({
                 <div className="break-all font-mono text-[11px] text-text-secondary">
                   {t("backup.secretsBackupSaved", { path: report.secretsBackupPath })}
                 </div>
-                <div className="text-[11px] leading-relaxed text-text-muted">
+                <div className="text-[11px] leading-relaxed text-text-secondary">
                   {t("backup.secretsBackupRestoreHint")}
                 </div>
               </>
@@ -1476,7 +1474,7 @@ function ImportDialog({
     <ModalShell title={t("backup.importTitle")} icon={Upload} onClose={onClose} busy={busy}>
       <div className="space-y-1 rounded-control bg-surface-elevated px-3 py-2">
         <div className="break-all font-mono text-[11px] text-text-secondary">{path}</div>
-        <div className="text-[11px] text-text-muted">
+        <div className="text-[11px] text-text-secondary">
           {t("backup.fileInfo", { version: preview.appVersion, time: preview.exportedAt })}
         </div>
         <div className="text-xs text-text-primary">
@@ -1486,7 +1484,7 @@ function ImportDialog({
             brain: preview.brainCount,
           })}
         </div>
-        <div className="text-[11px] text-text-muted">
+        <div className="text-[11px] text-text-secondary">
           {preview.hasSecrets ? t("backup.hasSecrets") : t("backup.noSecrets")}
         </div>
       </div>
@@ -1602,7 +1600,7 @@ function ModeOption({
       <input type="radio" className="mt-0.5" checked={checked} onChange={onSelect} />
       <div className="min-w-0">
         <div className="text-sm text-text-primary">{title}</div>
-        <div className="mt-0.5 text-[11px] leading-relaxed text-text-muted">{desc}</div>
+        <div className="mt-0.5 text-[11px] leading-relaxed text-text-secondary">{desc}</div>
         {note && (
           <div className={`mt-1 text-[11px] ${danger ? "text-warning" : "text-text-secondary"}`}>
             {note}

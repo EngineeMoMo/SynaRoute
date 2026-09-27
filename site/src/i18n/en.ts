@@ -91,11 +91,9 @@ export const en: Dict = {
   "benefits.threeClients.more":
     "Every category has its own key list, primary key, proxy port and model mappings. Swapping a key for the CLI leaves the desktop app untouched.",
 
-  "benefits.local.name": "Keys never leave your machine",
-  "benefits.local.desc":
-    "Config and keys live in local files. No cloud account, no config sync, no usage data collection.",
-  "benefits.local.more":
-    "Keys are encrypted at rest through the Windows Data Protection API (DPAPI), with an optional master password for a second layer.",
+  "benefits.local.name": "Keys stored locally",
+  "benefits.local.desc": "Config and keys are stored locally, not uploaded to a SynaRoute cloud. Keys authenticate requests to the upstream endpoints you configure.",
+  "benefits.local.more": "Windows defaults to account-bound DPAPI; macOS keeps a random encryption key in Keychain. Both can switch to master-password mode. Linux requires a master password and has no fixed-key fallback. Master-password mode uses Argon2id + AES-256-GCM and requires unlocking each launch; forgotten passwords cannot recover keys.",
 
   "benefits.protocol.name": "Protocol conversion",
   "benefits.protocol.desc": "When the client speaks one protocol and the vendor hears another, the proxy translates.",
@@ -128,9 +126,8 @@ export const en: Dict = {
     "Configure a set of members (a key plus a model) that answer in parallel, then hand their results to a chosen decider model. Summarisation can be compressed or full-context. Members can optionally read files from the working directory for reference, and images can be passed in as input.",
 
   "features.secret.name": "Encrypted key storage",
-  "features.secret.short": "Keys are encrypted on disk, with an optional master password.",
-  "features.secret.desc":
-    "By default keys are encrypted with the Windows Data Protection API (DPAPI), which binds the ciphertext to your current Windows account — copying the file to another machine or account won't decrypt it. You can optionally enable master-password mode, which derives a key from your passphrase with Argon2id and encrypts with AES-GCM; the app then asks you to unlock on startup.",
+  "features.secret.short": "Encrypted local storage; master password required on Linux, optional on Windows and macOS.",
+  "features.secret.desc": "Windows defaults to account-bound DPAPI; macOS keeps a random encryption key in Keychain. Both can switch to master-password mode. Linux requires a master password and has no fixed-key fallback. Master-password mode uses Argon2id + AES-256-GCM and requires unlocking each launch; forgotten passwords cannot recover keys.",
 
   "features.apply.name": "One-click client setup",
   "features.apply.short": "Hit Start and the proxy endpoint is written into your client's config.",
@@ -280,7 +277,7 @@ export const en: Dict = {
     "history live in the system application-data directory and are not affected by reinstalling.",
 
   // ---------- Steps ----------
-  "steps.title": "Four steps to get going",
+  "steps.title": "Three steps to get going",
   "steps.subtitle": "You don't have to read the whole manual first.",
 
   "steps.s1.title": "Download and install",
@@ -291,8 +288,7 @@ export const en: Dict = {
   // → `store.rs:560` → **零探测**。探测点是 `health.rs::check_all_categories`
   // （后台定时任务）+ 手动「测试查询」按钮。已删掉那半；模型列表那半是对的。
   // 这条与 `zh.ts` 的同名键是**同一句话的两份副本**，改一份必须改另一份。
-  "steps.s2.desc":
-    "Pick the client category you're configuring, add a key, and fill in the vendor's base URL and your secret. Saving pulls that vendor's available models.",
+  "steps.s2.desc": "On Linux, first enable a master password in Settings → Security. Choose a client category, add a key and enter the vendor endpoint and secret. Saving fetches the available models.",
   // 🔴 原 `steps.s4.*` 改名为 `steps.afterStart*`（组件已改用新键，`zh.ts` 已跟上，
   // 而这边漏了 → **英文页会露中文**，官网 `i18n-zh-en-parity` 那道门就是为此而设）。
   //
@@ -324,24 +320,20 @@ export const en: Dict = {
   "security.subtitle": "All of this describes what the app actually does; you can check it against the source.",
 
   "security.storage.title": "Where data lives",
-  "security.storage.desc":
-    "Entirely on your machine. The config file and the encrypted key file sit in a SynaRoute folder under your user's application data directory. Nothing is stored server-side.",
+  "security.storage.desc": "Config (config.json) and keys (secrets.enc) live in the user data directory: usually %APPDATA%\\SynaRoute on Windows, ~/Library/Application Support/SynaRoute on macOS, and $XDG_DATA_HOME/SynaRoute (or ~/.local/share/SynaRoute) on Linux. Logs may be elsewhere; check the actual path in Settings.",
 
   "security.encryption.title": "How keys are stored",
-  "security.encryption.desc":
-    "By default they're encrypted with the Windows Data Protection API (DPAPI), which ties the ciphertext to your current Windows account — copy it to another machine or account and it won't decrypt. Optionally you can enable master-password mode, which derives a key from your passphrase with Argon2id and encrypts with AES-GCM instead.",
+  "security.encryption.desc": "Windows defaults to account-bound DPAPI; macOS keeps a random encryption key in Keychain. Both can switch to master-password mode. Linux requires a master password and has no fixed-key fallback. Master-password mode uses Argon2id + AES-256-GCM and requires unlocking each launch; forgotten passwords cannot recover keys.",
 
   "security.network.title": "What goes out over the network",
   "security.network.desc":
     "Only the upstream vendor requests you configured, plus a check against the GitHub releases page when looking for updates. No usage data, no analytics, no accounts, no config sync.",
 
   "security.logs.title": "About logging",
-  "security.logs.desc":
-    "By default logs record metadata only — timestamp, which key served it, the model, the upstream status code. Logging full conversation bodies (including system prompts) is a separate switch that ships off; turn it on only while troubleshooting and turn it back off afterwards. Logs are written locally and nowhere else.",
+  "security.logs.desc": "Logs contain metadata by default; enabling conversation logging includes message bodies and system prompts, so use it only temporarily for troubleshooting. Windows/Linux prefer logs beside the executable, falling back to SynaRoute/logs in the user data directory if unwritable. macOS defaults to ~/Library/Logs/SynaRoute. Custom log directories are supported; check Settings for the active path.",
 
   "security.delete.title": "Removing your data",
-  "security.delete.desc":
-    "After uninstalling, delete the SynaRoute folder under your user application data directory to remove all config and keys. The app doesn't keep data anywhere else.",
+  "security.delete.desc": "Before uninstalling, stop the proxy and restore client configuration. Note the data and log directories in Settings, then quit. Remove the SynaRoute data folder (including config, vault and backups), the active log directory, and any previously used custom log directories. Separately remove exported configs, diagnostic reports and client config backups from their saved locations. Deleting only the data directory is not a complete cleanup.",
 
   "security.source.title": "Source code",
   "security.source.desc":
@@ -369,8 +361,7 @@ export const en: Dict = {
     "Windows, macOS and Linux. Windows 10 (1809) and later; macOS 11+ with separate dmg builds for Apple silicon and Intel; Linux ships as AppImage, deb and rpm and needs glibc 2.31+. The download section highlights the build for your system, and every other platform and architecture stays visible next to it.",
 
   "faq.q3": "Where are my data and keys stored?",
-  "faq.a3":
-    "All on your machine, in a SynaRoute folder under your user application data directory. Keys are encrypted at rest and are never uploaded anywhere.",
+  "faq.a3": "Config and the encrypted vault live in the local SynaRoute user data folder; logs may be elsewhere. Keys are not uploaded to a SynaRoute cloud, but authenticate requests to your configured upstream endpoints. Check the log path in Settings when cleaning up.",
 
   "faq.q4": "Do I need to sign in?",
   "faq.a4": "No. There's no account system and no multi-device config sync.",

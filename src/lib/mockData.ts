@@ -67,7 +67,7 @@ function forShowcase(list: ProviderKey[]): ProviderKey[] {
 }
 
 /** 主口令模式的浏览器预览态：默认关（与真实默认一致），启用后记住口令用于校验。 */
-let masterMock: MasterPasswordState = { enabled: false, locked: false };
+let masterMock: MasterPasswordState = { required: false, enabled: false, locked: false };
 let masterPw = "";
 
 /**
@@ -839,7 +839,7 @@ export const mockBridge = {
     if (masterMock.enabled) throw new Error("已处于主口令模式，无需重复启用");
     if (!password) throw new Error("主口令不能为空");
     masterPw = password;
-    masterMock = { enabled: true, locked: false };
+    masterMock = { required: false, enabled: true, locked: false };
     // 迁移条数 = 当前三个分类的 Key 总数（贴近真实反馈）
     return (Object.keys(store) as CategoryType[]).reduce((n, c) => n + store[c].length, 0);
   },
@@ -847,7 +847,7 @@ export const mockBridge = {
     await delay();
     if (!masterMock.enabled) throw new Error("当前不是主口令模式，无需关闭");
     if (password !== masterPw) throw new Error("主口令错误。请确认后重试（口令区分大小写）。");
-    masterMock = { enabled: false, locked: false };
+    masterMock = { required: false, enabled: false, locked: false };
     masterPw = "";
     return (Object.keys(store) as CategoryType[]).reduce((n, c) => n + store[c].length, 0);
   },

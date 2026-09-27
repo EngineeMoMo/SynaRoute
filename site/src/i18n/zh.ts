@@ -117,9 +117,9 @@ export const zh: Dict = {
   "benefits.threeClients.more":
     "每个分类有自己的 Key 列表、主 Key、代理端口与模型映射。给 CLI 换 Key 不会动到桌面端。",
 
-  "benefits.local.name": "密钥不出本机",
-  "benefits.local.desc": "配置与密钥都存在本地文件里，没有云端账号，不做配置同步，也不收集使用数据。",
-  "benefits.local.more": "密钥经 Windows 数据保护接口（DPAPI）加密后落盘，另可选开启主口令做二次加密。",
+  "benefits.local.name": "密钥本地保存",
+  "benefits.local.desc": "配置与密钥本地保存，不上传 SynaRoute 云端。调用上游时，密钥用于向你配置的厂商端点鉴权。",
+  "benefits.local.more": "Windows 默认使用 DPAPI，将密文绑定当前用户账户；macOS 使用系统钥匙串保管随机加密密钥。两者均可切换为主口令模式。Linux 必须先设置主口令，不提供固定密钥回退。主口令模式使用 Argon2id + AES-256-GCM，每次启动需解锁，忘记口令无法恢复密钥。",
 
   "benefits.protocol.name": "协议自动转换",
   "benefits.protocol.desc": "客户端说的和厂商听的不是一种协议时，由代理层在中间做转换。",
@@ -161,9 +161,8 @@ export const zh: Dict = {
   // 首页最靠前的黄金位置又被同一件事占掉约 600px。
 
   "features.secret.name": "加密密钥存储",
-  "features.secret.short": "密钥加密后存在本地文件，可选主口令二次保护。",
-  "features.secret.desc":
-    "默认使用 Windows 数据保护接口（DPAPI）加密，密文与当前 Windows 账户绑定，换机器或换账户无法解出。可选开启主口令增强模式，改用口令派生密钥（Argon2id）配合 AES-GCM 加密，此时启动需要先解锁。",
+  "features.secret.short": "密钥加密存于本地；Linux 强制主口令，Windows 与 macOS 可选。",
+  "features.secret.desc": "Windows 默认使用 DPAPI，将密文绑定当前用户账户；macOS 使用系统钥匙串保管随机加密密钥。两者均可切换为主口令模式。Linux 必须先设置主口令，不提供固定密钥回退。主口令模式使用 Argon2id + AES-256-GCM，每次启动需解锁，忘记口令无法恢复密钥。",
 
   "features.apply.name": "一键接入客户端",
   "features.apply.short": "点「启动」，自动把代理端点写进客户端配置。",
@@ -304,7 +303,7 @@ export const zh: Dict = {
     "配置、Key 和用量记录都存在系统的应用数据目录里，重装不会丢。",
 
   // ---------- 使用步骤 ----------
-  "steps.title": "四步开始使用",
+  "steps.title": "三步开始使用",
   "steps.subtitle": "不用读完整份文档也能跑起来。",
 
   "steps.s1.title": "下载并安装",
@@ -317,7 +316,7 @@ export const zh: Dict = {
   // （`KeyEditor.tsx:406` 的 `handleTest`）。这是 P1-1 第二条「假承诺」
   // （第一条是「四步」里那个「你不会感知到切换」，已在 `benefits.failover.desc` 里修）。
   // 删掉那句；模型列表那半是对的（`discover_models_for` 在 insert 与 update 里都调了）。
-  "steps.s2.desc": "选择要配置的客户端分类，新增一条 Key，填入厂商地址与密钥。保存时会自动拉取该厂商的可用模型列表。",
+  "steps.s2.desc": "Linux 用户先在「设置 → 安全」启用主口令。选择客户端分类，新增 Key 并填入厂商地址与密钥，保存时会拉取可用模型列表。",
   // 同时加上迁移路径（P1-1 第三条）：把 steps 尾段从「这就完成了」改成主动指路。
   "steps.afterStart": "照常使用就行",
   "steps.afterStartDesc":
@@ -346,24 +345,20 @@ export const zh: Dict = {
   "security.subtitle": "以下都是软件的实际行为，可以对照源码核对。",
 
   "security.storage.title": "数据存在哪里",
-  "security.storage.desc":
-    "全部在本机。配置文件与加密后的密钥文件位于当前用户的应用数据目录下的 SynaRoute 文件夹中。没有服务器端存储。",
+  "security.storage.desc": "配置 config.json 与密钥库 secrets.enc 位于用户应用数据目录的 SynaRoute 文件夹：Windows 通常为 %APPDATA%\\SynaRoute，macOS 为 ~/Library/Application Support/SynaRoute，Linux 为 $XDG_DATA_HOME/SynaRoute（未设置时为 ~/.local/share/SynaRoute）。日志可能位于其他目录，请在设置中确认实际路径。",
 
   "security.encryption.title": "密钥如何保存",
-  "security.encryption.desc":
-    "默认经 Windows 数据保护接口（DPAPI）加密后落盘，密文与当前 Windows 账户绑定，复制到别的机器或别的账户下无法解出。可选开启主口令增强模式，改用 Argon2id 从口令派生密钥、配合 AES-GCM 加密。",
+  "security.encryption.desc": "Windows 默认使用 DPAPI，将密文绑定当前用户账户；macOS 使用系统钥匙串保管随机加密密钥。两者均可切换为主口令模式。Linux 必须先设置主口令，不提供固定密钥回退。主口令模式使用 Argon2id + AES-256-GCM，每次启动需解锁，忘记口令无法恢复密钥。",
 
   "security.network.title": "会往外发什么",
   "security.network.desc":
     "只有你自己配置的上游厂商请求，以及检查新版本时对 GitHub 发布页的请求。不收集使用数据，不做行为统计，没有账号体系，也不做配置同步。",
 
   "security.logs.title": "关于日志",
-  "security.logs.desc":
-    "运行日志默认只记录元信息（时间、命中的 Key、模型、上游状态码）。「记录调用模型日志」开关默认关闭，开启后日志会包含完整对话正文（含系统提示词），仅建议排障时临时开启，查完关掉。日志只写在本地。",
+  "security.logs.desc": "默认日志仅记录元信息；开启「记录调用模型日志」后会包含对话正文与系统提示词，仅建议临时排障使用。Windows/Linux 优先写入可执行文件同级 logs，不可写时回退应用数据目录的 SynaRoute/logs；macOS 默认 ~/Library/Logs/SynaRoute。支持自定义日志目录，以设置页显示的路径为准。",
 
   "security.delete.title": "如何彻底删除数据",
-  "security.delete.desc":
-    "卸载软件后，删除用户应用数据目录下的 SynaRoute 文件夹即可清除全部配置与密钥。软件不会在其他位置留存数据。",
+  "security.delete.desc": "卸载前先停止代理并恢复客户端配置，在设置中记下应用数据目录与日志目录，然后退出应用。删除 SynaRoute 应用数据文件夹（含配置、密钥库及备份），另行删除实际日志目录及曾使用的自定义日志目录。自行导出的配置、诊断报告及客户端配置备份也需按保存位置单独清理；只删除应用数据目录并不保证清理完整。",
 
   "security.source.title": "源码",
   "security.source.desc":
@@ -390,8 +385,7 @@ export const zh: Dict = {
     "Windows、macOS、Linux 都有。Windows 10 (1809) 及以上；macOS 11+，Apple 芯片与 Intel 各一个 dmg；Linux 提供 AppImage、deb、rpm 三种包，需要 glibc 2.31+。下载区会按你的系统高亮推荐的那一个，其它平台与架构始终并列可见。",
 
   "faq.q3": "我的数据和密钥存在哪里？",
-  "faq.a3":
-    "全部在本机，位于当前用户应用数据目录下的 SynaRoute 文件夹。密钥经加密后存放，不会上传到任何服务器。",
+  "faq.a3": "配置和加密密钥库保存在本机用户应用数据目录的 SynaRoute 文件夹，日志可位于其他目录。密钥不上传 SynaRoute 云端，但会用于向你配置的上游端点鉴权。清理时请同时检查设置中的日志路径。",
 
   "faq.q4": "需要登录账号吗？",
   "faq.a4": "不需要。软件没有账号体系，也不做多设备配置同步。",

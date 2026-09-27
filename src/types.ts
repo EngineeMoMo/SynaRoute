@@ -743,6 +743,7 @@ export interface ImportReport {
  * 后者只是 UI 镜像，启动时会按库对账。
  */
 export interface MasterPasswordState {
+  required: boolean;
   /** 是否处于主口令模式 */
   enabled: boolean;
   /** 是否锁着（主口令模式但本次进程还没解锁）。DPAPI 模式恒 false */

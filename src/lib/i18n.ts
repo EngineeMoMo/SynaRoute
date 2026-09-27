@@ -9,6 +9,7 @@ import { fieldsEn, fieldsZh } from "./i18n.fields";
 import { mappingEn, mappingZh } from "./i18n.mapping";
 import { brainRunEn, brainRunZh } from "./i18n.brain"; import { sessionsEn, sessionsZh } from "./i18n.sessions"; import { resilienceEn, resilienceZh } from "./i18n.resilience";
 import { orderingEn, orderingZh } from "./i18n.ordering";
+import { securityEn, securityZh } from "./i18n.security";
 
 export type Lang = "zh" | "en";
 
@@ -452,6 +453,7 @@ const zh: Dict = {
   ...usageZh,
   ...brandPickerZh,
   ...fieldsZh,
+  ...securityZh,
   ...mappingZh,
   ...brainRunZh, ...sessionsZh, ...orderingZh, ...resilienceZh,
   "logs.empty": "暂无事件",
@@ -508,9 +510,6 @@ const zh: Dict = {
   "settings.theme.system": "跟随系统",
   "settings.language": "语言",
   "settings.languageDesc": "切换界面显示语言",
-  "settings.security": "安全与加密",
-  "settings.masterPwTitle": "启用主口令增强",
-  "settings.masterPwDesc": "默认用 Windows DPAPI 免口令加密（密钥绑定当前 Windows 账户，换机器解不出）。开启后改由你的主口令派生密钥加密整个密钥库（Argon2id + AES-256-GCM），每次启动需输入一次口令才能转发。",
   "master.unlockTitle": "解锁密钥库",
   "master.unlockDesc": "密钥库已用主口令加密。输入主口令后才能读取密钥并转发请求。",
   "master.unlockAction": "解锁",
@@ -1129,6 +1128,7 @@ const en: Dict = {
   ...usageEn,
   ...brandPickerEn,
   ...fieldsEn,
+  ...securityEn,
   ...mappingEn,
   ...brainRunEn, ...sessionsEn, ...orderingEn, ...resilienceEn,
   "logs.empty": "No events yet",
@@ -1184,9 +1184,6 @@ const en: Dict = {
   "settings.theme.system": "System",
   "settings.language": "Language",
   "settings.languageDesc": "Switch the interface language",
-  "settings.security": "Security & Encryption",
-  "settings.masterPwTitle": "Enable master password",
-  "settings.masterPwDesc": "Defaults to passwordless Windows DPAPI encryption (key bound to the current Windows account, undecryptable on another machine). When on, the whole secret vault is encrypted with a key derived from your master password (Argon2id + AES-256-GCM); you unlock it once per launch before forwarding works.",
   "master.unlockTitle": "Unlock secret vault",
   "master.unlockDesc": "The vault is encrypted with a master password. Enter it to read secrets and forward requests.",
   "master.unlockAction": "Unlock",

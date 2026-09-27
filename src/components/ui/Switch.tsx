@@ -5,6 +5,8 @@ interface SwitchProps {
   onCheckedChange: (checked: boolean) => void;
   disabled?: boolean;
   "aria-label"?: string;
+  "aria-labelledby"?: string;
+  "aria-describedby"?: string;
 }
 
 /** 轻量开关（无第三方依赖），用于 Key 启用、聚合开关等 */

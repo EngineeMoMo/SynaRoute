@@ -104,5 +104,4 @@ export const steps: Step[] = [
   { id: "s1", i18nPrefix: "steps.s1" },
   { id: "s2", i18nPrefix: "steps.s2" },
   { id: "s3", i18nPrefix: "steps.s3" },
-  { id: "s4", i18nPrefix: "steps.s4" },
 ];
