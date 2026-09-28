@@ -1343,7 +1343,7 @@ pub fn chat_resp_to_responses_ext(
                 if let Some(ns) = ns {
                     obj.insert("namespace".into(), json!(ns));
                 }
-                obj.insert("type".into(), json!("custom_tool_call"));
+                obj.extend([("type".into(), json!("custom_tool_call")), ("id".into(), json!(format!("ctc_{}", uuid_like())))]);
                 // 同流式路径：custom_tool_call 用裸字符串 `input`，不用 JSON `arguments`。
                 let args = obj
                     .get("arguments")
@@ -1656,6 +1656,24 @@ pub fn responses_resp_to_chat(body: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_id_repair_nonstream_roundtrip_preserves_call_and_namespace() {
+        let body = serde_json::json!({"choices":[{"message":{"tool_calls":[{
+            "id":"call_original","type":"function","function":{"name":"mcp__demo__run","arguments":"{}"}
+        }]}}]});
+        for custom in [false, true] {
+            let custom_tools = if custom { ["run".to_string()].into_iter().collect() } else { Default::default() };
+            let response = super::chat_resp_to_responses_ext(&body, &custom_tools, &Default::default(), &["mcp__demo".into()]);
+            let item = &response["output"][0];
+            assert!(item["id"].as_str().unwrap().starts_with(if custom { "ctc_" } else { "fc_" }));
+            assert_eq!(item["call_id"], "call_original");
+            assert_eq!(item["namespace"], "mcp__demo");
+            assert_eq!(item["name"], "run");
+            let back = super::responses_resp_to_chat(&response);
+            assert_eq!(back["choices"][0]["message"]["tool_calls"][0]["id"], "call_original");
+            assert_eq!(back["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "mcp__demo__run");
+        }
+    }
     use super::*;
     use crate::upstream::testfix::*;
     use crate::model::Protocol;

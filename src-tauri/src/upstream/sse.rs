@@ -410,9 +410,8 @@ impl SseTranslator {
         }
         for (i, (id, name, args)) in self.tool_calls.iter().enumerate() {
             let output_index = tool_base + i as u64;
-            let fc_id = if id.is_empty() { format!("fc_{}", uuid_like()) } else { id.clone() };
-            // call_id 必填且用于回配工具结果：上游给了 id 就用它，没有则退回生成的 fc_id。
-            let call_id = if id.is_empty() { fc_id.clone() } else { id.clone() };
+            // call_id 用于回配工具结果，独立于 Responses 条目 ID；上游有值时原样保留。
+            let call_id = if id.is_empty() { format!("call_{}", uuid_like()) } else { id.clone() };
             // arguments 必须是可解析的 JSON 字符串：无参工具（args 为空）兜底成 "{}"，
             // 否则 Codex 侧 serde_json 解析空串失败、工具无法执行。
             let arguments = if args.trim().is_empty() { "{}" } else { args.as_str() };
@@ -429,6 +428,7 @@ impl SseTranslator {
             } else {
                 "function_call"
             };
+            let fc_id = format!("{}_{}", if item_type == "custom_tool_call" { "ctc" } else { "fc" }, uuid_like());
             item_map.insert("type".into(), json!(item_type));
             item_map.insert("id".into(), json!(fc_id));
             item_map.insert("call_id".into(), json!(call_id));
@@ -1243,6 +1243,29 @@ fn sse_data(data: &Value) -> String {
 mod tests {
     use super::*;
     use super::super::testfix::{anthropic_tool_blocks, sse_events};
+
+    #[test]
+    fn tool_id_repair_stream_events_share_item_ids_without_changing_call_ids() {
+        for custom in [false, true] {
+            let custom_tools = if custom { ["run".to_string()].into_iter().collect() } else { Default::default() };
+            let mut translator = SseTranslator::with_namespaces_and_custom(
+                SseDirection::ChatToResponses, vec!["mcp__demo".into()], custom_tools, Default::default(),
+            );
+            let mut output = translator.push(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_original\",\"function\":{\"name\":\"mcp__demo__run\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n");
+            output.push_str(&translator.finish());
+            let events = sse_events(&output);
+            let added = events.iter().find(|event| event["type"] == "response.output_item.added" && event["item"]["call_id"] == "call_original").unwrap();
+            let done = events.iter().find(|event| event["type"] == "response.output_item.done" && event["item"]["call_id"] == "call_original").unwrap();
+            let completed = events.iter().find(|event| event["type"] == "response.completed").unwrap();
+            let item = &added["item"];
+            assert!(item["id"].as_str().unwrap().starts_with(if custom { "ctc_" } else { "fc_" }));
+            assert_eq!(item["call_id"], "call_original");
+            assert_eq!(item["namespace"], "mcp__demo");
+            assert_eq!(item["name"], "run");
+            assert_eq!(item, &done["item"]);
+            assert_eq!(item, &completed["response"]["output"][0]);
+        }
+    }
 
     #[test]
     fn complete_sse_line_is_limited_before_drain() {

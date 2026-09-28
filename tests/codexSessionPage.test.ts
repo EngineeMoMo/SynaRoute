@@ -90,6 +90,17 @@ describe("会话页与后端的两处契约", () => {
     }
   });
 
+  it("双向同步确认都披露 ID 修复与独立回滚边界", () => {
+    for (const dict of [sessionsZh, sessionsEn]) {
+      for (const key of ["sessions.syncConfirmBody", "sessions.syncConfirmNone"] as const) {
+        expect(dict[key]).toContain("call_id");
+        expect(dict[key]).toMatch(/退出 Codex|Quit Codex/);
+        expect(dict[key]).toMatch(/独立备份|independent backup/);
+        expect(dict[key]).toMatch(/不撤销|not ID repairs|does not undo/);
+      }
+    }
+  });
+
   /**
    * 🔴 确认框里承诺的备份目录，必须**就是后端真的写进去的那个**。
    *

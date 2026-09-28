@@ -118,6 +118,17 @@ pub(in crate::tools) fn locked_sync(
     super::sync_to_at(home, data_dir, target)
 }
 
+fn locked_manual_sync(home: &Path, data_dir: &Path, target: &str) -> Result<(SyncReport, String), String> {
+    let _guard = SYNC_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    if let super::ManifestState::Corrupt(path) = super::read_manifest_state(data_dir) {
+        return Err(super::corrupt_err(&path).to_string());
+    }
+    let repair_note = super::ids::repair_at(home, data_dir)?;
+    let report = super::sync_to_at(home, data_dir, target)
+        .map_err(|error| format!("{error}{repair_note}"))?;
+    Ok((report, repair_note))
+}
+
 /// 还原是同一批 rollout + 同一份清单的**第三个写者**，必须与两条同步路径共用这把锁。
 /// 少这一环会出现「同步改回 target 后，还原紧接着删掉清单」的不可回滚交错。
 pub(in crate::tools) fn locked_restore(
@@ -378,7 +389,7 @@ pub async fn sync_codex_sessions(target: String) -> Result<String, String> {
     if !target_is_known(&known, &target) {
         return Err(format!("provider id 不在当前可选目标中，未修改任何会话：{target}"));
     }
-    let report = locked_sync(&home, &data_dir, &target).map_err(|e| e.to_string())?;
+    let (report, repair_note) = locked_manual_sync(&home, &data_dir, &target)?;
     // 选过就记下来，下次打开这一页回填它。写失败不影响本次同步的结论。
     let mut prefs = read_prefs_in(&data_dir);
     prefs.last_target = target.clone();
@@ -386,7 +397,7 @@ pub async fn sync_codex_sessions(target: String) -> Result<String, String> {
     // 一条都没动也要如实说 —— 「已同步 0 条」比一句「完成」有信息量得多。
     Ok(super::describe(&report).unwrap_or_else(|| {
         format!("全部 {} 个历史对话已经指向 {target}，无需改动", report.already_ok)
-    }))
+    }) + &repair_note)
 }
 
 /// 保存本页偏好（目前只有「接入时自动同步」这一位）。
@@ -451,6 +462,43 @@ mod tests {
 
     const ID_A: &str = "01a05d14-4e5b-7773-b425-25ae029f078f";
     const ID_B: &str = "01a05d3b-0017-7ec3-9cff-23ea32293b1b";
+
+    #[test]
+    fn tool_id_repair_manual_sync_repairs_already_selected_provider_and_survives_roundtrip() {
+        let home = tmp_home("tool-id-roundtrip");
+        let relative = write_rollout(&home, ID_A, "openai");
+        let path = home.join(relative);
+        let mut original = fs::read_to_string(&path).unwrap();
+        original.push_str("{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"id\":\"call_bad\",\"call_id\":\"call_bad\",\"namespace\":\"mcp__demo\",\"name\":\"run\",\"arguments\":\"{}\"}}\n");
+        fs::write(&path, &original).unwrap();
+        locked_sync(&home, &home.join("data"), "openai").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        for (index, target) in ["openai", "third-party", "openai"].into_iter().enumerate() {
+            let (_, note) = locked_manual_sync(&home, &home.join("data"), target).unwrap();
+            assert_eq!(note.is_empty(), index != 0);
+            let current = fs::read_to_string(&path).unwrap();
+            let meta: Value = serde_json::from_str(current.lines().next().unwrap()).unwrap();
+            let item: Value = serde_json::from_str(current.lines().last().unwrap()).unwrap();
+            assert_eq!(meta["payload"]["model_provider"], target);
+            assert_eq!(item["payload"]["id"], "fc_bad");
+            assert_eq!(item["payload"]["call_id"], "call_bad");
+            assert_eq!(item["payload"]["namespace"], "mcp__demo");
+        }
+        assert_eq!(fs::read_dir(home.join("data/codex-session-id-backups")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn tool_id_repair_ambiguous_history_blocks_provider_switch() {
+        let home = tmp_home("tool-id-reject");
+        let relative = write_rollout(&home, ID_A, "third-party");
+        let path = home.join(relative);
+        let original = fs::read_to_string(&path).unwrap()
+            + "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"id\":\"call_bad\"}}\n";
+        fs::write(&path, &original).unwrap();
+        assert!(locked_manual_sync(&home, &home.join("data"), "openai").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!home.join("data/codex-session-id-backups").exists());
+    }
 
     /// 候选必须合并三个来源，且**当前生效的那个排第一**。
     #[test]

@@ -51,6 +51,7 @@ const MANIFEST_FILE: &str = "codex-session-providers.json";
 #[path = "codex_session_catalog.rs"] mod catalog; // Desktop 列表索引 local_thread_catalog（第三份 provider 副本）；理由见该文件模块头
 #[path = "codex_session_sqlite.rs"] mod sqlite;
 #[path = "codex_session_sync.rs"] pub(crate) mod sync;
+#[path = "codex_session_ids.rs"] mod ids;
 
 // 文件层的原语都在 [`files`] 里。这里再导出一次，让 [`ops`]/[`view`]/[`sync`] 与本模块
 // 用同一个名字 —— 各处 `files::` 前缀写法不一致时，「到底哪份实现」会变成一个要查的问题。

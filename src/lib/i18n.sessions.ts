@@ -72,9 +72,9 @@ export const sessionsZh: Dict = {
   "sessions.pickedHidden": "其中 {n} 条已被当前筛选隐藏，但仍会被删除",
   "sessions.syncConfirmTitle": "确认同步历史会话？",
   "sessions.syncConfirmBody":
-    "将把 {n} 条会话记的 provider 改成 {target}（当前列表里与它不一致的那些）。只改每个 rollout 首行的这一个字段，对话正文与文件修改时间都不动；原值会记进回滚清单，点「停止」时按它逐条改回。",
+    "请先退出 Codex。将先检查用户会话的工具 ID，独立备份后修复明确异常的 ID，保留 call_id、工具命名空间和文件修改时间；再把 {n} 条会话的 provider 改成 {target}。停止时只还原 provider，不撤销 ID 修复。其他跨上游兼容性不保证。",
   "sessions.syncConfirmNone":
-    "当前列表里的 {total} 条会话都已指向 {target}；仍会检查 local_thread_catalog，并在写库前备份后精确移除已确认的内部索引行。不会删除 rollout、threads 或对话正文。",
+    "当前 {total} 条会话都已指向 {target}。请先退出 Codex；仍会检查历史工具 ID，独立备份后修复明确异常的 ID（不改 call_id 或工具命名空间，切回 provider 不撤销修复），并备份、清理 local_thread_catalog 中已确认的内部索引行。不会删除会话正文。",
   "sessions.syncConfirmOk": "确认同步",
   "sessions.dbNone": "未找到（不影响路由，只影响列表里的标题与模型）",
   "sessions.inDbHint":
@@ -176,9 +176,9 @@ export const sessionsEn: Dict = {
   "sessions.pickedHidden": "{n} of them are hidden by the current filter but will still be deleted",
   "sessions.syncConfirmTitle": "Sync past sessions?",
   "sessions.syncConfirmBody":
-    "This rewrites the provider recorded in {n} session(s) to {target} (those in the current list that differ from it). Only that one field on each rollout's first line changes; the conversation body and the file's modification time stay untouched. The original values go into the rollback manifest and are restored one by one when you press Stop.",
+    "Quit Codex first. User sessions are checked for malformed tool item IDs and repaired after an independent backup, preserving call_id, tool namespaces and modification times. Then {n} session provider(s) change to {target}. Stop restores providers only, not ID repairs. Other cross-provider compatibility is not guaranteed.",
   "sessions.syncConfirmNone":
-    "All {total} session(s) in the current list already point at {target}; SynaRoute will still inspect local_thread_catalog and, after backing up the database, precisely remove confirmed internal index rows. This does not delete rollouts, threads, or conversation content.",
+    "All {total} session(s) already point at {target}. Quit Codex first: malformed tool item IDs will still be checked and repaired after an independent backup, without changing call_id or tool namespaces. Switching providers back does not undo repairs. Confirmed internal rows in local_thread_catalog are also backed up and cleaned. This does not delete conversation content.",
   "sessions.syncConfirmOk": "Sync",
   "sessions.dbNone": "Not found (routing is unaffected; only titles and models in this list are)",
   "sessions.inDbHint":
