@@ -829,6 +829,7 @@ export interface CodexProviderTarget {
   id: string;
   sources: string[];
   isCurrent: boolean;
+  available: boolean;
 }
 
 /** 同步目标下拉的数据源。 */

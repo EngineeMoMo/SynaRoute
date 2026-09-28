@@ -1344,7 +1344,7 @@ pub fn run() {
             tools::env_conflicts::detect_env_conflicts, tools::env_conflicts::remove_env_conflicts,
             tools::codex::codex_catalog::get_codex_config_model,
             tools::codex::codex_sessions::ops::list_codex_sessions, tools::codex::codex_sessions::ops::delete_codex_sessions, tools::codex::codex_sessions::ops::export_codex_session_markdown, tools::codex::codex_sessions::ops::open_codex_exports_dir,
-            tools::codex::codex_sessions::sync::list_codex_provider_targets, tools::codex::codex_sessions::sync::sync_codex_sessions, tools::codex::codex_sessions::sync::set_codex_session_auto_sync, tools::codex::codex_sessions::sync::audit_codex_session_index, tools::codex::codex_sessions::sync::prune_codex_session_index,
+            tools::codex::codex_sessions::sync::list_codex_provider_targets, tools::codex::codex_sessions::sync::sync_codex_sessions, tools::codex::codex_sessions::sync::set_codex_session_auto_sync, tools::codex::codex_sessions::sync::audit_codex_session_index, tools::codex::codex_sessions::sync::prune_codex_session_index, tools::codex::codex_sessions::maintenance::preview_codex_session_id_repair, tools::codex::codex_sessions::maintenance::apply_codex_session_id_repair,
             health::balance_gate::query_key_balance,
             show_main_window_cmd,
             recent_failure,

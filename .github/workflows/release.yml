@@ -54,8 +54,8 @@ jobs:
               body: [
                 'Download the installer for your platform from the assets below.',
                 '',
-                '**v0.1.71 — Codex session compatibility:** Fix malformed tool item IDs when switching providers, preserving call_id and tool namespaces. Manual session sync backs up affected history before repairing IDs, including sessions already assigned to the target provider. Quit Codex before syncing and reopen it afterward. Switching providers back does not undo ID repairs.',
-                '修复会话转 OpenAI 后工具 ID 前缀校验失败：先退出 Codex，再手动同步会话；异常历史会独立备份后修复，不改变 call_id 或工具命名空间。切回其他 provider 不撤销 ID 修复。此修复不保证其他跨上游兼容性。',
+                '**v0.1.72 — Safer Codex session maintenance:** Provider sync and tool ID repair are now separate operations. Scan and preview repairs, then confirm independent backups and repair. Preview expires after 10 minutes; changed files require a new scan. Live provider validation, maintenance locks, client-running checks and progress reporting reduce accidental writes. Streaming repair supports histories larger than the previous 128 MiB file limit.',
+                '会话维护补强：仅同步 provider 与历史工具 ID 修复独立操作。先扫描预览，再确认备份修复；预览 10 分钟有效，文件变化需重新扫描。新增实时配置校验、多实例维护锁、客户端运行检查与阶段进度，大文件改为流式处理。手动写入前请完全退出 Codex/ChatGPT（包括 CLI）。不改变 call_id 或工具命名空间；切回 provider 不撤销修复，部分失败也不会自动撤销已完成文件。此修复不保证所有跨上游兼容性，维护锁仅协调 SynaRoute 实例。',
                 '',
                 '---',
                 '',

@@ -1,9 +1,19 @@
 use super::files;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
+
+const MAX_LINE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ITEM_IDS: usize = 500_000;
+
+#[derive(Clone)]
+pub(super) struct Analysis {
+    pub digest: String,
+    pub mapping: HashMap<String, String>,
+}
 
 fn items(record: &mut Value) -> Vec<&mut Value> {
     match record.get("type").and_then(Value::as_str) {
@@ -16,19 +26,32 @@ fn items(record: &mut Value) -> Vec<&mut Value> {
     }
 }
 
-fn repair_text(original: &str) -> Result<Option<(String, usize)>, String> {
-    let lines: Vec<&str> = original.split_inclusive('\n').collect();
-    let mut records = lines.iter().map(|line| {
-        if line.trim().is_empty() { Ok(Value::Null) }
-        else { serde_json::from_str::<Value>(line).map_err(|error| error.to_string()) }
-    }).collect::<Result<Vec<_>, _>>()?;
+fn read_line(reader: &mut impl BufRead) -> Result<Option<String>, String> {
+    let mut bytes = Vec::new();
+    Read::take(&mut *reader, MAX_LINE_BYTES + 1).read_until(b'\n', &mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.is_empty() { return Ok(None); }
+    if bytes.len() as u64 > MAX_LINE_BYTES {
+        return Err("单条历史记录超过 16 MiB，无法安全自动修复".into());
+    }
+    String::from_utf8(bytes).map(Some).map_err(|_| "会话包含非 UTF-8 数据".into())
+}
+
+fn record(line: &str) -> Result<Value, String> {
+    if line.trim().is_empty() { Ok(Value::Null) }
+    else { serde_json::from_str(line).map_err(|_| "会话包含损坏或未写完的 JSON 记录".into()) }
+}
+
+fn analyze_reader(reader: &mut impl BufRead) -> Result<Analysis, String> {
+    let mut digest = Sha256::new();
     let mut existing = HashSet::new();
     let mut mapping = HashMap::new();
     let mut destinations = HashSet::new();
     let mut owners = HashMap::new();
     let mut ambiguous = HashSet::new();
-    for record in &mut records {
-        for item in items(record) {
+    while let Some(line) = read_line(reader)? {
+        digest.update(line.as_bytes());
+        for item in items(&mut record(&line)?) {
             let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
             let Some(id) = item.get("id").and_then(Value::as_str) else { continue };
             if kind != "item_reference" {
@@ -37,6 +60,7 @@ fn repair_text(original: &str) -> Result<Option<(String, usize)>, String> {
                 if owners.insert(id.to_string(), owner.clone()).is_some_and(|previous| previous != owner) {
                     ambiguous.insert(id.to_string());
                 }
+                if existing.len() > MAX_ITEM_IDS { return Err("历史条目数量超过安全上限，未自动修复".into()); }
             }
             let prefix = match kind {
                 "function_call" => "fc_",
@@ -57,35 +81,37 @@ fn repair_text(original: &str) -> Result<Option<(String, usize)>, String> {
             }
         }
     }
-    if mapping.is_empty() { return Ok(None); }
     if mapping.keys().any(|id| ambiguous.contains(id)) {
         return Err("异常 ID 被不同条目共用，不能安全修复".into());
     }
     if destinations.iter().any(|id| existing.contains(id)) {
         return Err("修复后的工具 ID 与已有条目冲突，未修改文件".into());
     }
-    let mut repaired = String::with_capacity(original.len());
-    for (line, record) in lines.iter().zip(records.iter_mut()) {
-        let mut changed = false;
-        for item in items(record) {
-            for field in ["id", "item_id"] {
-                if let Some(next) = item.get(field).and_then(Value::as_str).and_then(|id| mapping.get(id)) {
-                    item[field] = Value::String(next.clone());
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            repaired.push_str(&serde_json::to_string(record).map_err(|error| error.to_string())?);
-            repaired.push_str(files::split_eol(line).1);
-        } else {
-            repaired.push_str(line);
-        }
-    }
-    Ok(Some((repaired, mapping.len())))
+    Ok(Analysis { digest: format!("{:x}", digest.finalize()), mapping })
 }
 
-fn repair_file(path: &Path, backup: &Path) -> Result<usize, String> {
+fn rewrite_line(line: &str, mapping: &HashMap<String, String>) -> Result<String, String> {
+    let mut value = record(line)?;
+    let mut changed = false;
+    for item in items(&mut value) {
+        for field in ["id", "item_id"] {
+            if let Some(next) = item.get(field).and_then(Value::as_str).and_then(|id| mapping.get(id)) {
+                item[field] = Value::String(next.clone());
+                changed = true;
+            }
+        }
+    }
+    if !changed { return Ok(line.to_string()); }
+    Ok(serde_json::to_string(&value).map_err(|error| error.to_string())? + files::split_eol(line).1)
+}
+
+pub(super) fn analyze(path: &Path) -> Result<Analysis, String> {
+    let source = File::open(path).map_err(|error| format!("无法读取会话：{error}"))?;
+    analyze_reader(&mut BufReader::new(source))
+}
+
+pub(super) fn apply(path: &Path, backup: &Path, expected: &Analysis) -> Result<usize, String> {
+    if expected.mapping.is_empty() { return Ok(0); }
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
@@ -93,60 +119,95 @@ fn repair_file(path: &Path, backup: &Path) -> Result<usize, String> {
         use std::os::windows::fs::OpenOptionsExt;
         options.share_mode(4);
     }
-    let mut source = options.open(path).map_err(|error| format!("请先退出 Codex 再同步：{error}"))?;
-    let metadata = source.metadata().map_err(|error| error.to_string())?;
-    if metadata.len() > 128 * 1024 * 1024 {
-        return Err("会话超过 128 MiB，未自动修复，请单独处理".into());
+    let source = options.open(path).map_err(|error| format!("请先退出 Codex 再修复：{error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::flock(source.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err("会话文件正被其他维护进程占用".into());
+        }
     }
-    let mut original = String::new();
-    source.read_to_string(&mut original).map_err(|error| error.to_string())?;
-    let Some((repaired, count)) = repair_text(&original)? else { return Ok(0) };
+    let metadata = source.metadata().map_err(|error| error.to_string())?;
     if let Some(parent) = backup.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let mut saved = OpenOptions::new().write(true).create_new(true).open(backup)
-        .map_err(|error| error.to_string())?;
-    saved.write_all(original.as_bytes()).and_then(|_| saved.sync_all())
-        .map_err(|error| error.to_string())?;
     let temporary = files::tmp_path_for(path);
-    let result = (|| -> std::io::Result<()> {
-        let mut output = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
-        output.write_all(repaired.as_bytes())?;
+    let result = (|| -> Result<usize, String> {
+        let mut saved = OpenOptions::new().write(true).create_new(true).open(backup).map_err(|error| error.to_string())?;
+        let mut output = OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(|error| error.to_string())?;
+        let mut reader = BufReader::new(&source);
+        let mut digest = Sha256::new();
+        while let Some(line) = read_line(&mut reader)? {
+            digest.update(line.as_bytes());
+            saved.write_all(line.as_bytes()).map_err(|error| error.to_string())?;
+            output.write_all(rewrite_line(&line, &expected.mapping)?.as_bytes()).map_err(|error| error.to_string())?;
+        }
+        saved.sync_all().map_err(|error| error.to_string())?;
+        if format!("{:x}", digest.finalize()) != expected.digest {
+            return Err("会话内容已变化，预览失效；未替换原文件，请重新扫描".into());
+        }
         if let Ok(modified) = metadata.modified() {
-            output.set_times(fs::FileTimes::new().set_modified(modified))?;
+            output.set_times(fs::FileTimes::new().set_modified(modified)).map_err(|error| error.to_string())?;
         }
-        output.sync_all()?;
+        output.sync_all().map_err(|error| error.to_string())?;
         drop(output);
-        if source.metadata()?.len() != metadata.len() || source.metadata()?.modified()? != metadata.modified()? {
-            return Err(std::io::Error::other("会话在修复期间发生变化，请退出 Codex 后重试"));
+        let current = fs::metadata(path).map_err(|error| error.to_string())?;
+        if current.len() != metadata.len() || current.modified().ok() != metadata.modified().ok() {
+            return Err("会话在修复期间发生变化，未替换原文件".into());
         }
-        fs::rename(&temporary, path)
+        fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+        Ok(expected.mapping.len())
     })();
     if result.is_err() { let _ = fs::remove_file(&temporary); }
-    result.map_err(|error| format!("{error}；原文备份：{}", backup.display()))?;
-    Ok(count)
+    result.map_err(|error| format!("{error}；本次备份位置（失败时可能不完整）：{}", backup.display()))
 }
 
-pub(super) fn repair_at(home: &Path, data_dir: &Path) -> Result<String, String> {
-    let backup_root = data_dir.join("codex-session-id-backups").join(uuid::Uuid::new_v4().to_string());
-    let child_ids = super::sqlite::collect_child_thread_ids(home);
-    let mut count = 0;
-    for session in super::scan_at(home).sessions {
-        if super::session_is_internal(&session, &child_ids) { continue; }
-        let path = files::resolve_in_home(home, &session.rel_path)
-            .ok_or_else(|| "会话路径越界，未同步".to_string())?;
-        count += repair_file(&path, &backup_root.join(&session.rel_path))
-            .map_err(|error| format!("{}：{error}。尚未切换 provider；此前已修复 {count} 个 ID，备份目录：{}", path.display(), backup_root.display()))?;
-    }
-    Ok(if count == 0 { String::new() } else {
-        format!("；已修复 {count} 个历史工具 ID（不改 call_id/工具命名空间）。独立原文备份：{}。请重新打开 Codex 会话；切回 provider 不撤销此修复", backup_root.display())
-    })
+#[cfg(test)]
+fn repair_text(original: &str) -> Result<Option<(String, usize)>, String> {
+    let analysis = analyze_reader(&mut std::io::Cursor::new(original))?;
+    if analysis.mapping.is_empty() { return Ok(None); }
+    let mut output = String::new();
+    for line in original.split_inclusive('\n') { output.push_str(&rewrite_line(line, &analysis.mapping)?); }
+    Ok(Some((output, analysis.mapping.len())))
+}
+
+#[cfg(test)]
+fn repair_file(path: &Path, backup: &Path) -> Result<usize, String> {
+    apply(path, backup, &analyze(path)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn streaming_scan_accepts_files_larger_than_the_old_whole_file_limit() {
+        let path = std::env::temp_dir().join(format!("synaroute-large-history-{}.jsonl", uuid::Uuid::new_v4()));
+        let mut output = File::create(&path).unwrap();
+        output.write_all(line(json!({"type":"function_call","id":"call_large","call_id":"call_large"})).as_bytes()).unwrap();
+        let padding = " ".repeat(1024 * 1024 - 1) + "\n";
+        for _ in 0..129 { output.write_all(padding.as_bytes()).unwrap(); }
+        drop(output);
+        assert!(fs::metadata(&path).unwrap().len() > 128 * 1024 * 1024);
+        assert_eq!(analyze(&path).unwrap().mapping["call_large"], "fc_large");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn changes_during_apply_leave_the_original_untouched() {
+        let home = std::env::temp_dir().join(format!("synaroute-stream-race-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&home).unwrap();
+        let path = home.join("rollout.jsonl");
+        let original = line(json!({"type":"function_call","id":"call_old","call_id":"call_old"}));
+        fs::write(&path, &original).unwrap();
+        let plan = analyze(&path).unwrap();
+        let changed = original.replace("call_old", "call_new");
+        fs::write(&path, &changed).unwrap();
+        assert!(apply(&path, &home.join("backup.jsonl"), &plan).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), changed);
+        fs::remove_dir_all(home).unwrap();
+    }
 
     fn line(item: Value) -> String {
         format!("{}\r\n", json!({"type":"response_item", "payload":item}))

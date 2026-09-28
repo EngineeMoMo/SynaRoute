@@ -138,9 +138,10 @@ export function mockCodexProviderTargets(): CodexProviderTargetList {
     current: "synaroute",
     ours: "synaroute",
     targets: [
-      { id: "synaroute", sources: ["config", "rollout", "sqlite"], isCurrent: true },
-      { id: "cc-switch-relay", sources: ["config"], isCurrent: false },
-      { id: "openai", sources: ["config", "rollout"], isCurrent: false },
+      { id: "synaroute", sources: ["config", "rollout", "sqlite"], isCurrent: true, available: true },
+      { id: "cc-switch-relay", sources: ["config"], isCurrent: false, available: true },
+      { id: "openai", sources: ["config", "rollout"], isCurrent: false, available: true },
+      { id: "old-relay", sources: ["rollout"], isCurrent: false, available: false },
     ],
     prefs: { autoSyncDisabled: false, lastTarget: "" },
   };

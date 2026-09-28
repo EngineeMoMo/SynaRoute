@@ -1,3 +1,4 @@
+import type { SessionMaintenanceProgress, SessionIdRepairPreview, SessionIdRepairResult } from "./sessionMaintenance";
 import type {
   AggregatePreview,
   AggregateResult,
@@ -75,6 +76,14 @@ async function call<T>(cmd: string, args: Record<string, unknown> | undefined, m
 }
 
 // ---- 配置管理 ----
+
+async function sessionCall<T>(cmd: string, args: Record<string, unknown>, progress: ((value: SessionMaintenanceProgress) => void) | undefined, mock: () => Promise<T> | T): Promise<T> {
+  if (!isTauri()) return call<T>(cmd, args, mock);
+  const { Channel } = await import("@tauri-apps/api/core");
+  const channel = new Channel<SessionMaintenanceProgress>();
+  channel.onmessage = (value) => progress?.(value);
+  return call<T>(cmd, { ...args, onProgress: channel }, mock);
+}
 
 export const api = {
   // 列出某分类下的 Key
@@ -309,8 +318,18 @@ export const api = {
    * 与接入时的自动同步走**同一段实现**（同一把进程内互斥锁）。存在的理由是：接入那一刻
    * Codex 可能正开着、文件被独占，而此前唯一的补救是「先停止再启动」整个代理。
    */
-  syncCodexSessions: (target: string) =>
-    call<string>("sync_codex_sessions", { target }, () => mockBridge.syncCodexSessions(target)),
+  syncCodexSessions: (target: string, progress?: (value: SessionMaintenanceProgress) => void) =>
+    sessionCall<string>("sync_codex_sessions", { target }, progress, () => mockBridge.syncCodexSessions(target)),
+
+  previewCodexSessionIdRepair: (progress?: (value: SessionMaintenanceProgress) => void) =>
+    sessionCall<SessionIdRepairPreview>("preview_codex_session_id_repair", {}, progress, () => ({
+      token: "demo-repair", scanned: 5, files: [{ relPath: "sessions/demo.jsonl", ids: 2 }], issues: [],
+    })),
+
+  applyCodexSessionIdRepair: (token: string, progress?: (value: SessionMaintenanceProgress) => void) =>
+    sessionCall<SessionIdRepairResult>("apply_codex_session_id_repair", { token }, progress, () => ({
+      changedFiles: 1, changedIds: 2, remainingFiles: 0, backupDir: "Demo only — no files changed", issues: [],
+    })),
   detectEnvConflicts: () =>
     call<EnvFinding[]>("detect_env_conflicts", undefined, () => mockBridge.detectEnvConflicts()),
   removeEnvConflicts: (names: string[]) =>

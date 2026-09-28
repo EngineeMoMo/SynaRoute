@@ -27,15 +27,16 @@ describe("会话页与后端的两处契约", () => {
       ours: "synaroute",
       prefs: { autoSyncDisabled: false, lastTarget: "stale-provider" },
       targets: [
-        { id: "openai", sources: ["config"], isCurrent: true },
-        { id: "relay", sources: ["rollout"], isCurrent: false },
+        { id: "openai", sources: ["config"], isCurrent: true, available: true },
+        { id: "relay", sources: ["rollout"], isCurrent: false, available: false },
       ],
     };
     expect(chooseKnownTarget(base, "also-stale")).toBe("openai");
     expect(chooseKnownTarget({ ...base, prefs: { ...base.prefs, lastTarget: "relay" } }, "")).toBe(
-      "relay",
+      "openai",
     );
     expect(chooseKnownTarget({ ...base, targets: [] }, "")).toBe("");
+    expect(chooseKnownTarget({ ...base, targets: base.targets.map((option) => ({ ...option, available: false })) }, "openai")).toBe("");
   });
 
   /**
@@ -90,15 +91,31 @@ describe("会话页与后端的两处契约", () => {
     }
   });
 
-  it("双向同步确认都披露 ID 修复与独立回滚边界", () => {
+  it("provider 同步与 ID 修复的确认文案明确分开", () => {
     for (const dict of [sessionsZh, sessionsEn]) {
       for (const key of ["sessions.syncConfirmBody", "sessions.syncConfirmNone"] as const) {
-        expect(dict[key]).toContain("call_id");
-        expect(dict[key]).toMatch(/退出 Codex|Quit Codex/);
-        expect(dict[key]).toMatch(/独立备份|independent backup/);
-        expect(dict[key]).toMatch(/不撤销|not ID repairs|does not undo/);
+        expect(dict[key]).toMatch(/退出 Codex|quit Codex/);
+        expect(dict[key]).toMatch(/不修复工具 ID|不会执行工具 ID 修复|does not repair tool IDs|or repair tool IDs/);
       }
+      expect(dict["sessions.repair.hint"]).toContain("call_id");
+      expect(dict["sessions.repair.confirm"]).toMatch(/独立备份|independent backup/);
+      expect(dict["sessions.repair.confirm"]).toMatch(/不撤销|does not undo/);
     }
+  });
+
+  it("修复入口先扫描后确认，并显示进度、跳过原因和备份路径", () => {
+    const panel = readFileSync("src/components/SessionIdRepairPanel.tsx", "utf8");
+    expect(page).toContain("<SessionIdRepairPanel");
+    expect(panel).toContain("api.previewCodexSessionIdRepair(update)");
+    expect(panel).toContain("api.applyCodexSessionIdRepair(token, update)");
+    expect(panel).toContain("preview?.files.length");
+    expect(panel).toContain("inFlight.current");
+    expect(panel).toContain("result.backupDir");
+    expect(panel).toContain("preview.issues");
+    expect(panel).toContain("<SessionMaintenanceProgress");
+    expect(page).toContain("disabled={!o.available}");
+    const bridge = readFileSync("src/lib/bridge.ts", "utf8");
+    expect(bridge).toContain("onProgress: channel");
   });
 
   /**

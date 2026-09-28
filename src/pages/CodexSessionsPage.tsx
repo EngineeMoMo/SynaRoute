@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/bridge";
+import type { SessionMaintenanceProgress as Progress } from "@/lib/sessionMaintenance";
+import { SessionMaintenanceProgress } from "@/components/SessionMaintenanceProgress";
+import { SessionIdRepairPanel } from "@/components/SessionIdRepairPanel";
 import { useT } from "@/lib/useT";
 import type {
   CodexProviderTargetList,
@@ -35,9 +38,9 @@ export function chooseKnownTarget(
   options: CodexProviderTargetList,
   previous: string,
 ): string {
-  const known = new Set(options.targets.map((o) => o.id));
+  const known = new Set(options.targets.filter((option) => option.available).map((o) => o.id));
   return [previous, options.prefs.lastTarget, options.ours, options.current].find((v) => known.has(v))
-    ?? options.targets[0]?.id
+    ?? options.targets.find((option) => option.available)?.id
     ?? "";
 }
 
@@ -53,6 +56,8 @@ export function CodexSessionsPage() {
   const [note, setNote] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [repairing, setRepairing] = useState(false);
+  const [syncProgress, setSyncProgress] = useState<Progress | null>(null);
   const [confirmingSync, setConfirmingSync] = useState(false);
   const [query, setQuery] = useState("");
   const [onlyBad, setOnlyBad] = useState(false);
@@ -142,6 +147,7 @@ export function CodexSessionsPage() {
   }, [picked, shown]);
 
   const doDelete = async () => {
+    if (busy || syncing || repairing) return;
     setBusy(true);
     setConfirming(false);
     try {
@@ -157,11 +163,15 @@ export function CodexSessionsPage() {
   };
 
   const doSync = async () => {
+    if (busy || syncing || repairing || !targets?.targets.some((option) => option.id === target && option.available)) return;
     setSyncing(true);
+    setSyncProgress({ phase: "scanning", completed: 0, total: 0 });
     setConfirmingSync(false);
     try {
-      setNote(await api.syncCodexSessions(target));
+      setNote(await api.syncCodexSessions(target, setSyncProgress));
+      setSyncProgress({ phase: "complete", completed: 0, total: 0 });
     } catch (e) {
+      setSyncProgress(null);
       setNote(String(e));
     } finally {
       setSyncing(false);
@@ -170,11 +180,14 @@ export function CodexSessionsPage() {
   };
 
   const doPrune = async () => {
+    if (busy || syncing || repairing) return;
+    setBusy(true);
     try {
       setNote(await api.pruneCodexSessionIndex());
     } catch (e) {
       setNote(String(e));
     } finally {
+      setBusy(false);
       await load();
     }
   };
@@ -287,23 +300,26 @@ export function CodexSessionsPage() {
               <span className="text-text-muted">{t("sessions.targetLabel")}</span>
               <select
                 value={target}
+                disabled={busy || syncing || repairing}
                 onChange={(e) => setTarget(e.target.value)}
                 className="min-w-[18rem] rounded-control border border-border bg-surface px-2 py-1.5 text-sm text-text-primary"
               >
+                {!target && <option value="" disabled>{t("sessions.noAvailableTarget")}</option>}
                 {targets.targets.map((o) => (
-                  <option key={o.id} value={o.id}>
+                  <option key={o.id} value={o.id} disabled={!o.available}>
                     {o.id}
                     {"  ·  "}
                     {o.sources.map(srcLabel).join(" / ")}
                     {o.isCurrent ? `  ·  ${t("sessions.current").replace("：", "").replace(":", "")}` : ""}
                     {o.id === targets.ours ? `  ·  ${t("sessions.targetOurs")}` : ""}
+                    {!o.available ? `  ·  ${t("sessions.unavailableTarget")}` : ""}
                   </option>
                 ))}
               </select>
             </label>
             <Button
               size="sm"
-              disabled={syncing || !target}
+              disabled={busy || syncing || repairing || !target}
               onClick={() => setConfirmingSync(true)}
             >
               <Wand2 className="h-4 w-4" />
@@ -312,6 +328,7 @@ export function CodexSessionsPage() {
           </div>
           <p className="text-xs text-text-muted">{t("sessions.targetHint")}</p>
           <p className="text-xs text-text-muted">{t("sessions.syncHint")}</p>
+          <SessionMaintenanceProgress value={syncProgress} />
           {/* 改用户的对话文件之前先让他看清会动几条、动成什么 —— 同大脑聚合落盘前那一屏预览 */}
           {confirmingSync && (
             <div className="rounded-control border border-warning/50 bg-warning/8 p-3">
@@ -322,7 +339,7 @@ export function CodexSessionsPage() {
                   : t("sessions.syncConfirmNone", { total: data?.stats.total ?? 0, target })}
               </p>
               <div className="mt-3 flex gap-2">
-                <Button size="sm" onClick={() => void doSync()}>
+                <Button size="sm" disabled={busy || syncing || repairing || !target} onClick={() => void doSync()}>
                   {t("sessions.syncConfirmOk")}
                 </Button>
                 <Button size="sm" variant="outline" onClick={() => setConfirmingSync(false)}>
@@ -333,12 +350,15 @@ export function CodexSessionsPage() {
           )}
           <ToggleRow
             title={t("sessions.autoSync")}
+            disabled={busy || syncing || repairing}
             desc={t("sessions.autoSyncHint")}
             checked={!targets.prefs.autoSyncDisabled}
             onChange={(v) => void doToggleAuto(v)}
           />
         </div>
       )}
+
+      <SessionIdRepairPanel disabled={busy || syncing} onBusyChange={setRepairing} onDone={load} />
 
       {mismatched > 0 && (
         <InlineAlert tone="warning">{t("sessions.mismatchHint", { n: mismatched })}</InlineAlert>
@@ -355,7 +375,7 @@ export function CodexSessionsPage() {
           <p className="font-medium">{t("sessions.indexTitle")}</p>
           <p>{t("sessions.indexOrphans", { n: audit.orphans })}</p>
           <p className="text-xs text-text-muted">{t("sessions.indexBackupNote")}</p>
-          <Button size="sm" variant="outline" onClick={() => void doPrune()}>
+          <Button size="sm" variant="outline" disabled={busy || syncing || repairing} onClick={() => void doPrune()}>
             {t("sessions.indexPrune")}
           </Button>
         </div>
@@ -388,7 +408,7 @@ export function CodexSessionsPage() {
               {t("sessions.pickedHidden", { n: hiddenPicked })}
             </span>
           )}
-          <Button variant="danger" size="sm" disabled={busy} onClick={() => setConfirming(true)}>
+          <Button variant="danger" size="sm" disabled={busy || syncing || repairing} onClick={() => setConfirming(true)}>
             <Trash2 className="h-4 w-4" />
             {t("sessions.deleteSelected")}
           </Button>
@@ -402,7 +422,7 @@ export function CodexSessionsPage() {
             {t("sessions.confirmBody", { n: picked.size })}
           </p>
           <div className="mt-3 flex gap-2">
-                <Button variant="danger" size="sm" onClick={() => void doDelete()}>
+                <Button variant="danger" size="sm" disabled={busy || syncing || repairing} onClick={() => void doDelete()}>
                   {t("sessions.confirmOk")}
                 </Button>
                 <Button size="sm" variant="outline" onClick={() => setConfirming(false)}>

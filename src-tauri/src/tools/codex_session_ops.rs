@@ -497,6 +497,9 @@ pub async fn list_codex_sessions(
 pub async fn delete_codex_sessions(rel_paths: Vec<String>) -> Result<String, String> {
     let home = super::super::codex_paths::codex_home().map_err(|e| e.to_string())?;
     let data_dir = crate::store::data_dir::app_data_dir().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+    super::guard::ensure_stopped()?;
+    let _guard = super::guard::acquire(&home)?;
     let (deleted, failed, backup_dir) = delete_at(&home, &data_dir, &rel_paths);
     if failed.is_empty() {
         // 备份路径要**回显**：只说「已备份」而不说在哪，那句话对用户没有用。
@@ -508,6 +511,7 @@ pub async fn delete_codex_sessions(rel_paths: Vec<String>) -> Result<String, Str
         failed.len(),
         failed.join("；")
     ))
+    }).await.map_err(|error| error.to_string())?
 }
 
 /// 导出一条会话为 Markdown，**写进数据目录下的 `exports/`**，返回落盘的完整路径。

@@ -45,10 +45,6 @@ const BUILTIN_PROVIDER: &str = "openai";
 
 /// 进程内互斥：同一时刻只允许一趟会话同步。
 ///
-/// 🔴 **不做 CodexPlusPlus 那样的锁文件。** 它必须跨进程（launcher 与 manager 是两个
-/// 可执行文件，各自都会同步），而我们只有一个进程 —— 一个锁文件带来的是「上次崩溃留下
-/// 陈旧锁、此后永远同步不了」这类问题，而它要防的东西在这里压根不存在。
-///
 /// 有了「手动同步」这个入口之后，接入那一趟与用户点按钮那一趟**确实可能同时跑**，
 /// 而两趟都会读改同一批 rollout 与同一份清单 —— 清单那半的竞态方向最坏（「首记即锁」
 /// 依赖读-改-写是原子的）。
@@ -115,18 +111,23 @@ pub(in crate::tools) fn locked_sync(
     target: &str,
 ) -> AppResult<SyncReport> {
     let _guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _file_guard = super::guard::acquire(home).map_err(crate::error::AppError::ToolConfig)?;
     super::sync_to_at(home, data_dir, target)
 }
 
-fn locked_manual_sync(home: &Path, data_dir: &Path, target: &str) -> Result<(SyncReport, String), String> {
+fn locked_manual_sync(home: &Path, data_dir: &Path, target: &str, progress: &mut dyn FnMut(&str, usize, usize)) -> Result<SyncReport, String> {
     let _guard = SYNC_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _file_guard = super::guard::acquire(home)?;
+    let snapshot = super::target::TargetSnapshot::capture(home, target)?;
     if let super::ManifestState::Corrupt(path) = super::read_manifest_state(data_dir) {
         return Err(super::corrupt_err(&path).to_string());
     }
-    let repair_note = super::ids::repair_at(home, data_dir)?;
-    let report = super::sync_to_at(home, data_dir, target)
-        .map_err(|error| format!("{error}{repair_note}"))?;
-    Ok((report, repair_note))
+    let report = super::sync_to_at_observed(home, data_dir, target, &mut |phase, completed, total| {
+        progress(phase, completed, total);
+        snapshot.verify(home).map_err(crate::error::AppError::ToolConfig)
+    }).map_err(|error| error.to_string())?;
+    progress("complete", report.changed, report.changed);
+    Ok(report)
 }
 
 /// 还原是同一批 rollout + 同一份清单的**第三个写者**，必须与两条同步路径共用这把锁。
@@ -136,6 +137,7 @@ pub(in crate::tools) fn locked_restore(
     data_dir: &Path,
 ) -> AppResult<Option<String>> {
     let _guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _file_guard = super::guard::acquire(home).map_err(crate::error::AppError::ToolConfig)?;
     super::restore_at(home, data_dir)
 }
 
@@ -149,6 +151,7 @@ pub struct TargetOption {
     /// `config` / `rollout` / `sqlite`，已排序去重。
     pub sources: Vec<String>,
     pub is_current: bool,
+    pub available: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -218,6 +221,7 @@ fn sqlite_providers(home: &Path) -> Vec<String> {
 
 pub(in crate::tools) fn discover_targets(home: &Path, data_dir: &Path) -> TargetList {
     let (current, declared) = config_providers(home);
+    let available = super::target::configured(home).unwrap_or_default();
     // BTreeMap/BTreeSet：id 与 sources 都要稳定顺序，否则下拉每次刷新都在跳。
     let mut map: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
     let add = |ids: Vec<String>, src: &'static str, map: &mut BTreeMap<_, BTreeSet<_>>| {
@@ -240,6 +244,7 @@ pub(in crate::tools) fn discover_targets(home: &Path, data_dir: &Path) -> Target
         .into_iter()
         .map(|(id, srcs)| TargetOption {
             is_current: id == current,
+            available: available.contains(&id),
             sources: srcs.into_iter().map(str::to_string).collect(),
             id,
         })
@@ -364,11 +369,7 @@ pub(in crate::tools) fn prune_index(home: &Path, data_dir: &Path) -> Result<usiz
 pub async fn list_codex_provider_targets() -> Result<TargetList, String> {
     let home = super::super::codex_paths::codex_home().map_err(|e| e.to_string())?;
     let data_dir = crate::store::data_dir::app_data_dir().map_err(|e| e.to_string())?;
-    Ok(discover_targets(&home, &data_dir))
-}
-
-fn target_is_known(list: &TargetList, target: &str) -> bool {
-    list.targets.iter().any(|o| o.id == target)
+    tauri::async_runtime::spawn_blocking(move || discover_targets(&home, &data_dir)).await.map_err(|error| error.to_string())
 }
 
 /// 手动把历史会话同步到 `target`。
@@ -376,20 +377,18 @@ fn target_is_known(list: &TargetList, target: &str) -> bool {
 /// 目标形态在这里**必须再校验一次**：命令是前端调的，而它的值最终会被写进用户的 rollout
 /// 首行。前端校验只是体验，后端校验才是防线。
 #[tauri::command]
-pub async fn sync_codex_sessions(target: String) -> Result<String, String> {
+pub async fn sync_codex_sessions(target: String, on_progress: tauri::ipc::Channel<super::maintenance::Progress>) -> Result<String, String> {
     let target = target.trim().to_string();
     if !is_valid_provider_id(&target) {
         return Err(format!("provider id 形态不合法（只允许字母数字与 _ - .）：{target:?}"));
     }
     let home = super::super::codex_paths::codex_home().map_err(|e| e.to_string())?;
     let data_dir = crate::store::data_dir::app_data_dir().map_err(|e| e.to_string())?;
-    // 形态合法还不够：必须是后端刚发现并展示给用户的候选。否则直接调 IPC 能把任意
-    // `valid-looking` id 写进全部 rollout，而 config.toml 压根没声明它。
-    let known = discover_targets(&home, &data_dir);
-    if !target_is_known(&known, &target) {
-        return Err(format!("provider id 不在当前可选目标中，未修改任何会话：{target}"));
-    }
-    let (report, repair_note) = locked_manual_sync(&home, &data_dir, &target)?;
+    tauri::async_runtime::spawn_blocking(move || {
+    super::guard::ensure_stopped()?;
+    let report = locked_manual_sync(&home, &data_dir, &target, &mut |phase, completed, total| {
+        super::maintenance::notify(&on_progress, phase, completed, total);
+    })?;
     // 选过就记下来，下次打开这一页回填它。写失败不影响本次同步的结论。
     let mut prefs = read_prefs_in(&data_dir);
     prefs.last_target = target.clone();
@@ -397,7 +396,8 @@ pub async fn sync_codex_sessions(target: String) -> Result<String, String> {
     // 一条都没动也要如实说 —— 「已同步 0 条」比一句「完成」有信息量得多。
     Ok(super::describe(&report).unwrap_or_else(|| {
         format!("全部 {} 个历史对话已经指向 {target}，无需改动", report.already_ok)
-    }) + &repair_note)
+    }))
+    }).await.map_err(|error| error.to_string())?
 }
 
 /// 保存本页偏好（目前只有「接入时自动同步」这一位）。
@@ -421,12 +421,16 @@ pub async fn audit_codex_session_index() -> Result<IndexAudit, String> {
 pub async fn prune_codex_session_index() -> Result<String, String> {
     let home = super::super::codex_paths::codex_home().map_err(|e| e.to_string())?;
     let data_dir = crate::store::data_dir::app_data_dir().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+    super::guard::ensure_stopped()?;
+    let _guard = super::guard::acquire(&home)?;
     let n = prune_index(&home, &data_dir)?;
     Ok(if n == 0 {
         "没有需要清理的条目".to_string()
     } else {
         format!("已清掉 {n} 条指向已删除会话的索引行（原索引已备份到数据目录）")
     })
+    }).await.map_err(|error| error.to_string())?
 }
 
 #[cfg(test)]
@@ -464,7 +468,7 @@ mod tests {
     const ID_B: &str = "01a05d3b-0017-7ec3-9cff-23ea32293b1b";
 
     #[test]
-    fn tool_id_repair_manual_sync_repairs_already_selected_provider_and_survives_roundtrip() {
+    fn provider_sync_is_independent_of_id_repair_even_for_already_selected_targets() {
         let home = tmp_home("tool-id-roundtrip");
         let relative = write_rollout(&home, ID_A, "openai");
         let path = home.join(relative);
@@ -473,31 +477,45 @@ mod tests {
         fs::write(&path, &original).unwrap();
         locked_sync(&home, &home.join("data"), "openai").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
-        for (index, target) in ["openai", "third-party", "openai"].into_iter().enumerate() {
-            let (_, note) = locked_manual_sync(&home, &home.join("data"), target).unwrap();
-            assert_eq!(note.is_empty(), index != 0);
+        fs::write(home.join("config.toml"), "[model_providers.third-party]\nname = 'Relay'\n").unwrap();
+        for target in ["openai", "third-party", "openai"] {
+            locked_manual_sync(&home, &home.join("data"), target, &mut |_, _, _| {}).unwrap();
             let current = fs::read_to_string(&path).unwrap();
             let meta: Value = serde_json::from_str(current.lines().next().unwrap()).unwrap();
             let item: Value = serde_json::from_str(current.lines().last().unwrap()).unwrap();
             assert_eq!(meta["payload"]["model_provider"], target);
-            assert_eq!(item["payload"]["id"], "fc_bad");
+            assert_eq!(item["payload"]["id"], "call_bad");
             assert_eq!(item["payload"]["call_id"], "call_bad");
             assert_eq!(item["payload"]["namespace"], "mcp__demo");
         }
-        assert_eq!(fs::read_dir(home.join("data/codex-session-id-backups")).unwrap().count(), 1);
+        assert!(!home.join("data/codex-session-id-backups").exists());
     }
 
     #[test]
-    fn tool_id_repair_ambiguous_history_blocks_provider_switch() {
+    fn malformed_tool_history_does_not_block_provider_only_sync() {
         let home = tmp_home("tool-id-reject");
         let relative = write_rollout(&home, ID_A, "third-party");
         let path = home.join(relative);
         let original = fs::read_to_string(&path).unwrap()
             + "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"id\":\"call_bad\"}}\n";
         fs::write(&path, &original).unwrap();
-        assert!(locked_manual_sync(&home, &home.join("data"), "openai").is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(locked_manual_sync(&home, &home.join("data"), "openai", &mut |_, _, _| {}).is_ok());
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().last(), original.lines().last());
         assert!(!home.join("data/codex-session-id-backups").exists());
+    }
+
+    #[test]
+    fn manual_sync_rejects_stale_provider_and_config_changes_before_writing() {
+        let home = tmp_home("target-race");
+        let relative = write_rollout(&home, ID_A, "stale");
+        let original = fs::read(home.join(&relative)).unwrap();
+        assert!(discover_targets(&home, &home.join("data")).targets.iter().any(|entry| entry.id == "stale" && !entry.available));
+        assert!(locked_manual_sync(&home, &home.join("data"), "stale", &mut |_, _, _| {}).is_err());
+        let result = locked_manual_sync(&home, &home.join("data"), "openai", &mut |phase, _, _| {
+            if phase == "planning" { fs::write(home.join("config.toml"), "model_provider = 'changed'\n").unwrap(); }
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(home.join(relative)).unwrap(), original);
     }
 
     /// 候选必须合并三个来源，且**当前生效的那个排第一**。

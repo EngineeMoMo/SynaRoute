@@ -52,6 +52,9 @@ const MANIFEST_FILE: &str = "codex-session-providers.json";
 #[path = "codex_session_sqlite.rs"] mod sqlite;
 #[path = "codex_session_sync.rs"] pub(crate) mod sync;
 #[path = "codex_session_ids.rs"] mod ids;
+#[path = "codex_session_guard.rs"] mod guard;
+#[path = "codex_session_target.rs"] mod target;
+#[path = "codex_session_maintenance.rs"] pub(crate) mod maintenance;
 
 // 文件层的原语都在 [`files`] 里。这里再导出一次，让 [`ops`]/[`view`]/[`sync`] 与本模块
 // 用同一个名字 —— 各处 `files::` 前缀写法不一致时，「到底哪份实现」会变成一个要查的问题。
@@ -513,6 +516,16 @@ pub(in crate::tools) fn sync_to_at(
     data_dir: &Path,
     target: &str,
 ) -> AppResult<SyncReport> {
+    sync_to_at_observed(home, data_dir, target, &mut |_, _, _| Ok(()))
+}
+
+pub(super) fn sync_to_at_observed(
+    home: &Path,
+    data_dir: &Path,
+    target: &str,
+    observer: &mut dyn FnMut(&str, usize, usize) -> AppResult<()>,
+) -> AppResult<SyncReport> {
+    observer("scanning", 0, 0)?;
     let scan = scan_at(home);
     let mut report = SyncReport {
         target: target.to_string(),
@@ -542,6 +555,7 @@ pub(in crate::tools) fn sync_to_at(
         }
     }
 
+    observer("planning", 0, todo.len())?;
     // ② 清单先落盘。首记即锁：已有条目一律不动。
     let mut manifest = match read_manifest_state(data_dir) {
         ManifestState::Loaded(m) => m,
@@ -583,7 +597,8 @@ pub(in crate::tools) fn sync_to_at(
 
     // ③ 再改文件，并记下**确实改成功的** thread id。
     let mut done_ids: Vec<String> = Vec::new();
-    for (path, s) in &todo {
+    for (index, (path, s)) in todo.iter().enumerate() {
+        observer("syncing", index, todo.len())?;
         match rewrite_first_line(path, Some(target)) {
             Ok(Some((_, info))) => {
                 report.changed += 1;
@@ -613,6 +628,7 @@ pub(in crate::tools) fn sync_to_at(
     // ④ provider/missing 只接受 rollout 那半确实成功的证据；失败的 user session 不能因为
     // 全量扫描而被 catalog 标成已同步。child cleanup 是独立的 cleanup-only 计划：它不依赖
     // provider rollout 是否成功，也不能反过来扩大 provider 同步范围。
+    observer("indexing", done_ids.len(), todo.len())?;
     let catalog_rows = catalog_rows_for_sync(home, target, &done_ids, &child_ids, &scan.sessions);
     report.sqlite = sync_sqlite(home, data_dir, target, &done_ids, &catalog_rows);
     Ok(report)
