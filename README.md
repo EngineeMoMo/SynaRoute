@@ -67,7 +67,7 @@ SynaRoute 在 `127.0.0.1` 上起一个本地代理端口，客户端把请求发
 
 ## 从源码构建
 
-需要 [Node.js](https://nodejs.org/) 18+、[Rust](https://rustup.rs/) 稳定版，以及 Windows 上的 MSVC 工具链。
+需要 [Node.js](https://nodejs.org/) 20 或 22+（建议使用 LTS）、[Rust](https://rustup.rs/) 稳定版，以及 Windows 上的 MSVC 工具链。
 
 ```bash
 npm install
@@ -93,6 +93,8 @@ cd src-tauri && cargo test --lib
 - **卸载后**删掉那个 `SynaRoute` 文件夹即可清除全部配置与密钥，软件不在其他位置留存数据。
 
 需要你知道的两点风险：本地代理监听在回环地址上，同一台机器上的其他程序理论上可以访问该端点，请不要把代理端口暴露到公网；DPAPI 加密防的是文件被复制走，不防已经登录了你账户的程序。
+
+HTTP 接入限制：外部网页和 `Origin: null` 请求会被拒绝；原生客户端可不发送 Origin。代理请求体上限为 32 MiB，MCP 为 1 MiB，读取请求体最多等待 30 秒；每个监听服务最多接入 64 个连接，全局最多同时读取 4 个请求体。上游地址必须填写最终 API 地址，带密钥的请求不会自动跟随重定向。
 
 ## 文档
 

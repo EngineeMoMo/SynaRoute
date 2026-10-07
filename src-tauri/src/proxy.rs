@@ -232,18 +232,21 @@ impl ProxyManager {
         let gate_key = self.gate_key(category);
         let handle = tokio::spawn(async move {
             let mut loop_shutdown = accept_shutdown;
+            let connections = Arc::new(tokio::sync::Semaphore::new(crate::http_ingress::CONNECTION_LIMIT));
             loop {
                 tokio::select! {
                     accepted = proxy_listen::accept_either(&bound) => {
                         // peer 是局域网鉴权的唯一依据，**别再丢回 `_`** —— 丢了就只能放行所有人。
                         let Ok((stream, peer)) = accepted else { break };
+                        let Ok(permit) = connections.clone().try_acquire_owned() else { continue };
                         let io = TokioIo::new(stream);
                         let store = store.clone();
                         let gate_key = gate_key.clone();
                         let mut conn_shutdown = shutdown_rx.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             let svc = lan_guard::guarded(store, category, gate_key, peer);
-                            let conn = hyper::server::conn::http1::Builder::new()
+                            let conn = crate::http_ingress::http1()
                                 .serve_connection(io, svc);
                             tokio::pin!(conn);
                             tokio::select! {
@@ -356,6 +359,9 @@ async fn handle_request_inner(
     // 本地副本：`log_success` / `log_request` 两个闭包要按值捕获它写进 `RequestTrace`，
     // 而 `meta` 全程要可变借用（沿路填字段）。借一次 String 比让闭包持有 `&mut meta` 简单得多。
     let request_id = meta.request_id.clone();
+    if let Err(status) = crate::http_ingress::check_origin(req.headers()) {
+        return Ok(error_resp(status, "不允许的请求来源"));
+    }
     // 保留完整路径 + query（如 /v1/messages/count_tokens?beta=true）：同协议转发时原样透传，
     // 使 count_tokens 等非补全端点不被误改写为补全端点。协议判定仍用 contains 兼容。
     let path = req
@@ -403,14 +409,15 @@ async fn handle_request_inner(
         })
         .collect();
 
-    let body_bytes = match req.into_body().collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => return Ok(error_resp(StatusCode::BAD_REQUEST, "读取请求体失败")),
+    if let Err(status) = crate::http_ingress::check_json_request(req.method(), req.headers()) {
+        return Ok(error_resp(status, "该端点仅支持 JSON POST 请求"));
+    }
+    let body_bytes = match crate::http_ingress::read_body(req.into_body(), crate::http_ingress::PROXY_BODY_LIMIT).await {
+        Ok(c) => c,
+        Err(status) => return Ok(error_resp(status, "请求体过大、读取超时或服务繁忙")),
     };
 
-    // `mut`：最后一个候选会用 `mem::take` 把它移交给转发函数（P2-5 零拷贝），
-    // 之前的候选只借用。取走后本地变为 `Value::Null`，而循环里此后不再读它——
-    // 唯一的读取点就是构造 `body_for_attempt`，且那之后立刻 break/return。
+    // 最后一个候选通过 mem::take 接管请求体，前面的尝试只借用。
     let mut req_json: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
     let client_model = req_json
         .get("model")
@@ -430,15 +437,7 @@ async fn handle_request_inner(
     // 下游请求协议（按 path 判定）：/messages=Anthropic，/responses=OpenAI Responses，否则 Chat。
     let downstream = downstream_protocol(&path);
 
-    // 空探测请求短路：客户端（实测为 Claude 桌面端）会发 `{"messages":[],"model":null}` 这类
-    // **无内容**的探测请求。它转发到任何上游都必然 400（实测 "Failed to parse request body"），
-    // 而 400 被 status_counts_against_breaker 判为硬错误 → record_live_failure → 攒够 3 次把
-    // **完好的 Key** 刷成熔断，进而触发全熔断兜底、把所有 Key 反复重打（问题3 的更深一层根因：
-    // 实测 68 条失败请求里近半是这种空探测）。
-    //
-    // 故在此直接回 400，且**不打上游、不计熔断、不记 error 事件**：既不白耗上游额度，也不让
-    // 客户端的探测行为污染健康状态。判据要求「无内容」与「无模型」同时成立，避免误伤
-    // count_tokens 等合法的无 model 子路径请求（它们带真实 messages）。
+    // 空客户端探测不应发给上游或污染熔断状态；合法的 count_tokens 请求保留。
     if is_contentless_probe(&req_json) {
         return Ok(error_resp(
             StatusCode::BAD_REQUEST,

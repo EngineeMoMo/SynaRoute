@@ -298,6 +298,22 @@ fn effort_levels_for(name: &str, keys: &[ProviderKey]) -> Vec<Value> {
 /// 给 `None` 与今天的行为不同 —— 本模块的基线是**不改变现有行为**，那就照抄它的兜底值。
 const FALLBACK_CONTEXT_WINDOW: i64 = 272_000;
 
+/// 显示名只为菜单服务；Codex 发请求时仍使用原样的 slug。
+fn picker_display_name(slug: &str) -> String {
+    let Some(rest) = slug.strip_prefix("gpt-") else { return slug.to_owned() };
+    let (version, variant) = rest.split_once('-').unwrap_or((rest, ""));
+    if !version.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) {
+        return slug.to_owned();
+    }
+    if rest.ends_with('-') || variant.contains("--") { return slug.to_owned() }
+    if variant.is_empty() { return format!("GPT-{version}") }
+    let words = variant.split('-').map(|word| {
+        let mut chars = word.chars();
+        format!("{}{}", chars.next().unwrap().to_ascii_uppercase(), chars.as_str())
+    }).collect::<Vec<_>>();
+    format!("GPT-{version} {}", words.join(" "))
+}
+
 /// 构造一个模型条目。
 ///
 /// # 基线是「Codex 今天对未知模型用的那份元数据」，不是「官方 GPT 条目」
@@ -326,10 +342,8 @@ fn build_entry(slug: &str, index: usize, levels: Vec<Value>, context_window: Opt
     let ctx = context_window.map(i64::from).unwrap_or(FALLBACK_CONTEXT_WINDOW);
     json!({
         "slug": slug,
-        // 与 slug 相同：用户在 Codex 菜单里看到的就是他在 SynaRoute 里配的对外名。
-        // 加 "(SynaRoute)" 之类的后缀会造出第二个名字，而排障时「他说的那个模型」
-        // 必须能一字不差地对上我们的配置。
-        "display_name": slug,
+        // 编号 GPT 模型用官方式展示名；slug 不变，路由和排障仍按它定位。
+        "display_name": picker_display_name(slug),
         "description": "Routed by SynaRoute",
         "default_reasoning_level": if has_levels { json!(DEFAULT_EFFORT) } else { Value::Null },
         "supported_reasoning_levels": levels,
@@ -933,6 +947,26 @@ mod tests {
     fn one(models: &[&str], keys: &[ProviderKey]) -> Value {
         let owned: Vec<String> = models.iter().map(|s| (*s).to_string()).collect();
         build_catalog(&owned, keys)["models"][0].clone()
+    }
+
+    #[test]
+    fn gpt_picker_names_match_the_official_style_without_changing_model_ids() {
+        for (slug, display) in [
+            ("gpt-5.5", "GPT-5.5"),
+            ("gpt-5.6-luna", "GPT-5.6 Luna"),
+            ("gpt-5.6-terra", "GPT-5.6 Terra"),
+            ("gpt-6-astra", "GPT-6 Astra"),
+            ("gpt-6-sol", "GPT-6 Sol"),
+            ("gpt-6.1-sol", "GPT-6.1 Sol"),
+            ("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark"),
+            ("gpt-daybreak-blue-latest", "gpt-daybreak-blue-latest"),
+            ("glm-5.3", "glm-5.3"),
+            ("Reserve", "Reserve"),
+        ] {
+            let entry = one(&[slug], &[]);
+            assert_eq!(entry["slug"], slug);
+            assert_eq!(entry["display_name"], display, "{slug}");
+        }
     }
 
     /// 漏掉任一必填键的后果是 **Codex 启动即报错、完全起不来**，而报错文本只提第一个
@@ -1908,7 +1942,12 @@ mod tests {
         let file = d.join(CATALOG_FILE);
 
         let ks = [key(Protocol::Anthropic, &[("real", Some(200_000))])];
-        let models = vec!["claude-opus-4-8".to_string(), "glm-4.6".to_string()];
+        let models = vec![
+            "claude-opus-4-8".to_string(),
+            "glm-4.6".to_string(),
+            "gpt-6-luna".to_string(),
+            "gpt-5.5".to_string(),
+        ];
         write_catalog_at(&file, &models, &ks).unwrap();
         std::fs::write(
             home.join("config.toml"),
@@ -1942,6 +1981,19 @@ mod tests {
             slugs, models,
             "Codex 解析出的模型清单必须与我们写的逐条一致（顺序也是，priority 决定）"
         );
+        for (slug, display) in [
+            ("gpt-6-luna", "GPT-6 Luna"),
+            ("gpt-5.5", "GPT-5.5"),
+            ("glm-4.6", "glm-4.6"),
+        ] {
+            let entry = parsed["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["slug"] == slug)
+                .unwrap();
+            assert_eq!(entry["display_name"], display, "Codex 读到的菜单名与目录不一致：{slug}");
+        }
         eprintln!("✅ 真实 codex 接受了目录，解析出 {} 条：{slugs:?}", slugs.len());
 
         std::fs::remove_dir_all(&d).ok();

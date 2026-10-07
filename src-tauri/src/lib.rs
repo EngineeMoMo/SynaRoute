@@ -11,6 +11,7 @@ mod diagnostics;
 mod error;
 mod events;
 mod health;
+mod http_ingress;
 mod mcp;
 mod model;
 mod notification;
@@ -19,8 +20,7 @@ mod pricing;
 mod proc;
 mod proxy;
 mod retrieval;
-/// 转发诊断响应头（`X-SynaRoute-*`）。独立成模块是因为那份「头里允许携带什么」的清单
-/// 需要一个显眼的落脚点，而 proxy.rs 顶着棘轮基线、余量为 0。
+/// 转发诊断响应头（X-SynaRoute-*）。
 mod route_meta;
 #[path = "usage_commands.rs"] mod usage_commands; // 用量面板的 IPC 命令；抽出理由见该文件模块注释
 #[path = "client_resync.rs"] mod client_resync; // Key 变更后同步客户端模型清单；来由见该文件模块注释

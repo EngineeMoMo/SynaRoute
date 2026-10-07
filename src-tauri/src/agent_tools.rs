@@ -737,7 +737,7 @@ async fn grep_tool(env: &ToolEnv, args: &Value) -> Result<String, String> {
         cmd.args(["--glob", g]);
     }
     // `-e` 显式声明模式，否则以 `-` 开头的正则会被当成 rg 的选项。
-    cmd.args(["-e", pattern]).current_dir(&env.work_dir);
+    cmd.args(["-e", pattern, "."]).current_dir(&env.work_dir);
 
     let out = match cmd.output().await {
         Ok(o) => o,
@@ -1299,8 +1299,9 @@ mod tests {
         if !flag.is_empty() {
             cmd.arg(flag);
         }
-        cmd.arg(link)
-            .arg(target)
+        // cmd's mklink requires Windows separators, unlike Rust filesystem APIs.
+        cmd.arg(link.to_string_lossy().replace('/', "\\"))
+            .arg(target.to_string_lossy().replace('/', "\\"))
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)

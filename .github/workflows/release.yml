@@ -54,8 +54,11 @@ jobs:
               body: [
                 'Download the installer for your platform from the assets below.',
                 '',
-                '**v0.1.72 — Safer Codex session maintenance:** Provider sync and tool ID repair are now separate operations. Scan and preview repairs, then confirm independent backups and repair. Preview expires after 10 minutes; changed files require a new scan. Live provider validation, maintenance locks, client-running checks and progress reporting reduce accidental writes. Streaming repair supports histories larger than the previous 128 MiB file limit.',
-                '会话维护补强：仅同步 provider 与历史工具 ID 修复独立操作。先扫描预览，再确认备份修复；预览 10 分钟有效，文件变化需重新扫描。新增实时配置校验、多实例维护锁、客户端运行检查与阶段进度，大文件改为流式处理。手动写入前请完全退出 Codex/ChatGPT（包括 CLI）。不改变 call_id 或工具命名空间；切回 provider 不撤销修复，部分失败也不会自动撤销已完成文件。此修复不保证所有跨上游兼容性，维护锁仅协调 SynaRoute 实例。',
+                '**v0.1.73 — HTTP security and retrieval fixes:** Reject untrusted browser origins, stop forwarding credentials through upstream redirects, bound incoming request bodies and connections, and close active MCP connections when stopped. Fix empty code-search results on Windows and improve Codex GPT display names.',
+                '修复本地代理与 MCP 来源校验、重定向密钥泄露、请求体资源限制及 MCP 停止后的连接残留；修复 Windows 代码检索静默无结果。更新 Codex GPT 模型展示名，并补充 macOS 首次启动说明。',
+                'Compatibility: upstream API URLs must point to the final endpoint (redirects are no longer followed). Request bodies are limited to 32 MiB for the proxy and 1 MiB for MCP, with a 30-second read timeout.',
+                '兼容性说明：上游需填写最终 API 地址，不再自动跟随重定向。代理请求体上限 32 MiB，MCP 上限 1 MiB，读取超时 30 秒。',
+                'Updated Vite, Vitest, DOMPurify and React Router. Production npm dependency audits are clean; Tailwind 3 build-time dependency advisories remain and require a separate compatibility migration.',
                 '',
                 '---',
                 '',

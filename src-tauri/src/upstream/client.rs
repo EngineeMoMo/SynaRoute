@@ -71,6 +71,8 @@ pub(super) fn truncate_body(raw: &str) -> String {
 /// 转发路径要字节透明（[`shared_client`]），自建请求要能读明文（[`decoding_client`]）。
 fn base_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
+        // Redirects must not forward x-api-key or custom credentials to another endpoint.
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(30))
         // ---- 连接池与保活：针对「突发 + 长空闲」的桌面代理流量特征 ----
         //
@@ -309,6 +311,29 @@ pub(super) fn apply_models_auth(req: reqwest::RequestBuilder, secret: &str) -> r
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn redirect_never_forwards_credentials_or_request_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let source = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let target = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let source_addr = source.local_addr().unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = source.accept().await.unwrap();
+            let mut buf = [0; 8192];
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            socket.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_addr}/capture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let response = base_builder().no_proxy().build().unwrap()
+            .post(format!("http://{source_addr}/messages"))
+            .header("x-api-key", "fake-regression-key")
+            .body("private request").send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        server.await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(100), target.accept()).await.is_err());
+    }
 
     /// **自建请求客户端必须自带客户端身份头** —— 任何 `build_client` 路径都不会漏。
     ///

@@ -261,6 +261,11 @@ export const en: Dict = {
   "download.verifyTitle": "About the install warning",
   "download.verifyDesc":
     "The installer isn't code-signed yet, so Windows SmartScreen may warn about an unknown publisher. If that concerns you, check the file size against the GitHub release page before installing.",
+  "download.verifyMacTitle": "First launch on macOS",
+  "download.verifyMacDesc":
+    "The macOS app isn't signed with an Apple Developer ID certificate or notarized yet, so the first launch may be blocked with an unidentified-developer or “damaged” warning. Drag SynaRoute.app into Applications, then open Terminal and run the command below to remove this app's quarantine flag. Open SynaRoute again afterward:",
+  "download.verifyMacHint":
+    "Enter your Mac login password and press Return; no characters appear while you type. If you installed the app elsewhere, replace the path with its actual location.",
   "download.updateTitle": "About updates",
   "download.updateDesc":
     "The app checks for updates itself and prompts you in-app, so you don't need to come back here to download new versions.",

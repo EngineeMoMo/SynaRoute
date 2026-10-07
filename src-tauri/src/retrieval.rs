@@ -94,14 +94,14 @@ async fn grep_search(
                 "--glob", "!.git",
                 "--glob", "!*.lock",
                 "--glob", "!*.min.js",
-                kw,
+                "-e", kw, ".",
             ])
             .current_dir(work_dir)
             .output()
             .await;
 
         match output {
-            Ok(out) => {
+            Ok(out) if matches!(out.status.code(), Some(0 | 1)) => {
                 rg_ran = true;
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 for line in stdout.lines() {
@@ -109,7 +109,7 @@ async fn grep_search(
                     *file_hits.entry(path).or_insert(0) += 1;
                 }
             }
-            Err(_) => {
+            Ok(_) | Err(_) => {
                 // 无法启动 rg（未安装等）：立即放弃，交给兜底。
                 return None;
             }

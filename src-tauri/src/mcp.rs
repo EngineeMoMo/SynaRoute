@@ -25,12 +25,15 @@
 /// 作为 `mcp` 的子模块而非平级模块 —— 它与本模块共用同一套「路径段携带身份」的方案，
 /// 且要复用这里的 `local_static_response` / `rpc_ok` / 端口文件等，拆成平级只会互相 `pub`。
 pub(crate) mod stdio;
+mod server;
+#[cfg(test)]
+mod security_tests;
 
 use crate::aggregate;
 use crate::model::CategoryType;
 use crate::store::Store;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -267,21 +270,7 @@ impl McpManager {
         let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
 
         let store = self.store.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let io = TokioIo::new(stream);
-                let store = store.clone();
-                tokio::spawn(async move {
-                    let svc = service_fn(move |req| handle_http(store.clone(), req));
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, svc)
-                        .await;
-                });
-            }
-        });
+        let handle = tokio::spawn(server::serve(listener, store));
 
         *self.running.lock() = Some(RunningMcp {
             port: bound,
@@ -331,57 +320,16 @@ fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
-/// 是否允许该 `Origin` 访问本地 MCP（DNS rebinding 防护）。
-///
-/// MCP Streamable HTTP 规范要求本地服务器校验 `Origin`：否则用户随便打开的网页可以用
-/// `fetch('http://127.0.0.1:9527/mcp')` 直接驱动本机 MCP —— 对 SynaRoute 尤其危险，
-/// 因为 `synaroute_ai` 会消耗用户上游额度，且它的 `cwd` 参数会让服务端去检索该目录下的文件。
-///
-/// 判据：
-/// - **无 Origin 头** → 放行。非浏览器客户端（Codex 的 rmcp、Claude CLI、curl）不发 Origin，
-///   而浏览器发起的跨源请求一定带 Origin，故「无 Origin」不是绕过口子。
-/// - 有 Origin → 仅放行 loopback 源（`http(s)://localhost|127.0.0.1|[::1]`，可带端口）
-///   与 `null`（file:// 页面 / sandbox iframe，本机开发调试用）。
-fn origin_allowed(origin: Option<&str>) -> bool {
-    let Some(origin) = origin else { return true };
-    let o = origin.trim();
-    if o.is_empty() || o.eq_ignore_ascii_case("null") {
-        return true;
-    }
-    let rest = match o.split_once("://") {
-        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") => rest,
-        // 非 http(s) 源（tauri://、app:// 等自有壳）一律放行：不是浏览器可伪造的跨源场景。
-        _ => return true,
-    };
-    // 去掉端口后比对主机名。IPv6 形如 `[::1]:9527`。
-    let host = if let Some(stripped) = rest.strip_prefix('[') {
-        match stripped.split_once(']') {
-            Some((h, _)) => format!("[{h}]"),
-            None => return false,
-        }
-    } else {
-        rest.split(':').next().unwrap_or("").to_string()
-    };
-    matches!(host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "[::1]")
-}
+// Both local HTTP services use the same strict origin policy.
+#[cfg(test)]
+use crate::http_ingress::origin_allowed;
 
 async fn handle_http(
     store: Arc<Store>,
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    // Origin 校验放在最前：非法源连 OPTIONS 预检都不该拿到 CORS 许可，
-    // 否则等于告诉网页「可以来调」。
-    let origin = req
-        .headers()
-        .get(hyper::header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    if !origin_allowed(origin.as_deref()) {
-        tracing::warn!("拒绝非本机来源的 MCP 请求: Origin={:?}", origin);
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            rpc_error(Value::Null, -32600, "仅允许本机来源访问 MCP（Origin 校验未通过）"),
-        ));
+    if let Err(status) = crate::http_ingress::check_origin(req.headers()) {
+        return Ok(json_response(status, rpc_error(Value::Null, -32600, "不允许的请求来源")));
     }
     // CORS 预检
     if req.method() == hyper::Method::OPTIONS {
@@ -397,12 +345,15 @@ async fn handle_http(
     // 调用方身份必须在 `into_body()` **之前**取：那一步会消耗掉整个 Request（含 uri）。
     let caller = caller_from_path(req.uri().path());
 
-    let body_bytes = match req.into_body().collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => {
+    if let Err(status) = crate::http_ingress::check_json_type(req.headers()) {
+        return Ok(json_response(status, rpc_error(Value::Null, -32600, "请求体必须是 JSON")));
+    }
+    let body_bytes = match crate::http_ingress::read_body(req.into_body(), crate::http_ingress::MCP_BODY_LIMIT).await {
+        Ok(c) => c,
+        Err(status) => {
             return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                rpc_error(Value::Null, -32700, "读取请求体失败"),
+                status,
+                rpc_error(Value::Null, -32700, "请求体过大、读取超时或服务繁忙"),
             ))
         }
     };
@@ -974,7 +925,7 @@ mod tests {
     }
 
     /// 建一个隔离的临时 Store（测试专用；绝不碰开发机的真实配置）。
-    fn tmp_store(tag: &str) -> (std::path::PathBuf, Arc<Store>) {
+    pub(super) fn tmp_store(tag: &str) -> (std::path::PathBuf, Arc<Store>) {
         // 加进程内自增序号：同一进程里多个用例并发跑，只靠 pid 会撞同一个目录，
         // 表现是彼此删掉对方的 config.json（偶发红）。同 store.rs 里 db_copy_path 那个坑。
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1389,8 +1340,8 @@ mod tests {
         // 无 Origin：Codex 的 rmcp / Claude CLI / curl 都不发，必须放行，
         // 否则等于把整个 MCP 关掉（这是最容易改错的一侧）。
         assert!(origin_allowed(None), "原生客户端不发 Origin，必须放行");
-        assert!(origin_allowed(Some("")), "空 Origin 视为无");
-        assert!(origin_allowed(Some("null")), "file:// 页面的 null 源放行（本机调试）");
+        assert!(!origin_allowed(Some("")), "空 Origin 必须拒绝");
+        assert!(!origin_allowed(Some("null")), "opaque Origin 必须拒绝");
 
         // 本机来源放行（含端口、含 IPv6、大小写不敏感）。
         for ok in [

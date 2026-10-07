@@ -291,6 +291,11 @@ export const zh: Dict = {
   "download.verifyTitle": "关于安装时的系统提示",
   "download.verifyDesc":
     "安装包目前没有代码签名证书，Windows SmartScreen 可能提示「未知发布者」。如果介意，可以在 GitHub 发布页核对文件大小后再安装。",
+  "download.verifyMacTitle": "macOS 首次打开",
+  "download.verifyMacDesc":
+    "macOS 版本暂未使用 Apple Developer ID 证书签名，也未完成公证，首次打开可能提示「无法验证开发者」或「已损坏」。先将 SynaRoute.app 拖入「应用程序」文件夹，再打开「终端」执行以下命令，移除此应用的隔离标记后重新打开：",
+  "download.verifyMacHint":
+    "输入 Mac 登录密码并按回车（输入时不会显示字符）。若安装在其他位置，请将命令中的路径改为实际路径。",
   "download.updateTitle": "关于更新",
   "download.updateDesc": "软件内置更新检查，有新版本时会在界面上提示，无需手动来官网重新下载。",
   // 上面那句对停在 v0.1.23 及更早的用户**是假的** —— 他们的应用内更新已永久失效,

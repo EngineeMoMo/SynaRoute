@@ -33,10 +33,9 @@ export default function DownloadPage() {
 
         <PlatformGrid className="mt-12" />
 
-        {/* `items-start`：右卡结构上多一节「v0.1.23 或更早」，两张卡的高度差是恒定的
-            —— 默认的 stretch 会把左卡拉到同高，底下空出约 190px。 */}
+        {/* 两张说明卡按各自内容决定高度，避免网格拉伸留下大块空白。 */}
         <div className="mt-10 grid items-start gap-5 sm:grid-cols-2">
-          <div className="rounded-card border border-border bg-surface p-6 shadow-card">
+          <div className="min-w-0 rounded-card border border-border bg-surface p-6 shadow-card">
             <div className="flex items-center gap-2.5">
               <ShieldAlert size={18} className="shrink-0 text-warning" aria-hidden="true" />
               {/* h2 提到 text-base：原先是 14px，比它下方卡片里的 h3（16px）还小，
@@ -44,6 +43,21 @@ export default function DownloadPage() {
               <h2 className="text-base font-semibold text-text-primary">{t("download.verifyTitle")}</h2>
             </div>
             <p className="mt-2.5 text-sm leading-relaxed text-text-secondary">{t("download.verifyDesc")}</p>
+
+            <div className="mt-4 border-t border-border pt-3.5">
+              <h3 className="text-sm font-semibold text-text-primary">
+                {t("download.verifyMacTitle")}
+              </h3>
+              <p className="mt-1.5 text-sm leading-relaxed text-text-secondary">
+                {t("download.verifyMacDesc")}
+              </p>
+              <pre className="mt-3 whitespace-pre-wrap break-words rounded-control bg-background p-3 text-[13px] leading-relaxed text-text-primary">
+                <code>{'sudo xattr -rd com.apple.quarantine "/Applications/SynaRoute.app"'}</code>
+              </pre>
+              <p className="mt-2 text-sm leading-relaxed text-text-secondary">
+                {t("download.verifyMacHint")}
+              </p>
+            </div>
           </div>
 
           <div className="rounded-card border border-border bg-surface p-6 shadow-card">
