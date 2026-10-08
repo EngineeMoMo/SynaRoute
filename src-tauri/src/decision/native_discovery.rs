@@ -166,7 +166,11 @@ mod tests {
             .into_iter()
             .find(|p| p.is_file());
         assert_eq!(found, Some(native));
-        assert!(candidates("codex", &[PathBuf::from("relative")], None, None).is_empty());
+        // Relative PATH entries must add nothing; macOS still has a built-in app candidate.
+        assert_eq!(
+            candidates("codex", &[PathBuf::from("relative")], None, None),
+            candidates("codex", &[], None, None)
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }
