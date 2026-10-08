@@ -1,6 +1,6 @@
 [package]
 name = "synaroute"
-version = "0.1.73"
+version = "0.1.74"
 description = "SynaRoute - 智能 API Key 路由代理与配置管理"
 authors = ["SynaRoute"]
 edition = "2021"
@@ -95,6 +95,8 @@ socket2 = "0.6"
 windows = { version = "0.58", features = [
   "Win32_Security_Cryptography",
   "Win32_Foundation",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
   "Win32_Storage_FileSystem",
   # 删掉用户级环境变量之后广播 WM_SETTINGCHANGE。**不广播这个功能就等于不工作**：
   # Explorer 缓存着一份环境块，从它启动的新进程继承那份缓存，于是「移除」按钮在用户

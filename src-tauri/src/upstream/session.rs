@@ -652,6 +652,7 @@ impl ToolSession {
         // - Anthropic 协议要显式打 `cache_control` 断点。但你路由的是一堆第三方中转,
         //   个别严格中转会对未知字段回 400。故:已知不支持的端点直接不带;其余先带,
         //   若因它回 400 则自愈(去掉重发 + 记住该端点)。
+        crate::store::decision::apply_effort(key, model, &mut payload);
         let want_cache = !openai && !cache_known_unsupported(&key.base_url);
         if want_cache {
             inject_anthropic_cache(&mut payload, !tools.is_empty());
@@ -696,6 +697,7 @@ impl ToolSession {
             if !tools.is_empty() {
                 plain["tools"] = anthropic_tools(tools);
             }
+            crate::store::decision::apply_effort(key, model, &mut plain);
             let resp2 = send(&plain).await?;
             let status2 = resp2.status();
             // 与首个响应同一纪律：text() 会消费 resp2，Retry-After 必须先读。

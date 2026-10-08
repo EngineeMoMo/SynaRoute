@@ -10,6 +10,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { HealthBadge } from "@/components/HealthBadge";
 import { BrandIcon } from "@/components/BrandIcon";
+import { DecisionPanel } from "@/components/DecisionPanel"; import { NativeEffortPanel } from "@/components/NativeEffortPanel";
 import { BrainQuickStart } from "@/components/BrainQuickStart";
 import { computeQuickFill } from "@/lib/brainQuickStart";
 import { CodegraphPanel } from "@/components/CodegraphPanel";
@@ -254,8 +255,7 @@ export function BrainPage() {
           </CardContent>
         </Card>
 
-        {/* 一键会诊入口：未就绪→显眼的「一键配置并开始」；就绪→运行面板本体
-            （原在页尾、且只有配全了才出现，新用户看不到任何「开始」入口，故上移到这里）。 */}
+        <DecisionPanel key={category} category={category} brain={config} keys={keys} /><NativeEffortPanel key={`native-${category}`} category={category} workDir={config.workDir} autoFollowActive={config.autoFollowActive} />
         <BrainQuickStart
           category={category}
           config={config}

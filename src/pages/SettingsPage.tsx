@@ -1,4 +1,4 @@
-import { usePolling } from "@/lib/usePolling";
+import { usePolling } from "@/lib/usePolling"; import { SharedConfigSection } from "@/components/SharedConfigSection";
 import { useEffect, useState, useRef } from "react";
 import { useStore } from "@/store";
 import { api } from "@/lib/bridge";
@@ -1050,6 +1050,7 @@ export function SettingsPage() {
           </CardContent>
         </Card>
 
+        <SharedConfigSection onChanged={() => void reloadAfterImport()} />
         {/* 配置导入导出（FR-021）。密钥段走用户口令加密而非 DPAPI 密文——后者绑当前
             Windows 账户、换机解不出，照搬等于导出一份用不了的文件。 */}
         <Card>

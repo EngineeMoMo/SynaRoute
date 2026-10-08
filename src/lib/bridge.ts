@@ -1,3 +1,5 @@
+import { defaultDecision, type DecisionConfig, type DecisionView } from "./decision";
+import type { SharedTemplate, SharedImportResult } from "./sharedTemplate";
 import type { SessionMaintenanceProgress, SessionIdRepairPreview, SessionIdRepairResult } from "./sessionMaintenance";
 import type {
   AggregatePreview,
@@ -86,6 +88,15 @@ async function sessionCall<T>(cmd: string, args: Record<string, unknown>, progre
 }
 
 export const api = {
+  getDecisionConfig: (categoryId: CategoryType) => call<DecisionView>("get_decision_config", { categoryId }, () => defaultDecision()),
+  saveDecisionConfig: (categoryId: CategoryType, config: DecisionConfig, secret: string | null, clearSecret: boolean) => call<void>("save_decision_config", { categoryId, config, secret, clearSecret }, () => { throw new Error("请在桌面应用中保存判断配置 / Save decision settings in the desktop app"); }),
+  buildSharedTemplate: () => call<SharedTemplate>("build_shared_template", undefined, () => ({
+    format: "synaroute-share", version: 1, routes: [{ categoryId: "codex", protocol: "openai_chat", models: [{ realName: "example-model", contextWindow: null, maxOutputTokens: null }], mappings: [], defaultModel: null, tiers: [null, null, null, null], allowNamedModelFallback: false, temperature: null, topP: null, timeoutMs: null }],
+  })),
+  previewSharedTemplate: (raw: string) => call<SharedTemplate>("preview_shared_template", { raw }, () => { throw new Error("请在桌面应用中校验分享方案 / Validate templates in the desktop app"); }),
+  saveSharedTemplate: (raw: string) => call<string | null>("save_shared_template", { raw }, () => { throw new Error("请在桌面应用中保存 / Save in the desktop app"); }),
+  applySharedTemplate: (raw: string) => call<SharedImportResult>("apply_shared_template", { raw }, () => { throw new Error("请在桌面应用中导入 / Import in the desktop app"); }),
+  undoSharedTemplate: (token: string) => call<void>("undo_shared_template", { token }, () => { throw new Error("请在桌面应用中撤销 / Undo in the desktop app"); }),
   // 列出某分类下的 Key
   listKeys: (categoryId: CategoryType) =>
     call<ProviderKey[]>("list_keys", { categoryId }, () => mockBridge.listKeys(categoryId)),
@@ -636,7 +647,7 @@ export const api = {
   runAggregatePlan: (categoryId: CategoryType, prompt: string) =>
     call<AggregateResult>("aggregate_plan", { categoryId, prompt }, async () => ({
       resultType: "plan" as const,
-      content: "Mock: 修改 src/main.ts 第 10 行...",
+      content: "## 推荐结论\n演示报告：先验证重试逻辑，再决定是否调整连接池。\n\n## 依据与共识\n演示顾问 A 与 B 都建议先关联请求日志；本示例没有读取真实项目或运行检查。\n\n## 分歧与待确认\n顾问 A 优先考虑重复重试，顾问 B 建议同时观察连接池占用。现有信息不足以确认根因。\n\n## 验证与下一步\n1. 为每次重试记录请求 ID。\n2. 对照超时前后的连接占用。\n3. 根据实际结果再制定修改计划。以上步骤均待执行。",
       planStartedMs: Date.now(),
     })),
 

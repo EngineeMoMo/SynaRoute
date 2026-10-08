@@ -13,6 +13,8 @@ use crate::store::Store;
 // 且它读的每一位运行态，下面的文本报告都已汇过一遍。
 #[path = "resilience.rs"]
 pub(crate) mod resilience;
+#[path = "route_profiles.rs"]
+pub(crate) mod route_profiles;
 
 /// 遮掉 URL 里可能就是凭据的部分：`user:pass@`、像令牌的路径段、全部 query 值。
 ///

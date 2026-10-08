@@ -164,7 +164,8 @@ async function main() {
     console.error("[prerender] 找不到 dist/index.html —— 先跑 vite build");
     process.exit(1);
   }
-  const shellHtml = readFileSync(shellPath, "utf8");
+  // postbuild 保存的原始外壳；重复预渲染时 index.html 已是根网址跳转页。
+  const shellHtml = readFileSync(join(dist, "404.html"), "utf8");
 
   const chrome = CHROME_CANDIDATES.find(existsSync);
   if (!chrome) {
@@ -284,8 +285,7 @@ async function main() {
   // 代价只是产物里多一份同名 HTML（纯文本，全站合计几百 KB），而 canonical 统一
   // 指向不带斜杠的版本，两份指向同一规范网址、不构成重复内容。
   //
-  // 根 index.html 与 404.html **不动**：前者是 `/` → /zh 的客户端重定向外壳，
-  // 后者是深链兜底，都要保持 SPA 外壳。
+  // 404.html 保留 SPA 外壳；根 index.html 在内容页写完后生成静态跳转。
   for (const [route, html] of rendered) {
     const rel = route.replace(/^\/+/, "");
     // 扁平：dist/zh/docs/cli.html
@@ -297,6 +297,24 @@ async function main() {
     mkdirSync(dirname(dir), { recursive: true });
     writeFileSync(dir, html, "utf8");
   }
+  // 根网址也会被抓取，不能留下只能靠 JavaScript 跳转的空壳。
+  // GitHub Pages 无服务端重定向配置：0 秒 meta refresh 可作为永久跳转信号。
+  // 独立生成而不改 Vite 模板，避免 /zh、/en 和 404.html 继承跳转而循环。
+  writeFileSync(shellPath, `<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="refresh" content="0; url=https://synaroute.mofamilys.com/zh" />
+    <link rel="canonical" href="https://synaroute.mofamilys.com/zh" />
+    <title>SynaRoute — 官网</title>
+  </head>
+  <body>
+    <p>正在前往 <a href="https://synaroute.mofamilys.com/zh">SynaRoute 中文官网</a>。</p>
+    <p><a href="https://synaroute.mofamilys.com/en">SynaRoute in English</a></p>
+  </body>
+</html>
+`, "utf8");
   console.log(
     `[prerender] 完成，共 ${rendered.size} 条路由 × 2 份（<route>.html + <route>/index.html）`
   );

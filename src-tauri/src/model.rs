@@ -1988,8 +1988,7 @@ pub struct McpStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
-    /// 配置文件版本号，用于跟踪迁移状态。
-    /// 每次需要迁移已存配置时递增此版本号。
+    #[serde(default)] pub decision: std::collections::BTreeMap<CategoryType, crate::store::decision::DecisionConfig>,
     #[serde(default)]
     pub config_version: u32,
     #[serde(default)]

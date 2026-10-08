@@ -952,7 +952,7 @@ async fn compress(
     }
     let sum_prompt = format!(
         "以下是多位专家顾问对同一个问题的分析和建议。\n\
-         请提炼各位的关键要点、共识与分歧，压缩成简洁的要点清单，供最终决策参考。\n\n{joined}"
+         请提炼各位的关键要点、共识与分歧，保留顾问标签、具体证据、少数意见与待验证项；不要把推测写成事实，不要投票决定正确性。压缩成简洁的要点清单，供最终决策参考。\n\n{joined}"
     );
     let started = std::time::Instant::now();
     let (result, used) =

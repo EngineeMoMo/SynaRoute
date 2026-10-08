@@ -93,8 +93,8 @@ export default function App() {
     <BrowserRouter>
       <ScrollManager />
       <Routes>
-        {/* 裸访问 / 时按浏览器语言挑一个 */}
-        <Route path="/" element={<Navigate to={`/${detectLang()}`} replace />} />
+        {/* 与生产环境的静态跳转一致，让根网址有稳定的规范目标。 */}
+        <Route path="/" element={<Navigate to="/zh" replace />} />
 
         <Route path="/:lang" element={<LangLayout />}>
           <Route index element={<HomePage />} />

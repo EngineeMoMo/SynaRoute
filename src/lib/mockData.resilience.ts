@@ -56,6 +56,8 @@ export function mockResilienceOverview(
     });
   }
   return {
+    profiles: { version: 1, since: Date.now() - 3 * 86_400_000, dropped: 0, readOnly: false,
+      rows: cats.flatMap(c => c.keys.slice(0, 3).map((k, i) => ({ day: Math.floor(Date.now() / 86_400_000), categoryId: c.categoryId, keyId: k.keyId, requestedModel: "example-model", realModel: "example-model", streaming: true, attempts: [50, 25, 3][i], successes: [49, 17, 3][i], rateLimits: [0, 7, 0][i], successLatencyMs: [49000, 34000, 1500][i], lastSeen: Date.now() }))) },
     categories: cats,
     recent: { totalEvents: 500, routes: 431, failovers: 12, errors: 5, warnings: 9 },
   };

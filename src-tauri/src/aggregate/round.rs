@@ -46,15 +46,16 @@ pub(crate) enum RoundKind {
 impl RoundKind {
     /// 决策者 prompt。`file_section` 已是拼好的「## 相关文件」段（可能为空串）。
     fn decider_prompt(&self, prompt: &str, aggregated: &str, file_section: &str) -> String {
+        let report = prompt::CONSULTATION_REPORT;
         match self {
             Self::DesktopPlan => format!(
-                "你是最终决策者。以下是多位代码审阅者的分析意见。\n\
-                 请综合所有意见，输出一份具体的修改计划：列出需要修改的文件路径和具体改动描述。\n\
-                 注意：现在只输出计划，不要输出代码。等用户确认后再执行。\n\n\
+                "你是最终决策者。以下是专家顾问的独立分析意见，请综合成会诊报告。\n\
+                 {report}\n非代码问题直接给建议，不要硬套文件修改；涉及代码时列出文件路径和具体改动描述。\n\
+                 注意：现在只分析和建议；涉及修改时仅输出计划，不输出完整文件，不执行修改。\n\n\
                  ## 用户需求\n{prompt}\n\n\
                  ## 审阅意见\n{aggregated}\n\n\
                  {file_section}\
-                 请输出修改计划："
+                 请输出会诊报告（涉及修改时仅提供计划）："
             ),
             Self::Mcp => format!(
                 "你是最终决策者。以下是多位专家顾问对同一个问题的独立分析意见。\n\
@@ -63,7 +64,7 @@ impl RoundKind {
                  - 用 Markdown 组织，先给结论，再给依据/步骤/细节\n\
                  - 根据问题类型自适应：代码/技术任务给出要改的文件路径与具体改动说明（涉及代码可给关键片段示例，但不要臆造完整文件）；\
                  信息查询、方案设计、决策分析等问题则直接给出结论与理由，不要硬套「修改文件」的格式\n\
-                 - 标注顾问之间的分歧点（如有）\n\
+                 - {report}\n\
                  - 你只负责出答案/方案，实际的文件修改（如涉及）会由用户在客户端确认后执行\n\n\
                  ## 用户问题\n{prompt}\n\n\
                  ## 顾问意见\n{aggregated}\n\n\
@@ -123,6 +124,14 @@ pub(crate) async fn run(
     brain: &BrainConfig,
     spec: RoundSpec<'_>,
 ) -> AppResult<RoundOutcome> {
+    let started = std::time::Instant::now();
+    let scope = crate::store::decision::prepare(store, category, spec.prompt, !spec.images.is_empty(), brain.total_timeout_ms).await;
+    let mut adjusted = brain.clone();
+    adjusted.total_timeout_ms = brain.total_timeout_ms.saturating_sub(started.elapsed().as_millis() as u64).max(1);
+    crate::store::decision::EFFORT.scope(scope, run_inner(store, category, &adjusted, spec)).await
+}
+
+async fn run_inner(store: &Arc<Store>, category: CategoryType, brain: &BrainConfig, spec: RoundSpec<'_>) -> AppResult<RoundOutcome> {
     let decider_ref = brain
         .decider_ref
         .clone()
@@ -277,7 +286,10 @@ pub(crate) async fn run(
                 label_ref(store, &decider_ref)
             ),
         );
-        let fallback_prompt = build_solo_decider_prompt(prompt, &file_context);
+        let fallback_prompt = format!(
+            "{}\n\n本轮没有成功的顾问意见，请独立分析并明确说明；不要声称存在会诊共识。只提供建议或修改计划，不执行修改。\n{}",
+            build_solo_decider_prompt(prompt, &file_context), prompt::CONSULTATION_REPORT
+        );
         // 独答降级：无成员/压缩阶段，决策者独享整轮剩余时间。
         let solo_budget = decider_phase_budget_ms(remaining_ms(deadline), PHASE_MIN_BUDGET_MS);
         // 🔴 `with_usage` 不能省：独答同样烧额度，而这是**两份旧实现各漏一半**的那一处 ——
@@ -303,7 +315,7 @@ pub(crate) async fn run(
             (!solo_used.is_empty()).then_some(solo_used),
         );
         return Ok(RoundOutcome {
-            analysis: fallback,
+            analysis: format!("本轮无成功的参与者，以下由决策者独立作答。 / No successful participants; this is the decider's independent answer.\n\n{fallback}"),
             work_dir: effective_work_dir,
             member_labels,
             decider_ref,

@@ -4236,7 +4236,7 @@ dependencies = [
 
 [[package]]
 name = "synaroute"
-version = "0.1.73"
+version = "0.1.74"
 dependencies = [
  "aes-gcm",
  "argon2",

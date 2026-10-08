@@ -1,3 +1,4 @@
+import { RouteProfiles } from "@/components/RouteProfiles";
 import { useRef, useState } from "react";
 import { api } from "@/lib/bridge";
 import { useBackendEvent, FALLBACK_POLL_MS } from "@/lib/useBackendEvents";
@@ -50,6 +51,7 @@ export function ReliabilityPage() {
       />
       <div className="flex-1 space-y-4 overflow-y-auto p-6">
         {error && <InlineAlert tone="danger">{error}</InlineAlert>}
+        {data && <RouteProfiles data={data} />}
         {!data ? (
           <div className="py-16 text-center text-sm text-text-muted">{t("resilience.loading")}</div>
         ) : cats.length === 0 ? (

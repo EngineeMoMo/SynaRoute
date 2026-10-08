@@ -82,6 +82,7 @@ pub(crate) struct RecentActivity {
 pub(crate) struct ResilienceOverview {
     pub(crate) categories: Vec<CategoryResilience>,
     pub(crate) recent: RecentActivity,
+    pub(crate) profiles: super::route_profiles::ProfileSnapshot,
 }
 
 /// 组装当前快照（纯只读，可脱离 tauri 单测）。
@@ -146,7 +147,7 @@ pub(crate) fn build(store: &Store) -> ResilienceOverview {
             _ => {}
         }
     }
-    ResilienceOverview { categories, recent }
+    ResilienceOverview { categories, recent, profiles: store.route_profiles.snapshot() }
 }
 
 /// 可靠性总览（只读快照）。前端「可靠性」页轮询它。

@@ -517,6 +517,41 @@ pub fn apply_import(
     })
 }
 
+/// 导出配置到用户选定的文件。`password` 非空则包含密钥段（口令加密）。
+/// 返回实际写入的路径 + 跳过条数；用户取消选择时返回 None。
+#[tauri::command]
+pub async fn export_config(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::AppState>,
+    password: Option<String>,
+) -> AppResult<Option<crate::service::ExportOutcome>> {
+    use tauri_plugin_dialog::DialogExt;
+    // 先构建再弹框（见 crate::service::build_export_bytes 的理由）。
+    let (data, undecryptable, with_secrets) = crate::service::build_export_bytes(
+        &state.store,
+        app.package_info().version.to_string().as_str(),
+        password.as_ref(),
+    )?;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("导出 SynaRoute 配置")
+        .set_file_name(crate::service::export_file_name())
+        .add_filter("SynaRoute 配置", &["json"])
+        .save_file(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(path) = rx.await.ok().flatten() else {
+        return Ok(None); // 用户取消，不算错误
+    };
+    let path = path
+        .into_path()
+        .map_err(|e| crate::error::AppError::Other(format!("解析保存路径失败: {e}")))?;
+    crate::service::write_export(&state.store, &path, &data, undecryptable, with_secrets).map(Some)
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

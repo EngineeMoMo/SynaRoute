@@ -2,6 +2,8 @@
 
 Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路由 AI API 请求，含故障转移、模型映射、协议转换、加密密钥存储、健康检查。
 
+**涉及官网 `site/`、路由或部署时，先读本文「官网搜索索引硬规则」和 [site/README.md 的 SEO 章节](site/README.md#seo--预渲染--sitemap收到-google站点地图-404先读这一节)。** 根网址 `/` 必须单独检查，不能只验 sitemap 中的语言页。
+
 ## 🔴 换机/接手先读这一篇
 
 **[docs/14-交接与待办清单.md](docs/14-交接与待办清单.md)** —— 2026-07-31 换机交接。里面有：
@@ -3008,6 +3010,32 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
 - **换机注意**：`secrets.enc` 由 DPAPI 绑账户、**不可跨机器搬运**；本文档里的绝对路径都是旧机器实测值
 - **判据取证方法**：如何反查 `claude.exe` / `codex.exe` 的字段与内嵌官方 gateway 规范
   （本轮所有「客户端认什么字段」的结论都出自此，不是文档推测）
+
+## 官网搜索索引硬规则（2026-10-08）
+
+**本次已确认的遗漏**：Google Search Console 报告的是 `https://synaroute.mofamilys.com/`。
+线上 `/zh`、`/en` 已返回 200 且有预渲染正文，robots 与 sitemap 正常，但 `/` 仍返回空的
+`<div id="root"></div>`，无静态 canonical 或跳转，依赖 JavaScript 按浏览器语言导航。
+因此「语言页已预渲染」不能证明根入口已处理；这个技术缺陷也不能单独证明 Google 不收录的全部原因。
+
+- **根入口目标必须稳定**：`/` 固定跳转 `/zh`，canonical 同指 `/zh`。当前 GitHub Pages
+  部署使用独立的 0 秒 HTML meta refresh 页面和可点击链接，不依赖 JavaScript、浏览器语言
+  或爬虫身份。客户端根路由保持同一目标，英文内容继续通过 `/en` 和语言切换访问。
+- **跳转只写最终根产物**：由 `site/scripts/prerender.mjs` 在内容页预渲染后生成
+  `site/dist/index.html`。不得加进 `site/index.html` 共用模板，否则内容页和 404 兜底会继承
+  跳转。`dist/404.html` 保留原始 SPA 外壳，重复预渲染也从它读取外壳。
+- **检查实际产物，不能只检查源码**：官网发布前必须运行 `cd site` 后的 `npm run build`。
+  不得跳过其中的 `scripts/check-seo.mjs`；它检查根跳转、canonical、无需 JS 的链接、404
+  无跳转，以及 sitemap 每条网址的两份 HTML 都有 `<main>`、`<h1>`、匹配的 canonical，
+  且不含跳转或 noindex。不能为通过构建而删除检查或把错误降成警告。
+- **路由改动同步三处**：应用路由、sitemap 清单、预渲染清单保持一致；sitemap 只列内容页，
+  不加入根跳转入口。详细文件位置与流程统一维护在 `site/README.md` 的 SEO 章节。
+- **按报告的精确网址排查**：线上单独检查 `/`、`/zh`、`/en` 及报告中的具体 URL，核对
+  HTTP 状态、原始 HTML 正文、跳转、canonical、robots meta/响应头和 sitemap。
+  仅返回 200 不代表可收录，不得把所有排除报告直接归因为 Google 数据滞后。
+- **区分完成状态**：本地构建通过、已部署、线上复核通过、Google 已收录是四个不同状态。
+  发布后用 Search Console「测试实际网址」核对语言首页再请求收录；根入口作为跳转页无需
+  单独收录。不得承诺收录时间，也不得把「验证已开始」或代码修复描述为「Google 已恢复收录」。
 
 ## ⚠️ 构建/部署硬规则（踩过坑，务必遵守）
 

@@ -861,40 +861,6 @@ fn open_log_dir(app: tauri::AppHandle, state: tauri::State<AppState>) -> AppResu
 // 含密钥导出改用用户口令重新加密。这里三条命令只负责弹文件对话框 —— 那是唯一
 // 需要 AppHandle、也唯一无法单测的部分。
 
-/// 导出配置到用户选定的文件。`password` 非空则包含密钥段（口令加密）。
-/// 返回实际写入的路径 + 跳过条数；用户取消选择时返回 None。
-#[tauri::command]
-async fn export_config(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    password: Option<String>,
-) -> AppResult<Option<service::ExportOutcome>> {
-    use tauri_plugin_dialog::DialogExt;
-    // 先构建再弹框（见 service::build_export_bytes 的理由）。
-    let (data, undecryptable, with_secrets) = service::build_export_bytes(
-        &state.store,
-        app.package_info().version.to_string().as_str(),
-        password.as_ref(),
-    )?;
-
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
-        .file()
-        .set_title("导出 SynaRoute 配置")
-        .set_file_name(service::export_file_name())
-        .add_filter("SynaRoute 配置", &["json"])
-        .save_file(move |p| {
-            let _ = tx.send(p);
-        });
-    let Some(path) = rx.await.ok().flatten() else {
-        return Ok(None); // 用户取消，不算错误
-    };
-    let path = path
-        .into_path()
-        .map_err(|e| error::AppError::Other(format!("解析保存路径失败: {e}")))?;
-    service::write_export(&state.store, &path, &data, undecryptable, with_secrets).map(Some)
-}
-
 /// 让用户选一个导出文件并**只做校验与预检**（不改任何配置）。
 /// 返回 (文件路径, 预检信息)；用户取消时返回 None。
 #[tauri::command]
@@ -1373,7 +1339,9 @@ pub fn run() {
             prepare_log_dir,
             open_log_dir,
             export_diagnostics, diagnostics::resilience::resilience_overview,
-            export_config,
+            store::shared_config::build_shared_template, store::shared_config::preview_shared_template,
+            store::shared_config::save_shared_template, store::shared_config::apply_shared_template, store::shared_config::undo_shared_template,
+            portable::export_config,
             pick_and_preview_import,
             apply_import_config,
             count_orphan_secrets,
@@ -1381,6 +1349,7 @@ pub fn run() {
             list_vendors,
             upsert_vendor,
             delete_vendor,
+            store::decision::get_decision_config, store::decision::save_decision_config, store::decision::native_discovery::native_defaults, store::decision::native::native_open, store::decision::native::native_snapshot, store::decision::native::native_turn, store::decision::native::native_approve, store::decision::native::native_close, store::decision::laya_local::laya_local_status, store::decision::laya_local::laya_local_start, store::decision::laya_local::laya_local_stop,
             aggregate::aggregate_plan,
             aggregate::aggregate_execute,
             aggregate::aggregate_write,
@@ -1440,7 +1409,7 @@ pub fn run() {
                     tracing::info!("退出前已优雅停止 {stopped} 个分类的代理");
                 }
 
-                state.store.flush_logs();
+                tauri::async_runtime::block_on(async { store::decision::native::shutdown().await; store::decision::laya_local::shutdown().await; }); state.store.flush_logs();
                 let dropped = state.store.log_dropped_count();
                 if dropped > 0 {
                     // 丢弃必须留痕：静默丢日志是本项目最忌讳的失效形态。

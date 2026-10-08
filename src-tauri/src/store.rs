@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 // 四个子模块都挂在这里，因为它们要调私有的 mutate_and_persist / 解析数据目录 / 守住唯一落盘点；各自的挂载理由写在对应文件的模块注释里。
 #[path = "data_dir.rs"] pub(crate) mod data_dir;
-#[path = "log_rotate.rs"] pub(crate) mod log_rotate;
-#[path = "key_flags.rs"] pub(crate) mod key_flags; #[path = "brain_config.rs"] mod brain_config;
+#[path = "decision.rs"] pub(crate) mod decision; #[path = "log_rotate.rs"] pub(crate) mod log_rotate;
+#[path = "shared_config.rs"] pub(crate) mod shared_config; #[path = "key_flags.rs"] pub(crate) mod key_flags; #[path = "brain_config.rs"] mod brain_config;
 #[path = "key_order.rs"] pub(crate) mod key_order; // 三个排序入口的唯一实现；来由见该文件模块注释
 
 /// 检查 baseUrl 是否含路径后缀（如 `https://api.deepseek.com/anthropic` 中的 `/anthropic`）。
@@ -45,6 +45,7 @@ pub fn base_url_has_path_suffix(base_url: &str) -> bool {
 }
 
 pub struct Store {
+    pub(crate) route_profiles: crate::diagnostics::route_profiles::ProfileStore,
     config_path: PathBuf,
     config: RwLock<AppConfig>,
     pub secrets: RwLock<SecretStore>,
@@ -450,6 +451,7 @@ impl Store {
         let baseline_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
         let store = Self {
+            route_profiles: crate::diagnostics::route_profiles::ProfileStore::load(config_path.with_file_name("route-profiles.json")),
             config_path,
             config: RwLock::new(config),
             secrets: RwLock::new(secrets),
@@ -1274,7 +1276,7 @@ impl Store {
                 }
                 // 磁盘上新出现的 Key（本进程没见过）→ 保留其磁盘健康态作为暖启动值。
             }
-            cfg.brain = fresh.brain;
+            cfg.brain = fresh.brain; cfg.decision = fresh.decision;
             cfg.vendors = fresh.vendors;
             after_len = cfg.keys.len();
         }
@@ -1828,6 +1830,7 @@ impl Store {
     /// 每次 flush 后把基线抬到当前总量，于是下一次 flush 只写这之间的新增；
     /// 跨过 UTC 零点时同样抬基线并换桶，昨天的增量不会漏进今天。
     pub fn flush_usage_if_dirty(&self) -> bool {
+        self.route_profiles.flush();
         // 只读模式：磁盘上那份是更新的格式，本次运行一个字节都不许写。
         // **必须在清脏标记之前判**：否则标记被清掉、这段消耗既没写盘也不再重试，
         // 等于一边"保护"文件一边丢数据。
@@ -2856,6 +2859,7 @@ impl Store {
         let usage_path = crate::usage_store::usage_file_path(&config_path);
         let usage_loaded = crate::usage_store::load_usage(&usage_path);
         Ok(Self {
+            route_profiles: crate::diagnostics::route_profiles::ProfileStore::load(config_path.with_file_name("route-profiles.json")),
             config_path,
             config: RwLock::new(config),
             secrets: RwLock::new(secrets),
@@ -3267,6 +3271,7 @@ mod tests {
         let seed = Vendor::builtin_seed();
         let old = AppConfig {
             config_version: 0,
+            decision: Default::default(),
             keys: vec![],
             brain: vec![],
             vendors: vec![seed[0].clone()],

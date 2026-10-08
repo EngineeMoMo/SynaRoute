@@ -571,6 +571,7 @@ async fn handle_request_inner(
                        streaming: bool,
                        was_truncated: Option<bool>,
                        usage: Option<crate::upstream::TokenUsage>| {
+        store.route_profiles.record(key, &requested_model, &real_model, streaming, true, Some(status), elapsed);
         let detail = fmt_success_detail(
             &key.name,
             streaming,
@@ -598,14 +599,13 @@ async fn handle_request_inner(
             ok: true,
             was_truncated,
         });
-        let collapse = format!("ok:{}:{}:{}", key.id, requested_model, streaming);
         store.append_event_full(
             category,
             "route",
             Some(&key.id),
             &detail,
             trace,
-            Some(collapse),
+            Some(format!("ok:{}:{}:{}", key.id, requested_model, streaming)),
             usage,
         );
     };
@@ -622,6 +622,7 @@ async fn handle_request_inner(
                        response_body: String,
                        status: Option<u16>,
                        ok: bool| {
+        store.route_profiles.record(key, &requested_model, &real_model, wants_stream, ok, status, elapsed);
         if !req_log {
             return;
         }
@@ -4742,6 +4743,38 @@ mod tests {
     ///
     /// 判据两侧都要钉：① 令牌不得出现；② host 必须还在 —— 只钉①的话，
     /// 把整个字段清空也能过，而那会毁掉这个字段的全部排障价值（本仓「过度脱敏」那一族）。
+    #[tokio::test]
+    async fn passive_profiles_observe_success_and_failure_with_body_logging_off() {
+        for (status, streaming) in [(200, false), (429, false), (200, true), (429, true)] {
+            let upstream = if status == 200 && streaming {
+                spawn_sse_mock("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n").await
+            } else { spawn_mock(status, r#"{"content":[{"type":"text","text":"ok"}]}"#).await };
+            let dir = temp_dir("passive-profiles");
+            let store = Arc::new(Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
+            let mut settings = store.get_settings(); settings.request_log_enabled = false; settings.upstream_retry_enabled = false;
+            store.save_settings(UserPrefs::from(&settings)).unwrap();
+            let id = format!("profile-{}", uuid::Uuid::new_v4());
+            store.upsert_key(key(&id, 0, &upstream)).unwrap();
+            store.secrets.write().set(&id, "local-test-secret").unwrap();
+            let manager = ProxyManager::new(store.clone());
+            let port = manager.start(CategoryType::ClaudeCli).await.unwrap();
+            let response = reqwest::Client::new().post(format!("http://127.0.0.1:{port}/v1/messages"))
+                .json(&json!({"model":"m", "max_tokens":10, "stream":streaming, "messages":[{"role":"user","content":"private-body"}]}))
+                .send().await.unwrap();
+            let _ = response.bytes().await.unwrap();
+            let snapshot = store.route_profiles.snapshot();
+            assert_eq!(snapshot.rows.len(), 1, "one candidate attempt per request");
+            let row = &snapshot.rows[0];
+            assert_eq!(row.attempts, 1); assert_eq!(row.successes, u64::from(status == 200));
+            assert_eq!(row.rate_limits, u64::from(status == 429)); assert_eq!(row.streaming, streaming);
+            assert!(!serde_json::to_string(&snapshot).unwrap().contains("private-body"));
+            assert!(store.list_all_events().iter().all(|e| !e.has_trace));
+            manager.stop(CategoryType::ClaudeCli); store.flush_usage_if_dirty();
+            assert!(dir.join("route-profiles.json").exists());
+            drop(manager); drop(store); std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
     #[tokio::test]
     async fn the_trace_url_never_carries_a_path_token() {
         let token = "sk-proj-abc123def456ghi789jkl012mno345";

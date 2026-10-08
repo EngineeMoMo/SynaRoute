@@ -1,3 +1,4 @@
+import type { ProfileSnapshot } from "./routeProfiles";
 // 「可靠性」页的类型（与 Rust `resilience.rs` 的 serde 结构对齐）。
 //
 // 放这里而不是 types.ts：那个文件正卡在棘轮新文件上限（900 行）附近，再塞几个接口就超了。
@@ -48,4 +49,5 @@ export interface RecentActivity {
 export interface ResilienceOverview {
   categories: CategoryResilience[];
   recent: RecentActivity;
+  profiles: ProfileSnapshot;
 }

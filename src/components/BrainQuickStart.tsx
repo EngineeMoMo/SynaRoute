@@ -42,7 +42,7 @@ export function BrainQuickStart({ category, config, keys, onReady }: Props) {
 
   // 就绪（已开启 + 已选决策者）就直接是运行面板 —— 不再重复挂一份，行为与原先一致。
   if (config.enabled && config.deciderRef) {
-    return <BrainRunPanel category={category} />;
+    return <BrainRunPanel key={category} category={category} />;
   }
 
   const usable = usableAggregateKeys(keys);
@@ -59,7 +59,7 @@ export function BrainQuickStart({ category, config, keys, onReady }: Props) {
       const next = { ...config, ...patch };
       await api.saveBrainConfig(next);
       onReady(next);
-      showToast("success", t("brain.quickFillDone", { n: next.members.length }));
+      showToast("success", t("brain.consultConfigured", { n: next.members.length }));
     } catch (e) {
       showToast("error", String((e as Error)?.message ?? e));
     } finally {

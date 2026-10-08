@@ -12,6 +12,9 @@
 // 与那一页其余部分（配置编辑）本来就没有耦合，只共享 `category`。
 
 import { useState } from "react";
+import { ConsultationReport } from "./ConsultationReport";
+import { ConsultationTemplates } from "./ConsultationTemplates";
+import { consultationPrompt, type ConsultationTemplate } from "@/lib/consultation";
 import { api } from "@/lib/bridge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -26,6 +29,8 @@ type Phase = "idle" | "planning" | "planned" | "previewing" | "preview" | "writi
 export function BrainRunPanel({ category }: { category: CategoryType }) {
   const t = useT();
   const [prompt, setPrompt] = useState("");
+  const [template, setTemplate] = useState<ConsultationTemplate>("general");
+  const [submittedPrompt, setSubmittedPrompt] = useState("");
   const [phase, setPhase] = useState<Phase>("idle");
   const [plan, setPlan] = useState("");
   // Phase1 定下的工作目录与开始时刻，后两个阶段原样回传。
@@ -52,8 +57,10 @@ export function BrainRunPanel({ category }: { category: CategoryType }) {
     setPlan("");
     setPreview(null);
     setResult("");
+    const request = consultationPrompt(prompt, template, t);
+    setSubmittedPrompt(request);
     try {
-      const res = await api.runAggregatePlan(category, prompt);
+      const res = await api.runAggregatePlan(category, request);
       if (res.resultType === "plan") {
         setPlan(res.content);
         setPlanWorkDir(res.workDir ?? "");
@@ -75,7 +82,7 @@ export function BrainRunPanel({ category }: { category: CategoryType }) {
     try {
       const res = await api.runAggregatePreview(
         category,
-        prompt,
+        submittedPrompt,
         plan,
         planWorkDir,
         planStartedMs,
@@ -125,14 +132,19 @@ export function BrainRunPanel({ category }: { category: CategoryType }) {
         <CardTitle>{t("brain.runTitle")}</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
+        <p className="text-xs leading-relaxed text-text-secondary">{t("brain.consultIndependent")}</p>
+        <ConsultationTemplates value={template} onChange={setTemplate} disabled={phase !== "idle"} />
+        <label htmlFor={`consultation-prompt-${category}`} className="block text-sm font-medium text-text-primary">{t("brain.consultQuestion")}</label>
         <textarea
+          id={`consultation-prompt-${category}`}
           className="w-full rounded-control border border-border bg-background px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-ring"
           rows={3}
-          placeholder={t("brain.runPlaceholder")}
+          placeholder={t(`brain.template.${template}.placeholder`)}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           disabled={phase !== "idle"}
         />
+        {phase === "idle" && <p className="text-xs leading-relaxed text-text-secondary">{t("brain.consultSavedConfig")}</p>}
 
         <div className="flex flex-wrap items-center gap-2">
           {phase === "idle" && (
@@ -141,15 +153,15 @@ export function BrainRunPanel({ category }: { category: CategoryType }) {
             </Button>
           )}
           {phase === "planning" && (
-            <span className="text-xs text-text-muted">{t("brain.runThinking")}</span>
+            <span role="status" className="text-xs text-text-secondary">{t("brain.runThinking")}</span>
           )}
           {phase === "planned" && (
             <>
-              <Button size="sm" onClick={() => void runPreview()}>
+              <Button size="sm" variant="outline" onClick={() => void runPreview()}>
                 <CheckCircle size={14} /> {t("brain.runConfirm")}
               </Button>
               <Button size="sm" variant="outline" onClick={reset}>
-                {t("common.cancel")}
+                {t("brain.runReset")}
               </Button>
             </>
           )}
@@ -180,18 +192,9 @@ export function BrainRunPanel({ category }: { category: CategoryType }) {
           )}
         </div>
 
-        {error && <div className="text-xs text-danger">{error}</div>}
+        {error && <div role="alert" className="text-xs text-danger">{error}</div>}
 
-        {plan && (
-          <div>
-            <div className="mb-1 text-xs font-medium text-text-secondary">
-              {t("brain.runPlanTitle")}
-            </div>
-            <pre className="max-h-64 overflow-auto rounded-control border border-border bg-background p-3 font-mono text-xs leading-relaxed text-text-primary">
-              {plan}
-            </pre>
-          </div>
-        )}
+        {plan && <ConsultationReport key={planStartedMs} content={plan} />}
 
         {preview && phase === "preview" && (
           <PreviewList

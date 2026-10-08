@@ -186,12 +186,13 @@ async fn anthropic_message(
     request_timeout: Duration,
 ) -> AppResult<String> {
     let url = join_endpoint(&key.base_url, "/v1/messages");
-    let payload = json!({
+    let mut payload = json!({
         "model": model,
         "max_tokens": max_tokens.unwrap_or(1),
         "messages": [{ "role": "user", "content": prompt }]
     });
     // 版本头由 apply_auth 按协议统一添加（见那里的注释），此处不再单独补。
+    crate::store::decision::apply_effort(key, model, &mut payload);
     let mut req = client.post(&url).json(&payload).timeout(request_timeout);
     req = apply_auth(req, key, secret);
     req = apply_client_identity(req, key.protocol);
@@ -246,6 +247,7 @@ async fn openai_chat(
     if let Some(n) = max_tokens {
         payload["max_tokens"] = json!(n);
     }
+    crate::store::decision::apply_effort(key, model, &mut payload);
     let mut req = client.post(&url).json(&payload).timeout(request_timeout);
     req = apply_auth(req, key, secret);
     req = apply_client_identity(req, key.protocol);
