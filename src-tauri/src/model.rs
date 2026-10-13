@@ -1374,89 +1374,10 @@ fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
-/// 用量统计：按「分类 × Key」聚合的一行。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TokenUsageByKey {
-    pub category_id: CategoryType,
-    /// 空串 = 该分类的系统级事件（无具体 Key）。
-    pub key_id: String,
-    pub usage: TokenUsage,
-}
-
-/// 用量累计的**落盘快照**（`usage.json`）。
-///
-/// 刻意与 `config.json` 分开成独立文件，不塞进 `AppConfig`：
-/// - 用量是**运行期遥测**，不是用户配置。混进去会让「每分钟落一次用量」变成
-///   「每分钟重写一次用户的全部 Key 与设置」——把一份只该增长计数器的写入，
-///   放大成对用户最宝贵数据的反复覆写，任何一次坏写都可能带走 Key 配置。
-/// - 体积与节奏都不同：config 是事件驱动、~20KB；usage 是定时、通常几百字节。
-///
-/// **v2 改动（2026-08-11）**：按日分桶 + 90 天滚动。v1 只有单个全局 `entries`，
-/// 运行几个月后会攒到几千行；v2 把它们按 UTC 日期分桶，flush 时自动删 91 天前的桶。
-/// v1→v2 迁移：首次 flush 时把 v1 的 `entries` 全搬进一个桶（日期按 `since_ms` 推算），
-/// 之后 `entries` 字段留空（保留它是为了让 v2 能读 v1 文件）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsageSnapshot {
-    /// 格式版本。v1 = 全局 `entries`；v2 = 按日分桶 `daily_buckets`。
-    #[serde(default = "usage_snapshot_version")]
-    pub version: u32,
-    /// 统计起始时刻（毫秒时间戳）。首次创建时写入，之后原样保留 ——
-    /// 面板据此显示「统计自 X 起」，否则一个只增不减的数字用户无从判断它覆盖多长时间。
-    #[serde(default)]
-    pub since_ms: i64,
-    /// 最后一次落盘时刻，仅供人工排查「这份文件是不是卡住不更新了」。
-    #[serde(default)]
-    pub updated_ms: i64,
-    /// **v2 数据**：按 UTC 日期分桶的用量，最多保留 90 天。
-    /// 每个桶 = 一天内所有分类 × Key 的累计。降序排列（最新的在前）。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub daily_buckets: Vec<DailyUsageBucket>,
-    /// **v3 数据**：已被 90 天滚动淘汰的桶的累计（按分类 × Key）。
-    ///
-    /// 为什么必须有：`daily_buckets` 只留 90 天，而启动时的「累计总量」= 各存活桶之和。
-    /// 于是每有一个桶过期，**下次启动读出来的累计就变小**——一个「累计用量」面板越用
-    /// 数字越少，用户据此估额度会严重低估。这与当年「按事件环算总量」那个 bug 是同一个
-    /// 症状、不同的成因（那次已修，这次在第 90 天重现）。
-    ///
-    /// 淘汰桶的量在删除前折进这里，故：**累计总量 = retired + 各存活桶之和**，
-    /// 单调不减；而按日视图仍只看 `daily_buckets`，90 天窗口的语义不变。
-    /// 日维度如实丢弃（不编造一个假日期把整段历史堆到某天）。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub retired: Vec<TokenUsageByKey>,
-    /// **v1 兼容字段**：v2 写出时留空，只在读 v1 文件时有值。
-    /// v2 程序首次 flush 会把这里的内容迁移进 `daily_buckets` 的一个桶。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub entries: Vec<TokenUsageByKey>,
-}
-
-/// 一天的用量分桶（v2 格式）。`entries` 含义与 v1 相同：该天内所有 Key 的累计。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DailyUsageBucket {
-    /// UTC 日期字符串，格式 `"YYYY-MM-DD"`（如 `"2026-08-11"`）。
-    pub date: String,
-    /// 该天内按 `(分类, key_id)` 聚合的用量。Vec 而非 map 的理由同 v1。
-    pub entries: Vec<TokenUsageByKey>,
-}
-
-/// `usage.json` 的当前格式版本。**读写共用这一个常量**，别两边各写字面量 ——
-/// 那样改了写侧忘了改读侧，版本门就会把自己刚写出去的文件判为"来自未来"。
-///
-/// 改动规则：只有当**旧程序按旧结构解析新文件会得到错误结果**时才递增。
-/// v1→v2（按日分桶）正是这种情形：v1 程序解析 v2 文件时 `daily_buckets` 会被
-/// 忽略（未知字段），读出的 `entries` 是空的，紧接着 flush 就会用空数据覆盖
-/// 用户攒了几个月的累计 —— **版本门必须拦住**。
-///
-/// v2→v3（`retired`：已淘汰桶的累计）同样符合这条规则：v2 程序会忽略 `retired`，
-/// 于是累计总量凭空少掉 90 天以前的那一整段，而它下一次 flush 就把不含 `retired` 的
-/// 文件写回去 —— 那段历史**永久消失**（用量是纯累加值，没有别处可恢复）。
-pub const USAGE_SNAPSHOT_VERSION: u32 = 3;
-
-fn usage_snapshot_version() -> u32 {
-    USAGE_SNAPSHOT_VERSION
-}
+/// 用量快照的类型（`TokenUsageByKey` / `UsageSnapshot` / `DailyUsageBucket` / 版本号）
+/// 已搬到 [`crate::usage_store`]（加模型维度时，本文件棘轮余量不够）。这里 re-export，旧路径不变。
+pub use crate::usage_store::{DailyUsageBucket, TokenUsageByKey};
+#[cfg(test)] pub use crate::usage_store::{UsageSnapshot, USAGE_SNAPSHOT_VERSION};
 
 impl TokenUsage {
     pub fn total(&self) -> u64 {

@@ -29,10 +29,11 @@ To be clear about what this protects against: encryption guards against the file
 
 ### What the application sends over the network
 
-Two things only:
+Three things only:
 
 1. The upstream vendor requests you configured — the AI calls being proxied, sent to the addresses you entered on your keys;
-2. A request to the project's releases page when checking for updates.
+2. A request to the project's releases page when checking for updates;
+3. Once a day, a download of a public model price file (maintained by LiteLLM, via jsDelivr, falling back to GitHub), used to estimate costs on the usage page. It is an anonymous GET request and carries no local data, keys or usage.
 
 Nothing else leaves your machine.
 

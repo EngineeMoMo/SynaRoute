@@ -8,7 +8,7 @@
 //! Token → 美元换算链路：
 //! ```text
 //! TokenUsage {input, output, cache_read, cache_creation}
-//!   ↓ lookup_row()：归一模型名 → 最长片段命中一行
+//!   ↓ lookup()：归一模型名 → 内置表与在线表（`online`）里最长片段命中的一行，平局内置赢
 //!   ↓ 各项乘对应单价（缓存价按行里的显式值，缺省才用 0.1× / 1.25×）
 //!   ↓ 四项求和 → 纳美元
 //!   ↓ 乘 Key 倍率 → 最终成本
@@ -16,6 +16,7 @@
 //! ```
 
 pub(crate) mod table;
+pub(crate) mod online;
 
 use serde::{Deserialize, Serialize};
 use table::{Row, FAMILY_FLAGSHIP, PRICING_TABLE};
@@ -132,15 +133,49 @@ fn normalize(model: &str) -> String {
 ///
 /// 平局本身仍应尽量避免（靠给具体型号补显式行），因为字典序只保证**确定**、不保证**对**。
 /// `no_ambiguous_fragment_ties_in_coverage` 那条测试把「覆盖名单里不许有平局」钉住。
-fn lookup_row(model: &str) -> Option<&'static Row> {
-    let n = normalize(model);
-    if n.is_empty() {
+///
+/// 输入是**已归一**的名字：调用方归一一次，内置表与在线表共用，热路径上不重复分配。
+fn best_builtin(normalized: &str) -> Option<&'static Row> {
+    if normalized.is_empty() {
         return None;
     }
     PRICING_TABLE
         .iter()
-        .filter(|row| fragment_matches(row.frag, &n))
+        .filter(|row| fragment_matches(row.frag, normalized))
         .max_by_key(|row| (row.frag.len(), row.frag))
+}
+
+/// 一次查价的结果。
+struct Hit {
+    pricing: ModelPricing,
+    /// 命中的是内置表的家族兜底行（界面标 `≈`）。在线命中恒为 false。
+    is_family: bool,
+}
+
+/// 生产查价：内置表 + 当前的在线表（合并规则见 [`online`] 的模块头）。
+fn lookup(model: &str) -> Option<Hit> {
+    let snapshot = online::current();
+    let rows: &[online::Priced] = snapshot.as_deref().map_or(&[], |s| s.rows.as_slice());
+    lookup_in(model, rows)
+}
+
+/// [`lookup`] 的纯函数形态，在线表由入参给出（测试不必碰进程级状态）。
+///
+/// 🔴 **在线行只在片段严格更长时才赢**（`>`，不是 `>=`）：同名平局内置赢 —— 内置表是逐条对过
+/// 官方定价页的，在线表只用来补它不认得的、更具体的名字。
+fn lookup_in(model: &str, table: &[online::Priced]) -> Option<Hit> {
+    let n = normalize(model);
+    let builtin = best_builtin(&n);
+    let floor = builtin.map_or(0, |r| r.frag.len());
+    let better = table
+        .iter()
+        .filter(|p| p.frag.len() > floor && match_at(&p.frag, &n, true))
+        .max_by(|a, b| a.frag.len().cmp(&b.frag.len()).then_with(|| a.frag.cmp(&b.frag)));
+    match (better, builtin) {
+        (Some(p), _) => Some(Hit { pricing: p.pricing, is_family: false }),
+        (None, Some(r)) => Some(Hit { pricing: ModelPricing::from_row(r), is_family: is_family_row(r.frag) }),
+        (None, None) => None,
+    }
 }
 
 /// 片段是否命中模型名 —— 带**版本边界**判据。
@@ -163,28 +198,53 @@ fn lookup_row(model: &str) -> Option<&'static Row> {
 ///
 /// # 判据
 ///
-/// 片段以数字结尾、且模型名里紧跟 `-<数字>` 时，这一处出现**不算命中**（那是更晚的小版本）。
+/// 片段以数字结尾、且模型名里紧跟 `-<1~3 位数字>` 时，这一处出现**不算命中**（那是更晚的小版本）。
 /// 其余一律照旧，故这些必须不受影响（都在下面的测试里）：
 /// `gpt-4` ↛ `gpt-4-1-nano` 但 → `gpt-4o` / `gpt-4-turbo`；`o1` → `o1-mini`；
 /// `deepseek-v4` → `deepseek-v4-pro`；`glm-4` → `glm-4-plus`。
 ///
+/// 两个**不是**小版本的形态（2026-10-12 补）：
+/// - **日期快照**（`-20250514` / `-2025-04-14` / `-0613` / `-0309`，4 位及以上的数字段）。
+///   旧判据把它们一律当成「更晚的小版本」，于是 `claude-opus-4-20250514` 跳过了
+///   `claude-opus-4`（15/75）落到家族兜底（5/25）—— **低估 3 倍**；`gpt-4-0613` 落到旗舰价，
+///   输入低估 3 倍；`o3-2025-04-16` 干脆 Unknown。
+/// - **`-0`**（`mistral-large-4-0` = 4.0，`seed-2-0-lite` = 2.0）：`.0` 与不带它是同一个版本。
+///
 /// 同一片段在名字里出现多次时逐处试（`from` 往后推），只要有一处是有效命中就算命中。
 fn fragment_matches(frag: &str, normalized: &str) -> bool {
+    match_at(frag, normalized, false)
+}
+
+/// [`fragment_matches`] 的实现，外加可选的**词首**判据（在线表用，理由见 [`online`] 的模块头）：
+/// 命中处必须在名字开头、或紧跟 `-`。
+///
+/// `from = at + 1` 逐字节推进只在片段是 ASCII 时安全（命中处的首字节是单字节字符）。
+/// 内置片段都是 ASCII 常量；在线片段在装载时已过滤（`online::install`）。
+fn match_at(frag: &str, normalized: &str, word_start: bool) -> bool {
     let ends_with_digit = frag.as_bytes().last().is_some_and(u8::is_ascii_digit);
     let mut from = 0usize;
     while let Some(rel) = normalized[from..].find(frag) {
         let at = from + rel;
         let rest = &normalized[at + frag.len()..];
-        // 「更晚的小版本」= 片段以数字结尾，且后面紧跟 `-` 再跟一个数字
-        let is_later_minor = ends_with_digit
-            && rest.as_bytes().first() == Some(&b'-')
-            && rest.as_bytes().get(1).is_some_and(u8::is_ascii_digit);
-        if !is_later_minor {
+        let starts_word = !word_start || at == 0 || normalized.as_bytes()[at - 1] == b'-';
+        if starts_word && !(ends_with_digit && is_later_minor(rest)) {
             return true;
         }
         from = at + 1;
     }
     false
+}
+
+/// 片段之后紧跟的是不是「更晚的小版本号」：`-` + 1~3 位数字（且不是 `-0`）。
+///
+/// 数字段只看到下一个 `-` 或串尾为止之前的**连续数字**：`-5` / `-27b` 是（版本号/参数量
+/// 打头的段，沿用旧判据），`-20250514` / `-0613` 不是（日期快照），`-0` 不是（`.0`）。
+fn is_later_minor(rest: &str) -> bool {
+    let Some(tail) = rest.strip_prefix('-') else {
+        return false;
+    };
+    let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+    (1..=3).contains(&digits) && !(digits == 1 && tail.starts_with('0'))
 }
 
 /// 按模型名查单价。
@@ -193,7 +253,7 @@ fn fragment_matches(frag: &str, normalized: &str) -> bool {
 /// 「某个模型名查出来的四个价是多少」是这张表最直接的判据形态，测试里大量用到。
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn lookup_pricing(model_name: &str) -> Option<ModelPricing> {
-    lookup_row(model_name).map(ModelPricing::from_row)
+    lookup(model_name).map(|h| h.pricing)
 }
 
 /// 单价的来源，供界面如实标注精度。
@@ -204,7 +264,7 @@ pub fn lookup_pricing(model_name: &str) -> Option<ModelPricing> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PricingSource {
-    /// 命中某个**具体型号**行（带世代号，如 `claude-opus-5`）。
+    /// 命中某个**具体型号**行（带世代号，如 `claude-opus-5`；内置表或在线表）。
     Exact,
     /// 命中**家族兜底**行（裸家族名，如 `claude-opus` / `gpt`）—— 按当前旗舰价估。
     Family,
@@ -231,12 +291,10 @@ pub const MAX_COST_MULTIPLIER: f64 = 1000.0;
 
 /// 估算一段用量的成本（纳美元）+ 单价来源。
 ///
-/// `model_hint` 传该 Key 的代表模型名（默认兜底模型或首个模型）。
-/// **本函数刻意不按模型逐条算**：用量累加器的键是 `(分类, keyId)`、不含模型名，
-/// 要按模型精确计费得把落盘格式再升一版。而用户选定的方案是「每个 Key 一个折扣倍率」，
-/// 倍率本就挂在 Key 上，故按 Key 估算与该方案一致。代价是同一 Key 跑多个不同档位
-/// 模型时会有偏差 —— 界面必须标明这是估算，并回显用的是哪个代表模型
-/// （见 `usage_cost::UsageCostRow::priced_by_model`）。
+/// `model_hint` 传这段用量的**真实模型名**；只有升级前没记模型的历史用量才传 Key 的代表模型
+/// （那一步与「标成 ≈」都在 `usage_cost::part_cost`）。2026-10-12 之前这里写着「刻意不按模型
+/// 逐条算，因为累加器的键不含模型名」—— 那个前提已经没了（账本 v4 记了模型，见 `usage_ledger`），
+/// 而它的代价是实测的：一条 Key 按代表模型估，输入低估约 50 倍。倍率仍挂在 Key 上（用户的方案）。
 pub fn estimate_cost(
     usage: &crate::model::TokenUsage,
     model_hint: Option<&str>,
@@ -258,15 +316,11 @@ pub fn estimate_cost(
         return (None, PricingSource::Unknown);
     };
 
-    match lookup_row(name) {
+    match lookup(name) {
         None => (None, PricingSource::Unknown),
-        Some(row) => {
-            let cost = ModelPricing::from_row(row).calculate_cost_nano(usage, mult);
-            let src = if is_family_row(row.frag) {
-                PricingSource::Family
-            } else {
-                PricingSource::Exact
-            };
+        Some(hit) => {
+            let cost = hit.pricing.calculate_cost_nano(usage, mult);
+            let src = if hit.is_family { PricingSource::Family } else { PricingSource::Exact };
             (Some(cost), src)
         }
     }
@@ -291,31 +345,43 @@ mod tests {
         "gpt-6", "o1", "o1-mini", "o3", "o3-mini", "o3-pro", "o4-mini",
         "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini",
         "gpt-4-turbo", "gpt-3.5-turbo", "chatgpt-4o-latest", "gpt-oss-120b", "gpt-oss-20b",
+        // 2026-10-12 补：GPT-6 系、逐代 chat-latest、日期快照，以及用户 Codex Key 里的真实名字
+        "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna", "gpt-5-chat-latest",
+        "gpt-5.3-chat-latest", "gpt-4.5-preview", "gpt-4o-2024-05-13", "gpt-4-0613",
+        "gpt-4.1-2025-04-14", "o3-2025-04-16", "gpt-5.3-codex-spark", "codex-auto-review",
         // Anthropic
         "claude-opus-5", "claude-opus-5-thinking", "claude-opus-4-8", "claude-opus-4-6",
         "claude-opus-4-5", "claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5",
         "claude-haiku-4-5", "claude-fable-5", "claude-mythos-5",
         "claude-3-7-sonnet-20250219", "anthropic/claude-opus-5", "claude-synaroute-opus",
+        "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1",
+        "claude-fable-5.1", "claude-mythos-5-1", "claude-opus-4-1-20250805",
+        "claude-sonnet-4-5-20250929",
         // Google
         "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.1-pro-preview", "gemini-3-flash",
-        "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite",
+        "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.8-flash",
         // DeepSeek
         "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner",
-        "deepseek-ai/DeepSeek-V3",
+        "deepseek-ai/DeepSeek-V3", "deepseek-flash",
         // 智谱
         "glm-5.3", "glm-5", "glm-4.7", "glm-4.6", "glm-4.5-air", "glm-4-plus", "glm-4.7-flash",
+        "glm-5.3-flash", "glm-5.3-flashx",
         // Kimi
         "kimi-k3", "kimi-k2.6", "kimi-k2.7-code", "kimi-k2-thinking", "moonshot-v1-128k",
+        "kimi-k2.7-code-highspeed",
         // Qwen
         "qwen3.8-max", "qwen3.7-plus", "qwen3-max", "qwen3-coder-plus", "qwen-plus",
-        "qwen-max", "qwen-turbo",
+        "qwen-max", "qwen-turbo", "qwen3.8-max-prime", "qwen3.8-flash", "qwen3.7-flash",
         // xAI
         "grok-4.6", "grok-4.5", "grok-4-fast", "grok-code-fast-1", "grok-3-mini", "grok-5",
+        "grok-4.7", "grok-4.20-0309-reasoning",
         // 其余
         "mistral-large-latest", "mistral-medium", "codestral-latest", "ministral-3",
+        "mistral-large-4-0", "mistral-medium-3.1", "devstral-2512",
         "minimax-m3", "minimax-m2", "MiniMax-Text-01",
-        "hy3", "hunyuan-turbos-latest", "seed-2-1-turbo",
+        "hy3", "hunyuan-turbos-latest", "seed-2-1-turbo", "hy4-preview", "seed-2.0-mini",
         "command-a-03-2025", "command-r-plus", "sonar", "sonar-pro", "sonar-reasoning-pro",
+        "command-a-plus",
         "llama-3.3-70b-instruct", "gemma-3-27b-it",
     ];
 
@@ -339,7 +405,7 @@ mod tests {
     /// **表序不影响结果**。旧实现是「表序首个 contains」，顺序敏感 ——
     /// `opus` 排到 `claude` 之后，最贵的模型就按中档价算，而界面完全看不出错。
     ///
-    /// 故障注入判据：把 `lookup_row` 的 `max_by_key` 换回 `find` → 本测试必须变红。
+    /// 故障注入判据：把 `best_builtin` 的 `max_by_key` 换回 `find` → 本测试必须变红。
     /// 另一个注入：把平局键从 `(len, frag)` 改回 `len` → `gpt-5-codex` 必须变红。
     #[test]
     fn pricing_is_independent_of_table_order() {
@@ -496,6 +562,7 @@ mod tests {
                 ("ministral", table::Vendor::Mistral),
                 ("codestral", table::Vendor::Mistral),
                 ("command", table::Vendor::Cohere),
+                ("devstral", table::Vendor::Mistral),
                 ("seed-", table::Vendor::ByteDance),
                 ("hy", table::Vendor::Tencent),
             ]
@@ -595,7 +662,9 @@ mod tests {
         // ⑦ **未来小版本不许钉在最老的兄弟行上**（`fragment_matches` 的版本边界判据）。
         //    这三条此前都是 `Exact` → 界面不打 `≈`，用户看到一个自信的错数字。
         //    偏低尤其糟：它让人不知不觉超支（模块头写明「宁可偏高」）。
-        let flagship_gpt = estimate_cost(&one_m, Some("gpt-5.6-sol"), None).0;
+        //    比对对象是**家族旗舰**（2026-10-12 起是 gpt-6-astra），不写死某个具体型号 ——
+        //    旗舰换代时这条不该跟着改。
+        let flagship_gpt = estimate_cost(&one_m, Some("gpt-6-astra"), None).0;
         for future in ["gpt-5.6", "gpt-5.7", "gpt-5.9"] {
             assert_eq!(
                 estimate_cost(&one_m, Some(future), None).0,
@@ -621,6 +690,74 @@ mod tests {
             Some(30_000_000_000),
             "gpt-4.5 不该继承已退役的 gpt-4 行"
         );
+    }
+
+    /// 2026-10-12 那轮价格表复核修掉的偏差，每条锁住一个方向。
+    ///
+    /// ①② 来自用户本机的真实 Key（`config.json` 与日志里的模型名）：Claude Desktop 那条的
+    /// 主力是 `claude-opus-5-5`、Codex 那条 86% 的请求是 `gpt-6-astra`，两者此前都不在表里。
+    #[test]
+    fn price_table_2026_10_corrections_stay_fixed() {
+        let m = |input, output, cache_read| TokenUsage { input, output, cache_read, cache_creation: 0 };
+        let (one_m_in, one_m_out, one_m_cache) = (m(1_000_000, 0, 0), m(0, 1_000_000, 0), m(0, 0, 1_000_000));
+        let cost = |u: &TokenUsage, name: &str| estimate_cost(u, Some(name), None).0;
+
+        // ① Opus 5.5 = 4/20、缓存读 0.20（0.05×）。缺行时落家族兜底 = Opus 5 的 5/25/0.50。
+        assert_eq!(cost(&one_m_in, "claude-opus-5-5"), Some(4_000_000_000));
+        assert_eq!(cost(&one_m_out, "claude-opus-5-5"), Some(20_000_000_000));
+        assert_eq!(cost(&one_m_cache, "claude-opus-5-5"), Some(200_000_000), "缓存读是 0.05×");
+        assert_eq!(estimate_cost(&one_m_in, Some("claude-opus-5-5"), None).1, PricingSource::Exact);
+        // ② gpt-6-astra = 10/50；6.1 Sol 的缓存读是 0.05×（不是默认的 0.1×）
+        assert_eq!(cost(&one_m_in, "gpt-6-astra"), Some(10_000_000_000));
+        assert_eq!(cost(&one_m_out, "gpt-6-astra"), Some(50_000_000_000));
+        assert_eq!(cost(&one_m_cache, "gpt-6.1-sol"), Some(100_000_000));
+        // ③ Fable 5.1 的缓存读 0.025×（$0.25），按 Fable 5 的 $1 算会高估 4 倍
+        assert_eq!(cost(&one_m_cache, "claude-fable-5.1"), Some(250_000_000));
+        // ④ 日期快照不是「更晚的小版本」：dated id 必须按它自己那一代算
+        assert_eq!(cost(&one_m_in, "claude-opus-4-1-20250805"), Some(15_000_000_000), "退役 Opus 4.1 = $15");
+        assert_eq!(cost(&one_m_in, "claude-opus-4-20250514"), Some(15_000_000_000), "旧判据把它算成 $5");
+        assert_eq!(cost(&one_m_in, "gpt-4.1-2025-04-14"), Some(2_000_000_000));
+        assert_eq!(cost(&one_m_in, "gpt-4-0613"), Some(30_000_000_000));
+        assert_eq!(cost(&one_m_in, "o3-2025-04-16"), Some(2_000_000_000), "旧判据下它是 Unknown");
+        assert_eq!(cost(&one_m_in, "grok-4.20-0309-reasoning"), cost(&one_m_in, "grok-4.20"));
+        // ⑤ `.0` 与不带它是同一版本……
+        assert_eq!(cost(&one_m_in, "mistral-large-4-0"), Some(680_000_000));
+        assert_eq!(cost(&one_m_in, "seed-2.0-mini"), Some(100_000_000));
+        // ……但 `-<1~3 位数字>` 仍是更晚的小版本（防上面两条修过头）
+        assert_eq!(cost(&one_m_in, "claude-opus-5-9"), cost(&one_m_in, "claude-opus"));
+        // ⑥ 逐代 chat-latest：旧表让它们都落到裸 `chat-latest`（5/30）
+        assert_eq!(cost(&one_m_in, "gpt-5-chat-latest"), Some(1_250_000_000));
+        assert_eq!(cost(&one_m_in, "gpt-5.3-chat-latest"), Some(1_750_000_000));
+        // ⑦ 裸 sonar 是真实型号（1/1），不是 sonar-pro 的兜底（3/15）
+        assert_eq!(cost(&one_m_out, "sonar"), Some(1_000_000_000));
+        assert_eq!(estimate_cost(&one_m_out, Some("sonar"), None).1, PricingSource::Exact);
+        // ⑧ DeepSeek 旧 Flash 名按 V4.1-Flash 计费；GLM-5.3-Flash 不再按 GLM-5.3 算
+        assert_eq!(cost(&one_m_in, "deepseek-v4-flash"), Some(300_000_000));
+        assert_eq!(cost(&one_m_in, "glm-5.3-flash"), Some(150_000_000));
+        assert_eq!(cost(&one_m_in, "glm-5.3-flashx"), Some(370_000_000));
+        // ⑨ gpt-5-codex 的官方价是 1.25/10（旧表按 codex 的 1.75/14）
+        assert_eq!(cost(&one_m_in, "gpt-5-codex"), Some(1_250_000_000));
+    }
+
+    /// 「不另收写入费」的行，写入 token 必须按**输入价**算，而不是默认的 1.25×。
+    ///
+    /// 给 `upstream/usage.rs` 开始读 OpenAI `cache_write_tokens` 配的：那之前非 Anthropic
+    /// 上游的写入 token 恒为 0，这一列乘什么都无所谓；之后不显式写成 = input 就会静默多收 25%。
+    /// 故障注入判据：把 `rcn` 改回 `rc`（cache_write 留 None）→ 本测试变红。
+    #[test]
+    fn rows_without_a_write_fee_charge_writes_at_the_input_rate() {
+        let w = TokenUsage { input: 0, output: 0, cache_read: 0, cache_creation: 1_000_000 };
+        for (name, input_per_m) in [
+            ("gpt-5.5", 5_000_000_000u64),
+            ("gpt-5.4-mini", 750_000_000),
+            ("deepseek-v4-pro", 1_320_000_000),
+            ("glm-5.3", 1_400_000_000),
+        ] {
+            assert_eq!(estimate_cost(&w, Some(name), None).0, Some(input_per_m), "{name} 不另收写入费");
+        }
+        // 而 GPT-5.6+ 与 Anthropic 是 1.25×（官方明示）
+        assert_eq!(estimate_cost(&w, Some("gpt-6-astra"), None).0, Some(12_500_000_000));
+        assert_eq!(estimate_cost(&w, Some("claude-opus-5-5"), None).0, Some(5_000_000_000));
     }
 
     /// `Exact` 与 `Family` 必须都是**可达**的档位。

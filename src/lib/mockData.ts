@@ -20,7 +20,8 @@ import type {
   Vendor,
 } from "@/types";
 import type { UserPrefs } from "@/lib/prefs";
-import { mockUsageWithCost } from "./mockData.usage";
+import { mockDailyCost, mockUsageWithCost, purgedUsageKeys } from "./mockData.usage";
+import { lastNDayKeys } from "./usagePeriods";
 import { mockResilienceOverview } from "./mockData.resilience";
 import { MOCK_VENDORS } from "./mockData.vendors";
 import { mockEvents } from "./mockData.events";
@@ -608,9 +609,10 @@ export const mockBridge = {
     await delay();
     const buckets: DailyUsageBucket[] = [];
     const perDay = [1_200_000, 340_000, 0, 890_000, 1_750_000, 620_000, 2_100_000];
+    // 本机时区的日期（与后端 v4 同口径）；`lastNDayKeys` 最早在前，这里要最新在前。
+    const dates = lastNDayKeys(new Date(), perDay.length).reverse();
     for (let i = 0; i < perDay.length; i++) {
-      const d = new Date(Date.now() - i * 86_400_000);
-      const date = d.toISOString().slice(0, 10);
+      const date = dates[i];
       if (perDay[i] === 0) {
         buckets.push({ date, entries: [] });
         continue;
@@ -643,6 +645,17 @@ export const mockBridge = {
   async usageWithCost(): Promise<UsageCostRow[]> {
     await delay();
     return mockUsageWithCost(store, await this.tokenUsage());
+  },
+  /** 按天花费的 mock（造法见 mockData.usage 的 `mockDailyCost`）。 */
+  async dailyCost() {
+    await delay();
+    return mockDailyCost();
+  },
+  /** 清理已删除 Key 的用量：mock 里记下 id，`usageWithCost` 之后不再产出那一行。 */
+  async purgeKeyUsage(keyId: string) {
+    await delay();
+    purgedUsageKeys.add(keyId);
+    return true;
   },
 
   /** 可靠性总览的 mock（逐 Key 铺开每种弹性状态，见 mockData.resilience）。 */

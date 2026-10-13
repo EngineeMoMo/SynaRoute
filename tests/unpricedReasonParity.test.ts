@@ -23,7 +23,9 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const USAGE_COST_RS = readFileSync(join(ROOT, "src-tauri", "src", "usage_cost.rs"), "utf8");
-const TYPES_TS = readFileSync(join(ROOT, "src", "types.ts"), "utf8");
+// 用量类型 2026-10-12 拆到了 types.usage.ts（types.ts 行数到顶）。行尾归一成 LF：
+// 下面按 "\n\n" 找联合的结尾，工作区里这些文件可能是 CRLF。
+const TYPES_TS = readFileSync(join(ROOT, "src", "types.usage.ts"), "utf8").replace(/\r\n/g, "\n");
 const USAGE_PAGE = readFileSync(join(ROOT, "src", "pages", "UsagePage.tsx"), "utf8");
 const I18N_USAGE = readFileSync(join(ROOT, "src", "lib", "i18n.usage.ts"), "utf8");
 
@@ -40,7 +42,7 @@ function rustVariants(): string[] {
 /** 前端 `types.ts` 的 `UnpricedReason` 联合里出现的 `kind: "x"`。 */
 function tsVariants(): string[] {
   const start = TYPES_TS.indexOf("export type UnpricedReason");
-  expect(start, "types.ts 里应有 `UnpricedReason`").toBeGreaterThan(0);
+  expect(start, "types.usage.ts 里应有 `UnpricedReason`").toBeGreaterThan(0);
   const body = TYPES_TS.slice(start, TYPES_TS.indexOf("\n\n", start));
   return [...body.matchAll(/kind:\s*"([a-zA-Z0-9]+)"/g)].map((m) => m[1]);
 }

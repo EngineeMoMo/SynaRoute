@@ -1,32 +1,154 @@
-//! 用量快照（`usage.json`）的**读取**与落点解析。
+//! 用量快照（`usage.json`）的**格式、读取与落点**；内存里的计数器在 [`ledger`]。
 //!
-//! 从 store.rs 抽出来的：这两个函数与 `Store` 的内部状态无关（入参一个路径，
-//! 出参一份纯数据），而 store.rs 的棘轮余量为 0。写侧（`flush_usage_if_dirty`）
-//! 仍留在 store.rs —— 它要读写 `usage_totals` / `usage_baseline` 两把锁，搬不动。
+//! 快照类型（`TokenUsageByKey` / `UsageSnapshot` / `DailyUsageBucket`）原在 model.rs，
+//! 2026-10-12 加模型维度时搬到这里（model.rs 棘轮余量为 1）；model.rs 留了 `pub use`，
+//! 既有的 `crate::model::…` 路径全部不变。
 //!
 //! ⚠️ 这里最要紧的语义是 `read_only`：磁盘上那份是**更新的**格式时，
 //! 本次运行一个字节都不许写回，否则旧程序会把新维度永久抹掉（用量是纯累加值，
 //! 没有别处可恢复）。三种降级的写回权限刻意不同，别合并成一个分支。
 
-use crate::model::{CategoryType, TokenUsage, UsageSnapshot, USAGE_SNAPSHOT_VERSION};
+use crate::model::{CategoryType, TokenUsage};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+#[path = "usage_ledger.rs"] mod ledger; // 内存计数器 + 落盘 + 删除；来由见该文件模块注释
+pub(crate) use ledger::UsageLedger;
+
+/// 计数器的键：`(分类, key_id, 真实模型名)`。模型名空串 = v3 及更早的历史行（没记模型）。
+pub(crate) type UsageKey = (CategoryType, String, String);
+
+/// 用量统计：按「分类 × Key × 模型」聚合的一行。
+///
+/// `model` 是 v4 新增的维度（2026-10-12）。没有它时一条 Key 只能按一个「代表模型」
+/// 估价：实测一条 Key 86% 的请求跑的是 $10/$50 的模型，却按 $0.20/$1.20 的代表模型算，
+/// 输入低估约 50 倍。**单价表本身没错，是账本少了这一维。**
+///
+/// 空串的两种含义（都不是「未知模型」，别拿空串去查价）：v3 及更早的历史行；
+/// 以及按 Key 汇总的视图（`UsageLedger::by_key`）里本来就不区分模型。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageByKey {
+    pub category_id: CategoryType,
+    /// 空串 = 该分类的系统级事件（无具体 Key）。
+    pub key_id: String,
+    /// 上游真实模型名（映射之后的那个，计费按它）。空串见类型文档。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    pub usage: TokenUsage,
+}
+
+impl TokenUsageByKey {
+    pub(crate) fn slot(&self) -> UsageKey {
+        (self.category_id, self.key_id.clone(), self.model.clone())
+    }
+    pub(crate) fn from_slot((category_id, key_id, model): UsageKey, usage: TokenUsage) -> Self {
+        Self { category_id, key_id, model, usage }
+    }
+}
+
+/// 用量累计的**落盘快照**（`usage.json`）。
+///
+/// 刻意与 `config.json` 分开成独立文件，不塞进 `AppConfig`：
+/// - 用量是**运行期遥测**，不是用户配置。混进去会让「每分钟落一次用量」变成
+///   「每分钟重写一次用户的全部 Key 与设置」——把一份只该增长计数器的写入，
+///   放大成对用户最宝贵数据的反复覆写，任何一次坏写都可能带走 Key 配置。
+/// - 体积与节奏都不同：config 是事件驱动、~20KB；usage 是定时、通常几百字节。
+///
+/// 版本沿革：v1 = 全局 `entries`；v2 = 按日分桶 + 90 天滚动；v3 = `retired`；
+/// v4 = 每行多一个 `model`，且日桶按**本机时区**切天（见 [`local_date_string`]）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSnapshot {
+    #[serde(default = "usage_snapshot_version")]
+    pub version: u32,
+    /// 统计起始时刻（毫秒时间戳）。首次创建时写入，之后原样保留 ——
+    /// 面板据此显示「统计自 X 起」，否则一个只增不减的数字用户无从判断它覆盖多长时间。
+    #[serde(default)]
+    pub since_ms: i64,
+    /// 最后一次落盘时刻，仅供人工排查「这份文件是不是卡住不更新了」。
+    #[serde(default)]
+    pub updated_ms: i64,
+    /// 按日期分桶的用量，最多保留 90 天，降序排列（最新的在前）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub daily_buckets: Vec<DailyUsageBucket>,
+    /// **v3 数据**：已被 90 天滚动淘汰的桶的累计。
+    ///
+    /// 为什么必须有：`daily_buckets` 只留 90 天，而启动时的「累计总量」= 各存活桶之和。
+    /// 于是每有一个桶过期，**下次启动读出来的累计就变小**——一个「累计用量」面板越用
+    /// 数字越少，用户据此估额度会严重低估。淘汰桶的量在删除前折进这里，故
+    /// **累计总量 = retired + 各存活桶之和**，单调不减；按日视图仍只看 `daily_buckets`。
+    /// 日维度如实丢弃（不编造一个假日期把整段历史堆到某天）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<TokenUsageByKey>,
+    /// **v1 兼容字段**：v2 起写出时留空，只在读 v1 文件时有值（读入后归进 `retired`）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<TokenUsageByKey>,
+}
+
+/// 一天的用量分桶。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyUsageBucket {
+    /// 日期 `"YYYY-MM-DD"`。v4 起按**本机时区**切天；v3 及更早写下的桶是 UTC 日期，
+    /// 原样保留、不重新切分（拿不到逐笔时刻，切不了）—— 故升级那一天前后最多有
+    /// 「时区差」那么几个小时的用量落在相邻那天，写明免得被当 bug 重查。
+    pub date: String,
+    /// 该天内按 `(分类, key_id, 模型)` 聚合的用量。Vec 而非 map：JSON 的 map 键只能是字符串。
+    pub entries: Vec<TokenUsageByKey>,
+}
+
+/// `usage.json` 的当前格式版本。**读写共用这一个常量**，别两边各写字面量 ——
+/// 那样改了写侧忘了改读侧，版本门就会把自己刚写出去的文件判为"来自未来"。
+///
+/// 改动规则：只有当**旧程序按旧结构解析新文件会得到错误结果**时才递增。
+/// - v1→v2：v1 程序会忽略 `daily_buckets`，读出空 `entries` 再写回 → 历史清零。
+/// - v2→v3：v2 程序会忽略 `retired`，写回后 90 天以前那段**永久消失**。
+/// - v3→v4：v3 程序会忽略 `model`，把同一 Key 的各模型行并成一行 —— 总量对，
+///   但它下一次写回就把**模型维度抹掉了**，而那正是 v4 存在的全部理由（抹掉之后
+///   金额退回「按代表模型估」的老错误，且不可恢复）。代价：用户若再开旧版本，
+///   那次运行用量页只读不写（版本门），升级回来即恢复。
+pub const USAGE_SNAPSHOT_VERSION: u32 = 4;
+
+fn usage_snapshot_version() -> u32 {
+    USAGE_SNAPSHOT_VERSION
+}
+
+/// 毫秒时间戳 → **本机时区**的日期 `"YYYY-MM-DD"`。分桶、「今日」、90 天窗口的唯一判据。
+///
+/// 🔴 v3 及更早用 UTC 切天，于是 UTC+8 的用户每天 0~8 点的用量算在「昨天」——
+/// 「今日花费」一天里有三分之一的时间是错的。写盘（flush）、读视图（并入当天的未落盘增量）、
+/// 滚动删桶三处**必须**都走这一个函数：任何一处退回 UTC，零点前后就会出现两个「今日」。
+pub(crate) fn local_date_string(ms: i64) -> String {
+    date_string_at(ms, &chrono::Local)
+}
+
+/// [`local_date_string`] 的可测形态（测试里传固定时区，结果不随跑测试的机器变）。
+fn date_string_at<Tz: chrono::TimeZone>(ms: i64, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let utc = chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default();
+    utc.with_timezone(tz).format("%Y-%m-%d").to_string()
+}
 /// `load_usage` 的结果。
 ///
 /// 用具名结构体而不是元组：三个字段里有两个是 `i64`/`bool` 这种「位置一错就静默出错」
 /// 的类型，元组解构写反了编译器不会拦。`read_only` 尤其不能错 —— 它反了就等于
 /// 把版本门变成破坏源。
 pub(crate) struct UsageLoad {
-    pub(crate) totals: std::collections::BTreeMap<(CategoryType, String), TokenUsage>,
+    /// v3 及更早的行读进来时 `model` 为空串（那时没记模型），见 [`TokenUsageByKey`]。
+    pub(crate) totals: std::collections::BTreeMap<UsageKey, TokenUsage>,
     pub(crate) since: i64,
     /// 磁盘上那份文件**比本程序认识的格式更新**，本次运行只读不写。
     pub(crate) read_only: bool,
     /// 已落盘的按日分桶（v2）。v1 文件读出来是空的 —— 它没有日期维度，
     /// 那部分历史只体现在 `totals` 里，无法反推每天各花了多少（如实丢弃日维度，
     /// 不编造一个假日期把整段历史堆到某一天）。
-    pub(crate) daily_buckets: Vec<crate::model::DailyUsageBucket>,
+    pub(crate) daily_buckets: Vec<DailyUsageBucket>,
     /// 已被 90 天滚动淘汰的桶的累计（v3）。参与 `totals`，但不进按日视图。
     /// 见 `UsageSnapshot::retired`：没有它，累计总量每过一个 90 天就往下掉一截。
-    pub(crate) retired: Vec<crate::model::TokenUsageByKey>,
+    pub(crate) retired: Vec<TokenUsageByKey>,
 }
 
 /// `usage.json` 的路径：与 `config.json` 同目录。
@@ -99,8 +221,8 @@ pub(crate) fn load_usage(path: &Path) -> UsageLoad {
         // 起算时刻仍沿用文件里的：面板显示的起点是对的，只是这次没读到明细。
         let since = if snap.since_ms > 0 { snap.since_ms } else { now };
         // read_only = true：**必须**同时禁掉写回，否则这道门自己就是破坏源 ——
-        // 返回空 map 后第一个请求就会 mark_usage_dirty，60s 后的 flush 会拿
-        // 「空累加器 + version=1」覆写这个更高版本的文件，正好干成它要防的事。
+        // 返回空 map 后第一个请求就会把账本标脏，60s 后的 flush 会拿
+        // 「空累加器 + 旧 version」覆写这个更高版本的文件，正好干成它要防的事。
         return UsageLoad {
             totals: std::collections::BTreeMap::new(),
             since,
@@ -123,40 +245,23 @@ pub(crate) fn load_usage(path: &Path) -> UsageLoad {
     // 此前它只进内存累加器、不落任何桶，于是**重启一次就永久消失**
     // （旧测试把这个损失当成既定行为记着，理由是「无从得知属于哪天」——
     // 那个理由只否定「造一个假日期」，不构成「必须丢掉总量」）。
-    let mut retired: std::collections::BTreeMap<(CategoryType, String), TokenUsage> =
+    let mut retired: std::collections::BTreeMap<UsageKey, TokenUsage> =
         std::collections::BTreeMap::new();
-    for row in snap.retired.iter() {
-        retired
-            .entry((row.category_id, row.key_id.clone()))
-            .or_default()
-            .add(&row.usage);
-    }
     // v1 兼容：`entries` 非空 = 读到的是 v1 文件（v2+ 写出时该字段恒空）。
-    for row in &snap.entries {
-        retired
-            .entry((row.category_id, row.key_id.clone()))
-            .or_default()
-            .add(&row.usage);
+    for row in snap.retired.iter().chain(&snap.entries) {
+        retired.entry(row.slot()).or_default().add(&row.usage);
     }
-    for ((cat, kid), u) in retired.iter() {
-        map.entry((*cat, kid.clone())).or_insert_with(TokenUsage::default).add(u);
+    for (slot, u) in retired.iter() {
+        map.entry(slot.clone()).or_insert_with(TokenUsage::default).add(u);
     }
-    let retired: Vec<crate::model::TokenUsageByKey> = retired
-        .into_iter()
-        .map(|((cat, kid), u)| crate::model::TokenUsageByKey {
-            category_id: cat,
-            key_id: kid,
-            usage: u,
-        })
-        .collect();
+    let retired: Vec<TokenUsageByKey> =
+        retired.into_iter().map(|(slot, u)| TokenUsageByKey::from_slot(slot, u)).collect();
 
     // v2：合并所有 daily_buckets 里的 entries
     if snap.version >= 2 {
         for bucket in &snap.daily_buckets {
             for row in &bucket.entries {
-                map.entry((row.category_id, row.key_id.clone()))
-                    .or_insert_with(TokenUsage::default)
-                    .add(&row.usage);
+                map.entry(row.slot()).or_insert_with(TokenUsage::default).add(&row.usage);
             }
         }
     }
@@ -211,5 +316,39 @@ impl UsageLoad {
             daily_buckets: Vec::new(),
             retired: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 🔴 切天按时区，不按 UTC。用固定时区测，结果不随跑测试的机器变。
+    ///
+    /// 2026-10-12 00:30（UTC+8）= 2026-10-11 16:30 UTC。按 UTC 切会落在 10-11 ——
+    /// 那就是 v3 的老缺陷：东八区每天 0~8 点的用量算进「昨天」。
+    #[test]
+    fn day_boundary_follows_the_time_zone_not_utc() {
+        let ms = chrono::DateTime::parse_from_rfc3339("2026-10-12T00:30:00+08:00")
+            .unwrap()
+            .timestamp_millis();
+        let east8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        assert_eq!(date_string_at(ms, &east8), "2026-10-12", "东八区零点半已经是新的一天");
+        assert_eq!(date_string_at(ms, &chrono::Utc), "2026-10-11", "同一时刻在 UTC 还是前一天");
+        let west5 = chrono::FixedOffset::west_opt(5 * 3600).unwrap();
+        assert_eq!(date_string_at(ms, &west5), "2026-10-11");
+    }
+
+    /// v3 文件（行上没有 `model`）照常读入，模型维度为空串 —— 历史行不丢、不编造模型名。
+    #[test]
+    fn a_v3_row_without_a_model_loads_as_a_legacy_row() {
+        let row: TokenUsageByKey = serde_json::from_str(
+            r#"{"categoryId":"claude-cli","keyId":"k","usage":{"input":5,"output":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(row.model, "", "v3 行没有 model 字段 → 空串（历史行）");
+        // 空串不写出去：v4 文件里历史行与 v3 时长得一样，按 Key 汇总的 IPC 输出也不多一个空字段。
+        let back = serde_json::to_string(&row).unwrap();
+        assert!(!back.contains("model"), "空模型名不该序列化出来: {back}");
     }
 }

@@ -16,19 +16,19 @@
     "src-tauri/src/agent_tools.rs": 929,
     "src-tauri/src/aggregate.rs": 1184,
     "src-tauri/src/balance.rs": 1088,
-    "src-tauri/src/lib.rs": 1867,
-    "src-tauri/src/model.rs": 2015,
-    "src-tauri/src/proxy.rs": 2627,
-    "src-tauri/src/secret.rs": 1126,
+    "src-tauri/src/lib.rs": 1836,
+    "src-tauri/src/model.rs": 1935,
+    "src-tauri/src/proxy.rs": 2611,
+    "src-tauri/src/secret.rs": 1099,
     "src-tauri/src/service.rs": 1443,
-    "src-tauri/src/store.rs": 2888,
+    "src-tauri/src/store.rs": 2572,
     "src-tauri/src/tools.rs": 1797,
     "src-tauri/src/upstream/convert.rs": 1656,
-    "src-tauri/src/upstream/sse.rs": 1241,
+    "src-tauri/src/upstream/sse.rs": 1234,
     "src/components/KeyEditor.tsx": 1449,
-    "src/lib/i18n.ts": 1376,
-    "src/pages/BrainPage.tsx": 1139,
-    "src/pages/SettingsPage.tsx": 1846
+    "src/lib/i18n.ts": 1373,
+    "src/pages/BrainPage.tsx": 1135,
+    "src/pages/SettingsPage.tsx": 1845
   },
   "counters": {
     "bare_persist_calls": 3

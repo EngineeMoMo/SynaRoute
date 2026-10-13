@@ -357,7 +357,7 @@ export const zh: Dict = {
 
   "security.network.title": "会往外发什么",
   "security.network.desc":
-    "只有你自己配置的上游厂商请求，以及检查新版本时对 GitHub 发布页的请求。不收集使用数据，不做行为统计，没有账号体系，也不做配置同步。",
+    "只有你自己配置的上游厂商请求、检查新版本时对 GitHub 发布页的请求，以及每天一次下载公开的模型价格文件（用于估算花费，不携带任何本机数据）。不收集使用数据，不做行为统计，没有账号体系，也不做配置同步。",
 
   "security.logs.title": "关于日志",
   "security.logs.desc": "默认日志仅记录元信息；开启「记录调用模型日志」后会包含对话正文与系统提示词，仅建议临时排障使用。Windows/Linux 优先写入可执行文件同级 logs，不可写时回退应用数据目录的 SynaRoute/logs；macOS 默认 ~/Library/Logs/SynaRoute。支持自定义日志目录，以设置页显示的路径为准。",

@@ -1159,11 +1159,11 @@ pub fn run() {
         });
     }
 
-    // 余额闸门的数据源（B4）。线程与节奏都收在模块里；**刻意独立一趟**的三条理由
-    // （关掉探测会一起停 / 周期被探测间隔牵着走 / 吃掉那一轮的 timeout 预算）见其文档。
+    // 余额闸门（B4）/ Codex config.toml 外部改动监听 / 在线单价表：线程与节奏都收在各自模块里。**刻意各自
+    // 独立一趟**的三条理由（关掉探测会一起停 / 周期被探测间隔牵着走 / 吃掉那一轮的 timeout 预算）见 balance_gate。
     health::balance_gate::spawn_background(store.clone());
-    // Codex config.toml 的外部改动监听（轮询 mtime）。**同上刻意独立一趟**，理由同源。
     tools::codex::codex_watch::spawn_background(store.clone());
+    pricing::online::spawn_background(&store);
 
     tauri::Builder::default()
         // 单实例：再次启动时聚焦已有窗口，避免开多个进程（必须最先注册）。
@@ -1306,7 +1306,7 @@ pub fn run() {
             get_lan_token,
             regenerate_lan_token,
             usage_commands::get_token_usage, usage_commands::get_usage_since, usage_commands::get_daily_usage, usage_commands::get_usage_with_cost,
-            usage_commands::get_pricing_table_date,
+            usage_commands::get_pricing_status, usage_commands::get_daily_cost, usage_commands::purge_key_usage,
             tools::env_conflicts::detect_env_conflicts, tools::env_conflicts::remove_env_conflicts,
             tools::codex::codex_catalog::get_codex_config_model,
             tools::codex::codex_sessions::ops::list_codex_sessions, tools::codex::codex_sessions::ops::delete_codex_sessions, tools::codex::codex_sessions::ops::export_codex_session_markdown, tools::codex::codex_sessions::ops::open_codex_exports_dir,

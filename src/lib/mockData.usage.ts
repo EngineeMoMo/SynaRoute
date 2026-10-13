@@ -4,8 +4,46 @@
 // 全在「把所有分支都铺开」——浏览器预览模式下渲染不到的分支，样式与文案就必然做漏。
 // 本轮新增的四种无价成因各有不同的界面文案与指路，故每一种都要在预览里出现一次。
 
-import type { CategoryType, ProviderKey, TokenUsageByKey, UsageCostRow } from "@/types";
+import type { CategoryType, DailyCost, ProviderKey, TokenUsage, TokenUsageByKey, UsageCostRow, UsagePartCost } from "@/types";
 import type { PricingSource } from "@/types";
+import { lastNDayKeys } from "./usagePeriods";
+
+/** 预览里「清理」过的已删除 Key（mock 没有磁盘，记在内存里，刷新页面即恢复）。 */
+export const purgedUsageKeys = new Set<string>();
+
+/** 把一行按 9:1 拆成两个模型（演示「按模型拆分」tooltip）。 */
+function splitTwo(usage: TokenUsage, costNano: number, big: string, small: string): UsagePartCost[] {
+  const part = (f: number): TokenUsage => ({
+    input: Math.round(usage.input * f),
+    output: Math.round(usage.output * f),
+    cacheRead: Math.round((usage.cacheRead ?? 0) * f),
+  });
+  const bigCost = Math.round(costNano * 0.97); // 两格之和必须等于整行金额，否则 tooltip 与表格对不上
+  return [
+    { model: big, pricedAs: big, usage: part(0.9), costNano: bigCost, pricingSource: "exact" },
+    { model: small, pricedAs: small, usage: part(0.1), costNano: costNano - bigCost, pricingSource: "exact" },
+  ];
+}
+
+/**
+ * 按天花费的 mock：近 14 天（本机时区），最新在前，与后端同口径。
+ *
+ * 刻意铺开三种形态：普通的一天、**有一部分算不出**的一天（今天，验证「部分未计入」标注）、
+ * 没有用量的一天（后端不产出那天，前端按 0 处理）。
+ */
+export function mockDailyCost(): DailyCost[] {
+  // 🔴 14 天合计（≈$2.47 / 2.2M token）必须小于下面表格的累计（≈$3.43 / 2.6M token）：真实数据里
+  // 「本月」不可能超过「累计」，而官网截图取自演示模式 —— 反过来就是一张「统计算错了」的截图。
+  const perDay = [0.26, 0.09, 0, 0.18, 0.33, 0.13, 0.42, 0.15, 0.07, 0, 0.3, 0.23, 0.12, 0.19];
+  const days = lastNDayKeys(new Date(), perDay.length).reverse();
+  const out: DailyCost[] = [];
+  perDay.forEach((usd, i) => {
+    if (usd === 0) return;
+    const tokens = Math.round(usd * 900_000);
+    out.push({ date: days[i], costNano: Math.round(usd * 1e9), tokens, unpricedTokens: i === 0 ? 6_900 : 0 });
+  });
+  return out;
+}
 
 /**
  * 造出用量页那张表的 mock 行。
@@ -31,16 +69,22 @@ export function mockUsageWithCost(
   const out: UsageCostRow[] = rows.map((r, i) => {
     const src = sources[i % sources.length];
     const total = r.usage.input + r.usage.output;
+    const costNano = total * (src === "exact" ? 3000 : 15000);
     return {
       categoryId: r.categoryId,
       keyId: r.keyId,
       keyName: store[r.categoryId]?.find((k) => k.id === r.keyId)?.name ?? r.keyId ?? null,
       usage: r.usage,
       hasRecordedUsage: true,
-      costNano: total * (src === "exact" ? 3000 : 15000),
+      costNano,
       pricingSource: src,
       multiplier: src === "family" ? "0.3" : "1.0",
-      pricedByModel: src === "exact" ? "claude-opus-5" : "claude-opus-9-9",
+      pricedByModel: src === "exact" ? "claude-opus-5-5" : "claude-opus-9-9",
+      // exact：同一条 Key 跑两个模型（v4 按模型记账的常态）；family：升级前没记模型的历史用量。
+      breakdown:
+        src === "exact"
+          ? splitTwo(r.usage, costNano, "claude-opus-5-5", "claude-haiku-5-5")
+          : [{ model: "", pricedAs: "claude-opus-9-9", usage: r.usage, costNano, pricingSource: "family" }],
       // 预算「未超」形态：并排显示「$已花 / $预算」（muted），验证进度可读。
       budgetUsd: src === "exact" ? 100 : undefined,
       overBudget: false,
@@ -115,6 +159,28 @@ export function mockUsageWithCost(
       multiplier: "1.0",
     });
   }
+  // 部分算得出：一个模型在表里、一个不在 → 金额照显示（能算的那部分），旁边标「+?」，
+  // 横幅照样按成因列出那个不认识的模型。
+  if (cli[4]) {
+    const known: TokenUsage = { input: 18_000, output: 2_400, cacheRead: 40_000 };
+    const odd: TokenUsage = { input: 6_000, output: 900 };
+    out.push({
+      categoryId: "claude-cli",
+      keyId: cli[4].id,
+      keyName: cli[4].name,
+      usage: { input: 24_000, output: 3_300, cacheRead: 40_000, cacheCreation: 0 },
+      hasRecordedUsage: true,
+      costNano: 136_000_000,
+      pricingSource: "exact",
+      multiplier: "1.0",
+      pricedByModel: "glm-5-3",
+      unpricedReason: { kind: "modelNotInTable", model: "glm-5-3-air-preview" },
+      breakdown: [
+        { model: "glm-5-3", pricedAs: "glm-5-3", usage: known, costNano: 136_000_000, pricingSource: "exact" },
+        { model: "glm-5-3-air-preview", pricedAs: "glm-5-3-air-preview", usage: odd, pricingSource: "unknown" },
+      ],
+    });
+  }
 
   // 成因①：旧版大脑聚合的用量，keyId 为空串 → 表格显示「（系统级）」。
   // 这一行不依赖 store 里有没有 Key（它本来就没有 Key），故无条件补。
@@ -130,7 +196,7 @@ export function mockUsageWithCost(
     unpricedReason: { kind: "aggregate" },
   });
 
-  // 成因②：Key 在「删除前留档」上线**之前**就删了 —— 没有墓碑，金额不可恢复。
+  // 成因②：Key 早就删了、当时没留档 —— 金额不可恢复，只能清理。
   // keyName 为 null，表格退回显示 keyId。这一支是历史遗留，不会再新增。
   out.push({
     categoryId: "claude-desktop",
@@ -145,20 +211,25 @@ export function mockUsageWithCost(
     unpricedReason: { kind: "keyDeleted" },
   });
 
-  // 已删除但**有墓碑**：名字与金额都从留档还原，只多一个「（已删除）」标记。
-  // 这是现在删 Key 的常态 —— 演示数据必须体现它，否则截图里看不出这个功能存在。
+  // 已离开配置但**有墓碑**（导入时整份替换 / 手改 config.json 拿掉的）：名字与金额从留档还原，
+  // 只多一个「（已删除）」标记 + 清理按钮。用删除按钮删的 Key 不会出现在这里（2026-10-12 起连用量一起删）。
+  const tombUsage: TokenUsage = { input: 412_000, output: 26_500, cacheRead: 980_000, cacheCreation: 12_000 };
   out.push({
     categoryId: "claude-cli",
     keyId: "9f31c7be-old-relay",
     keyName: "厂商3（已下线中转）",
     keyDeleted: true,
-    usage: { input: 412_000, output: 26_500, cacheRead: 980_000, cacheCreation: 12_000 },
+    usage: tombUsage,
     hasRecordedUsage: true,
     costNano: 2_140_000_000,
     pricingSource: "family",
     multiplier: "1.4",
     pricedByModel: "claude-sonnet-4-5",
+    breakdown: [
+      { model: "", pricedAs: "claude-sonnet-4-5", usage: tombUsage, costNano: 2_140_000_000, pricingSource: "family" },
+    ],
   });
 
-  return out;
+  // 预览里点过「清理」的行不再出现（与后端同口径：清理 = 那条 Key 的用量整行消失）。
+  return out.filter((r) => !purgedUsageKeys.has(r.keyId));
 }

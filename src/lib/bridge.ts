@@ -16,7 +16,9 @@ import type {
   EnvRemovalResult,
   CodexProviderTargetList,
   CodexSessionIndexAudit,
+  DailyCost,
   DailyUsageBucket,
+  PricingStatus,
   DesktopModelNameReport,
   EventLogEntry,
   DeeplinkImportPreview,
@@ -371,38 +373,58 @@ export const api = {
     call<TokenUsageByKey[]>("get_token_usage", undefined, () => mockBridge.tokenUsage()),
 
   /**
-   * 按日分桶的用量（最近 90 天，最新在前），供「今日 / 本周 / 近 7 日趋势」。
+   * 按日分桶的 token 用量（最近 90 天，最新在前，本机时区切天）。
    *
-   * 🔴 **已含尚未落盘的增量**（后端把 `usage_totals - usage_baseline` 并进当天 UTC 桶）。
-   * 原注释说「不含、应与 getTokenUsage 配合使用」是过时的 —— 那个配合从未实现，
-   * 而后端早就并好了。照它去改 60s 落盘周期解决不了「用量不实时」（那是刷新接线的事）。
+   * 🔴 **已含尚未落盘的增量**（后端把未落盘的那段并进当天的桶）。照「不实时」去改 60s 落盘周期
+   * 解决不了问题（那是刷新接线的事）。用量页现在用的是 [`getDailyCost`]（同一份桶 + 估价）。
    */
   getDailyUsage: () =>
     call<DailyUsageBucket[]>("get_daily_usage", undefined, () => mockBridge.dailyUsage()),
 
   /**
+   * 按天的估算花费（「今日 / 本周 / 本月」与趋势图）。与 `getUsageWithCost` **同一套按模型估价**，
+   * 所以「今日花费」与表格里的金额对得上。`unpricedTokens > 0` = 那天有一部分算不出金额。
+   */
+  getDailyCost: () =>
+    call<DailyCost[]>("get_daily_cost", undefined, () => mockBridge.dailyCost()),
+
+  /**
    * 按「分类 × Key」聚合的用量 + 成本估算。
    *
-   * 成本按 Key 估算（累加器不含模型维度），代表模型取该 Key 的兜底模型或首个模型。
-   * `costNano` 为 null 表示没有可用单价 —— 界面应显示「—」而非 0，
-   * 否则用户会以为这条 Key 没花钱。
+   * 每个模型按自己的单价算（v4 账本记了模型），`breakdown` 是逐模型拆分；只有升级前没记模型的
+   * 历史用量才按 Key 的代表模型估（标 ≈）。`costNano` 为 null 表示一格都算不出 —— 界面显示「—」
+   * 而非 0，否则用户会以为这条 Key 没花钱。
    */
   getUsageWithCost: () =>
     call<UsageCostRow[]>("get_usage_with_cost", undefined, () => mockBridge.usageWithCost()),
+
+  /**
+   * 删掉一条**已不在配置里**的 Key 的全部用量记录（不可逆）。还在用的 Key 会被后端拒绝 ——
+   * 那种情形的正确动作是删 Key 本身（删 Key 会一并删用量）。
+   * 返回 false = 只从界面上去掉了，磁盘上没删成（只读 / 写盘失败），重启后可能还在。
+   */
+  purgeKeyUsage: (keyId: string) =>
+    call<boolean>("purge_key_usage", { keyId }, () => mockBridge.purgeKeyUsage(keyId)),
 
   /** 可靠性总览：五层弹性的当前状态 + 近期事件构成。只读快照，前端轮询它。 */
   resilienceOverview: () =>
     call<ResilienceOverview>("resilience_overview", undefined, () => mockBridge.resilienceOverview()),
 
   /**
-   * 内置单价表的核对日期（`YYYY-MM-DD`）。
+   * 单价表现状：内置表的核对日期 + 在线表（LiteLLM 公开价格，后端每天拉一次）。
    *
-   * 界面显示它的理由：这张表是人工核对各厂商定价页得来的，会随时间变旧，
-   * 而变旧的表现是金额悄悄偏离真实账单。给用户一个日期，他就能自己判断
-   * 这个估算值得信几分，而不是把它当账单。
+   * 界面显示它的理由：金额是估算，取决于用的是哪张表、表有多旧。给用户这些，
+   * 他就能自己判断这个估算值得信几分，而不是把它当账单。
    */
-  getPricingTableDate: () =>
-    call<string>("get_pricing_table_date", undefined, () => Promise.resolve("2026-08-25")),
+  getPricingStatus: () =>
+    call<PricingStatus>("get_pricing_status", undefined, () =>
+      Promise.resolve({
+        builtinDate: "2026-10-12",
+        onlineRows: 323,
+        onlineFetchedAtMs: Date.now() - 3 * 3600 * 1000,
+        onlineSource: "cdn.jsdelivr.net",
+      }),
+    ),
 
   /**
    * 查询某个 Key 的上游余额。

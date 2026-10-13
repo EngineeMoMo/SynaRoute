@@ -11,8 +11,14 @@
 //! 用量本身是纯累加值、Key 删了也保留，于是删一条 Key 之后：
 //! 它那些行的金额列永远显示「—」，成因写着 `KeyDeleted`、可行动项写着「无」。
 //!
-//! 用户的原话是「key 删除了用量要可看，价格应该是算好的」—— 这是对的：
-//! **花掉的钱不该因为删了一条配置就从统计里消失。**
+//! 用户 2026-09-02 的原话是「key 删除了用量要可看，价格应该是算好的」。
+//!
+//! # 🔴 2026-10-12 起口径变了：删 Key = 连用量一起删
+//!
+//! 用户原话「key 删除的时候 对应的记录也可以删除了」。用删除按钮删的 Key，用量记录与这里的
+//! 墓碑一并删掉（`usage_cost::purge_key`）。墓碑**仍然要维护**，因为还有两条路会让 Key 离开配置
+//! 而不经过删除按钮：导入配置时选「整份替换」、用户手改 `config.json`。那两种情形下用量还在，
+//! 没有墓碑的话它们的金额就退化成「—」；用户可以在用量页上把这类「（已删除）」行清掉。
 //!
 //! # 🔴 存「事实」而不是存「金额」
 //!
@@ -154,17 +160,43 @@ pub(crate) fn sync(
             merged.remove(&id);
         }
     }
-    if merged == before {
-        return merged;
+    if merged != before {
+        write(&path, &merged);
     }
-    let snap = Snapshot { version: SNAPSHOT_VERSION, keys: merged.clone() };
+    merged
+}
+
+/// 只读全表（不合并、不写）。读不出来按空表处理 —— 调用方只拿它给已离开配置的 Key 估价。
+pub(crate) fn read_facts(config_path: &Path) -> BTreeMap<String, KeyFacts> {
+    match load(&file_path(config_path)) {
+        LoadState::Usable(keys) => keys,
+        LoadState::Missing | LoadState::Protected => BTreeMap::new(),
+    }
+}
+
+/// 删掉一条 Key 的墓碑（它的用量已经删了，留着只会在表里占一个永远用不上的位置）。
+///
+/// 与 [`sync`] 同一把锁、同一套「损坏 / 更新格式的文件绝不覆盖」的保护。
+pub(crate) fn forget(config_path: &Path, key_id: &str) {
+    let _guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = file_path(config_path);
+    let LoadState::Usable(mut keys) = load(&path) else {
+        return;
+    };
+    if keys.remove(key_id).is_some() {
+        write(&path, &keys);
+    }
+}
+
+/// 原子写回。失败只记 warn：这张表是辅助数据，写不成的代价是已离开配置的 Key 金额算不出。
+fn write(path: &Path, keys: &BTreeMap<String, KeyFacts>) {
+    let snap = Snapshot { version: SNAPSHOT_VERSION, keys: keys.clone() };
     match serde_json::to_vec_pretty(&snap) {
         Ok(bytes) => {
-            if let Err(e) = crate::secret::atomic_write(&path, &bytes) {
-                tracing::warn!("写 usage-keys.json 失败（已删 Key 的金额将算不出）: {e}");
+            if let Err(e) = crate::secret::atomic_write(path, &bytes) {
+                tracing::warn!("写 usage-keys.json 失败（已离开配置的 Key 金额将算不出）: {e}");
             }
         }
         Err(e) => tracing::warn!("序列化 usage-keys.json 失败: {e}"),
     }
-    merged
 }

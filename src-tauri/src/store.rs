@@ -86,65 +86,9 @@ pub struct Store {
     /// 锁且内部含最坏 ~1.2s 的 `thread::sleep` 退避——在 tokio worker 上同步执行会让同线程
     /// 的其它并发转发（含 SSE 流）一并停顿。健康态是可重建的瞬态，合并落盘是正确的取舍。
     health_dirty: std::sync::atomic::AtomicBool,
-    /// 「本次运行以来」的 token 用量累计，按 (分类, key_id) 分组。
-    ///
-    /// **刻意与事件环 `events` 分开存**：`events` 是个 MAX_EVENTS 条的滑动环，超出即
-    /// drain 掉最老的。若把用量总计算在环上，累计值会在第 MAX_EVENTS 次请求之后**不再
-    /// 增长、甚至回退** —— 一个「累计用量」面板越用数字越小，比不显示更糟：用户据此
-    /// 估额度会严重低估。累加器只增不减，与保留多少条日志正交。
-    ///
-    /// **周期性落盘**（不是每请求落盘）：热路径只翻 `usage_dirty` 标记，真正的序列化
-    /// 与写盘由后台任务按固定节奏合并成一次，与 `health_dirty` 同一套取舍。
-    /// 这样既不丢跨重启的累计，也不把每请求写盘引回热路径（P1-3 的初衷）。
-    usage_totals: RwLock<std::collections::BTreeMap<(CategoryType, String), TokenUsage>>,
-    /// 用量累计有未落盘变更。由 `flush_usage_if_dirty` 合并落盘并清标记。
-    ///
-    /// 有这个标记，**空闲的应用一个字节都不写盘** —— 用户明确关心过 SSD 写入寿命，
-    /// 无脑定时写会让一个开着不用的窗口每分钟制造一次无意义写入。
-    usage_dirty: std::sync::atomic::AtomicBool,
-    /// `usage.json` 的路径（与 `config.json` 同目录）。
-    ///
-    /// 单独存字段而不是每次从 `config_path` 现推：读写两处各推一次就是漂移的温床
-    /// （`mcp.rs` 的端口文件正因此踩过——读写各算一次路径，改了一处就静默失配）。
-    usage_path: PathBuf,
-    /// 用量统计的起始时刻（毫秒）。随 `usage.json` 一起持久化，供面板显示「统计自 X 起」。
-    usage_since_ms: RwLock<i64>,
-    /// 磁盘上的 `usage.json` 版本高于本程序 → 本次运行**只读不写**。
-    ///
-    /// 没有这个开关，版本门就是自欺：它返回空累加器保护了「读」，但第一个请求
-    /// 就会标脏，随后的 flush 拿空数据 + 旧 version 覆写那个新格式文件，
-    /// 用户攒的历史当场清零 —— 正是这道门要防的破坏。
-    /// 启动时定一次，运行期不变（用户中途换文件属于自找麻烦，不为它加复杂度）。
-    usage_read_only: bool,
-    /// 按日分桶的**已落盘历史**（不含今天尚未 flush 的增量）。
-    ///
-    /// 与 `usage_totals` 的分工是这套结构的关键，写错就会算出天文数字：
-    /// - `usage_totals` = **跨全部历史的总量**，热路径只往里累加，永不按天切分；
-    /// - `daily_buckets` = 每天各是多少，是给「今日/本周/近 7 日」用的；
-    /// - `usage_baseline` = 本次进程启动那一刻的总量。
-    ///
-    /// 「今天新增」= `usage_totals` − `usage_baseline`。**不能**直接把 `usage_totals`
-    /// 整份写进当天的桶 —— 那是把历史总量当成当天消耗，跑一周后「今日花费」会等于
-    /// 「累计花费」，且每次 flush 都把同一批历史重复计入当天（实测踩到：v1 的 500
-    /// 与当天新增的 200 相加成了 700）。
-    daily_buckets: RwLock<Vec<crate::model::DailyUsageBucket>>,
-    /// 已被 90 天滚动淘汰的桶的累计（按分类 × Key）。见 `UsageSnapshot::retired`：
-    /// 没有它，启动时算出的累计总量每过一个 90 天就往下掉一截。
-    /// 只在 flush 里被读改写，不进按日视图。
-    retired_usage: RwLock<Vec<crate::model::TokenUsageByKey>>,
-    /// 本次进程启动时（以及每次 flush 后）的用量快照，用于算增量（见 `daily_buckets`）。
-    usage_baseline: RwLock<std::collections::BTreeMap<(CategoryType, String), TokenUsage>>,
-    /// 上一次 flush 落在哪个 UTC 日期。
-    ///
-    /// **它只是诊断信息，不参与分桶判定** —— 别按字面理解成「跨零点要靠它重置基线」。
-    /// 基线在**每次** flush 后都会被抬到当前总量（见 `flush_usage_if_dirty`），
-    /// 所以「增量」天然只覆盖两次 flush 之间那一段；跨零点时那段增量落进新日期的桶，
-    /// 旧桶保持不变，不需要额外的日期判断。
-    ///
-    /// 唯一的已知误差：横跨零点的那一次 flush（最多 60s 窗口），零点前的一小段会被
-    /// 记到零点后的桶里。为它引入「按时刻切分增量」的复杂度不值当 —— 用量面板的定位是
-    /// 趋势与量级，不是账单对账。
-    usage_baseline_date: RwLock<String>,
+    /// 用量账本（跨重启累计 + 按日分桶 + 按 Key 删除）。原先是这里的 9 个字段 + 3 把锁的纪律，
+    /// 2026-10-12 加模型维度时整体收进 [`crate::usage_store::UsageLedger`]，「三个数」与锁顺序见那边模块头。
+    pub(crate) usage: crate::usage_store::UsageLedger,
     /// 🔴 **让「序列化 + 落盘」成为一个原子单元**（A7-1）。
     ///
     /// 没有它时的丢更新：`persist` 的读锁只保护序列化，而 `atomic_write` 的进程级
@@ -443,12 +387,7 @@ impl Store {
         let initial_stamp = Self::read_disk_stamp(&config_path);
 
         // 用量累计：启动即恢复上次的累计值（周期性落盘保存下来的），失败则从零开始。
-        let usage_path = crate::usage_store::usage_file_path(&config_path);
-        let usage_loaded = crate::usage_store::load_usage(&usage_path);
-
-        // 启动时刻的基线 = 刚加载的历史总量（本次运行的增量从此开始累计）
-        let baseline = usage_loaded.totals.clone();
-        let baseline_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let usage = crate::usage_store::UsageLedger::load(&config_path);
 
         let store = Self {
             route_profiles: crate::diagnostics::route_profiles::ProfileStore::load(config_path.with_file_name("route-profiles.json")),
@@ -461,15 +400,7 @@ impl Store {
             log_tx: Self::spawn_log_writer(),
             log_dropped: std::sync::atomic::AtomicU64::new(0),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
-            usage_totals: RwLock::new(usage_loaded.totals),
-            usage_dirty: std::sync::atomic::AtomicBool::new(false),
-            usage_path,
-            usage_since_ms: RwLock::new(usage_loaded.since),
-            usage_read_only: usage_loaded.read_only,
-            daily_buckets: RwLock::new(usage_loaded.daily_buckets),
-            retired_usage: RwLock::new(usage_loaded.retired),
-            usage_baseline: RwLock::new(baseline),
-            usage_baseline_date: RwLock::new(baseline_date),
+            usage,
             persist_lock: std::sync::Mutex::new(()),
         };
         // 仅在「全新安装首次 seed」或「成功加载后的迁移」时落盘。
@@ -686,10 +617,8 @@ impl Store {
         self.append_event_full(category, kind, key_id, detail, trace, collapse_key, None);
     }
 
-    /// 带 token 用量的事件写入（其余重载最终都汇到这里，保持单一构造点）。
-    ///
-    /// 折叠时用量会**累加**：折叠的语义是「同一件事发生了 N 次」，那 N 次各自烧掉的额度
-    /// 理应合并计数 —— 只保留最后一次的用量会让界面显示的总量远小于真实消耗。
+    /// 带 token 用量的事件写入，**不知道模型名**的调用方用（大脑聚合等）。等价于
+    /// [`Self::append_event_model`] 传 `""`：用量页对这类行按 Key 的代表模型估价。
     #[allow(clippy::too_many_arguments)]
     pub fn append_event_full(
         &self,
@@ -700,6 +629,26 @@ impl Store {
         trace: Option<RequestTrace>,
         collapse_key: Option<String>,
         usage: Option<crate::upstream::TokenUsage>,
+    ) {
+        self.append_event_model(category, kind, key_id, detail, trace, collapse_key, usage, "");
+    }
+
+    /// 带 token 用量 + **上游真实模型名**的事件写入（其余重载最终都汇到这里，保持单一构造点）。
+    ///
+    /// `model` 进用量账本的第三维：同一条 Key 跑多个模型时每个按自己的单价算（见 `usage_ledger`）。
+    /// 折叠时用量会**累加**：折叠的语义是「同一件事发生了 N 次」，那 N 次各自烧掉的额度
+    /// 理应合并计数 —— 只保留最后一次的用量会让界面显示的总量远小于真实消耗。
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_event_model(
+        &self,
+        category: CategoryType,
+        kind: &str,
+        key_id: Option<&str>,
+        detail: &str,
+        trace: Option<RequestTrace>,
+        collapse_key: Option<String>,
+        usage: Option<crate::upstream::TokenUsage>,
+        model: &str,
     ) {
         let entry = EventLogEntry {
             id: uuid::Uuid::new_v4().to_string(),
@@ -724,10 +673,8 @@ impl Store {
         // 折叠与否只影响界面展示几行，不影响真实烧掉的额度，故这里无条件累加一次。
         // （放在 push_event_in_memory 之前，且用独立的锁——不与 events 写锁嵌套。）
         if let Some(u) = &entry.usage {
-            let k = (category, entry.key_id.clone().unwrap_or_default());
-            self.usage_totals.write().entry(k).or_default().add(u);
             // 只翻标记，不在此处落盘：写盘留给后台的合并 flush。
-            self.mark_usage_dirty();
+            self.usage.record(category, entry.key_id.as_deref().unwrap_or_default(), model, u);
         }
 
         // 内存态的写入抽成独立方法，让 events 写锁**随该方法返回即释放** ——
@@ -959,9 +906,9 @@ impl Store {
         self.events.read().iter().map(Self::strip_trace).collect()
     }
 
-    /// 按「分类 × Key」聚合 token 用量（用量统计面板用）。
+    /// 按「分类 × Key」聚合 token 用量（各模型相加）。
     ///
-    /// 数据源是 `usage_totals` 累加器，**与事件环解耦**：事件环只保留最近 MAX_EVENTS 条，
+    /// 数据源是用量账本（`self.usage`），**与事件环解耦**：事件环只保留最近 MAX_EVENTS 条，
     /// 若按环算总量，第 MAX_EVENTS 次请求之后累计值就不再增长（老事件被 drain 掉多少、
     /// 新事件就补回多少）——一个「累计用量」面板越用数字越小，用户据此估额度会严重低估。
     ///
@@ -974,15 +921,12 @@ impl Store {
     /// 用量页要的是并集，那一步在 `usage_cost::rows` 里做 —— 别在这里补零桶，
     /// 它会污染 flush 的增量计算。
     pub fn token_usage_by_key(&self) -> Vec<TokenUsageByKey> {
-        self.usage_totals
-            .read()
-            .iter()
-            .map(|((category_id, key_id), usage)| TokenUsageByKey {
-                category_id: *category_id,
-                key_id: key_id.clone(),
-                usage: *usage,
-            })
-            .collect()
+        self.usage.by_key()
+    }
+
+    /// 同上，但不并模型：`(分类, Key, 模型)` 的明细。估价用（每个模型按自己的单价算）。
+    pub fn token_usage_by_model(&self) -> Vec<TokenUsageByKey> {
+        self.usage.by_model()
     }
 
     /// 流式请求的用量**补记**：把流走完才拿到的 token 用量并进**已存在的那一行**。
@@ -1000,13 +944,10 @@ impl Store {
         key_id: Option<&str>,
         collapse_key: &str,
         usage: crate::upstream::TokenUsage,
+        model: &str,
     ) {
         // 累加器**无条件**先记：面板的总量口径与「那条日志行还在不在」无关。
-        {
-            let k = (category, key_id.unwrap_or_default().to_string());
-            self.usage_totals.write().entry(k).or_default().add(&usage);
-        }
-        self.mark_usage_dirty();
+        self.usage.record(category, key_id.unwrap_or_default(), model, &usage);
 
         // 再修补日志行：从后往前找同 collapse_key 的最近一条。
         {
@@ -1654,6 +1595,13 @@ impl Store {
         if let Err(e) = self.secrets.write().remove(key_id) {
             tracing::warn!("删除 Key 后移除密钥失败(config 已更新,残留孤儿密钥待清理): {e}");
         }
+        // 用量记录一并删除（2026-10-12 用户定的口径，推翻 09-02 的「删 Key 留墓碑、金额照算」）。
+        // 排在 config 落盘成功**之后**：反过来的话 config 写失败、Key 还在，而它的用量已经没了。
+        // 删不到磁盘（只读 / 写失败）不让「删 Key」整体报错：它会在下一轮 flush 重写，或在用量页留成
+        // 「（已删除）」行由用户手动清掉 —— 已完成的 config 删除不该因为一份统计文件回退。
+        if !crate::usage_cost::purge_key(self, key_id) {
+            tracing::warn!("删除 Key 后清理其用量记录未落盘（只读或写盘失败），重启后可能仍显示为「已删除」行");
+        }
         Ok(())
     }
 
@@ -1808,274 +1756,22 @@ impl Store {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// 标记「用量累计有未落盘的变更」。
-    fn mark_usage_dirty(&self) {
-        self.usage_dirty
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// 若用量累计被标脏则落盘一次并清标记（后台任务定期调用 + 退出前调用）。
-    ///
-    /// 返回是否真的写了盘。与 `flush_health_if_dirty` 同样**先清标记再写**：
-    /// 写盘期间若又有新消耗，宁可下一轮多写一次，也不要形成「标记已清、这次变更没落盘」
-    /// 的丢失窗口。
-    ///
-    /// **v2（2026-08-11）**：按日分桶 + 90 天滚动。
-    ///
-    /// 分桶的量是「**本次运行的增量**」= `usage_totals` − `usage_baseline`，
-    /// 而不是 `usage_totals` 本身。这个区别是本函数最容易写错的地方：
-    /// `usage_totals` 是跨全部历史的总量，把它整份写进当天的桶会让历史被反复
-    /// 重复计入当天（实测：v1 的 500 + 当天新增 200 → 当天桶显示 700）。
-    ///
-    /// 每次 flush 后把基线抬到当前总量，于是下一次 flush 只写这之间的新增；
-    /// 跨过 UTC 零点时同样抬基线并换桶，昨天的增量不会漏进今天。
+    /// 有未落盘的用量就落盘一次（后台每 60s + 退出前）。返回是否真的写了盘。
+    /// 增量口径、90 天滚动、失败重试都在 [`crate::usage_store::UsageLedger::flush`]。
     pub fn flush_usage_if_dirty(&self) -> bool {
         self.route_profiles.flush();
-        // 只读模式：磁盘上那份是更新的格式，本次运行一个字节都不许写。
-        // **必须在清脏标记之前判**：否则标记被清掉、这段消耗既没写盘也不再重试，
-        // 等于一边"保护"文件一边丢数据。
-        if self.usage_read_only {
-            return false;
-        }
-        if !self
-            .usage_dirty
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            return false;
-        }
-
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let since_ms = *self.usage_since_ms.read();
-        let today = Self::utc_date_string(now_ms);
-
-        // 先锁住桶，再锁 totals → baseline；写盘期间阻止新的 usage 更新，确保一次快照
-        // 对应一份明确的基线。只有写成功后才提交这些 guard 里的状态。
-        let mut buckets = self.daily_buckets.write();
-        let buckets_before = buckets.clone();
-        let previous_retired = self.retired_usage.read().clone();
-        let totals = self.usage_totals.read();
-        let mut baseline = self.usage_baseline.write();
-        let delta: Vec<crate::model::TokenUsageByKey> = {
-            let mut out = Vec::new();
-            for ((cat, kid), cur) in totals.iter() {
-                let base = baseline.get(&(*cat, kid.clone())).copied().unwrap_or_default();
-                // 逐字段相减：饱和减法防「外部改小了 usage.json」导致的下溢 panic。
-                let d = TokenUsage {
-                    input: cur.input.saturating_sub(base.input),
-                    output: cur.output.saturating_sub(base.output),
-                    cache_read: cur.cache_read.saturating_sub(base.cache_read),
-                    cache_creation: cur.cache_creation.saturating_sub(base.cache_creation),
-                };
-                if !d.is_empty() {
-                    out.push(crate::model::TokenUsageByKey {
-                        category_id: *cat,
-                        key_id: kid.clone(),
-                        usage: d,
-                    });
-                }
-            }
-            out
-        };
-
-        // 增量为空 = 这次标脏只来自非用量变更（或已被上一轮写掉）：不写盘。
-        if delta.is_empty() {
-            return false;
-        }
-
-        // 记录本次 flush 落在哪天（仅诊断用；分桶判定靠下面的 `today`，不靠它）。
-        // 基线只在写盘成功后抬高，故失败时这份桶与旧基线仍然能原样重试。
-
-        // 把增量并进今天的桶（已存在则叠加，否则新建）
-        match buckets.iter_mut().find(|b| b.date == today) {
-            Some(bucket) => {
-                let mut map: std::collections::BTreeMap<(CategoryType, String), TokenUsage> =
-                    bucket
-                        .entries
-                        .iter()
-                        .map(|e| ((e.category_id, e.key_id.clone()), e.usage))
-                        .collect();
-                for row in delta {
-                    map.entry((row.category_id, row.key_id))
-                        .or_default()
-                        .add(&row.usage);
-                }
-                bucket.entries = map
-                    .into_iter()
-                    .map(|((cat, kid), u)| crate::model::TokenUsageByKey {
-                        category_id: cat,
-                        key_id: kid,
-                        usage: u,
-                    })
-                    .collect();
-            }
-            None => buckets.push(crate::model::DailyUsageBucket {
-                date: today.clone(),
-                entries: delta,
-            }),
-        }
-
-        // 90 天滚动：删掉 91 天前的桶 —— 但**先把它们的量折进 `retired`**。
-        //
-        // 直接丢掉的话，启动时的累计总量（= 各存活桶之和）每过一个 90 天就往下掉一截：
-        // 「累计用量」面板越用数字越小，用户据此估额度会严重低估，而 `since_ms` 仍宣称
-        // 「统计自 <安装日> 起」—— 数字覆盖的区间比它声称的短，且这事完全不可见。
-        // 与当年「按事件环算总量」是同一个症状、不同的成因（那次已修，这里在第 90 天重现）。
-        //
-        // 日维度如实丢弃：只累计到 (分类, Key) 粒度，不编造一个假日期把整段历史堆到某天。
-        let cutoff_ms = now_ms - 90 * 86_400_000;
-        let mut retired_map: std::collections::BTreeMap<(CategoryType, String), TokenUsage> = previous_retired
-            .iter()
-            .map(|e| ((e.category_id, e.key_id.clone()), e.usage))
-            .collect();
-        let mut retired_changed = false;
-        buckets.retain(|b| {
-            // 解析失败的桶保留：手工编辑过的日期不该被静默删除。
-            let Ok(parsed) = chrono::NaiveDate::parse_from_str(&b.date, "%Y-%m-%d") else {
-                return true;
-            };
-            let keep = parsed
-                .and_hms_opt(0, 0, 0)
-                .map(|dt| dt.and_utc().timestamp_millis())
-                .unwrap_or(0)
-                >= cutoff_ms;
-            if !keep {
-                for row in &b.entries {
-                    retired_map
-                        .entry((row.category_id, row.key_id.clone()))
-                        .or_default()
-                        .add(&row.usage);
-                    retired_changed = true;
-                }
-            }
-            keep
-        });
-        let retired = if retired_changed {
-            retired_map
-                .into_iter()
-                .map(|((cat, kid), u)| crate::model::TokenUsageByKey {
-                    category_id: cat,
-                    key_id: kid,
-                    usage: u,
-                })
-                .collect()
-        } else {
-            previous_retired.clone()
-        };
-
-        // 降序（最新在前，便于面板取「最近 7/30 天」）
-        buckets.sort_by(|a, b| b.date.cmp(&a.date));
-
-        let snap = crate::model::UsageSnapshot {
-            version: crate::model::USAGE_SNAPSHOT_VERSION,
-            since_ms,
-            updated_ms: now_ms,
-            daily_buckets: buckets.clone(),
-            retired: retired.clone(),
-            entries: Vec::new(), // v2 不再用这个字段
-        };
-        let bytes = match serde_json::to_vec_pretty(&snap) {
-            Ok(b) => b,
-            Err(e) => {
-                *buckets = buckets_before;
-                self.mark_usage_dirty();
-                tracing::warn!("用量统计序列化失败: {e}");
-                return false;
-            }
-        };
-        // 走与 config/secrets 同一个 atomic_write：写临时文件 → `sync_all()` → 重命名。
-        // 两条保证要分开理解：**原子性**来自 rename（读者只会看到旧全量或新全量，
-        // 不会读到半截 JSON）；**持久性**来自 rename 之前那次 fsync（断电后内容真在盘上，
-        // 而不是「文件存在但 0 字节」）。缺后者时前半句仍成立、后半句不成立 ——
-        // 这正是本轮对抗审查在 `secret::atomic_write` 里补掉的那条数据丢失链。
-        if let Err(e) = crate::secret::atomic_write(&self.usage_path, &bytes) {
-            *buckets = buckets_before;
-            self.mark_usage_dirty();
-            tracing::warn!("用量统计落盘失败（下一轮重试）: {e}");
-            return false;
-        }
-        // 只有完整快照已经落盘，才提交内存基线与分桶；失败路径会保留旧状态并重试同一增量。
-        *baseline = totals.clone();
-        *self.retired_usage.write() = retired;
-        *self.usage_baseline_date.write() = today;
-        true
+        self.usage.flush()
     }
 
-    /// 按日分桶的只读快照（面板算「今日 / 本周 / 近 7 日」用），**已并入尚未 flush 的增量**。
-    ///
-    /// 为什么必须在这里并、而不是让前端相加：`daily_buckets` 只在 flush 时更新
-    /// （最多落后 `USAGE_FLUSH_INTERVAL_SECS` = 60s）。原注释写着「面板的今日由前端把这份
-    /// 历史与 `token_usage_by_key` 的实时增量相加得出」，但 `UsagePage` 从来没那么做 ——
-    /// 它的 `byDate` 只用这份桶。于是同一屏上出现自相矛盾：刚发过几个请求，
-    /// 「累计」已经涨了，「今日」还是 0（新装那次尤其明显，一分钟内就是 0）。
-    ///
-    /// 收在后端的理由：增量 = `usage_totals − usage_baseline`，与 flush 用的是同一条减法。
-    /// 让前端再算一遍等于把这条口径复制到两处，而它有两个易错点（饱和减法防外部改小、
-    /// UTC 而非本地日期）—— 复制必然漂移。这里并完，前端拿到的桶天然就是最新的。
-    ///
-    /// **不动 baseline**：这是只读视图，抬基线会把这段增量从下一次 flush 里吃掉。
+    /// 按日分桶的只读快照（今日 / 本周 / 本月 / 趋势），**已并入尚未 flush 的增量**、按本机时区切天。
+    /// 为什么必须在后端并、为什么不许抬基线，见 [`crate::usage_store::UsageLedger::daily_buckets`]。
     pub fn daily_usage_buckets(&self) -> Vec<crate::model::DailyUsageBucket> {
-        let mut buckets = self.daily_buckets.read().clone();
-        // 未落盘增量（口径同 flush_usage_if_dirty，但只读不抬基线）
-        let pending: Vec<crate::model::TokenUsageByKey> = {
-            let totals = self.usage_totals.read();
-            let baseline = self.usage_baseline.read();
-            totals
-                .iter()
-                .filter_map(|((cat, kid), cur)| {
-                    let base = baseline.get(&(*cat, kid.clone())).copied().unwrap_or_default();
-                    // 饱和减法：防「外部把 usage.json 改小了」导致下溢 panic。
-                    let d = TokenUsage {
-                        input: cur.input.saturating_sub(base.input),
-                        output: cur.output.saturating_sub(base.output),
-                        cache_read: cur.cache_read.saturating_sub(base.cache_read),
-                        cache_creation: cur.cache_creation.saturating_sub(base.cache_creation),
-                    };
-                    (!d.is_empty()).then(|| crate::model::TokenUsageByKey {
-                        category_id: *cat,
-                        key_id: kid.clone(),
-                        usage: d,
-                    })
-                })
-                .collect()
-        };
-        if pending.is_empty() {
-            return buckets;
-        }
-        // 落进**今天**的桶（与 flush 同一判定：UTC 日期）。跨零点时这段增量算今天，
-        // 与 flush 的处置一致 —— 两边同口径才不会在零点前后打出不同的「今日」。
-        let today = Self::utc_date_string(chrono::Utc::now().timestamp_millis());
-        match buckets.iter_mut().find(|b| b.date == today) {
-            Some(bucket) => {
-                for row in pending {
-                    match bucket
-                        .entries
-                        .iter_mut()
-                        .find(|e| e.category_id == row.category_id && e.key_id == row.key_id)
-                    {
-                        Some(slot) => slot.usage.add(&row.usage),
-                        None => bucket.entries.push(row),
-                    }
-                }
-            }
-            None => {
-                buckets.push(crate::model::DailyUsageBucket { date: today, entries: pending });
-                // 保持「最新在前」（调用方按这个顺序取最近 N 天）
-                buckets.sort_by(|a, b| b.date.cmp(&a.date));
-            }
-        }
-        buckets
-    }
-
-    /// 把毫秒时间戳转成 UTC 日期字符串 `"YYYY-MM-DD"`。
-    fn utc_date_string(ms: i64) -> String {
-        use chrono::Datelike;
-        let dt = chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default();
-        format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day())
+        self.usage.daily_buckets()
     }
 
     /// 用量统计的起始时刻（毫秒）。面板显示「统计自 X 起」用。
     pub fn usage_since_ms(&self) -> i64 {
-        *self.usage_since_ms.read()
+        self.usage.since_ms()
     }
 
     /// 若健康态被标脏则落盘一次并清标记（由后台任务定期调用，以及退出前调用）。
@@ -2856,8 +2552,7 @@ impl Store {
         let secrets = SecretStore::load(secrets_path)?;
         let initial_stamp = Self::read_disk_stamp(&config_path);
         // 与生产构造器同样恢复用量累计：测试才能覆盖「重启后累计不归零」这条判据。
-        let usage_path = crate::usage_store::usage_file_path(&config_path);
-        let usage_loaded = crate::usage_store::load_usage(&usage_path);
+        let usage = crate::usage_store::UsageLedger::load(&config_path);
         Ok(Self {
             route_profiles: crate::diagnostics::route_profiles::ProfileStore::load(config_path.with_file_name("route-profiles.json")),
             config_path,
@@ -2869,19 +2564,8 @@ impl Store {
             log_tx: Self::spawn_log_writer(),
             log_dropped: std::sync::atomic::AtomicU64::new(0),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
-            usage_dirty: std::sync::atomic::AtomicBool::new(false),
-            usage_path,
-            usage_since_ms: RwLock::new(usage_loaded.since),
-            usage_read_only: usage_loaded.read_only,
-            daily_buckets: RwLock::new(usage_loaded.daily_buckets),
-            retired_usage: RwLock::new(usage_loaded.retired),
-            // 基线 = 启动时的历史总量（与生产构造器同一口径，测试才能覆盖「今日增量」判据）
-            usage_baseline: RwLock::new(usage_loaded.totals.clone()),
-            usage_baseline_date: RwLock::new(
-                chrono::Utc::now().format("%Y-%m-%d").to_string(),
-            ),
+            usage,
             persist_lock: std::sync::Mutex::new(()),
-            usage_totals: RwLock::new(usage_loaded.totals),
         })
     }
 }
@@ -3819,6 +3503,7 @@ mod tests {
             entries: vec![TokenUsageByKey {
                 category_id: CategoryType::ClaudeCli,
                 key_id: "old-key".into(),
+                model: String::new(),
                 usage: TokenUsage { input: 500, output: 100, cache_read: 0, cache_creation: 0 },
             }],
         };
@@ -3854,7 +3539,7 @@ mod tests {
         assert!(!v2.daily_buckets.is_empty(), "v2 应有按日分桶");
 
         let dates: Vec<_> = v2.daily_buckets.iter().map(|b| &b.date).collect();
-        let today = Store::utc_date_string(chrono::Utc::now().timestamp_millis());
+        let today = crate::usage_store::local_date_string(chrono::Utc::now().timestamp_millis());
         assert!(
             dates.contains(&&today),
             "今天的桶必须存在（当前日期 {today}，实际桶: {dates:?}）"
@@ -3878,7 +3563,7 @@ mod tests {
         );
 
         // 再 flush 一次且无新消耗：不应把同一批增量重复写进桶（基线已抬高）。
-        store.mark_usage_dirty();
+        store.usage.mark_dirty();
         store.flush_usage_if_dirty();
         let v2b: UsageSnapshot =
             serde_json::from_slice(&std::fs::read(&usage_path).unwrap()).unwrap();
@@ -3932,7 +3617,7 @@ mod tests {
         use crate::upstream::TokenUsage;
         let dir = temp_dir("usage_pending");
         let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
-        let today = Store::utc_date_string(chrono::Utc::now().timestamp_millis());
+        let today = crate::usage_store::local_date_string(chrono::Utc::now().timestamp_millis());
         let sum_today = |s: &Store| -> u64 {
             s.daily_usage_buckets()
                 .iter()
@@ -4017,12 +3702,13 @@ mod tests {
         let sec = dir.join("secrets.enc");
         let usage_path = dir.join("usage.json");
 
-        let today = chrono::Utc::now().date_naive();
+        let today = chrono::Local::now().date_naive();
         let day = |off: i64| (today - chrono::Duration::days(off)).format("%Y-%m-%d").to_string();
         let usage = |input: u64| TokenUsage { input, output: 0, cache_read: 0, cache_creation: 0 };
         let row = |input: u64| TokenUsageByKey {
             category_id: CategoryType::ClaudeCli,
             key_id: "k".into(),
+            model: String::new(),
             usage: usage(input),
         };
 
@@ -4146,19 +3832,19 @@ mod tests {
             None,
             Some(TokenUsage { input: 7, output: 3, cache_read: 2, cache_creation: 1 }),
         );
-        let baseline_before = store.usage_baseline.read().clone();
-        let buckets_before = serde_json::to_vec(&*store.daily_buckets.read()).unwrap();
-        let retired_before = store.retired_usage.read().clone();
-        let date_before = store.usage_baseline_date.read().clone();
+        let baseline_before = store.usage.baseline.read().clone();
+        let buckets_before = serde_json::to_vec(&*store.usage.buckets.read()).unwrap();
+        let retired_before = store.usage.retired.read().clone();
+        let date_before = store.usage.baseline_date.read().clone();
 
         // 目录占位会让真实 atomic_write 的 rename 与原地回退都失败，且不依赖权限位。
         std::fs::create_dir_all(&usage_path).unwrap();
         assert!(!store.flush_usage_if_dirty(), "写入失败时不能报告成功");
-        assert_eq!(*store.usage_baseline.read(), baseline_before);
-        assert_eq!(serde_json::to_vec(&*store.daily_buckets.read()).unwrap(), buckets_before);
-        assert_eq!(*store.retired_usage.read(), retired_before);
-        assert_eq!(*store.usage_baseline_date.read(), date_before);
-        assert!(store.usage_dirty.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(*store.usage.baseline.read(), baseline_before);
+        assert_eq!(serde_json::to_vec(&*store.usage.buckets.read()).unwrap(), buckets_before);
+        assert_eq!(*store.usage.retired.read(), retired_before);
+        assert_eq!(*store.usage.baseline_date.read(), date_before);
+        assert!(store.usage.dirty.load(std::sync::atomic::Ordering::Relaxed));
 
         std::fs::remove_dir_all(&usage_path).unwrap();
         assert!(store.flush_usage_if_dirty(), "恢复写入后必须重试同一批增量");
@@ -4290,7 +3976,7 @@ mod tests {
 
         // 该标记必须真正传导到写侧闸门：产生新消耗后 flush 仍拒绝写盘。
         let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
-        assert!(store.usage_read_only, "只读标记应从 load_usage 传导到 Store");
+        assert!(store.usage.read_only, "只读标记应从 load_usage 传导到 Store");
         store.append_event_full(
             CategoryType::ClaudeCli,
             "route",
@@ -4361,7 +4047,7 @@ mod tests {
         );
         // 2) 流结束：补记用量。
         let u = TokenUsage { input: 12_345, output: 400, cache_read: 0, cache_creation: 0 };
-        store.backfill_usage_for_collapsed_event(CategoryType::ClaudeCli, Some("k1"), &collapse, u);
+        store.backfill_usage_for_collapsed_event(CategoryType::ClaudeCli, Some("k1"), &collapse, u, "claude-sonnet-4");
 
         let ev = store.list_all_events();
         assert_eq!(ev.len(), 1, "一次流式请求只能留一行，实际: {ev:?}");

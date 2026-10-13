@@ -23,7 +23,7 @@ const read = (...p: string[]) => readFileSync(join(ROOT, ...p), "utf8");
 
 const USAGE_PAGE = read("src", "pages", "UsagePage.tsx");
 const USAGE_COST_RS = read("src-tauri", "src", "usage_cost.rs");
-const TYPES_TS = read("src", "types.ts");
+const TYPES_TS = read("src", "types.usage.ts"); // 用量类型 2026-10-12 拆到了这里
 const I18N_USAGE = read("src", "lib", "i18n.usage.ts");
 const MOCK_USAGE = read("src", "lib", "mockData.usage.ts");
 
@@ -75,8 +75,16 @@ describe("零用量新 Key 的呈现", () => {
 
   it("🔴 行集合是并集：配置里的 Key 也要产出行", () => {
     const rs = code(USAGE_COST_RS);
-    // 并集的实现形态：历史桶先入表，再为活着的 Key 补占位（不覆盖已有桶）。
-    expect(rs, "要有补占位那一步").toMatch(/or_insert_with/);
+    // 并集的实现形态：历史桶先入表，再为活着的 Key 补占位（**只补缺、不覆盖**已有桶）。
+    //
+    // ⚠️ 钉性质不钉写法：第一版钉的是 `or_insert_with` 这个字面量，而按模型估价（2026-10-12）之后
+    // 占位的值变成空 Vec，clippy 的 `unwrap_or_default` 要求写成 `or_default()` —— 照旧判据就是假红。
+    // 要守的是「补占位那一步存在、且用 entry（不覆盖）而不是 insert（会把真实数字冲掉）」。
+    const at = rs.indexOf("for slot in live_slots");
+    expect(at, "要有补占位那一步（遍历活着的 Key）").toBeGreaterThan(0);
+    const step = rs.slice(at, at + 160);
+    expect(step, "补占位必须走 entry（只补缺）").toMatch(/\.entry\(slot\)/);
+    expect(step, "不许用 insert：那会把已有桶的真实数字冲掉").not.toMatch(/\.insert\(/);
     expect(rs, "占位行的 usage 是全零").toMatch(/TokenUsage::default\(\)/);
   });
 

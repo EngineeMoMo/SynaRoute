@@ -375,77 +375,17 @@ export interface TokenUsage {
   cacheCreation?: number;
 }
 
-/** 用量统计：按「分类 × Key」聚合的一行（后端 get_token_usage 返回）。 */
-export interface TokenUsageByKey {
-  categoryId: CategoryType;
-  /** 空串 = 该分类的系统级事件（无具体 Key） */
-  keyId: string;
-  usage: TokenUsage;
-}
-
-/** 一天的用量分桶（后端 get_daily_usage 返回，最近 90 天，最新在前）。 */
-export interface DailyUsageBucket {
-  /** UTC 日期，格式 `YYYY-MM-DD` */
-  date: string;
-  entries: TokenUsageByKey[];
-}
-
-/**
- * 单价来源，界面据此如实标注估算精度。
- *
- * - `exact`：命中内置官方单价表
- * - `family`：按家族关键词兜底（如 claude-opus-4-8 → opus 档）
- * - `unknown`：没有可用单价，金额显示「—」而非 0
- */
-export type PricingSource = "exact" | "family" | "unknown";
-
-/** 带成本估算的用量行（后端 get_usage_with_cost 返回）。 */
-/**
- * 为什么这一行算不出金额。
- *
- * **必须与 Rust 的 `usage_cost::UnpricedReason` 变体一一对应**（后端用
- * `#[serde(tag = "kind")]` 序列化，故这里是判别式联合）。两边分叉是静默的 ——
- * 编译器管不到这条缝，而漏一支的表现是界面渲染出空白提示。
- * `tests/unpricedReasonParity.test.ts` 机械校验两侧的变体集合一致。
- */
-export type UnpricedReason =
-  /** 大脑聚合的历史用量（keyId 为空串，无 Key 归属） */
-  | { kind: "aggregate" }
-  /** 这一行指向的 Key 已被删除 */
-  | { kind: "keyDeleted" }
-  /** Key 在，但没有任何代表模型名 */
-  | { kind: "noModelName" }
-  /** 有模型名，但单价表里没有它 */
-  | { kind: "modelNotInTable"; model: string };
-
-export interface UsageCostRow {
-  categoryId: CategoryType;
-  keyId: string;
-  /** Key 可读名；已删除时从墓碑还原，连墓碑也没有才是 null。 */
-  keyName: string | null;
-  /** 🔴 这一行的 Key 已不在配置里。`keyName` 对已删 Key 也有值，故界面必须靠这一位区分「还在用 / 已删除」。 */
-  keyDeleted?: boolean;
-  usage: TokenUsage;
-  /**
-   * 🔴 是否真的捕获过上游回报的 usage —— **不能用「四个 token 全 0」代替**。
-   * 行集合是「配置里的 Key ∪ 历史累计桶」，故新 Key 也有行；`false` = 尚无用量
-   * （金额显示「尚无用量」而**不是 $0**、不计进「未计入」条数），`true` = 真有过消耗。
-   */
-  hasRecordedUsage?: boolean;
-  /** 估算成本（纳美元 = 1e-9 USD）。null = 无可用单价 */
-  costNano: number | null;
-  pricingSource: PricingSource;
-  /** 实际生效的倍率（回显，空则 "1.0"） */
-  multiplier: string;
-  /** 算不出金额时的成因。存在性与 `costNano === null` 严格等价（后端有测试钉住）。 */
-  unpricedReason?: UnpricedReason;
-  /** 实际用来估算的代表模型名。界面显示「按 X 估算」，让偏差的来源可见。 */
-  pricedByModel?: string;
-  /** 用户为这条 Key 设的花费预算（美元）。界面据此画「$已花 / $预算」；未设则不画。 */
-  budgetUsd?: number;
-  /** 🔴 累计估算花费是否已达/超预算。后端单一事实来源，前端不自己比。 */
-  overBudget?: boolean;
-}
+/** 用量统计页的类型在 types.usage.ts（本文件行数到顶）；这里 re-export，`from "@/types"` 照旧可用。 */
+export type {
+  DailyCost,
+  DailyUsageBucket,
+  PricingSource,
+  PricingStatus,
+  TokenUsageByKey,
+  UnpricedReason,
+  UsageCostRow,
+  UsagePartCost,
+} from "./types.usage";
 
 /**
  * 余额查询配置（挂在 ProviderKey 上）。

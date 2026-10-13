@@ -4,7 +4,8 @@ import { useBackendEvent, FALLBACK_POLL_MS } from "@/lib/useBackendEvents";
 import { usePolling } from "@/lib/usePolling";
 import { useT } from "@/lib/useT";
 import type { TFunc } from "@/lib/i18n";
-import type { DailyUsageBucket, TokenUsage, UnpricedReason, UsageCostRow } from "@/types";
+import { inRange, lastNDayKeys, localDateKey, startOfMonthKey, startOfWeekKey } from "@/lib/usagePeriods";
+import type { DailyCost, PricingStatus, TokenUsage, UnpricedReason, UsageCostRow, UsagePartCost } from "@/types";
 import { AnimatedNumber } from "@/components/ui/AnimatedNumber";
 import { Badge } from "@/components/ui/Badge";
 import { RefreshButton } from "@/components/ui/RefreshButton";
@@ -17,8 +18,8 @@ import { TrendingUp } from "lucide-react";
  * 用量统计面板：按「分类 × Key」展示 token 消耗**与估算花费**。
  *
  * 数据来自两个后端接口：
- * - `getUsageWithCost`：跨重启累计的总量 + 成本估算（口径见下）
- * - `getDailyUsage`：按 UTC 日期分桶的历史（最近 90 天），供今日/本周/趋势
+ * - `getUsageWithCost`：跨重启累计的总量 + 按模型逐格的成本估算（口径见下）
+ * - `getDailyCost`：按天的花费与 token（最近 90 天，本机时区切天），供今日/本周/本月/趋势
  *
  * 累计量刻意不从事件环（最多 500 条）算：那样在环滚动后总量会停止增长（见
  * `token_usage_totals_never_shrink_when_event_ring_rotates`）。
@@ -26,9 +27,11 @@ import { TrendingUp } from "lucide-react";
  * ## 关于「花费」的口径（重要）
  *
  * 这里显示的是**估算**，不是账单：
- * - 单价来自内置官方价表，或按模型家族名兜底猜测（`pricingSource` 标注了是哪种）；
+ * - 单价来自内置官方价表（缺的由每天拉取的在线价格表补，同名内置赢），或按模型家族名兜底猜测
+ *   （`pricingSource` 标注了是哪种）；
  * - 中转站实际计价按各自折扣，用户可在 Key 编辑器里填「计费倍率」校准；
- * - 累加器的键不含模型名，故一条 Key 跑多个档位模型时按代表模型估算，会有偏差。
+ * - 每个模型按自己的单价算（2026-10-12 起账本记了模型）；只有升级前没记模型的历史用量
+ *   才按 Key 的代表模型估，并标「≈」。
  *
  * 所以面板上必须写明「估算」二字。此前这个页面的注释写着「只统计 token、不换算钱：
  * 各中转商单价差异巨大，SynaRoute 无从得知」—— 本轮推翻了它，但推翻的方式不是
@@ -37,10 +40,15 @@ import { TrendingUp } from "lucide-react";
 export function UsagePage() {
   const t = useT();
   const [rows, setRows] = useState<UsageCostRow[] | null>(null);
-  const [daily, setDaily] = useState<DailyUsageBucket[]>([]);
+  const [daily, setDaily] = useState<DailyCost[]>([]);
   const [sinceMs, setSinceMs] = useState<number | null>(null);
-  const [tableDate, setTableDate] = useState<string>("");
+  /** 单价表现状（内置表核对日期 + 在线表）。取不到时为 null，表头那一行就不画。 */
+  const [pricing, setPricing] = useState<PricingStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** 「清理」的两步确认：第一下只把这一行换成「确认清理 / 取消」（同 Key 卡片的删除）。 */
+  const [confirmingPurge, setConfirmingPurge] = useState<string | null>(null);
+  /** 清理成功但没落盘时的说明（不是错误：界面上那一行确实已经没了）。 */
+  const [notice, setNotice] = useState<string | null>(null);
 
   /**
    * 在途请求的代际号。**只允许最新那一轮提交结果。**
@@ -56,11 +64,11 @@ export function UsagePage() {
     const gen = ++genRef.current;
     try {
       // 四个请求并发发，避免标题/趋势慢一拍导致界面闪一下旧值。
-      const [next, since, buckets, priceDate] = await Promise.all([
+      const [next, since, days, priceStatus] = await Promise.all([
         api.getUsageWithCost(),
         api.getUsageSince(),
-        api.getDailyUsage(),
-        api.getPricingTableDate(),
+        api.getDailyCost(),
+        api.getPricingStatus(),
       ]);
       // 过期结果丢弃（见 genRef）。
       if (gen !== genRef.current) return;
@@ -73,8 +81,8 @@ export function UsagePage() {
       // 毁掉整页。App 层的 ErrorBoundary 是第二道防线，但第一道应该在数据入口。
       setRows(Array.isArray(next) ? next.filter(isValidCostRow) : []);
       setSinceMs(typeof since === "number" && Number.isFinite(since) ? since : null);
-      setDaily(Array.isArray(buckets) ? buckets.filter(isValidBucket) : []);
-      setTableDate(typeof priceDate === "string" ? priceDate : "");
+      setDaily(Array.isArray(days) ? days.filter(isValidDailyCost) : []);
+      setPricing(isValidPricingStatus(priceStatus) ? priceStatus : null);
       setError(null);
     } catch (e) {
       if (gen !== genRef.current) return;
@@ -103,11 +111,28 @@ export function UsagePage() {
   useBackendEvent(["logs", "config"], () => void load());
   usePolling(() => void load(), FALLBACK_POLL_MS);
 
-  /** 总计（token 与估算金额）。金额只累加**有单价**的行，无单价的不计入。 */
+  /** 清理一条已离开配置的 Key 的用量（不可逆，两步确认）。 */
+  const purge = async (keyId: string) => {
+    setConfirmingPurge(null);
+    try {
+      const persisted = await api.purgeKeyUsage(keyId);
+      setNotice(persisted ? null : t("usage.purgeNotPersisted"));
+      setError(null);
+    } catch (e) {
+      setError(String((e as Error)?.message ?? e));
+    }
+    await load();
+  };
+
+  /**
+   * 总计（token 与估算金额）。金额累加**能算出的部分**；一格都算不出的行（`unpriced`）与
+   * 只算出一部分的行（`partial`）都要在「累计花费」那一格上标出来 —— 否则它会被当成总计读。
+   */
   const summary = useMemo(() => {
     let input = 0, output = 0, cacheRead = 0, cacheCreation = 0;
     let costNano = 0;
     let unpriced = 0;
+    let partial = 0;
     for (const r of rows ?? []) {
       input += r.usage.input;
       output += r.usage.output;
@@ -119,9 +144,12 @@ export function UsagePage() {
       // 那是一条指向空处的提示。
       if (!r.hasRecordedUsage) continue;
       if (r.costNano == null) unpriced += 1;
-      else costNano += r.costNano;
+      else {
+        costNano += r.costNano;
+        if (r.unpricedReason) partial += 1;
+      }
     }
-    return { input, output, cacheRead, cacheCreation, costNano, unpriced };
+    return { input, output, cacheRead, cacheCreation, costNano, unpriced, partial };
   }, [rows]);
 
   /**
@@ -152,48 +180,32 @@ export function UsagePage() {
   );
 
   /**
-   * 按日聚合的 token 总量，供「今日 / 本周 / 本月」与趋势图。
-   *
-   * 日期用 UTC（与后端分桶同口径）。若这里改用本地时区，会出现
-   * 「今日」比后端桶少算或多算一段的错位。
+   * 「今日 / 本周 / 本月」：日历口径、**本机时区**（与后端 v4 的日桶同口径，见 `usagePeriods`）。
+   * 每一格是 `{ 花费, token, 算不出的 token }` 三个数之和 —— 后者非 0 时卡片上要标出来。
    */
-  const byDate = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const b of daily) {
-      let sum = 0;
-      // 桶里的单条 entry 仍可能是脏的（外部改坏 usage.json / 跨版本残留）：
-      // 逐条校验后再累加，坏行跳过。否则 `e.usage.input` 会抛 TypeError → 整页白屏。
-      for (const e of b.entries) {
-        if (!e || !isValidUsage(e.usage)) continue;
-        sum += e.usage.input + e.usage.output + (e.usage.cacheRead ?? 0) + (e.usage.cacheCreation ?? 0);
-      }
-      m.set(b.date, sum);
-    }
-    return m;
+  const periods = useMemo(() => {
+    const now = new Date();
+    const today = localDateKey(now);
+    const sum = (from: string) =>
+      daily
+        .filter((d) => inRange(d.date, from, today))
+        .reduce(
+          (acc, d) => ({ cost: acc.cost + d.costNano, tokens: acc.tokens + d.tokens, unpriced: acc.unpriced + d.unpricedTokens }),
+          { cost: 0, tokens: 0, unpriced: 0 },
+        );
+    return { today: sum(today), week: sum(startOfWeekKey(now)), month: sum(startOfMonthKey(now)) };
   }, [daily]);
 
-  const periods = useMemo(() => {
-    const utcDate = (offsetDays: number) =>
-      new Date(Date.now() - offsetDays * 86_400_000).toISOString().slice(0, 10);
-    const today = byDate.get(utcDate(0)) ?? 0;
-    let week = 0;
-    for (let i = 0; i < 7; i++) week += byDate.get(utcDate(i)) ?? 0;
-    let month = 0;
-    for (let i = 0; i < 30; i++) month += byDate.get(utcDate(i)) ?? 0;
-    return { today, week, month };
-  }, [byDate]);
-
-  /** 近 7 日趋势（最早在左）。空日保留为 0，好让「那天没用量」看得出来。 */
+  /** 近 7 日趋势（最早在左，滚动窗口）。没有用量的那天后端不产出，这里补成 0，好让「那天没用」看得出来。 */
   const trend = useMemo(() => {
-    const out: { date: string; total: number }[] = [];
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(Date.now() - i * 86_400_000).toISOString().slice(0, 10);
-      out.push({ date: d, total: byDate.get(d) ?? 0 });
-    }
-    return out;
-  }, [byDate]);
+    const byDate = new Map(daily.map((d) => [d.date, d]));
+    return lastNDayKeys(new Date(), 7).map((date) => {
+      const d = byDate.get(date);
+      return { date, tokens: d?.tokens ?? 0, cost: d?.costNano ?? 0, unpriced: d?.unpricedTokens ?? 0 };
+    });
+  }, [daily]);
 
-  const trendMax = Math.max(1, ...trend.map((d) => d.total));
+  const trendMax = Math.max(1, ...trend.map((d) => d.tokens));
 
   return (
     <div className="flex h-full flex-col">
@@ -204,7 +216,7 @@ export function UsagePage() {
           <>
             <p>{t("usage.subtitle")}</p>
             {sinceMs !== null && <p className="mt-0.5" title={t("usage.sinceHint")}>{t("usage.since")}: {new Date(sinceMs).toLocaleString()}</p>}
-            {tableDate && <p className="mt-0.5">{t("usage.tableDate", { date: tableDate })}</p>}
+            {pricing && <PricingLine status={pricing} t={t} />}
           </>
         }
         actions={
@@ -219,22 +231,35 @@ export function UsagePage() {
       <div className="px-6">
         {rows && rows.length > 0 && (
           <>
-            {/* 花费概览：今日 / 本周 / 本月（token），加累计估算金额 */}
+            {/* 花费概览：今日 / 本周 / 本月（日历口径，主数字是花费、token 作副行），加累计估算金额 */}
             <div className="mt-3 grid grid-cols-4 gap-2">
-              <StatCard label={t("usage.today")} value={periods.today} format={fmt} />
-              <StatCard label={t("usage.thisWeek")} value={periods.week} format={fmt} />
-              <StatCard label={t("usage.thisMonth")} value={periods.month} format={fmt} />
+              {(["today", "week", "month"] as const).map((k) => (
+                <StatCard
+                  key={k}
+                  label={t(k === "today" ? "usage.today" : k === "week" ? "usage.thisWeek" : "usage.thisMonth")}
+                  value={periods[k].cost}
+                  format={fmtUsd}
+                  hint={t("usage.periodHint")}
+                  sub={t("usage.periodTokens", { tokens: fmt(periods[k].tokens) })}
+                  /* 有一部分算不出时这个金额只是下限 —— 必须标在数字旁边，否则会被当成全部。 */
+                  note={
+                    periods[k].unpriced > 0
+                      ? t("usage.periodUnpriced", { tokens: fmt(periods[k].unpriced) })
+                      : undefined
+                  }
+                />
+              ))}
               <StatCard
                 label={t("usage.estCost")}
                 value={summary.costNano}
                 format={fmtUsd}
                 hint={t("usage.estimateHint")}
                 accent
-                /* 「累计花费」这个标签会被当成总计读。有行没算进去时**必须在这一格上**
+                /* 「累计花费」这个标签会被当成总计读。有行没（全部）算进去时**必须在这一格上**
                    标出来 —— 只靠下方横幅不够，用户看数字时未必往下看。 */
                 note={
-                  summary.unpriced > 0
-                    ? t("usage.estCostExcluded", { n: summary.unpriced })
+                  summary.unpriced + summary.partial > 0
+                    ? t("usage.estCostExcluded", { n: summary.unpriced + summary.partial })
                     : undefined
                 }
               />
@@ -247,7 +272,12 @@ export function UsagePage() {
                 {trend.map((d) => (
                   <Tooltip
                     key={d.date}
-                    content={`${d.date} · ${fmt(d.total)} token`}
+                    content={t(d.unpriced > 0 ? "usage.trendTipPartial" : "usage.trendTip", {
+                      date: d.date,
+                      tokens: fmt(d.tokens),
+                      cost: fmtUsd(d.cost),
+                      unpriced: fmt(d.unpriced),
+                    })}
                     side="top"
                   >
                     <div className="flex flex-1 cursor-default flex-col items-center gap-1">
@@ -256,7 +286,7 @@ export function UsagePage() {
                         style={{
                           // 至少 2px：完全没用量的那天也要有个可见的底座，
                           // 否则用户分不清「没数据」与「柱子没渲染出来」。
-                          height: `${Math.max(2, Math.round((d.total / trendMax) * 64))}px`,
+                          height: `${Math.max(2, Math.round((d.tokens / trendMax) * 64))}px`,
                         }}
                       />
                       <span className="text-[9px] tabular-nums text-text-muted">
@@ -270,9 +300,9 @@ export function UsagePage() {
 
             {/* 有行算不出金额时**按成因**如实说明，并各自指路。
                 旧实现是一句「模型名不在单价表中」—— 对四种成因里的三种都是假话。 */}
-            {summary.unpriced > 0 && (
+            {summary.unpriced + summary.partial > 0 && (
               <InlineAlert tone="warning" className="mt-2">
-                <div>{t("usage.unpricedBanner", { n: summary.unpriced })}</div>
+                <div>{t("usage.unpricedBanner", { n: summary.unpriced + summary.partial })}</div>
                 <ul className="mt-0.5 list-disc space-y-0.5 pl-4">
                   {unpricedGroups.aggregate > 0 && (
                     <li>{t("usage.unpricedGroup.aggregate", { n: unpricedGroups.aggregate })}</li>
@@ -314,6 +344,7 @@ export function UsagePage() {
 
       <div className="flex-1 overflow-y-auto p-6">
         {error && <InlineAlert tone="danger">{error}</InlineAlert>}
+        {notice && <InlineAlert tone="warning" className="mb-2">{notice}</InlineAlert>}
         {!rows ? (
           <div className="py-16 text-center text-sm text-text-muted">{t("usage.loading")}</div>
         ) : rows.length === 0 ? (
@@ -338,14 +369,24 @@ export function UsagePage() {
                     <td className="px-4 py-2">
                       <Badge variant="neutral">{t(`nav.${r.categoryId}`)}</Badge>
                     </td>
-                    <td className="max-w-[180px] truncate px-4 py-2 text-xs text-text-secondary">
-                      {r.keyName || r.keyId || t("usage.systemLevel")}
-                      {r.keyDeleted && (
-                        <span className="ml-1 text-text-muted">{t("usage.keyDeletedTag")}</span>
-                      )}
-                      {r.overBudget && (
-                        <span className="ml-1 font-medium text-danger">{t("usage.overBudget")}</span>
-                      )}
+                    <td className="max-w-[240px] px-4 py-2 text-xs text-text-secondary">
+                      <div className="flex items-center gap-1">
+                        <span className="min-w-0 truncate">{r.keyName || r.keyId || t("usage.systemLevel")}</span>
+                        {r.keyDeleted && <span className="shrink-0 text-text-muted">{t("usage.keyDeletedTag")}</span>}
+                        {r.overBudget && (
+                          <span className="shrink-0 font-medium text-danger">{t("usage.overBudget")}</span>
+                        )}
+                        {/* 只给已离开配置的 Key：用删除按钮删的 Key 会自动连用量一起删，不会出现在这里。 */}
+                        {r.keyDeleted && r.keyId && (
+                          <PurgeControl
+                            confirming={confirmingPurge === r.keyId}
+                            onAsk={() => setConfirmingPurge(r.keyId)}
+                            onCancel={() => setConfirmingPurge(null)}
+                            onConfirm={() => void purge(r.keyId)}
+                            t={t}
+                          />
+                        )}
+                      </div>
                     </td>
                     <td className="px-4 py-2 text-right font-mono tabular-nums">{fmt(r.usage.input)}</td>
                     <td className="px-4 py-2 text-right font-mono tabular-nums">{fmt(r.usage.output)}</td>
@@ -361,7 +402,7 @@ export function UsagePage() {
                       )}
                     </td>
                     <td className="px-4 py-2 text-right font-mono tabular-nums">
-                      <CostCell row={r} t={t} tableDate={tableDate} />
+                      <CostCell row={r} t={t} pricing={pricing} />
                     </td>
                   </tr>
                 ))}
@@ -387,6 +428,7 @@ function StatCard({
   format,
   hint,
   accent,
+  sub,
   note,
 }: {
   label: string;
@@ -395,6 +437,8 @@ function StatCard({
   format: (n: number) => string;
   hint?: string;
   accent?: boolean;
+  /** 数字下方的灰色副行（花费卡片用它显示 token 数）。 */
+  sub?: string;
   note?: string;
 }) {
   const body = (
@@ -413,6 +457,7 @@ function StatCard({
       >
         <AnimatedNumber value={value} format={format} />
       </div>
+      {sub && <div className="mt-0.5 font-mono text-[11px] tabular-nums text-text-muted">{sub}</div>}
       {note && <div className="mt-0.5 text-[10px] leading-tight text-warning">{note}</div>}
     </div>
   );
@@ -434,7 +479,7 @@ function StatCard({
  * 「—」是可聚焦元素（`tabIndex` + `aria-label`）：它此前是纯 `<span>` 靠 hover 出 tooltip，
  * 键盘与触屏用户完全拿不到那句解释 —— 而这一格恰恰是最需要解释的一格。
  */
-function CostCell({ row, t, tableDate }: { row: UsageCostRow; t: TFunc; tableDate: string }) {
+function CostCell({ row, t, pricing }: { row: UsageCostRow; t: TFunc; pricing: PricingStatus | null }) {
   // 还没捕获过 usage：显示「尚无用量」而不是 $0.0000。
   //
   // 🔴 后者读起来是「已经在服务、而且免费」，而真相是我们一次上游回报都没收到
@@ -456,7 +501,7 @@ function CostCell({ row, t, tableDate }: { row: UsageCostRow; t: TFunc; tableDat
     );
   }
   if (row.costNano == null) {
-    const hint = unpricedHint(row.unpricedReason, t, tableDate);
+    const hint = unpricedHint(row.unpricedReason, t, pricing);
     return (
       <Tooltip content={hint} side="left">
         <span
@@ -471,19 +516,29 @@ function CostCell({ row, t, tableDate }: { row: UsageCostRow; t: TFunc; tableDat
     );
   }
   const isEstimate = row.pricingSource === "family";
-  const base = t(isEstimate ? "usage.costFamilyHint" : "usage.costExactHint", {
-    multiplier: row.multiplier,
-  });
-  // 回显代表模型：同一条 Key 跑多个档位模型时，偏差恰恰来自「按哪个模型估的」，
-  // 不显示它用户就无从判断这个数字可信到什么程度。
-  const hint = row.pricedByModel
-    ? `${base}\n${t("usage.pricedBy", { model: row.pricedByModel })}`
-    : base;
+  // 金额与成因同时存在 = 只算出了一部分（按模型估价之后才有的形态）。
+  const partial = !!row.unpricedReason;
+  const parts = (row.breakdown ?? []).filter((p) => p && isValidUsage(p.usage));
+  // tooltip 逐行渲染（Tooltip 不保留 `\n`）：精度说明 → 主要按谁估 → 逐模型拆分 → 部分未计入的成因。
+  const lines = [
+    t(isEstimate ? "usage.costFamilyHint" : "usage.costExactHint", { multiplier: row.multiplier }),
+    ...(row.pricedByModel ? [t("usage.pricedBy", { model: row.pricedByModel })] : []),
+    ...(parts.length > 1 || parts.some((p) => !p.model)
+      ? [t("usage.breakdownTitle"), ...parts.map((p) => `· ${fmtPart(p, t)}`)]
+      : []),
+    ...(partial ? [t("usage.partialHint"), unpricedHint(row.unpricedReason, t, pricing)] : []),
+  ];
   return (
-    <Tooltip content={hint} side="left">
-      <span className={`cursor-default ${row.overBudget ? "font-medium text-danger" : ""}`}>
+    <Tooltip content={<div className="space-y-0.5">{lines.map((l, i) => <div key={i}>{l}</div>)}</div>} side="left">
+      <span
+        tabIndex={0}
+        role="note"
+        aria-label={lines.join(" ")}
+        className={`cursor-default rounded outline-none focus-visible:ring-1 focus-visible:ring-primary ${row.overBudget ? "font-medium text-danger" : ""}`}
+      >
         {fmtUsd(row.costNano)}
         {isEstimate && <span className="ml-0.5 text-warning">≈</span>}
+        {partial && <span className="ml-0.5 text-warning">{t("usage.partialMark")}</span>}
         {/* 设了预算就并排显示「已花 / $预算」，让进度一眼可见；超了整串标红。 */}
         {row.budgetUsd != null && (
           <span className="ml-0.5 text-text-muted">{` / $${row.budgetUsd}`}</span>
@@ -499,14 +554,14 @@ function CostCell({ row, t, tableDate }: { row: UsageCostRow; t: TFunc; tableDat
  * 四种成因各自不同的**可行动性**是分开写的全部理由（见 `usage_cost::UnpricedReason` 的
  * 那张表）：其中两种用户压根无路可走，硬塞一句「去设兜底模型」是把他送去做无效操作。
  */
-function unpricedHint(reason: UnpricedReason | undefined, t: TFunc, tableDate: string): string {
+function unpricedHint(reason: UnpricedReason | undefined, t: TFunc, pricing: PricingStatus | null): string {
   switch (reason?.kind) {
     case "aggregate":
       return t("usage.reason.aggregate");
     case "keyDeleted":
       return t("usage.reason.keyDeleted");
     case "modelNotInTable":
-      return t("usage.reason.modelNotInTable", { model: reason.model, date: tableDate });
+      return t("usage.reason.modelNotInTable", { model: reason.model, tables: tablesChecked(pricing, t) });
     case "noModelName":
       return t("usage.reason.noModelName");
     default:
@@ -514,6 +569,52 @@ function unpricedHint(reason: UnpricedReason | undefined, t: TFunc, tableDate: s
       // 不留这一支的话这里会渲染出空 tooltip，比说得笼统更糟。
       return t("usage.costUnknownHint");
   }
+}
+
+/**
+ * 「不在单价表里」那句话的括注：查过哪几张表。
+ *
+ * 🔴 在线表还没拉到时**不能**说「在线表也没有」—— 那张表压根没查过，这么写会让用户以为
+ * 等也没用，而它可能下一轮拉到就有了。
+ */
+function tablesChecked(pricing: PricingStatus | null, t: TFunc): string {
+  const date = pricing?.builtinDate ?? "";
+  return pricing && pricing.onlineRows > 0
+    ? t("usage.reason.tablesBoth", { date, n: pricing.onlineRows })
+    : t("usage.reason.tablesBuiltinOnly", { date });
+}
+
+/**
+ * 表头那一行：内置表核对日期 · 在线表状态。说明与失败原因放在 tooltip 里（可聚焦）——
+ * 镜像的报错可能有几百字，挤进表头会把整页往下推。
+ */
+function PricingLine({ status, t }: { status: PricingStatus; t: TFunc }) {
+  const when = status.onlineFetchedAtMs != null ? new Date(status.onlineFetchedAtMs).toLocaleString() : "";
+  const online =
+    status.onlineRows > 0
+      ? t(status.onlineError ? "usage.priceOnlineStale" : "usage.priceOnline", { n: status.onlineRows, time: when })
+      : t(status.onlineError ? "usage.priceOnlineFailed" : "usage.priceOnlinePending");
+  const text = `${t("usage.priceBuiltin", { date: status.builtinDate })} · ${online}`;
+  const hint = [t("usage.priceHint"), ...(status.onlineError ? [t("usage.priceErrorHint", { error: status.onlineError })] : [])];
+  return (
+    <Tooltip content={<div className="space-y-1">{hint.map((l, i) => <div key={i}>{l}</div>)}</div>} side="bottom">
+      <p
+        tabIndex={0}
+        role="note"
+        aria-label={`${text}. ${hint.join(" ")}`}
+        className="mt-0.5 cursor-default rounded outline-none focus-visible:ring-1 focus-visible:ring-primary"
+      >
+        {text}
+      </p>
+    </Tooltip>
+  );
+}
+
+/** 单价表现状的形状校验（同 `isValidCostRow`：脏数据不进 state）。 */
+function isValidPricingStatus(s: unknown): s is PricingStatus {
+  if (!s || typeof s !== "object") return false;
+  const o = s as Record<string, unknown>;
+  return typeof o.builtinDate === "string" && typeof o.onlineRows === "number" && Number.isFinite(o.onlineRows);
 }
 
 /** 紧凑 token 数字：≥10000 用 k，≥1000000 用 M（与日志页 fmtTokens 同口径）。 */
@@ -559,9 +660,62 @@ function isValidCostRow(r: unknown): r is UsageCostRow {
   return typeof o.keyId === "string" && typeof o.categoryId === "string" && isValidUsage(o.usage);
 }
 
-/** 一个日桶是否可安全聚合（date 是字符串、entries 是数组）。 */
-function isValidBucket(b: unknown): b is DailyUsageBucket {
-  if (!b || typeof b !== "object") return false;
-  const o = b as Record<string, unknown>;
-  return typeof o.date === "string" && Array.isArray(o.entries);
+/** 一天的花费是否可安全聚合（date 是字符串、三个数都是有限数字）。 */
+function isValidDailyCost(d: unknown): d is DailyCost {
+  if (!d || typeof d !== "object") return false;
+  const o = d as Record<string, unknown>;
+  const num = (v: unknown) => typeof v === "number" && Number.isFinite(v);
+  return typeof o.date === "string" && num(o.costNano) && num(o.tokens) && num(o.unpricedTokens);
+}
+
+/** 「按模型拆分」里的一行：`模型 · 1.2M token · $0.1234`（历史格说明它是按谁估的）。 */
+function fmtPart(p: UsagePartCost, t: TFunc): string {
+  const u = p.usage;
+  const tokens = u.input + u.output + (u.cacheRead ?? 0) + (u.cacheCreation ?? 0);
+  const name = p.model
+    ? p.model
+    : p.pricedAs
+      ? t("usage.breakdownLegacy", { model: p.pricedAs })
+      : t("usage.breakdownLegacyUnknown");
+  const cost = p.costNano != null ? fmtUsd(p.costNano) : t("usage.breakdownUnpriced");
+  return `${name} · ${fmt(tokens)} token · ${cost}`;
+}
+
+/**
+ * 已离开配置的 Key 的「清理」按钮。两步确认，同 Key 卡片的删除：这是本页唯一不可逆的动作。
+ * 判据（只给 `keyDeleted` 的行）在调用处；后端也会拒绝清理仍在用的 Key。
+ */
+function PurgeControl({
+  confirming,
+  onAsk,
+  onCancel,
+  onConfirm,
+  t,
+}: {
+  confirming: boolean;
+  onAsk: () => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+  t: TFunc;
+}) {
+  const btn = "shrink-0 rounded px-1 text-[11px] outline-none focus-visible:ring-1 focus-visible:ring-primary";
+  if (!confirming) {
+    return (
+      <Tooltip content={t("usage.purgeHint")} side="top">
+        <button type="button" aria-label={t("usage.purgeHint")} className={`${btn} text-text-muted underline hover:text-danger`} onClick={onAsk}>
+          {t("usage.purge")}
+        </button>
+      </Tooltip>
+    );
+  }
+  return (
+    <>
+      <button type="button" className={`${btn} font-medium text-danger underline`} onClick={onConfirm}>
+        {t("usage.purgeConfirm")}
+      </button>
+      <button type="button" className={`${btn} text-text-muted underline`} onClick={onCancel}>
+        {t("common.cancel")}
+      </button>
+    </>
+  );
 }

@@ -24,32 +24,32 @@ fn parse_usage_object(u: &Value) -> Option<TokenUsage> {
             .unwrap_or(0)
     };
     let anthropic_cache_read = u.get("cache_read_input_tokens").and_then(|v| v.as_u64());
-    let chat_cache_read = u
-        .get("prompt_tokens_details")
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(|v| v.as_u64());
-    let responses_cache_read = u
-        .get("input_tokens_details")
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(|v| v.as_u64());
-    let cache_read = anthropic_cache_read
-        .or(chat_cache_read)
-        .or(responses_cache_read)
-        .unwrap_or(0);
-    // Anthropic 的 input_tokens 不含缓存；OpenAI Chat/Responses 的输入总量包含缓存。
+    // OpenAI 的缓存明细：Chat 在 `prompt_tokens_details`，Responses 在 `input_tokens_details`。
+    let detail = |field: &str| {
+        ["prompt_tokens_details", "input_tokens_details"]
+            .iter()
+            .find_map(|d| u.get(*d).and_then(|o| o.get(field)).and_then(|v| v.as_u64()))
+    };
+    let openai_cache_read = detail("cached_tokens");
+    // 🔴 `cache_write_tokens`（GPT-5.6 起，官方 prompt-caching 指南）是 `input_tokens` 的**子集**，
+    // 按 1.25× 计费。不读它的话这部分按普通输入价算 —— 每次写缓存都静默少算 20%。
+    // 官方文档只写了 Responses 那个位置；Chat 的同名字段按对称处理（字段不存在时读到 None，无害）。
+    let openai_cache_write = detail("cache_write_tokens");
+    let cache_read = anthropic_cache_read.or(openai_cache_read).unwrap_or(0);
+    let cache_write_subset = openai_cache_write.unwrap_or(0);
+    // Anthropic 的 input_tokens 不含缓存；OpenAI Chat/Responses 的输入总量**包含**缓存读与缓存写，
+    // 两者都要从里面减掉，否则同一批 token 被按两种单价各算一次。
+    let openai_shape =
+        anthropic_cache_read.is_none() && (openai_cache_read.is_some() || openai_cache_write.is_some());
     let input = match u.get("input_tokens").and_then(|v| v.as_u64()) {
-        Some(total)
-            if anthropic_cache_read.is_none()
-                && (chat_cache_read.is_some() || responses_cache_read.is_some()) =>
-        {
-            total.saturating_sub(cache_read)
-        }
+        Some(total) if openai_shape => total.saturating_sub(cache_read).saturating_sub(cache_write_subset),
         Some(input) => input,
         None => u
             .get("prompt_tokens")
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
-            .saturating_sub(cache_read),
+            .saturating_sub(cache_read)
+            .saturating_sub(cache_write_subset),
     };
     let usage = TokenUsage {
         input,
@@ -58,6 +58,7 @@ fn parse_usage_object(u: &Value) -> Option<TokenUsage> {
         cache_creation: u
             .get("cache_creation_input_tokens")
             .and_then(|v| v.as_u64())
+            .or(openai_cache_write)
             .unwrap_or(0),
     };
     (!usage.is_empty()).then_some(usage)
@@ -420,6 +421,43 @@ data: [DONE]\n";
         });
         let u = extract_usage(&wrapped).expect("空候选后仍应继续尝试 response.usage");
         assert_eq!((u.input, u.output), (12, 3));
+    }
+
+    /// 🔴 OpenAI 的缓存**写入**（GPT-5.6 起）：`cache_write_tokens` 是 `input_tokens` 的子集，
+    /// 按 1.25× 单独计价。必须归进 `cache_creation` 并从 input 里减掉 ——
+    /// 只做前一半会让这批 token 被按输入价与写入价**各算一次**。
+    ///
+    /// 故障注入判据：去掉 input 那一步的 `.saturating_sub(cache_write_subset)` → 不变式那条变红。
+    #[test]
+    fn openai_cache_write_tokens_are_split_out_of_input() {
+        let body = serde_json::json!({
+            "type": "response.completed",
+            "response": { "usage": {
+                "input_tokens": 10_000,
+                "output_tokens": 300,
+                "input_tokens_details": { "cached_tokens": 6_000, "cache_write_tokens": 3_000 }
+            }}
+        });
+        let u = extract_usage(&body).expect("Responses usage 应能取到");
+        assert_eq!((u.input, u.cache_read, u.cache_creation, u.output), (1_000, 6_000, 3_000, 300));
+        // 不变式：三段加回去必须等于上游给的 input_tokens（同一批 token 只算一次）。
+        assert_eq!(u.input + u.cache_read + u.cache_creation, 10_000);
+
+        // 只有写、没有读（首轮写缓存的常态）也必须拆出来 —— 判据不能只认 cached_tokens。
+        let first = serde_json::json!({ "usage": {
+            "input_tokens": 5_000, "output_tokens": 10,
+            "input_tokens_details": { "cache_write_tokens": 4_000 }
+        }});
+        let u = extract_usage(&first).unwrap();
+        assert_eq!((u.input, u.cache_read, u.cache_creation), (1_000, 0, 4_000));
+
+        // Anthropic 形态不受影响：它的 input 本就不含缓存，cache_creation 照旧取原字段。
+        let a = serde_json::json!({ "usage": {
+            "input_tokens": 50, "output_tokens": 5,
+            "cache_read_input_tokens": 900, "cache_creation_input_tokens": 120
+        }});
+        let u = extract_usage(&a).unwrap();
+        assert_eq!((u.input, u.cache_read, u.cache_creation), (50, 900, 120));
     }
 
     #[test]

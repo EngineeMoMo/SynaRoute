@@ -220,6 +220,8 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
     if let Some(line) = crate::tools::codex::codex_sessions::ops::diagnostics_line() {
         let _ = writeln!(r, "- {line}");
     }
+    // 用量页的金额与账单对不上时，「当时用的是哪张单价表、多旧、在线表拉成功没有」是第一个问题。
+    let _ = writeln!(r, "- 单价表：{}", crate::pricing::online::status_line());
     let _ = writeln!(r);
 
     // 客户端环境变量冲突。**必须进报告**：这一类的失效形态是「接入提示说成功、请求一个都

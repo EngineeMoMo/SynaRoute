@@ -453,6 +453,8 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, onDuplicate, isF
           )}
           {confirmingDelete ? (
             <div className="flex items-center gap-1">
+              {/* 2026-10-12 起删 Key 会连用量记录一起删（不可逆）—— 确认这一步必须说出来。 */}
+              <span className="text-[11px] text-warning">{t("usage.deleteKeyNote")}</span>
               <Button
                 size="sm"
                 variant="danger"

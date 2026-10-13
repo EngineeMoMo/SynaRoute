@@ -33,7 +33,9 @@ const pass = (msg) => console.log(`✅ ${msg}`);
     /(^|\/)secrets\.enc$/.test(f) ||
     // `usage.json` / `usage-keys.json` 是用量运行数据（后者含用户给厂商起的名字、
     // 代表模型与计费倍率）。不含密钥，但同属「开发机的数据不该进包」那一类。
+    // `pricing-online.json` 是在线单价表的本机缓存（公开数据），理由同上：运行时生成的东西不进仓库。
     /(^|\/)usage(-keys)?\.json$/.test(f) ||
+    /(^|\/)pricing-online\.json$/.test(f) ||
     /(^|\/)logs\//.test(f) ||
     /(^|\/)latest\.json$/.test(f) ||
     (/\.key$|\.pem$/.test(f) && !f.endsWith(".gpg")),

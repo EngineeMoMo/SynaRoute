@@ -231,21 +231,34 @@ impl SseTranslator {
         }
     }
 
+    /// OpenAI 系上游的用量：Chat 的 `prompt/completion_tokens` 或 Responses 的 `input/output_tokens`，
+    /// 加缓存读与缓存写（`*_tokens_details.cached_tokens` / `cache_write_tokens`，后者 GPT-5.6 起；
+    /// 两者都是**输入总数的子集**，见 [`Self::accumulated_usage`]）。四个 OpenAI 上游方向共用这一处 ——
+    /// 此前 Chat→Responses 与 Responses→Chat **一处都没存**，`accumulated_usage` 恒为 None，
+    /// 那两条路的流式请求一个 token 都不入账（Codex 接 Chat 中转正是 Chat→Responses，主场景）。
+    fn capture_openai_usage(&mut self, u: &Value) {
+        let tok = |a: &str, b: &str| u.get(a).or_else(|| u.get(b)).and_then(|t| t.as_u64());
+        let detail = |f: &str| ["prompt_tokens_details", "input_tokens_details"].iter().find_map(|d| u.get(*d)?.get(f)?.as_u64());
+        if let Some(i) = tok("prompt_tokens", "input_tokens") { self.input_tokens = i; }
+        if let Some(o) = tok("completion_tokens", "output_tokens") { self.output_tokens = o; }
+        if let Some(cr) = detail("cached_tokens") { self.cache_read = cr; }
+        if let Some(cw) = detail("cache_write_tokens") { self.cache_creation = cw; }
+    }
+
     /// 给**跨协议流式的用量采集**用。同协议直通走「尾窗缓存 + 事后 `extract_usage_from_sse`」；
     /// 跨协议不能照搬（尾窗里是已转换的下游格式），而翻译器本来就得读懂上游 usage 才能翻译，
     /// 直接问它最准。判 0 而非「见过 usage 事件」：token 为 0 的成功请求实际不存在。
+    ///
+    /// 🔴 OpenAI 上游的输入总数**含**缓存读/写（Anthropic 的不含），记账前必须减掉 —— 否则缓存部分
+    /// 先按全价、再按缓存价各算一次（同协议那条路的 `upstream::usage::parse_usage_object` 一直是减的）。
     pub fn accumulated_usage(&self) -> Option<crate::model::TokenUsage> {
         if self.input_tokens == 0 && self.output_tokens == 0 {
             return None;
         }
-        Some(crate::model::TokenUsage {
-            input: self.input_tokens,
-            output: self.output_tokens,
-            // A10-2：各方向在写入点已按各自协议的字段名捕获缓存读/写（见 `capture_anthropic_cache`
-            // 与 Chat/Responses 的 `cached_tokens` 捕获）；不带出来的话跨协议流末记账恒为 0。
-            cache_read: self.cache_read,
-            cache_creation: self.cache_creation,
-        })
+        let openai_up = !matches!(self.dir, SseDirection::AnthropicToChat | SseDirection::AnthropicToResponses);
+        let cached = if openai_up { self.cache_read.saturating_add(self.cache_creation) } else { 0 };
+        let (cache_read, cache_creation) = (self.cache_read, self.cache_creation);
+        Some(crate::model::TokenUsage { input: self.input_tokens.saturating_sub(cached), output: self.output_tokens, cache_read, cache_creation })
     }
 
     /// 流结束时冲刷收尾事件（Responses 需要 response.completed；Chat 需 [DONE]）。
@@ -361,9 +374,10 @@ impl SseTranslator {
             // assistant 回复持久化进会话；此前只发 delta（实时流），重开对话文本回复全丢。
             out.push_str(&self.emit_text_item_done());
         }
-        // usage 单独出现（无 choices 或 choices 空）时，触发 completed
-        if chunk.get("usage").is_some() && chunk.get("usage") != Some(&Value::Null) {
-            out.push_str(&self.emit_responses_completed(chunk.get("usage")));
+        // usage 单独出现（无 choices 或 choices 空）时，触发 completed；同时入账（见 capture_openai_usage）。
+        if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
+            self.capture_openai_usage(u);
+            out.push_str(&self.emit_responses_completed(Some(u)));
         }
         out
     }
@@ -533,7 +547,8 @@ impl SseTranslator {
                 })));
                 // usage 收尾 chunk（此前这条方向从不发 usage → 与其它四个方向的能力漂移，已修）。
                 // Chat 约定：末 chunk 带 `usage`、`choices` 为空数组（include_usage 形状）。
-                // 取 Responses 事件里的 usage，取不到时回退到流中累积的字段值。
+                // 取 Responses 事件里的 usage，取不到时回退到流中累积的字段值；同时入账。
+                if let Some(u) = ev.get("response").and_then(|r| r.get("usage")) { self.capture_openai_usage(u); }
                 let (it, ot) = ev
                     .get("response")
                     .and_then(|r| r.get("usage"))
@@ -679,18 +694,7 @@ impl SseTranslator {
         }
         // usage（Chat 末尾 chunk，需 stream_options）→ 收尾时由 message_delta 带给 Anthropic 下游。
         if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
-            if let Some(pt) = u.get("prompt_tokens").and_then(|t| t.as_u64()) {
-                self.input_tokens = pt;
-            }
-            if let Some(ct) = u.get("completion_tokens").and_then(|t| t.as_u64()) {
-                self.output_tokens = ct;
-            }
-            // A10-2：OpenAI Chat 的缓存读在 `prompt_tokens_details.cached_tokens`（无缓存写概念）。
-            if let Some(cr) =
-                u.pointer("/prompt_tokens_details/cached_tokens").and_then(|t| t.as_u64())
-            {
-                self.cache_read = cr;
-            }
+            self.capture_openai_usage(u);
         }
         out
     }
@@ -1087,18 +1091,7 @@ impl SseTranslator {
                 }
                 // usage 归位：Responses 的 usage 在 completed 里，Anthropic 由 message_delta 承载。
                 if let Some(u) = ev.get("response").and_then(|r| r.get("usage")) {
-                    if let Some(it) = u.get("input_tokens").and_then(|t| t.as_u64()) {
-                        self.input_tokens = it;
-                    }
-                    if let Some(ot) = u.get("output_tokens").and_then(|t| t.as_u64()) {
-                        self.output_tokens = ot;
-                    }
-                    // A10-2：Responses 的缓存读在 `input_tokens_details.cached_tokens`（无写概念）。
-                    if let Some(cr) =
-                        u.pointer("/input_tokens_details/cached_tokens").and_then(|t| t.as_u64())
-                    {
-                        self.cache_read = cr;
-                    }
+                    self.capture_openai_usage(u);
                 }
                 // 兜底：部分上游只在 completed.output[] 里给工具调用，不发独立 output_item.done
                 // （或事件被中间层裁剪）。这里补扫一遍，靠 anthropic_tool_seen 去重。
@@ -2251,6 +2244,34 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
             u.cache_read, 145200,
             "🔴 A10-2：message_start 的 cache_read_input_tokens 必须带出，否则缓存命中被记成 0"
         );
+    }
+
+    /// 🔴 OpenAI 上游的四个方向：用量必须入账，且输入**不含**缓存部分。
+    ///
+    /// 两条缺陷一起钉：① Chat→Responses / Responses→Chat 此前把 usage 读进局部变量就丢了，
+    /// `accumulated_usage` 恒为 None —— 流式请求一个 token 都不入账（Codex 接 Chat 中转 = 主场景）；
+    /// ② 另两个方向入了账，但 OpenAI 的输入总数含缓存，而缓存又单独计价 → 缓存部分算两遍。
+    /// Anthropic 上游不受影响（它的 input_tokens 本来就不含缓存），上面那条长流用例钉着那一半。
+    #[test]
+    fn openai_upstream_usage_is_recorded_with_cache_split_out_of_input() {
+        let chat = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10000,\"completion_tokens\":300,\"prompt_tokens_details\":{\"cached_tokens\":6000}}}\n\n";
+        let resp = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10000,\"output_tokens\":300,\"input_tokens_details\":{\"cached_tokens\":6000,\"cache_write_tokens\":3000}}}}\n\n";
+        for (dir, feed, write) in [
+            (SseDirection::ChatToResponses, &chat[..], 0),
+            (SseDirection::ChatToAnthropic, &chat[..], 0),
+            (SseDirection::ResponsesToChat, &resp[..], 3000),
+            (SseDirection::ResponsesToAnthropic, &resp[..], 3000),
+        ] {
+            let mut tr = SseTranslator::new(dir);
+            tr.push(feed);
+            tr.finish();
+            let u = tr.accumulated_usage().unwrap_or_else(|| panic!("{dir:?}：用量必须入账"));
+            assert_eq!(
+                (u.input, u.output, u.cache_read, u.cache_creation),
+                (10000 - 6000 - write, 300, 6000, write),
+                "{dir:?}：输入要减掉缓存读/写（它们另行计价）"
+            );
+        }
     }
 
     #[test]

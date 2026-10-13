@@ -580,8 +580,7 @@ async fn handle_request_inner(
             was_truncated,
             usage.as_ref(),
         );
-        // 成功但换了模型时另落一条 warning（理由见该函数文档）。排在 `trace` 之前：那里会
-        // move 掉 `real_model`，放后面就得多一次 clone。
+        // 成功但换了模型时另落一条 warning（理由见该函数文档）。
         model_pool::note_silent_downgrade(store, category, &requested_model, key, &real_model);
         // 链路快照只在「调用模型日志」开关开启时产生（正文各受 REQ_LOG_CAP 约束）。
         let trace = req_log.then(|| RequestTrace {
@@ -591,7 +590,7 @@ async fn handle_request_inner(
             protocol: key.protocol,
             url: crate::diagnostics::mask_url_credentials(&url),
             requested_model: requested_model.clone(),
-            real_model,
+            real_model: real_model.clone(),
             request_body: cap(&request_body),
             response_body: cap(&response_body),
             status: Some(status),
@@ -599,15 +598,9 @@ async fn handle_request_inner(
             ok: true,
             was_truncated,
         });
-        store.append_event_full(
-            category,
-            "route",
-            Some(&key.id),
-            &detail,
-            trace,
-            Some(format!("ok:{}:{}:{}", key.id, requested_model, streaming)),
-            usage,
-        );
+        // 带真实模型名记账：同一条 Key 跑多个模型时每个按自己的单价算（见 usage_ledger 模块头）。
+        let collapse = Some(format!("ok:{}:{}:{}", key.id, requested_model, streaming));
+        store.append_event_model(category, "route", Some(&key.id), &detail, trace, collapse, usage, &real_model);
     };
 
     // 失败的单次尝试（开关开启时记，含链路快照供排障）。与成功路径分开：失败信息（状态码、
@@ -1682,12 +1675,7 @@ async fn try_stream_to_key(
                     // 再 append 一条同 collapse key 的事件会被折叠逻辑当成「又发生了一次」：
                     // repeat 变 2（一次请求显示成 ×2）、detail 被覆盖（延迟数字丢失）。
                     let collapse = format!("ok:{}:{}:{}", key_id2, req_model2, true);
-                    store2.backfill_usage_for_collapsed_event(
-                        category2,
-                        Some(&key_id2),
-                        &collapse,
-                        u,
-                    );
+                    store2.backfill_usage_for_collapsed_event(category2, Some(&key_id2), &collapse, u, &real_model2);
                 }
             });
             BodyExt::boxed(StreamBody::new(byte_stream))
@@ -1783,12 +1771,8 @@ async fn try_stream_to_key(
                     // 不新追加事件：同 collapse key 再 append 会被折叠成「又发生了一次」
                     // （repeat 变 2、detail 被覆盖）。理由同同协议分支。
                     let collapse = format!("ok:{}:{}:{}", self.key_id, self.req_model, true);
-                    self.store.backfill_usage_for_collapsed_event(
-                        self.category,
-                        Some(&self.key_id),
-                        &collapse,
-                        u,
-                    );
+                    let (store, cat) = (&self.store, self.category);
+                    store.backfill_usage_for_collapsed_event(cat, Some(&self.key_id), &collapse, u, &self.real_model);
                 }
             }
 
