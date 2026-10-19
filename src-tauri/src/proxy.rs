@@ -28,6 +28,7 @@ use tokio::task::JoinHandle;
 #[path = "model_choice.rs"] mod model_choice; // 客户端发的名字 vs 应用内选的；来由见该文件模块注释
 #[path = "model_pool.rs"] pub(crate) mod model_pool; // 对外模型并集 + 模型感知路由；来由见该文件模块注释
 #[path = "proxy/soft_error.rs"] mod soft_error; // 非流式「200 包着错误」的降级；调用**必须**排在 outcome.ok 守卫之前（有判据钉着），来由见该文件模块注释
+#[path = "proxy/codex_images.rs"] mod codex_images;
 // 对外可选模型集的**唯一**实现。re-export 而不是留一层包装函数：包装函数会让
 // 「proxy.rs 生产段里不许有第二份并集实现」那条源码级判据失去意义。
 pub(crate) use model_pool::discoverable_models;
@@ -1570,7 +1571,6 @@ async fn try_stream_to_key(
         .map(|s| s.to_string());
 
     let body: ResBody = match sse_dir {
-        // 同协议：reqwest 字节流 → hyper StreamBody，逐块原样透传。
         // 同时用滑动窗口保留尾部字节，流结束后从尾部 SSE chunk 提取 token 用量——
         // 不缓存全文、不牺牲首字节延迟。提取失败（上游没给 usage）时静默忽略。
         None => {
@@ -1614,7 +1614,7 @@ async fn try_stream_to_key(
             // 不再自己拼 detail —— detail 由流开始时那条同步日志负责，补记只往里补用量。
             let req_model2 = requested_model.to_string();
 
-            let byte_stream = crate::upstream::guard_stream_idle(resp.bytes_stream(), permit).map(move |chunk| {
+            let byte_stream = codex_images::stream(crate::upstream::guard_stream_idle(resp.bytes_stream(), permit), category, downstream, &content_type, upstream_content_encoding.as_deref(), store).map(move |chunk| {
                 // 闭包持有守卫；闭包被 drop → 守卫 Drop → 通知补记任务。
                 let _ = &end_guard;
                 match chunk {
