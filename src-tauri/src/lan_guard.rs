@@ -121,7 +121,7 @@ pub(crate) fn verdict(peer: &SocketAddr, presented: Option<&str>, expected: Opti
 /// 反过来**绝不能**把整个 `::ffff:0:0/96` 段当本机：那里面 `::ffff:192.168.1.5`
 /// 是真实的局域网地址，当成本机就是把鉴权整个绕过去。故只归一、再判 loopback，
 /// 判定权仍在 `is_loopback()` 手里。
-fn is_loopback_peer(ip: &std::net::IpAddr) -> bool {
+pub(crate) fn is_loopback_peer(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_loopback(),
         std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {

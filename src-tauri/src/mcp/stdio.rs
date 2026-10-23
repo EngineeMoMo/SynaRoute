@@ -602,7 +602,9 @@ async fn forward_tool_call_to_main(
         "params": params,
     });
     // 聚合可能耗时较久（多模型并行 + 决策者），给足超时。
+    // 目标恒为本机主应用：系统代理（尤其远端代理）连不到我们这台机器的 127.0.0.1。
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(std::time::Duration::from_secs(FORWARD_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("构造 HTTP 客户端失败: {e}"))?;
@@ -662,6 +664,7 @@ async fn probe_mcp_alive(port: u16) -> bool {
         "params": { "protocolVersion": super::PROTOCOL_VERSION }
     });
     let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
         .timeout(std::time::Duration::from_secs(3))
         .build()
     else {
@@ -936,6 +939,17 @@ mod tests {
     /// `ProgressNotificationParam`（serde 结构，说明它**解析得了**）与 `progressToken`
     /// 字段，但「解析得了」不等于「会显示」（同本仓那次教训：静态取证只能提出假设，
     /// 不能下结论）。答案会在用户下一次真实调用时自动落进 `mcp-stdio.log` 的那行取证里。
+    /// Both clients here only ever reach the main app on this machine's 127.0.0.1. Through the system
+    /// proxy that worked only when the proxy itself ran locally (Clash); a remote proxy connects to
+    /// its own loopback and every tool call fails. Each builder must therefore start with no_proxy.
+    #[test]
+    fn the_hop_to_the_main_app_never_uses_the_system_proxy() {
+        let src = crate::proxy::custom_headers::production_code_only(include_str!("stdio.rs"));
+        let prod = &src[..src.find("mod tests").unwrap_or(src.len())];
+        let builders = prod.matches("reqwest::Client::builder()").count();
+        assert_eq!(builders, 2, "a new client here needs the same rule");
+        assert_eq!(prod.matches("reqwest::Client::builder()\n        .no_proxy()").count(), builders);
+    }
     #[test]
     fn the_progress_heartbeat_must_be_gated_and_logged_before_forwarding() {
         let src = crate::proxy::custom_headers::production_code_only(include_str!("stdio.rs"));

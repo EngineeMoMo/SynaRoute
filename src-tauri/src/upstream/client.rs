@@ -67,8 +67,8 @@ pub(super) fn truncate_body(raw: &str) -> String {
 
 /// 连接池 / 保活的公共基线（两个共享客户端共用，避免调参漂移）。
 ///
-/// 取值理由见 [`shared_client`]。**不含**任何解压设置——解压是否开启由各构造点决定：
-/// 转发路径要字节透明（[`shared_client`]），自建请求要能读明文（[`decoding_client`]）。
+/// 取值理由见 [`shared_client_for`]。**不含**任何解压设置——解压是否开启由各构造点决定：
+/// 转发路径要字节透明（[`shared_client_for`]），自建请求要能读明文（[`decoding_client_for`]）。
 fn base_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         // Redirects must not forward x-api-key or custom credentials to another endpoint.
@@ -104,10 +104,10 @@ fn base_builder() -> reqwest::ClientBuilder {
         // ⚠️ 必须显式关掉自动解压。reqwest 的 `Accepts::default()` 对**编译进的**
         // gzip/brotli/deflate feature 一律置 `true`（async_impl/client.rs），与是否调用
         // `.gzip(true)` **无关**——Cargo.toml 为余额/拉模型加了这三个 feature 后，若这里不显式
-        // 关闭，转发路径的 `shared_client()` 会被默认翻成「自动解压」：tower-http 还会顺带注入
+        // 关闭，转发路径的 `shared_client_for()` 会被默认翻成「自动解压」：tower-http 还会顺带注入
         // `Accept-Encoding: gzip,br,deflate`，正好抵消 proxy.rs 剥离 accept-encoding 的用意，
         // 且解压后删除 `content-encoding`/`content-length`、把 gzip 解码塞进 SSE 热路径——
-        // 破坏「字节透明转发」这条硬约束。故基线一律关；需要解压的 `decoding_client()` 再逐项开。
+        // 破坏「字节透明转发」这条硬约束。故基线一律关；需要解压的 `decoding_client_for()` 再逐项开。
         .gzip(false)
         .brotli(false)
         .deflate(false)
@@ -121,16 +121,26 @@ fn base_builder() -> reqwest::ClientBuilder {
 /// 响应体字节透明——代理把上游的 body 与 `content-encoding` 头原样转给下游客户端，由下游
 /// 自己解压。若在这里开 gzip/brotli，reqwest 会自动解压并删掉 `content-encoding`/
 /// `content-length`，导致「头说压缩、体已解压」的不一致，甚至扰乱 SSE 分块。
-/// 需要读明文 body 的**自建请求**（余额/拉模型/健康探测/聚合）用 [`decoding_client`]。
-pub fn shared_client() -> reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            base_builder()
-                .build()
-                .expect("构建共享 HTTP 客户端失败")
-        })
-        .clone()
+/// 需要读明文 body 的**自建请求**（余额/拉模型/健康探测/聚合）用 [`decoding_client_for`]。
+///
+/// **按目标地址选客户端**（见 [`bypasses_proxy`]）：本机与系统代理例外里的地址走直连，
+/// 其余走系统代理。故没有不带地址的版本 —— 那样的调用点一定会漏掉这一步。
+pub fn shared_client_for(url: &str) -> reqwest::Client {
+    shared_client_routed(bypasses_proxy(url))
+}
+fn shared_client_routed(direct: bool) -> reqwest::Client {
+    static CELLS: [std::sync::OnceLock<reqwest::Client>; 2] = [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    cached(&CELLS[usize::from(direct)], direct, base_builder)
+}
+/// 每个口味各缓存一个（直连 / 系统代理），共享连接池。`direct` 只决定 `.no_proxy()`，
+/// 其余设置一律来自 `make`，于是两个孪生客户端除了代理之外完全一致。
+fn cached(cell: &std::sync::OnceLock<reqwest::Client>, direct: bool, make: impl FnOnce() -> reqwest::ClientBuilder) -> reqwest::Client {
+    cell.get_or_init(|| {
+        let builder = make();
+        let builder = if direct { builder.no_proxy() } else { builder };
+        builder.build().expect("构建 HTTP 客户端失败")
+    })
+    .clone()
 }
 
 /// 带**自动解压**（gzip/brotli/deflate）的共享客户端，供本应用**自己解析响应体**的自建请求
@@ -142,21 +152,15 @@ pub fn shared_client() -> reqwest::Client {
 /// （实测「余额查询返回一堆乱码字节」正是此因）。reqwest 开启对应 feature + `.gzip(true)` 等
 /// 后：仅在请求头未含 `Accept-Encoding` 时自动补上，并**按响应的 `Content-Encoding`** 透明
 /// 解压、移除 `content-encoding`/`content-length`——故对「不问自压」的网关同样生效。
-/// 连接池参数与 [`shared_client`] 共用 [`base_builder`]，不丢保活。
+/// 连接池参数与 [`shared_client_for`] 共用 [`base_builder`]，不丢保活。
 ///
-/// 转发路径**绝不用它**（见 [`shared_client`] 的字节透明约束）。
-pub fn decoding_client() -> reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            base_builder()
-                .gzip(true)
-                .brotli(true)
-                .deflate(true)
-                .build()
-                .expect("构建解压 HTTP 客户端失败")
-        })
-        .clone()
+/// 转发路径**绝不用它**（见 [`shared_client_for`] 的字节透明约束）。
+pub fn decoding_client_for(url: &str) -> reqwest::Client {
+    decoding_client_routed(bypasses_proxy(url))
+}
+fn decoding_client_routed(direct: bool) -> reqwest::Client {
+    static CELLS: [std::sync::OnceLock<reqwest::Client>; 2] = [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    cached(&CELLS[usize::from(direct)], direct, || base_builder().gzip(true).brotli(true).deflate(true))
 }
 
 /// 某 Key 的单请求总超时（缺省 30s）。可在 Key 编辑器设置（timeoutMs），
@@ -183,7 +187,7 @@ pub fn fast_timeout(key: &ProviderKey) -> Duration {
 
 /// 自建请求（拉模型/健康探测/聚合成员/工具会话）用的客户端。
 ///
-/// 走 [`decoding_client`] 的连接池与解压设置，**并把客户端身份头装成默认头**
+/// 走 [`decoding_client_for`] 的连接池与解压设置，**并把客户端身份头装成默认头**
 /// （见 [`apply_client_identity`]）。
 ///
 /// ## 为什么身份头要装在这一层，而不是靠各调用点自觉
@@ -205,24 +209,105 @@ pub fn fast_timeout(key: &ProviderKey) -> Duration {
 /// `apply_client_identity` 保持不变（逐请求头覆盖同名默认头，值一样，无副作用），
 /// 它仍是「这个请求需要身份」这一意图的显式表达。
 pub(super) fn build_client(key: &ProviderKey) -> AppResult<reqwest::Client> {
-    Ok(identity_client(key.protocol))
+    // 这些自建请求都打在 Key 自己的 base_url 上，故按它选直连还是系统代理。
+    Ok(identity_client(key.protocol, bypasses_proxy(&key.base_url)))
 }
 
-/// 按协议带**默认身份头**的自建请求客户端（两种口味各缓存一个）。
-fn identity_client(protocol: Protocol) -> reqwest::Client {
-    static OPENAI: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    static ANTHROPIC: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let cell = if protocol.is_openai() { &OPENAI } else { &ANTHROPIC };
-    cell.get_or_init(|| {
-        base_builder()
-            .gzip(true)
-            .brotli(true)
-            .deflate(true)
-            .default_headers(identity_headers(protocol))
-            .build()
-            .expect("构建带身份头的 HTTP 客户端失败")
+/// 按协议带**默认身份头**的自建请求客户端（协议两种 × 直连/系统代理两种，各缓存一个）。
+fn identity_client(protocol: Protocol, direct: bool) -> reqwest::Client {
+    static CELLS: [std::sync::OnceLock<reqwest::Client>; 4] =
+        [std::sync::OnceLock::new(), std::sync::OnceLock::new(), std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    let cell = &CELLS[usize::from(protocol.is_openai()) * 2 + usize::from(direct)];
+    cached(cell, direct, || base_builder().gzip(true).brotli(true).deflate(true).default_headers(identity_headers(protocol)))
+}
+
+/// 这个地址是否必须绕过系统代理直连。本机地址（`localhost`、`127.0.0.0/8`、`::1`）一律直连：
+/// 代理连的是**它自己那台机器**的本机，用户的本地服务（Ollama、本机中转、本地判断服务）
+/// 在远端代理上不存在；碰巧可用只是因为 Clash 这类代理就跑在本机。
+///
+/// Windows 另认「Internet 选项」的例外列表（`ProxyOverride`）。hyper-util 0.1.20 读它时只做了
+/// 去掉 `*.` 一步，于是 `127.*`、`192.168.*` 被当成域名、`<local>` 被当成一个叫 `<local>` 的
+/// 主机 —— 实测在 Clash Verge 的标准例外列表下 `127.0.0.1` 照样走代理。这里按 WinINet 的语义
+/// 补上那几种写法；`NO_PROXY` 已设置时 hyper-util 不读该列表，这里也不读（见 `system_overrides`）。
+///
+/// 只会**增加**直连，不会让原本直连的地址改走代理：返回 false 时仍由 reqwest 原样处理。
+pub(crate) fn bypasses_proxy(url: &str) -> bool {
+    bypasses_with(url, system_overrides())
+}
+/// The decision itself, with the exception list as a parameter so tests can supply one.
+fn bypasses_with(url: &str, rules: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else { return false };
+    let Some(host) = parsed.host_str() else { return false };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    is_loopback_host(host) || matches_override(host, rules)
+}
+/// 端点是否指向本机（判断服务把「连不上本机服务」报成「服务未运行」用的就是这一条）。
+pub(crate) fn is_loopback_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else { return false };
+    parsed.host_str().is_some_and(|h| is_loopback_host(h.trim_start_matches('[').trim_end_matches(']')))
+}
+fn is_loopback_host(host: &str) -> bool {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => crate::proxy::lan_guard::is_loopback_peer(&ip),
+        Err(_) => host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost"),
+    }
+}
+/// WinINet 例外列表的语义：`;` 分隔，`*` 通配（可在任意位置），`<local>` = 不含点的主机名，
+/// 条目可带 `http://` 前缀，大小写不敏感。
+fn matches_override(host: &str, rules: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    rules.split(';').map(|r| r.trim().to_ascii_lowercase()).filter(|r| !r.is_empty()).any(|rule| {
+        if rule == "<local>" {
+            return !host.contains('.') && host.parse::<std::net::IpAddr>().is_err();
+        }
+        let rule = rule.strip_prefix("http://").or_else(|| rule.strip_prefix("https://")).unwrap_or(&rule);
+        glob_match(rule, &host)
     })
-    .clone()
+}
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == text;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if text.len() < first.len() + last.len() || !text.starts_with(first) || !text.ends_with(last) {
+        return false;
+    }
+    let mut rest = &text[first.len()..text.len() - last.len()];
+    for part in &parts[1..parts.len() - 1] {
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+/// 进程内只读一次，与 hyper-util 一样：共享客户端也只在首次使用时读一次系统代理配置。
+fn system_overrides() -> &'static str {
+    static RULES: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RULES.get_or_init(read_system_overrides)
+}
+#[cfg(windows)]
+fn read_system_overrides() -> String {
+    // 与 hyper-util 同一判据：取 NO_PROXY / no_proxy 中先存在的那个，非空则不读注册表。
+    let env_no = ["NO_PROXY", "no_proxy"].iter().find_map(|n| std::env::var(n).ok()).unwrap_or_default();
+    if !env_no.is_empty() {
+        return String::new();
+    }
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    let Ok(key) = winreg::RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings", KEY_READ)
+    else {
+        return String::new();
+    };
+    if key.get_value::<u32, _>("ProxyEnable").unwrap_or(0) == 0 {
+        return String::new();
+    }
+    key.get_value::<String, _>("ProxyOverride").unwrap_or_default()
+}
+#[cfg(not(windows))]
+fn read_system_overrides() -> String {
+    String::new()
 }
 
 /// 客户端身份头的**唯一取值来源**（默认头与 [`apply_client_identity`] 都从这里取）。
@@ -312,6 +397,56 @@ pub(super) fn apply_models_auth(req: reqwest::RequestBuilder, secret: &str) -> r
 mod tests {
     use super::*;
 
+    #[test]
+    fn loopback_and_windows_exceptions_go_direct() {
+        for url in ["http://127.0.0.1:11434/v1", "http://127.9.9.9/x", "http://localhost:8000/x", "http://LOCALHOST/x",
+            "http://foo.localhost/x", "http://[::1]:8000/x", "http://[::ffff:127.0.0.1]:8000/x"] {
+            assert!(is_loopback_url(url) && bypasses_proxy(url), "{url} is this machine");
+        }
+        for url in ["https://api.example.com/v1", "http://192.168.1.5/x", "http://localhost.example.com/x", "not a url"] {
+            assert!(!is_loopback_url(url), "{url} is not loopback");
+        }
+        // Clash Verge's standard exception list, as Windows stores it; hyper-util misreads every IP
+        // wildcard and `<local>` in it.
+        let clash = "localhost;127.*;192.168.*;10.*;172.16.*;<local>;*.corp.example;HTTP://Intranet.Example";
+        for host in ["127.0.0.1", "192.168.1.5", "10.0.0.8", "172.16.3.4", "nas", "x.corp.example", "x.y.corp.example", "intranet.example", "LOCALHOST"] {
+            assert!(matches_override(host, clash), "{host} is in the exception list");
+        }
+        for host in ["172.17.0.1", "8.8.8.8", "corp.example", "evilcorp.example", "api.example.com", "fe80::1"] {
+            assert!(!matches_override(host, clash), "{host} must keep the proxy");
+        }
+        assert!(!matches_override("anything", "") && !matches_override("nas", " ; ;"));
+        assert!(glob_match("10.*.5", "10.1.2.5") && !glob_match("10.*.5", "10.1.2.50") && !glob_match("a*a", "a"));
+        assert!(!matches_override("localhost2.example", "localhost"), "an entry without * matches exactly");
+        // The URL-level decision must consult the list (the cases above call the matcher directly).
+        assert!(bypasses_with("http://192.168.1.5:8080/v1", clash) && bypasses_with("http://nas/v1", clash));
+        assert!(!bypasses_with("http://192.168.1.5:8080/v1", "") && !bypasses_with("https://api.example.com/v1", clash));
+        let prod = crate::proxy::custom_headers::production_code_only(include_str!("client.rs"));
+        assert!(prod.contains("bypasses_with(url, system_overrides())"), "the system exception list must reach the routing decision");
+    }
+
+    #[test]
+    fn only_bypassed_destinations_get_a_client_without_the_system_proxy() {
+        let has_proxy = |c: reqwest::Client| format!("{c:?}").contains("proxies");
+        assert!(has_proxy(shared_client_routed(false)) && !has_proxy(shared_client_routed(true)));
+        assert!(has_proxy(decoding_client_routed(false)) && !has_proxy(decoding_client_routed(true)));
+        for protocol in [Protocol::Anthropic, Protocol::OpenaiChat] {
+            assert!(has_proxy(identity_client(protocol, false)) && !has_proxy(identity_client(protocol, true)));
+        }
+        // Loopback is decided here regardless of what the system exception list says.
+        assert!(!has_proxy(shared_client_for("http://127.0.0.1:1/x")) && !has_proxy(decoding_client_for("http://[::1]:1/x")));
+        // Wiring: every production client goes through the one routing decision.
+        let prod = crate::proxy::custom_headers::production_code_only(include_str!("client.rs"));
+        let body = |sig: &str| {
+            let rest = &prod[prod.find(sig).unwrap_or_else(|| panic!("{sig}"))..];
+            rest[..rest.find("\n}\n").unwrap()].to_string()
+        };
+        assert!(body("pub fn shared_client_for(").contains("bypasses_proxy(url)"));
+        assert!(body("pub fn decoding_client_for(").contains("bypasses_proxy(url)"));
+        assert!(body("pub(super) fn build_client(").contains("bypasses_proxy(&key.base_url)"));
+        assert_eq!(prod.matches(".no_proxy()").count(), 1, "only `cached` decides direct connections");
+    }
+
     #[tokio::test]
     async fn redirect_never_forwards_credentials_or_request_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -381,7 +516,7 @@ mod tests {
 
             // 两条路径**逐头一致**：`apply_client_identity` 是 identity_headers 的另一种用法，
             // 这条断言把「同一取值来源」这件事钉住 —— 若有人把其中一处改回手写头就会红。
-            let explicit = apply_client_identity(shared_client().get("http://127.0.0.1:1/x"), protocol)
+            let explicit = apply_client_identity(shared_client_for("http://127.0.0.1:1/x").get("http://127.0.0.1:1/x"), protocol)
                 .build()
                 .unwrap()
                 .headers()
@@ -475,15 +610,15 @@ mod tests {
         assert!(out.chars().count() < 500);
     }
 
-    /// 转发用的 `shared_client()` **必须**字节透明：不主动索要压缩（不发 `Accept-Encoding`），
-    /// 从而上游返回未压缩体、代理原样转发。而自建请求用的 `decoding_client()` **必须**主动
+    /// 转发用的 `shared_client_for()` **必须**字节透明：不主动索要压缩（不发 `Accept-Encoding`），
+    /// 从而上游返回未压缩体、代理原样转发。而自建请求用的 `decoding_client_for()` **必须**主动
     /// 索要并透明解压（发 `Accept-Encoding`）。
     ///
     /// 这条为一个实测回归立的护栏：Cargo.toml 给 reqwest 加 gzip/brotli/deflate feature 后，
     /// reqwest 的 `Accepts::default()` 会把这些 feature 一律置 true —— 若 `base_builder()` 不
-    /// 显式 `.gzip(false)…`，`shared_client()` 会被默认翻成「自动解压 + 注入 Accept-Encoding」，
+    /// 显式 `.gzip(false)…`，`shared_client_for()` 会被默认翻成「自动解压 + 注入 Accept-Encoding」，
     /// 悄悄破坏转发字节透明。**故障注入判据**：删掉 base_builder 里的 `.gzip(false).brotli(false)
-    /// .deflate(false)`，本测试的「shared_client 不发 Accept-Encoding」断言立刻变红。
+    /// .deflate(false)`，本测试的「shared_client_for 不发 Accept-Encoding」断言立刻变红。
     ///
     /// 用真实 TCP 监听回读请求头（而非验代码写了哪一行）：起一个只读一个请求头块的极简 server，
     /// 分别用两个 client 发 GET，比对是否出现 `accept-encoding`。
@@ -514,8 +649,9 @@ mod tests {
         let addr1 = l1.local_addr().unwrap();
         let h1 = serve_once(l1);
         rt.block_on(async {
-            let _ = shared_client()
-                .get(format!("http://{addr1}/"))
+            let url = format!("http://{addr1}/");
+            let _ = shared_client_for(&url)
+                .get(&url)
                 .timeout(Duration::from_secs(5))
                 .send()
                 .await;
@@ -531,8 +667,9 @@ mod tests {
         let addr2 = l2.local_addr().unwrap();
         let h2 = serve_once(l2);
         rt.block_on(async {
-            let _ = decoding_client()
-                .get(format!("http://{addr2}/"))
+            let url = format!("http://{addr2}/");
+            let _ = decoding_client_for(&url)
+                .get(&url)
                 .timeout(Duration::from_secs(5))
                 .send()
                 .await;

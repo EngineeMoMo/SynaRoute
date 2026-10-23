@@ -1462,7 +1462,7 @@ async fn try_stream_to_key(
     let url = crate::upstream::join_endpoint(&key.base_url, &resource_path);
 
     // 流式：用共享客户端（连接池复用，含 connect_timeout），不设总超时，避免长回答被掐断。
-    let client = crate::upstream::shared_client();
+    let client = crate::upstream::shared_client_for(&url);
 
     // 请求头统一由 apply_upstream_headers 装齐（与非流式路径共用同一实现，防两条路径分叉）。
     // **不在 RequestBuilder 上调 `.timeout()`**：reqwest 的那个超时覆盖「整个请求含读完 body」，
@@ -2124,7 +2124,7 @@ async fn forward_to_key(
     let url = crate::upstream::join_endpoint(&key.base_url, &resource_path);
 
     // 用共享客户端（连接池复用），总超时按 Key 配置逐请求指定。
-    let client = crate::upstream::shared_client();
+    let client = crate::upstream::shared_client_for(&url);
 
     // 本次请求的超时 = min(Key 自身超时, 故障转移剩余预算)。
     // 取小值：既不让一个慢 Key 吃光整池预算（那会让后续候选无机会尝试），

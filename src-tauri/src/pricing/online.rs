@@ -344,7 +344,7 @@ fn save(path: &Path, d: &OnDisk) {
 ///
 /// 边读边计数而不是读完再比：CDN 的 gzip 响应常常不带 `Content-Length`，读完再判就晚了。
 async fn fetch_bytes(url: &str, cap: usize) -> Result<Vec<u8>, String> {
-    let mut resp = crate::upstream::decoding_client()
+    let mut resp = crate::upstream::decoding_client_for(url)
         .get(url)
         .header("user-agent", concat!("SynaRoute/", env!("CARGO_PKG_VERSION")))
         .timeout(FETCH_TIMEOUT)
