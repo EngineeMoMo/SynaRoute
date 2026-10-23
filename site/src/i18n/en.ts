@@ -332,7 +332,7 @@ export const en: Dict = {
 
   "security.network.title": "What goes out over the network",
   "security.network.desc":
-    "Only the upstream vendor requests you configured, a check against the GitHub releases page when looking for updates, and a daily download of a public model price file (used to estimate costs; it carries no local data). No usage data, no analytics, no accounts, no config sync.",
+    "By default, only the upstream vendor requests you configured, a check against the GitHub releases page when looking for updates, and a daily download of a public model price file (used to estimate costs; it carries no local data). With the optional dynamic reasoning on, task text goes to the decision service you chose; confirming one-click Laya setup downloads Python and dependencies from their official sources and the model from Hugging Face (or, with the optional mirror on, from the third-party mirror hf-mirror.com). No usage data, no analytics, no accounts, no config sync.",
 
   "security.logs.title": "About logging",
   "security.logs.desc": "Logs contain metadata by default; enabling conversation logging includes message bodies and system prompts, so use it only temporarily for troubleshooting. Windows/Linux prefer logs beside the executable, falling back to SynaRoute/logs in the user data directory if unwritable. macOS defaults to ~/Library/Logs/SynaRoute. Custom log directories are supported; check Settings for the active path.",

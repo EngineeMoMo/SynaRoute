@@ -29,11 +29,16 @@ To be clear about what this protects against: encryption guards against the file
 
 ### What the application sends over the network
 
-Three things only:
+By default, three things only:
 
 1. The upstream vendor requests you configured — the AI calls being proxied, sent to the addresses you entered on your keys;
 2. A request to the project's releases page when checking for updates;
 3. Once a day, a download of a public model price file (maintained by LiteLLM, via jsDelivr, falling back to GitHub), used to estimate costs on the usage page. It is an anonymous GET request and carries no local data, keys or usage.
+
+Two more happen only after you turn them on or confirm them:
+
+4. Dynamic reasoning in Brain aggregation (off by default): when enabled, each round's task text is sent to the decision service you chose — a local Laya service stays on your machine; Jev or a compatible endpoint receives it at that address. Retrieved files and images are not sent.
+5. One-click setup of the local Laya service (Windows, only after you confirm): if Python is missing, the official installer is downloaded from python.org, dependencies from PyPI and the official PyTorch index, and the model from Hugging Face. If you turn on "Download the model through hf-mirror.com" in the panel (off by default), the model comes from that third-party mirror instead, which sees those download requests. These are ordinary downloads and carry no local configuration, keys or conversation content.
 
 Nothing else leaves your machine.
 
