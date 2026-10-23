@@ -36,6 +36,8 @@ const pass = (msg) => console.log(`✅ ${msg}`);
     // `pricing-online.json` 是在线单价表的本机缓存（公开数据），理由同上：运行时生成的东西不进仓库。
     /(^|\/)usage(-keys)?\.json$/.test(f) ||
     /(^|\/)pricing-online\.json$/.test(f) ||
+    // `laya-local.json` 是本机偏好（是否随应用启动 Laya），同属运行时生成、不进仓库。
+    /(^|\/)laya-local\.json$/.test(f) ||
     /(^|\/)logs\//.test(f) ||
     /(^|\/)latest\.json$/.test(f) ||
     (/\.key$|\.pem$/.test(f) && !f.endsWith(".gpg")),

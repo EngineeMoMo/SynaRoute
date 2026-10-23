@@ -117,6 +117,12 @@
 
     RMDir /r "$APPDATA\SynaRoute"
 
+    ; 动态思考的 Laya 本地服务把私有 Python 环境（含 PyTorch，约 1 GB）放在
+    ; %LOCALAPPDATA%\SynaRoute\laya（decision/laya_windows.rs 的 install_dir）。默认安装时那正是
+    ; $INSTDIR\laya，于是下面那条非递归 RMDir "$INSTDIR" 必然失败，勾了「删除应用数据」也留下它。
+    ; 只删这一个目录：自动安装的 Python 在「应用和功能」里单独卸载，Hugging Face 模型缓存是共享的，都不归本应用。
+    RMDir /r "$LOCALAPPDATA\SynaRoute\laya"
+
     ; Windows 上运行日志优先落 exe 同级 logs\（store.rs 的 resolve_default_log_dir
     ; 刻意这么设，为躲 MSIX 虚拟化），currentUser 安装时即 $INSTDIR\logs。
     ; 开了请求日志时里面是**明文对话正文**，用户勾了「删除应用数据」却留着它，

@@ -1210,7 +1210,7 @@ pub fn run() {
             service::reconcile_auto_start(&state.store, &PluginAutostart(app.handle()));
 
             // 定时检查更新（30 分钟一轮，先睡后查）。**必须在 setup 里起**（要 AppHandle 才拿得到 updater）；不做前端定时器 / 不搭探测车的理由见该模块文档。
-            update_watch::spawn_background(app.handle().clone(), state.store.clone());
+            update_watch::spawn_background(app.handle().clone(), state.store.clone()); store::decision::laya_local::autostart_on_launch(); // 用户开启时启动已装好的 Laya，永不安装
 
             // 深链接导入（synaroute://）：`register` 让直接跑 exe / tauri dev 也能被唤起、且自愈（安装包也注册；macOS 由 bundle 注册，故此调用返 UnsupportedPlatform、`let _` 忽略）。
             // `on_open_url` 覆盖冷启动与 macOS 已运行；Windows 已运行走 single-instance 回调（见上），两处同调 `handle_deeplink`。
@@ -1349,7 +1349,7 @@ pub fn run() {
             list_vendors,
             upsert_vendor,
             delete_vendor,
-            store::decision::get_decision_config, store::decision::save_decision_config, store::decision::native_discovery::native_defaults, store::decision::native::native_open, store::decision::native::native_snapshot, store::decision::native::native_turn, store::decision::native::native_approve, store::decision::native::native_close, store::decision::laya_local::laya_local_status, store::decision::laya_local::laya_local_start, store::decision::laya_local::laya_local_stop,
+            store::decision::get_decision_config, store::decision::save_decision_config, store::decision::native_discovery::native_defaults, store::decision::native::native_open, store::decision::native::native_snapshot, store::decision::native::native_turn, store::decision::native::native_approve, store::decision::native::native_close, store::decision::laya_local::laya_local_status, store::decision::laya_local::laya_local_start, store::decision::laya_local::laya_local_stop, store::decision::laya_local::laya_local_set_autostart, store::decision::laya_local::laya_local_set_mirror, store::decision::laya_local::laya_local_sync_endpoints,
             aggregate::aggregate_plan,
             aggregate::aggregate_execute,
             aggregate::aggregate_write,
