@@ -507,7 +507,7 @@ async fn run_turn(store: &super::Store, request: TurnRequest) -> Result<Snapshot
                 .get(&request.category)
                 .cloned()
                 .unwrap_or_default();
-            match native_judge::select(store, config, &request.prompt, &efforts).await {
+            match native_judge::select(store, config, &request.prompt, &efforts, &request.effort).await {
                 Ok(selected) => {
                     effort = selected;
                     format!("自动选择 / selected: {effort}")

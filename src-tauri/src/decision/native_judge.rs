@@ -1,5 +1,5 @@
 //! Native effort selection uses the client's catalog, never a three-level translation.
-use super::{query, DecisionConfig, Mode, Provider, Store};
+use super::{laya_judge, query, DecisionConfig, Mode, Provider, Store};
 use serde_json::{json, Value};
 
 pub(super) async fn select(
@@ -7,6 +7,7 @@ pub(super) async fn select(
     mut config: DecisionConfig,
     prompt: &str,
     efforts: &[String],
+    manual: &str,
 ) -> Result<String, &'static str> {
     config.mode = Mode::Suggest;
     config
@@ -14,6 +15,15 @@ pub(super) async fn select(
         .map_err(|_| "判断服务未配置 / judge not configured")?;
     if prompt.is_empty() || prompt.len() > 24_000 || efforts.is_empty() {
         return Err("缺少可判断的文本或原生档位 / missing task or native efforts");
+    }
+    if config.provider == Provider::Laya {
+        // Upgrade-only (see laya_judge): never lower the user's manual effort.
+        let body = query(store, &config, laya_judge::body(&config.model, prompt)).await?;
+        if !laya_judge::needs_deep_reasoning(&body) {
+            return Err("未判定为需要深度推理，保持手动档位 / not a deep task; manual effort kept");
+        }
+        return laya_judge::pick_upgrade(efforts, manual)
+            .ok_or("手动档位已不低于 high / manual effort is already at or above high");
     }
     let instructions = format!(
         "Select reasoning effort for the next user turn, keeping the model fixed. \
@@ -54,22 +64,9 @@ fn parse(provider: Provider, body: &Value, allowed: &[String]) -> Option<String>
             .ok()?;
         parsed["effort"].as_str()?
     } else {
-        if provider == Provider::Laya
-            && (body["usage"]["truncated"] == true
-                || body["usage"]["truncated"].as_u64().is_some_and(|v| v > 0)
-                || body["usage"]["state_tokens_dropped"]
-                    .as_u64()
-                    .is_some_and(|v| v > 0))
-        {
-            return None;
-        }
+        // Jev only; Laya never reaches here (upgrade-only path above).
         let answer = &body["answers"]["effort"];
-        let confidence = answer[if provider == Provider::Laya {
-            "answer_confidence"
-        } else {
-            "confidence"
-        }]
-        .as_f64()?;
+        let confidence = answer["confidence"].as_f64()?;
         if !confidence.is_finite() || confidence < 0.7 {
             return None;
         }
@@ -111,13 +108,10 @@ mod tests {
             ),
             None
         );
-        assert_eq!(
-            parse(
-                Provider::Laya,
-                &json!({"usage":{"truncated":1},"answers":{"effort":{"choice":"low","answer_confidence":0.95}}}),
-                &allowed
-            ),
-            None
-        );
+        // Wiring: Laya takes the upgrade-only path before the catalog question is ever built.
+        let prod = crate::proxy::custom_headers::production_code_only(include_str!("native_judge.rs"));
+        let laya = prod.find("if config.provider == Provider::Laya").expect("Laya branch");
+        assert!(laya < prod.find("let instructions = format!(").unwrap(), "Laya must not reach the catalog question");
+        assert!(prod[laya..].contains("laya_judge::pick_upgrade(efforts, manual)"));
     }
 }
