@@ -1,4 +1,4 @@
-import { defaultDecision, type DecisionConfig, type DecisionView } from "./decision";
+import { defaultDecision, type DecisionConfig, type DecisionView, type LayaLocalStatus } from "./decision";
 import type { SharedTemplate, SharedImportResult } from "./sharedTemplate";
 import type { SessionMaintenanceProgress, SessionIdRepairPreview, SessionIdRepairResult } from "./sessionMaintenance";
 import type {
@@ -44,6 +44,10 @@ import type {
 import type { UserPrefs } from "@/lib/prefs";
 import type { ResilienceOverview } from "@/lib/resilience";
 import { mockBridge } from "./mockData";
+
+// Browser preview only: one mutable status so the switches stay consistent with each other.
+const layaMock: LayaLocalStatus = { supported: true, phase: "idle", endpoint: "http://127.0.0.1:8000/v1/systemone", logs: [], error: null, installed: false, autostart: false, mirror: false };
+const desktopOnly = () => { throw new Error("请在桌面应用中运行本地服务 / Run the local service in the desktop app"); };
 
 /** 是否运行在 Tauri 环境内 */
 export function isTauri(): boolean {
@@ -91,6 +95,13 @@ async function sessionCall<T>(cmd: string, args: Record<string, unknown>, progre
 
 export const api = {
   getDecisionConfig: (categoryId: CategoryType) => call<DecisionView>("get_decision_config", { categoryId }, () => defaultDecision()),
+  layaLocalStatus: () => call<LayaLocalStatus>("laya_local_status", undefined, () => ({ ...layaMock })),
+  // An object, not positional booleans: swapping repair/noInstall at a call site must not be possible.
+  layaLocalStart: (opts: { repair: boolean; noInstall: boolean }) => call<LayaLocalStatus>("laya_local_start", { repair: opts.repair, noInstall: opts.noInstall }, desktopOnly),
+  layaLocalStop: () => call<LayaLocalStatus>("laya_local_stop", undefined, () => ({ ...layaMock })),
+  layaLocalSetAutostart: (enabled: boolean) => call<LayaLocalStatus>("laya_local_set_autostart", { enabled }, () => { layaMock.autostart = enabled; return { ...layaMock }; }),
+  layaLocalSetMirror: (enabled: boolean) => call<LayaLocalStatus>("laya_local_set_mirror", { enabled }, () => { layaMock.mirror = enabled; return { ...layaMock }; }),
+  layaLocalSyncEndpoints: (endpoint: string) => call<CategoryType[]>("laya_local_sync_endpoints", { endpoint }, () => []),
   saveDecisionConfig: (categoryId: CategoryType, config: DecisionConfig, secret: string | null, clearSecret: boolean) => call<void>("save_decision_config", { categoryId, config, secret, clearSecret }, () => { throw new Error("请在桌面应用中保存判断配置 / Save decision settings in the desktop app"); }),
   buildSharedTemplate: () => call<SharedTemplate>("build_shared_template", undefined, () => ({
     format: "synaroute-share", version: 1, routes: [{ categoryId: "codex", protocol: "openai_chat", models: [{ realName: "example-model", contextWindow: null, maxOutputTokens: null }], mappings: [], defaultModel: null, tiers: [null, null, null, null], allowNamedModelFallback: false, temperature: null, topP: null, timeoutMs: null }],

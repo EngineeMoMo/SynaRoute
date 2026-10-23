@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import type { ReactNode } from "react";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, Info } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { DialogBody, DialogFooter, DialogFrame, DialogHeader } from "@/components/ui/DialogFrame";
 
@@ -12,6 +12,7 @@ export function ConfirmDialog({
   onConfirm,
   onCancel,
   busy = false,
+  tone = "danger",
 }: {
   title: string;
   description: ReactNode;
@@ -20,6 +21,8 @@ export function ConfirmDialog({
   onConfirm: () => void;
   onCancel: () => void;
   busy?: boolean;
+  /** "danger" for destructive or irreversible actions (the default); "primary" for an ordinary confirmation. */
+  tone?: "danger" | "primary";
 }) {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -39,8 +42,8 @@ export function ConfirmDialog({
     >
       <DialogHeader>
         <div className="flex items-center gap-2">
-          <span className="flex h-8 w-8 items-center justify-center rounded-control bg-danger/12 text-danger">
-            <AlertTriangle size={16} aria-hidden="true" />
+          <span className={`flex h-8 w-8 items-center justify-center rounded-control ${tone === "danger" ? "bg-danger/12 text-danger" : "bg-primary/12 text-primary"}`}>
+            {tone === "danger" ? <AlertTriangle size={16} aria-hidden="true" /> : <Info size={16} aria-hidden="true" />}
           </span>
           <h2 className="text-sm font-semibold text-text-primary">{title}</h2>
         </div>
@@ -52,7 +55,7 @@ export function ConfirmDialog({
         <Button variant="ghost" onClick={onCancel} disabled={busy} autoFocus>
           {cancelLabel}
         </Button>
-        <Button variant="danger" onClick={onConfirm} disabled={busy}>
+        <Button variant={tone} onClick={onConfirm} disabled={busy}>
           {confirmLabel}
         </Button>
       </DialogFooter>

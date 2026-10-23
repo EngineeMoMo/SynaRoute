@@ -1,7 +1,7 @@
 import { LayaLocalPanel } from "./LayaLocalPanel";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/bridge";
-import { defaultDecision, decisionPresets, type DecisionConfig, type DecisionProvider, type EffortApi } from "@/lib/decision";
+import { defaultDecision, decisionPresets, isLoopbackEndpoint, type DecisionConfig, type DecisionProvider, type EffortApi } from "@/lib/decision";
 import { useStore } from "@/store";
 import { Button } from "@/components/ui/Button";
 import type { BrainConfig, CategoryType, ProviderKey } from "@/types";
@@ -41,8 +41,16 @@ export function DecisionPanel({ category, brain, keys }: { category: CategoryTyp
     const next = { ...config, provider: "laya" as const, endpoint, model: "multilingual" };
     await api.saveDecisionConfig(category, next, null, true);
     setConfig(next); setHasSecret(false); setSecret(""); setClearSecret(false);
-    setStatus(text("已保存本地服务配置；如需自动调整，请选择运行方式并授权模型。", "Local service saved. Choose a mode and authorize models to enable automatic adjustment."));
+    // Other categories still on an earlier port of this managed service follow it to the new one.
+    let synced = "";
+    try {
+      const moved = await api.layaLocalSyncEndpoints(endpoint);
+      if (moved.length) synced = text(`另有 ${moved.length} 个分类原先指向本服务的旧端口，已一并改为新端口。`, ` ${moved.length} other categories that pointed at this service's previous port now use the new one.`);
+    } catch (e) { synced = text(`（其他分类未能改到新端口：${String(e)}）`, ` (Other categories could not be moved to the new port: ${String(e)})`); }
+    setStatus(text("已保存本地服务配置；如需自动调整，请选择运行方式并授权模型。", "Local service saved. Choose a mode and authorize models to enable automatic adjustment.") + synced);
   }
+  // Saving the local endpoint overwrites a remote service or a stored key; the panel confirms that first.
+  const replacesRemote = (hasSecret && !clearSecret) || (!!config.endpoint.trim() && !isLoopbackEndpoint(config.endpoint));
   return <details className="rounded-card border border-border bg-surface p-4">
     <summary className="cursor-pointer text-sm font-medium text-text-primary">{text("动态思考 · 可选增强", "Dynamic reasoning · Optional")}</summary>
     <p className="mt-3 text-xs leading-relaxed text-text-secondary">{text("不开启也能正常会诊。开启后，每轮会将问题文本发送给所选判断服务（云端可能收费），判断低／中／高思考强度；不会发送检索文件或图片。失败时保留原配置。", "Consultations work without this. When enabled, each task's text is sent to the selected service (cloud calls may cost money) to choose low, medium or high reasoning effort. Retrieved files and images are excluded. Failures preserve original settings.")}</p>
@@ -73,7 +81,7 @@ export function DecisionPanel({ category, brain, keys }: { category: CategoryTyp
           }}><option value="">{text("保持原样", "Unchanged")}</option>{key?.protocol === "anthropic" ? <option value="adaptive">Claude adaptive</option> : <option value="openai">Chat reasoning_effort</option>}</select></label>;
         })}
       </div>
-      {config.provider === "laya" && <LayaLocalPanel key={category} onConfigure={configureLocal} />}
+      {config.provider === "laya" && <LayaLocalPanel key={category} onConfigure={configureLocal} replaces={replacesRemote} />}
       <Button size="sm" onClick={() => void save()} disabled={busy}>{busy ? text("保存中…", "Saving…") : text("保存动态思考设置", "Save reasoning settings")}</Button>
     </fieldset>
     {status && <p role="status" className="mt-3 text-xs text-text-secondary">{status}</p>}
