@@ -60,11 +60,12 @@ fn current_root_provider(home: &Path) -> String {
 
 fn list_at(home: &Path, codex_keys: &[crate::model::ProviderKey]) -> CodexSessionList {
     let mut scan = scan_at(home);
-    // 新的排前面。用户来这个页面通常是为了最近那几条对话。
-    scan.sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     let current_provider = current_root_provider(home);
     // 标题/模型/档位/token 与统计都在这一步补上（见 `view` 的模块头：**文件为准、库来补充**）。
     let stats = view::enrich(home, &mut scan.sessions, &current_provider, codex_keys);
+    scan.sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at)
+        .then_with(|| right.timestamp.cmp(&left.timestamp))
+        .then_with(|| left.rel_path.cmp(&right.rel_path)));
     CodexSessionList {
         rows: scan.sessions,
         current_provider,
@@ -489,7 +490,8 @@ pub async fn list_codex_sessions(
 ) -> Result<CodexSessionList, String> {
     let home = super::super::codex_paths::codex_home().map_err(|e| e.to_string())?;
     let keys = state.store.enabled_keys_sorted(crate::model::CategoryType::Codex);
-    Ok(list_at(&home, &keys))
+    tauri::async_runtime::spawn_blocking(move || list_at(&home, &keys))
+        .await.map_err(|error| format!("读取会话失败：{error}"))
 }
 
 /// 删除选中的会话。前端仍必须先弹确认 —— 有备份不等于可以随手删。
@@ -604,6 +606,22 @@ mod tests {
     /// 返回 (相对路径, thread id)。
     fn write_full_rollout(home: &std::path::Path, label: &str) -> (String, String) {
         write_rollout_with_provider(home, label, "openai")
+    }
+
+    #[test]
+    fn recently_resumed_sessions_precede_newer_but_inactive_sessions() {
+        let home = tmp_home("recent-activity");
+        let (_, older_id) = write_full_rollout(&home, "older");
+        let (_, resumed_id) = write_full_rollout(&home, "resumed");
+        let connection = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        connection.execute_batch("CREATE TABLE threads (id TEXT, updated_at INTEGER);").unwrap();
+        connection.execute("INSERT INTO threads VALUES (?1, 1793354400)", [&older_id]).unwrap();
+        connection.execute("INSERT INTO threads VALUES (?1, 1793354500)", [&resumed_id]).unwrap();
+        let listed = list_at(&home, &[]);
+        assert_eq!(listed.rows[0].thread_id, resumed_id);
+        assert_eq!(listed.rows[1].thread_id, older_id);
+        drop(connection);
+        fs::remove_dir_all(home).unwrap();
     }
 
     fn write_rollout_with_provider(

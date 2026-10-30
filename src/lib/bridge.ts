@@ -12,6 +12,7 @@ import type {
   CategoryType,
   CodegraphState,
   CodexSessionList,
+  CodexSessionArchiveResult,
   EnvFinding,
   EnvRemovalResult,
   CodexProviderTargetList,
@@ -301,6 +302,21 @@ export const api = {
   /** Codex 本地会话列表（会话管理页）。只读每个 rollout 的首行，几百条也很快。 */
   listCodexSessions: () =>
     call<CodexSessionList>("list_codex_sessions", undefined, () => mockBridge.listCodexSessions()),
+
+  setCodexSessionsArchived: (relPaths: string[], archived: boolean) =>
+    call<CodexSessionArchiveResult>("set_codex_sessions_archived", { relPaths, archived }, () => {
+      const rows = mockBridge.listCodexSessions();
+      return Promise.resolve(rows).then((data) => {
+        const updated: string[] = [];
+        const unchanged: string[] = [];
+        for (const row of data.rows) {
+          if (!relPaths.includes(row.relPath)) continue;
+          (row.archived === archived ? unchanged : updated).push(row.relPath);
+          row.archived = archived;
+        }
+        return { updated, unchanged, failed: [], warnings: [], backupDir: "" };
+      });
+    }),
 
   /**
    * 删除选中的会话。调用方必须先弹确认。

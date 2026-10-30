@@ -44,6 +44,10 @@ fn sqlite_root(home: &Path) -> PathBuf {
 
 pub(in crate::tools) fn session_db_paths(home: &Path) -> Vec<PathBuf> {
     let root = sqlite_root(home);
+    database_paths_in(&root)
+}
+
+fn database_paths_in(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(root.join("sqlite")) {
         for e in entries.flatten() {
@@ -55,9 +59,15 @@ pub(in crate::tools) fn session_db_paths(home: &Path) -> Vec<PathBuf> {
         }
         out.sort();
     }
-    let legacy = root.join("state_5.sqlite");
-    if legacy.is_file() {
-        out.push(legacy);
+    if let Ok(entries) = fs::read_dir(root) {
+        let mut legacy: Vec<_> = entries.flatten().filter_map(|entry| {
+            let name = entry.file_name();
+            let version = name.to_str()?.strip_prefix("state_")?.strip_suffix(".sqlite")?
+                .parse::<u32>().ok()?;
+            entry.path().is_file().then_some((version, entry.path()))
+        }).collect();
+        legacy.sort_by(|left, right| right.0.cmp(&left.0));
+        out.extend(legacy.into_iter().map(|(_, path)| path));
     }
     out
 }
@@ -305,6 +315,24 @@ pub(super) fn set_threads_provider(db: &Path, provider: &str, ids: &[String]) ->
             .map_err(|e| format!("{}: {e}", db.display()))?;
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn discovers_new_state_versions_numerically_after_the_sqlite_directory() {
+        let home = std::env::temp_dir().join(format!("synaroute-db-discovery-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(home.join("sqlite")).unwrap();
+        for name in ["state_5.sqlite", "state_6.sqlite", "state_10.sqlite", "state_wrong.sqlite", "sqlite/current.db"] {
+            fs::write(home.join(name), b"").unwrap();
+        }
+        fs::create_dir(home.join("state_99.sqlite")).unwrap();
+        assert_eq!(database_paths_in(&home), ["sqlite/current.db", "state_10.sqlite", "state_6.sqlite", "state_5.sqlite"]
+            .map(|name| home.join(name)).to_vec());
+        fs::remove_dir_all(home).unwrap();
+    }
 }
 
 

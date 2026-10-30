@@ -50,12 +50,8 @@ describe("会话页与后端的两处契约", () => {
     const src = code(page);
     expect(src, "必须直接用后端算好的那个数字").toContain("data?.stats.mismatched");
     expect(src, "「模型已失效」的条数同理").toContain("data?.stats.modelGone");
-    // 反向：页面里只有「筛选当前显示行」那一处允许比较 provider 与 currentProvider。
-    // 再出现一次就意味着又在前端算了第二份统计；按语义计数，不用会漏 `(r) =>` 的正则。
-    expect(
-      src.split(".provider !== data.currentProvider").length - 1,
-      "provider/currentProvider 比较只能用于筛选，第二处就是第二个统计来源",
-    ).toBe(1);
+    expect(src).toContain("<SessionBrowser data={data}");
+    expect(src.split(".provider !== data.currentProvider").length - 1).toBe(0);
   });
 
   /**

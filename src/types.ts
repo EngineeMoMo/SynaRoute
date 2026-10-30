@@ -710,6 +710,9 @@ export interface CodexSessionRow {
   cwd: string;
   timestamp: string;
   bytes: number;
+  updatedAt?: string;
+  internal?: boolean;
+  source?: string;
   /** `user` = 用户自己的对话；其它值（`guardian_review` 等）是 Codex 内部派生的 */
   threadSource: string;
   /** fork 出来的分支（文件名带两个 UUID） */
@@ -762,6 +765,14 @@ export interface CodexSessionList {
   /** 路径无法安全定位的文件数（与上一条成因不同，故分开） */
   pathRejected: number;
   stats: CodexSessionStats;
+}
+
+export interface CodexSessionArchiveResult {
+  updated: string[];
+  unchanged: string[];
+  failed: { relPath: string; error: string }[];
+  warnings: string[];
+  backupDir: string;
 }
 
 /** 一个可选的同步目标。`sources` 说明它在哪儿出现过（`config` / `rollout` / `sqlite`）。 */

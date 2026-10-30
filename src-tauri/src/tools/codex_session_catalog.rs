@@ -275,10 +275,13 @@ fn row_has_user_veto(row: &CatalogRow) -> bool {
 }
 
 fn row_is_confirmed_child(row: &CatalogRow) -> bool {
-    !row.forked
-        && !row.thread_source.trim().eq_ignore_ascii_case("user")
-        && (thread_source_marks_child(&row.thread_source)
-            || source_kind_marks_child(&row.source_kind))
+    is_internal_source(&row.thread_source, &row.source_kind, row.forked)
+}
+
+pub(super) fn is_internal_source(thread_source: &str, source: &str, forked: bool) -> bool {
+    !forked
+        && !thread_source.trim().eq_ignore_ascii_case("user")
+        && (thread_source_marks_child(thread_source) || source_kind_marks_child(source))
 }
 
 pub(in crate::tools) fn cleanup_rows(

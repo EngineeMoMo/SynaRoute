@@ -11,8 +11,11 @@ import type {
   CodexSessionRow,
 } from "@/types";
 import { ToggleRow } from "@/components/ToggleRow";
-import { FolderOpen, Trash2, Wand2 } from "lucide-react";
-import { SessionTable } from "@/components/SessionTable";
+import { FolderOpen, Wand2 } from "lucide-react";
+import { SessionBrowser } from "@/components/SessionBrowser";
+import { SessionDetailDialog } from "@/components/SessionDetailDialog";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import { normalizeSessionRow, retainSessionSelection, selectSessionPaths } from "@/lib/codexSessionBrowser";
 import { Button } from "@/components/ui/Button";
 import { RefreshButton } from "@/components/ui/RefreshButton";
 import { InlineAlert } from "@/components/ui/InlineAlert";
@@ -52,39 +55,47 @@ export function CodexSessionsPage() {
   const [target, setTarget] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState<Set<string>>(new Set());
-  const [confirming, setConfirming] = useState(false);
+  const [deleteRequest, setDeleteRequest] = useState<string[] | null>(null);
+  const [archiveRequest, setArchiveRequest] = useState<{ paths: string[]; archived: boolean } | null>(null);
+  const [detail, setDetail] = useState<CodexSessionRow | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [repairing, setRepairing] = useState(false);
   const [syncProgress, setSyncProgress] = useState<Progress | null>(null);
   const [confirmingSync, setConfirmingSync] = useState(false);
-  const [query, setQuery] = useState("");
-  const [onlyBad, setOnlyBad] = useState(false);
-  const [onlyGone, setOnlyGone] = useState(false);
+  const [maintenanceError, setMaintenanceError] = useState("");
   const loadGeneration = useRef(0);
+  const operationInFlight = useRef(false);
 
   const load = useCallback(async () => {
     const generation = ++loadGeneration.current;
     setError(null);
     try {
-      const [next, tl, ia] = await Promise.all([
+      const [sessionsResult, targetsResult, auditResult] = await Promise.allSettled([
         api.listCodexSessions(),
         api.listCodexProviderTargets(),
         api.auditCodexSessionIndex(),
       ]);
       if (generation !== loadGeneration.current) return;
-      // 后端返回的形状做一次校验再入 state：本页多处直接解引用 row 字段，而 render 抛异常
-      // 会让 React 卸载整棵树 → 整窗口白屏（用量页真机反馈过这种事故）。
-      setData({
-        ...next,
-        rows: Array.isArray(next.rows) ? next.rows.filter(isValidRow) : [],
-      });
-      setTargets(tl);
-      setAudit(ia);
-      // 只选后端真实列出的 id。`ours` 只是推荐标签，不保证当前 config 声明过它；
-      // 让一个不在 options 里的 value 留在受控 select 中，会显示空白却仍允许写盘。
-      setTarget((prev) => chooseKnownTarget(tl, prev));
+      if (sessionsResult.status === "fulfilled") {
+        const next = sessionsResult.value;
+        const rows = Array.isArray(next.rows)
+          ? next.rows.map(normalizeSessionRow).filter((row): row is CodexSessionRow => row !== null) : [];
+        setData({ ...next, rows });
+        setPicked((previous) => retainSessionSelection(previous, rows));
+        setDetail((previous) => previous ? rows.find((row) => row.relPath === previous.relPath) ?? null : null);
+      } else {
+        setError(String(sessionsResult.reason));
+      }
+      if (targetsResult.status === "fulfilled") {
+        setTargets(targetsResult.value);
+        setTarget((previous) => chooseKnownTarget(targetsResult.value, previous));
+      }
+      if (auditResult.status === "fulfilled") setAudit(auditResult.value);
+      setMaintenanceError([targetsResult, auditResult]
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+        .map((result) => String(result.reason)).join("\n"));
     } catch (e) {
       if (generation !== loadGeneration.current) return;
       setError(String(e));
@@ -93,41 +104,11 @@ export function CodexSessionsPage() {
 
   useEffect(() => {
     void load();
+    return () => { loadGeneration.current += 1; };
   }, [load]);
-
-  // 选中项按 relPath 记，而不是按下标 —— 刷新后顺序可能变（新会话插到最前面），
-  // 按下标记会让「删除选中」删错行。
-  const toggle = (relPath: string) => {
-    setPicked((prev) => {
-      const next = new Set(prev);
-      if (!next.delete(relPath)) next.add(relPath);
-      return next;
-    });
-  };
 
   const mismatched = data?.stats.mismatched ?? 0;
   const modelGone = data?.stats.modelGone ?? 0;
-
-  /**
-   * 筛选是纯前端的：整份列表已经在手里，为一次筛选再跑一趟 IPC + 重扫几百个文件毫无道理。
-   *
-   * 🔴 **这不是把 `stats.mismatched` 重算一遍**（那一位仍然只来自后端，见
-   * `tests/codexSessionPage.test.ts`）—— 这里算的是「当前筛选下显示几行」，
-   * 而统计卡永远报**全量**。两个数字回答的是不同问题，所以刻意不共用。
-   */
-  const shown = useMemo(() => {
-    const rows = data?.rows ?? [];
-    const q = query.trim().toLowerCase();
-    return rows.filter((r) => {
-      if (onlyBad && !(data?.currentProvider && r.provider !== data.currentProvider)) return false;
-      if (onlyGone && !r.modelUnserviceable) return false;
-      if (!q) return true;
-      return [r.title, r.cwd, r.provider, r.model, r.project, r.relPath]
-        .join("")
-        .toLowerCase()
-        .includes(q);
-    });
-  }, [data, query, onlyBad, onlyGone]);
 
   /**
    * 点「立刻同步」会改到几条 —— 用**用户正在看的这份列表**算，因为确认框要说的就是他看到的
@@ -140,30 +121,54 @@ export function CodexSessionsPage() {
     [data, target],
   );
 
-  /** 选中但被当前筛选藏起来的条数 —— 它们照样会被删，所以必须在界面上点出来。 */
-  const hiddenPicked = useMemo(() => {
-    const visible = new Set(shown.map((r) => r.relPath));
-    return [...picked].filter((p) => !visible.has(p)).length;
-  }, [picked, shown]);
-
   const doDelete = async () => {
-    if (busy || syncing || repairing) return;
+    if (busy || syncing || repairing || operationInFlight.current || !deleteRequest?.length) return;
+    operationInFlight.current = true;
+    const paths = deleteRequest;
     setBusy(true);
-    setConfirming(false);
+    setDeleteRequest(null);
     try {
-      setNote(await api.deleteCodexSessions([...picked]));
-      setPicked(new Set());
+      setNote(await api.deleteCodexSessions(paths));
+      setPicked((previous) => selectSessionPaths(previous, paths, false));
     } catch (e) {
       // 部分成功时后端返回 Err 并列出没删掉的那些 —— 原样展示，不要压成一句「失败」。
       setNote(String(e));
     } finally {
-      setBusy(false);
       await load();
+      setBusy(false);
+      operationInFlight.current = false;
+    }
+  };
+
+  const doArchive = async () => {
+    if (busy || syncing || repairing || operationInFlight.current || !archiveRequest) return;
+    operationInFlight.current = true;
+    const request = archiveRequest;
+    setArchiveRequest(null);
+    setBusy(true);
+    try {
+      const result = await api.setCodexSessionsArchived(request.paths, request.archived);
+      setPicked((previous) => selectSessionPaths(previous, [...result.updated, ...result.unchanged], false));
+      setNote([
+        t(request.archived ? "sessions.archiveResult" : "sessions.restoreResult", {
+          n: result.updated.length, unchanged: result.unchanged.length, failed: result.failed.length,
+        }),
+        result.updated.length > 0 && result.backupDir ? t("sessions.archiveBackup", { path: result.backupDir }) : "",
+        ...result.failed.map((failure) => `${failure.relPath}: ${failure.error}`),
+        ...result.warnings,
+      ].filter(Boolean).join("\n"));
+    } catch (error) {
+      setNote(String(error));
+    } finally {
+      await load();
+      setBusy(false);
+      operationInFlight.current = false;
     }
   };
 
   const doSync = async () => {
-    if (busy || syncing || repairing || !targets?.targets.some((option) => option.id === target && option.available)) return;
+    if (busy || syncing || repairing || operationInFlight.current || !targets?.targets.some((option) => option.id === target && option.available)) return;
+    operationInFlight.current = true;
     setSyncing(true);
     setSyncProgress({ phase: "scanning", completed: 0, total: 0 });
     setConfirmingSync(false);
@@ -174,21 +179,24 @@ export function CodexSessionsPage() {
       setSyncProgress(null);
       setNote(String(e));
     } finally {
-      setSyncing(false);
       await load();
+      setSyncing(false);
+      operationInFlight.current = false;
     }
   };
 
   const doPrune = async () => {
-    if (busy || syncing || repairing) return;
+    if (busy || syncing || repairing || operationInFlight.current) return;
+    operationInFlight.current = true;
     setBusy(true);
     try {
       setNote(await api.pruneCodexSessionIndex());
     } catch (e) {
       setNote(String(e));
     } finally {
-      setBusy(false);
       await load();
+      setBusy(false);
+      operationInFlight.current = false;
     }
   };
 
@@ -237,6 +245,19 @@ export function CodexSessionsPage() {
           : t("sessions.srcSqlite"),
     [t],
   );
+
+  const disabled = busy || syncing || repairing || deleteRequest !== null || archiveRequest !== null;
+  const closeDetail = useCallback(() => setDetail(null), []);
+  const requestDelete = (paths: string[]) => {
+    if (disabled || !paths.length) return;
+    setDetail(null);
+    setDeleteRequest([...paths]);
+  };
+  const requestArchive = (paths: string[], archived: boolean) => {
+    if (disabled || !paths.length) return;
+    setDetail(null);
+    setArchiveRequest({ paths: [...paths], archived });
+  };
 
   return (
     // 🔴 **`h-full overflow-y-auto`：整页一起滚。** `App` 的 `<main>` 是
@@ -292,7 +313,9 @@ export function CodexSessionsPage() {
         </div>
       )}
 
-      {/* 同步区：目标下拉 + 立刻同步 + 自动同步开关 */}
+      <details className="space-y-3 rounded-control border border-border p-4">
+      <summary className="cursor-pointer text-sm font-medium text-text-primary">{t("sessions.maintenance")}</summary>
+      {maintenanceError && <p className="whitespace-pre-wrap text-sm text-warning">{maintenanceError}</p>}
       {targets && (
         <div className="space-y-3 rounded-control border border-border p-4">
           <div className="flex flex-wrap items-end gap-3">
@@ -392,88 +415,33 @@ export function CodexSessionsPage() {
         </p>
       )}
 
-      {note && <p className="rounded-control bg-surface-hover p-3 text-sm text-text-primary">{note}</p>}
+      </details>
+      {note && <p role="status" className="whitespace-pre-wrap break-words rounded-control bg-surface-hover p-3 text-sm text-text-primary">{note}</p>}
       {error && (
         <p className="rounded-control border border-danger/40 bg-danger/8 p-3 text-sm text-text-primary">
           {t("sessions.loadFailed")}: {error}
         </p>
       )}
 
-      {picked.size > 0 && (
-        <div className="flex flex-wrap items-center gap-3 rounded-control border border-border bg-surface-hover p-3">
-          <span className="text-sm text-text-primary">{t("sessions.selected", { n: picked.size })}</span>
-          {/* 勾完再筛选会让选中项藏起来 —— 藏着的条目照样会被删，所以必须点出来有几条 */}
-          {hiddenPicked > 0 && (
-            <span className="text-xs text-warning">
-              {t("sessions.pickedHidden", { n: hiddenPicked })}
-            </span>
-          )}
-          <Button variant="danger" size="sm" disabled={busy || syncing || repairing} onClick={() => setConfirming(true)}>
-            <Trash2 className="h-4 w-4" />
-            {t("sessions.deleteSelected")}
-          </Button>
-        </div>
-      )}
-
-      {confirming && (
-        <div className="rounded-control border border-danger/50 bg-danger/8 p-4">
-          <p className="font-medium text-text-primary">{t("sessions.confirmTitle")}</p>
-          <p className="mt-1 text-sm text-text-muted">
-            {t("sessions.confirmBody", { n: picked.size })}
-          </p>
-          <div className="mt-3 flex gap-2">
-                <Button variant="danger" size="sm" disabled={busy || syncing || repairing} onClick={() => void doDelete()}>
-                  {t("sessions.confirmOk")}
-                </Button>
-                <Button size="sm" variant="outline" onClick={() => setConfirming(false)}>
-                  {t("sessions.cancel")}
-                </Button>
-          </div>
-        </div>
-      )}
-
-      {data === null ? (
+      {data === null && !error ? (
         <p className="text-sm text-text-muted">{t("sessions.loading")}</p>
-      ) : data.rows.length === 0 ? (
+      ) : data?.rows.length === 0 ? (
         <p className="text-sm text-text-muted">{t("sessions.empty")}</p>
-      ) : (
-        <div className="space-y-3">
-          <div className="flex flex-wrap items-center gap-3">
-            <input
-              type="search"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder={t("sessions.filterPlaceholder")}
-              aria-label={t("sessions.filter")}
-              className="min-w-[16rem] flex-1 rounded-control border border-border bg-surface px-2.5 py-1.5 text-sm text-text-primary"
-            />
-            <label className="flex items-center gap-1.5 text-sm text-text-muted">
-              <input type="checkbox" checked={onlyBad} onChange={(e) => setOnlyBad(e.target.checked)} />
-              {t("sessions.onlyMismatched")}
-            </label>
-            <label className="flex items-center gap-1.5 text-sm text-text-muted">
-              <input
-                type="checkbox"
-                checked={onlyGone}
-                onChange={(e) => setOnlyGone(e.target.checked)}
-              />
-              {t("sessions.onlyModelGone")}
-            </label>
-            {shown.length !== data.rows.length && (
-              <span className="text-xs text-text-muted">
-                {t("sessions.filtered", { n: shown.length, total: data.rows.length })}
-              </span>
-            )}
-          </div>
-          <SessionTable
-            rows={shown}
-            currentProvider={data.currentProvider}
-            picked={picked}
-            onToggle={toggle}
-            onExport={(r) => void doExport(r)}
-          />
-        </div>
-      )}
+      ) : data ? <SessionBrowser data={data} picked={picked} disabled={disabled}
+        onSelect={(paths, selected) => setPicked((previous) => selectSessionPaths(previous, paths, selected))}
+        onDetails={setDetail} onExport={(row) => void doExport(row)} onDelete={requestDelete} onArchive={requestArchive} /> : null}
+      {deleteRequest && <ConfirmDialog title={t("sessions.confirmTitle")}
+        description={t("sessions.confirmBody", { n: deleteRequest.length })}
+        confirmLabel={t("sessions.confirmOk")} cancelLabel={t("sessions.cancel")}
+        busy={busy || syncing || repairing} onConfirm={() => void doDelete()} onCancel={() => setDeleteRequest(null)} />}
+      {archiveRequest && <ConfirmDialog tone="primary"
+        title={t(archiveRequest.archived ? "sessions.archiveConfirmTitle" : "sessions.restoreConfirmTitle")}
+        description={t("sessions.archiveConfirmBody", { n: archiveRequest.paths.length })}
+        confirmLabel={t(archiveRequest.archived ? "sessions.archive" : "sessions.restore")} cancelLabel={t("sessions.cancel")}
+        busy={busy || syncing || repairing} onConfirm={() => void doArchive()} onCancel={() => setArchiveRequest(null)} />}
+      {detail && <SessionDetailDialog row={detail} disabled={disabled} onClose={closeDetail}
+        onExport={(row) => { setDetail(null); void doExport(row); }}
+        onArchive={(row) => requestArchive([row.relPath], !row.archived)} onDelete={(row) => requestDelete([row.relPath])} />}
       </div>
     </div>
   );
@@ -488,8 +456,3 @@ function Stat({ label, value, danger }: { label: string; value: string; danger?:
   );
 }
 
-/** 后端返回的行必须有这几个字段才敢渲染（见 `load` 里那段注释）。 */
-function isValidRow(r: unknown): r is CodexSessionRow {
-  const o = r as Partial<CodexSessionRow> | null;
-  return !!o && typeof o.relPath === "string" && typeof o.provider === "string";
-}

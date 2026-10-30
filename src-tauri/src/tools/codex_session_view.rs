@@ -66,6 +66,10 @@ pub(in crate::tools) struct ThreadInfo {
     pub model: String,
     pub effort: String,
     pub tokens: u64,
+    pub archived: Option<bool>,
+    pub updated_at_ms: Option<i64>,
+    pub thread_source: String,
+    pub source: String,
 }
 
 /// 列表页顶部那张统计卡。
@@ -126,7 +130,7 @@ fn cache_key(home: &Path, rel: &str) -> (String, u64, u64) {
             (ms, m.len())
         })
         .unwrap_or((0, 0));
-    (rel.to_string(), ms, len)
+    (home.join(rel).to_string_lossy().into_owned(), ms, len)
 }
 
 fn cached_title(home: &Path, rel: &str) -> Option<String> {
@@ -213,11 +217,6 @@ pub(in crate::tools) fn enrich(
         ..SessionStats::default()
     };
     for r in rows.iter_mut() {
-        if r.archived {
-            stats.archived += 1;
-        } else {
-            stats.active += 1;
-        }
         // 🔴 统计卡的这一位与表格里「哪些行标红」必须**同源**：两处各算一遍必然漂移，
         // 而漂移的表现是「表头说 3 条指向别处、表里只标红 1 行」，用户不知道该信哪个。
         // 前端拿的就是这个数字（`data.stats.mismatched`），不自己再 filter 一遍。
@@ -241,6 +240,24 @@ pub(in crate::tools) fn enrich(
             r.model = i.model.clone();
             r.effort = i.effort.clone();
             r.tokens = i.tokens;
+            if let Some(archived) = i.archived {
+                r.archived = archived;
+            }
+            if let Some(updated) = i.updated_at_ms.and_then(chrono::DateTime::from_timestamp_millis) {
+                r.updated_at = updated.to_rfc3339();
+            }
+            if r.thread_source.trim().is_empty() {
+                r.thread_source = i.thread_source.clone();
+            }
+            if r.source.trim().is_empty() || r.source == "null" {
+                r.source = i.source.clone();
+            }
+        }
+        r.internal = super::catalog::is_internal_source(&r.thread_source, &r.source, r.forked);
+        if r.archived {
+            stats.archived += 1;
+        } else {
+            stats.active += 1;
         }
         if r.title.is_empty() {
             // 库里没有它（fork 子会话），或那几列都是空的 / 是注入 —— 回落到读正文。
@@ -308,10 +325,17 @@ fn thread_info(home: &Path) -> HashMap<String, ThreadInfo> {
             if title_expr.is_empty() { "''".to_string() } else { format!("COALESCE({title_expr}, '')") };
         let pick = |c: &str| if has(c) { c.to_string() } else { "''".to_string() };
         let sql = format!(
-            "SELECT id, {title_expr}, {}, {}, {} FROM threads",
+            "SELECT id, {title_expr}, {}, {}, {}, {}, {}, {}, {} FROM threads",
             pick("model"),
             pick("reasoning_effort"),
             if has("tokens_used") { "tokens_used" } else { "0" },
+            if has("archived") { "archived" } else { "NULL" },
+            if has("updated_at_ms") && has("updated_at") {
+                "COALESCE(NULLIF(updated_at_ms, 0), updated_at * 1000)"
+            } else if has("updated_at_ms") { "updated_at_ms" }
+            else if has("updated_at") { "updated_at * 1000" } else { "NULL" },
+            pick("thread_source"),
+            pick("source"),
         );
         let Ok(mut stmt) = conn.prepare(&sql) else { continue };
         let Ok(rows) = stmt.query_map([], |r| {
@@ -322,6 +346,10 @@ fn thread_info(home: &Path) -> HashMap<String, ThreadInfo> {
                     model: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                     effort: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                     tokens: r.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64,
+                    archived: r.get::<_, Option<bool>>(5)?,
+                    updated_at_ms: r.get::<_, Option<i64>>(6)?.filter(|value| *value > 0),
+                    thread_source: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    source: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
                 },
             ))
         }) else {
@@ -423,6 +451,44 @@ mod tests {
 
     const USER_LINE: &str = "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"使用java写一个快速排序\"}]}}\n";
     const DEV_LINE: &str = "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":\"APP-CONTEXT\"}]}}\n";
+
+    #[test]
+    fn database_archive_and_activity_override_folder_and_creation_metadata() {
+        let home = tmp_home("archive-activity");
+        write_rollout(&home, "rollout-2026-09-01T21-06-47-01a05d14-4e5b-7773-b425-25ae029f078f.jsonl", "synaroute", USER_LINE);
+        let connection = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        connection.execute_batch("CREATE TABLE threads (id TEXT, archived INTEGER, updated_at INTEGER, updated_at_ms INTEGER); INSERT INTO threads VALUES ('01a05d14-4e5b-7773-b425-25ae029f078f', 1, 1793354400, 1793354400123);").unwrap();
+        let mut rows = super::super::scan_at(&home).sessions;
+        let stats = enrich(&home, &mut rows, "synaroute", &[]);
+        assert!(rows[0].archived);
+        assert_eq!(stats.archived, 1);
+        assert_eq!(stats.active, 0);
+        assert_eq!(chrono::DateTime::parse_from_rfc3339(&rows[0].updated_at).unwrap().timestamp_millis(), 1793354400123);
+        connection.execute("UPDATE threads SET archived = 0, updated_at_ms = 0", []).unwrap();
+        rows[0].archived = true;
+        let stats = enrich(&home, &mut rows, "synaroute", &[]);
+        assert!(!rows[0].archived);
+        assert_eq!(stats.active, 1);
+        assert_eq!(chrono::DateTime::parse_from_rfc3339(&rows[0].updated_at).unwrap().timestamp_millis(), 1793354400000);
+        drop(connection);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn title_cache_is_isolated_by_codex_home_even_with_matching_paths_sizes_and_mtimes() {
+        let first = tmp_home("cache-first");
+        let second = tmp_home("cache-second");
+        let name = "rollout-2026-09-01T21-06-47-01a05d14-4e5b-7773-b425-25ae029f078f.jsonl";
+        let rel = write_rollout(&first, name, "synaroute", &USER_LINE.replace("使用java写一个快速排序", "First title"));
+        write_rollout(&second, name, "synaroute", &USER_LINE.replace("使用java写一个快速排序", "Other title"));
+        let fixed = std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1700000000));
+        std::fs::File::options().write(true).open(first.join(&rel)).unwrap().set_times(fixed).unwrap();
+        std::fs::File::options().write(true).open(second.join(&rel)).unwrap().set_times(fixed).unwrap();
+        assert_eq!(cached_title(&first, &rel).as_deref(), Some("First title"));
+        assert_eq!(cached_title(&second, &rel).as_deref(), Some("Other title"));
+        fs::remove_dir_all(first).unwrap();
+        fs::remove_dir_all(second).unwrap();
+    }
 
     /// 🔴 标题优先取库里的 `name`（Codex 自己生成的短标题），而不是原始第一条消息。
     ///

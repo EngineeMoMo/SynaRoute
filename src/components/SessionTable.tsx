@@ -12,7 +12,7 @@
 
 import type { CodexSessionRow } from "@/types";
 import { Badge } from "@/components/ui/Badge";
-import { Download } from "lucide-react";
+import { Archive, ArchiveRestore, Download, Trash2 } from "lucide-react";
 import { useT } from "@/lib/useT";
 
 export function SessionTable({
@@ -21,12 +21,20 @@ export function SessionTable({
   picked,
   onToggle,
   onExport,
+  onDetails,
+  onArchive,
+  onDelete,
+  disabled = false,
 }: {
   rows: CodexSessionRow[];
   currentProvider: string;
   picked: Set<string>;
   onToggle: (relPath: string) => void;
   onExport: (row: CodexSessionRow) => void;
+  onDetails: (row: CodexSessionRow) => void;
+  onArchive: (row: CodexSessionRow) => void;
+  onDelete: (row: CodexSessionRow) => void;
+  disabled?: boolean;
 }) {
   const t = useT();
   return (
@@ -50,7 +58,7 @@ export function SessionTable({
             <th className="px-3 py-2">{t("sessions.colTitle")}</th>
             <th className="px-3 py-2">{t("sessions.colProvider")}</th>
             <th className="px-3 py-2">{t("sessions.colModel")}</th>
-            <th className="px-3 py-2">{t("sessions.colTime")}</th>
+            <th className="px-3 py-2">{t("sessions.updatedAt")}</th>
             <th className="px-3 py-2">{t("sessions.colCwd")}</th>
             <th className="px-3 py-2 text-right">{t("sessions.colSize")}</th>
             <th className="px-3 py-2 text-right">{t("sessions.colOps")}</th>
@@ -64,15 +72,16 @@ export function SessionTable({
                 <td className="px-3 py-2">
                   <input
                     type="checkbox"
-                    aria-label={r.relPath}
+                    aria-label={t("sessions.selectSession", { title: r.title || r.threadId || r.relPath })}
+                    disabled={disabled}
                     checked={picked.has(r.relPath)}
                     onChange={() => onToggle(r.relPath)}
                   />
                 </td>
                 <td className="max-w-[24rem] px-3 py-2">
-                  <div className="truncate text-text-primary" title={r.title || r.relPath}>
+                  <button type="button" onClick={() => onDetails(r)} className="block max-w-full truncate text-left text-text-primary hover:text-primary hover:underline" title={r.title || r.relPath}>
                     {r.title || t("sessions.noTitle")}
-                  </div>
+                  </button>
                   <div className="mt-0.5 flex flex-wrap items-center gap-1">
                     {r.archived && <Badge variant="neutral">{t("sessions.archived")}</Badge>}
                     {r.forked && <Badge variant="neutral">{t("sessions.forked")}</Badge>}
@@ -105,7 +114,7 @@ export function SessionTable({
                     <div className="text-xs">{formatTokens(r.tokens)} tokens</div>
                   )}
                 </td>
-                <td className="whitespace-nowrap px-3 py-2 text-text-primary">{formatTime(r.timestamp)}</td>
+                <td className="whitespace-nowrap px-3 py-2 text-text-primary">{formatTime(r.updatedAt || r.timestamp)}</td>
                 <td className="max-w-[16rem] truncate px-3 py-2 text-text-muted" title={r.cwd}>
                   {r.cwd || "—"}
                   {/* Desktop 项目侧栏的归属。空 = 未归入任何项目，那正是「这条对话为什么
@@ -124,6 +133,7 @@ export function SessionTable({
                 <td className="whitespace-nowrap px-3 py-2 text-right">
                   <button
                     type="button"
+                    disabled={disabled}
                     onClick={() => onExport(r)}
                     title={t("sessions.export")}
                     className="inline-flex items-center gap-1 rounded-control border border-border px-2 py-1 text-xs text-text-primary transition-colors hover:border-border-strong hover:bg-surface-hover"
@@ -131,6 +141,13 @@ export function SessionTable({
                     <Download className="h-3.5 w-3.5" />
                     {t("sessions.export")}
                   </button>
+                  <button type="button" disabled={disabled} onClick={() => onArchive(r)}
+                    aria-label={t(r.archived ? "sessions.restore" : "sessions.archive")} title={t(r.archived ? "sessions.restore" : "sessions.archive")}
+                    className="ml-1 inline-flex rounded-control p-1.5 text-text-muted hover:bg-surface-hover hover:text-primary disabled:opacity-50">
+                    {r.archived ? <ArchiveRestore size={15} /> : <Archive size={15} />}
+                  </button>
+                  <button type="button" disabled={disabled} onClick={() => onDelete(r)} aria-label={t("sessions.delete")} title={t("sessions.delete")}
+                    className="ml-1 inline-flex rounded-control p-1.5 text-text-muted hover:bg-danger/8 hover:text-danger disabled:opacity-50"><Trash2 size={15} /></button>
                 </td>
               </tr>
             );

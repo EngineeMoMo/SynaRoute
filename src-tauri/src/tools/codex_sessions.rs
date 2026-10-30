@@ -55,6 +55,7 @@ const MANIFEST_FILE: &str = "codex-session-providers.json";
 #[path = "codex_session_guard.rs"] mod guard;
 #[path = "codex_session_target.rs"] mod target;
 #[path = "codex_session_maintenance.rs"] pub(crate) mod maintenance;
+#[path = "codex_session_archive.rs"] pub(crate) mod archive;
 
 // 文件层的原语都在 [`files`] 里。这里再导出一次，让 [`ops`]/[`view`]/[`sync`] 与本模块
 // 用同一个名字 —— 各处 `files::` 前缀写法不一致时，「到底哪份实现」会变成一个要查的问题。
@@ -90,6 +91,8 @@ pub(crate) struct SessionRef {
     pub archived: bool,
     pub cwd: String,
     pub timestamp: String,
+    pub updated_at: String,
+    pub internal: bool,
     pub bytes: u64,
     /// Codex 的结构化来源标记（如 `{"subagent":...}`）。非空且命中内部来源形态时，
     /// 与 `thread_source`/edge/job 一样表示内部派生；普通用户 fork 不因此被排除。
@@ -327,7 +330,11 @@ fn parse_meta(line: &str) -> Option<(String, String, String, String, String, Str
 pub(in crate::tools) fn scan_at(home: &Path) -> ScanReport {
     let mut report = ScanReport::default();
     for (path, archived) in collect_rollouts(home) {
-        let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let metadata = fs::metadata(&path).ok();
+        let bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+        let updated_at = metadata.and_then(|m| m.modified().ok())
+            .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339())
+            .unwrap_or_default();
         let Ok(line) = read_first_line(&path) else {
             report.unreadable += 1;
             continue;
@@ -353,6 +360,8 @@ pub(in crate::tools) fn scan_at(home: &Path) -> ScanReport {
             archived,
             cwd,
             timestamp,
+            updated_at,
+            internal: false,
             bytes,
             source,
             thread_source,
