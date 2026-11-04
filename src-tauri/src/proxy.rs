@@ -4752,6 +4752,18 @@ mod tests {
             assert_eq!(row.attempts, 1); assert_eq!(row.successes, u64::from(status == 200));
             assert_eq!(row.rate_limits, u64::from(status == 429)); assert_eq!(row.streaming, streaming);
             assert!(!serde_json::to_string(&snapshot).unwrap().contains("private-body"));
+            let attempts = store.route_profiles.latest();
+            assert_eq!(attempts.len(), 1);
+            let attempt = &attempts[0];
+            assert_eq!(attempt.key_id, id);
+            assert_eq!(attempt.requested_model, "m");
+            assert_eq!(attempt.streaming, streaming);
+            assert_eq!(attempt.ok, status == 200);
+            assert_eq!(attempt.status, Some(status));
+            let serialized = serde_json::to_string(&attempts).unwrap();
+            for secret in ["private-body", "local-test-secret", upstream.as_str()] {
+                assert!(!serialized.contains(secret));
+            }
             assert!(store.list_all_events().iter().all(|e| !e.has_trace));
             manager.stop(CategoryType::ClaudeCli); store.flush_usage_if_dirty();
             assert!(dir.join("route-profiles.json").exists());

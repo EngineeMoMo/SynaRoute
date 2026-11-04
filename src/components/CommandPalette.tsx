@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
+  Waypoints,
   Search,
   Brain,
   ScrollText,
@@ -31,6 +32,7 @@ import { openLogDir } from "@/lib/openLogDir";
 const CATEGORIES: CategoryType[] = ["claude-cli", "claude-desktop", "codex"];
 
 const NAV_ICONS: Record<NavKey, LucideIcon> = {
+  overview: Waypoints,
   ...CATEGORY_ICONS,
   brain: Brain,
   sessions: History,

@@ -21,6 +21,7 @@ import { CATEGORY_ICONS } from "@/lib/categoryIcons";
 
 export type NavKey =
   | CategoryType
+  | "overview"
   | "brain"
   | "sessions"
   | "logs"
@@ -38,6 +39,7 @@ interface NavItem {
 }
 
 const NAV: NavItem[] = [
+  { key: "overview", tKey: "nav.overview", icon: Waypoints, group: "category" },
   { key: "claude-cli", tKey: "nav.claude-cli", icon: CATEGORY_ICONS["claude-cli"], group: "category" },
   { key: "claude-desktop", tKey: "nav.claude-desktop", icon: CATEGORY_ICONS["claude-desktop"], group: "category" },
   { key: "codex", tKey: "nav.codex", icon: CATEGORY_ICONS.codex, group: "category" },

@@ -1338,7 +1338,7 @@ pub fn run() {
             get_effective_log_dir,
             prepare_log_dir,
             open_log_dir,
-            export_diagnostics, diagnostics::resilience::resilience_overview,
+            export_diagnostics, diagnostics::resilience::resilience_overview, tools::overview::routing_overview,
             store::shared_config::build_shared_template, store::shared_config::preview_shared_template,
             store::shared_config::save_shared_template, store::shared_config::apply_shared_template, store::shared_config::undo_shared_template,
             portable::export_config,

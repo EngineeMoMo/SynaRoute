@@ -28,7 +28,7 @@ const BACKUP_SUFFIX: &str = "synaroute.bak";
 ///
 /// 子模块能访问 `tools` 的私有项（Rust 的可见性是「定义模块及其后代」），
 /// 故 `read_preview_text` 等**无需放宽可见性**。
-pub(crate) mod codex;
+pub(crate) mod codex; pub(crate) mod overview;
 
 /// 写入 / 备份 / 回滚 / 还原这一层。抽出来的判据见该模块头。
 mod fsops;

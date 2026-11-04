@@ -1,6 +1,7 @@
 import * as React from "react";
 import { useEffect, useState } from "react";
 import { Sidebar, type NavKey } from "@/components/Sidebar";
+import { RoutingOverviewPage } from "@/pages/RoutingOverviewPage";
 import { CategoryPage } from "@/pages/CategoryPage";
 import { BrainPage } from "@/pages/BrainPage";
 import { LogsPage } from "@/pages/LogsPage";
@@ -56,7 +57,7 @@ export default function App() {
   });
   const theme = useStore((s) => s.theme);
   const t = useT();
-  const [nav, setNav] = useState<NavKey>("claude-cli");
+  const [nav, setNav] = useState<NavKey>("overview");
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingKey, setEditingKey] = useState<ProviderKey | null>(null);
   /**
@@ -200,6 +201,7 @@ export default function App() {
   );
 
   const renderMain = () => {
+    if (nav === "overview") return <RoutingOverviewPage onManage={handleNav} onOpenLogs={() => handleNav("logs")} onOpenReliability={() => handleNav("resilience")} />;
     if (nav === "brain") return <BrainPage />;
     if (nav === "sessions") return <CodexSessionsPage />;
     if (nav === "logs") return <LogsPage />;

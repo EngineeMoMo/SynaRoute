@@ -35,9 +35,25 @@ pub struct ProfileSnapshot {
     pub read_only: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LatestAttempt {
+    pub category_id: CategoryType,
+    pub key_id: String,
+    pub key_name: String,
+    pub requested_model: String,
+    pub real_model: String,
+    pub streaming: bool,
+    pub ok: bool,
+    pub status: Option<u16>,
+    pub latency_ms: u64,
+    pub observed_at: i64,
+}
+
 struct State {
     snapshot: ProfileSnapshot,
     dirty: bool,
+    latest: Vec<LatestAttempt>,
 }
 
 pub struct ProfileStore {
@@ -80,6 +96,7 @@ impl ProfileStore {
             state: Mutex::new(State {
                 snapshot,
                 dirty: false,
+                latest: Vec::new(),
             }),
             flush_lock: Mutex::new(()),
         }
@@ -121,6 +138,18 @@ impl ProfileStore {
         now: i64,
     ) {
         let mut state = self.state.lock();
+        if requested.len() <= 256 && real.len() <= 256 {
+            let attempt = LatestAttempt {
+                category_id: key.category_id, key_id: key.id.clone(), key_name: key.name.clone(),
+                requested_model: requested.into(), real_model: real.into(), streaming, ok, status,
+                latency_ms: latency, observed_at: now,
+            };
+            if let Some(old) = state.latest.iter_mut().find(|a| a.category_id == key.category_id) {
+                *old = attempt;
+            } else {
+                state.latest.push(attempt);
+            }
+        }
         let s = &mut state.snapshot;
         let day = now.div_euclid(DAY_MS);
         s.rows.retain(|r| r.day >= day - 29);
@@ -171,6 +200,10 @@ impl ProfileStore {
         }
         row.last_seen = now;
         state.dirty = true;
+    }
+
+    pub fn latest(&self) -> Vec<LatestAttempt> {
+        self.state.lock().latest.clone()
     }
 
     pub fn snapshot(&self) -> ProfileSnapshot {
@@ -239,6 +272,39 @@ mod tests {
             now + 30 * DAY_MS,
         );
         assert_eq!(store.state.lock().snapshot.rows.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn latest_attempts_are_per_category_and_only_for_this_run() {
+        let dir = std::env::temp_dir().join(format!("sr-latest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("profiles.json");
+        let store = ProfileStore::load(path.clone());
+        let mut key = ProviderKey { id: "latest-first".into(), name: "Original name".into(), ..Default::default() };
+        let now = chrono::Utc::now().timestamp_millis();
+        store.record_at(&key, "alias", "real-first", true, true, Some(200), 11, now);
+        key.id = "latest-second".into();
+        key.name = "Replacement name".into();
+        store.record_at(&key, "alias", "real-second", false, false, Some(429), 22, now + 1);
+        key.category_id = CategoryType::Codex;
+        store.record_at(&key, "codex", "codex-real", true, true, Some(200), 33, now + 2);
+        let latest = store.latest();
+        assert_eq!(latest.len(), 2);
+        let cli = latest.iter().find(|a| a.category_id == CategoryType::ClaudeCli).unwrap();
+        assert_eq!(cli.key_name, "Replacement name");
+        assert_eq!(cli.real_model, "real-second");
+        assert_eq!(cli.status, Some(429));
+        assert!(!cli.ok);
+        assert!(!cli.streaming);
+        assert_eq!(cli.latency_ms, 22);
+        assert_eq!(cli.observed_at, now + 1);
+        store.flush();
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        assert!(!bytes.contains("Replacement name"));
+        let restarted = ProfileStore::load(path);
+        assert!(!restarted.snapshot().rows.is_empty());
+        assert!(restarted.latest().is_empty(), "historical aggregates cannot stand in for a live attempt");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

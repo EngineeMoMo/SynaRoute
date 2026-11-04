@@ -44,6 +44,7 @@ import type {
 } from "@/types";
 import type { UserPrefs } from "@/lib/prefs";
 import type { ResilienceOverview } from "@/lib/resilience";
+import type { RoutingOverview } from "./routingOverview";
 import { mockBridge } from "./mockData";
 
 // Browser preview only: one mutable status so the switches stay consistent with each other.
@@ -95,6 +96,7 @@ async function sessionCall<T>(cmd: string, args: Record<string, unknown>, progre
 }
 
 export const api = {
+  routingOverview: () => call<RoutingOverview>("routing_overview", undefined, () => mockBridge.routingOverview()),
   getDecisionConfig: (categoryId: CategoryType) => call<DecisionView>("get_decision_config", { categoryId }, () => defaultDecision()),
   layaLocalStatus: () => call<LayaLocalStatus>("laya_local_status", undefined, () => ({ ...layaMock })),
   // An object, not positional booleans: swapping repair/noInstall at a call site must not be possible.
