@@ -16,7 +16,7 @@
 //
 // ## 判据
 //
-// 对比工作区的 baseline 与 `git HEAD` 里的那一份，只允许这些变化：
+// 本地与 HEAD 比较；CI 与事件指定的前置提交比较，只允许这些变化：
 //   - `frozen` 里某个数字**变小**，或整条**被删除**；
 //   - `counters` 里某个数字**变小**；
 //   - `newFileCapLines` **变小**。
@@ -26,6 +26,7 @@
 // 抬高不是不可能，而是**有成本、留痕迹**。
 import { readFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { comparisonRef } from "./lib/ratchet-base.mjs";
 
 const BASELINE = "config/quality/ratchet.json";
 const MIN_WHY_LEN = 20;
@@ -45,30 +46,25 @@ if (!existsSync(BASELINE)) {
 }
 
 let head;
-if (BEFORE_FILE) {
-  if (!existsSync(BEFORE_FILE)) {
-    console.error(`❌ --before 指定的文件不存在：${BEFORE_FILE}`);
-    process.exit(2);
+try {
+  if (beforeIdx >= 0) {
+    if (!BEFORE_FILE || !existsSync(BEFORE_FILE)) throw new Error("--before 必须指定存在的基线文件");
+    head = JSON.parse(readFileSync(BEFORE_FILE, "utf8"));
+  } else {
+    const git = args => execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    const event = process.env.GITHUB_ACTIONS === "true" && process.env.GITHUB_EVENT_PATH
+      ? JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8")) : {};
+    const before = comparisonRef(process.env, event, git);
+    const commit = git(["rev-parse", "--verify", `${before}^{commit}`]).trim();
+    if (process.env.GITHUB_ACTIONS === "true" && commit === git(["rev-parse", "HEAD"]).trim()) {
+      throw new Error("CI 比较基准等于当前提交，检查无效");
+    }
+    head = JSON.parse(git(["show", `${commit}:${BASELINE}`]));
+    console.log(`棘轮比较基准：${before} (${commit})`);
   }
-  head = JSON.parse(readFileSync(BEFORE_FILE, "utf8"));
-} else {
-  try {
-    head = JSON.parse(
-      execFileSync("git", ["show", `HEAD:${BASELINE}`], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-      })
-    );
-  } catch {
-    // HEAD 里还没有这个文件（首次引入棘轮的那个提交）→ 无从对比，放行。
-    // ⚠️ 这条分支意味着「本次运行什么都没验」。刻意打印得显眼一点，
-    // 免得它在 CI 日志里被当成一次成功的检查。
-    console.log(
-      "⚠️  HEAD 里尚无棘轮基线（首次引入棘轮的提交）→ 无从对比，本次**什么都没验**。\n" +
-        "    下一个提交起本检查才真正生效。要现在验，用 --before <改动前的基线文件>。"
-    );
-    process.exit(0);
-  }
+} catch (error) {
+  console.error(`无法读取有效的改动前基线，检查失败：${error.message}`);
+  process.exit(2);
 }
 const now = JSON.parse(readFileSync(BASELINE, "utf8"));
 

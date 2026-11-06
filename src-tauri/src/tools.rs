@@ -28,7 +28,7 @@ const BACKUP_SUFFIX: &str = "synaroute.bak";
 ///
 /// 子模块能访问 `tools` 的私有项（Rust 的可见性是「定义模块及其后代」），
 /// 故 `read_preview_text` 等**无需放宽可见性**。
-pub(crate) mod codex; pub(crate) mod overview;
+pub(crate) mod codex; pub(crate) mod overview; pub(crate) mod scene_config;
 
 /// 写入 / 备份 / 回滚 / 还原这一层。抽出来的判据见该模块头。
 mod fsops;
@@ -76,7 +76,7 @@ const DESKTOP_META_FILE: &str = "_meta.json";
 /// - **Claude CLI only**：取首个写 env.ANTHROPIC_MODEL + 顶层 `model`；并清除档位 DEFAULT_* 残留。
 /// - **Codex only**：整份写进 `model_catalog_json` 模型目录；顶层 `model` **仅在缺失/不可服务时**写。
 /// - **桌面端**：整份列表写进 gateway 档的 `inferenceModels`（切 3p 部署模式，见 apply_claude_desktop）。
-pub fn apply(
+pub fn apply(groups: &[crate::store::routing::config::RouteGroup],
     category: CategoryType,
     endpoint: &str,
     models: &[String],
@@ -85,8 +85,8 @@ pub fn apply(
     let first = models.first().map(String::as_str);
     match category {
         CategoryType::ClaudeCli => apply_claude_cli(endpoint, first),
-        CategoryType::Codex => codex::apply(endpoint, models, keys),
-        CategoryType::ClaudeDesktop => apply_claude_desktop(endpoint, models, keys),
+        CategoryType::Codex => codex::apply(groups, endpoint, models, keys),
+        CategoryType::ClaudeDesktop => apply_claude_desktop(groups, endpoint, models, keys),
     }
 }
 
@@ -235,7 +235,7 @@ fn desktop_meta_path(threep: &Path) -> PathBuf {
     threep.join(DESKTOP_CONFIG_LIBRARY).join(DESKTOP_META_FILE)
 }
 
-fn apply_claude_desktop(
+fn apply_claude_desktop(groups: &[crate::store::routing::config::RouteGroup],
     endpoint: &str,
     models: &[String],
     keys: &[ProviderKey],
@@ -260,7 +260,7 @@ fn apply_claude_desktop(
             meta.clone(),
         ],
         || {
-            apply_desktop_at(
+            apply_desktop_at(groups,
                 &normal_config,
                 &threep_config,
                 &profile,
@@ -288,8 +288,8 @@ fn apply_claude_desktop(
 ///
 /// `keys` 供推导每条模型的能力断言（`supports1m` 等，见 [`build_desktop_model_entries`]）；
 /// 传空切片时退化为「无窗口数据」，即 `supports1m` 一律不写（保守，不做无依据的断言）。
-fn apply_desktop_at(
-    normal_config: &Path,
+#[allow(clippy::too_many_arguments)] // Four explicit file paths keep this testable without touching user configuration.
+fn apply_desktop_at(groups: &[crate::store::routing::config::RouteGroup], normal_config: &Path,
     threep_config: &Path,
     profile: &Path,
     meta: &Path,
@@ -327,7 +327,7 @@ fn apply_desktop_at(
     // 2) gateway 档：预填端点 + 占位 key + bearer + 模型清单（合并写，保留档内其它既有键）。
     //    每条模型的能力断言（supports1m / anthropicFamilyTier）由 Key 数据推导，见
     //    build_desktop_model_entries——不做无依据的断言。
-    let entries = build_desktop_model_entries(&effective, keys);
+    let entries = desktop_profile::build_routing_entries(&effective, keys, groups);
     let profile_json = build_gateway_profile(existing, endpoint, &entries);
     crate::secret::atomic_write(profile, &serde_json::to_vec_pretty(&profile_json)?)?; // 不写 .bak：判据见 desktop_apply_leaves_no_stale_backup_snapshots
 
@@ -523,7 +523,7 @@ fn write_deployment_mode(path: &Path, mode: &str) -> AppResult<()> {
 
 #[path = "tools/desktop_profile.rs"] mod desktop_profile; // 桌面端 gateway 档 + labelOverride；取证见该文件模块注释
 #[path = "tools/env_conflicts.rs"] pub(crate) mod env_conflicts; // 客户端环境变量顶掉我们写的配置；判据与 CodexPlusPlus 的差异见该文件模块注释
-use desktop_profile::{build_desktop_model_entries, build_gateway_profile};
+use desktop_profile::build_gateway_profile; #[cfg(test)] use desktop_profile::build_desktop_model_entries;
 
 /// 接入时更新 `_meta.json`：确保 entries 里有本档（去重，与 cc-switch 档共存），appliedId 指向本档。
 fn write_desktop_meta_apply(path: &Path) -> AppResult<()> {
@@ -1844,7 +1844,7 @@ mod tests {
         assert!(after_mcp.contains("mcp_servers"), "MCP 项本身要写进去");
 
         // ② 接入（真正的「接入」）：此刻才该抓快照，且快照必须是**含 MCP 的当前内容**
-        codex::apply_at(&cfg, "http://127.0.0.1:47101", &[], &[], &cfg.with_extension("catalog.json")).unwrap();
+        codex::apply_at(&[], &cfg, "http://127.0.0.1:47101", &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         assert!(bak.exists(), "接入必须抓一份接入前快照");
         assert_eq!(
             std::fs::read_to_string(&bak).unwrap(),
@@ -3258,7 +3258,7 @@ tool_timeout_sec = 600
         );
 
         // 正常接入 → appliedId 是本档 → 无警告。
-        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
+        apply_desktop_at(&[], &normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
         assert!(
             detect_desktop_takeover_at(&profile, &meta).is_none(),
             "appliedId 仍指向本档时不得报警"
@@ -3337,6 +3337,7 @@ tool_timeout_sec = 600
 
         let models = vec!["claude-opus-4-8".to_string(), "claude-opus-5".to_string()];
         let msg = apply_desktop_at(
+            &[],
             &normal,
             &threep,
             &profile,
@@ -3401,7 +3402,7 @@ tool_timeout_sec = 600
         let (dir, normal, threep, profile, meta) = desktop_layout("desktop_warn_all");
         let models = vec!["glm-4.6".to_string(), "grok-4.5".to_string()];
         let msg =
-            apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &models, &[])
+            apply_desktop_at(&[], &normal, &threep, &profile, &meta, "http://127.0.0.1:1", &models, &[])
                 .unwrap();
 
         assert!(msg.contains("3p 部署模式"), "接入本身仍应成功: {msg}");
@@ -3432,7 +3433,7 @@ tool_timeout_sec = 600
         let (dir, normal, threep, profile, meta) = desktop_layout("desktop_warn_part");
         let models = vec!["claude-opus-4-8".to_string(), "glm-4.6".to_string()];
         let msg =
-            apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &models, &[])
+            apply_desktop_at(&[], &normal, &threep, &profile, &meta, "http://127.0.0.1:1", &models, &[])
                 .unwrap();
 
         assert!(msg.contains("glm-4.6"), "要点出不合规的那个: {msg}");
@@ -3451,7 +3452,7 @@ tool_timeout_sec = 600
         let (dir, normal, threep, profile, meta) = desktop_layout("desktop_warn_none");
         let models = vec!["claude-opus-4-8".to_string(), "opus".to_string()];
         let msg =
-            apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &models, &[])
+            apply_desktop_at(&[], &normal, &threep, &profile, &meta, "http://127.0.0.1:1", &models, &[])
                 .unwrap();
         assert!(!msg.contains('⚠'), "全合规不该有警告: {msg}");
         assert!(!msg.contains("不被桌面端接受"), "全合规不该有警告: {msg}");
@@ -3465,7 +3466,7 @@ tool_timeout_sec = 600
         // 进了 3p 却无模型可选，运行时发现一失败就 models_not_discovered、连会话都开不起来
         // （与「卡 get-started」同级的死局）。
         let (dir, normal, threep, profile, meta) = desktop_layout("desktop_nomodels");
-        let err = apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &[], &[])
+        let err = apply_desktop_at(&[], &normal, &threep, &profile, &meta, "http://127.0.0.1:1", &[], &[])
             .unwrap_err();
         assert!(
             err.to_string().contains("至少一个可服务模型"),
@@ -3485,6 +3486,7 @@ tool_timeout_sec = 600
         let (dir, normal, threep, profile, meta) = desktop_layout("desktop_empty_fallback");
         // 先以非空模型接入（写入 gateway 档 + inferenceModels=[A]）。
         apply_desktop_at(
+            &[],
             &normal,
             &threep,
             &profile,
@@ -3496,7 +3498,7 @@ tool_timeout_sec = 600
         .unwrap();
 
         // 再以空模型「改端口」重写：应成功、端点更新、模型清单保留。
-        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:2", &[], &[]).unwrap();
+        apply_desktop_at(&[], &normal, &threep, &profile, &meta, "http://127.0.0.1:2", &[], &[]).unwrap();
 
         let p: Value = serde_json::from_slice(&std::fs::read(&profile).unwrap()).unwrap();
         assert_eq!(
@@ -3526,6 +3528,7 @@ tool_timeout_sec = 600
         .unwrap();
 
         apply_desktop_at(
+            &[],
             &normal,
             &threep,
             &profile,
@@ -3569,7 +3572,7 @@ tool_timeout_sec = 600
         )
         .unwrap();
 
-        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
+        apply_desktop_at(&[], &normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
 
         let m: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
         assert_eq!(m["appliedId"], DESKTOP_PROFILE_ID, "appliedId 应改指本档");
@@ -3589,7 +3592,7 @@ tool_timeout_sec = 600
         // 重复接入：entries 里本档不重复出现（去重）。
         let (dir, normal, threep, profile, meta) = desktop_layout("desktop_idem");
         for _ in 0..3 {
-            apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
+            apply_desktop_at(&[], &normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
         }
         let m: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
         let ours: Vec<_> = m["entries"]
@@ -3612,7 +3615,7 @@ tool_timeout_sec = 600
         // （desktop_restore_deletes_configs_it_created）。
         std::fs::write(&normal, b"{}").unwrap();
         std::fs::write(&threep, b"{}").unwrap();
-        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
+        apply_desktop_at(&[], &normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
         assert!(profile.exists());
         assert_eq!(
             read_desktop_applied_id(&meta).as_deref(),
@@ -3652,7 +3655,7 @@ tool_timeout_sec = 600
         assert!(!normal.exists(), "前提：normal config 接入前不存在");
         assert!(!threep.exists(), "前提：threep config 接入前不存在");
 
-        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
+        apply_desktop_at(&[], &normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
         assert!(normal.exists(), "接入应凭空建出 normal config");
         assert!(threep.exists(), "接入应凭空建出 threep config");
 
@@ -3717,6 +3720,7 @@ tool_timeout_sec = 600
         .unwrap();
 
         apply_desktop_at(
+            &[],
             &normal,
             &threep,
             &profile,
@@ -3739,6 +3743,7 @@ tool_timeout_sec = 600
 
         // 重复接入同样不该凭空长出 .bak（首写即锁那条语义的反向验证）
         apply_desktop_at(
+            &[],
             &normal,
             &threep,
             &profile,
@@ -3761,6 +3766,7 @@ tool_timeout_sec = 600
         assert!(!normal.exists(), "前置条件：normal 接入前不存在");
         std::fs::write(&threep, b"{}").unwrap();
         apply_desktop_at(
+            &[],
             &normal,
             &threep,
             &profile,
@@ -3808,7 +3814,7 @@ tool_timeout_sec = 600
         // 不再解析 JSON，本用例赖以制造失败的注入点（写非法 JSON）就失去着力点。
         std::fs::write(&normal, b"{}").unwrap();
         std::fs::write(&threep, b"{}").unwrap();
-        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
+        apply_desktop_at(&[], &normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
         assert!(profile.exists(), "前置条件：接入后 profile 存在");
         assert_eq!(
             read_desktop_applied_id(&meta).as_deref(),
@@ -3867,7 +3873,7 @@ tool_timeout_sec = 600
         let ccswitch_profile = meta.parent().unwrap().join(format!("{ccswitch_id}.json"));
         std::fs::write(&ccswitch_profile, r#"{"inferenceProvider":"gateway"}"#).unwrap();
 
-        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
+        apply_desktop_at(&[], &normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
         let n: Value = serde_json::from_slice(&std::fs::read(&normal).unwrap()).unwrap();
         assert_eq!(n["deploymentMode"], "3p", "接入后应为 3p");
 
@@ -3907,7 +3913,7 @@ tool_timeout_sec = 600
         )
         .unwrap();
 
-        apply_desktop_at(&normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
+        apply_desktop_at(&[], &normal, &threep, &profile, &meta, "http://127.0.0.1:1", &desktop_test_models(), &[]).unwrap();
         restore_desktop_at(&normal, &threep, &profile, &meta, Some(prev_id)).unwrap();
 
         let m: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
@@ -4087,6 +4093,7 @@ tool_timeout_sec = 600
 
         let (dir, normal, threep, profile, meta) = desktop_layout("hermetic_apply");
         apply_desktop_at(
+            &[],
             &normal,
             &threep,
             &profile,

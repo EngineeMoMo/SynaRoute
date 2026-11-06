@@ -405,7 +405,8 @@ pub(crate) fn guarded(
     Error = hyper::Error,
     Future = impl std::future::Future<Output = Result<Response<crate::proxy::ResBody>, hyper::Error>>,
 > {
-    service_fn(move |req: Request<Incoming>| {
+    service_fn(move |mut req: Request<Incoming>| {
+        req.extensions_mut().insert(crate::store::routing::identity::VerifiedPeer(peer.ip()));
         let store = store.clone();
         let gate_key = gate_key.clone();
         async move {

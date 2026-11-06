@@ -195,31 +195,13 @@ mod tests {
     /// 这是本仓第 9 次盯同一类接线盲区。
     #[test]
     fn both_streaming_exits_must_go_through_the_idle_guard() {
-        let src = std::fs::read_to_string("src/proxy.rs").unwrap();
+        let src = std::fs::read_to_string("src/proxy/streaming.rs").unwrap();
         let prod = crate::proxy::custom_headers::production_code_only(&src);
-        // ⚠️ **钉「两条出口都套了」这个性质，不钉某一种调用形态。**
-        //
-        // 第一版写死 `guard_stream_idle(resp.bytes_stream())` 这个**逐字**的串，于是任何给
-        // `guard_stream_idle` 加参数的改动都会让它变红 —— 哪怕两条出口仍然都套着。
-        // 我曾据此把「并发限流」判成做不到（那件事需要给这个 guard 传一个 permit），
-        // 而真正的障碍只是这一行断言。同 `tool_calls_must_run_concurrently` 那条：
-        // **钉手法的判据会在有人改进实现时制造假红，而假红的代价是改进被撤回去。**
-        //
-        // 现在按「函数名出现两次 + 每次都吃 `resp.bytes_stream()`」判，加参数不受影响。
-        assert_eq!(
-            prod.matches("guard_stream_idle(").count(),
-            2,
-            "同协议直通与跨协议翻译两条流式路径都要套静默超时"
-        );
-        assert_eq!(
-            prod.matches("resp.bytes_stream()").count(),
-            2,
-            "两处字节流都必须交给 guard_stream_idle，不许有第三处裸用"
-        );
-        assert!(
-            !prod.contains("let upstream = resp.bytes_stream();"),
-            "不许绕过静默超时直接用裸字节流"
-        );
+        // 同/跨协议共用一条上游入口；不是把旧的两处漏接为一处。
+        assert!(prod.contains("Some(tr) => Bytes::from(tr.push(&bytes)), None => bytes"));
+        assert_eq!(prod.matches("guard_stream_idle(").count(), 1);
+        assert_eq!(prod.matches("resp.bytes_stream()").count(), 1);
+        assert!(prod.contains("let state = State { upstream, translator,"));
     }
 }
 

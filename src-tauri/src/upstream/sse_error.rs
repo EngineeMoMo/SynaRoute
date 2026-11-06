@@ -48,6 +48,10 @@ use serde_json::{json, Value};
 /// 上游错误消息的截断上限。上游可能把整个 HTML 错误页塞进 message。
 const MSG_CAP: usize = 500;
 
+pub(crate) fn declares_error(json: &Value) -> bool {
+    matches!(json.get("type").and_then(Value::as_str), Some("error" | "response.failed"))
+}
+
 /// 这个 SSE 载荷是不是「上游报错」？是则返回可读消息。
 ///
 /// 三家协议的形态各不相同，判据刻意都收在这里（而不是散进六个方向函数）：
@@ -59,10 +63,8 @@ const MSG_CAP: usize = 500;
 /// `"error": null` 占位，`Value::Null` 既不是对象也不是字符串，故不会被误判 ——
 /// 而误判的代价是把一条正常增量翻译成错误、当场掐断一次好的对话。
 pub(crate) fn upstream_error_message(json: &Value) -> Option<String> {
-    let kind = json.get("type").and_then(Value::as_str);
     let err = json.get("error");
-    let is_err = kind == Some("error")
-        || kind == Some("response.failed")
+    let is_err = declares_error(json)
         || matches!(err, Some(v) if v.is_object() || v.is_string());
     if !is_err {
         return None;

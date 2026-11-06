@@ -1909,9 +1909,9 @@ pub struct McpStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
+    #[serde(default)] pub routing: crate::store::routing::config::RoutingConfig,
     #[serde(default)] pub decision: std::collections::BTreeMap<CategoryType, crate::store::decision::DecisionConfig>,
-    #[serde(default)]
-    pub config_version: u32,
+    #[serde(default)] pub config_version: u32,
     #[serde(default)]
     pub keys: Vec<ProviderKey>,
     #[serde(default)]

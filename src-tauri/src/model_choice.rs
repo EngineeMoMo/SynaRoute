@@ -38,6 +38,9 @@ use crate::store::Store;
 
 /// 本次请求应当使用的对外模型名。
 pub(super) fn pick(store: &Store, category: CategoryType, client_model: String) -> String {
+    if crate::store::routing::config::is_auto_id(client_model.trim()) {
+        return client_model.trim().to_owned();
+    }
     let Some(active) = store.active_model_of(category) else {
         // 没在应用内选过 → 一律透传客户端原值（现状，也是绝大多数用户的路径）。
         return client_model;
@@ -64,7 +67,7 @@ pub(super) fn pick(store: &Store, category: CategoryType, client_model: String) 
     // 并集口径下这道门比交集时**宽**得多（备用 Key 独有的名字现在也在清单里），方向是对的：
     // 用户在 Codex 菜单里选了什么就用什么，而「这条名字有没有 Key 认识」由
     // `model_pool::rank_candidates` 与 `reject_if_unserviceable` 各自把关。
-    if crate::proxy::discoverable_models(&store.enabled_keys_sorted(category))
+    if crate::store::routing::catalog::models(store, category)
         .iter()
         .any(|m| m == asked)
     {

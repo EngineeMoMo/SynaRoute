@@ -409,11 +409,11 @@ mod tests {
             "判定必须走独立变体，不许从错误文本里反推（文案一改就静默失效）"
         );
         // 流式那条：permit 必须作为实参交给 guard，而不是在本地被丢掉。
-        assert_eq!(
-            prod.matches("guard_stream_idle(resp.bytes_stream(), permit)").count(),
-            2,
-            "🔴 两个流式出口都必须把 permit 交给 guard —— 就地 drop 会让上限静默失效"
-        );
+        assert!(prod.contains("streaming::response(resp, permit,"), "permit 必须交给共享流生命周期");
+        let stream = std::fs::read_to_string("src/proxy/streaming.rs").unwrap();
+        let stream = crate::proxy::custom_headers::production_code_only(&stream);
+        assert!(stream.contains("guard_stream_idle(resp.bytes_stream().inspect("));
+        assert!(stream.contains("}), permit)"), "共享上游入口必须保有真实 permit");
         for bad in ["drop(permit)", "let _ = permit;"] {
             assert!(
                 !prod.contains(bad),

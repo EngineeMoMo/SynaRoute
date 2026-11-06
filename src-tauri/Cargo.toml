@@ -71,6 +71,7 @@ argon2 = "0.5"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 # 导出文件完整性校验（FR-021 验收要求「导入时校验版本与完整性」）。
 sha2 = "0.10"
+regex = "1"
 
 # 路径 / 时间 / 日志 / 错误
 dirs = "5"

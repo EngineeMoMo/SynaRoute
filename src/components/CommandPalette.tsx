@@ -33,6 +33,7 @@ const CATEGORIES: CategoryType[] = ["claude-cli", "claude-desktop", "codex"];
 
 const NAV_ICONS: Record<NavKey, LucideIcon> = {
   overview: Waypoints,
+  policies: ShieldCheck,
   ...CATEGORY_ICONS,
   brain: Brain,
   sessions: History,

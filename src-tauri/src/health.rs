@@ -1282,11 +1282,11 @@ mod tests {
     fn both_streaming_exits_must_record_through_record_stream_end() {
         let src = std::fs::read_to_string("src/proxy.rs").unwrap();
         let prod = crate::proxy::custom_headers::production_code_only(&src);
-        assert_eq!(
-            prod.matches("record_stream_end(").count(),
-            2,
-            "同协议直通与跨协议翻译两条流末路径都要走它"
-        );
+        let stream_src = std::fs::read_to_string("src/proxy/streaming.rs").unwrap();
+        let stream = crate::proxy::custom_headers::production_code_only(&stream_src);
+        assert!(prod.contains("streaming::response(resp, permit,"), "转发必须进入共享流生命周期");
+        assert_eq!(stream.matches("record_stream_end(").count(), 1, "两条路径共用一个 Drop 结算点");
+        assert!(stream.contains("End::Operator | End::Disconnected"), "人工停止/下游断开不得误记健康");
         // 流式路径不许自己记成功。历史缺陷（实测复现过）：拿到 2xx 响应头就同步
         // `record_live_success` 清零 fail_count，于是「流内报错补记失败」永远只能把它
         // 从 0 加到 1、够不到熔断阈值 → 该 Key 永不熔断、客户端无限重试同一条坏 Key。

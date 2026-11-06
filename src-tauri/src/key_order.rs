@@ -92,16 +92,27 @@ fn not_found(category: CategoryType, key_id: &str) -> AppError {
 }
 
 /// 把某 Key 提为该分类的「主 Key」（优先级 0），其余保持原相对顺序顺延。
+pub(crate) fn promote_in(cfg: &mut crate::model::AppConfig, category: CategoryType, key_id: &str) -> AppResult<bool> {
+    let mut ids = ordered_ids(cfg, category);
+    let changed = promote_ids(&mut ids, category, key_id)?;
+    if changed {
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(key) = cfg.keys.iter_mut().find(|k| &k.id == id) { key.priority = i as i32; }
+        }
+    }
+    Ok(changed)
+}
+
+fn promote_ids(ids: &mut Vec<String>, category: CategoryType, key_id: &str) -> AppResult<bool> {
+    let pos = ids.iter().position(|id| id == key_id).ok_or_else(|| not_found(category, key_id))?;
+    if pos == 0 { return Ok(false); }
+    let target = ids.remove(pos);
+    ids.insert(0, target);
+    Ok(true)
+}
+
 pub(crate) fn set_primary(store: &Store, category: CategoryType, key_id: &str) -> AppResult<bool> {
-    mutate_order(store, category, |ids| {
-        let Some(pos) = ids.iter().position(|id| id == key_id) else {
-            return Err(not_found(category, key_id));
-        };
-        let original = ids.clone();
-        let target = ids.remove(pos);
-        ids.insert(0, target);
-        Ok(*ids != original)
-    })
+    mutate_order(store, category, |ids| promote_ids(ids, category, key_id))
 }
 
 /// 把某 Key 在同分类内上移/下移一位。已在两端时返回 `false`。

@@ -632,7 +632,9 @@ mod tests {
         ] {
             assert!(!enabled(category, protocol, content_type, encoding));
         }
-        let source = include_str!("../proxy.rs");
-        assert!(source.contains("codex_images::stream(crate::upstream::guard_stream_idle(resp.bytes_stream(), permit), category, downstream, &content_type, upstream_content_encoding.as_deref(), store)"));
+        let source = crate::proxy::custom_headers::production_code_only(include_str!("streaming.rs"));
+        assert!(source.contains("if translated {"));
+        assert!(source.contains("codex_images::stream(stream, category, downstream, &content_type, encoding.as_deref(), store)"));
+        assert!(crate::proxy::custom_headers::production_code_only(include_str!("../proxy.rs")).contains("streaming::response(resp, permit,"));
     }
 }

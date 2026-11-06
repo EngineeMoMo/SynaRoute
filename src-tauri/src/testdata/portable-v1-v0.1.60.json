@@ -1,0 +1,59 @@
+{
+  "formatVersion": 1,
+  "appVersion": "0.1.60",
+  "exportedAt": "2026-09-09T12:00:00Z",
+  "payloadSha256": "bd204435fa5fc269ec336fb25a36f2e4481404b1af43431f636db369114db82f",
+  "payload": {
+    "keys": [
+      {
+        "id": "legacy-fixture",
+        "categoryId": "claude-cli",
+        "name": "Legacy fixture",
+        "vendor": "fixture",
+        "baseUrl": "https://api.example.test",
+        "protocol": "anthropic",
+        "hasSecret": false,
+        "enabled": true,
+        "allowInAggregate": false,
+        "priority": 0,
+        "params": { "temperature": 0.3, "topP": 0.9 },
+        "models": [],
+        "mappings": [],
+        "health": {
+          "status": "unknown",
+          "failCount": 0,
+          "modelLocks": {
+            "z-model": { "until": 1, "failCount": 2 },
+            "a-model": { "until": 3, "failCount": 4 }
+          }
+        }
+      }
+    ],
+    "brain": [],
+    "vendors": [],
+    "settings": {
+      "theme": "system",
+      "language": "zh",
+      "autoStart": false,
+      "masterPasswordEnabled": false,
+      "lanExposure": false,
+      "requestLogEnabled": false,
+      "logDownstreamRawEnabled": false,
+      "healthCheckIntervalSecs": 60,
+      "failoverTotalBudgetMs": 90000,
+      "mcpEnabled": false,
+      "mcpPort": 9527,
+      "mcpRegisteredCategories": [],
+      "upstreamRetryEnabled": true,
+      "healthProbeRealCompletion": false,
+      "healthProbeTestMessages": [],
+      "aggregateTraceEnabled": false,
+      "activeModels": {},
+      "trayModelSwitchEnabled": true,
+      "activeEfforts": {},
+      "proxyPorts": {},
+      "proxyRunningCategories": [],
+      "onboardingDone": null
+    }
+  }
+}

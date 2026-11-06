@@ -23,6 +23,8 @@ import type { UserPrefs } from "@/lib/prefs";
 import { mockDailyCost, mockUsageWithCost, purgedUsageKeys } from "./mockData.usage";
 import { lastNDayKeys } from "./usagePeriods";
 import { mockRoutingOverview } from "./mockData.overview";
+import { createRoutingMock } from "./mockData.routing";
+import { createActiveRequestsMock } from "./mockData.activeRequests";
 import { mockResilienceOverview } from "./mockData.resilience";
 import { MOCK_VENDORS } from "./mockData.vendors";
 import { mockEvents } from "./mockData.events";
@@ -310,6 +312,8 @@ const delay = (ms = 200) => new Promise((r) => setTimeout(r, ms));
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
 
 export const mockBridge = {
+  ...createActiveRequestsMock(),
+  ...createRoutingMock((category) => forShowcase(store[category] ?? [])),
   async routingOverview() {
     await delay();
     return clone(mockRoutingOverview(store, proxyStates, settings));

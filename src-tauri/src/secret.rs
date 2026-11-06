@@ -223,8 +223,6 @@ impl SecretStore {
             ));
         }
         self.vault_key = Some(key);
-        // 失效点 7/7：解锁前若残留过 DPAPI 模式的缓存（例如刚做完 disable→enable 往返），
-        // 那些明文对应的已是旧模式的密文，留着只会给出过期结论。
         self.invalidate_cache();
         Ok(())
     }
@@ -273,25 +271,36 @@ impl SecretStore {
     pub fn set(&mut self, key_id: &str, secret: &str) -> AppResult<()> {
         self.refuse_if_unreadable()?;
         if self.is_master_mode() {
-            let boxed = {
-                let key = self.require_vault_key()?;
-                crate::crypto::seal_with_key(key, secret.as_bytes())?
-            };
-            self.vault.boxes.insert(key_id.to_string(), boxed);
-            self.vault.entries.remove(key_id);
+            let boxed = crate::crypto::seal_with_key(self.require_vault_key()?, secret.as_bytes())?;
+            self.mutate_entry(key_id, |vault| {
+                vault.boxes.insert(key_id.to_string(), boxed);
+                vault.entries.remove(key_id);
+            })
         } else {
-            let cipher = os_encrypt(secret.as_bytes())?;
-            self.vault.entries.insert(key_id.to_string(), STANDARD.encode(cipher));
-            // 对称清理：DPAPI 模式下也要清掉 boxes 里的同 id（关闭主口令后新存的密钥，
-            // 若 boxes 残留旧条目，将来再启用主口令时 all_key_ids 会读到那条过期密文）。
-            self.vault.boxes.remove(key_id);
+            let cipher = STANDARD.encode(os_encrypt(secret.as_bytes())?);
+            self.mutate_entry(key_id, |vault| {
+                vault.entries.insert(key_id.to_string(), cipher);
+                vault.boxes.remove(key_id);
+            })
         }
-        // 失效点 1/7：这一条的明文变了，缓存里那份已过期。
-        // 漏掉它就是「明明更新过密钥却仍报鉴权失败」这个历史症状。
-        // 只清这一条不够保险？——`invalidate_cache` 整体清空更稳：`set` 是低频用户操作，
-        // 全清的代价只是后续几次请求各多一次解密，而漏清的代价是持续用错密钥。
+    }
+
+    fn mutate_entry(&mut self, key_id: &str, change: impl FnOnce(&mut SecretVault)) -> AppResult<()> {
+        let previous = (self.vault.entries.get(key_id).cloned(), self.vault.boxes.get(key_id).cloned());
+        change(&mut self.vault);
         self.invalidate_cache();
-        self.persist()
+        if let Err(error) = self.persist() {
+            match previous.0 {
+                Some(value) => { self.vault.entries.insert(key_id.to_string(), value); }
+                None => { self.vault.entries.remove(key_id); }
+            }
+            match previous.1 {
+                Some(value) => { self.vault.boxes.insert(key_id.to_string(), value); }
+                None => { self.vault.boxes.remove(key_id); }
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// 读取一条明文密钥（仅在代理转发时后端内部使用，绝不返回前端）。
@@ -355,21 +364,17 @@ impl SecretStore {
         self.os_cache.contains_key(key_id)
     }
 
-    /// 清空解密缓存。**所有会让缓存过期的操作都必须调它**（见 `os_cache` 字段文档）。
+    /// 清空解密缓存，所有凭据变更和锁定/解锁都必须调用。
     fn invalidate_cache(&mut self) {
-        // Zeroizing 的值在这里被析构 → 自动清零，不留明文残迹。
         self.os_cache.clear();
     }
 
     pub fn remove(&mut self, key_id: &str) -> AppResult<()> {
-        self.refuse_if_unreadable()?; // 同 `set`：降级态下删一条会把整份库换成空库
-        // 两个 map 都删：模式切换过程中断时同 id 可能两处都有，只删一个会留下能被
-        // 反向模式读出的残留密文。
-        self.vault.entries.remove(key_id);
-        self.vault.boxes.remove(key_id);
-        // 失效点 2/7：删了还留在缓存里，会让 `get` 对一条已不存在的 Key 返回明文。
-        self.invalidate_cache();
-        self.persist()
+        self.refuse_if_unreadable()?;
+        self.mutate_entry(key_id, |vault| {
+            vault.entries.remove(key_id);
+            vault.boxes.remove(key_id);
+        })
     }
 
     /// 库里现有的全部 keyId（不解密，仅用于迁移与对账）。
@@ -465,9 +470,7 @@ impl SecretStore {
         }
 
         let prev = std::mem::take(&mut self.vault);
-        // 失效点 3~5/7（三个整库迁移各一处）：整份重写后，缓存里的明文对应的都是**旧密文**，
-        // 留着必然给出过期结论。放在 take 之后、写盘之前——即便随后回滚，多解密几次也无害，
-        // 而漏清会让用错密钥持续下去。
+        // 即使随后回滚，缓存也必须失效，避免使用与当前密文不对应的明文。
         self.invalidate_cache();
         self.vault.master = Some(MasterHeader { kdf: hdr, verifier });
         self.vault.boxes = boxes;
@@ -527,9 +530,7 @@ impl SecretStore {
         }
 
         let prev = std::mem::take(&mut self.vault);
-        // 失效点 3~5/7（三个整库迁移各一处）：整份重写后，缓存里的明文对应的都是**旧密文**，
-        // 留着必然给出过期结论。放在 take 之后、写盘之前——即便随后回滚，多解密几次也无害，
-        // 而漏清会让用错密钥持续下去。
+        // 即使随后回滚，缓存也必须失效，避免使用与当前密文不对应的明文。
         self.invalidate_cache();
         let prev_key = self.vault_key.take();
         self.vault.entries = entries;
@@ -585,9 +586,7 @@ impl SecretStore {
         }
 
         let prev = std::mem::take(&mut self.vault);
-        // 失效点 3~5/7（三个整库迁移各一处）：整份重写后，缓存里的明文对应的都是**旧密文**，
-        // 留着必然给出过期结论。放在 take 之后、写盘之前——即便随后回滚，多解密几次也无害，
-        // 而漏清会让用错密钥持续下去。
+        // 即使随后回滚，缓存也必须失效，避免使用与当前密文不对应的明文。
         self.invalidate_cache();
         let prev_key = self.vault_key.take();
         self.vault.master = Some(MasterHeader { kdf: hdr, verifier });
@@ -626,21 +625,20 @@ impl SecretStore {
     fn persist(&mut self) -> AppResult<()> {
         // 降级空库后的首次写入：先备份磁盘原文件（内含用户全部既有密文），备份失败则拒绝写，
         // 防止「空库+单条新密钥」把原密钥库整份覆盖销毁。
-        if self.load_failed {
-            if self.path.exists() {
-                let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-                let bak = self.path.with_extension(format!("enc.corrupt-{ts}"));
-                std::fs::copy(&self.path, &bak).map_err(|e| {
-                    AppError::Other(format!(
-                        "密钥库处于降级态,备份原文件失败,已拒绝覆盖写入(避免销毁既有密文): {e}"
-                    ))
-                })?;
-                tracing::warn!("密钥库降级态首次写入,已备份原文件到 {bak:?}");
-            }
-            self.load_failed = false;
+        if self.load_failed && self.path.exists() {
+            let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+            let bak = self.path.with_extension(format!("enc.corrupt-{ts}"));
+            std::fs::copy(&self.path, &bak).map_err(|e| {
+                AppError::Other(format!(
+                    "密钥库处于降级态,备份原文件失败,已拒绝覆盖写入(避免销毁既有密文): {e}"
+                ))
+            })?;
+            tracing::warn!("密钥库降级态首次写入,已备份原文件到 {bak:?}");
         }
         let data = serde_json::to_vec_pretty(&self.vault)?;
-        atomic_write(&self.path, &data)
+        atomic_write(&self.path, &data)?;
+        self.load_failed = false;
+        Ok(())
     }
 }
 
@@ -1129,6 +1127,74 @@ mod tests {
     /// ⚠️ 这道门**只针对读取失败，不针对解析失败**：后者磁盘那份已经损坏、密文本来就解不出，
     /// 允许「先备份再写」是既有的刻意设计（`persist` 的降级分支）。把两者混起来会让
     /// 「库损坏了就再也删不掉任何东西」。
+    #[test]
+    fn failed_entry_writes_keep_the_previous_credentials() {
+        let dir = temp_dir("entry_rollback");
+        for master in [false, true] {
+            if !master && cfg!(all(not(windows), not(target_os = "macos"))) { continue; }
+            let path = dir.join(format!("vault-{master}.enc"));
+            let mut store = SecretStore::load(path.clone()).unwrap();
+            if master { store.enable_master_password("TestPass123").unwrap(); }
+            store.set("existing", "old-value").unwrap();
+            store.get_caching("existing").unwrap();
+            let saved = std::fs::read(&path).unwrap();
+            let blocked = dir.join("blocked");
+            std::fs::write(&blocked, "not a directory").unwrap();
+            store.path = blocked.join("secrets.enc");
+            assert!(store.set("existing", "new-value").is_err());
+            assert_eq!(store.get("existing").unwrap().unwrap().as_str(), "old-value");
+            assert!(store.set("new", "new-value").is_err());
+            assert!(store.get("new").unwrap().is_none());
+            assert!(store.remove("existing").is_err());
+            assert_eq!(store.get_caching("existing").unwrap().unwrap().as_str(), "old-value");
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            store.path = path;
+            store.set("other", "ok").unwrap();
+            let mut reopened = SecretStore::load(store.path.clone()).unwrap();
+            if master { reopened.unlock("TestPass123").unwrap(); }
+            assert_eq!(reopened.get("existing").unwrap().unwrap().as_str(), "old-value");
+            assert!(reopened.get("new").unwrap().is_none());
+            std::fs::remove_file(blocked).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_lan_rotation_preserves_token_and_does_not_announce_success() {
+        let (store, dir) = crate::service::tests::temp_store("lan_rotation_rollback");
+        store.secrets.write().enable_master_password("TestPass123").unwrap();
+        let before = crate::proxy::lan_guard::regenerate_lan_token_in(&store).unwrap();
+        let events_before = store.list_all_events().len();
+        let path = store.secrets.read().path.clone();
+        let saved = std::fs::read(&path).unwrap();
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, "not a directory").unwrap();
+        store.secrets.write().path = blocked.join("secrets.enc");
+        assert!(crate::proxy::lan_guard::regenerate_lan_token_in(&store).is_err());
+        assert_eq!(crate::proxy::lan_guard::read_lan_token_from(&store).unwrap(), Some(before));
+        assert_eq!(store.list_all_events().len(), events_before);
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        store.secrets.write().path = path;
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_persist_keeps_degraded_state_until_success() {
+        let dir = temp_dir("degraded_retry");
+        let mut store = SecretStore::load(dir.join("secrets.enc")).unwrap();
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, "not a directory").unwrap();
+        store.path = blocked.join("secrets.enc");
+        store.load_failed = true;
+        assert!(store.persist().is_err());
+        assert!(store.is_degraded());
+        store.path = dir.join("secrets.enc");
+        store.persist().unwrap();
+        assert!(!store.is_degraded());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn removing_a_key_while_the_vault_is_unreadable_must_not_wipe_it() {
         let dir = temp_dir("remove_in_degraded");

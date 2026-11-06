@@ -22,6 +22,7 @@ import { CATEGORY_ICONS } from "@/lib/categoryIcons";
 export type NavKey =
   | CategoryType
   | "overview"
+  | "policies"
   | "brain"
   | "sessions"
   | "logs"
@@ -43,6 +44,7 @@ const NAV: NavItem[] = [
   { key: "claude-cli", tKey: "nav.claude-cli", icon: CATEGORY_ICONS["claude-cli"], group: "category" },
   { key: "claude-desktop", tKey: "nav.claude-desktop", icon: CATEGORY_ICONS["claude-desktop"], group: "category" },
   { key: "codex", tKey: "nav.codex", icon: CATEGORY_ICONS.codex, group: "category" },
+  { key: "policies", tKey: "nav.policies", icon: ShieldCheck, group: "feature" },
   { key: "brain", tKey: "nav.brain", icon: Brain, group: "feature" },
   // Codex 专属：本地历史对话（每条自带 provider，与当前不一致时打开会走错上游）
   { key: "sessions", tKey: "nav.sessions", icon: History, group: "feature" },

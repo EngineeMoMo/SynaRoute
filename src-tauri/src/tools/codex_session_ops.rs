@@ -86,25 +86,31 @@ fn list_at(home: &Path, codex_keys: &[crate::model::ProviderKey]) -> CodexSessio
 /// 备份」，那是对的 —— 而我们此前的确认框写的是「不可逆、SynaRoute 不会为它们留备份」。
 /// 两种做法都自洽，但「有备份」严格更好：误删一条几个月前的对话，用户没有任何别的退路。
 ///
-/// 备份**只备份 rollout 文件本身**（sqlite 行与索引行不备），因为那才是对话内容；
-/// 前两者是可以从 rollout 重建的元数据，而备份一整个会话库要 0.5 MB × 每次删除。
+/// 正文与实际修改的数据库均先备份；索引清理失败保留正文供重试。
 fn delete_at(home: &Path, data_dir: &Path, rel_paths: &[String]) -> (usize, Vec<String>, String) {
     let known = scan_at(home).sessions;
     let mut failed = Vec::new();
 
     // ① 先把路径解析完、thread id 收齐 —— 文件一删就查不到 id 了。
     let mut targets: Vec<(std::path::PathBuf, &String, String)> = Vec::new();
-    for rel in rel_paths {
-        match resolve_in_home(home, rel) {
-            Some(p) => {
-                let tid = known
-                    .iter()
-                    .find(|s| &s.rel_path == rel)
-                    .map(|s| s.thread_id.clone())
-                    .unwrap_or_default();
-                targets.push((p, rel, tid));
+    for rel in rel_paths.iter().collect::<std::collections::BTreeSet<_>>() {
+        let Some(p) = resolve_in_home(home, rel) else {
+            failed.push(format!("{rel}（路径越界，已拒绝）"));
+            continue;
+        };
+        let tid = known.iter().find(|s| &s.rel_path == rel).map(|s| s.thread_id.clone());
+        let tid = tid.or_else(|| {
+            let root = Path::new(rel).components().next()?.as_os_str();
+            if root != "sessions" && root != "archived_sessions" { return None; }
+            if !matches!(fs::symlink_metadata(&p), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+                return None;
             }
-            None => failed.push(format!("{rel}（路径越界，已拒绝）")),
+            let id = files::thread_id_from_filename(p.file_name()?.to_str()?)?;
+            (!known.iter().any(|session| session.thread_id == id)).then_some(id)
+        });
+        match tid.filter(|id| !id.is_empty()) {
+            Some(tid) => targets.push((p, rel, tid)),
+            None => failed.push(format!("{rel}（不是可安全识别的会话文件，已拒绝删除）")),
         }
     }
 
@@ -137,11 +143,16 @@ fn delete_at(home: &Path, data_dir: &Path, rel_paths: &[String]) -> (usize, Vec<
             files::IoBlame::Unwritable => "，目录不可写，请检查权限",
             files::IoBlame::Other => "",
         };
+        failed.push(format!("session_index.jsonl 更新失败，正文未删除（{e}{why}）"));
         return (
             0,
-            vec![format!("session_index.jsonl 更新失败（{e}{why}）")],
-            String::new(),
+            failed,
+            data_dir.join("backups").join(BACKUP_KIND).display().to_string(),
         );
+    }
+    if let Some(error) = delete_threads_rows(home, data_dir, &ids) {
+        failed.push(format!("会话数据库索引未完全清理，正文未删除，可重试：{error}"));
+        return (0, failed, data_dir.join("backups").join(BACKUP_KIND).display().to_string());
     }
     let mut deleted = 0usize;
     for (path, rel, _) in &targets {
@@ -165,10 +176,6 @@ fn delete_at(home: &Path, data_dir: &Path, rel_paths: &[String]) -> (usize, Vec<
         }
     }
 
-    // ④ sqlite 的 threads 行。best-effort：它只影响列表显示，而文件已经没了。
-    if let Some(e) = delete_threads_rows(home, &ids) {
-        failed.push(format!("会话列表元数据未完全清理（不影响已删除的文件）：{e}"));
-    }
     (deleted, failed, data_dir.join("backups").join(BACKUP_KIND).display().to_string())
 }
 
@@ -198,9 +205,11 @@ fn remove_from_index(home: &Path, thread_ids: &[String]) -> std::io::Result<()> 
         return Ok(());
     }
     let path = home.join("session_index.jsonl");
-    // 索引不存在 / 读不出来都不算失败：没有索引就没有要摘的行（fork 出来的会话本来就
-    // 可能不在里面）。真正不能忽略的是**写**那一半。
-    let Ok(text) = fs::read_to_string(&path) else { return Ok(()) };
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
     let kept: Vec<&str> = text
         .lines()
         .filter(|l| {
@@ -229,40 +238,38 @@ fn remove_from_index(home: &Path, thread_ids: &[String]) -> std::io::Result<()> 
     }
 }
 
-fn delete_threads_rows(home: &Path, ids: &[String]) -> Option<String> {
-    if ids.is_empty() {
-        return None;
-    }
-    let mut first_err = None;
+fn delete_threads_rows(home: &Path, data_dir: &Path, ids: &[String]) -> Option<String> {
+    if ids.is_empty() { return None; }
+    let mut errors = Vec::new();
     for db in session_db_paths(home) {
-        let Ok(conn) = rusqlite::Connection::open(&db) else { continue };
-        let _ = conn.busy_timeout(std::time::Duration::from_millis(1500));
-        // 🔴 先查表在不在。`session_db_paths` 只按扩展名筛文件，不保证里面有 `threads`
-        // （`~/.codex/sqlite/` 下将来可能有别的库）。不查的话 DELETE 报 `no such table`，
-        // 于是一次**成功的删除**会附带一句无意义的错误消息 —— 用户以为没删干净。
-        let has_table = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads' LIMIT 1",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-        if !has_table {
-            continue;
-        }
-        for chunk in ids.chunks(SQL_CHUNK) {
-            // `repeat_n` 要 Rust 1.82，而本仓 MSRV 是 1.77。
-            let holes = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
-            let sql = format!("DELETE FROM threads WHERE id IN ({holes})");
-            let params: Vec<&dyn rusqlite::ToSql> =
-                chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-            if let Err(e) = conn.execute(&sql, params.as_slice()) {
-                first_err.get_or_insert(format!("{}: {e}", db.display()));
-                break;
+        let remove = || -> Result<(), String> {
+            let mut conn = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .map_err(|e| e.to_string())?;
+            conn.busy_timeout(std::time::Duration::from_millis(1500)).map_err(|e| e.to_string())?;
+            let has_table = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads')",
+                [], |r| r.get::<_, bool>(0),
+            ).map_err(|e| e.to_string())?;
+            if !has_table { return Ok(()); }
+            let mut found = false;
+            for id in ids {
+                found |= conn.query_row("SELECT EXISTS(SELECT 1 FROM threads WHERE id=?1)", [id],
+                    |r| r.get::<_, bool>(0)).map_err(|e| e.to_string())?;
             }
-        }
+            if !found { return Ok(()); }
+            super::sqlite::backup_db(&db, data_dir)?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+            for chunk in ids.chunks(SQL_CHUNK) {
+                let holes = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+                tx.execute(&format!("DELETE FROM threads WHERE id IN ({holes})"),
+                    rusqlite::params_from_iter(chunk)).map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())
+        };
+        if let Err(error) = remove() { errors.push(format!("{}: {error}", db.display())); }
     }
-    first_err
+    (!errors.is_empty()).then(|| errors.join("；"))
 }
 
 /// 把一条会话导出成 Markdown。
@@ -917,6 +924,120 @@ mod tests {
     /// 那半的纪律（备份不成就不写库）。夹具用「把备份目录的位置做成一个文件」让
     /// `create_dir_all` 失败：跨平台都成立，不依赖权限位（Unix 看目录权限、Windows 看文件
     /// 属性，拿只读位当夹具会在另一个平台上静默失效）。
+    #[test]
+    fn database_delete_failure_keeps_rollout_and_allows_retry() {
+        let home = tmp_home("db_delete_failure");
+        let (rel, id) = write_full_rollout(&home, "t1");
+        let original = fs::read(home.join(&rel)).unwrap();
+        let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY); CREATE TRIGGER reject_delete BEFORE DELETE ON threads BEGIN SELECT RAISE(ABORT, 'blocked deletion'); END;").unwrap();
+        db.execute("INSERT INTO threads VALUES (?1)", [&id]).unwrap();
+        let paths = std::slice::from_ref(&rel);
+        let (deleted, failed, _) = delete_at(&home, &home.join("appdata"), paths);
+        assert_eq!(deleted, 0);
+        assert!(!failed.is_empty());
+        assert_eq!(fs::read(home.join(&rel)).unwrap(), original);
+        db.execute_batch("DROP TRIGGER reject_delete").unwrap();
+        let (deleted, failed, _) = delete_at(&home, &home.join("appdata"), paths);
+        assert_eq!(deleted, 1);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM threads", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        drop(db);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn unreadable_index_and_broken_database_prevent_file_deletion() {
+        let home = tmp_home("unreadable_indexes");
+        let (rel, id) = write_full_rollout(&home, "t1");
+        let paths = std::slice::from_ref(&rel);
+        let index = home.join("session_index.jsonl");
+        fs::create_dir(&index).unwrap();
+        assert_eq!(delete_at(&home, &home.join("appdata"), paths).0, 0);
+        assert!(home.join(&rel).exists());
+        fs::remove_dir(&index).unwrap();
+        fs::write(&index, format!("{{\"id\":\"{id}\"}}\n")).unwrap();
+        let database = home.join("state_5.sqlite");
+        fs::write(&database, "not a database").unwrap();
+        let result = delete_at(&home, &home.join("appdata"), paths);
+        assert_eq!(result.0, 0);
+        assert!(!result.1.is_empty());
+        assert!(home.join(&rel).exists());
+        fs::remove_file(&database).unwrap();
+        assert_eq!(delete_at(&home, &home.join("appdata"), paths).0, 1);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn missing_rollout_can_still_have_its_indexes_removed() {
+        let home = tmp_home("missing_delete_retry");
+        let (rel, id) = write_full_rollout(&home, "t1");
+        let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY)").unwrap();
+        db.execute("INSERT INTO threads VALUES (?1)", [&id]).unwrap();
+        fs::write(home.join("session_index.jsonl"), format!("{{\"id\":\"{id}\"}}\n")).unwrap();
+        fs::remove_file(home.join(&rel)).unwrap();
+        let result = delete_at(&home, &home.join("appdata"), &[rel.clone(), rel]);
+        assert_eq!(result.0, 1);
+        assert!(result.1.is_empty(), "{:?}", result.1);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM threads", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert!(!fs::read_to_string(home.join("session_index.jsonl")).unwrap().contains(&id));
+        drop(db);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_missing_path_cannot_delete_indexes_for_a_live_session_elsewhere() {
+        let home = tmp_home("stale_delete_path");
+        let (rel, id) = write_full_rollout(&home, "t1");
+        let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY)").unwrap();
+        db.execute("INSERT INTO threads VALUES (?1)", [&id]).unwrap();
+        let stale = format!("archived_sessions/{}", Path::new(&rel).file_name().unwrap().to_str().unwrap());
+        let result = delete_at(&home, &home.join("appdata"), &[stale]);
+        assert_eq!(result.0, 0);
+        assert!(!result.1.is_empty());
+        assert!(home.join(&rel).exists());
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM threads", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        drop(db);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_partial_database_cleanup_keeps_files_until_every_database_is_ready() {
+        let home = tmp_home("multi_db_delete");
+        let (rel, id) = write_full_rollout(&home, "t1");
+        let original = fs::read(home.join(&rel)).unwrap();
+        let newer = rusqlite::Connection::open(home.join("state_6.sqlite")).unwrap();
+        let older = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        for db in [&newer, &older] {
+            db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY)").unwrap();
+            db.execute("INSERT INTO threads VALUES (?1)", [&id]).unwrap();
+        }
+        older.execute_batch("CREATE TRIGGER reject_delete BEFORE DELETE ON threads BEGIN SELECT RAISE(ABORT, 'blocked deletion'); END;").unwrap();
+        let paths = std::slice::from_ref(&rel);
+        let data = home.join("appdata");
+        let result = delete_at(&home, &data, paths);
+        assert_eq!(result.0, 0);
+        assert!(result.1.iter().any(|error| error.contains("state_5.sqlite")));
+        assert_eq!(fs::read(home.join(&rel)).unwrap(), original);
+        assert_eq!(newer.query_row("SELECT COUNT(*) FROM threads", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(older.query_row("SELECT COUNT(*) FROM threads", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        let backups: Vec<_> = fs::read_dir(data.join("backups/codex-sqlite")).unwrap().map(|entry| entry.unwrap().path()).collect();
+        assert_eq!(backups.len(), 2);
+        for backup in backups {
+            let snapshot = rusqlite::Connection::open(backup).unwrap();
+            assert_eq!(snapshot.query_row("SELECT COUNT(*) FROM threads", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        }
+        older.execute_batch("DROP TRIGGER reject_delete").unwrap();
+        let result = delete_at(&home, &data, paths);
+        assert_eq!(result.0, 1);
+        assert!(result.1.is_empty(), "{:?}", result.1);
+        assert_eq!(older.query_row("SELECT COUNT(*) FROM threads", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        drop((newer, older));
+        fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn a_session_whose_backup_fails_is_not_deleted() {
         let home = tmp_home("nobak");

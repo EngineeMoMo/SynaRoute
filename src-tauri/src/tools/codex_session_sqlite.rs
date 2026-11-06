@@ -66,7 +66,7 @@ fn database_paths_in(root: &Path) -> Vec<PathBuf> {
                 .parse::<u32>().ok()?;
             entry.path().is_file().then_some((version, entry.path()))
         }).collect();
-        legacy.sort_by(|left, right| right.0.cmp(&left.0));
+        legacy.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         out.extend(legacy.into_iter().map(|(_, path)| path));
     }
     out

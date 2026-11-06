@@ -21,6 +21,7 @@ import type { EventLogEntry, ProviderKey } from "@/types";
 import { Plus, AlertTriangle, Inbox, X } from "lucide-react";
 import { CATEGORY_ICONS } from "@/lib/categoryIcons";
 import { EnvConflictBanner } from "@/components/EnvConflictBanner";
+import { ActiveRequestsPanel } from "@/components/ActiveRequestsPanel";
 
 /** 分类主页：代理状态条 + 模型映射兜底提示 + Key 卡片列表 */
 export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }: {
@@ -306,7 +307,8 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
           不贴着窗口边缘；要改数值请按视觉效果自行决定，不必再顾虑 FAB 重叠。 */}
       {/* `drag.scrollRef` 必须挂在**这个**滚动容器上：拖到视口外时靠它自动滚动，
           不挂的话长列表里「把末尾那条拖到首位」根本走不到（首位那张卡在视口外）。 */}
-      <div ref={drag.scrollRef} className="flex-1 space-y-2 overflow-y-auto px-6 pb-24">
+      <div ref={drag.scrollRef} className="min-h-0 flex-1 space-y-2 overflow-y-auto px-6 pb-24">
+        <ActiveRequestsPanel key={activeCategory} category={activeCategory} />
         {loading && <div className="py-10 text-center text-sm text-text-muted">{t("common.loading")}</div>}
 
         {!loading && sorted.length === 0 && (

@@ -11,9 +11,8 @@ use crate::health;
 use crate::model::{CategoryType, Protocol, ProviderKey, RequestTrace};
 use crate::store::Store;
 use bytes::Bytes;
-use futures_util::StreamExt;
-use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
-use hyper::body::{Frame, Incoming};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
@@ -29,6 +28,7 @@ use tokio::task::JoinHandle;
 #[path = "model_pool.rs"] pub(crate) mod model_pool; // 对外模型并集 + 模型感知路由；来由见该文件模块注释
 #[path = "proxy/soft_error.rs"] mod soft_error; // 非流式「200 包着错误」的降级；调用**必须**排在 outcome.ok 守卫之前（有判据钉着），来由见该文件模块注释
 #[path = "proxy/codex_images.rs"] mod codex_images;
+pub(crate) mod active_requests; mod streaming;
 // 对外可选模型集的**唯一**实现。re-export 而不是留一层包装函数：包装函数会让
 // 「proxy.rs 生产段里不许有第二份并集实现」那条源码级判据失去意义。
 pub(crate) use model_pool::discoverable_models;
@@ -289,6 +289,7 @@ impl ProxyManager {
     }
 
     pub fn stop(&self, category: CategoryType) {
+        self.store.routing_runtime.reset(category);
         // 必须先把 guard 取出来再用：写成 `if let Some(p) = self.running.lock().remove(..)`
         // 的话，那个临时 MutexGuard 会活到整个 if-let 语句结束，emit 就落在持锁期间了。
         // 泵的设计让持锁 emit 也不至于死锁，但「emit 前放光锁」这条纪律要守住 ——
@@ -314,6 +315,7 @@ impl ProxyManager {
     }
 
     pub fn stop_all(&self) -> usize {
+        for category in CategoryType::ALL { self.store.routing_runtime.reset(category); }
         // 一次性取走全部句柄，锁内只做 remove、不做 I/O。
         let handles: Vec<RunningProxy> = {
             let mut running = self.running.lock();
@@ -413,6 +415,7 @@ async fn handle_request_inner(
     if let Err(status) = crate::http_ingress::check_json_request(req.method(), req.headers()) {
         return Ok(error_resp(status, "该端点仅支持 JSON POST 请求"));
     }
+    let route_hints = crate::store::routing::identity::Hints::from_request(&req);
     let body_bytes = match crate::http_ingress::read_body(req.into_body(), crate::http_ingress::PROXY_BODY_LIMIT).await {
         Ok(c) => c,
         Err(status) => return Ok(error_resp(status, "请求体过大、读取超时或服务繁忙")),
@@ -464,27 +467,21 @@ async fn handle_request_inner(
         ));
     }
 
-    // 密钥库锁着（主口令模式、本次进程未解锁）→ 任何 Key 都取不到密钥。
-    //
-    // 必须在**进入故障转移循环之前**挡住：否则会逐个候选去试、每个都因「未解锁」失败，
-    // 于是 record_live_failure 把整池好 Key 刷成熔断、还武装 529 短路窗口——用户解锁后
-    // 反倒要等熔断窗口过去才恢复。而真实原因只是没解锁，与 Key 好坏无关。
-    //
-    // 状态码用 503（service_unavailable）而非 529：529 的语义是「上游过载、稍后重试」，
-    // 客户端会自动退避重试；而这里需要的是**人来操作**（打开主窗口输口令），
-    // 自动重试永远等不到结果。503 + 明确文案让客户端与用户都知道要做什么。
-    if store.secrets.read().is_locked() {
-        return Ok(error_resp(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "密钥库已用主口令加密但尚未解锁：请打开 SynaRoute 主窗口输入主口令解锁后重试。",
-        ));
-    }
-
+    let active_guard = store.active_requests.begin(store.clone(), &request_id, category, &requested_model, wants_stream);
+    let active = active_guard.control();
+    active_requests::run(active_guard, downstream, async {
     // 候选：启用 + 未熔断，按优先级。全被熔断时（如单 Key 刚熔断）忽略熔断兜底，
     // 避免无处可切却直接 503——熔断本为多 Key 快速切换，无候选可切时不应自杀。
     // 走 `candidates_for`：一次读锁内筛选排序、只克隆入选者（旧路径
     // `enabled_keys_sorted` + `select_candidates` 要克隆两轮全量启用 Key）。
-    let (candidates, used_breaker_fallback) = store.candidates_for(category, &requested_model);
+    let deadline = store.failover_budget().map(|b| std::time::Instant::now() + b);
+    let route = match crate::store::routing::policy::prepare(&store, category, &req_json, downstream, &route_hints, &requested_model, deadline).await {
+        Ok(route) => route,
+        Err(response) => return Ok(response),
+    };
+    active.model(&route.model);
+    let requested_model = route.model.clone(); let (mut candidates, used_breaker_fallback) = store.candidates_for(category, &requested_model);
+    route.rank(&store, &mut candidates);
 
     if candidates.is_empty() {
         return Ok(error_resp(
@@ -572,6 +569,7 @@ async fn handle_request_inner(
                        streaming: bool,
                        was_truncated: Option<bool>,
                        usage: Option<crate::upstream::TokenUsage>| {
+        route.served(store, key, &real_model);
         store.route_profiles.record(key, &requested_model, &real_model, streaming, true, Some(status), elapsed);
         let detail = fmt_success_detail(
             &key.name,
@@ -616,6 +614,7 @@ async fn handle_request_inner(
                        response_body: String,
                        status: Option<u16>,
                        ok: bool| {
+        if !ok { route.failed_candidate(store, key); }
         store.route_profiles.record(key, &requested_model, &real_model, wants_stream, ok, status, elapsed);
         if !req_log {
             return;
@@ -730,7 +729,7 @@ async fn handle_request_inner(
     // 语义是「不再**开始**新的候选尝试」——不硬掐正在进行的请求，尤其不掐已建立的 SSE 流。
     // 没有它时最坏耗时 = 候选数 × per-Key 超时（6 Key × 30s = 180s），而客户端早已超时重发，
     // 代理侧那条僵尸链仍在逐个打上游烧额度。
-    let deadline = store.failover_budget().map(|b| std::time::Instant::now() + b);
+    // The deadline also covers privacy checks and optional intent classification.
 
     for (i, key) in candidates.iter().enumerate() {
         // 诊断头：一进候选就记「试到第几条、是哪条」。放在循环**开头**而不是各分支里，
@@ -838,6 +837,8 @@ async fn handle_request_inner(
             log_failover(&store, key, "跳过", &skip_err, next);
             continue;
         }
+        if active.end() == Some(active_requests::End::Operator) { return Ok(active_requests::stopped_response()); }
+        active.attempt(key, &requested_model, (i + 1) as u32);
         let started = std::time::Instant::now();
         // 上一候选若因思考块签名被拒 → 就地摘掉再给本候选用。刻意放在**共享前段**
         // 而不是某条失败分支里：失败分支有三条，挂一条必然漏掉另两条。
@@ -885,7 +886,7 @@ async fn handle_request_inner(
             } else {
                 take_body(&mut req_json)
             };
-            match try_stream_to_key(&store, category, key, &path, body, &requested_model, &fwd_headers, req_log, remaining)
+            match try_stream_to_key(&store, category, key, &path, body, &requested_model, &fwd_headers, req_log, remaining, route.lease.clone(), &active)
                 .await
             {
                 Ok(StreamAttempt::Streaming { resp, url, real_model, request_body }) => {
@@ -1056,7 +1057,7 @@ async fn handle_request_inner(
             take_body(&mut req_json)
         };
         let result =
-            forward_to_key(&store, category, key, &path, body, &requested_model, &fwd_headers, req_log, remaining)
+            forward_to_key(&store, category, key, &path, body, &requested_model, &fwd_headers, req_log, remaining, &active)
                 .await;
         let elapsed = started.elapsed().as_millis() as u64;
         // 诊断头：本次尝试耗时。放在这里（三个分支之前）而不是各分支里 ——
@@ -1064,6 +1065,7 @@ async fn handle_request_inner(
         meta.latency_ms = elapsed;
         match result.map(|o| soft_error::demote(&store, category, key, o)) {
             Ok(outcome) if outcome.ok => {
+                if active.finish(active_requests::End::Complete) == active_requests::End::Operator { return Ok(active_requests::stopped_response()); }
                 // 响应体快照只在开关开启时构造：唯一去向是下面的 log_success，
                 // 而它在 `req_log` 关闭时直接 return。成功响应体常态几十 KB~几百 KB
                 // （流式以外的完整回答），默认关日志时这份 to_string() 是纯浪费。
@@ -1242,6 +1244,7 @@ async fn handle_request_inner(
         &format!("全部 Key 不可用：{last_err}"),
         Some(retry_after),
     ))
+    }).await
 }
 
 fn budget_truncated_attempt(
@@ -1277,10 +1280,6 @@ fn all_failed_is_hard_error(config_error: bool, last_status: Option<u16>) -> boo
 
 #[path = "proxy/models_endpoint.rs"] mod models_endpoint; // 显示名这一维的取证见该文件模块注释
 use models_endpoint::{handle_gateway_side_endpoints, handle_list_models, handle_retrieve_model};
-
-const TAIL_WINDOW_BYTES: usize = 8192;
-
-const HEAD_WINDOW_BYTES: usize = 8192;
 
 #[path = "proxy/log_cap.rs"] mod log_cap;
 use log_cap::{cap, cap_to};
@@ -1373,6 +1372,8 @@ async fn try_stream_to_key(
     // 转发 SSE，就完全不再受它约束——流式刻意不设总超时，掐断会把长回答截断，
     // 那是本项目明确的设计判断（见下方 send() 处的注释）。
     budget_left: Option<std::time::Duration>,
+    route_lease: Option<crate::store::routing::runtime::Lease>,
+    active: &active_requests::Control,
 ) -> AppResult<StreamAttempt> {
     // 走 secret_for：DPAPI 模式带进程内解密缓存，免掉每请求每候选一次 CryptUnprotectData
     // 内核态系统调用（P2-6）。锁定态返 Err 的刻意语义原样保留。
@@ -1489,6 +1490,7 @@ async fn try_stream_to_key(
     // 并发槽位：满了就排队（不拒绝，理由见 `concurrency` 模块头）。🔴 **排队算进本次预算** ——
     // 裸 `acquire` 再给 `send()` 完整 `probe_to`，用户配的超时会变成「排队 N 秒 + 探头
     // probe_to」，且整段排队逃出故障转移 deadline（`budget_left` 是排队前算的）。
+    active.phase(active_requests::Phase::Queued);
     let (permit, probe_to) = crate::health::concurrency::acquire_with_budget(&key.id, probe_to)
         .await
         .map_err(|_| queue_timeout_err(key, probe_to))?;
@@ -1497,7 +1499,8 @@ async fn try_stream_to_key(
     // 只有两个调用点(首发 / 整流后重发),宏就地展开、零借用跨越问题。
     let deadline = tokio::time::Instant::now() + probe_to;
     macro_rules! probe {
-        () => {
+        () => {{
+            active.phase(active_requests::Phase::Waiting);
             match tokio::time::timeout_at(deadline, send_once(&payload)).await {
                 Ok(r) => r.map_err(|e| AppError::upstream_msg(format!("连接 {} 失败: {e}", crate::diagnostics::mask_url_credentials(&url))))?,
                 Err(_) => {
@@ -1507,7 +1510,7 @@ async fn try_stream_to_key(
                     )))
                 }
             }
-        };
+        }};
     }
     let mut resp = probe!();
     let mut status = resp.status();
@@ -1522,7 +1525,7 @@ async fn try_stream_to_key(
     // 停发 body（半开连接 / LB 中途丢弃 / chunked 不收尾）会让这个候选**永久阻塞**,后续
     // 候选一个都轮不到,而 stream:true 是主路径。读不全无所谓,宁可给「读取超时」占位。
     let read_err_body = |resp: reqwest::Response| async {
-        match tokio::time::timeout_at(deadline, resp.bytes()).await {
+        match tokio::time::timeout_at(deadline, active.read_body(resp)).await {
             Ok(Ok(b)) => crate::diagnostics::redact_secret(&String::from_utf8_lossy(&b), secret.as_str()),
             Ok(Err(e)) => format!("（错误体读取失败：{e}）"),
             Err(_) => format!("（错误体读取超时：{}ms 内未读完，已按失败切换下一个候选）", probe_to.as_millis()),
@@ -1551,315 +1554,12 @@ async fn try_stream_to_key(
         }
     }
 
-    // 2xx：同协议原样透传；跨协议用 SseTranslator 逐块重组事件流。
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("text/event-stream")
-        .to_string();
-    // 上游的 content-encoding（正常应为空——我们已发 `accept-encoding: identity`）。
-    // 仍取它是纵深防御：个别网关不守规范、不问自压。同协议是**字节透明**透传，
-    // 此时必须把该头一并转给下游，否则下游按明文解析一堆压缩字节 → 乱码。
-    // 跨协议不透传：那条路要自己解析 SSE 文本，压缩体根本翻译不了（见下方 else 分支说明）。
-    let upstream_content_encoding = resp
-        .headers()
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty() && s != "identity")
-        .map(|s| s.to_string());
-
-    let body: ResBody = match sse_dir {
-        // 同时用滑动窗口保留尾部字节，流结束后从尾部 SSE chunk 提取 token 用量——
-        // 不缓存全文、不牺牲首字节延迟。提取失败（上游没给 usage）时静默忽略。
-        None => {
-            // 尾部滑动窗口 + 「流已结束」信号。
-            //
-            // buffer 用 `std::sync::Mutex`：写入发生在 `map` 这个**同步**闭包里，
-            // 用异步锁只能 `try_lock`，一旦竞争就静默丢块。这里写者只有流本身、
-            // 读者只在流结束后才动，用同步锁反而既简单又不丢数据。
-            //
-            // 结束信号用 `Notify` + Drop 守卫：`map` 闭包被 drop 的时刻，就是
-            // 上游流被消费完（或下游提前断开）的时刻，hyper 送完 body 就会 drop 它。
-            // 这是唯一能在 `.map()` 上拿到「流结束」的可靠点位 —— 用 `notify_one`
-            // 而非 `notify_waiters`，因为它会留下 permit，补记任务晚到也不会漏掉。
-            struct StreamEnd(std::sync::Arc<tokio::sync::Notify>);
-            impl Drop for StreamEnd {
-                fn drop(&mut self) {
-                    self.0.notify_one();
-                }
-            }
-
-            let tail_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::with_capacity(
-                TAIL_WINDOW_BYTES,
-            )));
-            // 头部窗口：留住流首的 message_start（input/缓存 token 所在），攒够 HEAD_WINDOW_BYTES
-            // 即停增长。与尾窗分开两块，不合并成一个大缓冲——长会话下全文可达几十万字节。
-            let head_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::with_capacity(
-                HEAD_WINDOW_BYTES,
-            )));
-            let stream_done = std::sync::Arc::new(tokio::sync::Notify::new());
-            let end_guard = StreamEnd(stream_done.clone());
-
-            let tail_buf2 = tail_buf.clone();
-            let head_buf2 = head_buf.clone();
-            let store2 = store.clone();
-            let key_id2 = key.id.clone();
-            // 流末记账要按「哪个模型」衰减第二层的模型锁，故必须带上真实模型名
-            // （`req_model2` 是**对外名**，不是这个）。
-            let real_model2 = real_model.clone();
-            let category2 = category;
-            // 补记只需要「定位到哪一行」的三要素（分类 + key + collapse_key），
-            // 不再自己拼 detail —— detail 由流开始时那条同步日志负责，补记只往里补用量。
-            let req_model2 = requested_model.to_string();
-
-            let byte_stream = codex_images::stream(crate::upstream::guard_stream_idle(resp.bytes_stream(), permit), category, downstream, &content_type, upstream_content_encoding.as_deref(), store).map(move |chunk| {
-                // 闭包持有守卫；闭包被 drop → 守卫 Drop → 通知补记任务。
-                let _ = &end_guard;
-                match chunk {
-                    Ok(bytes) => {
-                        // 头部窗口：只在未满 HEAD_WINDOW_BYTES 前追加（message_start 是第一个事件，
-                        // 必落在前 8KB 内）。满了就不再动，省得长流一直拷贝。
-                        if let Ok(mut hbuf) = head_buf.lock() {
-                            if hbuf.len() < HEAD_WINDOW_BYTES {
-                                let room = HEAD_WINDOW_BYTES - hbuf.len();
-                                let take = room.min(bytes.len());
-                                hbuf.extend_from_slice(&bytes[..take]);
-                            }
-                        }
-                        // 滑动窗口：只留尾部 8KB（output usage / 终止事件在 SSE 最末几个事件里）。
-                        if let Ok(mut buf) = tail_buf.lock() {
-                            buf.extend_from_slice(&bytes);
-                            if buf.len() > TAIL_WINDOW_BYTES {
-                                let drop_n = buf.len() - TAIL_WINDOW_BYTES;
-                                buf.drain(0..drop_n);
-                            }
-                        }
-                        Ok(Frame::data(bytes))
-                    }
-                    Err(e) => Err(std::io::Error::other(e.to_string())),
-                }
-            });
-
-            // 补记任务：**必须**先等流结束再读窗口。
-            // 曾经这里直接 `lock().await` 就读 —— 而 body 是惰性的，spawn 那一刻流还没被
-            // poll 过一个字节，锁空闲、buffer 为空，于是永远提取不到 usage 且不报错。
-            tokio::spawn(async move {
-                stream_done.notified().await;
-                let tail_snap = match tail_buf2.lock() {
-                    Ok(buf) => buf.clone(),
-                    Err(_) => return,
-                };
-                let head_snap = head_buf2.lock().map(|b| b.clone()).unwrap_or_default();
-                // 头窗（message_start：input/缓存 token）+ 尾窗（message_delta：output token）合并解析。
-                // 只留尾窗时，>8KB 的回答会把流首的 message_start 挤掉 → input/缓存记成 0
-                // （面板把占比常 >90% 的输入/缓存显示为 ~0）。extract_usage_from_sse 按字段取最大值，
-                // 头尾拼接即得完整用量；两窗重叠（短流全落头窗、也落尾窗）也不会翻倍（取 max 而非累加）。
-                let tail_sse = String::from_utf8_lossy(&tail_snap);
-                let mut merged = String::with_capacity(head_snap.len() + tail_snap.len() + 1);
-                merged.push_str(&String::from_utf8_lossy(&head_snap));
-                merged.push('\n');
-                merged.push_str(&tail_sse);
-                // 流末统一记账（成功/失败二选一）。**必须在这里而不是拿到 200 响应头时**：
-                // 上游可能 200 后在流内发 error 事件（Anthropic 过载常见形态）。早记成功会把
-                // fail_count 清零，使随后的失败补记永远只能把它从 0 加到 1、够不到熔断阈值
-                // （该 Key 永不熔断 → 客户端反复重打同一条坏 Key，正是熔断要止住的风暴）。
-                // 用尾窗判错：终止性 error 事件必落在流末 8KB 内。
-                // 走 `record_stream_end` 而不是自己写二选一：失败时**还要落一条可见事件**，
-                // 否则日志页只剩开流那一刻写下的「路由成功」（见该函数文档）。
-                let errored = crate::upstream::sse_stream_errored(&tail_sse);
-                health::record_stream_end(&store2, category2, &key_id2, &req_model2, &real_model2, errored);
-                if let Some(u) = crate::upstream::extract_usage_from_sse(&merged) {
-                    // 补记进**流开始时已写下的那一行**，不新追加一条。
-                    // 再 append 一条同 collapse key 的事件会被折叠逻辑当成「又发生了一次」：
-                    // repeat 变 2（一次请求显示成 ×2）、detail 被覆盖（延迟数字丢失）。
-                    let collapse = format!("ok:{}:{}:{}", key_id2, req_model2, true);
-                    store2.backfill_usage_for_collapsed_event(category2, Some(&key_id2), &collapse, u, &real_model2);
-                }
-            });
-            BodyExt::boxed(StreamBody::new(byte_stream))
-        }
-        // 跨协议：有状态翻译器逐块把上游 SSE 重组成下游协议事件；流末尾冲刷收尾事件。
-        // 用 stream::unfold 承载状态机（不引 async_stream 依赖）：累加器持有翻译器、上游流、
-        // 以及「是否已冲刷收尾」标志。每步产出一个 Frame。
-        Some(dir) => {
-            // 三个集合已在消费 req_json 之前收集好（见函数上方 tool_sets）。
-            // sse_dir 为 Some 时 tool_sets 必然也是 Some（同一个条件），故这里可以直接取。
-            let (namespaces, custom_tools, search_tools) =
-                tool_sets.expect("sse_dir 为 Some 时 tool_sets 必然已收集");
-            let translator = crate::upstream::SseTranslator::with_namespaces_and_custom(
-                dir,
-                namespaces,
-                custom_tools,
-                search_tools,
-            );
-            let upstream = crate::upstream::guard_stream_idle(resp.bytes_stream(), permit);
-
-            // 用量补记三要素（与同协议分支同一套定位口径：分类 + key + collapse_key）。
-            // 跨协议这条路**不用**尾窗 + `extract_usage_from_sse`：翻译器边收边转，尾窗里
-            // 躺的是已转换成下游格式的字节，字段名与上游不一定对得上。翻译器本来就要读懂
-            // 上游 usage 才能翻译，直接问它最准，也省一份 8KB 缓冲。
-            let usage_store = store.clone();
-            let usage_key_id = key.id.clone();
-            let usage_category = category;
-            let usage_req_model = requested_model.to_string();
-            // 同同协议分支：流末衰减模型锁要用真实模型名，不是对外名。
-            let usage_real_model = real_model.clone();
-
-            struct StreamState<S> {
-                translator: crate::upstream::SseTranslator,
-                upstream: S,
-                finished: bool,
-                usage_recorded: bool,
-                raw_tail: Vec<u8>,
-                health_recorded: bool,
-                store: std::sync::Arc<Store>,
-                category: CategoryType,
-                key_id: String,
-                req_model: String,
-                real_model: String,
-            }
-
-            // 挂在 Drop 上而不是在几个 `return None` 分支里各调一次：unfold 的累加器在
-            // **任何**终止路径上都会被 drop —— 正常收完、上游报错、以及下游中途断开
-            // （客户端 Ctrl+C，此时一个分支都不会执行）。前两种手写能覆盖，第三种漏不掉才是关键：
-            // 那正是长回答被打断的场合，用户更想知道这次花了多少 token。
-            impl<S> Drop for StreamState<S> {
-                fn drop(&mut self) {
-                    self.record_usage();
-                    self.record_health();
-                }
-            }
-
-            impl<S> StreamState<S> {
-                fn push_raw(&mut self, bytes: &[u8]) {
-                    self.raw_tail.extend_from_slice(bytes);
-                    if self.raw_tail.len() > TAIL_WINDOW_BYTES {
-                        let drop_n = self.raw_tail.len() - TAIL_WINDOW_BYTES;
-                        self.raw_tail.drain(0..drop_n);
-                    }
-                }
-
-                fn saw_upstream_error(&self) -> bool {
-                    crate::upstream::sse_stream_errored(&String::from_utf8_lossy(&self.raw_tail))
-                }
-
-                fn record_health(&mut self) {
-                    if self.health_recorded {
-                        return;
-                    }
-                    self.health_recorded = true;
-                    health::record_stream_end(
-                        &self.store,
-                        self.category,
-                        &self.key_id,
-                        &self.req_model,
-                        &self.real_model,
-                        self.saw_upstream_error(),
-                    );
-                }
-
-                fn record_usage(&mut self) {
-                    if self.usage_recorded {
-                        return;
-                    }
-                    self.usage_recorded = true;
-                    let Some(u) = self.translator.accumulated_usage() else {
-                        return; // 上游没给用量 —— 不造假数
-                    };
-                    // 不新追加事件：同 collapse key 再 append 会被折叠成「又发生了一次」
-                    // （repeat 变 2、detail 被覆盖）。理由同同协议分支。
-                    let collapse = format!("ok:{}:{}:{}", self.key_id, self.req_model, true);
-                    let (store, cat) = (&self.store, self.category);
-                    store.backfill_usage_for_collapsed_event(cat, Some(&self.key_id), &collapse, u, &self.real_model);
-                }
-            }
-
-            let init = StreamState {
-                translator,
-                upstream,
-                finished: false,
-                usage_recorded: false,
-                raw_tail: Vec::new(),
-                health_recorded: false,
-                store: usage_store,
-                category: usage_category,
-                key_id: usage_key_id,
-                req_model: usage_req_model,
-                real_model: usage_real_model,
-            };
-            let translated = futures_util::stream::unfold(init, |mut st| async move {
-                loop {
-                    match st.upstream.next().await {
-                        Some(Ok(bytes)) => {
-                            // 先留一份原始字节用于判错（翻译器会丢掉 error 事件，之后就查不到了）
-                            st.push_raw(&bytes);
-                            let out = st.translator.push(&bytes);
-                            if out.is_empty() {
-                                continue; // 该块未凑齐完整行，继续拉取
-                            }
-                            let frame = Ok(Frame::data(Bytes::from(out)));
-                            return Some((frame, st));
-                        }
-                        Some(Err(e)) => {
-                            let frame = Err(std::io::Error::other(e.to_string()));
-                            st.finished = true;
-                            return Some((frame, st));
-                        }
-                        None => {
-                            // 上游结束：冲刷一次收尾事件，之后终止。
-                            if st.finished {
-                                return None;
-                            }
-                            st.finished = true;
-                            // **上游流内报过 error 时不冲刷收尾事件**：`finish()` 会发
-                            // `response.completed` / `message_stop`，叠在错误之后就是一条自相
-                            // 矛盾的「completed 且内容为空」的**假成功**，客户端多半以后者为准。
-                            // 这道门刻意比 `sse_error` 的判据**更宽**（原始尾窗认任何非 null 的
-                            // `error` 字段，翻译器只认对象/字符串）—— 那一小块差集里没有它就会
-                            // 退回假成功。代价是 Chat 下游此时也拿不到 `[DONE]`：错误本身已经发
-                            // 出去了，缺一个终止符远好于一条假成功。
-                            if st.saw_upstream_error() {
-                                return None;
-                            }
-                            let tail = st.translator.finish();
-                            if tail.is_empty() {
-                                return None;
-                            }
-                            let frame = Ok(Frame::data(Bytes::from(tail)));
-                            return Some((frame, st));
-                        }
-                    }
-                }
-            });
-            BodyExt::boxed(StreamBody::new(translated))
-        }
-    };
-
-    // 跨协议时下游 content-type 固定为 SSE（上游的可能不同）；同协议沿用上游值。
-    let out_content_type = if sse_dir.is_some() {
-        "text/event-stream".to_string()
-    } else {
-        content_type
-    };
-
-    let mut rb = Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", out_content_type)
-        .header("cache-control", "no-cache");
-    // 同协议字节透明透传时，把上游的 content-encoding 一并带给下游，让下游自己解压。
-    // 跨协议**刻意不带**：那条路输出的是翻译器重新生成的明文事件，带上压缩标记会让下游
-    // 去解压明文而失败。（真遇到「上游压缩 + 跨协议」时，翻译器本身就读不懂压缩字节，
-    // 属另一个问题：应在源头用 accept-encoding: identity 避免，见 apply_upstream_headers。）
-    if sse_dir.is_none() {
-        if let Some(enc) = &upstream_content_encoding {
-            rb = rb.header("content-encoding", enc.as_str());
-        }
-    }
-    let response = rb
-        .body(body)
-        .map_err(|e| AppError::upstream_msg(e.to_string()))?;
+    let translator = sse_dir.map(|dir| {
+        let (namespaces, custom_tools, search_tools) = tool_sets.expect("sse_dir 为 Some 时 tool_sets 必然已收集");
+        crate::upstream::SseTranslator::with_namespaces_and_custom(dir, namespaces, custom_tools, search_tools)
+    });
+    let response = streaming::response(resp, permit, store, category, key, requested_model, &real_model,
+        downstream, translator, route_lease, active.clone())?;
 
     // 转换后发往上游的请求体快照（供调用模型日志核对 reasoning→thinking 等映射）。
     // 开关关闭时不构造——理由同 `forward_to_key` 内同名变量（三处同进同退）。
@@ -2037,6 +1737,7 @@ async fn forward_to_key(
     // 故障转移剩余预算；None = 用户关闭了整体预算。与 Key 自身超时取**小**值：
     // 谁先到谁生效，既不让单个慢 Key 吃光整池预算，也不放宽用户为该 Key 设的上限。
     budget_left: Option<std::time::Duration>,
+    active: &active_requests::Control,
 ) -> AppResult<ForwardOutcome> {
     // 同 try_stream_to_key：走带解密缓存的 secret_for（P2-6）。
     // 密钥缺失同样判 `Invalid`（本地配置错误、永不自愈），理由见流式那处的完整说明。
@@ -2139,6 +1840,7 @@ async fn forward_to_key(
     };
     // 并发槽位。非流式不用搬运它：`resp.bytes()` 在同一作用域 await 完，permit 随函数返回落地。
     // rb 再排队与流式那条是同一个缺陷（排队时间凭空加在预算之外）。两条路径必须同口径。
+    active.phase(active_requests::Phase::Queued);
     let (_permit, effective_to) =
         crate::health::concurrency::acquire_with_budget(&key.id, effective_to)
             .await
@@ -2148,6 +1850,7 @@ async fn forward_to_key(
     // **超时留在这里设**：非流式要等上游完整生成，语义与流式刻意不同，故不进公共函数。
     let deadline = tokio::time::Instant::now() + effective_to;
     let send_once = |body: &Value| {
+        active.phase(active_requests::Phase::Waiting);
         apply_upstream_headers(
             client.post(&url).json(body).timeout(deadline.saturating_duration_since(tokio::time::Instant::now())),
             key,
@@ -2163,7 +1866,7 @@ async fn forward_to_key(
     let mut status = resp.status();
     // Retry-After 须在 resp.bytes() 消费响应体之前取（bytes() 拿走所有权）。
     let mut retry_after = parse_retry_after(resp.headers());
-    let mut bytes = crate::diagnostics::redact_upstream_error_bytes(status.as_u16(), resp.bytes().await.map_err(|e| AppError::upstream_msg(e.to_string()))?, secret.as_str());
+    let mut bytes = crate::diagnostics::redact_upstream_error_bytes(status.as_u16(), active.read_body(resp).await.map_err(|e| AppError::upstream_msg(e.to_string()))?, secret.as_str());
 
     // max_tokens 钳小后越界，见 `rectify_on_budget_error`）→ 就地降/关预算再打一次这条 Key。
     // 必须在这里、作用于**转换后**的 `payload`：`thinking.budget_tokens` 是转换链算出来的，
@@ -2184,7 +1887,7 @@ async fn forward_to_key(
             .map_err(|e| AppError::upstream_msg(format!("连接 {} 失败: {e}", crate::diagnostics::mask_url_credentials(&url))))?;
         status = resp.status();
         retry_after = parse_retry_after(resp.headers());
-        bytes = crate::diagnostics::redact_upstream_error_bytes(status.as_u16(), resp.bytes().await.map_err(|e| AppError::upstream_msg(e.to_string()))?, secret.as_str());
+        bytes = crate::diagnostics::redact_upstream_error_bytes(status.as_u16(), active.read_body(resp).await.map_err(|e| AppError::upstream_msg(e.to_string()))?, secret.as_str());
     }
 
     // 跨协议响应翻译：上游 2xx 时，把响应体从上游协议翻译回下游客户端期望的协议格式。
@@ -5040,6 +4743,42 @@ mod tests {
         assert_eq!(parse_retry_after(&h), None);
     }
 
+    #[tokio::test]
+    async fn routing_privacy_blocks_before_judge_business_and_body_logs() {
+        use crate::store::routing::{self, config::{CategoryPolicy, PrivacyMode, RouteGroup, ModelRef, IntentRule}};
+        let captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let upstream = spawn_capture_mock(captured.clone()).await;
+        let dir = temp_dir("routing_privacy_e2e");
+        let store = Arc::new(Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
+        let mut settings = store.get_settings(); settings.request_log_enabled = true; settings.log_downstream_raw_enabled = true;
+        store.save_settings(UserPrefs::from(&settings)).unwrap();
+        let mut k = key("routing-privacy-e2e", 0, &upstream);
+        k.models = vec![crate::model::ModelInfo { real_name: "real".into(), source: "manual".into(), fetched_at: None, context_window: None, max_output_tokens: None }];
+        store.upsert_key(k).unwrap();
+        store.secrets.write().set("routing-privacy-e2e", "dummy").unwrap();
+        let mut policy = CategoryPolicy::default();
+        policy.privacy.mode = PrivacyMode::Block;
+        let group = RouteGroup { id: uuid::Uuid::new_v4().to_string(), name: "Test".into(), enabled: true, default_model: "real".into(), judge: Some(ModelRef { key_id: "routing-privacy-e2e".into(), model: "real".into() }), rules: vec![IntentRule { id: "test".into(), intent: "test".into(), model: "real".into() }] };
+        let auto = group.model_id(); policy.groups.push(group);
+        routing::save_policy(&store, CategoryType::ClaudeCli, policy, None, 0).unwrap();
+        let pm = ProxyManager::new(store.clone());
+        let port = pm.start(CategoryType::ClaudeCli).await.unwrap();
+        let secret = format!("sk-proj-{}", "Sensitive0123456789".repeat(3));
+        let client = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(10)).build().unwrap();
+        let response = client.post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-synaroute-session-id", "privacy-e2e-session")
+            .json(&json!({"model":auto,"max_tokens":20,"messages":[{"role":"user","content":secret}]})).send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 422);
+        assert!(captured.lock().is_empty(), "neither judge nor business upstream may receive blocked text");
+        assert!(!response.text().await.unwrap().contains(&secret));
+        for event in store.list_all_events() {
+            assert!(!serde_json::to_string(&event).unwrap().contains(&secret));
+            if let Some(trace) = store.event_trace(&event.id) { assert!(!serde_json::to_string(&trace).unwrap().contains(&secret)); }
+        }
+        pm.stop(CategoryType::ClaudeCli);
+        drop(pm); drop(store); std::fs::remove_dir_all(dir).ok();
+    }
+
     /// 起一个**捕获请求体**的 mock 上游：把收到的 body 存进共享 Vec，返回固定 200。
     /// 用于端到端验证「发往上游的 body 里到底有没有 thinking」。
     async fn spawn_capture_mock(captured: std::sync::Arc<parking_lot::Mutex<Vec<String>>>) -> String {
@@ -6581,6 +6320,58 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn responses_failed_events_update_health_in_direct_and_translated_streams() {
+        let upstream = spawn_sse_mock(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"p2-failure\"}}\n\n\
+             event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n\
+             event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"p2 terminal failure\"}}}\n\n",
+        ).await;
+        for category in [CategoryType::Codex, CategoryType::ClaudeCli] {
+            let id = format!("p2-response-failure-{}", uuid::Uuid::new_v4());
+            let dir = temp_dir(&id);
+            let store = std::sync::Arc::new(Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
+            let mut candidate = key(&id, 0, &upstream);
+            candidate.category_id = category;
+            candidate.protocol = Protocol::OpenaiResponses;
+            candidate.health.fail_count = 1;
+            store.upsert_key(candidate).unwrap();
+            if store.secrets.read().master_state().required {
+                store.secrets.write().enable_master_password("TestPass123").unwrap();
+            }
+            store.secrets.write().set(&id, "fixture-secret").unwrap();
+            let proxy = ProxyManager::new(store.clone());
+            let port = proxy.start(category).await.unwrap();
+            let (path, body) = if category == CategoryType::Codex {
+                ("responses", json!({"model":"p2-failed-model","input":"hi","stream":true}))
+            } else {
+                ("messages", json!({"model":"p2-failed-model","messages":[{"role":"user","content":"hi"}],"max_tokens":64,"stream":true}))
+            };
+            let response = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).build().unwrap()
+                .post(format!("http://127.0.0.1:{port}/v1/{path}")).json(&body).send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let text = response.text().await.unwrap();
+            assert!(text.contains("p2 terminal failure"), "{category:?}: {text}");
+            assert!(!text.contains("response.completed") && !text.contains("message_stop"), "{text}");
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let mut tick = tokio::time::interval(std::time::Duration::from_millis(5));
+                while store.get_key(&id).unwrap().health.last_live_success.is_none()
+                    && !store.list_all_events().iter().any(|event| event.kind == "error"
+                        && event.key_id.as_deref() == Some(id.as_str()) && event.detail.contains("流内失败")) {
+                    tick.tick().await;
+                }
+            }).await.expect("流末健康记账必须完成");
+            let health = store.get_key(&id).unwrap().health;
+            assert_eq!(health.fail_count, 2, "{category:?}: response.failed 不得走成功衰减");
+            assert!(health.last_live_success.is_none());
+            assert!(store.list_all_events().iter().any(|event| event.kind == "error"
+                && event.key_id.as_deref() == Some(id.as_str()) && event.detail.contains("流内失败")));
+            proxy.stop(category);
+            drop(store);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// **P0 回归**：同协议流式「200 响应头 + 流内 error」必须能把 Key 熔断。

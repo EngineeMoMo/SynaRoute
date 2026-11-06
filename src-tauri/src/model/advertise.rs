@@ -386,10 +386,12 @@ mod tests {
             let at = endpoint_rs.find(f).unwrap_or_else(|| panic!("{f} 改名了，请同步本判据"));
             let body = &endpoint_rs[at..(at + 900).min(endpoint_rs.len())];
             assert!(
-                body.contains("advertised_pool("),
+                body.contains("catalog::advertised(store, category)"),
                 "{f} 没走带 label 的那份 —— 这个出口的显示名会静默退回对外名"
             );
         }
+        let catalog_rs = prod(include_str!("../routing/catalog.rs"));
+        assert!(catalog_rs.contains("crate::proxy::model_pool::advertised_pool(keys)"), "路由目录必须保留真实模型的显示名来源");
         assert_eq!(
             endpoint_rs.matches("anthropic_model_json").count(),
             3,

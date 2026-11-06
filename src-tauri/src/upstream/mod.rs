@@ -19,6 +19,7 @@ mod budget;
 mod cache;
 mod client;
 mod completion;
+pub(crate) mod routing_judge;
 mod convert;
 mod discovery;
 mod endpoint;
@@ -177,15 +178,7 @@ pub(crate) fn body_is_upstream_error(bytes: &[u8]) -> Option<String> {
     upstream_error_message(&json)
 }
 
-/// 流式 SSE（末尾窗口）里是否出现**上游报错事件**。
-///
-/// 上游可能先回 200 响应头、随后在 SSE 流内发错误（Anthropic 过载 / 生成中报错的常见形态：
-/// `event: error` + `data: {"type":"error","error":{"type":"overloaded_error",...}}`；
-/// OpenAI 兼容流有时也在末尾 chunk 塞 `{"error":{...}}`）。这类「200 后流内失败」若不识别，
-/// 会被当成成功记账（清 fail_count、解除短路窗口），使熔断/短路在流式主路径上零保护。
-///
-/// 用于 proxy.rs 同协议流式的流末补记：命中则 `record_live_failure` 而非坐实 success。
-/// 只看**已缓存的尾部窗口**（8KB）——终止性错误事件必在流末，尾窗必然覆盖到。
+/// 从流末尾窗内可解析的 SSE 事件识别失败；截断或非 SSE 数据不在该判据覆盖范围。
 pub fn sse_stream_errored(sse: &str) -> bool {
     for line in sse.lines() {
         let Some(data) = line.trim().strip_prefix("data:") else {
@@ -198,8 +191,7 @@ pub fn sse_stream_errored(sse: &str) -> bool {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(data.as_bytes()) else {
             continue;
         };
-        // Anthropic：顶层 {"type":"error",...}；OpenAI 兼容：顶层含非空 "error" 对象。
-        if v.get("type").and_then(|t| t.as_str()) == Some("error") {
+        if sse::sse_error::declares_error(&v) {
             return true;
         }
         if v.get("error").map(|e| !e.is_null()).unwrap_or(false) {
@@ -523,6 +515,39 @@ data: [DONE]\n";
         assert!(!super::sse_stream_errored(ok), "正常流不得被判为错误");
         // error 为 null（部分上游总带该键但成功时为 null）→ 不算错
         assert!(!super::sse_stream_errored("data: {\"choices\":[],\"error\":null}\n\n"));
+    }
+
+    #[test]
+    fn health_detection_includes_every_translatable_error() {
+        for payload in [
+            serde_json::json!({"type":"error","error":{"message":"failed"}}),
+            serde_json::json!({"type":"response.failed","response":{"error":{"message":"failed"}}}),
+            serde_json::json!({"error":{"message":"failed"}}),
+            serde_json::json!({"error":"failed"}),
+        ] {
+            assert!(super::upstream_error_message(&payload).is_some());
+            assert!(super::sse_stream_errored(&format!("data: {payload}\n\n")), "{payload}");
+        }
+    }
+
+    #[test]
+    fn responses_terminal_failures_are_not_successful_streams() {
+        for payload in [
+            serde_json::json!({"type":"response.failed","response":{"status":"failed","error":{"message":"failed"}}}),
+            serde_json::json!({"type":"response.failed","response":{"error":null}}),
+            serde_json::json!({"type":"error","message":"failed"}),
+            serde_json::json!({"error":42}),
+        ] {
+            assert!(super::sse_stream_errored(&format!("data: {payload}\n\n")), "{payload}");
+        }
+        for payload in [
+            serde_json::json!({"type":"response.completed","response":{"status":"completed","error":null}}),
+            serde_json::json!({"type":"response.incomplete","response":{"status":"incomplete","error":null}}),
+            serde_json::json!({"type":"response.output_text.delta","delta":"response.failed is an event name"}),
+            serde_json::json!({"error":null}),
+        ] {
+            assert!(!super::sse_stream_errored(&format!("data: {payload}\n\n")), "{payload}");
+        }
     }
 
     #[test]

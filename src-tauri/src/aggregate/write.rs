@@ -595,33 +595,57 @@ fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// 备份 → 同目录临时文件 → `rename`。返回备份文件路径（目标原本不存在时为 `None`）。
-///
-/// 🔴 **备份失败一律中止写入**（fail-closed）：备份是这次改动对用户的核心承诺，
-/// 备份没成功还照写等于「无备份覆盖源代码」，而那正是本模块要消除的东西。
-/// 磁盘满 / 权限不足 / 杀软锁文件都会走到这条，宁可让这一条失败并如实说明。
+// 不直接写已有路径，避免跟随临时文件或备份的链接。
+fn replace_file(
+    target: &Path,
+    permissions: Option<std::fs::Permissions>,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let tmp = with_suffix(target, &format!(".{}{TEMP_SUFFIX}", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    // Only clean files we created; create_new must never truncate an existing alias.
+    scopeguard::defer! { let _ = std::fs::remove_file(&tmp); }
+    let result = (|| {
+        if let Some(permissions) = permissions { file.set_permissions(permissions)?; }
+        write(&mut file)?;
+        file.sync_all()
+    })();
+    drop(file);
+    result?;
+    std::fs::rename(&tmp, target)
+}
+
+fn check_backup_target(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(_) => Err("备份路径不是普通文件，已放弃写入".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("无法检查备份路径，已放弃写入：{e}")),
+    }
+}
+
 fn write_one(full: &Path, content: &str) -> Result<Option<PathBuf>, String> {
+    use std::io::Write;
     if let Some(parent) = full.parent() {
-        // 显式报错而不是 `let _ =`：建不了目录时后面的写入会失败在一句
-        // 「系统找不到指定的路径」上，而真因是父目录没建起来。
         std::fs::create_dir_all(parent).map_err(|e| format!("创建父目录失败：{e}"))?;
     }
-    let backup = if full.exists() {
+    let permissions = match std::fs::metadata(full) {
+        Ok(meta) => Some(meta.permissions()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("读取原文件权限失败：{e}")),
+    };
+    let backup = if permissions.is_some() {
         let bak = with_suffix(full, BACKUP_SUFFIX);
-        std::fs::copy(full, &bak).map_err(|e| format!("备份原文件失败，已放弃写入：{e}"))?;
+        check_backup_target(&bak)?;
+        replace_file(&bak, permissions.clone(), |dst| {
+            std::io::copy(&mut std::fs::File::open(full)?, dst).map(|_| ())
+        }).map_err(|e| format!("备份原文件失败，已放弃写入：{e}"))?;
         Some(bak)
     } else {
         None
     };
-    // 原子写。临时文件必须与目标**同目录** —— `%TEMP%` 跨卷时 `rename` 直接失败，
-    // 而原子性全靠这一步（同 codex_sessions 那条）。
-    let tmp = with_suffix(full, TEMP_SUFFIX);
-    std::fs::write(&tmp, content).map_err(|e| format!("写入临时文件失败：{e}"))?;
-    std::fs::rename(&tmp, full).map_err(|e| {
-        // 不清理会在用户源码目录里留一个 `.synaroute.tmp` 垃圾文件。
-        let _ = std::fs::remove_file(&tmp);
-        format!("替换目标文件失败：{e}")
-    })?;
+    replace_file(full, permissions, |dst| dst.write_all(content.as_bytes()))
+        .map_err(|e| format!("替换目标文件失败：{e}"))?;
     Ok(backup)
 }
 
@@ -806,6 +830,88 @@ mod tests {
         assert_eq!(std::fs::read_to_string(work.join("c.rs")).unwrap(), "first");
         assert_eq!(std::fs::read_to_string(work.join("d.rs")).unwrap(), "second");
         std::fs::remove_dir_all(&work).ok();
+    }
+
+    #[test]
+    fn failed_temporary_write_cleans_only_its_own_file() {
+        use std::io::Write;
+        let dir = temp_dir("tmp_cleanup");
+        let target = dir.join("a.rs");
+        let legacy_tmp = with_suffix(&target, TEMP_SUFFIX);
+        std::fs::write(&target, "original").unwrap();
+        std::fs::write(&legacy_tmp, "unrelated").unwrap();
+        let error = replace_file(&target, None, |file| {
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+        assert!(error.is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+        assert_eq!(std::fs::read_to_string(&legacy_tmp).unwrap(), "unrelated");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn side_file_aliases_never_modify_their_external_target() {
+        for suffix in [BACKUP_SUFFIX, TEMP_SUFFIX] {
+            let dir = temp_dir("side_alias");
+            let work = dir.join("work");
+            std::fs::create_dir(&work).unwrap();
+            let full = work.join("a.rs");
+            let outside = dir.join("outside.txt");
+            std::fs::write(&full, "original").unwrap();
+            std::fs::write(&outside, "must stay").unwrap();
+            std::fs::hard_link(&outside, with_suffix(&full, suffix)).unwrap();
+            let changes = apply(&work, "```file:a.rs\nreplacement\n```\n");
+            assert!(changes[0].success, "{suffix}: {changes:?}");
+            assert_eq!(std::fs::read_to_string(&full).unwrap(), "replacement");
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "must stay", "{suffix}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn backup_symlinks_are_refused_and_legacy_temporary_symlinks_are_not_used() {
+        let dir = temp_dir("side_symlinks");
+        let work = dir.join("work");
+        std::fs::create_dir(&work).unwrap();
+        let full = work.join("a.rs");
+        let outside = dir.join("outside.txt");
+        std::fs::write(&full, "original").unwrap();
+        std::fs::write(&outside, "must stay").unwrap();
+        let backup = with_suffix(&full, BACKUP_SUFFIX);
+        if !link_file_for_test(&outside, &backup) {
+            eprintln!("跳过：当前环境无法创建文件符号链接；硬链接回归单独执行");
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        let changes = apply(&work, "```file:a.rs\nreplacement\n```\n");
+        assert!(!changes[0].success);
+        assert_eq!(std::fs::read_to_string(&full).unwrap(), "original");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "must stay");
+        std::fs::remove_file(&backup).unwrap();
+        assert!(link_file_for_test(&outside, &with_suffix(&full, TEMP_SUFFIX)));
+        assert!(apply(&work, "```file:a.rs\nreplacement\n```\n")[0].success);
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "must stay");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_preserves_permissions_and_rejects_backup_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = temp_dir("permissions");
+        let full = dir.join("run.sh");
+        std::fs::write(&full, "original").unwrap();
+        std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o750)).unwrap();
+        write_one(&full, "next").unwrap();
+        assert_eq!(std::fs::metadata(&full).unwrap().permissions().mode() & 0o777, 0o750);
+        let backup = with_suffix(&full, BACKUP_SUFFIX);
+        std::fs::remove_file(&backup).unwrap();
+        symlink(&full, &backup).unwrap();
+        assert!(write_one(&full, "must not write").is_err());
+        assert_eq!(std::fs::read_to_string(&full).unwrap(), "next");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

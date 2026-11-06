@@ -25,6 +25,10 @@ import securitySource from "./i18n.security.ts?raw";
 import { securityEn, securityZh } from "@/lib/i18n.security";
 import overviewSource from "./i18n.overview.ts?raw";
 import { overviewEn, overviewZh } from "@/lib/i18n.overview";
+import routingSource from "./i18n.routing.ts?raw";
+import { routingEn, routingZh } from "@/lib/i18n.routing";
+import activeRequestsSource from "./i18n.activeRequests.ts?raw";
+import { activeRequestsEn, activeRequestsZh } from "./i18n.activeRequests";
 
 /**
  * i18n 的结构性判据。**这些浏览器里看不出来**（缺翻译只是显示成另一种语言或原始 key，
@@ -66,6 +70,8 @@ const SOURCES: { name: string; src: string }[] = [
   { name: "i18n.resilience.ts", src: resilienceSource },
   { name: "i18n.security.ts", src: securitySource },
   { name: "i18n.overview.ts", src: overviewSource },
+  { name: "i18n.routing.ts", src: routingSource },
+  { name: "i18n.activeRequests.ts", src: activeRequestsSource },
 ];
 
 /** 各分片导出的运行时字典，用于校验「分片真的被展开进主词典了」。 */
@@ -81,6 +87,8 @@ const CHUNKS: { name: string; zh: Record<string, string>; en: Record<string, str
   { name: "resilience", zh: resilienceZh, en: resilienceEn },
   { name: "security", zh: securityZh, en: securityEn },
   { name: "overview", zh: overviewZh, en: overviewEn },
+  { name: "routing", zh: routingZh, en: routingEn },
+  { name: "activeRequests", zh: activeRequestsZh, en: activeRequestsEn },
 ];
 
 /**

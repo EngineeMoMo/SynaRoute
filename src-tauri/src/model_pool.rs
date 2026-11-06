@@ -437,6 +437,14 @@ pub(crate) fn would_silently_substitute(
 /// 原样返回全部启用 Key（熔断本为「多 Key 快速切换」而设，无处可切时不应自杀成 503）。
 /// **兜底也继承同一排序**（降级不剔除，同 `balance_gate`）：无处可切时，最有把握的那条
 /// 仍该排在最前。该语义有多条测试锁住，改这里前先读那两处的文档。
+fn routing_class(key: &ProviderKey, model: &str, over_budget: &std::collections::HashSet<String>) -> (Confidence, bool, bool) {
+    (confidence(key, model), crate::health::balance_gate::is_exhausted(key), over_budget.contains(&key.id))
+}
+
+pub(crate) fn same_routing_class(a: &ProviderKey, b: &ProviderKey, model: &str, over_budget: &std::collections::HashSet<String>) -> bool {
+    routing_class(a, model, over_budget) == routing_class(b, model, over_budget)
+}
+
 pub(crate) fn rank_candidates_budgeted(
     all: &[ProviderKey],
     category: CategoryType,
@@ -451,16 +459,7 @@ pub(crate) fn rank_candidates_budgeted(
     // `to_ascii_lowercase` 分配 + 若干字符串比较。这是**转发热路径**上每请求一次的地方，
     // 本仓整治过同类开销（「每请求克隆整份 AppSettings 3~4 次」）。
     // cached 版对每个元素只算一次，代价是一个 n 长的临时 Vec —— n 是该分类的启用 Key 数。
-    enabled.sort_by_cached_key(|k| {
-        (
-            confidence(k, requested_model),
-            crate::health::balance_gate::is_exhausted(k),
-            // 超预算降级（不剔除，同 `balance_gate`）：累计估算花费已达用户设的上限的 Key 排到
-            // 同把握里的后面，但仍在池子里 —— 软上限，别为一个「估算」把请求直接打失败。
-            over_budget.contains(&k.id),
-            k.priority,
-        )
-    });
+    enabled.sort_by_cached_key(|k| (routing_class(k, requested_model, over_budget), k.priority));
 
     // 未熔断、要的模型没被锁、且不在上游给的配额窗口内。前两条是纯函数（只读
     // HealthState + 当前时间），调用方持着读锁时调用安全；第三条读进程级窗口表
@@ -1292,7 +1291,7 @@ mod tests {
     fn the_budget_gate_must_be_wired_into_routing() {
         let here = prod(include_str!("model_pool.rs"));
         assert_eq!(
-            here.matches("over_budget.contains(&k.id)").count(),
+            here.matches("over_budget.contains(&key.id)").count(),
             1,
             "排序键里必须有且仅有一处「超预算降级」"
         );

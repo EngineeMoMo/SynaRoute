@@ -90,7 +90,7 @@ use std::path::{Path, PathBuf};
 ///
 /// 名字里带 `synaroute` 是[`pointer_is_ours`]的唯一判据：只认这个文件名，绝不覆盖用户指针。
 /// 同类工具为此修过 #6087（早期抢用户指针且不能还原，只能发公告手动修）。
-const CATALOG_FILE: &str = "synaroute-model-catalog.json";
+pub(in crate::tools) const CATALOG_FILE: &str = "synaroute-model-catalog.json";
 
 /// 自定义条目的 `priority` 起点。
 ///
@@ -413,7 +413,7 @@ fn context_window_across_keys(name: &str, keys: &[ProviderKey]) -> Option<u32> {
 /// `resolve_model` 解析，落到一条根本不叫这个名字的上游模型上。菜单里出现选不动的东西，
 /// 比菜单里少几个更难排查。还原会把 `config.toml` 整份从 `.bak` 恢复（指针那行随之消失）、
 /// 并按 `.synaroute-created` 标记删掉目录文件本身，官方条目当场回来。
-pub(super) fn build_catalog(models: &[String], keys: &[ProviderKey]) -> Value {
+pub(in crate::tools) fn build_catalog(models: &[String], keys: &[ProviderKey]) -> Value {
     let entries: Vec<Value> = models
         .iter()
         .enumerate()
@@ -451,7 +451,7 @@ pub(super) fn catalog_path() -> AppResult<PathBuf> {
 /// 目录、丢弃用户自定义路径，而且被改过的指针**不会被还原** —— 只能发升级公告让用户
 /// 手动指回去。指针是用户可能自己在用的东西（官方文档就教了 `model_catalog_json` 怎么配），
 /// 抢掉它的后果是用户精心配的模型目录静默失效。
-pub(super) fn pointer_is_ours(pointer: &str) -> bool {
+pub(in crate::tools) fn pointer_is_ours(pointer: &str) -> bool {
     Path::new(pointer)
         .file_name()
         .is_some_and(|n| n == CATALOG_FILE)
@@ -558,11 +558,13 @@ fn validate(catalog: &Value) -> AppResult<()> {
 /// 生成并写入目录文件。走 [`backup_and_write_bytes`]：文件本不存在时会落
 /// `.synaroute-created` 标记，还原时按标记整份删除（语义正是「这份文件是我们凭空造的」）。
 pub(super) fn write_catalog_at(
+    groups: &[crate::store::routing::config::RouteGroup],
     path: &Path,
     models: &[String],
     keys: &[ProviderKey],
 ) -> AppResult<()> {
-    let catalog = build_catalog(models, keys);
+    let mut catalog = build_catalog(models, keys);
+    crate::store::routing::catalog::decorate_codex(&mut catalog, groups, keys);
     validate(&catalog)?;
     let data = serde_json::to_vec_pretty(&catalog)?;
     super::backup_and_write_bytes(path, &data)
@@ -590,6 +592,7 @@ pub(super) fn write_catalog_at(
 ///   不改的代价是 Codex 拿一个我们服务不了的名字去请求，被 `resolve_model` 兜到别处或 404；
 /// - 没有值 → 写列表首个，让 Codex 启动即有模型可用（原有行为）。
 pub(super) fn wire_into(
+    groups: &[crate::store::routing::config::RouteGroup],
     table: &mut toml::value::Table,
     models: &[String],
     keys: &[ProviderKey],
@@ -600,7 +603,7 @@ pub(super) fn wire_into(
     // 与目录同一次写盘：它是 config.toml 顶层表上的另一个键，分两次写只会多一次备份+落盘。
     disable_remote_compaction(table);
     if can_build(models) {
-        write_catalog_at(catalog_file, models, keys)?;
+        write_catalog_at(groups, catalog_file, models, keys)?;
         table.insert(
             "model_catalog_json".to_string(),
             toml::Value::String(catalog_file.to_string_lossy().into_owned()),
@@ -717,36 +720,10 @@ fn select_model_at(
     model: &str,
     path: &Path,
 ) -> AppResult<()> {
-    let trimmed = model.trim();
-    let write_config = |()| -> AppResult<()> {
-        if trimmed.is_empty() || !path.is_file() {
-            // 空串 =「跟随客户端透传」，语义是「不干预」——删掉 `model` 键会连带清掉用户在
-            // Codex 菜单里做过的选择。文件不存在 = 没接入过，不凭空造一份。
-            // ⚠️ 后一道与下面的 `ours` 判据**重叠**（空文件读出空表 → 取不到
-            // `model_provider` → 同样早退），注入验证时确认过。仍然保留：早退的语义是
-            // 「没接入过就不碰」，不该依赖另一道门的副作用来成立。
-            return Ok(());
-        }
-        let text = std::fs::read_to_string(path)?;
-        let mut doc = text
-            .parse::<toml::Value>()
-            .map_err(|e| AppError::ToolConfig(format!("解析 config.toml 失败: {e}")))?;
-        let Some(table) = doc.as_table_mut() else {
-            return Ok(());
-        };
-        let ours = table
-            .get("model_provider")
-            .and_then(|v| v.as_str())
-            .is_some_and(|v| v == super::MCP_CLIENT_NAME);
-        if !ours {
-            return Ok(());
-        }
-        table.insert("model".to_string(), toml::Value::String(trimmed.to_string()));
-        let serialized =
-            toml::to_string_pretty(&doc).map_err(|e| AppError::ToolConfig(e.to_string()))?;
-        crate::tools::write_without_locking_snapshot(path, serialized.as_bytes())
-    };
-    write_config(())?;
+    let _edit = store.routing_runtime.edit.lock();
+    if let Some(bytes) = crate::tools::scene_config::codex_model_bytes(path, model)? {
+        crate::tools::write_without_locking_snapshot(path, &bytes)?;
+    }
     store.set_active_model(crate::model::CategoryType::Codex, model)
 }
 
@@ -1352,7 +1329,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join(CATALOG_FILE);
         let mut table = toml::value::Table::new();
-        wire_into(&mut table, &["m".into()], &[], &file).unwrap();
+        wire_into(&[], &mut table, &["m".into()], &[], &file).unwrap();
 
         let levels = table
             .get("desktop")
@@ -1409,7 +1386,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let file = d.join(CATALOG_FILE);
         let mut table = toml::value::Table::new();
-        wire_into(&mut table, &[], &[], &file).unwrap();
+        wire_into(&[], &mut table, &[], &[], &file).unwrap();
         assert!(!file.exists(), "空列表不该写出目录文件");
         assert!(!table.contains_key("model_catalog_json"), "更不该写指针");
         assert!(!table.contains_key("model"), "没有模型可写时也不该造一个 model 键");
@@ -1421,7 +1398,7 @@ mod tests {
             "model_catalog_json".into(),
             toml::Value::String(file.to_string_lossy().into_owned()),
         );
-        wire_into(&mut mine, &[], &[], &file).unwrap();
+        wire_into(&[], &mut mine, &[], &[], &file).unwrap();
         assert!(!mine.contains_key("model_catalog_json"));
 
         let mut theirs = toml::value::Table::new();
@@ -1429,7 +1406,7 @@ mod tests {
             "model_catalog_json".into(),
             toml::Value::String("/home/u/.codex/my-catalog.json".into()),
         );
-        wire_into(&mut theirs, &[], &[], &file).unwrap();
+        wire_into(&[], &mut theirs, &[], &[], &file).unwrap();
         assert_eq!(
             theirs["model_catalog_json"].as_str(),
             Some("/home/u/.codex/my-catalog.json"),
@@ -1483,19 +1460,19 @@ mod tests {
         // ① 用户已选第二个 → 保留
         let mut t = toml::value::Table::new();
         t.insert("model".into(), toml::Value::String("user-picked".into()));
-        wire_into(&mut t, &models, &ks, &file).unwrap();
+        wire_into(&[], &mut t, &models, &ks, &file).unwrap();
         assert_eq!(t["model"].as_str(), Some("user-picked"), "用户的选择不许被冲掉");
 
         // ② 选的模型已不在可服务列表里（改了 Key 池）→ 换成首个，否则 Codex 会拿一个
         //    我们服务不了的名字去请求。
         let mut t = toml::value::Table::new();
         t.insert("model".into(), toml::Value::String("gone-away".into()));
-        wire_into(&mut t, &models, &ks, &file).unwrap();
+        wire_into(&[], &mut t, &models, &ks, &file).unwrap();
         assert_eq!(t["model"].as_str(), Some("first"));
 
         // ③ 没有 model 键 → 写首个（原有行为：启动即有模型可用）
         let mut t = toml::value::Table::new();
-        wire_into(&mut t, &models, &ks, &file).unwrap();
+        wire_into(&[], &mut t, &models, &ks, &file).unwrap();
         assert_eq!(t["model"].as_str(), Some("first"));
 
         // 指针与文件同时到位（写了指针而文件不在 = Codex 启动即报错）
@@ -1545,7 +1522,7 @@ mod tests {
         let file = d.join(CATALOG_FILE);
         let ks = [key(Protocol::Anthropic, &[("m", None)])];
 
-        write_catalog_at(&file, &["m".into()], &ks).unwrap();
+        write_catalog_at(&[], &file, &["m".into()], &ks).unwrap();
         assert!(file.is_file());
         assert!(
             crate::tools::restore_one(&file).unwrap(),
@@ -1625,6 +1602,7 @@ mod tests {
         let cfg = d.join("config.toml");
         let cat = d.join(CATALOG_FILE);
         super::super::apply_at(
+            &[],
             &cfg,
             "http://127.0.0.1:47101",
             &["a".to_string(), "b".to_string()],
@@ -1892,7 +1870,7 @@ mod tests {
         let pairs: Vec<(&str, Option<u32>)> = models.iter().map(|m| (m.as_str(), None)).collect();
         let keys = [key(proto, &pairs)];
         // 走完整生产路径（含 wire_into 对顶层 model 的三分支决策）。
-        let msg = super::super::apply_at(&cfg, &endpoint, &models, &keys, &cat).unwrap();
+        let msg = super::super::apply_at(&[], &cfg, &endpoint, &models, &keys, &cat).unwrap();
 
         let doc = std::fs::read_to_string(&cfg)
             .unwrap()
@@ -1948,7 +1926,7 @@ mod tests {
             "gpt-6-luna".to_string(),
             "gpt-5.5".to_string(),
         ];
-        write_catalog_at(&file, &models, &ks).unwrap();
+        write_catalog_at(&[], &file, &models, &ks).unwrap();
         std::fs::write(
             home.join("config.toml"),
             format!(

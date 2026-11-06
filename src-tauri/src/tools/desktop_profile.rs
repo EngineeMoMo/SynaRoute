@@ -105,6 +105,24 @@ pub fn build_desktop_model_entries(
 /// `deploymentMode=3p`。代价是接入后桌面端里看不到官方登录入口，须从 SynaRoute 点还原才能回官方。
 ///
 /// `entries` 恒非空（调用方已挡空列表）；每条的能力断言见 [`DesktopModelEntry`]。
+pub(super) fn build_routing_entries(
+    models: &[String],
+    keys: &[ProviderKey],
+    groups: &[crate::store::routing::config::RouteGroup],
+) -> Vec<DesktopModelEntry> {
+    let mut entries = build_desktop_model_entries(models, keys);
+    for entry in &mut entries {
+        if let Some(group) = crate::store::routing::catalog::resolve_group(groups, &entry.name) {
+            entry.label_override = Some(format!("{} · Auto", group.name));
+            entry.supports1m = crate::store::routing::catalog::common_context(group, keys)
+                .is_some_and(|n| n >= crate::model::ONE_MILLION_CONTEXT);
+            entry.anthropic_family_tier = None;
+            entry.is_family_default = false;
+        }
+    }
+    entries
+}
+
 pub fn build_gateway_profile(
     existing: Value,
     endpoint: &str,

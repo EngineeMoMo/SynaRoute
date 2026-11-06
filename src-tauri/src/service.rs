@@ -58,7 +58,7 @@ fn notify(_title: &str, _body: &str) {}
 /// ⚠️ 并集不重演它，靠 `model_pool::rank_candidates` 把「能原生服务本次模型」排在
 /// `priority` 之前 —— 单独放开这个口径而不改排序会把那个缺陷原样带回来。
 pub(crate) fn models_for_apply(store: &Store, category: CategoryType) -> Vec<String> {
-    crate::proxy::discoverable_models(&store.enabled_keys_sorted(category))
+    crate::store::routing::catalog::models(store, category)
 }
 
 /// 该分类**当前应当生效**的代理端点。
@@ -100,7 +100,7 @@ pub(crate) async fn apply_tool_config(
     // - Codex：整份写进 model_catalog_json 那份模型目录；顶层 model 仅在缺失/不可服务时才写
     // - 桌面端：整份写进 gateway 档的 inferenceModels（3p 部署模式）
     let keys = store.enabled_keys_sorted(category);
-    let models = crate::proxy::discoverable_models(&keys);
+    let models = models_for_apply(store, category);
     // 写工具配置失败 → **必须把刚起来的代理停掉**，让整个「起代理」操作原子地失败。
     //
     // 否则：端口已在监听、`proxy.is_running` 为真 → 托盘该分类打勾、状态条显示「运行中」、
@@ -109,7 +109,7 @@ pub(crate) async fn apply_tool_config(
     // 真实触发路径很日常：新建桌面端 Key 还没拉模型（models 为空）→ apply_desktop_at 直接 Err。
     //
     // 与本函数的语义契约保持一致：起代理 = 监听 + 写客户端配置，两者缺一即算没起来。
-    let msg = match crate::tools::apply(category, &endpoint, &models, &keys) {
+    let msg = match crate::store::routing::settings(store).and_then(|routing| crate::tools::apply(crate::store::routing::catalog::groups(&routing, category), category, &endpoint, &models, &keys)) {
         Ok(m) => m,
         Err(e) => {
             // stop 是同步且不返回错误（只是撤掉监听与运行态标记）。
@@ -215,8 +215,8 @@ pub(crate) async fn set_proxy_port(
     // 用**真实绑定端口**而非请求端口：首选端口被占用时会回退，写错客户端就连不上。
     let endpoint = format!("http://127.0.0.1:{bound}");
     let keys = store.enabled_keys_sorted(category);
-    let models = crate::proxy::discoverable_models(&keys);
-    match crate::tools::apply(category, &endpoint, &models, &keys) {
+    let models = models_for_apply(store, category);
+    match crate::store::routing::settings(store).and_then(|routing| crate::tools::apply(crate::store::routing::catalog::groups(&routing, category), category, &endpoint, &models, &keys)) {
         Ok(_) => record_apply_success(
             store,
             category,

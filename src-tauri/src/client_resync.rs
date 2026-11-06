@@ -103,9 +103,9 @@ fn resync_running(state: &crate::AppState) {
             continue;
         };
         let keys = state.store.enabled_keys_sorted(category);
-        let models = crate::proxy::discoverable_models(&keys);
+        let models = crate::service::models_for_apply(&state.store, category);
         let endpoint = format!("http://127.0.0.1:{port}");
-        match crate::tools::apply(category, &endpoint, &models, &keys) {
+        match crate::store::routing::settings(&state.store).and_then(|routing| crate::tools::apply(crate::store::routing::catalog::groups(&routing, category), category, &endpoint, &models, &keys)) {
             // 成功时**不记 config 事件**：这是自动同步，每编辑一次 Key 就刷一条是纯噪音，
             // 而 `backup_and_write_bytes` 在「序列化结果与磁盘一致」时压根不写盘 ——
             // 绝大多数情况下什么都没变。桌面端的对外名体检要照做（它只在真有不合规名时落事件），

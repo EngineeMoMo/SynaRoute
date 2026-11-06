@@ -12,39 +12,14 @@ use std::time::SystemTime;
 #[path = "data_dir.rs"] pub(crate) mod data_dir;
 #[path = "decision.rs"] pub(crate) mod decision; #[path = "log_rotate.rs"] pub(crate) mod log_rotate;
 #[path = "shared_config.rs"] pub(crate) mod shared_config; #[path = "key_flags.rs"] pub(crate) mod key_flags; #[path = "brain_config.rs"] mod brain_config;
-#[path = "key_order.rs"] pub(crate) mod key_order; // 三个排序入口的唯一实现；来由见该文件模块注释
+#[path = "key_order.rs"] pub(crate) mod key_order; #[path = "routing/mod.rs"] pub(crate) mod routing;
 
-/// 检查 baseUrl 是否含路径后缀（如 `https://api.deepseek.com/anthropic` 中的 `/anthropic`）。
-///
-/// DeepSeek 等部分厂商的 baseUrl 会带路径后缀，此时用 `{{baseUrl}}/user/balance` 会拼出
-/// `.../anthropic/user/balance` → 404。应改用 `{{origin}}/user/balance` 剥掉路径部分。
-pub fn base_url_has_path_suffix(base_url: &str) -> bool {
-    let trimmed = base_url.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    // 尝试解析为 URL
-    if let Ok(url) = url::Url::parse(trimmed) {
-        // 检查路径是否非空且不只是 "/"
-        let path = url.path();
-        return !path.is_empty() && path != "/";
-    }
-
-    // 不是有效 URL，则检查是否含 "://" 后跟域名再跟 "/"（如 "https://example.com/path"）
-    if let Some(after_scheme) = trimmed.split("://").nth(1) {
-        // 找到第一个 '/' 的位置（域名结束）
-        if let Some(first_slash) = after_scheme.find('/') {
-            // 如果 '/' 后还有内容（不只是结尾的 '/'），说明有路径后缀
-            let after_slash = &after_scheme[first_slash + 1..];
-            return !after_slash.is_empty();
-        }
-    }
-
-    false
-}
+#[path = "store_endpoint.rs"] mod endpoint;
+pub use endpoint::base_url_has_path_suffix;
 
 pub struct Store {
+    pub(crate) routing_runtime: routing::runtime::Runtime,
+    pub(crate) active_requests: std::sync::Arc<crate::proxy::active_requests::Registry>,
     pub(crate) route_profiles: crate::diagnostics::route_profiles::ProfileStore,
     config_path: PathBuf,
     config: RwLock<AppConfig>,
@@ -390,6 +365,8 @@ impl Store {
         let usage = crate::usage_store::UsageLedger::load(&config_path);
 
         let store = Self {
+            routing_runtime: routing::runtime::Runtime::default(),
+            active_requests: std::sync::Arc::default(),
             route_profiles: crate::diagnostics::route_profiles::ProfileStore::load(config_path.with_file_name("route-profiles.json")),
             config_path,
             config: RwLock::new(config),
@@ -1028,6 +1005,7 @@ impl Store {
     where
         F: FnOnce(&mut AppConfig) -> (R, bool),
     {
+        let _routing_edit = self.routing_runtime.edit.lock();
         // 快照必须在改内存之前取（回滚基线），但只有真要落盘时才用得上。
         let snapshot = self.config.read().clone();
         let (value, changed) = {
@@ -1076,6 +1054,7 @@ impl Store {
     where
         F: FnOnce(&mut AppConfig) -> AppResult<R>,
     {
+        let _routing_edit = self.routing_runtime.edit.lock();
         let snapshot = self.config.read().clone();
         let outcome = {
             let mut cfg = self.config.write();
@@ -1217,7 +1196,7 @@ impl Store {
                 }
                 // 磁盘上新出现的 Key（本进程没见过）→ 保留其磁盘健康态作为暖启动值。
             }
-            cfg.brain = fresh.brain; cfg.decision = fresh.decision;
+            cfg.brain = fresh.brain; cfg.decision = fresh.decision; cfg.routing = fresh.routing;
             cfg.vendors = fresh.vendors;
             after_len = cfg.keys.len();
         }
@@ -2554,6 +2533,8 @@ impl Store {
         // 与生产构造器同样恢复用量累计：测试才能覆盖「重启后累计不归零」这条判据。
         let usage = crate::usage_store::UsageLedger::load(&config_path);
         Ok(Self {
+            routing_runtime: routing::runtime::Runtime::default(),
+            active_requests: std::sync::Arc::default(),
             route_profiles: crate::diagnostics::route_profiles::ProfileStore::load(config_path.with_file_name("route-profiles.json")),
             config_path,
             config: RwLock::new(config),
@@ -2955,6 +2936,7 @@ mod tests {
         let seed = Vendor::builtin_seed();
         let old = AppConfig {
             config_version: 0,
+            routing: Default::default(),
             decision: Default::default(),
             keys: vec![],
             brain: vec![],
@@ -3817,7 +3799,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_flush_failure_keeps_baseline_for_the_next_retry() {
+    fn usage_flush_failure_keeps_pending_for_the_next_retry() {
         use crate::model::UsageSnapshot;
         use crate::upstream::TokenUsage;
         let dir = temp_dir("usage_flush_retry");
@@ -3832,18 +3814,16 @@ mod tests {
             None,
             Some(TokenUsage { input: 7, output: 3, cache_read: 2, cache_creation: 1 }),
         );
-        let baseline_before = store.usage.baseline.read().clone();
+        let pending_before = store.usage.pending.read().clone();
         let buckets_before = serde_json::to_vec(&*store.usage.buckets.read()).unwrap();
         let retired_before = store.usage.retired.read().clone();
-        let date_before = store.usage.baseline_date.read().clone();
 
         // 目录占位会让真实 atomic_write 的 rename 与原地回退都失败，且不依赖权限位。
         std::fs::create_dir_all(&usage_path).unwrap();
         assert!(!store.flush_usage_if_dirty(), "写入失败时不能报告成功");
-        assert_eq!(*store.usage.baseline.read(), baseline_before);
+        assert_eq!(*store.usage.pending.read(), pending_before);
         assert_eq!(serde_json::to_vec(&*store.usage.buckets.read()).unwrap(), buckets_before);
         assert_eq!(*store.usage.retired.read(), retired_before);
-        assert_eq!(*store.usage.baseline_date.read(), date_before);
         assert!(store.usage.dirty.load(std::sync::atomic::Ordering::Relaxed));
 
         std::fs::remove_dir_all(&usage_path).unwrap();

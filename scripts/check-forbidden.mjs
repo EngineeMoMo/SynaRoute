@@ -103,7 +103,7 @@ const pass = (name, detail) => console.log(`✅ ${name}${detail ? ` —— ${det
     for (let i = 0; i < lines.length; i++) {
       if (!/^\s*#\[tauri::command/.test(lines[i])) continue;
       for (let j = i + 1; j < Math.min(i + 8, lines.length); j++) {
-        const m = lines[j].match(/^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)/);
+        const m = lines[j].match(/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)/);
         if (m) {
           declared.add(m[1]);
           break;

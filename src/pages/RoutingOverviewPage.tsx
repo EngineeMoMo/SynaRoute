@@ -80,7 +80,8 @@ function ClientRow({ row, onManage }: { row: CategoryOverview; onManage: (catego
   </article>;
 }
 
-export function RoutingOverviewPage({ onManage, onOpenLogs, onOpenReliability }: {
+export function RoutingOverviewPage({ onManage, onOpenLogs, onOpenReliability, onOpenPolicies }: {
+  onOpenPolicies: () => void;
   onManage: (category: CategoryType) => void;
   onOpenLogs: () => void;
   onOpenReliability: () => void;
@@ -95,7 +96,7 @@ export function RoutingOverviewPage({ onManage, onOpenLogs, onOpenReliability }:
     <div className="mx-auto max-w-7xl space-y-4 px-6 py-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-xs leading-5 text-text-secondary">{t("overview.readOnly")}</p>
-        <div className="flex flex-wrap gap-2"><Button size="sm" variant="ghost" onClick={onOpenLogs}><ScrollText size={14} aria-hidden />{t("overview.logs")}</Button><Button size="sm" variant="ghost" onClick={onOpenReliability}><ShieldCheck size={14} aria-hidden />{t("overview.reliability")}</Button></div>
+        <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" onClick={onOpenPolicies}>{t("routing.manage")}</Button><Button size="sm" variant="ghost" onClick={onOpenLogs}><ScrollText size={14} aria-hidden />{t("overview.logs")}</Button><Button size="sm" variant="ghost" onClick={onOpenReliability}><ShieldCheck size={14} aria-hidden />{t("overview.reliability")}</Button></div>
       </div>
       {failed && <InlineAlert tone="warning" className="text-text-primary" role="alert">{t(data ? "overview.stale" : "overview.error")}</InlineAlert>}
       {data?.vaultLocked && <InlineAlert tone="warning" className="text-text-primary" icon={LockKeyhole}>{t("overview.vaultLocked")}</InlineAlert>}

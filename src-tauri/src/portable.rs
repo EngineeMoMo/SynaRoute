@@ -27,11 +27,12 @@ use crate::error::{AppError, AppResult};
 use crate::model::{AppSettings, BrainConfig, ProviderKey, Vendor};
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+#[path = "portable_digest.rs"] mod digest;
+#[cfg(test)] use sha2::{Digest, Sha256};
 
 /// 导出文件格式版本。**改动载荷结构时必须 +1**，并在 [`check_format_version`] 里明确拒绝
 /// 或做迁移——静默按新结构解析旧文件会得到半份配置。
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 /// 导出文件的顶层结构。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,7 +44,7 @@ pub struct ExportFile {
     pub app_version: String,
     /// 导出时间（ISO8601）
     pub exported_at: String,
-    /// 载荷的 sha256（hex）。校验的是 `serde_json::to_vec(&payload)` 的字节。
+    /// v1 按导出时的字段顺序；v2 按 JSON 对象键递归排序后计算，均不含外层信封。
     pub payload_sha256: String,
     /// 配置本体（不含密钥）
     pub payload: ExportPayload,
@@ -153,10 +154,7 @@ pub struct ImportReport {
 
 /// 计算载荷的 sha256（hex 小写）。
 fn payload_digest(payload: &ExportPayload) -> AppResult<String> {
-    let bytes = serde_json::to_vec(payload)?;
-    let mut h = Sha256::new();
-    h.update(&bytes);
-    Ok(format!("{:x}", h.finalize()))
+    Ok(digest::canonical(payload)?)
 }
 
 /// 剔除「只对本机有意义」的设置字段。
@@ -271,7 +269,7 @@ pub fn build_export(
 
 /// 校验格式版本。**不认识的版本一律拒绝**，不尝试「尽力解析」——半份配置比明确报错更难排查。
 fn check_format_version(v: u32) -> AppResult<()> {
-    if v == FORMAT_VERSION {
+    if v == 1 || v == FORMAT_VERSION {
         return Ok(());
     }
     Err(AppError::Invalid(if v > FORMAT_VERSION {
@@ -288,16 +286,9 @@ fn check_format_version(v: u32) -> AppResult<()> {
 
 /// 解析 + 校验导出文件（版本 + 完整性）。**任何写盘动作之前**都要先过这一关。
 pub fn parse_and_verify(raw: &[u8]) -> AppResult<ExportFile> {
-    let file: ExportFile = serde_json::from_slice(raw)
-        .map_err(|e| AppError::Invalid(format!("不是有效的 SynaRoute 导出文件: {e}")))?;
-    check_format_version(file.format_version)?;
-    let actual = payload_digest(&file.payload)?;
-    if actual != file.payload_sha256 {
-        return Err(AppError::Invalid(
-            "导出文件校验和不匹配：文件已损坏或被修改，已拒绝导入（未改动任何本机配置）。".into(),
-        ));
-    }
-    Ok(file)
+    digest::verify(raw)?;
+    serde_json::from_slice(raw)
+        .map_err(|e| AppError::Invalid(format!("不是有效的 SynaRoute 导出文件: {e}")))
 }
 
 /// 导入前预检：只读，不改任何东西。
@@ -983,6 +974,64 @@ mod tests {
     }
 
     /// 完整性校验：载荷被改一个字节就必须拒绝，且**在改动任何本机配置之前**。
+    #[test]
+    fn legacy_export_without_new_key_fields_is_still_importable() {
+        let dir = temp_dir("legacy_digest");
+        let src = store_at(&dir);
+        src.upsert_key(key("legacy", "old backup")).unwrap();
+        let file = build_export(&src, "0.1.60", None).unwrap().0;
+        let payload = serde_json::to_string(&file.payload).unwrap()
+            .replace("\"allowNamedModelFallback\":false,", "");
+        assert!(!payload.contains("allowNamedModelFallback"));
+        let digest = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        let raw = format!(r#"{{"formatVersion":1,"appVersion":"0.1.60","exportedAt":"2026-09-09","payloadSha256":"{digest}","payload":{payload}}}"#);
+        let parsed = parse_and_verify(raw.as_bytes()).unwrap();
+        assert_eq!(parsed.payload.keys[0].id, "legacy");
+        assert!(!parsed.payload.keys[0].allow_named_model_fallback);
+        assert!(parse_and_verify(raw.replace("old backup", "tampered").as_bytes()).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fixed_v1_fixture_imports_with_original_field_order_and_numbers() {
+        let raw = include_bytes!("testdata/portable-v1-v0.1.60.json");
+        let parsed = parse_and_verify(raw).unwrap();
+        assert_eq!(parsed.format_version, 1);
+        assert_eq!(parsed.payload.keys[0].params.temperature, Some(0.3));
+        assert_eq!(parsed.payload.keys[0].health.model_locks.len(), 2);
+        assert!(!parsed.payload.keys[0].allow_named_model_fallback);
+        let dir = temp_dir("fixed_legacy");
+        let destination = store_at(&dir);
+        let report = apply_import(&destination, &parsed, ImportMode::Merge, None).unwrap();
+        assert_eq!(report.keys_added, 1);
+        assert_eq!(destination.get_key("legacy-fixture").unwrap().name, "Legacy fixture");
+        let tampered = std::str::from_utf8(raw).unwrap().replace("Legacy fixture", "changed");
+        assert!(parse_and_verify(tampered.as_bytes()).is_err());
+        drop(destination);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v2_digest_survives_nested_key_reordering_and_checks_unknown_fields() {
+        let dir = temp_dir("canonical_export");
+        let source = store_at(&dir);
+        let mut provider = key("canonical", "Canonical fixture");
+        provider.params.temperature = Some(0.3);
+        provider.params.top_p = Some(0.9);
+        provider.health.model_locks.insert("z-model".into(), crate::model::ModelLock { until: 1, fail_count: 2 });
+        provider.health.model_locks.insert("a-model".into(), crate::model::ModelLock { until: 3, fail_count: 4 });
+        source.upsert_key(provider).unwrap();
+        let file = build_export(&source, "0.1.78", None).unwrap().0;
+        assert_eq!(file.format_version, 2);
+        let raw = serde_json::to_vec_pretty(&file).unwrap();
+        let mut reordered: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(parse_and_verify(&serde_json::to_vec(&reordered).unwrap()).unwrap().payload.keys[0].id, "canonical");
+        reordered["payload"]["unknownFutureField"] = serde_json::json!({"value": 1});
+        assert!(parse_and_verify(&serde_json::to_vec(&reordered).unwrap()).is_err());
+        drop(source);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn tampered_payload_is_rejected_by_checksum() {
         let dir = temp_dir("checksum");

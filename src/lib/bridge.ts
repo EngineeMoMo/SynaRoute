@@ -45,7 +45,9 @@ import type {
 import type { UserPrefs } from "@/lib/prefs";
 import type { ResilienceOverview } from "@/lib/resilience";
 import type { RoutingOverview } from "./routingOverview";
+import type { CategoryPolicy, RoutingPolicyView, RoutingSaveResult, RoutingScene, RoutingSyncResult, SceneApplied, ScenePreview, SensitiveScan } from "./routingPolicies";
 import { mockBridge } from "./mockData";
+import type { ActiveRequest, RequestStopResult } from "./activeRequests";
 
 // Browser preview only: one mutable status so the switches stay consistent with each other.
 const layaMock: LayaLocalStatus = { supported: true, phase: "idle", endpoint: "http://127.0.0.1:8000/v1/systemone", logs: [], error: null, installed: false, autostart: false, mirror: false };
@@ -96,6 +98,17 @@ async function sessionCall<T>(cmd: string, args: Record<string, unknown>, progre
 }
 
 export const api = {
+  listActiveRequests: (categoryId: CategoryType) => call<ActiveRequest[]>("list_active_requests", { categoryId }, () => mockBridge.listActiveRequests(categoryId)),
+  stopActiveRequest: (categoryId: CategoryType, requestId: string) => call<RequestStopResult>("stop_active_request", { categoryId, requestId }, () => mockBridge.stopActiveRequest(categoryId, requestId)),
+  routingPolicies: () => call<RoutingPolicyView>("routing_policies", undefined, () => mockBridge.routingPolicies()),
+  saveRoutingPolicy: (categoryId: CategoryType, policy: CategoryPolicy, terms: string[] | null, revision: number) => call<RoutingSaveResult>("save_routing_policy", { categoryId, policy, terms, revision }, () => mockBridge.saveRoutingPolicy(categoryId, policy, terms, revision)),
+  saveRoutingScene: (scene: RoutingScene, revision: number) => call<RoutingPolicyView>("save_routing_scene", { scene, revision }, () => mockBridge.saveRoutingScene(scene, revision)),
+  deleteRoutingScene: (sceneId: string, revision: number) => call<RoutingPolicyView>("delete_routing_scene", { sceneId, revision }, () => mockBridge.deleteRoutingScene(sceneId, revision)),
+  previewRoutingScene: (sceneId: string) => call<ScenePreview>("preview_routing_scene", { sceneId }, () => mockBridge.previewRoutingScene(sceneId)),
+  applyRoutingScene: (token: string) => call<SceneApplied>("apply_routing_scene", { token }, () => mockBridge.applyRoutingScene(token)),
+  syncRoutingClients: (categories: CategoryType[]) => call<RoutingSyncResult[]>("sync_routing_clients", { categories }, () => mockBridge.syncRoutingClients(categories)),
+  clearRoutingSessions: (categoryId: CategoryType) => call<void>("clear_routing_sessions", { categoryId }, () => mockBridge.clearRoutingSessions(categoryId)),
+  previewSensitiveContent: (categoryId: CategoryType, text: string, credentials: boolean, emails: boolean, phones: boolean) => call<SensitiveScan>("preview_sensitive_content", { categoryId, text, credentials, emails, phones }, () => mockBridge.previewSensitiveContent(categoryId, text, { credentials, emails, phones })),
   routingOverview: () => call<RoutingOverview>("routing_overview", undefined, () => mockBridge.routingOverview()),
   getDecisionConfig: (categoryId: CategoryType) => call<DecisionView>("get_decision_config", { categoryId }, () => defaultDecision()),
   layaLocalStatus: () => call<LayaLocalStatus>("laya_local_status", undefined, () => ({ ...layaMock })),

@@ -36,9 +36,9 @@ export interface RoutingOverview {
   categories: CategoryOverview[];
 }
 
-export function createOverviewRefresher(
-  read: () => Promise<RoutingOverview>,
-  update: (data: RoutingOverview | null, failed: boolean) => void,
+export function createOverviewRefresher<T>(
+  read: () => Promise<T>,
+  update: (data: T | null, failed: boolean) => void,
   loading: (value: boolean) => void,
   visible: () => boolean,
 ) {

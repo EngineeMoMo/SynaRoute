@@ -6,7 +6,13 @@ on:
       - 'v*'
 
 jobs:
+  quality:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/gates.yml
+
   create-release:
+    needs: quality
     permissions:
       contents: write
     runs-on: ubuntu-22.04

@@ -125,6 +125,7 @@ pub(super) fn auth_path() -> AppResult<PathBuf> {
 
 /// 写入 Codex 接入配置：`config.toml` + 模型目录 + `auth.json`（后者仅在必要时，见 [`apply_auth_at`]）。
 pub(super) fn apply(
+    groups: &[crate::store::routing::config::RouteGroup],
     endpoint: &str,
     models: &[String],
     keys: &[crate::model::ProviderKey],
@@ -137,7 +138,7 @@ pub(super) fn apply(
     // 自己按主路径推导后一并纳入快照 —— 漏了它们会造成数据丢失级后果，
     // 判据见 tools.rs 里 `with_rollback` 的文档。
     let applied = with_rollback(&[path.clone(), auth.clone(), catalog.clone()], || {
-        let msg = apply_at(&path, endpoint, models, keys, &catalog)?;
+        let msg = apply_at(groups, &path, endpoint, models, keys, &catalog)?;
         // **写完立刻读回校验**，且校验的是「身份」不是「存在」（见 `is_intact`）。
         //
         // 为什么不可省：Codex 桌面端 App 拥有 config.toml，会在接入**之后**重写它。
@@ -324,7 +325,7 @@ fn is_our_placeholder_value(v: &str) -> bool {
 
 /// provider 表里该写的 `base_url`：Codex 按 `wire_api=responses` 调 `{base_url}/responses`，
 /// 而本地代理识别 `/v1/responses`，故要带上 `/v1`。
-fn expected_base_url(endpoint: &str) -> String {
+pub(super) fn expected_base_url(endpoint: &str) -> String {
     format!("{}/v1", endpoint.trim_end_matches('/'))
 }
 
@@ -369,6 +370,7 @@ fn expected_base_url(endpoint: &str) -> String {
 /// 故重复接入不会把已接入的 config 当成「接入前快照」拷进 `.bak`。
 /// 保留 config.toml 其余表（`mcp_servers` / 用户自己的 `model_providers` 等）不动。
 pub(super) fn apply_at(
+    groups: &[crate::store::routing::config::RouteGroup],
     path: &Path,
     endpoint: &str,
     models: &[String],
@@ -401,7 +403,7 @@ pub(super) fn apply_at(
 
     // 模型目录 + 顶层 `model` 的处理整段收在 `codex_catalog::wire_into`（它们是一件事，
     // 且 codex.rs 的棘轮余量只有 35 行）。它决定「写不写指针」与「要不要覆盖已有的 model」。
-    codex_catalog::wire_into(table, models, keys, catalog_file)?;
+    codex_catalog::wire_into(groups, table, models, keys, catalog_file)?;
 
     let providers = table
         .entry("model_providers".to_string())
@@ -933,7 +935,7 @@ mod tests {
         let cfg = d.join("config.toml");
         let auth = d.join("auth.json");
 
-        let msg = apply_at(&cfg, EP, &["gpt-5.6-sol".to_string()], &[], &cfg.with_extension("catalog.json")).unwrap();
+        let msg = apply_at(&[], &cfg, EP, &["gpt-5.6-sol".to_string()], &[], &cfg.with_extension("catalog.json")).unwrap();
         assert!(!auth.exists(), "apply_at 这一层不该创建 auth.json");
 
         let doc = std::fs::read_to_string(&cfg).unwrap().parse::<toml::Value>().unwrap();
@@ -971,7 +973,7 @@ mod tests {
         let cfg = d.join("config.toml");
         let cat = d.join("synaroute-model-catalog.json");
 
-        let msg = apply_at(&cfg, EP, &["claude-opus-4-8".to_string()], &[], &cat).unwrap();
+        let msg = apply_at(&[], &cfg, EP, &["claude-opus-4-8".to_string()], &[], &cat).unwrap();
         // 🔴 注入验证抓出来的盲区：把 apply_at 里那句 `apply_note` 换成空串，原先**没有任何**
         // 测试变红 —— 而目录是「只在 Codex 启动时加载」，少了这句提示，用户加条 Key 之后
         // Codex 菜单不变，那个现象跟「功能没生效」一模一样。
@@ -991,6 +993,7 @@ mod tests {
             ..crate::model::ProviderKey::default()
         };
         let msg2 = apply_at(
+            &[],
             &cfg,
             EP,
             &["claude-opus-4-8".to_string()],
@@ -1083,7 +1086,7 @@ mod tests {
             path: cat.to_string_lossy().into_owned(),
         };
 
-        apply_at(&cfg, EP, &["claude-opus-4-8".to_string()], &[], &cat).unwrap();
+        apply_at(&[], &cfg, EP, &["claude-opus-4-8".to_string()], &[], &cat).unwrap();
         assert_eq!(drift_state(&cfg, &auth, EP, true), DriftState::Intact);
 
         std::fs::remove_file(&cat).unwrap();
@@ -1157,7 +1160,7 @@ mod tests {
         let cfg = d.join("config.toml");
 
         // ① 全新写入
-        apply_at(&cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
+        apply_at(&[], &cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         let doc = std::fs::read_to_string(&cfg).unwrap().parse::<toml::Value>().unwrap();
         assert_eq!(
             doc["model_providers"]["synaroute"]["requires_openai_auth"].as_bool(),
@@ -1176,7 +1179,7 @@ mod tests {
              wire_api = \"responses\"\n\
              requires_openai_auth = false\n",
         );
-        apply_at(&cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
+        apply_at(&[], &cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         let doc = std::fs::read_to_string(&cfg).unwrap().parse::<toml::Value>().unwrap();
         assert_eq!(
             doc["model_providers"]["synaroute"]["requires_openai_auth"].as_bool(),
@@ -1199,7 +1202,7 @@ mod tests {
              [model_providers.custom]\nname = \"别人\"\nbase_url = \"https://x.example/v1\"\n\
              [mcp_servers.synaroute]\ncommand = \"x.exe\"\n",
         );
-        apply_at(&cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
+        apply_at(&[], &cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         let doc = std::fs::read_to_string(&cfg).unwrap().parse::<toml::Value>().unwrap();
         assert_eq!(doc["disable_response_storage"].as_bool(), Some(true));
         assert_eq!(doc["features"]["js_repl"].as_bool(), Some(false));
@@ -1217,7 +1220,7 @@ mod tests {
         let d = temp_dir("intact");
         let cfg = d.join("config.toml");
 
-        apply_at(&cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
+        apply_at(&[], &cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         assert!(is_intact(&cfg, EP), "刚写完必须完好");
 
         // 端口漂移：非空但不是我们
@@ -1485,7 +1488,7 @@ mod tests {
         let auth = d.join("auth.json");
 
         // ① 完好 → 不报警
-        apply_at(&cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
+        apply_at(&[], &cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         assert_eq!(drift_state(&cfg, &auth, EP, true), DriftState::Intact);
         assert!(drift_warning(&DriftState::Intact).is_none());
 
@@ -1574,7 +1577,7 @@ mod tests {
         let auth = d.join("auth.json");
 
         // `<name>.config.toml` 存在 → `codex --profile name` 完全忽略 config.toml
-        apply_at(&cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
+        apply_at(&[], &cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         write(&d.join("mine.config.toml"), "model = \"x\"\n");
         let s = drift_state(&cfg, &auth, EP, true);
         assert_eq!(s, DriftState::ProfileShadowed { profiles: vec!["mine".into()] });
@@ -1601,7 +1604,7 @@ mod tests {
         let d = temp_dir("profile_intact");
         let cfg = d.join("config.toml");
         let auth = d.join("auth.json");
-        apply_at(&cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
+        apply_at(&[], &cfg, EP, &[], &[], &cfg.with_extension("catalog.json")).unwrap();
         assert_eq!(drift_state(&cfg, &auth, EP, true), DriftState::Intact);
         write(&d.join("work.config.toml"), "model = \"x\"\n");
         assert!(

@@ -1,47 +1,20 @@
-//! 用量计数器：内存累计 + 按日分桶 + 周期落盘 + 按 Key 删除。挂在 `usage_store` 下（`#[path]`）。
-//!
-//! 原先是 `Store` 上的 9 个字段 + 3 把锁的纪律，散在 store.rs 里（冻结、余量 0）。
-//! 2026-10-12 加模型维度时整体搬出来：键从 `(分类, key_id)` 变成 `(分类, key_id, 模型)`，
-//! 而那 9 个字段的读写散在 store.rs 的五六个函数里，没有地方容纳这一维。
-//!
-//! # 为什么要按模型记
-//!
-//! 一条 Key 的金额此前只能按它的「代表模型」估（`default_model` 或 `models[0]`）。
-//! 实测用户一条 Key 86% 的请求跑的是 $10/$50 的模型，代表模型却是 $0.20/$1.20 的那个 →
-//! 输入低估约 50 倍；另一条落到家族兜底价，缓存读高估 2.5 倍。**表没错，是账本少了一维。**
-//!
-//! # 三个数各是什么（写错会算出天文数字）
-//!
-//! - `totals` = **跨全部历史的总量**，热路径只往里累加，永不按天切分；
-//! - `buckets` = 每天各是多少（今日 / 本周 / 本月 / 趋势）；
-//! - `baseline` = 上一次**成功落盘**那一刻的 `totals`。
-//!
-//! 未落盘增量 = `totals − baseline`。**不能**把 `totals` 整份写进当天的桶 ——
-//! 那是把历史总量当成当天消耗（实测踩过：v1 的 500 与当天新增的 200 相加成了 700）。
-//!
-//! # 🔴 锁顺序：`buckets → retired → totals → baseline`
-//!
-//! 要同时持有其中两把以上的地方，一律按这个顺序取（`write_locked` / `purge_key` /
-//! `daily_buckets`）。反过来取一次就可能与 flush 交叉死锁 —— 而死锁在转发热路径上的
-//! 表现是「所有请求卡住」，日志里一个字都没有。加新方法时照这个顺序。
-//!
-//! 写盘期间**不持** `totals` 的锁：先拍快照、放锁、再写盘，成功后把 `baseline` 抬到**快照**
-//! （不是抬到当时的 `totals`）。原实现整个写盘期间持着 `totals` 的读锁，于是转发热路径上的
-//! `record` 要等 `atomic_write`（含 fsync 与最多 ~1.2s 的退避）；而快照之后到来的那几笔
-//! 留在 `totals − baseline` 里，下一轮照常落盘，一笔都不会丢。
+//! 用量计数器：按收到 usage 时的本机日期记账，周期落盘并支持按 Key 删除。
+//! 锁顺序：提交锁 → 已落盘桶 → retired → 按日待写增量 → 累计；写盘不持后两把锁。
 
 use super::{
     local_date_string, DailyUsageBucket, TokenUsageByKey, UsageKey, UsageSnapshot,
     USAGE_SNAPSHOT_VERSION,
 };
 use crate::model::{CategoryType, TokenUsage};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 按日视图保留多少天（含今天）。更早的桶折进 `retired`，见 [`retire_expired`]。
 const KEEP_DAYS: i64 = 90;
+
+type DailyPending = BTreeMap<String, BTreeMap<UsageKey, TokenUsage>>;
 
 /// 用量账本。`Store` 上只有这一个字段（`store.usage`）。
 pub(crate) struct UsageLedger {
@@ -68,10 +41,9 @@ pub(crate) struct UsageLedger {
     pub(crate) buckets: RwLock<Vec<DailyUsageBucket>>,
     /// 已被 90 天滚动淘汰的桶的累计。只在 flush / 删除里改，不进按日视图。
     pub(crate) retired: RwLock<Vec<TokenUsageByKey>>,
-    /// 上一次成功落盘时的 `totals`（见模块头「三个数」）。
-    pub(crate) baseline: RwLock<BTreeMap<UsageKey, TokenUsage>>,
-    /// 上一次落盘落在哪天。**只是诊断信息，不参与分桶** —— 分桶看的是落盘那一刻的日期。
-    pub(crate) baseline_date: RwLock<String>,
+    /// 日期在入账时固定，提交失败与之后的重试不能改变它。
+    pub(crate) pending: RwLock<DailyPending>,
+    commit_lock: Mutex<()>,
 }
 
 impl UsageLedger {
@@ -80,8 +52,6 @@ impl UsageLedger {
         let path = super::usage_file_path(config_path);
         let loaded = super::load_usage(&path);
         Self {
-            // 基线 = 刚加载的历史总量：本次运行的增量从此开始累计。
-            baseline: RwLock::new(loaded.totals.clone()),
             totals: RwLock::new(loaded.totals),
             dirty: AtomicBool::new(false),
             must_rewrite: AtomicBool::new(false),
@@ -90,7 +60,8 @@ impl UsageLedger {
             read_only: loaded.read_only,
             buckets: RwLock::new(loaded.daily_buckets),
             retired: RwLock::new(loaded.retired),
-            baseline_date: RwLock::new(local_date_string(chrono::Utc::now().timestamp_millis())),
+            pending: RwLock::new(BTreeMap::new()),
+            commit_lock: Mutex::new(()),
         }
     }
 
@@ -99,8 +70,17 @@ impl UsageLedger {
     /// 只翻脏标记、不在这里落盘：转发热路径上的一次写盘要序列化整份快照再走
     /// `atomic_write`（含 fsync），合并给后台那趟 60s 的 flush 才是对的。
     pub(crate) fn record(&self, category: CategoryType, key_id: &str, model: &str, u: &TokenUsage) {
+        self.record_at(category, key_id, model, u, chrono::Utc::now().timestamp_millis());
+    }
+
+    fn record_at(&self, category: CategoryType, key_id: &str, model: &str, u: &TokenUsage, recorded_ms: i64) {
+        if u.is_empty() { return; }
+        let day = local_date_string(recorded_ms);
         let slot = (category, key_id.to_string(), model.trim().to_string());
-        self.totals.write().entry(slot).or_default().add(u);
+        let mut pending = self.pending.write();
+        let mut totals = self.totals.write();
+        pending.entry(day).or_default().entry(slot.clone()).or_default().add(u);
+        totals.entry(slot).or_default().add(u);
         self.mark_dirty();
     }
 
@@ -136,25 +116,14 @@ impl UsageLedger {
             .collect()
     }
 
-    /// 按日分桶的只读快照，**已并入尚未落盘的增量**（落进本机时区的「今天」）。
-    ///
-    /// 必须在后端并：桶只在 flush 时更新（最多落后 60s），不并的话同一屏上「累计」涨了、
-    /// 「今日」还是 0。**不动 baseline**：这是只读视图，抬了基线这段增量就再也不落盘了。
-    ///
-    /// 整段持着 `buckets` 的读锁：flush 在同一把锁的写侧里「并增量 + 抬基线」，于是这里读到的
-    /// 落盘桶与增量一定出自同一侧 —— 否则 flush 恰好插在中间时，那段增量两边都不算（少一截）。
+    /// 合并已落盘日桶与按入账日期保存的增量；查看不消费待写记录。
     pub(crate) fn daily_buckets(&self) -> Vec<DailyUsageBucket> {
-        let guard = self.buckets.read();
-        let pending = {
-            let totals = self.totals.read();
-            let baseline = self.baseline.read();
-            pending_delta(&totals, &baseline)
+        let (mut out, pending) = {
+            let buckets = self.buckets.read();
+            let pending = self.pending.read();
+            (buckets.clone(), pending.clone())
         };
-        let mut out = guard.clone();
-        drop(guard);
-        if !pending.is_empty() {
-            merge_into_day(&mut out, &local_date_string(chrono::Utc::now().timestamp_millis()), pending);
-        }
+        merge_pending(&mut out, &pending);
         out
     }
 
@@ -164,6 +133,7 @@ impl UsageLedger {
     /// 「标记已清、这次变更没落盘」的丢失窗口。只读判定**必须在清标记之前**，
     /// 否则标记被清掉、这段消耗既没写盘也不再重试。
     pub(crate) fn flush(&self) -> bool {
+        let _commit = self.commit_lock.lock();
         if self.read_only {
             return false;
         }
@@ -173,44 +143,37 @@ impl UsageLedger {
         }
         self.write_locked(forced)
     }
-    /// 把增量并进今天的桶、滚掉过期的桶、整份写盘。`force` = 增量为空也写（删除之后）。
-    ///
-    /// 失败时内存里的桶与 `retired` **原样回退**、基线不抬 —— 下一轮重试的是同一批增量，
-    /// 既不丢也不重复计。
+
     fn write_locked(&self, force: bool) -> bool {
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.write_with(force, chrono::Utc::now().timestamp_millis(), |bytes| {
+            crate::secret::atomic_write(&self.path, bytes)
+        })
+    }
+
+    fn write_with(&self, force: bool, now_ms: i64, persist: impl FnOnce(&[u8]) -> crate::error::AppResult<()>) -> bool {
         let today = local_date_string(now_ms);
         let mut buckets = self.buckets.write();
         let mut retired = self.retired.write();
-        // 快照之后立刻放掉 totals 的锁（见模块头「写盘期间不持 totals 的锁」）。
-        let snapshot = self.totals.read().clone();
-        let mut baseline = self.baseline.write();
-        let delta = pending_delta(&snapshot, &baseline);
-        // 增量为空 = 这次标脏没带来新消耗（或已被上一轮写掉）：不写盘。
-        if delta.is_empty() && !force {
+        let pending = self.pending.read().clone();
+        if pending.is_empty() && !force {
             return false;
         }
-        let (buckets_before, retired_before) = (buckets.clone(), retired.clone());
-        if !delta.is_empty() {
-            merge_into_day(&mut buckets, &today, delta);
-        }
-        retire_expired(&mut buckets, &mut retired, &today);
+        let mut next_buckets = buckets.clone();
+        let mut next_retired = retired.clone();
+        merge_pending(&mut next_buckets, &pending);
+        retire_expired(&mut next_buckets, &mut next_retired, &today);
         let snap = UsageSnapshot {
             version: USAGE_SNAPSHOT_VERSION,
             since_ms: self.since_ms,
             updated_ms: now_ms,
-            daily_buckets: buckets.clone(),
-            retired: retired.clone(),
-            entries: Vec::new(), // v1 兼容字段，v2 起恒空
+            daily_buckets: next_buckets,
+            retired: next_retired,
+            entries: Vec::new(),
         };
-        // 走与 config/secrets 同一个 atomic_write：临时文件 → fsync → rename。原子性来自 rename
-        // （读者只会看到旧全量或新全量），持久性来自 rename 之前那次 fsync。
         let written = serde_json::to_vec_pretty(&snap)
             .map_err(crate::error::AppError::from)
-            .and_then(|bytes| crate::secret::atomic_write(&self.path, &bytes));
+            .and_then(|bytes| persist(&bytes));
         if let Err(e) = written {
-            *buckets = buckets_before;
-            *retired = retired_before;
             self.mark_dirty();
             if force {
                 self.must_rewrite.store(true, Ordering::Relaxed);
@@ -218,8 +181,10 @@ impl UsageLedger {
             tracing::warn!("用量统计落盘失败（下一轮重试）: {e}");
             return false;
         }
-        *baseline = snapshot;
-        *self.baseline_date.write() = today;
+        // 写盘期间的新记录仍留在 pending，只扣掉本次快照中已提交的量。
+        subtract_committed(&mut self.pending.write(), &pending);
+        *buckets = snap.daily_buckets;
+        *retired = snap.retired;
         true
     }
     /// 删掉某条 Key 的**全部**用量：各分类、各模型、每个日桶、`retired`，并**立刻落盘**。
@@ -234,16 +199,18 @@ impl UsageLedger {
     /// 返回 `true` = 磁盘上也已经没有它了；`false` = 只删了内存（本次运行只读、或写盘失败），
     /// 这时重启后它可能还在 —— 调用方据此决定是否告诉用户。
     pub(crate) fn purge_key(&self, key_id: &str) -> bool {
+        let _commit = self.commit_lock.lock();
         let removed = {
             let mut buckets = self.buckets.write();
             let mut retired = self.retired.write();
+            let mut pending = self.pending.write();
             let mut totals = self.totals.write();
-            let mut baseline = self.baseline.write();
             let before = totals.len() + retired.len() + buckets.iter().map(|b| b.entries.len()).sum::<usize>();
-            // baseline 必须一起删：留着的话这条 Key 日后再有用量（同 id 重建），
-            // 饱和减法会把新增量吃掉一截（`当前 − 旧基线` 被截成 0）。
             totals.retain(|(_, kid, _), _| kid != key_id);
-            baseline.retain(|(_, kid, _), _| kid != key_id);
+            pending.retain(|_, rows| {
+                rows.retain(|(_, kid, _), _| kid != key_id);
+                !rows.is_empty()
+            });
             retired.retain(|r| r.key_id != key_id);
             for b in buckets.iter_mut() {
                 b.entries.retain(|r| r.key_id != key_id);
@@ -268,24 +235,27 @@ impl UsageLedger {
     }
 }
 
-/// 未落盘增量 = `totals − baseline`（逐字段饱和减法：防「外部把 usage.json 改小了」导致下溢 panic）。
-fn pending_delta(
-    totals: &BTreeMap<UsageKey, TokenUsage>,
-    baseline: &BTreeMap<UsageKey, TokenUsage>,
-) -> Vec<TokenUsageByKey> {
-    totals
-        .iter()
-        .filter_map(|(slot, cur)| {
-            let base = baseline.get(slot).copied().unwrap_or_default();
-            let d = TokenUsage {
-                input: cur.input.saturating_sub(base.input),
-                output: cur.output.saturating_sub(base.output),
-                cache_read: cur.cache_read.saturating_sub(base.cache_read),
-                cache_creation: cur.cache_creation.saturating_sub(base.cache_creation),
-            };
-            (!d.is_empty()).then(|| TokenUsageByKey::from_slot(slot.clone(), d))
-        })
-        .collect()
+fn merge_pending(buckets: &mut Vec<DailyUsageBucket>, pending: &DailyPending) {
+    for (day, rows) in pending {
+        merge_into_day(buckets, day, rows.iter()
+            .map(|(slot, usage)| TokenUsageByKey::from_slot(slot.clone(), *usage)).collect());
+    }
+}
+
+fn subtract_committed(pending: &mut DailyPending, committed: &DailyPending) {
+    pending.retain(|day, rows| {
+        let sent = committed.get(day);
+        rows.retain(|slot, current| {
+            if let Some(saved) = sent.and_then(|rows| rows.get(slot)) {
+                current.input = current.input.saturating_sub(saved.input);
+                current.output = current.output.saturating_sub(saved.output);
+                current.cache_read = current.cache_read.saturating_sub(saved.cache_read);
+                current.cache_creation = current.cache_creation.saturating_sub(saved.cache_creation);
+            }
+            !current.is_empty()
+        });
+        !rows.is_empty()
+    });
 }
 /// 把若干行并进某一天的桶（没有就新建），并保持「最新在前」。
 ///
@@ -363,7 +333,175 @@ mod tests {
         s.daily_buckets.iter().flat_map(|b| &b.entries).chain(&s.retired).any(|r| r.key_id == key)
     }
 
-    /// 🔴 同一条 Key 上的两个模型必须分开记 —— 这是本模块存在的理由（见模块头「为什么要按模型记」）。
+    fn local_ms(value: &str) -> i64 {
+        use chrono::TimeZone;
+        chrono::Local.from_local_datetime(&chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").unwrap())
+            .single().unwrap().timestamp_millis()
+    }
+
+    fn sum_day(buckets: &[DailyUsageBucket], date: &str) -> u64 {
+        buckets.iter().filter(|bucket| bucket.date == date).flat_map(|bucket| &bucket.entries)
+            .map(|row| row.usage.input).sum()
+    }
+
+    #[test]
+    fn usage_stays_on_its_recorded_day_when_flushed_after_midnight() {
+        let cfg = temp_cfg("midnight");
+        let ledger = UsageLedger::load(&cfg);
+        let before = local_ms("2026-11-01 23:59:50");
+        let after = local_ms("2026-11-02 00:00:10");
+        ledger.record_at(CategoryType::Codex, "k", "m", &u(70), before);
+        ledger.record_at(CategoryType::Codex, "k", "m", &u(30), after);
+        let view = ledger.daily_buckets();
+        assert_eq!(sum_day(&view, "2026-11-01"), 70);
+        assert_eq!(sum_day(&view, "2026-11-02"), 30);
+        assert!(ledger.write_with(false, after, |bytes| crate::secret::atomic_write(&ledger.path, bytes)));
+        let stored = on_disk(&cfg);
+        assert_eq!(stored.version, 4);
+        assert_eq!(sum_day(&stored.daily_buckets, "2026-11-01"), 70);
+        assert_eq!(sum_day(&stored.daily_buckets, "2026-11-02"), 30);
+        assert!(!ledger.flush(), "已提交增量不能重复累计");
+        let reopened = UsageLedger::load(&cfg);
+        assert_eq!(reopened.by_key()[0].usage.input, 100);
+        assert_eq!(sum_day(&reopened.daily_buckets(), "2026-11-01"), 70);
+        std::fs::remove_dir_all(cfg.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_writes_keep_each_original_day_across_month_and_year_boundaries() {
+        let cfg = temp_cfg("failed_dates");
+        let ledger = UsageLedger::load(&cfg);
+        let records = [
+            ("2026-12-31 23:59:50", "2026-12-31", 11),
+            ("2027-01-01 00:00:10", "2027-01-01", 22),
+            ("2027-01-02 08:00:00", "2027-01-02", 33),
+        ];
+        std::fs::create_dir(&ledger.path).unwrap();
+        for (time, _, amount) in records {
+            ledger.record_at(CategoryType::ClaudeCli, "k", "m", &u(amount), local_ms(time));
+            assert!(!ledger.write_with(false, local_ms(time), |bytes| crate::secret::atomic_write(&ledger.path, bytes)));
+        }
+        let view = ledger.daily_buckets();
+        for (_, day, amount) in records { assert_eq!(sum_day(&view, day), amount, "{day}"); }
+        std::fs::remove_dir(&ledger.path).unwrap();
+        assert!(ledger.write_with(false, local_ms("2027-01-03 08:00:00"), |bytes| crate::secret::atomic_write(&ledger.path, bytes)));
+        let snapshot = on_disk(&cfg);
+        for (_, day, amount) in records { assert_eq!(sum_day(&snapshot.daily_buckets, day), amount, "{day}"); }
+        assert_eq!(sum_day(&snapshot.daily_buckets, "2027-01-03"), 0);
+        assert!(!ledger.flush());
+        std::fs::remove_dir_all(cfg.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn recording_during_a_commit_keeps_new_usage_on_its_original_days() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+        for fail in [false, true] {
+            let cfg = temp_cfg(if fail { "concurrent_failed_commit" } else { "concurrent_commit" });
+            let ledger = Arc::new(UsageLedger::load(&cfg));
+            let before = local_ms("2026-11-01 23:59:50");
+            let after = local_ms("2026-11-02 00:00:10");
+            let initial = TokenUsage { input: 70, output: 7, cache_read: 5, cache_creation: 3 };
+            let during = TokenUsage { input: 7, output: 1, cache_read: 2, cache_creation: 4 };
+            let next_day = TokenUsage { input: 30, output: 3, cache_read: 9, cache_creation: 1 };
+            ledger.record_at(CategoryType::Codex, "k", "m", &initial, before);
+            if fail { std::fs::create_dir(&ledger.path).unwrap(); }
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let writer_ledger = ledger.clone();
+            let writer = std::thread::spawn(move || {
+                let _commit = writer_ledger.commit_lock.lock();
+                writer_ledger.write_with(false, after, |bytes| {
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).expect("提交测试协调超时");
+                    crate::secret::atomic_write(&writer_ledger.path, bytes)
+                })
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (recorded_tx, recorded_rx) = mpsc::channel();
+            let recording_ledger = ledger.clone();
+            let recorder = std::thread::spawn(move || {
+                recording_ledger.record_at(CategoryType::Codex, "k", "m", &during, before);
+                recording_ledger.record_at(CategoryType::Codex, "k", "m", &next_day, after);
+                recorded_tx.send(()).unwrap();
+            });
+            let recorded_without_waiting_for_disk = recorded_rx.recv_timeout(Duration::from_secs(2));
+            let reading_ledger = ledger.clone();
+            let reader = std::thread::spawn(move || reading_ledger.daily_buckets());
+            release_tx.send(()).unwrap();
+            assert_eq!(writer.join().unwrap(), !fail);
+            recorder.join().unwrap();
+            recorded_without_waiting_for_disk.expect("记账不得等待磁盘提交");
+            let view = reader.join().unwrap();
+            assert_eq!(sum_day(&view, "2026-11-01"), 77);
+            assert_eq!(sum_day(&view, "2026-11-02"), 30);
+            if fail {
+                std::fs::remove_dir(&ledger.path).unwrap();
+            } else {
+                assert_eq!(sum_day(&on_disk(&cfg).daily_buckets, "2026-11-01"), 70);
+                assert_eq!(sum_day(&on_disk(&cfg).daily_buckets, "2026-11-02"), 0);
+            }
+            assert!(ledger.write_with(false, after, |bytes| crate::secret::atomic_write(&ledger.path, bytes)));
+            let persisted = on_disk(&cfg);
+            assert_eq!(sum_day(&persisted.daily_buckets, "2026-11-01"), 77);
+            assert_eq!(sum_day(&persisted.daily_buckets, "2026-11-02"), 30);
+            let reopened = UsageLedger::load(&cfg);
+            let total = reopened.by_key()[0].usage;
+            assert_eq!((total.input, total.output, total.cache_read, total.cache_creation), (107, 11, 16, 8));
+            assert!(!ledger.flush());
+            assert_eq!(ledger.by_model(), reopened.by_model());
+            std::fs::remove_dir_all(cfg.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn purging_during_a_commit_cannot_restore_deleted_usage() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+        let cfg = temp_cfg("concurrent_purge");
+        let ledger = Arc::new(UsageLedger::load(&cfg));
+        ledger.record(CategoryType::Codex, "gone", "m", &u(10));
+        ledger.record(CategoryType::Codex, "stay", "m", &u(20));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer_ledger = ledger.clone();
+        let writer = std::thread::spawn(move || {
+            let _commit = writer_ledger.commit_lock.lock();
+            writer_ledger.write_with(false, chrono::Utc::now().timestamp_millis(), |bytes| {
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).expect("提交测试协调超时");
+                crate::secret::atomic_write(&writer_ledger.path, bytes)
+            })
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let purging_ledger = ledger.clone();
+        let (purged_tx, purged_rx) = mpsc::channel();
+        let purger = std::thread::spawn(move || purged_tx.send(purging_ledger.purge_key("gone")).unwrap());
+        release_tx.send(()).unwrap();
+        assert!(writer.join().unwrap());
+        assert!(purged_rx.recv_timeout(Duration::from_secs(5)).expect("删除与提交不得死锁"));
+        purger.join().unwrap();
+        assert!(!disk_has_key(&cfg, "gone"));
+        assert!(!ledger.flush());
+        assert_eq!(ledger.by_model(), UsageLedger::load(&cfg).by_model());
+        assert_eq!(ledger.by_key()[0].key_id, "stay");
+        assert_eq!(ledger.by_key()[0].usage.input, 20);
+        std::fs::remove_dir_all(cfg.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn empty_usage_does_not_create_a_day_or_dirty_the_ledger() {
+        let cfg = temp_cfg("empty_record");
+        let ledger = UsageLedger::load(&cfg);
+        ledger.record(CategoryType::Codex, "k", "m", &TokenUsage::default());
+        assert!(ledger.by_model().is_empty());
+        assert!(ledger.daily_buckets().is_empty());
+        assert!(!ledger.flush());
+        assert!(!ledger.path.exists());
+        std::fs::remove_dir_all(cfg.parent().unwrap()).unwrap();
+    }
+
+    /// 同 Key 的不同模型分别记账，重启后不合并模型维度。
     #[test]
     fn two_models_on_one_key_stay_separate_and_survive_a_restart() {
         let cfg = temp_cfg("per_model");
@@ -528,7 +666,9 @@ mod tests {
         for banned in ["Utc::now().format", "Utc::now().date_naive", "and_utc()"] {
             assert!(!prod.contains(banned), "生产段出现了 `{banned}` —— 东八区每天 0~8 点会被算进昨天");
         }
-        // 反向：三处取「今天」的地方都在用它（load / 读视图 / 写盘）。少于 3 说明判据在空转。
-        assert!(prod.matches("local_date_string(").count() >= 3, "取「今天」的调用点变少了");
+        let recording = prod.split_once("fn record_at(").unwrap().1.split_once("pub(crate) fn mark_dirty(").unwrap().0;
+        assert!(recording.contains("local_date_string(recorded_ms)"), "入账日期必须由收到 usage 的时刻确定");
+        let view = prod.split_once("pub(crate) fn daily_buckets(").unwrap().1.split_once("pub(crate) fn flush(").unwrap().0;
+        assert!(!view.contains("now()"), "查看日桶不能重新分配日期");
     }
 }

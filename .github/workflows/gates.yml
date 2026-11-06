@@ -13,16 +13,19 @@ on:
     branches: [master, main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   gates:
     runs-on: ubuntu-22.04
     steps:
-      # fetch-depth: 2 —— `ratchet:verify` 要读 `git show HEAD:<baseline>` 做对比。
-      # 浅到 1 层时 HEAD 就是本次提交本身，对比不出任何变化（那会让它静默空转）。
+      # push / PR / tag 的比较基准可能不在最近两个提交里。
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -70,9 +73,13 @@ jobs:
         with:
           workspaces: './src-tauri -> target'
 
+      - name: Rust 非测试构型检查
+        working-directory: ./src-tauri
+        run: cargo check --locked --lib
+
       - name: clippy（零警告）
         working-directory: ./src-tauri
-        run: cargo clippy --lib --all-targets -- -D warnings
+        run: cargo clippy --locked --lib --all-targets -- -D warnings
 
       # 跑两遍。第一遍是基线，第二遍抓「并发/端口/时间窗」类偶发 ——
       # 本仓的历史证明这类用例会约每 10 轮红一次，单跑一遍等于没测到

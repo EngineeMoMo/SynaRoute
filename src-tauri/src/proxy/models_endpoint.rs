@@ -23,7 +23,7 @@
 //! `id`/`display_name`/`anthropic_family_tier`/`is_family_default`/`supports_1m`/`max_input_tokens`，
 //! **不读 `description`** —— 故加这个字段对桌面端零影响。
 
-use super::model_pool::advertised_pool;
+use crate::store::routing::catalog;
 use super::{error_resp, json_resp, ResBody};
 use crate::model::CategoryType;
 use crate::store::Store;
@@ -47,7 +47,7 @@ pub(super) fn handle_retrieve_model(
     if id.is_empty() {
         return handle_list_models(store, category);
     }
-    let models = advertised_pool(&store.enabled_keys_sorted(category));
+    let models = catalog::advertised(store, category);
     // 客户端可能用对外名，也可能用我们暴露的 gateway 别名（claude-synaroute-*），两者都接。
     let hit = models.iter().find(|a| {
         a.outward == id || crate::model::to_gateway_model_id(&a.outward) == id
@@ -123,7 +123,7 @@ pub(super) fn handle_list_models(store: &Arc<Store>, category: CategoryType) -> 
     // 模型发现不受健康态影响：只要 Key 启用，就应在 /model 选择器里列出它能服务的模型名。
     // 健康/熔断只决定「实际路由到哪个 Key」，不该决定「能选哪些模型」——否则单 Key 被真实探测
     // 判 Down 后 /model 会空掉，用户连模型都选不了（此前用 select_candidates 过滤导致的 bug）。
-    let models = advertised_pool(&store.enabled_keys_sorted(category));
+    let models = catalog::advertised(store, category);
 
     // 分类固定了下游协议形态：Codex 用 OpenAI，Claude CLI/桌面端用 Anthropic。
     // Claude Code 丢弃 id 里不含 claude/anthropic 的条目 → 非合规名包成
