@@ -849,17 +849,51 @@ mod tests {
         result.expect("smoke deadline exceeded").unwrap();
     }
 
+    fn job_fixture_command() -> tokio::process::Command {
+        let mut command = crate::proc::hidden(std::env::current_exe().unwrap());
+        command.args([
+            "--ignored",
+            "--exact",
+            "store::decision::laya_local::windows::tests::job_descendant_fixture",
+            "--nocapture",
+        ]);
+        command
+    }
+
+    #[tokio::test]
+    #[ignore = "Subprocess fixture for closing_job_also_stops_spawned_descendant"]
+    async fn job_descendant_fixture() {
+        use std::io::Write;
+        use tokio::io::AsyncReadExt;
+
+        if std::env::var("SYNAROUTE_JOB_FIXTURE_ROLE").as_deref() == Ok("descendant") {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            return;
+        }
+
+        let mut gate = [0; 6];
+        tokio::io::stdin().read_exact(&mut gate).await.unwrap();
+        assert_eq!(&gate, b"start\n");
+        let mut descendant = job_fixture_command()
+            .env("SYNAROUTE_JOB_FIXTURE_ROLE", "descendant")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        println!("SYNAROUTE_DESCENDANT_PID={}", descendant.id().unwrap());
+        std::io::stdout().flush().unwrap();
+        descendant.wait().await.unwrap();
+    }
+
     #[tokio::test]
     async fn closing_job_also_stops_spawned_descendant() {
         use tokio::io::{AsyncBufReadExt, BufReader};
         use windows::Win32::System::Threading::{
             GetExitCodeProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
-        let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-        let code = r#"[Console]::ReadLine() | Out-Null; $p = Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60' -PassThru; [Console]::WriteLine($p.Id); Start-Sleep -Seconds 60"#;
-        let mut child = crate::proc::hidden(shell)
-            .args(["-NoProfile", "-NonInteractive", "-Command", code])
+        let mut child = job_fixture_command()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -875,21 +909,27 @@ mod tests {
             .await
             .unwrap();
         let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        let pid: u32 = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pid: u32 = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if let Some((_, value)) = line.split_once("SYNAROUTE_DESCENDANT_PID=") {
+                    return value.trim().parse().unwrap();
+                }
+            }
+            panic!("descendant fixture exited before reporting its PID");
+        })
+        .await
+        .expect("descendant fixture did not report its PID within 10 seconds");
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).unwrap() };
+        let mut exit = 259;
+        unsafe {
+            GetExitCodeProcess(handle, &mut exit).unwrap();
+        }
+        assert_eq!(exit, 259, "descendant exited before job closure");
         drop(job);
         tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
             .unwrap()
             .unwrap();
-        let mut exit = 259;
         for _ in 0..50 {
             unsafe {
                 GetExitCodeProcess(handle, &mut exit).unwrap();
