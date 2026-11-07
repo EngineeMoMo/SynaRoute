@@ -474,8 +474,8 @@ impl Store {
     /// （功能在、测试过，但只对新装用户生效，而老用户是绝大多数）。
     ///
     /// 两条边界：**不覆盖同 id 的现有项**（用户可能改过内置厂商的 base_url，
-    /// 覆盖等于冲掉他的配置，只补一条都没有的 id）；**追加在末尾不重排**
-    /// （厂商顺序用户有感知）。
+    /// 覆盖等于冲掉他的配置，只补一条都没有的 id）；除新增魔法家族置首外，追加末尾。
+    /// 其余现有厂商的相对顺序保持不变。
     ///
     /// 不需要「墓碑」记录用户删掉的内置项，因为**内置厂商删不掉**：`delete_vendor` 对
     /// `builtin` 直接返 Err，`portable.rs` 的 Replace 导入也刻意保留内置项。
@@ -489,7 +489,7 @@ impl Store {
             if existing.contains(&s.id) {
                 continue;
             }
-            vendors.push(s);
+            vendors.insert(if s.id == "mofamilys" { 0 } else { vendors.len() }, s);
             added += 1;
         }
         added
@@ -2974,6 +2974,20 @@ mod tests {
     ///
     /// 故障注入判据：把 `add_new_builtin_vendors` 的调用从 `Store::new` 里去掉
     /// → 本测试必须变红。
+    #[test]
+    fn upgrade_places_mofamilys_first_and_preserves_existing_order() {
+        let mut vendors: Vec<_> = Vendor::builtin_seed().into_iter()
+            .filter(|v| v.id != "mofamilys").collect();
+        vendors[0].default_base_url = "https://my-mirror.example.com".into();
+        let before = serde_json::to_value(&vendors).unwrap();
+        assert_eq!(Store::add_new_builtin_vendors(&mut vendors), 1);
+        assert_eq!(vendors[0].id, "mofamilys");
+        assert_eq!(serde_json::to_value(&vendors[1..]).unwrap(), before);
+        let migrated = serde_json::to_value(&vendors).unwrap();
+        assert_eq!(Store::add_new_builtin_vendors(&mut vendors), 0);
+        assert_eq!(serde_json::to_value(&vendors).unwrap(), migrated);
+    }
+
     #[test]
     fn upgrade_adds_new_builtin_vendors_without_touching_existing_ones() {
         let seed = Vendor::builtin_seed();

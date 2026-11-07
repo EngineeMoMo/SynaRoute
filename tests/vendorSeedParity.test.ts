@@ -72,6 +72,12 @@ function parseRustSeed(): { id: string; url: string; proto: string }[] {
 describe("内置厂商清单：Rust 与演示数据不得分叉", () => {
   const rust = parseRustSeed();
 
+  it("魔法家族排在首位，使用站主给定地址", () => {
+    expect(rust[0]).toEqual({ id: "mofamilys", url: "https://ai.mofamilys.com", proto: "anthropic" });
+    expect(MOCK_VENDORS[0].name).toBe("魔法家族");
+    expect(MOCK_VENDORS[0].presetModels).toEqual([]);
+  });
+
   it("解析器本身没空转", () => {
     // 反向判据：抠不出足够多条就说明解析坏了，别让一个恒绿的门悄悄放行
     // （同 `invoke-command-must-exist` 那条教训）。

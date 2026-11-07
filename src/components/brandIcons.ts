@@ -72,6 +72,8 @@ const OPENAI_PATH =
  * 与新建 Key 时的真实分布一致。
  */
 export const BRANDS: Brand[] = [
+  // 未提供品牌 logo，沿用首字色块，不伪造标志。
+  { key: "mofamilys", label: "魔法家族", labelEn: "魔法家族", group: "gateway", color: "#7C3AED", keywords: ["mofamilys", "魔法家族"] },
   // ---------------- 国际原厂 ----------------
   {
     key: "anthropic",

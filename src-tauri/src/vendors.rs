@@ -75,11 +75,14 @@ fn pm_unknown(real: &str, disp: &str) -> PresetModel {
 
 /// 内置厂商种子。
 ///
-/// **顺序即界面顺序**：国际原厂 → 国内原厂 → 聚合/中转 → 本机推理 → 自定义。
+/// **顺序即界面顺序**：魔法家族 → 国际原厂 → 国内原厂 → 聚合/中转 → 本机推理 → 自定义。
 /// `custom` 必须排最后（它是「以上都不是」的兜底项）。
 pub fn builtin_seed() -> Vec<Vendor> {
     use Protocol::{Anthropic, OpenaiChat, OpenaiResponses};
     vec![
+        // 站主指定首位；2026-11-07 未鉴权探测 /v1/messages 返回 API_KEY_REQUIRED。
+        // 不预填未经确认的模型，接入时用真实密钥拉取。
+        mk("mofamilys", "魔法家族", "https://ai.mofamilys.com", Anthropic, vec![]),
         // ==================== 国际原厂 ====================
         // 实测 POST /v1/messages 返 401 authentication_error（路由存在）。
         // 5 系三个都是 1M context；4.5/4.6 系已被官方列入 Legacy（context 只有 200k），

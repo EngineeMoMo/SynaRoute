@@ -23,6 +23,7 @@ import type { Vendor } from "@/types";
  * 从 vendors.rs 的 `mk(...)` 调用里抠出来）。
  */
 export const MOCK_VENDORS: Vendor[] = [
+  { id: "mofamilys", name: "魔法家族", defaultBaseUrl: "https://ai.mofamilys.com", defaultProtocol: "anthropic", builtin: true, presetModels: [] },
   { id: "anthropic", name: "Anthropic", defaultBaseUrl: "https://api.anthropic.com", defaultProtocol: "anthropic", builtin: true, presetModels: [
     { realName: "claude-opus-5", displayName: "Claude Opus 5", contextWindow: 1000000 },
     { realName: "claude-sonnet-5", displayName: "Claude Sonnet 5", contextWindow: 1000000 },
