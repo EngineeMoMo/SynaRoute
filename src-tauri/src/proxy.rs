@@ -477,7 +477,7 @@ async fn handle_request_inner(
     let deadline = store.failover_budget().map(|b| std::time::Instant::now() + b);
     let route = match crate::store::routing::policy::prepare(&store, category, &req_json, downstream, &route_hints, &requested_model, deadline).await {
         Ok(route) => route,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     active.model(&route.model);
     let requested_model = route.model.clone(); let (mut candidates, used_breaker_fallback) = store.candidates_for(category, &requested_model);

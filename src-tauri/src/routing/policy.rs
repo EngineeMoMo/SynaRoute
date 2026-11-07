@@ -7,15 +7,15 @@ use std::{sync::Arc, time::Instant};
 #[derive(Clone, Default)]
 pub struct Decision { pub model: String, pub lease: Option<Lease>, pub keep_key: bool }
 
-fn reject(status: StatusCode, message: &str) -> Response<ResBody> {
+fn reject(status: StatusCode, message: &str) -> Box<Response<ResBody>> {
     let mut response = Response::new(crate::proxy::full_body(bytes::Bytes::from(serde_json::json!({"type":"error","error":{"type":"routing_policy_error","message":message}}).to_string())));
     *response.status_mut() = status;
     response.headers_mut().insert("content-type", hyper::header::HeaderValue::from_static("application/json"));
-    response
+    Box::new(response)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn prepare(store: &Arc<Store>, category: CategoryType, body: &Value, protocol: Protocol, hints: &Hints, baseline: &str, deadline: Option<Instant>) -> Result<Decision, Response<ResBody>> {
+pub async fn prepare(store: &Arc<Store>, category: CategoryType, body: &Value, protocol: Protocol, hints: &Hints, baseline: &str, deadline: Option<Instant>) -> Result<Decision, Box<Response<ResBody>>> {
     // Reject before candidate failure accounting: a locked vault is not an upstream failure.
     if store.secrets.read().is_locked() {
         return Err(reject(StatusCode::SERVICE_UNAVAILABLE, "密钥库已用主口令加密但尚未解锁：请打开 SynaRoute 主窗口输入主口令解锁后重试。"));
@@ -84,4 +84,21 @@ impl Decision {
 
 pub fn stream_end(store: &Arc<Store>, lease: &Option<Lease>, errored: bool) {
     if errored { if let Some(lease) = lease { store.routing_runtime.failed(lease); } }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn boxed_rejection_preserves_http_contract() {
+        let response = *reject(StatusCode::CONFLICT, "fixture rejection");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "routing_policy_error");
+        assert_eq!(body["error"]["message"], "fixture rejection");
+    }
 }

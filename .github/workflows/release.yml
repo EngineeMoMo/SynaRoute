@@ -60,7 +60,7 @@ jobs:
               body: [
                 'Download the installer for your platform from the assets below.',
                 '',
-                '**v0.1.79 — Routing policies and active requests.** Added routing scenes, session affinity, sensitive-content controls, intent routing, and an active proxy request list with per-request cancellation.',
+                '**v0.1.80 — Routing policies and active requests.** Fixes the Rust 1.99 Clippy release blocker in v0.1.79. Added routing scenes, session affinity, sensitive-content controls, intent routing, and an active proxy request list with per-request cancellation.',
                 '新增路由场景、会话保持、敏感内容控制、意图路由与代理活跃请求列表，可停止单条请求而不再换 Key 重试。',
                 'Improved persistence rollback, configuration import compatibility, usage accounting, session deletion safety, and release quality gates.',
                 '加固配置与密钥落盘回滚、导入兼容性、用量记账、会话删除及发布质量门。',
