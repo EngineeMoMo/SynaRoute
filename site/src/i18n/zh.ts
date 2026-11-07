@@ -10,6 +10,22 @@ import type { Dict } from "./index";
  * - 仓库是 public 但**没有 LICENSE 文件**，因此一律表述为「源码公开」，不称「开源」。
  */
 export const zh: Dict = {
+  "routingSite.title": "看清线路，再决定如何路由",
+  "routingSite.intro": "五项已发布能力，把查看、切换、保持、选模和敏感检查放在同一套本地工作流中。",
+  "routingSite.overview": "路由总览",
+  "routingSite.overviewBody": "并列查看三类客户端的配置与最近线路尝试，不把配置值当成实际结果。",
+  "routingSite.scenes": "场景方案",
+  "routingSite.scenesBody": "保存常用主 Key、模型与档位兜底；先预览再应用，不改登录态、不启动代理。",
+  "routingSite.affinity": "会话保持",
+  "routingSite.affinityBody": "按本轮或整个会话尽量保留成功线路，仍服从熔断、配额、余额和预算。",
+  "routingSite.intent": "意图选模",
+  "routingSite.intentBody": "主动选择 Auto 入口后按任务匹配目标模型，判断失败回默认；判断调用可能产生费用。",
+  "routingSite.privacy": "敏感内容检查",
+  "routingSite.privacyBody": "本地检测、提醒或拦截，自定义词加密保存。提醒仍发送原文，检测不等于完整安全保证。",
+  "routingSite.showExample": "查看界面示例（点击图片放大）",
+  "routingSite.exampleNote": "浏览器预览截图，中文界面与示例数据；未保存草稿仅演示配置入口，不代表已启用。",
+  "routingSite.guide": "查看配置与使用步骤",
+
   // ---------- 通用 ----------
   "common.download": "立即下载",
   "common.viewGithub": "查看 GitHub",

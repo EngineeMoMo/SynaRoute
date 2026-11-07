@@ -1,6 +1,7 @@
 import { Hero } from "@/components/sections/Hero";
 import { Benefits } from "@/components/sections/Benefits";
 import { BrainSpotlight } from "@/components/sections/BrainSpotlight";
+import { RoutingCapabilities } from "@/components/sections/RoutingCapabilities";
 import { Features } from "@/components/sections/Features";
 import { Screenshots } from "@/components/sections/Screenshots";
 import { Downloads } from "@/components/sections/Downloads";
@@ -30,6 +31,7 @@ export default function HomePage() {
           这里立刻给出别处没有的那一条，再往下才是常规功能清单 */}
       <BrainSpotlight />
       <Features />
+      <RoutingCapabilities />
       <Screenshots />
       <Downloads />
       <GettingStarted />

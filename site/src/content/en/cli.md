@@ -12,6 +12,42 @@ You have API keys from several AI services (different vendors, different relays)
 
 SynaRoute opens a local proxy port on `127.0.0.1`. `claude` sends requests there, and SynaRoute forwards them upstream according to your rules. **It listens on loopback only and is not exposed externally.**
 
+## Routing overview and policies (available now)
+
+These five capabilities support Claude CLI, Claude Desktop and Codex categories. Add and enable keys first. Affinity, intent rules and sensitive-content checks are optional and off by default.
+
+### Routing overview
+
+![Routing overview with Chinese UI and browser sample data](/screenshots/routing-overview.jpg)
+
+Open Routing overview in the sidebar to compare proxy listeners, configured primary keys/models and recent route attempts across all three categories. Matching configuration does not prove a running client has reloaded it. A stream being established does not mean its answer has completed successfully.
+
+### Scenes
+
+![Scene draft, not yet applied; Chinese UI with sample data](/screenshots/routing-scenes.jpg)
+
+Open Routing policies → Scenes → Create from current setup. Name the scene and select categories, primary keys, models and the Codex effort fallback, then save. Saving does not switch routes. Preview the current and target choices before confirming application. Scenes do not copy secrets, start proxies, change login state or old conversations, or disable privacy policies. Previews expire after ten minutes and must be renewed after state changes. If client sync fails, local choices remain saved; resolve file access problems and retry sync.
+
+### Session affinity
+
+![Affinity mode selector in the Chinese browser preview](/screenshots/routing-affinity.jpg)
+
+Select a category and choose Off, This turn or Entire session, then save the category policy. Reliable session identity is required. Affinity cannot override circuit breakers, quotas, balance, budgets or model eligibility. Clear affinity records to select routes again. Cross-account cache and signature compatibility are not guaranteed.
+
+### Intent routing
+
+![Auto group draft: select default and judge models before saving; sample data](/screenshots/routing-intent.jpg)
+
+Add a group, choose a default model and a judge key/real model, then add ordered intent descriptions and target models. Enable and save it. Explicitly select its Auto entry in the client menu or a scene; ordinary real-model requests are not intercepted by intent rules. The latest user text and rule descriptions may be sent to the judge and incur charges. Judgment waits up to four seconds within the request budget. Failures normally use the default; signed history whose original model cannot be established is rejected with guidance to select the original real model. Restart clients that need to reload a changed model catalog.
+
+### Sensitive content
+
+![Sensitive-content modes, detection types and local scan controls in Chinese](/screenshots/routing-privacy.jpg)
+
+Select Off, Warn only or Block and the detection types, then save. Warning mode still sends original text. Blocking rejects matches, rule-loading failures and scan-limit overruns before judge or business upstream calls. Custom terms are encrypted: one per line, up to 100, at least three characters and at most 256 bytes each. Check Replace to change them; saving an empty replacement clears them. Local test scans do not call a model and use current detection switches plus saved terms, not unsaved drafts.
+
+Checks can miss content or produce false positives. They do not inspect images, binary attachments or encrypted reasoning, nor independent brain consultations, native controlled clients or requests bypassing the proxy. Warning mode does not disable raw body logs. A failed refresh or stale snapshot does not mean protection is off; discard a stale draft and refresh before resolving a save conflict.
+
 ## Installing
 
 1. Get the installer from the [download page](/en/download) and run it (per-user install, no administrator rights needed).

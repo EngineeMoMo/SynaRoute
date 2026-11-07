@@ -9,6 +9,22 @@ import type { Dict } from "./index";
  * is consistently "source available", never "open source".
  */
 export const en: Dict = {
+  "routingSite.title": "See the route. Choose how it behaves.",
+  "routingSite.intro": "Five released capabilities bring inspection, scene switching, affinity, model selection and sensitive-content checks into one local workflow.",
+  "routingSite.overview": "Routing overview",
+  "routingSite.overviewBody": "Compare configuration and recent route attempts across three client categories without confusing settings with actual outcomes.",
+  "routingSite.scenes": "Scenes",
+  "routingSite.scenesBody": "Save primary keys, models and effort fallbacks. Preview before applying, without changing login state or starting proxies.",
+  "routingSite.affinity": "Session affinity",
+  "routingSite.affinityBody": "Prefer successful routes within a turn or session while respecting circuit breakers, quotas, balance and budgets.",
+  "routingSite.intent": "Intent routing",
+  "routingSite.intentBody": "Explicitly select an Auto entry to match tasks to models, with a default fallback. Judge calls may incur charges.",
+  "routingSite.privacy": "Sensitive content checks",
+  "routingSite.privacyBody": "Detect, warn or block locally with encrypted custom terms. Warnings still send original text; detection is not a complete safety guarantee.",
+  "routingSite.showExample": "View interface example (click image to enlarge)",
+  "routingSite.exampleNote": "Browser preview with Chinese UI and sample data. Unsaved drafts illustrate setup controls, not enabled policies.",
+  "routingSite.guide": "Read the setup and usage guide",
+
   // ---------- Common ----------
   "common.download": "Download",
   "common.viewGithub": "View on GitHub",

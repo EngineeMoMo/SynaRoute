@@ -1,6 +1,8 @@
-# SynaRoute CLI 接入用户手册（试用版）
+# SynaRoute CLI 接入用户手册
 
-> 适用版本：SynaRoute 0.1.0 · 面向 Claude Code 命令行（`claude`）用户
+> 路由总览、场景方案、会话保持、意图选模与敏感内容检测／拦截已发布，完整操作步骤见 [路由总览与策略使用手册](37-路由策略使用手册.md)。这些能力也适用于 Claude 桌面端与 Codex 分类。
+
+> 面向 Claude Code 命令行（`claude`）用户；安装包版本以下载页最新正式 Release 为准。
 > 一句话：SynaRoute 在你本机起一个代理，把 `claude` 的请求按你配的多个 Key 做**故障转移 + 模型映射**，一个挂了自动切下一个。
 
 ---

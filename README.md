@@ -11,6 +11,7 @@
 
 [官网](https://synaroute.mofamilys.com) ·
 [下载](https://github.com/EngineeMoMo/SynaRoute/releases/latest) ·
+[路由策略使用手册](docs/37-路由策略使用手册.md) ·
 [CLI 接入手册](docs/12-CLI用户手册.md) ·
 [大脑聚合](docs/10-大脑聚合使用说明.md) ·
 [MCP 接入](docs/06-MCP使用手册.md)
