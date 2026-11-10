@@ -679,7 +679,7 @@ impl ToolSession {
         let retry_after = crate::proxy::parse_retry_after(resp.headers());
         // 同 text_completion：先读文本再解析，否则上游回 HTML 错误页时只能看到笼统的
         // 「error decoding response body」，看不出上游到底说了什么。
-        let raw = resp.text().await?;
+        let raw = super::response_body::text(resp).await?;
         let label = if openai { "OpenAI" } else { "Anthropic" };
 
         // 自愈：带了缓存字段、上游回 400、且响应体确认是缓存问题 → 去掉缓存重发一次,
@@ -702,11 +702,11 @@ impl ToolSession {
             let status2 = resp2.status();
             // 与首个响应同一纪律：text() 会消费 resp2，Retry-After 必须先读。
             let retry_after2 = crate::proxy::parse_retry_after(resp2.headers());
-            let raw2 = resp2.text().await?;
+            let raw2 = super::response_body::text(resp2).await?;
             if !status2.is_success() {
                 return Err(AppError::upstream_http_after(
                     status2.as_u16(),
-                    format!("{label} HTTP {status2}: {}", truncate_body(&raw2)),
+                    format!("{label} HTTP {status2}: {}", truncate_body(&crate::diagnostics::redact_secret(&raw2, p.secret))),
                     retry_after2,
                 ));
             }
@@ -714,7 +714,7 @@ impl ToolSession {
             return parse_anthropic_turn(&raw2).ok_or_else(|| {
                 AppError::upstream_http(
                     status2.as_u16(),
-                    format!("{label} 响应无法解析: {}", truncate_body(&raw2)),
+                    format!("{label} 响应无法解析: {}", truncate_body(&crate::diagnostics::redact_secret(&raw2, p.secret))),
                 )
             });
         }
@@ -722,7 +722,7 @@ impl ToolSession {
         if !status.is_success() {
             return Err(AppError::upstream_http_after(
                 status.as_u16(),
-                format!("{label} HTTP {status}: {}", truncate_body(&raw)),
+                format!("{label} HTTP {status}: {}", truncate_body(&crate::diagnostics::redact_secret(&raw, p.secret))),
                 retry_after,
             ));
         }
@@ -754,7 +754,7 @@ impl ToolSession {
         parsed.ok_or_else(|| {
             AppError::upstream_http(
                 status.as_u16(),
-                format!("{label} 响应无法解析: {}", truncate_body(&raw)),
+                format!("{label} 响应无法解析: {}", truncate_body(&crate::diagnostics::redact_secret(&raw, p.secret))),
             )
         })
     }

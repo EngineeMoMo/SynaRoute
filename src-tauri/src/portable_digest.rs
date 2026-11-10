@@ -97,7 +97,7 @@ pub(super) fn verify(raw: &[u8]) -> crate::error::AppResult<()> {
     let mut envelope: Envelope = serde_json::from_slice(raw)
         .map_err(|e| crate::error::AppError::Invalid(format!("不是有效的 SynaRoute 导出文件: {e}")))?;
     super::check_format_version(envelope.format_version)?;
-    if envelope.format_version == 2 { envelope.payload.sort_keys(); }
+    if envelope.format_version >= 2 { envelope.payload.sort_keys(); }
     if envelope.payload.digest()? != envelope.payload_sha256 {
         return Err(crate::error::AppError::Invalid(
             "导出文件校验和不匹配：文件已损坏或被修改，已拒绝导入（未改动任何本机配置）。".into(),

@@ -1111,12 +1111,10 @@ export function KeyEditor({ initial, onClose, onSaved }: KeyEditorProps) {
                     {balance.auth === "access-token" && (
                       <div className="grid grid-cols-2 gap-2">
                         <Field label={t("balance.accessToken")}>
-                          <input
+                          <BalanceTokenInput
                             className={`${inputCls} font-mono`}
-                            value={balance.accessToken ?? ""}
-                            onChange={(e) =>
-                              setBalance((b) => ({ ...b, accessToken: e.target.value }))
-                            }
+                            value={balance.accessToken} reference={balance.accessTokenRef}
+                            onChange={(accessToken) => setBalance((current) => ({ ...current, accessToken }))}
                           />
                         </Field>
                         <Field label={t("balance.userId")}>
@@ -1446,3 +1444,4 @@ function ContextWindowInput({
     </div>
   );
 }
+import { BalanceTokenInput } from "@/components/BalanceTokenInput";

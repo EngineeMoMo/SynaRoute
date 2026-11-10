@@ -15,6 +15,7 @@ use std::time::SystemTime;
 #[path = "key_order.rs"] pub(crate) mod key_order; #[path = "routing/mod.rs"] pub(crate) mod routing;
 
 #[path = "store_endpoint.rs"] mod endpoint;
+#[path = "store_balance.rs"] pub(crate) mod balance;
 pub use endpoint::base_url_has_path_suffix;
 
 pub struct Store {
@@ -386,6 +387,7 @@ impl Store {
         if needs_persist && !load_failed {
             store.persist()?;
         }
+        store.migrate_balance_credentials()?;
         Ok(store)
     }
 
@@ -1285,9 +1287,11 @@ impl Store {
                 cfg.vendors.retain(|v| v.builtin);
             }
             for k in &payload.keys {
+                let mut protected = k.clone();
+                balance::protect_key(&mut protected, &mut self.secrets.write())?;
                 match cfg.keys.iter_mut().find(|x| x.id == k.id) {
-                    Some(slot) => *slot = k.clone(),
-                    None => cfg.keys.push(k.clone()),
+                    Some(slot) => *slot = protected,
+                    None => cfg.keys.push(protected),
                 }
             }
             for b in &payload.brain {
@@ -1322,8 +1326,9 @@ impl Store {
             // 理由全文见 `portable::strip_machine_local`。
             incoming.lan_exposure = cfg.settings.lan_exposure;
             cfg.settings = incoming;
+            crate::portable::config::apply(cfg, payload, mode)?;
             Ok(removed)
-        })
+        }).inspect(|_| crate::portable::config::reset_runtime(self))
     }
 
     /// 清理「配置里已不存在的 Key 仍留在密钥库里」的孤儿密钥（P2-3）。
@@ -1343,19 +1348,20 @@ impl Store {
     ///
     /// 返回被清理的条数。**这是破坏性操作**，调用方应先备份并让用户确认（见 lib.rs 的调用点）。
     pub fn prune_orphan_secrets(&self) -> usize {
+        let _editing = self.routing_runtime.edit.lock();
         if self.secrets.read().is_locked() {
             return 0;
         }
         let live: std::collections::HashSet<String> =
-            self.config.read().keys.iter().map(|k| k.id.clone()).collect();
+            balance::referenced_key_secrets(&self.config.read().keys);
         let orphans: Vec<String> = {
             let sec = self.secrets.read();
             // 跳过库内部条目（局域网令牌）—— 删了它局域网客户端立刻 401，见 `is_internal_secret_id`。
-            sec.all_key_ids().into_iter().filter(|id| !live.contains(id) && !crate::proxy::lan_guard::is_internal_secret_id(id)).collect()
+            sec.all_key_ids().into_iter().filter(|id| balance::is_orphan(id, &live)).collect()
         };
         let mut n = 0;
         for id in &orphans {
-            match self.secrets.write().remove(id) {
+            match self.remove_credential(id) {
                 Ok(()) => n += 1,
                 // 单条失败只记日志：残留一条孤儿是无害的（下次再清或手工处理），
                 // 不该让整次清理中断。
@@ -1374,9 +1380,9 @@ impl Store {
             return 0;
         }
         let live: std::collections::HashSet<String> =
-            self.config.read().keys.iter().map(|k| k.id.clone()).collect();
+            balance::referenced_key_secrets(&self.config.read().keys);
         let sec = self.secrets.read();
-        sec.all_key_ids().into_iter().filter(|id| !live.contains(id) && !crate::proxy::lan_guard::is_internal_secret_id(id)).count()
+        sec.all_key_ids().into_iter().filter(|id| balance::is_orphan(id, &live)).count()
     }
 
     /// 让每个 Key 的 `has_secret` 标记与密钥库实际内容对账，返回「标记有但实际没有」的条数。
@@ -1455,6 +1461,7 @@ impl Store {
         }
         // 失败回滚：落盘失败不让内存领先磁盘（见 mutate_and_persist）。
         self.mutate_and_persist(|cfg| {
+            balance::protect_key(&mut key, &mut self.secrets.write())?;
             if let Some(existing) = cfg.keys.iter_mut().find(|k| k.id == key.id) {
                 // ⚠️ **运行态字段一律沿用库里现值，前端传什么都忽略**。
                 //
@@ -1468,7 +1475,7 @@ impl Store {
                 // 「上移/下移」也走整份 upsert（前端重编号后并发提交），同样会踩中这一条。
                 // 收在这里而不是让每个调用点自觉，是因为漏一处就是一个静默失效点。
                 let health = existing.health.clone();
-                let cached_balance = existing.cached_balance.clone();
+                let cached_balance = balance::same_query(existing, &key).then(|| existing.cached_balance.clone()).flatten();
                 *existing = key.clone();
                 existing.health = health;
                 existing.cached_balance = cached_balance;
@@ -1571,7 +1578,7 @@ impl Store {
         // config 已成功落盘,现在移除密钥(SecretStore::remove 内部落盘 secrets.enc)。
         // 失败仅记日志——残留密钥是无害孤儿(下次同 id 覆盖或手动清理),不该让「删 Key」整体
         // 报错、更不该回退已完成的 config 删除。
-        if let Err(e) = self.secrets.write().remove(key_id) {
+        if let Err(e) = self.remove_credential(key_id) {
             tracing::warn!("删除 Key 后移除密钥失败(config 已更新,残留孤儿密钥待清理): {e}");
         }
         // 用量记录一并删除（2026-10-12 用户定的口径，推翻 09-02 的「删 Key 留墓碑、金额照算」）。
@@ -1812,85 +1819,6 @@ impl Store {
         Ok(())
     }
 
-    /// 更新某 Key 的余额查询缓存（查询成功或失败后调用）。
-    ///
-    /// 纯内存操作、不落盘（`cached_balance` 字段带 `#[serde(skip)]`）。
-    /// 重启后缓存自然清空，下次查询时重新拉取是合理的。
-    pub fn update_balance_cache(&self, key_id: &str, result: BalanceResult) -> AppResult<()> {
-        let mut cfg = self.config.write();
-        if let Some(k) = cfg.keys.iter_mut().find(|k| k.id == key_id) {
-            k.cached_balance = Some(result);
-            // cached_balance 标记为 #[serde(skip)]，不会序列化到磁盘。
-            // 重启后缓存自然清空是合理的（避免使用过期数据）。
-            // 删除 persist() 调用：它不会序列化 cached_balance，纯属无效 I/O。
-        }
-        Ok(())
-    }
-
-    /// 记住余额查询探测命中的地址模板（窄写入，只改这一个字段并落盘）。
-    ///
-    /// 返回是否真的写了盘（已是同值则幂等跳过）。
-    ///
-    /// **为什么必须是窄写入、不能让前端走 `upsert_key`**：那条路提交的是「打开编辑器那一刻」
-    /// 的整份快照，`upsert_key` 的守卫只保住 `health` 与 `cached_balance` 两项，
-    /// 其余字段一概照覆盖 —— 用一次后台余额查询去触发整份覆盖，会把这期间用户改的别的东西
-    /// 或后端自管的值顶掉。与 `set_primary_key`/`move_key` 收进后端是同一条理由。
-    ///
-    /// 只在 `balance_query` 已存在时写：`None` 表示这条 Key 压根没配余额查询，
-    /// 而能走到这里说明查过 —— 那是调用方的 bug，此时凭空造一个配置比什么都不做更糟。
-    pub fn set_balance_query_url(&self, key_id: &str, url_template: &str) -> AppResult<bool> {
-        self.mutate_and_persist_when(|cfg| {
-            let Some(k) = cfg.keys.iter_mut().find(|k| k.id == key_id) else {
-                return (false, false);
-            };
-            let Some(bq) = k.balance_query.as_mut() else {
-                return (false, false);
-            };
-            if bq.url == url_template {
-                return (false, false); // 幂等：已是目标值，不写盘
-            }
-            bq.url = url_template.to_string();
-            (true, true)
-        })
-    }
-
-    /// 获取某 Key 的余额缓存（如果存在且未过期）。
-    ///
-    /// 返回 `Some(result)` 表示缓存命中且未过期，调用方可直接使用；
-    /// 返回 `None` 表示无缓存或已过期，需要重新查询上游。
-    ///
-    /// 缓存有效期：与 `auto_interval_min` 对齐，但**取其 90%** ——
-    /// 前端轮询在 t=T 时到达，此刻缓存年龄 = T − 网络延迟，恒小于 T；
-    /// 有效期取整 T 会把每个奇数次轮询拦掉，实际查询周期变成配置的 2 倍
-    /// （用户设 30 分钟实为 1 小时的静默偏差）。留 10% 余量后奇数次轮询正常放行。
-    /// 未配置自动查询（`auto_interval_min == 0`）时缓存 5 分钟（避免短时间内重复查询，
-    /// 该路径没有定时轮询打边界，不需要余量）。
-    pub fn get_balance_cache(&self, key_id: &str) -> Option<BalanceResult> {
-        let cfg = self.config.read();
-        let key = cfg.keys.iter().find(|k| k.id == key_id)?;
-        let cached = key.cached_balance.as_ref()?;
-
-        // 计算缓存有效期（秒）
-        let cache_duration_secs = if let Some(bq) = &key.balance_query {
-            if bq.auto_interval_min > 0 {
-                // 90% 余量：与前端 KeyCard 轮询的 freshFor 同一口径（见上方文档注释）
-                (bq.auto_interval_min as i64) * 60 * 9 / 10
-            } else {
-                5 * 60 // 默认 5 分钟
-            }
-        } else {
-            5 * 60
-        };
-
-        // 检查是否过期
-        let now = chrono::Utc::now().timestamp_millis();
-        let age_secs = (now - cached.queried_at) / 1000;
-        if age_secs < cache_duration_secs {
-            Some(cached.clone())
-        } else {
-            None // 已过期
-        }
-    }
 
     /// 更新某 Key 的模型列表（拉取模型后调用）
     pub fn set_models(&self, key_id: &str, models: Vec<ModelInfo>) -> AppResult<()> {
@@ -2532,7 +2460,7 @@ impl Store {
         let initial_stamp = Self::read_disk_stamp(&config_path);
         // 与生产构造器同样恢复用量累计：测试才能覆盖「重启后累计不归零」这条判据。
         let usage = crate::usage_store::UsageLedger::load(&config_path);
-        Ok(Self {
+        let store = Self {
             routing_runtime: routing::runtime::Runtime::default(),
             active_requests: std::sync::Arc::default(),
             route_profiles: crate::diagnostics::route_profiles::ProfileStore::load(config_path.with_file_name("route-profiles.json")),
@@ -2547,7 +2475,9 @@ impl Store {
             health_dirty: std::sync::atomic::AtomicBool::new(false),
             usage,
             persist_lock: std::sync::Mutex::new(()),
-        })
+        };
+        store.migrate_balance_credentials()?;
+        Ok(store)
     }
 }
 
@@ -2712,6 +2642,7 @@ mod tests {
             ..Default::default()
         };
         let payload = crate::portable::ExportPayload {
+            routing: None, decision: None,
             keys: vec![],
             brain: store.snapshot_config().brain.clone(),
             vendors: vec![],

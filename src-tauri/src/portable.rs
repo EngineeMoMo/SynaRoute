@@ -28,11 +28,13 @@ use crate::model::{AppSettings, BrainConfig, ProviderKey, Vendor};
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
 #[path = "portable_digest.rs"] mod digest;
+#[path = "portable_config.rs"] pub(crate) mod config;
 #[cfg(test)] use sha2::{Digest, Sha256};
+#[cfg(test)] #[path = "portable_config_tests.rs"] mod config_tests;
 
 /// 导出文件格式版本。**改动载荷结构时必须 +1**，并在 [`check_format_version`] 里明确拒绝
 /// 或做迁移——静默按新结构解析旧文件会得到半份配置。
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 /// 导出文件的顶层结构。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,12 +64,23 @@ pub struct ExportPayload {
     pub brain: Vec<BrainConfig>,
     pub vendors: Vec<Vendor>,
     pub settings: AppSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<crate::store::routing::config::RoutingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<std::collections::BTreeMap<crate::model::CategoryType, crate::store::decision::DecisionConfig>>,
 }
 
 /// 密钥段解密后的明文结构：keyId → 明文密钥。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SecretsPlain {
     entries: std::collections::HashMap<String, String>,
+}
+
+impl Drop for SecretsPlain {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for secret in self.entries.values_mut() { secret.zeroize(); }
+    }
 }
 
 /// 导入模式（用户当场选，见模块注释）。
@@ -207,12 +220,15 @@ pub fn build_export(
     password: Option<&str>,
 ) -> AppResult<(ExportFile, usize)> {
     let cfg = store.snapshot_config();
-    let payload = ExportPayload {
+    let mut payload = ExportPayload {
         keys: cfg.keys.clone(),
         brain: cfg.brain.clone(),
         vendors: cfg.vendors.clone(),
         settings: strip_machine_local(cfg.settings.clone()),
+        routing: Some(cfg.routing.clone()),
+        decision: Some(cfg.decision.clone()),
     };
+    let mut secret_plain = SecretsPlain { entries: config::take_legacy_tokens(&mut payload, password.is_some()) };
     let payload_sha256 = payload_digest(&payload)?;
 
     let mut undecryptable = 0usize;
@@ -230,25 +246,27 @@ pub fn build_export(
             // 逐个 Key 从当前保护模式解出明文。解不出的**跳过而非中断**：某个 Key 的密文可能因
             // 换过 Windows 账户而失效，不该因此让整次导出失败（导出元数据仍有价值）。
             // 但**必须计数并上报**——见函数文档。
-            let mut entries = std::collections::HashMap::new();
             let guard = store.secrets.read();
-            for k in &cfg.keys {
-                match guard.get(&k.id) {
+            for reference in config::secret_references(&payload) {
+                if secret_plain.entries.contains_key(&reference) { continue; }
+                match guard.get(&reference) {
                     Ok(Some(plain)) => {
                         // 解出 Zeroizing 存进待序列化的 map：这份内容马上要被 crypto::seal
                         // 加密进导出文件，必须是普通 String 才能过 serde。
-                        entries.insert(k.id.clone(), plain.to_string());
+                        secret_plain.entries.insert(reference.clone(), plain.to_string());
                     }
                     // `Ok(None)` = 这个 Key 本来就没配密钥，不算「解不出」。
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if !payload.keys.iter().any(|key| key.id == reference && !key.has_secret) { undecryptable += 1; }
+                    }
                     Err(e) => {
                         undecryptable += 1;
-                        tracing::warn!("导出时 Key {} 的密钥解密失败，已跳过: {e}", k.id);
+                        tracing::warn!("导出时密钥 {reference} 解密失败，已跳过: {e}");
                     }
                 }
             }
             drop(guard);
-            let plain = serde_json::to_vec(&SecretsPlain { entries })?;
+            let plain = zeroize::Zeroizing::new(serde_json::to_vec(&secret_plain)?);
             Some(crypto::seal(pw, &plain)?)
         }
         None => None,
@@ -269,7 +287,7 @@ pub fn build_export(
 
 /// 校验格式版本。**不认识的版本一律拒绝**，不尝试「尽力解析」——半份配置比明确报错更难排查。
 fn check_format_version(v: u32) -> AppResult<()> {
-    if v == 1 || v == FORMAT_VERSION {
+    if (1..=FORMAT_VERSION).contains(&v) {
         return Ok(());
     }
     Err(AppError::Invalid(if v > FORMAT_VERSION {
@@ -345,11 +363,12 @@ pub fn apply_import(
     password: Option<&str>,
 ) -> AppResult<ImportReport> {
     let mut warnings = Vec::new();
+    config::validate_references(&file.payload)?;
 
     // 主口令模式未解锁时，密钥一条也写不进去（`SecretStore::set` 会拒绝）。若照常往下走，
     // 会得到「配置全导入了、密钥全失败」的半成品，而 Replace 模式已经把本机原有条目删了。
     // 故在**动任何东西之前**拒绝。
-    if file.secrets.is_some() && store.secrets.read().is_locked() {
+    if (file.secrets.is_some() || config::has_legacy_tokens(&file.payload)) && store.secrets.read().is_locked() {
         return Err(AppError::Invalid(
             "密钥库已用主口令加密但尚未解锁，无法导入密钥。请先解锁后重试。".into(),
         ));
@@ -358,7 +377,7 @@ pub fn apply_import(
     // 密钥段先解开（在动配置之前）：口令错就该在什么都没改的时候失败。
     let secrets: Option<SecretsPlain> = match (&file.secrets, password) {
         (Some(env), Some(pw)) => {
-            let plain = crypto::open(pw, env)?;
+            let plain = zeroize::Zeroizing::new(crypto::open(pw, env)?);
             Some(serde_json::from_slice(&plain).map_err(|e| {
                 AppError::Invalid(format!("密钥段解密成功但内容无法解析（文件损坏）: {e}"))
             })?)
@@ -420,7 +439,7 @@ pub fn apply_import(
     // 对账会读到孤儿密文把 has_secret 刷成 true，得到「新配置 + 旧密钥」的嵌合体 → 莫名 401。
     let mut secrets_pruned = 0usize;
     if !removed_ids.is_empty() {
-        let mut guard = store.secrets.write();
+        let guard = store.secrets.read();
         // **删密钥前必须先备份整个 secrets.enc**，且备份不成就一条都不删。
         //
         // 为什么：上面 :372 的 `backup_config_before_import` 只备份了 config.json。
@@ -443,14 +462,14 @@ pub fn apply_import(
                 removed_ids.clear();
             }
         }
+        drop(guard);
         for id in &removed_ids {
-            match guard.remove(id) {
+            match store.remove_credential(id) {
                 Ok(()) => secrets_pruned += 1,
                 // 残留一条孤儿是无害的（可被 prune_orphan_secrets 兜住），不中止导入。
                 Err(e) => warnings.push(format!("清理 Key {id} 的旧密钥失败: {e}")),
             }
         }
-        drop(guard);
     }
 
     // 密钥逐条写入（在配置落盘成功之后——否则可能出现「有密钥、没 Key」的孤儿）。
@@ -463,18 +482,16 @@ pub fn apply_import(
         // 逐条写：`SecretStore::set` 每次都会 persist 一遍 secrets.enc。这里刻意不做批量写——
         // 批量的唯一好处是少几次落盘，代价是「中途失败则整批不知道写进去几条」，
         // 而导入是低频一次性操作，逐条落盘换来的确定性更值。
-        let mut guard = store.secrets.write();
+        let references = config::secret_references(&file.payload);
         for (key_id, plain) in &s.entries {
-            // 只导入「文件里确实有这个 Key」的密钥，避免留下无主密钥。
-            if !file_ids.contains(key_id) {
+            if !references.contains(key_id) {
                 continue;
             }
-            match guard.set(key_id, plain) {
+            match store.save_credential(key_id, plain) {
                 Ok(()) => secrets_imported += 1,
                 Err(e) => warnings.push(format!("Key {key_id} 的密钥写入失败: {e}")),
             }
         }
-        drop(guard);
     }
 
     // has_secret 标记与实际密钥库对账 —— **两条路径都要做**（有无密钥段都要）。
@@ -491,6 +508,17 @@ pub fn apply_import(
         warnings.push(format!(
             "{missing} 个 Key 标记了有密钥但库里实际没有，已把标记置回未配置——请重新录入密钥。"
         ));
+    }
+    let missing_auxiliary = {
+        let secrets = store.secrets.read();
+        if secrets.is_locked() { 0 } else {
+            config::secret_references(&file.payload).iter().filter(|reference| {
+                !file_ids.contains(*reference) && secrets.get(reference).ok().flatten().is_none()
+            }).count()
+        }
+    };
+    if missing_auxiliary > 0 {
+        warnings.push(format!("{missing_auxiliary} 个余额、判断服务或隐私规则凭证未包含或未能导入，请重新配置后使用相关功能。"));
     }
 
     Ok(ImportReport {
@@ -1022,7 +1050,7 @@ mod tests {
         provider.health.model_locks.insert("a-model".into(), crate::model::ModelLock { until: 3, fail_count: 4 });
         source.upsert_key(provider).unwrap();
         let file = build_export(&source, "0.1.78", None).unwrap().0;
-        assert_eq!(file.format_version, 2);
+        assert_eq!(file.format_version, FORMAT_VERSION);
         let raw = serde_json::to_vec_pretty(&file).unwrap();
         let mut reordered: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(parse_and_verify(&serde_json::to_vec(&reordered).unwrap()).unwrap().payload.keys[0].id, "canonical");
@@ -1352,6 +1380,7 @@ mod tests {
 
         // 第一步：造出「有内置种子 + 有自定义厂商」的本机状态。
         let seed_payload = ExportPayload {
+            routing: None, decision: None,
             keys: vec![],
             brain: vec![],
             vendors: vec![vendor("builtin-1", true)],

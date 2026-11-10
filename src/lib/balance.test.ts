@@ -114,6 +114,7 @@ describe("balanceFingerprint", () => {
       balanceFingerprint(keyWith("https://api.example.com", { timeoutSecs: 30 })),
       balanceFingerprint(keyWith("https://api.example.com", { remainingPath: "data.balance" })),
       balanceFingerprint(keyWith("https://api.example.com", { accessToken: "tok" })),
+      balanceFingerprint(keyWith("https://api.example.com", { accessTokenRef: "__balance_access_reference" })),
       balanceFingerprint(keyWith("https://api.example.com", { userId: "7" })),
     ];
     for (const fp of changed) expect(fp).not.toBe(base);

@@ -16,7 +16,8 @@ import type {
 } from "@/types";
 import { translate, type Lang } from "@/lib/i18n";
 import { api, isTauri } from "@/lib/bridge";
-import { pickPrefs } from "@/lib/prefs";
+import type { UserPrefs } from "@/lib/prefs";
+import { persistPreferences } from "@/lib/prefsWriter";
 import { reuseUnchanged } from "@/lib/reuseUnchanged";
 // 与后端 key_order::reorder_before / mockData.reorderKey 同语义的顺序变换（三处共用一份判据）
 import { reorderIds } from "@/lib/keyOrdering";
@@ -31,6 +32,18 @@ export interface BalanceCacheEntry {
   result: BalanceResult;
   fingerprint: string;
 }
+
+interface BalanceRefresh {
+  fingerprint: string;
+  force: boolean;
+  maxAgeMs?: number;
+}
+interface BalanceRequest {
+  fingerprint: string;
+  invalidated: boolean;
+  next?: BalanceRefresh;
+}
+const balanceRequests = new Map<string, BalanceRequest>();
 
 /**
  * 余额缓存的新鲜期。超过它，卡片重新挂载时（切分类回来、重开窗口）会自动重查一次。
@@ -59,7 +72,7 @@ export const BALANCE_TTL_MS = 5 * 60 * 1000;
  * `api.setAutoStart`。那正是出过 P0 的地方 —— 切主题会把用户刚关掉的自启动重新装回系统。
  */
 /**
- * persistOneSetting 的串行化链。
+ * 所有偏好写入（含设置页）共用 prefsWriter 的串行化链。
  *
  * 没有它时两次快速连续调用（切主题后立刻切语言，两个控件相邻，真实可发生）各自并发执行
  * getSettings → merge → saveSettings：第二次的 getSettings 读到的是**未含第一次 patch**
@@ -68,27 +81,17 @@ export const BALANCE_TTL_MS = 5 * 60 * 1000;
  * 正是本函数注释里最忌讳的「切 X 顶掉刚改的 Y」，只是发生在它自己的两次调用之间。
  * 链式串行让第二次的 getSettings 必然读到第一次已落盘的结果。
  */
-let persistChain: Promise<void> = Promise.resolve();
-
 async function persistOneSetting(
-  patch: Partial<AppSettings>,
+  patch: Partial<UserPrefs>,
   get: () => AppState,
 ): Promise<void> {
-  const run = async () => {
-    try {
-      const latest = await api.getSettings();
-      const next = { ...latest, ...patch };
-      await api.saveSettings(pickPrefs(next));
-      // 落盘成功后同步 store 副本，避免它继续陈旧下去（下一次调用仍会重拉，这里只是保持一致）
-      useStore.setState({ settings: next });
-    } catch (e) {
-      console.error("persistOneSetting failed", patch, e);
-      get().showToast("error", String((e as Error)?.message ?? e));
-    }
-  };
-  // run 自吞异常（catch 里已提示用户），链上不会累积 rejected 状态。
-  persistChain = persistChain.then(run);
-  return persistChain;
+  try {
+    const next = await persistPreferences(patch);
+    useStore.setState({ settings: next });
+  } catch (error) {
+    console.error("persistOneSetting failed", patch, error);
+    get().showToast("error", String((error as Error)?.message ?? error));
+  }
 }
 
 interface AppState {
@@ -227,7 +230,13 @@ export const useStore = create<AppState>((set, get) => ({
   async refreshBalance(keyId, fingerprint, force = false, maxAgeMs) {
     // 并发去重。**这一条不能省**：StrictMode 下 effect 会连跑两次，
     // 卡片挂载即发两个一模一样的请求。这里同步读同步写，第二次调用必然看到 true。
-    if (get().balanceLoading[keyId]) return;
+    const inFlight = balanceRequests.get(keyId);
+    if (inFlight) {
+      if (inFlight.fingerprint !== fingerprint || inFlight.invalidated || force) {
+        inFlight.next = { fingerprint, force, maxAgeMs };
+      }
+      return;
+    }
 
     if (!force) {
       const cached = get().balances[keyId];
@@ -248,6 +257,8 @@ export const useStore = create<AppState>((set, get) => ({
       }
     }
 
+    const request: BalanceRequest = { fingerprint, invalidated: false };
+    balanceRequests.set(keyId, request);
     set((s) => ({ balanceLoading: { ...s.balanceLoading, [keyId]: true } }));
     try {
       // force 必须**透传给后端**：后端有自己的缓存（有效期 = autoIntervalMin，未配则 5 分钟，
@@ -260,12 +271,13 @@ export const useStore = create<AppState>((set, get) => ({
       // （最长 5 分钟），而真正在跑的那次查询结果反被这条后到的伪失败盖掉 ——
       // 用户看到「余额查询正在进行中」这句话停留数分钟，点刷新也没用。
       // 直接丢弃即可：那次真查询自己会写缓存。
-      if (result.transient) return;
+      if (result.transient || request.invalidated || request.next) return;
       // 失败结果**也要落缓存**：后端把失败装在 `BalanceResult.error` 里正常返回
       // （不抛 Err），卡片要如实显示那句原因。丢掉它会让卡片停在「未查询」，
       // 用户既看不到余额也看不到为什么。
       set((s) => ({ balances: { ...s.balances, [keyId]: { result, fingerprint } } }));
     } catch (e) {
+      if (request.invalidated || request.next) return;
       // 走到这里是 IPC 本身炸了（后端 panic、命令不存在），不是查询失败。
       // 同样如实写进缓存，绝不静默——静默会让卡片永远停在「未查询」。
       console.error("queryKeyBalance failed", e);
@@ -283,12 +295,17 @@ export const useStore = create<AppState>((set, get) => ({
         },
       }));
     } finally {
+      balanceRequests.delete(keyId);
       // 用 delete 而不是置 false：这个表按 keyId 增长，删过的 Key 不该留残项。
       set((s) => {
         const next = { ...s.balanceLoading };
         delete next[keyId];
         return { balanceLoading: next };
       });
+      if (request.next) {
+        const { fingerprint: nextFingerprint, force: nextForce, maxAgeMs: nextAge } = request.next;
+        await get().refreshBalance(keyId, nextFingerprint, nextForce, nextAge);
+      }
     }
   },
 
@@ -297,6 +314,11 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   clearBalance(keyId) {
+    const request = balanceRequests.get(keyId);
+    if (request) {
+      request.invalidated = true;
+      request.next = { fingerprint: request.next?.fingerprint ?? request.fingerprint, force: true };
+    }
     set((s) => {
       if (!(keyId in s.balances)) return {};
       const next = { ...s.balances };
@@ -591,6 +613,8 @@ export const useStore = create<AppState>((set, get) => ({
   async deleteKey(keyId) {
     try {
       await api.deleteKey(keyId);
+      const request = balanceRequests.get(keyId);
+      if (request) { request.invalidated = true; request.next = undefined; }
     } catch (e) {
       console.error("deleteKey failed", e);
       get().showToast("error", String((e as Error)?.message ?? e));

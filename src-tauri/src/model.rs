@@ -522,13 +522,11 @@ pub struct BalanceQuery {
     /// 留空 = 走内置候选链自动探测。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remaining_path: Option<String>,
-    /// NewAPI 类面板的 access token（对应 `{{accessToken}}` 占位符）。
-    ///
-    /// 与 API Key 分开：NewAPI 的用量接口认的是**面板登录态**，不是转发用的 API Key。
-    /// 明文存在配置里 —— 它不是转发凭据、权限仅限查自己的用量面板，
-    /// 与 API Key 不同级；真要藏可留空并改用自定义模板。
+    /// NewAPI 面板 Token：兼容旧配置与编辑输入，保存前迁移到密钥库。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_token_ref: Option<String>,
     /// NewAPI 类面板的用户 id（对应 `{{userId}}` 占位符，也用于 `New-Api-User` 头）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
@@ -556,6 +554,7 @@ impl Default for BalanceQuery {
             auto_interval_min: 0,
             remaining_path: None,
             access_token: None,
+            access_token_ref: None,
             user_id: None,
         }
     }

@@ -33,6 +33,7 @@ pub async fn fetch_models(key: &ProviderKey, secret: &str) -> AppResult<Vec<Stri
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
+                let url = crate::diagnostics::mask_url_credentials(&url);
                 // 连接层失败：区分「域名解析不了/连不上」与「超时」，并直接给出该查什么。
                 // 原先只有 `e.to_string()`（`error sending request for url (…)`），
                 // 用户看不出是自己网络问题、base_url 写错、还是上游真的挂了。
@@ -44,11 +45,12 @@ pub async fn fetch_models(key: &ProviderKey, secret: &str) -> AppResult<Vec<Stri
                          以及是否需要代理/VPN 才能访问该站点"
                     )
                 } else {
-                    format!("请求 {url} 失败：{e}")
+                    format!("请求 {url} 失败：{}", crate::diagnostics::http_error_message(e))
                 };
                 continue;
             }
         };
+        let url = crate::diagnostics::mask_url_credentials(&url);
         let status = resp.status();
         if !status.is_success() {
             // 带上状态码的可行动含义：401/403 是密钥问题，404 是路径问题（会自动换下个候选）。
@@ -62,7 +64,7 @@ pub async fn fetch_models(key: &ProviderKey, secret: &str) -> AppResult<Vec<Stri
             // **把上游自己那句话带出来**：真机上 agentrouter.org 回的是
             // `unauthorized client detected`（客户端准入，不是密钥问题），
             // 而我们的 hint 说「请检查密钥是否填对」——方向相反。上游原文才是真因所在。
-            let body = resp.text().await.unwrap_or_default();
+            let body = crate::diagnostics::redact_secret(&super::response_body::text(resp).await.unwrap_or_default(), secret);
             let snippet: String = body.trim().chars().take(200).collect();
             last_err = if snippet.is_empty() {
                 format!("HTTP {status} @ {url}{hint}")
@@ -78,7 +80,7 @@ pub async fn fetch_models(key: &ProviderKey, secret: &str) -> AppResult<Vec<Stri
         // 那是「第 1 行第 1 列不是合法 JSON」的字面意思，对用户毫无指向性。
         // 这里先取文本再解析，失败时报出「拿到的不是 JSON」并附开头片段，让用户一眼看出
         // 究竟是被挡在了登录页、还是 base_url 少了 `/v1`。
-        let text = match resp.text().await {
+        let text = match super::response_body::text(resp).await {
             Ok(t) => t,
             Err(e) => {
                 last_err = format!("读取 {url} 的响应失败：{e}");
@@ -88,7 +90,7 @@ pub async fn fetch_models(key: &ProviderKey, secret: &str) -> AppResult<Vec<Stri
         let body: Value = match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(_) => {
-                last_err = non_json_models_hint(&url, &text);
+                last_err = non_json_models_hint(&url, &crate::diagnostics::redact_secret(&text, secret));
                 continue;
             }
         };

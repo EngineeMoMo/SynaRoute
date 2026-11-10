@@ -97,6 +97,25 @@ pub(crate) fn redact_secret(text: &str, secret: &str) -> String {
     }
 }
 
+pub(crate) fn http_error_message(error: reqwest::Error) -> String {
+    let original_url = error.url().map(ToString::to_string);
+    let error = error.without_url();
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        message.push_str(&format!(" ← {cause}"));
+        source = cause.source();
+    }
+    if let Some(url) = original_url {
+        message = message.replace(&url, &mask_url_credentials(&url));
+    }
+    message
+}
+
+pub(crate) fn connection_error(url: &str, error: reqwest::Error) -> String {
+    format!("连接 {} 失败: {}", mask_url_credentials(url), http_error_message(error))
+}
+
 /// 只在错误响应或 200 包裹错误时遮掉密钥，正常模型正文保持字节不变。
 pub(crate) fn redact_upstream_error_bytes(
     status: u16,
@@ -369,6 +388,20 @@ pub(crate) fn diagnostics_file_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transport_errors_never_repeat_url_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{address}/balance?apiKey=AUDIT_TOKEN_NOT_REAL");
+        let error = reqwest::Client::builder().no_proxy().build().unwrap()
+            .get(&url).send().await.unwrap_err();
+        let message = connection_error(&url, error);
+        assert!(!message.contains("AUDIT_TOKEN_NOT_REAL"));
+        assert!(message.contains("apiKey=***"));
+        assert!(message.contains("error sending request"));
+    }
     // 夹具复用 service.rs 测试段里那两个（`temp_store` 造一个临时目录的 Store、
     // `key` 造一条最小 ProviderKey）。**刻意不在这里再抄一份**：夹具抄两份之后，
     // 「ProviderKey 加了字段」这类改动会让两处各自漂移，而漂移的表现是

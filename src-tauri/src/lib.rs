@@ -150,7 +150,7 @@ fn get_master_password_state(state: tauri::State<AppState>) -> secret::MasterPas
 #[tauri::command]
 fn unlock_master_password(state: tauri::State<AppState>, password: String) -> AppResult<()> {
     // 写锁在语句结束即释放，emit 在其后（纪律见 events::emit 文档）。
-    state.store.secrets.write().unlock(&password)?;
+    state.store.unlock_secrets(&password)?;
     tracing::info!("密钥库已用主口令解锁");
     events::emit(events::Topic::Vault, None);
     Ok(())

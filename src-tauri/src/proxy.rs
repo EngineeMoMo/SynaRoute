@@ -91,6 +91,7 @@ fn apply_upstream_headers(
 const MIN_ATTEMPT_SLICE: std::time::Duration = std::time::Duration::from_secs(5);
 
 const ALL_FAILED_SHORT_CIRCUIT_MS: i64 = 5_000;
+const MAX_ALL_FAILED_GATES: usize = 1024;
 
 const STATUS_OVERLOADED: u16 = 529;
 
@@ -136,6 +137,15 @@ fn arm_all_failed_gate(gate_key: &str, retry_after_secs: Option<i64>) {
             },
         );
     }
+    prune_all_failed_gates(&mut gate, now);
+}
+
+fn prune_all_failed_gates(gate: &mut HashMap<String, GateEntry>, now: i64) {
+    gate.retain(|_, entry| entry.until_ms > now);
+    while gate.len() > MAX_ALL_FAILED_GATES {
+        let oldest = gate.iter().min_by_key(|(_, entry)| entry.until_ms).map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest { gate.remove(&oldest); }
+    }
 }
 
 fn all_failed_gate_remaining(gate_key: &str) -> Option<(i64, i64)> {
@@ -161,7 +171,8 @@ fn all_failed_gate_remaining(gate_key: &str) -> Option<(i64, i64)> {
 }
 
 fn clear_all_failed_gate(gate_key: &str) {
-    all_failed_gate().lock().remove(gate_key);
+    let prefix = format!("{gate_key}:");
+    all_failed_gate().lock().retain(|key, _| key != gate_key && !key.starts_with(&prefix));
 }
 
 fn retry_after_secs_until(target_ms: i64, now_ms: i64) -> i64 {
@@ -171,6 +182,13 @@ fn retry_after_secs_until(target_ms: i64, now_ms: i64) -> i64 {
 
 fn gate_key_of(ns: u64, category: CategoryType) -> String {
     format!("{ns}:{}", category.as_str())
+}
+
+fn model_gate_key(namespace: &str, model: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    model.hash(&mut hasher);
+    format!("{namespace}:{:016x}", hasher.finish())
 }
 
 pub struct ProxyManager {
@@ -481,6 +499,7 @@ async fn handle_request_inner(
     };
     active.model(&route.model);
     let requested_model = route.model.clone(); let (mut candidates, used_breaker_fallback) = store.candidates_for(category, &requested_model);
+    let gate_key = model_gate_key(&gate_key, &requested_model);
     route.rank(&store, &mut candidates);
 
     if candidates.is_empty() {
@@ -1502,7 +1521,7 @@ async fn try_stream_to_key(
         () => {{
             active.phase(active_requests::Phase::Waiting);
             match tokio::time::timeout_at(deadline, send_once(&payload)).await {
-                Ok(r) => r.map_err(|e| AppError::upstream_msg(format!("连接 {} 失败: {e}", crate::diagnostics::mask_url_credentials(&url))))?,
+                Ok(r) => r.map_err(|error| AppError::upstream_msg(crate::diagnostics::connection_error(&url, error)))?,
                 Err(_) => {
                     return Err(AppError::upstream_msg(format!(
                         "连接 {} 超时（{}ms 内未拿到响应头）",
@@ -1862,11 +1881,11 @@ async fn forward_to_key(
     };
     let mut resp = send_once(&payload)
         .await
-        .map_err(|e| AppError::upstream_msg(format!("连接 {} 失败: {e}", crate::diagnostics::mask_url_credentials(&url))))?;
+        .map_err(|error| AppError::upstream_msg(crate::diagnostics::connection_error(&url, error)))?;
     let mut status = resp.status();
     // Retry-After 须在 resp.bytes() 消费响应体之前取（bytes() 拿走所有权）。
     let mut retry_after = parse_retry_after(resp.headers());
-    let mut bytes = crate::diagnostics::redact_upstream_error_bytes(status.as_u16(), active.read_body(resp).await.map_err(|e| AppError::upstream_msg(e.to_string()))?, secret.as_str());
+    let mut bytes = crate::diagnostics::redact_upstream_error_bytes(status.as_u16(), active.read_body(resp).await?, secret.as_str());
 
     // max_tokens 钳小后越界，见 `rectify_on_budget_error`）→ 就地降/关预算再打一次这条 Key。
     // 必须在这里、作用于**转换后**的 `payload`：`thinking.budget_tokens` 是转换链算出来的，
@@ -1884,10 +1903,10 @@ async fn forward_to_key(
     } {
         resp = send_once(&payload)
             .await
-            .map_err(|e| AppError::upstream_msg(format!("连接 {} 失败: {e}", crate::diagnostics::mask_url_credentials(&url))))?;
+            .map_err(|error| AppError::upstream_msg(crate::diagnostics::connection_error(&url, error)))?;
         status = resp.status();
         retry_after = parse_retry_after(resp.headers());
-        bytes = crate::diagnostics::redact_upstream_error_bytes(status.as_u16(), active.read_body(resp).await.map_err(|e| AppError::upstream_msg(e.to_string()))?, secret.as_str());
+        bytes = crate::diagnostics::redact_upstream_error_bytes(status.as_u16(), active.read_body(resp).await?, secret.as_str());
     }
 
     // 跨协议响应翻译：上游 2xx 时，把响应体从上游协议翻译回下游客户端期望的协议格式。
@@ -2315,6 +2334,60 @@ const MAX_RETRY_AFTER_SECS: i64 = 300;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_gates_are_bounded_and_expired_models_are_removed() {
+        let mut entries = HashMap::new();
+        entries.insert("expired".into(), GateEntry { until_ms: 0, retry_at_ms: None });
+        for index in 0..MAX_ALL_FAILED_GATES + 5 {
+            entries.insert(format!("model-{index}"), GateEntry { until_ms: 10 + index as i64, retry_at_ms: None });
+        }
+        prune_all_failed_gates(&mut entries, 1);
+        assert!(!entries.contains_key("expired"));
+        assert_eq!(entries.len(), MAX_ALL_FAILED_GATES);
+    }
+
+    #[test]
+    fn clearing_a_category_clears_all_its_model_gates_only() {
+        let namespace = "test:model-gates";
+        let first = model_gate_key(namespace, "first");
+        let second = model_gate_key(namespace, "second");
+        let unrelated = model_gate_key("test:other-model-gates", "first");
+        for key in [&first, &second, &unrelated] { arm_all_failed_gate(key, None); }
+        clear_all_failed_gate(namespace);
+        assert!(all_failed_gate_remaining(&first).is_none());
+        assert!(all_failed_gate_remaining(&second).is_none());
+        assert!(all_failed_gate_remaining(&unrelated).is_some());
+        clear_all_failed_gate(&unrelated);
+    }
+
+    #[tokio::test]
+    async fn failing_one_named_model_does_not_short_circuit_a_healthy_model() {
+        let unavailable = spawn_mock(500, "temporary upstream failure").await;
+        let healthy = spawn_mock(200, r#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#).await;
+        let directory = temp_dir("model_scoped_gate");
+        let store = Arc::new(Store::new_at(directory.join("config.json"), directory.join("secrets.enc")).unwrap());
+        let mut first = key("gate-model-first", 0, &unavailable);
+        first.category_id = CategoryType::Codex;
+        first.models = vec![model_ctx("first", None)];
+        let mut second = key("gate-model-second", 1, &healthy);
+        second.category_id = CategoryType::Codex;
+        second.models = vec![model_ctx("second", None)];
+        for candidate in [first, second] {
+            store.save_credential(&candidate.id, "fixture-secret").unwrap();
+            store.upsert_key(candidate).unwrap();
+        }
+        let manager = ProxyManager::new(store);
+        let port = manager.start(CategoryType::Codex).await.unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for (model, expected) in [("first", 529), ("second", 200)] {
+            let response = client.post(format!("http://127.0.0.1:{port}/v1/messages"))
+                .json(&json!({"model":model,"max_tokens":10,"messages":[{"role":"user","content":"hi"}]}))
+                .send().await.unwrap();
+            assert_eq!(response.status().as_u16(), expected);
+        }
+        manager.stop(CategoryType::Codex);
+    }
     // 生产段已改走 lan_guard::guarded（那层负责鉴权），故 service_fn 只剩测试在用。
     use hyper::service::service_fn;
     // 同理：生产段的端口绑定已收进 proxy_listen，这两个只剩测试在用（各处自己起临时监听）。

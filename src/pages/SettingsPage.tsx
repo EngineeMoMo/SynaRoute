@@ -11,7 +11,8 @@ import { PageHeader } from "@/components/ui/PageHeader";
 import { useT } from "@/lib/useT";
 import { LANGS } from "@/lib/i18n";
 import { openLogDir } from "@/lib/openLogDir";
-import { pickPrefs } from "@/lib/prefs";
+import type { UserPrefs } from "@/lib/prefs";
+import { persistPreferences } from "@/lib/prefsWriter";
 import { McpAddressList, mcpCategoryUrl } from "@/components/McpAddressList";
 import type {
   AppSettings,
@@ -197,10 +198,8 @@ export function SettingsPage() {
   /**
    * 文本类字段的**本地草稿**：输入时只改草稿，失焦（或按 Enter）才落盘。
    *
-   * 为什么必需：`update()` 每次调用都要 `getSettings()`（读磁盘最新值）→ 合并 → `saveSettings()`。
-   * 逐字符触发时会并发出一串这样的往返，而**它们的返回顺序不保证**：先发的请求后返回时，
-   * 其 `.then` 里的 `setSettings(merged)` 会把输入框内容**回退到几个字符之前**
-   * ——用户看到自己打的字被吃掉，且无任何报错。开关类字段无此问题（单次点击、不连发）。
+   * `update()` 通过共用队列读取最新设置、合并并保存。文本先留在草稿中，
+   * 避免每次输入都排队执行 IPC 和磁盘写入，也不让保存回填打断尚未提交的输入。
    *
    * `null` = 没在编辑，显示 `settings` 里的值。空串是合法草稿（用户清空路径），
    * 故必须用 `null` 而非 `""` 表达「无草稿」。
@@ -216,35 +215,30 @@ export function SettingsPage() {
    */
   const abortDraftRef = useRef(false);
 
-  const update = (patch: Partial<AppSettings>) => {
+  const preferencesRevision = useRef(0);
+  const update = (patch: Partial<UserPrefs>) => {
     if (!settings) return;
-    const prev = settings;
-    // 乐观更新：先用本页当前快照 + patch 立刻反映到 UI，不等 IPC 往返。
-    setSettings({ ...settings, ...patch });
-    // 落盘前**重新拉一次磁盘最新值**再合并 patch —— 不能用本页挂载时的旧 `settings` 当基线。
-    //
-    // 本页的 `settings` 只在挂载时 `getSettings()` 拉过一次。若用户先切了主题/语言
-    // （store.ts 的 setTheme/setLang 走 persistOneSetting，各自都会重拉磁盘最新值再落盘，
-    // 绕过本页状态），本页这份快照就带着**旧的 theme/language**。此时再点本页任意一个开关，
-    // 若直接拿本页旧快照 `{...settings, ...patch}` 提交，就会把刚落盘的新主题/语言顶回旧值——
-    // 用户会看到「明明选了深色，点了个不相关的开关后又变回浅色」，且没有任何报错。
-    // 与 persistOneSetting 同一套写法：先拉最新、再合并、再落盘，避免用旧快照覆盖新值。
-    void api
-      .getSettings()
-      .then((latest) => {
-        const merged = { ...latest, ...patch };
-        return api.saveSettings(pickPrefs(merged)).then(() => merged);
-      })
+    const revision = ++preferencesRevision.current;
+    setSettings((current) => current ? { ...current, ...patch } : current);
+    void persistPreferences(patch)
       .then((merged) => {
-        // 用合并后的值同步两份状态：本页快照（继续给用户看）与全局 store
-        // （store.settings 是切主题/语言时的落盘基线之一，留着旧值会反过来把这次的改动顶回去）。
-        setSettings(merged);
+        if (revision === preferencesRevision.current) setSettings(merged);
         useStore.setState({ settings: merged });
       })
-      .catch((e) => {
-        console.error("saveSettings failed", e);
-        setSettings(prev);
-        showToast("error", String((e as Error)?.message ?? e));
+      .catch(async (error) => {
+        console.error("saveSettings failed", error);
+        if (revision === preferencesRevision.current) {
+          try {
+            const latest = await api.getSettings();
+            if (revision === preferencesRevision.current) {
+              setSettings(latest);
+              useStore.setState({ settings: latest });
+            }
+          } catch (reloadError) {
+            console.error("reloadSettings failed", reloadError);
+          }
+        }
+        showToast("error", String((error as Error)?.message ?? error));
       });
   };
 

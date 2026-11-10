@@ -35,6 +35,35 @@ afterEach(() => {
 });
 
 describe("refreshBalance", () => {
+  it("在途配置变更会丢弃旧结果并补查最新指纹", async () => {
+    let finish = (_result: BalanceResult) => {};
+    spy = vi.spyOn(api, "queryKeyBalance")
+      .mockImplementationOnce(() => new Promise<BalanceResult>((resolve) => { finish = resolve; }) as never)
+      .mockResolvedValue(okResult(Date.now()) as never);
+    const first = useStore.getState().refreshBalance("k1", "old-fingerprint");
+    await useStore.getState().refreshBalance("k1", "new-fingerprint");
+    expect(spy).toHaveBeenCalledTimes(1);
+    finish({ ...okResult(Date.now()), remaining: 0 });
+    await first;
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(useStore.getState().balances.k1.fingerprint).toBe("new-fingerprint");
+    expect(useStore.getState().balances.k1.result.remaining).toBe(42);
+  });
+
+  it("清除在途余额后不会被旧凭证结果重新填回", async () => {
+    let finish = (_result: BalanceResult) => {};
+    spy = vi.spyOn(api, "queryKeyBalance")
+      .mockImplementationOnce(() => new Promise<BalanceResult>((resolve) => { finish = resolve; }) as never)
+      .mockResolvedValue(okResult(Date.now()) as never);
+    const first = useStore.getState().refreshBalance("k1", "same-fingerprint");
+    useStore.getState().clearBalance("k1");
+    finish({ ...okResult(Date.now()), remaining: 0 });
+    await first;
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(spy).toHaveBeenLastCalledWith("k1", true);
+    expect(useStore.getState().balances.k1.result.remaining).toBe(42);
+  });
+
   it("并发去重：同一 Key 连发两次只打一次上游（StrictMode 双跑的防线）", async () => {
     let resolveFn: (r: BalanceResult) => void = () => {};
     spy = vi.spyOn(api, "queryKeyBalance").mockImplementation(

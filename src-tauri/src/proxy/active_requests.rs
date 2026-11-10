@@ -3,7 +3,7 @@
 //! streamed responses move that guard to a bounded pump, independent of downstream polls.
 use super::{full_body, ResBody};
 use crate::{model::{CategoryType, Protocol, ProviderKey}, store::Store};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::{body::{Body, Frame, SizeHint}, Response, StatusCode};
 use parking_lot::Mutex;
@@ -119,15 +119,8 @@ impl Control {
         if *rx.borrow_and_update() { return; }
         let _ = rx.changed().await;
     }
-    pub(super) async fn read_body(&self, response: reqwest::Response) -> Result<Bytes, reqwest::Error> {
-        use futures_util::StreamExt;
-        let mut stream = response.bytes_stream();
-        let mut bytes = BytesMut::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            self.received(chunk.len()); bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes.freeze())
+    pub(super) async fn read_body(&self, response: reqwest::Response) -> crate::error::AppResult<Bytes> {
+        crate::upstream::response_body::read(response, |length| self.received(length)).await
     }
 }
 pub(super) struct Guard { registry: Arc<Registry>, control: Control, store: Arc<Store> }

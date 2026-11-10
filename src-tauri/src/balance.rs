@@ -24,6 +24,8 @@
 use crate::model::{BalanceQuery, BalanceResult, ProviderKey, DEFAULT_BALANCE_TIMEOUT_SECS};
 use serde_json::Value;
 use std::time::Duration;
+#[path = "balance/query.rs"] mod query;
+pub use query::query_balance;
 
 /// 剩余额度的候选字段链（按优先级）。
 ///
@@ -642,78 +644,6 @@ fn billing_limit_only(body: &Value, custom_path: Option<&str>) -> Option<f64> {
     Some(limit)
 }
 
-/// 对单个 Key 执行一次余额查询。
-///
-/// `secret` 由调用方从密钥库取出（本模块不碰密钥库，保持可测）。
-///
-/// **可能按序试多个端点**：用户没填地址、域名又认不出时走
-/// [`FALLBACK_ENDPOINTS`] 探测，命中即停并把命中的模板放进
-/// `resolved_url_template` 供调用方写回配置（此后每次只发 1 个请求）。
-/// 单端点场景（用户填了 / 域名认得出）行为与从前完全一致。
-pub async fn query_balance(
-    key: &ProviderKey,
-    cfg: &BalanceQuery,
-    secret: &str,
-) -> BalanceResult {
-    if !cfg.enabled {
-        return BalanceResult::failed("未启用余额查询");
-    }
-
-    let base = cfg
-        .base_url_override
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&key.base_url);
-
-    let candidates = resolve_endpoint_candidates(cfg, base);
-    let probing = candidates.len() > 1;
-    let mut first_err: Option<BalanceResult> = None;
-    // 「有信息量」的失败：它解释了**为什么**查不到（目前只有「只给了配额上限」这一种）。
-    // 优先它而不是第一条 —— 否则最终报告是第一个候选那句 404，而真正的原因被丢了。
-    let mut informative_err: Option<BalanceResult> = None;
-
-    for (url_template, auth_scheme) in &candidates {
-        let mut r = query_one_endpoint(key, cfg, secret, base, url_template, auth_scheme).await;
-        if r.ok {
-            // 只在真探测过时才回写：单端点场景没什么可「记住」的，回写等于把
-            // 自动识别的结果固化成用户配置，日后我们改进识别表就再也不生效了。
-            if probing {
-                r.resolved_url_template = Some((*url_template).to_string());
-            }
-            return r;
-        }
-        // 瞬时失败（并发去重哨兵）不代表端点不对，也不该继续打其余端点。
-        if r.transient {
-            return r;
-        }
-        if informative_err.is_none()
-            && r.error.as_deref().is_some_and(failure_explains_root_cause)
-        {
-            informative_err = Some(r.clone());
-        }
-        if first_err.is_none() {
-            first_err = Some(r);
-        }
-    }
-
-    // 全部候选都失败：优先报**解释了原因**的那条，其次报第一条（最可能对的那个端点）。
-    // 只报最后一条会让用户去查 `hard_limit_usd` 那个最不可能的路径。
-    let mut out = informative_err
-        .or(first_err)
-        .unwrap_or_else(|| BalanceResult::failed("没有可用的查询端点"));
-    if probing {
-        let tried: Vec<&str> = candidates.iter().map(|(u, _)| *u).collect();
-        let note = format!("\n（已自动尝试 {} 个常见端点均失败：{}。若站点的余额接口不在其中，请在「查询地址」里手填。）", tried.len(), tried.join("、"));
-        out.error = Some(match out.error.take() {
-            Some(e) => format!("{e}{note}"),
-            None => note.trim_start().to_string(),
-        });
-    }
-    out
-}
-
-/// 对**一个**端点执行查询（[`query_balance`] 的单次尝试）。
 async fn query_one_endpoint(
     key: &ProviderKey,
     cfg: &BalanceQuery,
@@ -728,9 +658,8 @@ async fn query_one_endpoint(
     let access_token = cfg.access_token.as_deref().unwrap_or("");
     let user_id = cfg.user_id.as_deref().unwrap_or("");
     let url = expand_placeholders(url_template, base, secret, access_token, user_id);
-    // 占位符展开后仍不是绝对 URL 说明配置有问题，早报错好过让 reqwest 抛一句晦涩的解析错。
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return BalanceResult::failed(format!("查询地址不是合法的 http(s) URL: {url}"));
+        return BalanceResult::failed(format!("查询地址不是合法的 http(s) URL: {}", crate::diagnostics::mask_url_credentials(&url)));
     }
 
     let timeout = Duration::from_secs(if cfg.timeout_secs == 0 {
@@ -792,11 +721,11 @@ async fn query_one_endpoint(
         Err(e) if e.is_timeout() => {
             return BalanceResult::failed(format!("查询超时（{}s）", timeout.as_secs()))
         }
-        Err(e) => return BalanceResult::failed(format!("请求失败: {e}")),
+        Err(error) => return BalanceResult::failed(format!("请求失败: {}", crate::diagnostics::http_error_message(error))),
     };
 
     let status = resp.status();
-    let text = match resp.text().await {
+    let text = match query::response_text(resp).await {
         Ok(t) => t,
         Err(e) => return BalanceResult::failed(format!("读取响应失败: {e}")),
     };
@@ -804,7 +733,7 @@ async fn query_one_endpoint(
     if !status.is_success() {
         // 带上状态码与截断的响应体：401/403 是配错密钥，404 是路径不对，
         // 不给这个区分用户只能盲猜。
-        let snippet: String = text.chars().take(200).collect();
+        let snippet: String = query::redact(&text, cfg, secret).chars().take(200).collect();
         return BalanceResult::failed(format!("上游返回 HTTP {status}: {snippet}"));
     }
 
@@ -893,6 +822,7 @@ async fn query_one_endpoint(
             // 用户看到的是一堆 `<meta charset=...>`，完全不知道该改哪里
             // （真机反馈：用户以为是程序坏了）。
             if looks_like_html(&text) {
+                let url = crate::diagnostics::mask_url_credentials(&url);
                 return BalanceResult::failed(format!(
                     "该地址返回的是网页而不是 API 数据（{url}）。\
                      通常是查询地址填错了：\n\
@@ -901,7 +831,7 @@ async fn query_one_endpoint(
                      • 站点若只有网页版账单、没有开放接口，则无法查询余额"
                 ));
             }
-            let snippet: String = text.chars().take(200).collect();
+            let snippet: String = query::redact(&text, cfg, secret).chars().take(200).collect();
             BalanceResult::failed(format!("响应不是合法 JSON（{e}）: {snippet}"))
         }
     }
@@ -957,7 +887,7 @@ async fn read_newapi_quota_unit(
     if !resp.status().is_success() {
         return None;
     }
-    let v: Value = serde_json::from_str(&resp.text().await.ok()?).ok()?;
+    let v: Value = serde_json::from_str(&query::response_text(resp).await.ok()?).ok()?;
     let per_unit = find_number(&v, &["data.quota_per_unit", "quota_per_unit"])?;
     // 比率必须是正数：0 或负数会让除法产出 inf / 负余额（本项目已被 `"inf"` 咬过一次）。
     if !(per_unit.is_finite() && per_unit > 0.0) {
@@ -1068,7 +998,7 @@ async fn read_billing_usage_usd(
     if !resp.status().is_success() {
         return None;
     }
-    let text = resp.text().await.ok()?;
+    let text = query::response_text(resp).await.ok()?;
     serde_json::from_str::<Value>(&text).ok().and_then(|v| parse_billing_usage_usd(&v))
 }
 
@@ -1089,6 +1019,45 @@ fn looks_like_html(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn echoed_balance_credentials_are_redacted_before_snippet_truncation() {
+        static ROUTES: &[(&str, u16, &str)] = &[
+            ("/error", 401, "api=balance-api-secret token=balance-panel-secret"),
+            ("/invalid", 200, "api=balance-api-secret token=balance-panel-secret"),
+            ("/json", 200, r#"{"success":false,"message":"balance-api-secret balance-panel-secret"}"#),
+        ];
+        let base = spawn_path_mock(ROUTES).await;
+        let key = ProviderKey { base_url: base.clone(), ..Default::default() };
+        for endpoint in ["/error", "/invalid", "/json"] {
+            let config = BalanceQuery {
+                url: format!("{base}{endpoint}"),
+                access_token: Some("balance-panel-secret".into()),
+                ..Default::default()
+            };
+            let result = query_balance(&key, &config, "balance-api-secret").await;
+            assert!(!result.ok);
+            let error = result.error.unwrap();
+            assert!(!error.contains("balance-api-secret"), "{error}");
+            assert!(!error.contains("balance-panel-secret"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_query_with_credentials_in_url_is_safe() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let config = BalanceQuery {
+            url: format!("http://{address}/balance?apiKey={{{{apiKey}}}}&token={{{{accessToken}}}}"),
+            access_token: Some("balance-panel-secret".into()),
+            ..Default::default()
+        };
+        let result = query_balance(&ProviderKey::default(), &config, "balance-api-secret").await;
+        let error = result.error.unwrap();
+        assert!(!error.contains("balance-api-secret"));
+        assert!(!error.contains("balance-panel-secret"));
+    }
 
     /// 起一个**按路径分流**的 mock 上游，返回 `http://127.0.0.1:port`。
     ///

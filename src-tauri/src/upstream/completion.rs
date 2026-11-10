@@ -205,13 +205,13 @@ async fn anthropic_message(
     let retry_after = crate::proxy::parse_retry_after(resp.headers());
     // 先读文本再解析：上游可能返回 SSE 流（data: {...}）、HTML 错误页或非标准 JSON，
     // 直接 resp.json() 会得到笼统的「error decoding response body」，看不到上游到底返回了啥。
-    let raw = resp.text().await?;
+    let raw = super::response_body::text(resp).await?;
     if !status.is_success() {
         // 传**真实状态码**：消息里拼了响应体，绝不能让重试判定去里面猜（见
         // `is_retriable_upstream_error` 的文档：401 + 响应体含「请检查网络连接」曾被误判可重试）。
         return Err(AppError::upstream_http_after(
             status.as_u16(),
-            format!("Anthropic HTTP {status}: {}", truncate_body(&raw)),
+            format!("Anthropic HTTP {status}: {}", truncate_body(&crate::diagnostics::redact_secret(&raw, secret))),
             retry_after,
         ));
     }
@@ -222,7 +222,7 @@ async fn anthropic_message(
     let text = parse_anthropic_text(&raw).ok_or_else(|| {
         AppError::upstream_http(
             status.as_u16(),
-            format!("Anthropic 响应无法解析: {}", truncate_body(&raw)),
+            format!("Anthropic 响应无法解析: {}", truncate_body(&crate::diagnostics::redact_secret(&raw, secret))),
         )
     })?;
     Ok(text)
@@ -256,12 +256,12 @@ async fn openai_chat(
     let status = resp.status();
     // 读头必须排在 `text()` 之前，理由同 `anthropic_message`（那里有全文）。
     let retry_after = crate::proxy::parse_retry_after(resp.headers());
-    let raw = resp.text().await?;
+    let raw = super::response_body::text(resp).await?;
     if !status.is_success() {
         // 传真实状态码，理由同 `anthropic_message`。
         return Err(AppError::upstream_http_after(
             status.as_u16(),
-            format!("OpenAI HTTP {status}: {}", truncate_body(&raw)),
+            format!("OpenAI HTTP {status}: {}", truncate_body(&crate::diagnostics::redact_secret(&raw, secret))),
             retry_after,
         ));
     }
@@ -270,7 +270,7 @@ async fn openai_chat(
     let text = parse_openai_text(&raw).ok_or_else(|| {
         AppError::upstream_http(
             status.as_u16(),
-            format!("OpenAI 响应无法解析: {}", truncate_body(&raw)),
+            format!("OpenAI 响应无法解析: {}", truncate_body(&crate::diagnostics::redact_secret(&raw, secret))),
         )
     })?;
     Ok(text)

@@ -7,7 +7,7 @@
 //!
 //! `upsert_key` 是**整份替换**，而前端传的是「渲染那张卡片那一刻的快照」。它只沿用库里的
 //! `health` 与 `cached_balance` 两项运行态（见那边的 ⚠️ 注释），可后端在运行中会写的
-//! **配置**字段不止这两个 —— 最确定的一处是 [`Store::set_balance_query_url`]：余额查询
+//! **配置**字段不止这两个 —— 最确定的一处是 [`Store::commit_balance_result`]：余额查询
 //! 首次探测命中后，会把真正可用的端点模板写回 `balance_query.url`（那条修复的来由是
 //! 「su2api 全查回 10000 USD」）。用户此刻勾一下 checkbox，整份 upsert 就把刚解析出来的
 //! 端点顶回旧值。

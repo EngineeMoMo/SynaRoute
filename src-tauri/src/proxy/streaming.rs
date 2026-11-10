@@ -84,7 +84,7 @@ pub(super) fn response(
                 }
                 Some(Err(e)) => {
                     st.errored = true; st.finished = true; st.active.finish(End::UpstreamError);
-                    return Some((Err(std::io::Error::other(e.to_string())), st));
+                    return Some((Err(std::io::Error::other(crate::diagnostics::http_error_message(e))), st));
                 }
                 None => {
                     st.eof = true; st.finished = true;

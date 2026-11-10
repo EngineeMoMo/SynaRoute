@@ -57,11 +57,11 @@ pub async fn health_probe(key: &ProviderKey, secret: &str) -> (bool, u64, Option
                 (true, None)
             } else {
                 // 拿到响应但鉴权失败（401/403）：密钥无效。带出确切状态码与端点。
-                (false, Some(format!("连通探测鉴权失败 HTTP {code}（GET {url}）")))
+                (false, Some(format!("连通探测鉴权失败 HTTP {code}（GET {}）", crate::diagnostics::mask_url_credentials(&url))))
             }
         }
         // 连接层失败（超时/连不上/DNS）：带出 reqwest 错误详情。
-        Err(e) => (false, Some(format!("连接层失败（GET {url}）：{e}"))),
+        Err(error) => (false, Some(crate::diagnostics::connection_error(&url, error))),
     };
     let latency = start.elapsed().as_millis() as u64;
     (healthy, latency, reason)

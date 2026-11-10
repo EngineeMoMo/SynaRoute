@@ -417,6 +417,7 @@ export interface BalanceQuery {
   remainingPath?: string;
   /** NewAPI 类面板的 access token（对应 {{accessToken}} 占位符） */
   accessToken?: string;
+  accessTokenRef?: string;
   /** NewAPI 类面板的用户 id（对应 {{userId}}，也用于 New-Api-User 头） */
   userId?: string;
 }

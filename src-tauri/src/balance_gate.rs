@@ -312,39 +312,43 @@ pub(crate) async fn query_and_record(
             return Ok(cached);
         }
     }
+    let flight_id = format!("{:p}:{key_id}", Arc::as_ptr(store));
     {
         let mut guard = in_flight().lock();
-        if guard.contains(key_id) {
+        if guard.contains(&flight_id) {
             tracing::debug!("余额查询已在进行中，拒绝重复请求: key={key_id}");
             // **标记为瞬时**：这次压根没打上游，不代表任何结论。不标的话前端会把它当真失败
             // 写进缓存，卡片被一条假错误钉住整个 TTL（最长 5 分钟），而真正在跑的那次查询
             // 结果反被这条后到的伪失败盖掉。`verdict_from` 也据此判 Unknown。
             return Ok(BalanceResult::transient("该 Key 的余额查询正在进行中，请稍候"));
         }
-        guard.insert(key_id.to_string());
+        guard.insert(flight_id.clone());
     }
-    let owned = key_id.to_string();
+    let owned = flight_id;
     let _guard = scopeguard::guard((), move |_| {
         in_flight().lock().remove(&owned);
     });
     let Some(key) = store.get_key(key_id) else {
         return Err(AppError::NotFound(key_id.to_string()));
     };
-    let Some(cfg) = key.balance_query.clone() else {
-        return Ok(fail_with_event(store, &key, "该 Key 未配置余额查询"));
-    };
-    // 主口令锁定时取不到密钥：如实说明是「锁着」，不是「余额接口坏了」。
-    if store.secrets.read().is_locked() {
-        return Ok(fail_with_event(store, &key, "密钥库已锁定，请先用主口令解锁"));
-    }
-    // 允许用另一条密钥查余额（部分站点的计费面板与转发端点不同域、各用各的凭证）。
-    let secret_ref = cfg.api_key_ref.as_deref().unwrap_or(key_id);
-    let Some(secret) = store.secrets.read().get(secret_ref).ok().flatten() else {
-        return Ok(fail_with_event(store, &key, "未配置密钥"));
+    let credentials = match store.balance_credentials(&key) {
+        Ok(credentials) => credentials,
+        Err(error) => return Ok(fail_with_event(store, &key, &error.to_string())),
     };
     let start = std::time::Instant::now();
-    let result = crate::balance::query_balance(&key, &cfg, &secret).await;
-    record_outcome(store, &key, &cfg, &result, start.elapsed().as_millis(), trigger);
+    let result = crate::balance::query_balance(&key, &credentials.config, &credentials.secret).await;
+    let remembered = match store.commit_balance_result(&key, &credentials, &result) {
+        Ok(None) => return Ok(BalanceResult::transient("余额查询配置或凭证已变更，请重新查询")),
+        Ok(Some(remembered)) => remembered,
+        Err(error) => {
+            tracing::warn!("记住余额查询结果失败（key={key_id}）: {error}");
+            false
+        }
+    };
+    record_outcome(store, &key, &credentials.config, &result, start.elapsed().as_millis(), trigger);
+    if remembered {
+        store.append_event(key.category_id, "config", Some(key_id), "余额查询地址已自动记住（此后不再逐个试探端点）");
+    }
     Ok(result)
 }
 
@@ -404,6 +408,7 @@ fn record_outcome(
         token_masked,
         cfg.user_id.as_deref().unwrap_or(""),
     );
+    let url = crate::diagnostics::mask_url_credentials(&url);
     let detail = if let Some(err) = &result.error {
         format!("❌ 查询失败 | {elapsed_ms}ms | {url} | {err}")
     } else if let Some(remaining) = result.remaining {
@@ -431,26 +436,6 @@ fn record_outcome(
         );
     }
     announce_exhaustion(store, key, result);
-    // 探测命中的端点写回配置：此后每次只发 1 个请求，不再重跑整条探测链。
-    // 走 `set_balance_query_url` 而非整份 upsert：那会把打开编辑器那一刻的旧快照写回去，
-    // 顺带清掉运行中的熔断与余额缓存（`upsert_key` 的守卫只保这两项，其余字段照覆盖）。
-    // 失败只记日志：地址没记住的代价是下次再探测一遍，而让一次成功的查询报错更糟。
-    if let Some(tpl) = &result.resolved_url_template {
-        match store.set_balance_query_url(&key.id, tpl) {
-            Ok(true) => store.append_event(
-                key.category_id,
-                "config",
-                Some(&key.id),
-                &format!("余额查询地址已自动记住：{tpl}（此后不再逐个试探端点）"),
-            ),
-            Ok(false) => {}
-            Err(e) => tracing::warn!("记住余额查询地址失败（key={}，下次会重新探测）: {e}", key.id),
-        }
-    }
-    // 成功和失败都缓存，避免对失败端点短时间内重复轰炸。写入失败只记日志（缓存是优化手段）。
-    if let Err(e) = store.update_balance_cache(&key.id, result.clone()) {
-        tracing::warn!("余额缓存写入失败（key={}, 不影响本次查询）: {e}", key.id);
-    }
 }
 
 /// 🔴 刚变成「已耗尽」时留一条**可折叠告警**。
@@ -495,6 +480,45 @@ fn announce_exhaustion(store: &Arc<Store>, key: &ProviderKey, result: &BalanceRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn query_result_is_discarded_when_configuration_or_credentials_change_in_flight() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for change in ["configuration", "credential"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (observed_sender, observed) = tokio::sync::oneshot::channel();
+            let (finish, finished) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                observed_sender.send(()).unwrap();
+                finished.await.unwrap();
+                let body = r#"{"remaining":0,"unit":"USD"}"#;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let store = store(change);
+            let mut key = key_with("in-flight-balance", 0, None);
+            key.balance_query.as_mut().unwrap().url = format!("http://{address}/balance");
+            store.upsert_key(key).unwrap();
+            crate::service::save_secret(&store, "in-flight-balance", "before-change").unwrap();
+            let running = store.clone();
+            let query = tokio::spawn(async move { query_and_record(&running, "in-flight-balance", true, Trigger::User).await.unwrap() });
+            tokio::time::timeout(std::time::Duration::from_secs(5), observed).await.unwrap().unwrap();
+            if change == "configuration" {
+                let mut key = store.get_key("in-flight-balance").unwrap();
+                key.balance_query.as_mut().unwrap().url = format!("http://{address}/new-balance");
+                store.upsert_key(key).unwrap();
+            } else {
+                crate::service::save_secret(&store, "in-flight-balance", "after-change").unwrap();
+            }
+            finish.send(()).unwrap();
+            assert!(query.await.unwrap().transient);
+            assert!(store.get_balance_cache("in-flight-balance").is_none());
+            assert!(!store.list_events(CategoryType::ClaudeCli).iter().any(|event| event.detail.contains("余额已耗尽")));
+        }
+    }
     use crate::model::{CategoryType, Protocol};
     use std::path::PathBuf;
 

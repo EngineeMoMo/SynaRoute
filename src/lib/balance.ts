@@ -80,6 +80,7 @@ export function balanceFingerprint(key: ProviderKey): string {
     b.timeoutSecs,
     b.remainingPath ?? "",
     b.accessToken ?? "",
+    b.accessTokenRef ?? "",
     b.userId ?? "",
   ]);
 }

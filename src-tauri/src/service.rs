@@ -35,6 +35,9 @@ use crate::proxy::ProxyManager;
 use crate::store::Store;
 use std::sync::Arc;
 
+#[path = "service/client_restore.rs"]
+mod client_restore;
+
 /// 发系统通知。非 test 走 `notification::notify`；test 下是 no-op。
 ///
 /// 与 `health.rs` 同一套 cfg 分派：`notification` 模块整体 `#[cfg(not(test))]`
@@ -311,12 +314,8 @@ pub(crate) fn save_key(store: &Store, key: ProviderKey) -> AppResult<ProviderKey
 /// 模型探测 / 代理转发都取不到密钥，报「未配置密钥」，用户难察觉自己配过了。
 /// 先写库则失败时直接返回 `Err`，标记不会被写脏。
 pub(crate) fn save_secret(store: &Store, key_id: &str, secret: &str) -> AppResult<()> {
-    store.secrets.write().set(key_id, secret)?;
-    if let Some(mut k) = store.get_key(key_id) {
-        k.has_secret = true;
-        store.upsert_key(k)?;
-    }
-    Ok(())
+    store.save_credential(key_id, secret)?;
+    store.mark_secret_present(key_id)
 }
 
 /// 启用/停用某条 Key。返回**是否需要补一次健康探测**。
@@ -602,6 +601,7 @@ pub(crate) fn desktop_unacceptable_models(models: &[String]) -> Vec<&str> {
 /// 写锁在第一条语句结束即释放（`.write()` 的临时借用不跨到下一行），
 /// 故随后的 `sync_master_flag` 去拿 config 写锁不会与它叠在一起。
 pub(crate) fn enable_master_password(store: &Store, password: &str) -> AppResult<usize> {
+    store.migrate_balance_credentials()?;
     let migrated = store.secrets.write().enable_master_password(password)?;
     sync_master_flag(store, true);
     tracing::info!("已启用主口令模式，迁移 {migrated} 条密钥");
@@ -611,6 +611,7 @@ pub(crate) fn enable_master_password(store: &Store, password: &str) -> AppResult
 /// 关闭主口令：用口令解出全部密钥、改回 DPAPI。需要当前主口令确认。返回迁移条数。
 pub(crate) fn disable_master_password(store: &Store, password: &str) -> AppResult<usize> {
     let migrated = store.secrets.write().disable_master_password(password)?;
+    store.migrate_balance_credentials()?;
     sync_master_flag(store, false);
     tracing::info!("已关闭主口令模式，迁移 {migrated} 条密钥回 DPAPI");
     Ok(migrated)
@@ -709,25 +710,12 @@ pub(crate) fn restore_client_config_keeping_mcp(
     mcp: &McpManager,
     category: CategoryType,
 ) -> AppResult<String> {
-    let msg = crate::tools::restore(category)?;
-
-    // 该分类本就没注册过 MCP → 无需补，直接返回还原结果。
-    if !store
-        .get_settings()
-        .mcp_registered_categories
-        .contains(&category)
-    {
-        return Ok(msg);
-    }
-    // 注册过，但 MCP 服务当前没跑（用户没开启 MCP）→ 现在补也没处补；
-    // 保留在 mcp_registered_categories 里，下次启用 MCP 时由 start 流程恢复。
-    // 不在此清空该记录：清了反而会让「下次启用 MCP」漏掉这个分类。
-    let Some(port) = mcp.running_port() else {
-        return Ok(msg);
-    };
-    // 幂等重注册：Codex 补回 restore 抹掉的 mcp_servers；CLI/桌面端内容没变会跳过写盘。
-    register_and_record(store, category, port);
-    Ok(msg)
+    client_restore::restore(
+        || crate::tools::restore(category),
+        || store.get_settings().mcp_registered_categories.contains(&category),
+        || mcp.running_port(),
+        |port| register_and_record(store, category, port),
+    )
 }
 
 /// 把 synaroute MCP 注册进某分类对应工具的客户端配置，并把该分类记入
@@ -2114,29 +2102,19 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 停代理还原客户端配置时**不得动 `mcp_registered_categories`**（停代理 ≠ 关 MCP）。
-    ///
-    /// 这是「停止代理 / 托盘停止 / 切官方」三条路共用的 `restore_client_config_keeping_mcp`
-    /// 的核心不变量。真实的 Codex 缺陷（`config.toml` 整文件回滚抹掉 `mcp_servers`、
-    /// 而设置仍记着已注册 → 下次启动又写回 → 间歇错乱）要真机验（改开发机的
-    /// `~/.codex/config.toml`）；这里只钉住能在内存里验的那半：还原动作本身不改「已注册」记录。
-    ///
-    /// 前置把注册集合保持为空，避免 `register_and_record` 去写真实客户端文件。
-    /// 空集合下 `restore_client_config_keeping_mcp` 在「本就没注册过」处提前返回，
-    /// 正好覆盖「CLI 停代理不应凭空冒出注册记录」这一面。
     #[test]
     fn stopping_proxy_restore_does_not_touch_mcp_registration() {
         let (store, dir) = temp_store("stop_keeps_mcp");
         let mcp = McpManager::new(store.clone());
-
-        assert!(
-            store.get_settings().mcp_registered_categories.is_empty(),
-            "前置：无已注册分类（否则会去写真实客户端文件）"
-        );
-
-        // CLI 从未接入过：还原是幂等的「无备份，无需还原」，且绝不该新增注册记录。
-        let msg = restore_client_config_keeping_mcp(&store, &mcp, CategoryType::ClaudeCli).unwrap();
-        assert!(msg.contains("无需还原") || msg.contains("还原"), "应返回还原结果: {msg}");
+        let restored = std::cell::Cell::new(false);
+        let msg = client_restore::restore(
+            || { restored.set(true); Ok("无备份，无需还原".into()) },
+            || store.get_settings().mcp_registered_categories.contains(&CategoryType::ClaudeCli),
+            || mcp.running_port(),
+            |_| panic!("未注册的分类不能写入客户端 MCP 配置"),
+        ).unwrap();
+        assert!(restored.get());
+        assert_eq!(msg, "无备份，无需还原");
         assert!(
             store.get_settings().mcp_registered_categories.is_empty(),
             "停代理的还原不得凭空造出 MCP 注册记录"
