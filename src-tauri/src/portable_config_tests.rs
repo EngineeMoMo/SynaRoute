@@ -258,6 +258,107 @@ fn import_refuses_to_overwrite_or_reference_machine_credentials() {
 }
 
 #[test]
+fn replace_snapshots_credentials_even_when_only_existing_ids_are_overwritten() {
+    let source = configured();
+    let file = build_export(&source, "test", Some("Backup-Aa123!"))
+        .unwrap()
+        .0;
+    let (destination, directory) = fixture();
+    destination
+        .upsert_key(source.get_key("provider").unwrap())
+        .unwrap();
+    destination
+        .save_credential("provider", "original-provider-secret")
+        .unwrap();
+    let reference = source
+        .get_key("provider")
+        .unwrap()
+        .balance_query
+        .unwrap()
+        .access_token_ref
+        .unwrap();
+    destination
+        .save_credential(&reference, "original-panel-secret")
+        .unwrap();
+    let before = std::fs::read(directory.join("secrets.enc")).unwrap();
+    let report = apply_import(
+        &destination,
+        &file,
+        ImportMode::Replace,
+        Some("Backup-Aa123!"),
+    )
+    .unwrap();
+    assert_eq!(report.keys_removed, 0);
+    assert_eq!(report.secrets_pruned, 0);
+    let path = report.secrets_backup_path.unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let vault = crate::secret::SecretStore::load(path.into()).unwrap();
+    assert_eq!(
+        vault.get("provider").unwrap().unwrap().as_str(),
+        "original-provider-secret"
+    );
+    assert_eq!(
+        vault.get(&reference).unwrap().unwrap().as_str(),
+        "original-panel-secret"
+    );
+    assert_eq!(
+        destination
+            .secrets
+            .read()
+            .get(&reference)
+            .unwrap()
+            .unwrap()
+            .as_str(),
+        "private-panel-credential"
+    );
+}
+
+#[test]
+fn vault_backup_failure_aborts_replace_before_any_configuration_or_credential_change() {
+    let source = configured();
+    let file = build_export(&source, "test", Some("Backup-Aa123!"))
+        .unwrap()
+        .0;
+    let (destination, directory) = fixture();
+    destination
+        .upsert_key(ProviderKey {
+            id: "local-provider".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    destination
+        .save_credential("local-provider", "original-provider-secret")
+        .unwrap();
+    let before = std::fs::read(directory.join("config.json")).unwrap();
+    let vault_path = directory.join("secrets.enc");
+    std::fs::rename(&vault_path, directory.join("original-secrets.enc")).unwrap();
+    std::fs::create_dir(&vault_path).unwrap();
+    assert!(apply_import(
+        &destination,
+        &file,
+        ImportMode::Replace,
+        Some("Backup-Aa123!")
+    )
+    .is_err());
+    assert_eq!(
+        std::fs::read(directory.join("config.json")).unwrap(),
+        before
+    );
+    assert!(destination.get_key("local-provider").is_some());
+    assert!(destination.get_key("provider").is_none());
+    assert_eq!(
+        destination
+            .secrets
+            .read()
+            .get("local-provider")
+            .unwrap()
+            .unwrap()
+            .as_str(),
+        "original-provider-secret"
+    );
+}
+
+#[test]
 fn locked_legacy_tokens_are_never_exported_and_migrate_after_unlock() {
     let (source, directory) = fixture();
     source

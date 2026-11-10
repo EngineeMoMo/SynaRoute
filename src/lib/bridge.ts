@@ -27,6 +27,7 @@ import type {
   ImportMode,
   ImportPreview,
   ImportReport,
+  SanitizedBackupOutcome,
   MasterPasswordState,
   McpStatus,
   ModelInfo,
@@ -644,6 +645,9 @@ export const api = {
   /** 选文件并只做校验+预检（不改任何配置）。返回 [路径, 预检]；用户取消时 null。 */
   pickAndPreviewImport: () =>
     call<[string, ImportPreview] | null>("pick_and_preview_import", undefined, async () => null),
+
+  sanitizeLegacyBackup: (path: string) =>
+    call<SanitizedBackupOutcome | null>("sanitize_legacy_backup", { path }, async () => null),
 
   /** 执行导入。path 来自 pickAndPreviewImport。 */
   applyImportConfig: (path: string, mode: ImportMode, password?: string) =>

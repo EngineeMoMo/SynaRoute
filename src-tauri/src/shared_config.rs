@@ -374,4 +374,35 @@ mod tests {
         )
         .is_err());
     }
+
+    #[test]
+    fn shared_import_rejects_locked_legacy_tokens_before_creating_a_rollback_copy() {
+        let (store, directory) = temp_store("share-locked-legacy-backup");
+        store.upsert_key(key(CategoryType::Codex)).unwrap();
+        store.save_credential("k1", "shared-api-credential").unwrap();
+        store.secrets.write().enable_master_password("Migration-Aa123!").unwrap();
+        store.secrets.write().lock();
+        store.config.write().keys[0].balance_query = Some(crate::model::BalanceQuery {
+            access_token: Some("legacy-shared-panel-token".into()),
+            ..Default::default()
+        });
+        store.persist().unwrap();
+        let config_path = directory.join("config.json");
+        let secrets_path = directory.join("secrets.enc");
+        let original_config = std::fs::read(&config_path).unwrap();
+        let original_secrets = std::fs::read(&secrets_path).unwrap();
+        let template = SharedTemplate::build(&store);
+        assert!(apply(&store, &template).is_err());
+        assert_eq!(std::fs::read(&config_path).unwrap(), original_config);
+        assert_eq!(std::fs::read(&secrets_path).unwrap(), original_secrets);
+        assert_eq!(store.snapshot_config().keys.len(), 1);
+        assert!(!std::fs::read_dir(&directory).unwrap().any(|entry| {
+            entry.unwrap().file_name().to_string_lossy().starts_with("config.pre-import-")
+        }));
+        store.unlock_secrets("Migration-Aa123!").unwrap();
+        assert_eq!(apply(&store, &template).unwrap().added, 1);
+        let backup = std::fs::read_dir(&directory).unwrap().map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap().to_string_lossy().starts_with("config.pre-import-")).unwrap();
+        assert!(!std::fs::read_to_string(backup).unwrap().contains("legacy-shared-panel-token"));
+    }
 }

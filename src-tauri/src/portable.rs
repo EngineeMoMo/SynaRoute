@@ -29,6 +29,8 @@ use crate::store::Store;
 use serde::{Deserialize, Serialize};
 #[path = "portable_digest.rs"] mod digest;
 #[path = "portable_config.rs"] pub(crate) mod config;
+#[path = "portable_sanitize.rs"] pub(crate) mod sanitize;
+#[path = "portable_file.rs"] pub(crate) mod file;
 #[cfg(test)] use sha2::{Digest, Sha256};
 #[cfg(test)] #[path = "portable_config_tests.rs"] mod config_tests;
 
@@ -120,6 +122,8 @@ pub struct ImportPreview {
     pub brain_count: usize,
     /// 文件是否含密钥段（含则导入时需要口令）
     pub has_secrets: bool,
+    pub plaintext_balance_tokens: usize,
+    pub local_config: bool,
 }
 
 /// 一处「id 相同但看起来根本不是同一条 Key」的冲突。
@@ -154,11 +158,11 @@ pub struct ImportReport {
     /// Replace 模式下导入前备份的 config 路径（Merge 模式为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<String>,
-    /// Replace 模式下、真的要删旧密钥时备份的 secrets.enc 路径。
+    /// Replace 模式下、导入写入任何配置或密钥前备份的 secrets.enc 路径。
     ///
     /// 必须与 `backup_path` 并列给到用户：只回滚 config.json 会得到「Key 都回来了、
     /// 密钥没了」的半截状态，两个文件要一起还原才是真正的回滚。
-    /// 没有 Key 被移除、或库文件本就不存在时为 None。
+    /// Merge 模式或库文件本就不存在时为 None。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secrets_backup_path: Option<String>,
     /// 非致命提示（如「某 Key 有密钥标记但文件里没有对应密钥」）
@@ -304,6 +308,7 @@ fn check_format_version(v: u32) -> AppResult<()> {
 
 /// 解析 + 校验导出文件（版本 + 完整性）。**任何写盘动作之前**都要先过这一关。
 pub fn parse_and_verify(raw: &[u8]) -> AppResult<ExportFile> {
+    file::check_size(raw.len())?;
     digest::verify(raw)?;
     serde_json::from_slice(raw)
         .map_err(|e| AppError::Invalid(format!("不是有效的 SynaRoute 导出文件: {e}")))
@@ -349,6 +354,8 @@ pub fn preview_import(store: &Store, file: &ExportFile) -> ImportPreview {
         vendor_count: file.payload.vendors.len(),
         brain_count: file.payload.brain.len(),
         has_secrets: file.secrets.is_some(),
+        plaintext_balance_tokens: sanitize::plaintext_token_count(&file.payload),
+        local_config: false,
     }
 }
 
@@ -362,7 +369,14 @@ pub fn apply_import(
     mode: ImportMode,
     password: Option<&str>,
 ) -> AppResult<ImportReport> {
+    let _editing = store.routing_runtime.edit.lock();
     let mut warnings = Vec::new();
+    let plaintext_tokens = sanitize::plaintext_token_count(&file.payload);
+    if plaintext_tokens > 0 {
+        warnings.push(format!(
+            "原备份含 {plaintext_tokens} 个明文余额面板 Token；导入不会清理原文件。请另存脱敏副本，若原文件曾对外分享，应撤销或轮换相关 Token。"
+        ));
+    }
     config::validate_references(&file.payload)?;
 
     // 主口令模式未解锁时，密钥一条也写不进去（`SecretStore::set` 会拒绝）。若照常往下走，
@@ -402,10 +416,12 @@ pub fn apply_import(
     };
 
     // Replace 模式先备份现有 config —— 它会删掉导出后新建的条目，必须留退路。
-    let backup_path = if mode == ImportMode::Replace {
-        Some(store.backup_config_before_import()?)
+    let (backup_path, secrets_backup) = if mode == ImportMode::Replace {
+        let config_path = store.backup_config_before_import()?;
+        let secrets_path = store.secrets.read().backup_before_rewrite("import-replace")?;
+        (Some(config_path), secrets_path.map(|path| path.to_string_lossy().into_owned()))
     } else {
-        None
+        (None, None)
     };
 
     let local_before = store.snapshot_config();
@@ -423,9 +439,7 @@ pub fn apply_import(
     };
 
     // 配置整体落盘（走 store 的带回滚写路径）。返回 Replace 模式下被移除的 Key id。
-    let mut removed_ids = store.apply_imported_config(&file.payload, mode)?;
-    // 密钥库备份路径（只有真的要删旧密钥时才产生），随报告一并交给用户。
-    let mut secrets_backup: Option<String> = None;
+    let removed_ids = store.apply_imported_config(&file.payload, mode)?;
 
     // 清理被移除 Key 的密钥（P2-3）。**必须在配置落盘成功之后**——反之若配置落盘失败，
     // Key 会在下次启动时复活而密钥已没了（`has_secret=true` 却取不到的孤儿）。
@@ -438,37 +452,10 @@ pub fn apply_import(
     // secrets.enc 里，UI 无入口可见更无法删除；日后导入「含同 id Key 但不含密钥段」的文件时，
     // 对账会读到孤儿密文把 has_secret 刷成 true，得到「新配置 + 旧密钥」的嵌合体 → 莫名 401。
     let mut secrets_pruned = 0usize;
-    if !removed_ids.is_empty() {
-        let guard = store.secrets.read();
-        // **删密钥前必须先备份整个 secrets.enc**，且备份不成就一条都不删。
-        //
-        // 为什么：上面 :372 的 `backup_config_before_import` 只备份了 config.json。
-        // 若在此直接 `remove`，`SecretStore::remove` 会立刻整份重写 secrets.enc ——
-        // 用户拿着报告里的 backup_path 把 config.json 还原回去，那些 Key 全部复活，
-        // 密钥密文却已被覆盖掉，只能去各中转商后台重新取一遍。**配置可回滚而密钥不可回滚，
-        // 等于没有回滚**（选错文件做 Replace 导入是很容易发生的误操作）。
-        //
-        // 备份失败时**跳过清理而不是中止导入**：此刻配置已经落盘、回不去了，中止没有意义；
-        // 而残留几条孤儿密钥是无害的（UI 有 `prune_orphan_secrets` 兜底，且它自己也会先备份）。
-        // 「没有安全网就不做这个不可逆动作」比「删了再说」正确。
-        match guard.backup_before_rewrite("import-replace") {
-            Ok(Some(bak)) => secrets_backup = Some(bak.to_string_lossy().into_owned()),
-            Ok(None) => {} // 库文件还不存在（本机从没存过密钥），没什么可删也没什么可备份
-            Err(e) => {
-                warnings.push(format!(
-                    "备份密钥库失败，已跳过清理 {} 条被移除 Key 的旧密钥（它们仍留在库中，可稍后用设置页的「清理孤儿密钥」处理）: {e}",
-                    removed_ids.len()
-                ));
-                removed_ids.clear();
-            }
-        }
-        drop(guard);
-        for id in &removed_ids {
-            match store.remove_credential(id) {
-                Ok(()) => secrets_pruned += 1,
-                // 残留一条孤儿是无害的（可被 prune_orphan_secrets 兜住），不中止导入。
-                Err(e) => warnings.push(format!("清理 Key {id} 的旧密钥失败: {e}")),
-            }
+    for id in &removed_ids {
+        match store.remove_credential(id) {
+            Ok(()) => secrets_pruned += 1,
+            Err(e) => warnings.push(format!("清理 Key {id} 的旧密钥失败: {e}")),
         }
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "synaroute"
-version = "0.1.82"
+version = "0.1.83"
 description = "SynaRoute - 智能 API Key 路由代理与配置管理"
 authors = ["SynaRoute"]
 edition = "2021"
@@ -75,6 +75,7 @@ regex = "1"
 
 # 路径 / 时间 / 日志 / 错误
 dirs = "5"
+tempfile = "3"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"

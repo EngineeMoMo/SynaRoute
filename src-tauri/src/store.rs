@@ -16,6 +16,7 @@ use std::time::SystemTime;
 
 #[path = "store_endpoint.rs"] mod endpoint;
 #[path = "store_balance.rs"] pub(crate) mod balance;
+#[path = "store_backup.rs"] mod backup;
 pub use endpoint::base_url_has_path_suffix;
 
 pub struct Store {
@@ -1227,25 +1228,6 @@ impl Store {
     pub fn snapshot_config(&self) -> AppConfig {
         self.reload_if_disk_newer();
         self.config.read().clone()
-    }
-
-    /// 导入前把现有 config 备份到同目录的 `config.pre-import-<时间戳>.json`，返回备份路径。
-    ///
-    /// 只在 Replace 模式调用——那个模式会删掉「导出之后新建的条目」，必须留一条退路。
-    /// 备份失败**上抛**：宁可不导入，也不在无退路的情况下做破坏性替换。
-    pub fn backup_config_before_import(&self) -> AppResult<String> {
-        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-        let backup = self
-            .config_path
-            .with_file_name(format!("config.pre-import-{stamp}.json"));
-        // 用当前**磁盘**内容做备份（而非内存序列化）：备份的意义是「回到导入前磁盘上那一份」。
-        // 磁盘文件不存在（极早期/首次运行）时退化为序列化内存态，仍给出可回滚的东西。
-        let data = match std::fs::read(&self.config_path) {
-            Ok(d) => d,
-            Err(_) => serde_json::to_vec_pretty(&*self.config.read())?,
-        };
-        atomic_write(&backup, &data)?;
-        Ok(backup.display().to_string())
     }
 
     /// 把导入载荷写进配置（走 `mutate_and_persist`，落盘失败磁盘对账回滚）。

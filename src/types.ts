@@ -613,6 +613,11 @@ export interface SuspiciousConflict {
   incomingBaseUrl: string;
 }
 
+export interface SanitizedBackupOutcome {
+  path: string;
+  removedTokens: number;
+}
+
 export interface ImportPreview {
   formatVersion: number;
   /** 产出该文件的 SynaRoute 版本（仅供人看） */
@@ -633,6 +638,8 @@ export interface ImportPreview {
   brainCount: number;
   /** 文件是否含密钥段（含则导入时需要口令） */
   hasSecrets: boolean;
+  plaintextBalanceTokens: number;
+  localConfig: boolean;
 }
 
 /**
@@ -667,7 +674,7 @@ export interface ImportReport {
   /** replace 模式下导入前备份的 config 路径 */
   backupPath?: string;
   /**
-   * replace 模式下、真的删了旧密钥时备份的 secrets.enc 路径。
+   * replace 模式下、写入配置或密钥前备份的 secrets.enc 路径（库文件存在时）。
    *
    * 必须和 backupPath 一起显示：只导回配置备份会得到「Key 都回来了、密钥没了」的半截状态，
    * 密钥库要用户手动拷回去（它不是能被「导入」的格式）。

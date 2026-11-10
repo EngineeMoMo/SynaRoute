@@ -21,6 +21,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use zeroize::Zeroizing;
+#[path = "secret_backup.rs"] mod backup;
 
 /// 主口令模式的库头部：KDF 参数 + 盐 + 校验串。存在即表示当前是主口令模式。
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -600,40 +601,11 @@ impl SecretStore {
         Ok(plain.len())
     }
 
-    /// 整份重写前的备份（带用途标签与时间戳，可回滚 —— dev-hard-rules）。
-    /// 文件不存在时返回 `Ok(None)`，不算失败（首次启用、库还没落过盘）。
-    ///
-    /// `pub(crate)`：孤儿密钥清理（P2-3）与 Replace 导入清理旧密钥都是不可逆的删除操作，
-    /// 必须先备份。**返回备份路径**，好让调用方把它交到用户手里 —— 一个用户找不到的
-    /// 备份文件等于没有备份（Replace 导入那条路径尤其重要：报告里已有 config.json 的
-    /// 备份路径，密钥库的必须并列给出，否则用户按报告回滚配置后才发现密钥回不来了）。
-    pub(crate) fn backup_before_rewrite(&self, tag: &str) -> AppResult<Option<PathBuf>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-        let bak = self.path.with_extension(format!("enc.{tag}-{ts}"));
-        std::fs::copy(&self.path, &bak).map_err(|e| {
-            AppError::Other(format!(
-                "整份重写密钥库前的备份失败（用途：{tag}），已放弃该操作（避免写坏后无从恢复）: {e}"
-            ))
-        })?;
-        tracing::info!("密钥库整份重写前已备份到 {bak:?}（用途：{tag}）");
-        Ok(Some(bak))
-    }
-
     fn persist(&mut self) -> AppResult<()> {
         // 降级空库后的首次写入：先备份磁盘原文件（内含用户全部既有密文），备份失败则拒绝写，
         // 防止「空库+单条新密钥」把原密钥库整份覆盖销毁。
-        if self.load_failed && self.path.exists() {
-            let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-            let bak = self.path.with_extension(format!("enc.corrupt-{ts}"));
-            std::fs::copy(&self.path, &bak).map_err(|e| {
-                AppError::Other(format!(
-                    "密钥库处于降级态,备份原文件失败,已拒绝覆盖写入(避免销毁既有密文): {e}"
-                ))
-            })?;
-            tracing::warn!("密钥库降级态首次写入,已备份原文件到 {bak:?}");
+        if self.load_failed {
+            self.backup_before_rewrite("corrupt")?;
         }
         let data = serde_json::to_vec_pretty(&self.vault)?;
         atomic_write(&self.path, &data)?;

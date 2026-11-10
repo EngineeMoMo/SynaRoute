@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/Button";
 import { LanSection } from "@/components/LanSection";
 import { ToggleRow } from "@/components/ToggleRow";
 import { MasterPasswordToggle } from "@/components/MasterPasswordToggle";
+import { BackupImportPreview } from "@/components/BackupImportPreview";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { useT } from "@/lib/useT";
 import { LANGS } from "@/lib/i18n";
@@ -1335,6 +1336,10 @@ function ExportDialog({
         </div>
       )}
 
+      <div className="rounded-control border border-warning/30 bg-warning/8 px-3 py-2 text-[11px] leading-relaxed text-warning">
+        {t("backup.legacyExportWarning")}
+      </div>
+
       {/* 口令校验提示常驻渲染：只把它塞进 disabled 判据的话，用户只看到一个灰掉的按钮，
           界面上一个字都不说为什么（「至少 8 位」这个约束也无从得知）。开始输入后才显示，
           避免刚打开弹窗就报红。 */}
@@ -1377,12 +1382,14 @@ function ImportDialog({
   const showToast = useStore((s) => s.showToast);
   const [mode, setMode] = useState<ImportMode>("merge");
   const [pw, setPw] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [operation, setOperation] = useState<"import" | "sanitize" | null>(null);
+  const busy = operation !== null;
   const [err, setErr] = useState<string | null>(null);
   const [report, setReport] = useState<ImportReport | null>(null);
 
   const run = async () => {
-    setBusy(true);
+    if (busy || preview.localConfig) return;
+    setOperation("import");
     setErr(null);
     try {
       const r = await api.applyImportConfig(path, mode, preview.hasSecrets ? pw : undefined);
@@ -1400,7 +1407,7 @@ function ImportDialog({
       // 口令错 / 文件损坏都在这里。后端已保证「失败时本机配置一点没动」。
       setErr(String((e as Error)?.message ?? e));
     } finally {
-      setBusy(false);
+      setOperation(null);
     }
   };
 
@@ -1431,7 +1438,7 @@ function ImportDialog({
             <div className="text-[11px] leading-relaxed text-text-secondary">
               {t("backup.backupRestoreHint")}
             </div>
-            {/* 删过旧密钥时，密钥库的备份必须并列给出并单独说明怎么用：
+            {/* 回滚时，密钥库的备份必须并列给出并单独说明怎么用：
                 secrets.enc 不是能被「导入」的格式，只能手动拷回去。
                 少了这一句，用户按上面那行导回配置，会得到「Key 都回来了、密钥没了」的半截状态。 */}
             {report.secretsBackupPath && (
@@ -1467,24 +1474,15 @@ function ImportDialog({
 
   return (
     <ModalShell title={t("backup.importTitle")} icon={Upload} onClose={onClose} busy={busy}>
-      <div className="space-y-1 rounded-control bg-surface-elevated px-3 py-2">
-        <div className="break-all font-mono text-[11px] text-text-secondary">{path}</div>
-        <div className="text-[11px] text-text-secondary">
-          {t("backup.fileInfo", { version: preview.appVersion, time: preview.exportedAt })}
-        </div>
-        <div className="text-xs text-text-primary">
-          {t("backup.summary", {
-            keys: preview.keyCount,
-            vendors: preview.vendorCount,
-            brain: preview.brainCount,
-          })}
-        </div>
-        <div className="text-[11px] text-text-secondary">
-          {preview.hasSecrets ? t("backup.hasSecrets") : t("backup.noSecrets")}
-        </div>
-      </div>
+      <BackupImportPreview
+        path={path}
+        preview={preview}
+        busy={busy}
+        onBusyChange={(working) => setOperation(working ? "sanitize" : null)}
+        t={t}
+      />
 
-      <div className="space-y-2">
+      {!preview.localConfig && <div className="space-y-2">
         <div className="text-xs font-medium text-text-primary">{t("backup.modeTitle")}</div>
         <ModeOption
           checked={mode === "merge"}
@@ -1509,7 +1507,7 @@ function ImportDialog({
           }
           danger
         />
-      </div>
+      </div>}
 
       {/* 可疑冲突（P3-5）：id 相同但名字与地址都不同 → 极可能是历史时间戳 id 跨机碰撞，
           导入会把一条完全无关的本机 Key 换成对方的配置。必须逐条显示，
@@ -1555,15 +1553,15 @@ function ImportDialog({
 
       <div className="flex justify-end gap-2 pt-1">
         <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>
-          {t("common.cancel")}
+          {t(preview.localConfig ? "common.close" : "common.cancel")}
         </Button>
-        <Button
+        {!preview.localConfig && <Button
           size="sm"
           onClick={() => void run()}
           disabled={busy || (preview.hasSecrets && pw.length === 0)}
         >
-          {busy ? t("backup.importing") : t("backup.importAction")}
-        </Button>
+          {operation === "sanitize" ? t("backup.sanitizing") : busy ? t("backup.importing") : t("backup.importAction")}
+        </Button>}
       </div>
     </ModalShell>
   );

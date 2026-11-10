@@ -883,7 +883,7 @@ async fn pick_and_preview_import(
     let path = path
         .into_path()
         .map_err(|e| error::AppError::Other(format!("解析文件路径失败: {e}")))?;
-    let preview = service::preview_import(&state.store, &path)?;
+    let preview = portable::file::preview_in_background(Arc::clone(&state.store), path.clone()).await?;
     Ok(Some((path.display().to_string(), preview)))
 }
 
@@ -896,7 +896,7 @@ async fn apply_import_config(
     mode: portable::ImportMode,
     password: Option<String>,
 ) -> AppResult<portable::ImportReport> {
-    client_resync::sync_after(&state, service::apply_import_config(&state.store, &path, mode, password.as_ref()))
+    client_resync::sync_after(&state, portable::file::import_in_background(Arc::clone(&state.store), path, mode, password).await)
 }
 
 /// 统计孤儿密钥条数（P2-3）：密钥库里有、但配置里已无对应 Key 的残留。
@@ -1341,7 +1341,7 @@ pub fn run() {
             export_diagnostics, diagnostics::resilience::resilience_overview, tools::overview::routing_overview, store::routing::routing_policies, store::routing::save_routing_policy, store::routing::clear_routing_sessions, store::routing::routing_models, store::routing::privacy::preview_sensitive_content, store::routing::scenes::save_routing_scene, store::routing::scenes::delete_routing_scene, store::routing::scenes::preview_routing_scene, store::routing::scenes::apply_routing_scene, store::routing::scenes::sync_routing_clients,
             store::shared_config::build_shared_template, store::shared_config::preview_shared_template,
             store::shared_config::save_shared_template, store::shared_config::apply_shared_template, store::shared_config::undo_shared_template,
-            portable::export_config,
+            portable::export_config, portable::sanitize::sanitize_legacy_backup,
             pick_and_preview_import,
             apply_import_config,
             count_orphan_secrets,

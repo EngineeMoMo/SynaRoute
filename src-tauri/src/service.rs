@@ -1325,6 +1325,7 @@ pub(crate) fn write_export(
     undecryptable: usize,
     with_secrets: bool,
 ) -> AppResult<ExportOutcome> {
+    crate::portable::file::check_size(data.len())?;
     crate::secret::atomic_write(path, data)?;
     store.append_event(
         CategoryType::ClaudeCli,
@@ -1354,9 +1355,8 @@ pub(crate) fn preview_import(
     store: &Store,
     path: &std::path::Path,
 ) -> AppResult<crate::portable::ImportPreview> {
-    let raw = std::fs::read(path)?;
-    let file = crate::portable::parse_and_verify(&raw)?;
-    Ok(crate::portable::preview_import(store, &file))
+    let raw = crate::portable::file::read(path)?;
+    crate::portable::sanitize::preview_backup(store, &raw)
 }
 
 /// 执行导入。
@@ -1371,7 +1371,7 @@ pub(crate) fn apply_import_config(
     mode: crate::portable::ImportMode,
     password: Option<&String>,
 ) -> AppResult<crate::portable::ImportReport> {
-    let raw = std::fs::read(path)?;
+    let raw = crate::portable::file::read(path)?;
     let file = crate::portable::parse_and_verify(&raw)?;
     let report = crate::portable::apply_import(store, &file, mode, effective_password(password))?;
     store.append_event(

@@ -7,6 +7,7 @@ import { brandPickerEn, brandPickerZh } from "./i18n.brandPicker";
 import { vendorEn, vendorZh } from "./i18n.vendor";
 import { fieldsEn, fieldsZh } from "./i18n.fields";
 import { mappingEn, mappingZh } from "./i18n.mapping";
+import { backupSecurityEn, backupSecurityZh } from "./i18n.backup";
 import { brainRunEn, brainRunZh } from "./i18n.brain"; import { sessionsEn, sessionsZh } from "./i18n.sessions"; import { resilienceEn, resilienceZh } from "./i18n.resilience";
 import { orderingEn, orderingZh } from "./i18n.ordering"; import { routingEn, routingZh } from "./i18n.routing";
 import { securityEn, securityZh } from "./i18n.security"; import { overviewEn, overviewZh } from "./i18n.overview"; import { activeRequestsEn, activeRequestsZh } from "./i18n.activeRequests";
@@ -21,6 +22,7 @@ export const LANGS: { value: Lang; label: string }[] = [
 type Dict = Record<string, string>;
 
 const zh: Dict = {
+  ...backupSecurityZh,
   // 通用
   "common.cancel": "取消",
   "common.save": "保存",
@@ -624,8 +626,6 @@ const zh: Dict = {
   "backup.importTitle": "导入配置",
   "backup.fileInfo": "文件：由 SynaRoute {version} 于 {time} 导出",
   "backup.summary": "包含 {keys} 个 Key、{vendors} 个厂商、{brain} 份大脑配置",
-  "backup.hasSecrets": "含加密的密钥段（需口令）",
-  "backup.noSecrets": "不含密钥",
   "backup.modeTitle": "如何处理本机已有配置",
   "backup.modeMerge": "合并（推荐）",
   "backup.modeMergeDesc": "同名条目用文件版本覆盖，本机独有的保留。不会删除任何配置。",
@@ -640,9 +640,7 @@ const zh: Dict = {
   "backup.importing": "导入中…",
   "backup.importDone": "导入完成：新增 {added} / 覆盖 {overwritten} / 删除 {removed} 个 Key，密钥 {secrets} 条",
   "backup.backupSaved": "导入前配置已备份到 {path}",
-  "backup.backupRestoreHint": "如需回退到导入前的状态：用「替换导入」模式导入上面这个备份文件即可。",
   "backup.secretsBackupSaved": "密钥库已备份到 {path}",
-  "backup.secretsBackupRestoreHint": "本次删掉了随 Key 一并移除的旧密钥。若要连密钥一起回退，光导回上面的配置备份不够——还需先关闭 SynaRoute，把这个密钥库备份文件改名回 secrets.enc 覆盖原文件。",
   "backup.secretsPruned": "已清理 {n} 条随 Key 一并移除的旧密钥（它们对应的 Key 已不在配置里）。",
 
   // MCP 服务器
@@ -688,6 +686,7 @@ const zh: Dict = {
 };
 
 const en: Dict = {
+  ...backupSecurityEn,
   "common.cancel": "Cancel",
   "common.save": "Save",
   "time.never": "never",
@@ -1295,8 +1294,6 @@ const en: Dict = {
   "backup.importTitle": "Import config",
   "backup.fileInfo": "File: exported by SynaRoute {version} at {time}",
   "backup.summary": "Contains {keys} keys, {vendors} vendors, {brain} brain configs",
-  "backup.hasSecrets": "Includes an encrypted secrets section (password required)",
-  "backup.noSecrets": "No secrets included",
   "backup.modeTitle": "How to handle existing local config",
   "backup.modeMerge": "Merge (recommended)",
   "backup.modeMergeDesc": "Entries with the same id are overwritten by the file; local-only entries are kept. Nothing is deleted.",
@@ -1312,9 +1309,7 @@ const en: Dict = {
   "backup.importing": "Importing…",
   "backup.importDone": "Import done: {added} added / {overwritten} overwritten / {removed} removed keys, {secrets} secrets",
   "backup.backupSaved": "Previous config backed up to {path}",
-  "backup.backupRestoreHint": "To roll back to the state before this import: import the backup file above using \"Replace\" mode.",
   "backup.secretsBackupSaved": "Secret vault backed up to {path}",
-  "backup.secretsBackupRestoreHint": "This import also deleted the stored secrets of the removed keys. Importing the config backup above is not enough to get them back — quit SynaRoute first, then rename this vault backup to secrets.enc and overwrite the original.",
   "backup.secretsPruned": "Cleaned up {n} stale API key(s) belonging to keys that are no longer in the config.",
 
   // MCP server
