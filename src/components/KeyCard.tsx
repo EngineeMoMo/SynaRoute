@@ -5,6 +5,7 @@ import { Switch } from "@/components/ui/Switch";
 import { Button } from "@/components/ui/Button";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { HealthBadge } from "@/components/HealthBadge";
+import { KeyChatButton } from "@/components/KeyChatDialog";
 import { BrandIcon } from "@/components/BrandIcon";
 import { type ProviderKey, protocolLabel } from "@/types";
 import { api } from "@/lib/bridge";
@@ -490,6 +491,7 @@ export const KeyCard = React.memo(function KeyCard({ k, onEdit, onDuplicate, isF
                   <RefreshCw size={14} />
                 </Button>
               </Tooltip>
+              <KeyChatButton provider={k} />
               <Tooltip content={t("common.edit")} side="top">
                 <Button
                   size="icon"

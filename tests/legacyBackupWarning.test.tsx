@@ -85,6 +85,7 @@ describe("legacy backup credential warning", () => {
         vendorCount: 0,
         brainCount: 0,
         hasSecrets,
+        unauthenticatedSecrets: false,
         plaintextBalanceTokens: 1,
         localConfig: false,
       },
@@ -112,6 +113,7 @@ describe("legacy backup credential warning", () => {
         vendorCount: 0,
         brainCount: 0,
         hasSecrets: false,
+        unauthenticatedSecrets: false,
         plaintextBalanceTokens: 1,
         localConfig: true,
       },
@@ -124,5 +126,33 @@ describe("legacy backup credential warning", () => {
     expect(markup).toContain("matching vault");
     expect(markup).toContain("Save a copy without plaintext tokens");
     expect(markup).not.toMatch(/backup\.[A-Za-z]/);
+  });
+});
+
+describe("authenticated backup consent", () => {
+  const preview = (legacy: boolean, consent = false) => renderToStaticMarkup(createElement(BackupImportPreview, {
+    path: "backup.json",
+    preview: {
+      formatVersion: legacy ? 3 : 4, appVersion: "test", exportedAt: "2026-11-11",
+      keyCount: 1, conflictingKeys: 0, suspiciousConflicts: [], localOnlyKeys: 0,
+      vendorCount: 0, brainCount: 0, hasSecrets: true, unauthenticatedSecrets: legacy,
+      plaintextBalanceTokens: 0, localConfig: false,
+    },
+    busy: false, onBusyChange: () => {}, legacyConsent: consent, onLegacyConsent: () => {},
+    t: (key, variables) => translate("en", key, variables),
+  }));
+
+  it("requires a distinct unchecked acknowledgement for legacy encrypted backups", () => {
+    const html = preview(true);
+    expect(html).toContain("does not authenticate endpoint settings");
+    expect(html).toContain("correct password cannot prove");
+    expect(html).toContain('type="checkbox"');
+    expect(html).not.toContain('checked=""');
+    expect(preview(true, true)).toContain('checked=""');
+  });
+
+  it("does not label authenticated v4 backups as legacy", () => {
+    expect(preview(false)).not.toContain("does not authenticate endpoint settings");
+    expect(preview(false)).not.toContain('type="checkbox"');
   });
 });

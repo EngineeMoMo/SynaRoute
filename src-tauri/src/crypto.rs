@@ -15,7 +15,7 @@
 //!
 //! | 场景 | API | 每次调用的成本 |
 //! |---|---|---|
-//! | 导出/导入（一次性，整份载荷一个信封） | [`seal`] / [`open`] | 跑一次 Argon2（约百毫秒） |
+//! | 导出/导入（一次性，整份载荷一个信封） | [`seal_authenticated`] / [`open_authenticated`]；旧格式用 [`open`] | 跑一次 Argon2（约百毫秒） |
 //! | 主口令密钥库（每条密钥各一个盒子） | [`derive_vault_key`] + [`seal_with_key`] / [`open_with_key`] | 只有 AES-GCM（微秒级） |
 //!
 //! 后者存在的理由：密钥库里每条密钥都要独立加解密，而代理转发每次取密钥都要解一次。
@@ -33,7 +33,7 @@
 //! 自己记录的参数解开。这是「能重新导入同版本导出文件」这条验收标准的前提。
 
 use crate::error::{AppError, AppResult};
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::RngCore;
@@ -281,7 +281,12 @@ fn derive_key(password: &str, salt: &[u8], m: u32, t: u32, p: u32) -> AppResult<
 }
 
 /// 用口令加密任意字节，产出自描述信封。
+#[cfg(test)]
 pub fn seal(password: &str, plain: &[u8]) -> AppResult<Envelope> {
+    seal_authenticated(password, plain, &[])
+}
+
+pub(crate) fn seal_authenticated(password: &str, plain: &[u8], aad: &[u8]) -> AppResult<Envelope> {
     if password.is_empty() {
         return Err(AppError::Invalid("口令不能为空".into()));
     }
@@ -294,7 +299,7 @@ pub fn seal(password: &str, plain: &[u8]) -> AppResult<Envelope> {
     let key = derive_key(password, &salt, ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST)?;
     let cipher = Aes256Gcm::new((&key.0).into());
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), plain)
+        .encrypt(Nonce::from_slice(&nonce_bytes), Payload { msg: plain, aad })
         .map_err(|e| AppError::Crypto(format!("加密失败: {e}")))?;
 
     Ok(Envelope {
@@ -315,6 +320,10 @@ pub fn seal(password: &str, plain: &[u8]) -> AppResult<Envelope> {
 /// 混成一句「解密失败」会让人反复试口令却毫无进展。GCM 认证失败即口令错（或密文被篡改），
 /// 故那条单独给文案；格式/base64/版本问题归「文件损坏或版本不符」。
 pub fn open(password: &str, env: &Envelope) -> AppResult<Vec<u8>> {
+    open_authenticated(password, env, &[])
+}
+
+pub(crate) fn open_authenticated(password: &str, env: &Envelope, aad: &[u8]) -> AppResult<Vec<u8>> {
     if env.v != ENVELOPE_VERSION {
         return Err(AppError::Invalid(format!(
             "加密信封版本不支持：文件是 v{}，本程序支持 v{ENVELOPE_VERSION}。请用相同或更新版本的 SynaRoute 打开。",
@@ -347,7 +356,7 @@ pub fn open(password: &str, env: &Envelope) -> AppResult<Vec<u8>> {
     let key = derive_key(password, &salt, env.m, env.t, env.p)?;
     let cipher = Aes256Gcm::new((&key.0).into());
     cipher
-        .decrypt(Nonce::from_slice(&nonce), ct.as_ref())
+        .decrypt(Nonce::from_slice(&nonce), Payload { msg: &ct, aad })
         .map_err(|_| {
             // 刻意不透出底层错误细节：GCM 失败原因单一（认证不通过），且详情对用户无意义。
             AppError::Invalid(

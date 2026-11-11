@@ -166,7 +166,7 @@ fn rejects_corrupt_future_duplicate_and_malformed_backups() {
     corrupt["payloadSha256"] = "incorrect".into();
     assert!(sanitize_bytes(&serde_json::to_vec(&corrupt).unwrap()).is_err());
     let mut future = original.clone();
-    future["formatVersion"] = 4.into();
+    future["formatVersion"] = 5.into();
     assert!(sanitize_bytes(&encode(future)).is_err());
     let duplicate = String::from_utf8(legacy_backup(2)).unwrap().replace(
         "\"accessToken\": \"legacy-panel-credential\"",
@@ -315,7 +315,8 @@ fn raw_rollback_preview_and_copy_work_without_unlocking_or_importing() {
         &store,
         source.to_str().unwrap(),
         ImportMode::Replace,
-        None
+        None,
+        false
     )
     .is_err());
     assert_eq!(std::fs::read(&source).unwrap(), raw);

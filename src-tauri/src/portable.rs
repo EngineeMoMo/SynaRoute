@@ -31,12 +31,14 @@ use serde::{Deserialize, Serialize};
 #[path = "portable_config.rs"] pub(crate) mod config;
 #[path = "portable_sanitize.rs"] pub(crate) mod sanitize;
 #[path = "portable_file.rs"] pub(crate) mod file;
+#[path = "portable_credentials.rs"] pub(crate) mod credentials;
 #[cfg(test)] use sha2::{Digest, Sha256};
 #[cfg(test)] #[path = "portable_config_tests.rs"] mod config_tests;
+#[cfg(test)] #[path = "portable_security_tests.rs"] mod security_tests;
 
 /// 导出文件格式版本。**改动载荷结构时必须 +1**，并在 [`check_format_version`] 里明确拒绝
 /// 或做迁移——静默按新结构解析旧文件会得到半份配置。
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 
 /// 导出文件的顶层结构。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,7 +108,7 @@ pub struct ImportPreview {
     pub key_count: usize,
     /// 其中与本机 id 重复的（Merge 会覆盖它们）
     pub conflicting_keys: usize,
-    /// **可疑冲突**：id 相同但 name 与 base_url 都不一样的条目（P3-5）。
+    /// **可疑冲突**：同 id 的目标地址、协议或分类发生变化。
     ///
     /// 为什么要单列出来：历史上 Key id 是 `k_<毫秒时间戳>`，跨机会碰撞
     /// （「两台机器照同一份教程配置」是真实场景）。撞号时导入会把一条**完全无关**的本机
@@ -122,6 +124,7 @@ pub struct ImportPreview {
     pub brain_count: usize,
     /// 文件是否含密钥段（含则导入时需要口令）
     pub has_secrets: bool,
+    pub unauthenticated_secrets: bool,
     pub plaintext_balance_tokens: usize,
     pub local_config: bool,
 }
@@ -172,6 +175,10 @@ pub struct ImportReport {
 /// 计算载荷的 sha256（hex 小写）。
 fn payload_digest(payload: &ExportPayload) -> AppResult<String> {
     Ok(digest::canonical(payload)?)
+}
+
+fn associated_data(version: u32, checksum: &str) -> Vec<u8> {
+    format!("SynaRoute portable backup\0{version}\0{checksum}").into_bytes()
 }
 
 /// 剔除「只对本机有意义」的设置字段。
@@ -271,7 +278,7 @@ pub fn build_export(
             }
             drop(guard);
             let plain = zeroize::Zeroizing::new(serde_json::to_vec(&secret_plain)?);
-            Some(crypto::seal(pw, &plain)?)
+            Some(crypto::seal_authenticated(pw, &plain, &associated_data(FORMAT_VERSION, &payload_sha256))?)
         }
         None => None,
     };
@@ -322,18 +329,13 @@ pub fn preview_import(store: &Store, file: &ExportFile) -> ImportPreview {
     let file_ids: std::collections::HashSet<&str> =
         file.payload.keys.iter().map(|k| k.id.as_str()).collect();
 
-    // 可疑冲突（P3-5）：id 撞了，但 name 与 base_url **都**不同 → 极可能是时间戳 id 碰撞，
-    // 而不是同一条 Key 的正常更新。判据要求两者都不同：只改名字（同一上游换个称呼）或
-    // 只改 base_url（中转商换域名）都是常见的正常更新，单独一项不同不该报警。
     let suspicious_conflicts: Vec<SuspiciousConflict> = file
         .payload
         .keys
         .iter()
         .filter_map(|inc| {
             let loc = local.keys.iter().find(|k| k.id == inc.id)?;
-            let name_differs = loc.name.trim() != inc.name.trim();
-            let url_differs = loc.base_url.trim_end_matches('/') != inc.base_url.trim_end_matches('/');
-            (name_differs && url_differs).then(|| SuspiciousConflict {
+            (!credentials::same_provider(loc, inc)).then(|| SuspiciousConflict {
                 id: inc.id.clone(),
                 local_name: loc.name.clone(),
                 local_base_url: loc.base_url.clone(),
@@ -354,6 +356,7 @@ pub fn preview_import(store: &Store, file: &ExportFile) -> ImportPreview {
         vendor_count: file.payload.vendors.len(),
         brain_count: file.payload.brain.len(),
         has_secrets: file.secrets.is_some(),
+        unauthenticated_secrets: file.secrets.is_some() && file.format_version < 4,
         plaintext_balance_tokens: sanitize::plaintext_token_count(&file.payload),
         local_config: false,
     }
@@ -363,14 +366,32 @@ pub fn preview_import(store: &Store, file: &ExportFile) -> ImportPreview {
 ///
 /// `password` 仅在文件含密钥段时需要；给了口令但文件无密钥段时**报错而非静默忽略**——
 /// 用户显然以为在导密钥，静默成功会让他以为密钥已导入。
+#[cfg(test)]
 pub fn apply_import(
     store: &Store,
     file: &ExportFile,
     mode: ImportMode,
     password: Option<&str>,
 ) -> AppResult<ImportReport> {
+    apply_import_with_consent(store, file, mode, password, false)
+}
+
+pub(crate) fn apply_import_with_consent(
+    store: &Store,
+    file: &ExportFile,
+    mode: ImportMode,
+    password: Option<&str>,
+    allow_legacy_secrets: bool,
+) -> AppResult<ImportReport> {
     let _editing = store.routing_runtime.edit.lock();
     let mut warnings = Vec::new();
+    check_format_version(file.format_version)?;
+    if file.secrets.is_some() && file.format_version < 4 {
+        if !allow_legacy_secrets {
+            return Err(AppError::Invalid("旧版备份未认证配置与密钥的绑定。请先核对来源和全部接口地址，并在导入预览中明确确认风险。".into()));
+        }
+        warnings.push("已按确认导入旧版未认证备份：口令正确不代表接口地址未被修改。建议立即重新导出 v4 加密备份。".into());
+    }
     let plaintext_tokens = sanitize::plaintext_token_count(&file.payload);
     if plaintext_tokens > 0 {
         warnings.push(format!(
@@ -391,7 +412,12 @@ pub fn apply_import(
     // 密钥段先解开（在动配置之前）：口令错就该在什么都没改的时候失败。
     let secrets: Option<SecretsPlain> = match (&file.secrets, password) {
         (Some(env), Some(pw)) => {
-            let plain = zeroize::Zeroizing::new(crypto::open(pw, env)?);
+            let plain = if file.format_version >= 4 {
+                crypto::open_authenticated(pw, env, &associated_data(file.format_version, &file.payload_sha256))?
+            } else {
+                crypto::open(pw, env)?
+            };
+            let plain = zeroize::Zeroizing::new(plain);
             Some(serde_json::from_slice(&plain).map_err(|e| {
                 AppError::Invalid(format!("密钥段解密成功但内容无法解析（文件损坏）: {e}"))
             })?)
@@ -414,6 +440,8 @@ pub fn apply_import(
             None
         }
     };
+
+    credentials::validate_reuse(&store.snapshot_config(), &file.payload, &store.secrets.read().all_key_ids())?;
 
     // Replace 模式先备份现有 config —— 它会删掉导出后新建的条目，必须留退路。
     let (backup_path, secrets_backup) = if mode == ImportMode::Replace {
@@ -1419,10 +1447,11 @@ mod tests {
         let mut file = build_export(&src, "1.0.0", Some("pw")).unwrap().0;
 
         // 手工往密钥段里塞一个「配置里不存在的 Key」的密钥，模拟被改过的文件。
-        let plain = crypto::open("pw", file.secrets.as_ref().unwrap()).unwrap();
+        let aad = associated_data(file.format_version, &file.payload_sha256);
+        let plain = crypto::open_authenticated("pw", file.secrets.as_ref().unwrap(), &aad).unwrap();
         let mut sp: SecretsPlain = serde_json::from_slice(&plain).unwrap();
         sp.entries.insert("ghost".into(), "sk-ghost".into());
-        file.secrets = Some(crypto::seal("pw", &serde_json::to_vec(&sp).unwrap()).unwrap());
+        file.secrets = Some(crypto::seal_authenticated("pw", &serde_json::to_vec(&sp).unwrap(), &aad).unwrap());
 
         let dst = store_at(&dst_dir);
         let report = apply_import(&dst, &file, ImportMode::Merge, Some("pw")).unwrap();

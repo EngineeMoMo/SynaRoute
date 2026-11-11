@@ -9,12 +9,16 @@ export function BackupImportPreview({
   preview,
   busy,
   onBusyChange,
+  legacyConsent = false,
+  onLegacyConsent,
   t,
 }: {
   path: string;
   preview: ImportPreview;
   busy: boolean;
   onBusyChange: (busy: boolean) => void;
+  legacyConsent?: boolean;
+  onLegacyConsent?: (allowed: boolean) => void;
   t: TFunc;
 }) {
   const [sanitized, setSanitized] = useState<SanitizedBackupOutcome | null>(null);
@@ -55,6 +59,15 @@ export function BackupImportPreview({
       {preview.localConfig && (
         <div role="note" className="rounded-control bg-info/10 px-3 py-2 text-xs leading-relaxed text-text-secondary">
           {t("backup.localConfigHint")}
+        </div>
+      )}
+      {preview.unauthenticatedSecrets && (
+        <div role="alert" className="space-y-2 rounded-control border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
+          <p>{t("backup.unauthenticatedWarning")}</p>
+          <label className="flex items-start gap-2">
+            <input type="checkbox" checked={legacyConsent} disabled={busy || !onLegacyConsent} onChange={(event) => onLegacyConsent?.(event.target.checked)} />
+            {t("backup.legacyConsent")}
+          </label>
         </div>
       )}
       <LegacyBackupWarning

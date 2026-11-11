@@ -92,6 +92,7 @@ pub(crate) fn preview_backup(
         vendor_count: config.vendors.len(),
         brain_count: config.brain.len(),
         has_secrets: false,
+        unauthenticated_secrets: false,
         plaintext_balance_tokens: token_count(&config.keys),
         local_config: true,
     })
@@ -100,7 +101,11 @@ pub(crate) fn preview_backup(
 fn sanitize_bytes(raw: &[u8]) -> AppResult<SanitizedBackup> {
     let mut file = read_json(raw)?;
     let version = if is_portable(&file) {
-        Some(super::parse_and_verify(raw)?.format_version)
+        let parsed = super::parse_and_verify(raw)?;
+        if parsed.format_version >= 4 && parsed.secrets.is_some() {
+            return Err(AppError::Invalid("认证备份不能在保留原密钥密文时修改配置，请导入可信原件后重新导出。".into()));
+        }
+        Some(parsed.format_version)
     } else {
         local_config(raw, &file)?;
         None

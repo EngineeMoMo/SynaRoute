@@ -26,8 +26,11 @@
 /// 且要复用这里的 `local_static_response` / `rpc_ok` / 端口文件等，拆成平级只会互相 `pub`。
 pub(crate) mod stdio;
 mod server;
+mod logging;
 #[cfg(test)]
 mod security_tests;
+#[cfg(test)]
+mod regression_tests;
 
 use crate::aggregate;
 use crate::model::CategoryType;
@@ -75,7 +78,14 @@ pub(crate) enum McpCaller {
 /// 运行中的 MCP 服务器句柄
 struct RunningMcp {
     port: u16,
+    requested_port: u16,
     handle: JoinHandle<()>,
+}
+
+impl Drop for RunningMcp {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 /// MCP 服务基址（不带分类段）。前端展示与重启日志用它。
@@ -160,12 +170,12 @@ fn mcp_port_file_path() -> Option<PathBuf> {
 
 /// 主应用把实际 MCP 端口写到端口文件，供 stdio 子进程发现（见 [`run_stdio`]）。
 /// 写失败不致命（子进程会退回端口扫描），仅记日志。
-fn write_mcp_port_file(port: u16) {
-    let Some(path) = mcp_port_file_path() else {
+fn write_mcp_port_file(path: Option<&std::path::Path>, port: u16) {
+    let Some(path) = path else {
         tracing::warn!("无法定位 MCP 端口文件路径，stdio 子进程将退回端口扫描");
         return;
     };
-    if let Err(e) = std::fs::write(&path, port.to_string()) {
+    if let Err(e) = std::fs::write(path, port.to_string()) {
         tracing::warn!("写 MCP 端口文件失败({}): {e}", path.display());
     }
 }
@@ -173,6 +183,10 @@ fn write_mcp_port_file(port: u16) {
 /// 读端口文件（stdio 子进程用）。读不到返回 None。
 pub(crate) fn read_mcp_port_file() -> Option<u16> {
     let path = mcp_port_file_path()?;
+    read_port_from(&path)
+}
+
+fn read_port_from(path: &std::path::Path) -> Option<u16> {
     let content = std::fs::read_to_string(path).ok()?;
     content.trim().parse::<u16>().ok()
 }
@@ -184,9 +198,9 @@ pub(crate) fn read_mcp_port_file() -> Option<u16> {
 /// 读到这个旧端口、去连、失败 —— 本可以直接走「端口扫描兜底」少绕一圈。删掉它让
 /// 「文件存在」== 「主应用此刻确实在监听那个端口」这个不变量成立。
 /// 删除失败只告警：文件陈旧不致命，下次 `write_mcp_port_file` 会覆盖它。
-fn clear_mcp_port_file() {
-    let Some(path) = mcp_port_file_path() else { return };
-    match std::fs::remove_file(&path) {
+fn clear_mcp_port_file(path: Option<&std::path::Path>) {
+    let Some(path) = path else { return };
+    match std::fs::remove_file(path) {
         Ok(()) => {}
         // 本来就不存在 = 已是期望状态，不算错。
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -202,15 +216,29 @@ pub(crate) const FALLBACK_RANGE: u16 = 20;
 /// MCP 服务器管理器：负责生命周期（启用即启动，改端口需重启）。
 pub struct McpManager {
     store: Arc<Store>,
+    port_file: Option<PathBuf>,
+    pub(crate) operation: tokio::sync::Mutex<()>,
     running: Mutex<Option<RunningMcp>>,
     /// 最近一次启动失败的原因（供 UI 展示；成功时清空）。
     last_error: Mutex<Option<String>>,
 }
 
+impl Drop for McpManager {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 impl McpManager {
     pub fn new(store: Arc<Store>) -> Self {
+        #[cfg(not(test))]
+        let port_file = mcp_port_file_path();
+        #[cfg(test)]
+        let port_file = Some(PathBuf::from(store.config_path_display()).with_file_name(MCP_PORT_FILE));
         Self {
             store,
+            port_file,
+            operation: tokio::sync::Mutex::new(()),
             running: Mutex::new(None),
             last_error: Mutex::new(None),
         }
@@ -232,11 +260,14 @@ impl McpManager {
     /// 配置端口被占用时，在 [port, port+FALLBACK_RANGE] 内自动向上寻找可用端口。
     /// 返回实际绑定的端口（可能与请求端口不同——UI 需按此展示接入地址）。
     pub async fn start(&self, port: u16) -> Result<u16, String> {
-        if let Some(cur) = self.running_port() {
-            if cur == port {
-                return Ok(cur);
+        let mut running = self.running.lock();
+        if let Some(current) = running.as_ref() {
+            if current.requested_port == port || current.port == port {
+                return Ok(current.port);
             }
-            self.stop();
+        }
+        if running.take().is_some() {
+            clear_mcp_port_file(self.port_file.as_deref());
         }
 
         // 逐个尝试候选端口，记录最后一次错误用于诊断。
@@ -245,9 +276,12 @@ impl McpManager {
         let end = port.saturating_add(FALLBACK_RANGE);
         for candidate in port..=end {
             let addr = SocketAddr::from(([127, 0, 0, 1], candidate));
-            match TcpListener::bind(addr).await {
-                Ok(l) => {
-                    listener = Some(l);
+            match std::net::TcpListener::bind(addr).and_then(|socket| {
+                socket.set_nonblocking(true)?;
+                TcpListener::from_std(socket)
+            }) {
+                Ok(socket) => {
+                    listener = Some(socket);
                     break;
                 }
                 Err(e) => {
@@ -272,8 +306,9 @@ impl McpManager {
         let store = self.store.clone();
         let handle = tokio::spawn(server::serve(listener, store));
 
-        *self.running.lock() = Some(RunningMcp {
+        *running = Some(RunningMcp {
             port: bound,
+            requested_port: port,
             handle,
         });
         *self.last_error.lock() = None;
@@ -283,16 +318,16 @@ impl McpManager {
         // 把实际端口写到平台对应的共享文件（见 mcp_port_file_path）：
         // Windows 放 exe 同级以躲 MSIX AppData 虚拟化；macOS 放 Application Support，
         // 避免写进 .app bundle。stdio 子进程据此找到主应用并转发 tools/call。
-        write_mcp_port_file(bound);
+        write_mcp_port_file(self.port_file.as_deref(), bound);
         tracing::info!("MCP 服务器已启动: http://127.0.0.1:{bound}/mcp");
         Ok(bound)
     }
 
     pub fn stop(&self) {
-        if let Some(r) = self.running.lock().take() {
-            r.handle.abort();
+        let mut running = self.running.lock();
+        if running.take().is_some() {
             // 端口文件与「服务在监听」绑定：停了就删，别留个指向死端口的文件误导 stdio 子进程。
-            clear_mcp_port_file();
+            clear_mcp_port_file(self.port_file.as_deref());
             tracing::info!("MCP 服务器已停止");
         }
     }
@@ -678,73 +713,10 @@ async fn handle_tool_call(
         aggregate::run_mcp(store, category, &effective_prompt, cwd.clone(), image_paths).await;
     let elapsed = started.elapsed().as_millis() as u64;
 
+    logging::record_outcome(store, category, &prompt, cwd.as_deref(), &outcome, elapsed);
     match outcome {
-        Ok(res) => {
-            // 记录调用日志（事件流 + 落盘，Q10）。带完整 trace：prompt 进 requestBody、
-            // 聚合分析全文进 responseBody，日志页可展开查看，解决「MCP 日志太长看不了」。
-            let detail = format!(
-                "synaroute_ai · {} · 参与者 成功{}/发起{}{} · {}个文件 · {}ms",
-                res.work_dir.as_deref().unwrap_or("(无工作目录)"),
-                res.member_labels.len(),
-                res.members_attempted,
-                if res.members_failed > 0 {
-                    format!("(失败{})", res.members_failed)
-                } else {
-                    String::new()
-                },
-                res.file_count,
-                elapsed
-            );
-            let members = if res.member_labels.is_empty() {
-                "(无可用参与者)".to_string()
-            } else {
-                res.member_labels.join(" · ")
-            };
-            let trace = crate::model::RequestTrace {
-                request_id: String::new(),
-                key_name: "synaroute_ai".into(),
-                vendor: "mcp".into(),
-                protocol: crate::model::Protocol::Anthropic,
-                url: res.work_dir.clone().unwrap_or_default(),
-                requested_model: format!("参与者: {members}"),
-                real_model: format!("{}个文件", res.file_count),
-                request_body: prompt.clone(),
-                response_body: res.analysis.clone(),
-                status: Some(200),
-                latency_ms: elapsed,
-                ok: true,
-                was_truncated: None,
-            };
-            store.append_event_trace(category, "mcp", None, &detail, Some(trace));
-
-            let md = format_markdown(&prompt, &res, elapsed);
-            Ok(tool_text_content(&md))
-        }
-        Err(e) => {
-            let trace = crate::model::RequestTrace {
-                request_id: String::new(),
-                key_name: "synaroute_ai".into(),
-                vendor: "mcp".into(),
-                protocol: crate::model::Protocol::Anthropic,
-                url: cwd.clone().unwrap_or_default(),
-                requested_model: String::new(),
-                real_model: String::new(),
-                request_body: prompt.clone(),
-                response_body: format!("{e}"),
-                status: None,
-                latency_ms: elapsed,
-                ok: false,
-                was_truncated: None,
-            };
-            store.append_event_trace(
-                category,
-                "mcp",
-                None,
-                &format!("synaroute_ai 失败: {e}"),
-                Some(trace),
-            );
-            Ok(tool_error_content(&format!("聚合失败: {e}")))
-        }
+        Ok(result) => Ok(tool_text_content(&format_markdown(&prompt, &result, elapsed))),
+        Err(error) => Ok(tool_error_content(&format!("聚合失败: {error}"))),
     }
 }
 
@@ -836,31 +808,15 @@ mod tests {
     /// 指向死端口的陈旧文件误导 stdio 子进程。
     #[test]
     fn mcp_port_file_write_read_clear_roundtrip() {
-        // 用真实路径解析（Windows=exe 同级、mac=Application Support）；测试二进制自己的
-        // 目录里写一个 mcp-port，不碰用户数据。若环境拿不到路径（极少见），跳过而非误判。
-        let Some(path) = mcp_port_file_path() else {
-            return;
-        };
-        // 先清干净，避免上一次遗留影响断言。
-        clear_mcp_port_file();
-
-        write_mcp_port_file(48123);
-        assert_eq!(
-            read_mcp_port_file(),
-            Some(48123),
-            "写入后应能读回同一端口"
-        );
-
-        clear_mcp_port_file();
-        assert_eq!(
-            read_mcp_port_file(),
-            None,
-            "清理后端口文件应消失（下次 stdio 子进程会退回端口扫描，而非连一个死端口）"
-        );
-
-        // 幂等：文件已不存在时再清一次不得报错/ panic。
-        clear_mcp_port_file();
-        assert_eq!(read_mcp_port_file(), None);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(MCP_PORT_FILE);
+        clear_mcp_port_file(Some(&path));
+        write_mcp_port_file(Some(&path), 48123);
+        assert_eq!(read_port_from(&path), Some(48123));
+        clear_mcp_port_file(Some(&path));
+        assert_eq!(read_port_from(&path), None);
+        clear_mcp_port_file(Some(&path));
+        assert_eq!(read_port_from(&path), None);
 
         // 顺带确认文件真在盘上没了。
         assert!(!path.exists(), "clear 之后文件不应还在: {}", path.display());

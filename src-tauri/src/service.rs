@@ -818,6 +818,7 @@ pub(crate) async fn register_mcp_for_category(
     mcp: &McpManager,
     category: CategoryType,
 ) -> AppResult<McpStatus> {
+    let _operation = mcp.operation.lock().await;
     let bound = match ensure_mcp_running(store, mcp).await {
         Ok(b) => b,
         Err(e) => {
@@ -910,6 +911,7 @@ pub(crate) async fn set_mcp_enabled(
     enabled: bool,
     port: u16,
 ) -> AppResult<McpStatus> {
+    let _operation = mcp.operation.lock().await;
     store.set_mcp_port(port)?;
     if enabled {
         match mcp.start(port).await {
@@ -964,6 +966,7 @@ pub(crate) async fn set_mcp_enabled(
 /// 无论端口是否变化都重新注入：手动重启的语义就是「把客户端配置也对齐一次」，
 /// 这正是排障时最想要的动作。
 pub(crate) async fn restart_mcp(store: &Store, mcp: &McpManager) -> AppResult<McpStatus> {
+    let _operation = mcp.operation.lock().await;
     let port = store.get_settings().mcp_port;
     mcp.stop();
     store.append_event(
@@ -1014,6 +1017,8 @@ pub(crate) async fn restart_mcp(store: &Store, mcp: &McpManager) -> AppResult<Mc
 /// 就会每次开机重复「绑定失败 → 向上探测 → 回退 → 重写客户端」，
 /// 而客户端配置只在客户端启动时读一次，用户那边表现为「时不时要重启 Claude 才能用」。
 pub(crate) async fn start_mcp_on_launch(store: &Store, mcp: &McpManager) {
+    let _operation = mcp.operation.lock().await;
+    if !store.get_settings().mcp_enabled { return; }
     let preferred = store.get_settings().mcp_port;
     match mcp.start(preferred).await {
         Ok(bound) => {
@@ -1370,10 +1375,13 @@ pub(crate) fn apply_import_config(
     path: &str,
     mode: crate::portable::ImportMode,
     password: Option<&String>,
+    allow_legacy_secrets: bool,
 ) -> AppResult<crate::portable::ImportReport> {
     let raw = crate::portable::file::read(path)?;
     let file = crate::portable::parse_and_verify(&raw)?;
-    let report = crate::portable::apply_import(store, &file, mode, effective_password(password))?;
+    let report = crate::portable::apply_import_with_consent(
+        store, &file, mode, effective_password(password), allow_legacy_secrets,
+    )?;
     store.append_event(
         CategoryType::ClaudeCli,
         "config",

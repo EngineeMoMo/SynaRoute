@@ -894,9 +894,9 @@ async fn apply_import_config(
     state: tauri::State<'_, AppState>,
     path: String,
     mode: portable::ImportMode,
-    password: Option<String>,
+    password: Option<String>, allow_legacy_secrets: Option<bool>,
 ) -> AppResult<portable::ImportReport> {
-    client_resync::sync_after(&state, portable::file::import_in_background(Arc::clone(&state.store), path, mode, password).await)
+    client_resync::sync_after(&state, portable::file::import_in_background(Arc::clone(&state.store), path, mode, password, allow_legacy_secrets.unwrap_or(false)).await)
 }
 
 /// 统计孤儿密钥条数（P2-3）：密钥库里有、但配置里已无对应 Key 的残留。
@@ -1290,7 +1290,7 @@ pub fn run() {
             store::key_flags::set_key_allow_in_aggregate,
             fetch_models,
             fetch_models_draft,
-            check_health,
+            check_health, proxy::key_chat::test_key_conversation,
             get_brain_config,
             save_brain_config,
             get_proxy_state, proxy::active_requests::list_active_requests, proxy::active_requests::stop_active_request,

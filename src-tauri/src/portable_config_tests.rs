@@ -34,16 +34,6 @@ fn configured() -> Store {
             ..Default::default()
         })
         .unwrap();
-    for (reference, value) in [
-        ("provider", "private-provider-credential"),
-        ("billing-override", "private-billing-credential"),
-        ("__decision_test", "private-decision-credential"),
-        ("__routing_terms_test", r#"["private-sensitive-term"]"#),
-        (crate::proxy::lan_guard::TOKEN_ID, "private-lan-credential"),
-        ("__unrelated_internal", "private-unrelated-credential"),
-    ] {
-        store.save_credential(reference, value).unwrap();
-    }
     let mut payload = build_export(&store, "test", None).unwrap().0.payload;
     payload.routing = Some(RoutingConfig::Known(Box::new(Settings {
         revision: 7,
@@ -96,15 +86,25 @@ fn configured() -> Store {
     store
         .apply_imported_config(&payload, ImportMode::Merge)
         .unwrap();
+    for (reference, value) in [
+        ("provider", "private-provider-credential"),
+        ("billing-override", "private-billing-credential"),
+        ("__decision_test", "private-decision-credential"),
+        ("__routing_terms_test", r#"["private-sensitive-term"]"#),
+        (crate::proxy::lan_guard::TOKEN_ID, "private-lan-credential"),
+        ("__unrelated_internal", "private-unrelated-credential"),
+    ] {
+        store.save_credential(reference, value).unwrap();
+    }
     store
 }
 
 #[test]
-fn v3_roundtrips_routing_decision_and_only_referenced_secrets() {
+fn v4_roundtrips_routing_decision_and_only_referenced_secrets() {
     let source = configured();
     let (file, skipped) = build_export(&source, "test", Some("Export-Aa123!")).unwrap();
     assert_eq!(skipped, 0);
-    assert_eq!(file.format_version, 3);
+    assert_eq!(file.format_version, 4);
     let raw = serde_json::to_vec(&file).unwrap();
     let text = String::from_utf8(raw.clone()).unwrap();
     for forbidden in [
@@ -122,7 +122,7 @@ fn v3_roundtrips_routing_decision_and_only_referenced_secrets() {
     }
     assert!(!text.contains("\"accessToken\":"));
     let plaintext: SecretsPlain = serde_json::from_slice(
-        &crypto::open("Export-Aa123!", file.secrets.as_ref().unwrap()).unwrap(),
+        &crypto::open_authenticated("Export-Aa123!", file.secrets.as_ref().unwrap(), &associated_data(file.format_version, &file.payload_sha256)).unwrap(),
     )
     .unwrap();
     assert_eq!(plaintext.entries.len(), 5);

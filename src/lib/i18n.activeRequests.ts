@@ -1,7 +1,9 @@
+import { keyChatEn, keyChatZh } from "./i18n.keyChat";
 type Dict = Record<string, string>;
 export const activeRequestsZh: Dict = {
+  ...keyChatZh,
   "active.title": "代理活跃请求",
-  "active.scope": "仅代理转发，不含大脑聚合 / MCP 独立调用。每秒刷新，窗口隐藏时暂停显示刷新。",
+  "active.scope": "包含代理转发和单 Key 会话测试，不含大脑聚合 / MCP 独立调用。每秒刷新，窗口隐藏时暂停显示刷新。",
   "active.empty": "当前没有活跃的代理请求",
   "active.loading": "正在读取活跃请求…",
   "active.error": "刷新失败：{error}。所示数据可能已过期。",
@@ -29,8 +31,9 @@ export const activeRequestsZh: Dict = {
   "active.requested": "已请求停止；正在释放上游连接。",
 };
 export const activeRequestsEn: Dict = {
+  ...keyChatEn,
   "active.title": "Active proxy requests",
-  "active.scope": "Proxy forwarding only; excludes standalone Brain / MCP calls. Refreshes every second while visible.",
+  "active.scope": "Proxy forwarding and single-Key conversation tests; excludes standalone Brain / MCP calls. Refreshes every second while visible.",
   "active.empty": "No active proxy requests",
   "active.loading": "Loading active requests…",
   "active.error": "Refresh failed: {error}. Displayed data may be stale.",

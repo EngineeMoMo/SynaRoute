@@ -59,7 +59,7 @@ const AGG_LOG_CAP: usize = 20_000;
 /// 用 `char_indices().nth()` 而不是先 `chars().count()`：后者把整串走一遍**才知道要不要
 /// 截断**，而这个函数每轮聚合要对每个成员的入参与出参各调一次，单个可达数十万字符。
 /// 现在未超限时只走前 `AGG_LOG_CAP` 个字符（绝大多数调用都是这一支）。
-fn cap_text(s: &str) -> String {
+pub(crate) fn cap_text(s: &str) -> String {
     match s.char_indices().nth(AGG_LOG_CAP) {
         None => s.to_string(),
         // 已经确定要截断了，这时再数总长度（为了如实报「共 N 字符」）才值得。

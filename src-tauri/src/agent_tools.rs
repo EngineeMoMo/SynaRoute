@@ -1948,3 +1948,7 @@ src{sep}lib.rs:7:// NEEDLE
         assert!(e.contains("cwd"), "{e}");
     }
 }
+
+#[cfg(test)]
+#[path = "agent_tools/path_security_tests.rs"]
+mod path_security_tests;

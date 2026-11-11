@@ -1,6 +1,8 @@
 type Dict = Record<string, string>;
 
 export const backupSecurityZh: Dict = {
+  "backup.unauthenticatedWarning": "此旧版备份只加密密钥，没有认证接口地址等配置。即使口令正确，地址仍可能被篡改；请只导入可信来源并核对全部接口。",
+  "backup.legacyConsent": "我已核对来源和接口地址，理解旧版备份的风险并继续导入",
   "backup.legacyExportWarning": "旧版备份即使选择了「不含密钥」，也可能含余额面板 Token 明文。升级或重新导出不会清理旧文件；可在导入预览中检测并另存脱敏副本，若旧文件曾对外分享，应撤销或轮换 Token。",
   "backup.hasSecrets": "含加密的密钥段（需口令）",
   "backup.noSecrets": "不含加密密钥段",
@@ -17,6 +19,8 @@ export const backupSecurityZh: Dict = {
 };
 
 export const backupSecurityEn: Dict = {
+  "backup.unauthenticatedWarning": "This legacy backup encrypts secrets but does not authenticate endpoint settings. A correct password cannot prove that endpoints are unchanged. Only import trusted files after checking all endpoints.",
+  "backup.legacyConsent": "I verified the source and endpoints and accept the risks of importing this legacy backup",
   "backup.legacyExportWarning": "Older backups may contain plaintext balance-panel tokens even when exported without secrets. Upgrading or exporting again does not clean old files. Use the import preview to detect them and save a sanitized copy; revoke or rotate tokens if the original was shared.",
   "backup.hasSecrets": "Includes an encrypted secrets section (password required)",
   "backup.noSecrets": "No encrypted secrets section",

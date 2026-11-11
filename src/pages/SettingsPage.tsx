@@ -1382,17 +1382,18 @@ function ImportDialog({
   const showToast = useStore((s) => s.showToast);
   const [mode, setMode] = useState<ImportMode>("merge");
   const [pw, setPw] = useState("");
+  const [legacyConsent, setLegacyConsent] = useState(false);
   const [operation, setOperation] = useState<"import" | "sanitize" | null>(null);
   const busy = operation !== null;
   const [err, setErr] = useState<string | null>(null);
   const [report, setReport] = useState<ImportReport | null>(null);
 
   const run = async () => {
-    if (busy || preview.localConfig) return;
+    if (busy || preview.localConfig || (preview.unauthenticatedSecrets && !legacyConsent)) return;
     setOperation("import");
     setErr(null);
     try {
-      const r = await api.applyImportConfig(path, mode, preview.hasSecrets ? pw : undefined);
+      const r = await api.applyImportConfig(path, mode, preview.hasSecrets ? pw : undefined, legacyConsent);
       setReport(r);
       showToast(
         "success",
@@ -1475,6 +1476,7 @@ function ImportDialog({
   return (
     <ModalShell title={t("backup.importTitle")} icon={Upload} onClose={onClose} busy={busy}>
       <BackupImportPreview
+        legacyConsent={legacyConsent} onLegacyConsent={setLegacyConsent}
         path={path}
         preview={preview}
         busy={busy}
@@ -1558,7 +1560,7 @@ function ImportDialog({
         {!preview.localConfig && <Button
           size="sm"
           onClick={() => void run()}
-          disabled={busy || (preview.hasSecrets && pw.length === 0)}
+          disabled={busy || (preview.hasSecrets && pw.length === 0) || (preview.unauthenticatedSecrets && !legacyConsent)}
         >
           {operation === "sanitize" ? t("backup.sanitizing") : busy ? t("backup.importing") : t("backup.importAction")}
         </Button>}

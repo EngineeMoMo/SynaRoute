@@ -68,7 +68,7 @@ fn oversized_preview_and_both_import_modes_leave_configuration_and_files_unchang
     assert!(crate::service::preview_import(&store, &path).is_err());
     for mode in [ImportMode::Merge, ImportMode::Replace] {
         assert!(
-            crate::service::apply_import_config(&store, path.to_str().unwrap(), mode, None)
+            crate::service::apply_import_config(&store, path.to_str().unwrap(), mode, None, false)
                 .is_err()
         );
         assert_eq!(

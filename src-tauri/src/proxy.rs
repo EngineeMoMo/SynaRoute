@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 #[path = "model_pool.rs"] pub(crate) mod model_pool; // 对外模型并集 + 模型感知路由；来由见该文件模块注释
 #[path = "proxy/soft_error.rs"] mod soft_error; // 非流式「200 包着错误」的降级；调用**必须**排在 outcome.ok 守卫之前（有判据钉着），来由见该文件模块注释
 #[path = "proxy/codex_images.rs"] mod codex_images;
-pub(crate) mod active_requests; mod streaming;
+pub(crate) mod active_requests; mod streaming; pub(crate) mod key_chat;
 // 对外可选模型集的**唯一**实现。re-export 而不是留一层包装函数：包装函数会让
 // 「proxy.rs 生产段里不许有第二份并集实现」那条源码级判据失去意义。
 pub(crate) use model_pool::discoverable_models;

@@ -89,10 +89,11 @@ pub(crate) async fn import_in_background(
     path: String,
     mode: super::ImportMode,
     password: Option<String>,
+    allow_legacy_secrets: bool,
 ) -> AppResult<super::ImportReport> {
     blocking(move || {
         let password = password.map(Zeroizing::new);
-        crate::service::apply_import_config(&store, &path, mode, password.as_deref())
+        crate::service::apply_import_config(&store, &path, mode, password.as_deref(), allow_legacy_secrets)
     })
     .await
 }

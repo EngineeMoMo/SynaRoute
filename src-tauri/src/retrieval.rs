@@ -281,6 +281,9 @@ mod deny {
 
 /// 该文件是否因可能含凭据而**禁止**被检索/外发。见 [`deny`] 的分级理由。
 pub fn is_sensitive_path(path: &Path) -> bool {
+    if crate::aggregate::write::is_vcs_internal(&path.to_string_lossy()).is_some() {
+        return true;
+    }
     let name = path
         .file_name()
         .and_then(|n| n.to_str())

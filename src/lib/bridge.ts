@@ -49,6 +49,7 @@ import type { RoutingOverview } from "./routingOverview";
 import type { CategoryPolicy, RoutingPolicyView, RoutingSaveResult, RoutingScene, RoutingSyncResult, SceneApplied, ScenePreview, SensitiveScan } from "./routingPolicies";
 import { mockBridge } from "./mockData";
 import type { ActiveRequest, RequestStopResult } from "./activeRequests";
+import type { KeyChatRequest, KeyChatReply, KeyChatStarted } from "./keyChat";
 
 // Browser preview only: one mutable status so the switches stay consistent with each other.
 const layaMock: LayaLocalStatus = { supported: true, phase: "idle", endpoint: "http://127.0.0.1:8000/v1/systemone", logs: [], error: null, installed: false, autostart: false, mirror: false };
@@ -99,6 +100,13 @@ async function sessionCall<T>(cmd: string, args: Record<string, unknown>, progre
 }
 
 export const api = {
+  testKeyConversation: async (request: KeyChatRequest, onStarted: (started: KeyChatStarted) => void): Promise<KeyChatReply> => {
+    if (!isTauri()) return desktopOnly();
+    const { Channel } = await import("@tauri-apps/api/core");
+    const channel = new Channel<KeyChatStarted>();
+    channel.onmessage = onStarted;
+    return call<KeyChatReply>("test_key_conversation", { request, onStarted: channel }, desktopOnly);
+  },
   listActiveRequests: (categoryId: CategoryType) => call<ActiveRequest[]>("list_active_requests", { categoryId }, () => mockBridge.listActiveRequests(categoryId)),
   stopActiveRequest: (categoryId: CategoryType, requestId: string) => call<RequestStopResult>("stop_active_request", { categoryId, requestId }, () => mockBridge.stopActiveRequest(categoryId, requestId)),
   routingPolicies: () => call<RoutingPolicyView>("routing_policies", undefined, () => mockBridge.routingPolicies()),
@@ -650,8 +658,8 @@ export const api = {
     call<SanitizedBackupOutcome | null>("sanitize_legacy_backup", { path }, async () => null),
 
   /** 执行导入。path 来自 pickAndPreviewImport。 */
-  applyImportConfig: (path: string, mode: ImportMode, password?: string) =>
-    call<ImportReport>("apply_import_config", { path, mode, password }, async () => ({
+  applyImportConfig: (path: string, mode: ImportMode, password?: string, allowLegacySecrets = false) =>
+    call<ImportReport>("apply_import_config", { path, mode, password, allowLegacySecrets }, async () => ({
       mode,
       keysAdded: 0,
       keysOverwritten: 0,

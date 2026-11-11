@@ -619,6 +619,7 @@ export interface SanitizedBackupOutcome {
 }
 
 export interface ImportPreview {
+  unauthenticatedSecrets: boolean;
   formatVersion: number;
   /** 产出该文件的 SynaRoute 版本（仅供人看） */
   appVersion: string;
@@ -628,8 +629,8 @@ export interface ImportPreview {
   /** 其中与本机 id 重复的（merge 会覆盖它们） */
   conflictingKeys: number;
   /**
-   * id 相同但名字与地址都不同的条目：极可能是历史时间戳 id 跨机碰撞，
-   * 导入会把一条完全无关的本机 Key 覆盖成对方的配置。逐条显式警告，不混进计数。
+   * 同 id 的目标地址、协议或分类发生变化；逐条警告，不混进普通覆盖计数。
+   * 涉及本机现有凭证重绑定时，后端会在任何导入写入前拒绝。
    */
   suspiciousConflicts: SuspiciousConflict[];
   /** 本机独有、replace 模式会被删掉的 Key 数 */

@@ -1248,8 +1248,7 @@ impl Store {
     ) -> AppResult<Vec<String>> {
         use crate::portable::ImportMode;
         self.mutate_and_persist(|cfg| {
-            // Replace 会清空 keys：记下「本机原有、但导入载荷里没有」的 id，它们的密钥要清理。
-            // 载荷里也有的 id 不算移除（马上会被写回来，且随后可能要写入新密钥）。
+            crate::portable::credentials::validate_reuse(cfg, payload, &self.secrets.read().all_key_ids())?;
             let removed: Vec<String> = if mode == ImportMode::Replace {
                 let incoming: std::collections::HashSet<&str> =
                     payload.keys.iter().map(|k| k.id.as_str()).collect();
