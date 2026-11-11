@@ -153,7 +153,7 @@ jobs:
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           args: ${{ matrix.args }}
-          includeUpdaterJson: true
+          includeUpdaterJson: false
 
       # ---- 产物门：在这里，而不是「发完再人工看一眼」 ----
       #
@@ -198,6 +198,26 @@ jobs:
     needs: [create-release, build-tauri]
 
     steps:
+      - uses: actions/checkout@v4
+
+      - name: assemble complete updater manifest
+        uses: actions/github-script@v7
+        env:
+          release_id: ${{ needs.create-release.outputs.release_id }}
+        with:
+          script: |
+            const { pathToFileURL } = require('node:url')
+            const { publishUpdaterManifest } = await import(pathToFileURL(`${process.env.GITHUB_WORKSPACE}/scripts/lib/release-updater.mjs`).href)
+            const { version } = require(`${process.env.GITHUB_WORKSPACE}/package.json`)
+            const result = await publishUpdaterManifest({
+              github,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              releaseId: Number(process.env.release_id),
+              version
+            })
+            core.info(`Verified updater manifest with ${result.platformCount} platform entries.`)
+
       - name: publish release
         id: publish-release
         uses: actions/github-script@v7
@@ -205,7 +225,7 @@ jobs:
           release_id: ${{ needs.create-release.outputs.release_id }}
         with:
           script: |
-            github.rest.repos.updateRelease({
+            await github.rest.repos.updateRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
               release_id: process.env.release_id,
