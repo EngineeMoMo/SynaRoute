@@ -17,7 +17,7 @@ export function Footer() {
 
   // 与顶栏同样的锚点处理：不在首页时先回首页
   function goToHash(hash: string) {
-    if (location.pathname === homePath) {
+    if (location.pathname === "/" || location.pathname === homePath) {
       scrollToId(hash);
     } else {
       navigate(`${homePath}#${hash}`);

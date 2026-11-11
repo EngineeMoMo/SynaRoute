@@ -21,7 +21,7 @@ export function Header() {
   const [menuOpen, setMenuOpen] = useState(false);
 
   const homePath = path("");
-  const onHome = location.pathname === homePath || location.pathname === `${homePath}/`;
+  const onHome = location.pathname === "/" || location.pathname === homePath || location.pathname === `${homePath}/`;
 
   // 滚动后给顶栏加背景模糊与描边，首屏保持通透
   useEffect(() => {
@@ -57,7 +57,7 @@ export function Header() {
     if (onHome) {
       scrollToId(hash);
       // 让地址栏反映当前位置，但不产生历史记录堆积
-      window.history.replaceState(null, "", `${homePath}#${hash}`);
+      window.history.replaceState(null, "", `${location.pathname}${location.search}#${hash}`);
     } else {
       navigate(`${homePath}#${hash}`);
     }

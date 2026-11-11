@@ -19,7 +19,7 @@ export const LANGS: { value: Lang; label: string }[] = [
   { value: "en", label: "English" },
 ];
 
-export const DEFAULT_LANG: Lang = "zh";
+export const DEFAULT_LANG: Lang = "en";
 
 export type Dict = Record<string, string>;
 
@@ -39,7 +39,7 @@ export function translate(lang: Lang, key: string, vars?: Record<string, string 
 export type TFunc = (key: string, vars?: Record<string, string | number>) => string;
 
 /**
- * 非法语言段等兜底场景按浏览器语言挑一个；根网址固定跳转 /zh。
+ * 非法语言段等兜底场景按浏览器语言挑一个；根网址直接显示默认英文首页。
  * 只认前缀 `zh`，其余一律英文 —— 与其猜错不如给一个明确的默认。
  */
 export function detectLang(): Lang {

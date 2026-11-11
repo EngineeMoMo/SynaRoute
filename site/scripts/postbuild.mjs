@@ -41,7 +41,7 @@ for (const lang of LANGS) {
         "  <url>",
         `    <loc>${loc}</loc>`,
         alternates,
-        `    <xhtml:link rel="alternate" hreflang="x-default" href="${SITE_URL}/zh${p ? `/${p}` : ""}"/>`,
+        `    <xhtml:link rel="alternate" hreflang="x-default" href="${SITE_URL}/en${p ? `/${p}` : ""}"/>`,
         `    <lastmod>${today}</lastmod>`,
         // 首页权重最高，文档次之，条款类最低
         `    <priority>${p === "" ? "1.0" : p.startsWith("docs") ? "0.8" : "0.6"}</priority>`,

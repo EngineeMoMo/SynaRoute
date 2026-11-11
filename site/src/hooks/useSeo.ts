@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { useLocation } from "react-router-dom";
 import { siteConfig } from "@/config/site";
-import { LANGS, type Lang } from "@/i18n";
+import { DEFAULT_LANG, LANGS, type Lang } from "@/i18n";
 
 export interface SeoInput {
   title: string;
@@ -50,7 +50,8 @@ export function useSeo({ title, description, lang, image, type = "website" }: Se
 
   useEffect(() => {
     const fullTitle = title === siteConfig.name ? title : `${title} · ${siteConfig.name}`;
-    const canonical = `${siteConfig.url}${pathname}`;
+    const canonicalPath = pathname === "/" ? `/${DEFAULT_LANG}` : pathname;
+    const canonical = `${siteConfig.url}${canonicalPath}`;
     const ogImage = `${siteConfig.url}${image ?? siteConfig.ogImage}`;
 
     document.title = fullTitle;
@@ -81,6 +82,6 @@ export function useSeo({ title, description, lang, image, type = "website" }: Se
     for (const { value } of LANGS) {
       upsertLink("alternate", `${siteConfig.url}/${value}${rest ? `/${rest}` : ""}`, { hreflang: value });
     }
-    upsertLink("alternate", `${siteConfig.url}/zh${rest ? `/${rest}` : ""}`, { hreflang: "x-default" });
+    upsertLink("alternate", `${siteConfig.url}/${DEFAULT_LANG}${rest ? `/${rest}` : ""}`, { hreflang: "x-default" });
   }, [title, description, lang, image, type, pathname]);
 }

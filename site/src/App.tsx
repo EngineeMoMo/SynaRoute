@@ -53,7 +53,7 @@ function LangLayout() {
   const t = useT();
   const location = useLocation();
 
-  if (!isLang(lang)) {
+  if (!isLang(lang) && location.pathname !== "/") {
     const rest = location.pathname.split("/").filter(Boolean).slice(1).join("/");
     return <Navigate to={`/${detectLang()}${rest ? `/${rest}` : ""}`} replace />;
   }
@@ -93,8 +93,9 @@ export default function App() {
     <BrowserRouter>
       <ScrollManager />
       <Routes>
-        {/* 与生产环境的静态跳转一致，让根网址有稳定的规范目标。 */}
-        <Route path="/" element={<Navigate to="/zh" replace />} />
+        <Route path="/" element={<LangLayout />}>
+          <Route index element={<HomePage />} />
+        </Route>
 
         <Route path="/:lang" element={<LangLayout />}>
           <Route index element={<HomePage />} />
