@@ -14,7 +14,8 @@ const artifactNames = [
   `SynaRoute_${version}_x64_en-US.msi`, `SynaRoute_${version}_x64-setup.exe`,
 ];
 
-function fixtures() {
+function fixtures({ draft = false } = {}) {
+  const downloadTag = draft ? "untagged-96cb622799f0fb03553e" : `v${version}`;
   const packet = Buffer.alloc(74, 1);
   packet.write("ED", 0, "ascii");
   const signature = Buffer.from([
@@ -22,14 +23,14 @@ function fixtures() {
     "trusted comment: test fixture", Buffer.alloc(64, 2).toString("base64"), "",
   ].join("\n")).toString("base64");
   const assets = artifactNames.flatMap((name, index) => [
-    { id: index * 2 + 1, name, state: "uploaded", size: 100, browser_download_url: `https://github.com/${owner}/${repo}/releases/download/v${version}/${name}` },
-    { id: index * 2 + 2, name: `${name}.sig`, state: "uploaded", size: signature.length, browser_download_url: `https://github.com/${owner}/${repo}/releases/download/v${version}/${name}.sig` },
+    { id: index * 2 + 1, name, state: "uploaded", size: 100, browser_download_url: `https://github.com/${owner}/${repo}/releases/download/${downloadTag}/${name}` },
+    { id: index * 2 + 2, name: `${name}.sig`, state: "uploaded", size: signature.length, browser_download_url: `https://github.com/${owner}/${repo}/releases/download/${downloadTag}/${name}.sig` },
   ]);
   return { version, owner, repo, pubDate, assets, signatures: Object.fromEntries(artifactNames.map((name) => [name, signature])) };
 }
 
 function githubFixture({ roundTripObject = false } = {}) {
-  const inputs = fixtures();
+  const inputs = fixtures({ draft: true });
   const stored = new Map<number, Buffer | string>();
   for (const asset of inputs.assets.filter((asset) => asset.name.endsWith(".sig"))) {
     stored.set(asset.id, inputs.signatures[asset.name.slice(0, -4)]);
@@ -64,6 +65,28 @@ describe("complete release updater manifest", () => {
       expect(entry.url).toContain(`/releases/download/v${version}/`);
       expect(entry.signature).toBe(inputs.signatures[artifactNames[0]]);
     }
+  });
+
+  it("converts GitHub draft asset URLs into fixed release-tag URLs", () => {
+    const inputs = fixtures({ draft: true });
+    const manifest = buildUpdaterManifest(inputs);
+    expect(Object.keys(manifest.platforms)).toHaveLength(11);
+    for (const entry of Object.values(manifest.platforms) as Array<{ url: string }>) {
+      expect(entry.url).toContain(`/releases/download/v${version}/`);
+      expect(entry.url).not.toContain("untagged-");
+    }
+  });
+
+  it.each([
+    `https://example.test/${owner}/${repo}/releases/download/untagged-96cb622799f0fb03553e/${artifactNames[0]}`,
+    `https://github.com/${owner}/Other/releases/download/untagged-96cb622799f0fb03553e/${artifactNames[0]}`,
+    `https://github.com/${owner}/${repo}/releases/download/v0.1.83/${artifactNames[0]}`,
+    `https://github.com/${owner}/${repo}/releases/download/untagged-96cb622799f0fb03553e/other.AppImage`,
+    `https://github.com/${owner}/${repo}/releases/download/untagged-96cb622799f0fb03553e/${artifactNames[0]}?download=1`,
+  ])("rejects an unexpected draft download location: %s", (url) => {
+    const inputs = fixtures({ draft: true });
+    inputs.assets[0].browser_download_url = url;
+    expect(() => buildUpdaterManifest(inputs)).toThrow("Unexpected download URL");
   });
 
   it.each(artifactNames)("rejects a missing artifact: %s", (name) => {
@@ -177,7 +200,7 @@ describe("complete release updater manifest", () => {
     const child = `
       import assert from "node:assert/strict";
       import { createRequire } from "node:module";
-      const inputs = ${JSON.stringify(fixtures())};
+      const inputs = ${JSON.stringify(fixtures({ draft: true }))};
       const stored = new Map();
       for (const asset of inputs.assets.filter(asset => asset.name.endsWith(".sig"))) {
         stored.set(asset.id, inputs.signatures[asset.name.slice(0, -4)]);

@@ -26,7 +26,10 @@ function assetPlan({ version, owner, repo, assets }) {
     const artifact = requireAsset(assets, name);
     const signatureAsset = requireAsset(assets, `${name}.sig`);
     const url = `https://github.com/${owner}/${repo}/releases/download/${encodeURIComponent(`v${version}`)}/${encodeURIComponent(name)}`;
-    if (artifact.browser_download_url !== url || signatureAsset.size > 16384) {
+    const draftTag = artifact.browser_download_url?.split("/").at(-2);
+    const isDraftUrl = /^untagged-[a-f0-9]+$/.test(draftTag ?? "") &&
+      artifact.browser_download_url === `https://github.com/${owner}/${repo}/releases/download/${draftTag}/${encodeURIComponent(name)}`;
+    if ((artifact.browser_download_url !== url && !isDraftUrl) || signatureAsset.size > 16384) {
       throw new Error(`Unexpected download URL or signature size: ${name}`);
     }
     return { name, platforms, artifact, signatureAsset, url };
