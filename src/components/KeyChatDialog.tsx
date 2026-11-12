@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Loader2, MessageSquare, Send, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/Button";
+import { Combobox } from "@/components/ui/Combobox";
 import { DialogBody, DialogFooter, DialogFrame, DialogHeader } from "@/components/ui/DialogFrame";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { api } from "@/lib/bridge";
@@ -137,12 +138,12 @@ export function KeyChatDialog({ provider, onClose }: { provider: ProviderKey; on
     <DialogBody className="space-y-3">
       <p className="text-xs leading-relaxed text-text-secondary">{translate("keyChat.scope")}</p>
       <p className="break-all font-mono text-[11px] text-text-muted">{provider.baseUrl}</p>
-      <label className="block space-y-1 text-xs text-text-secondary" htmlFor={modelId}>
-        <span>{translate("keyChat.model")}</span>
-        <input id={modelId} list={`${modelId}-options`} className={inputClass} value={model} maxLength={200} disabled={busy}
-          placeholder={translate("keyChat.modelPlaceholder")} onChange={(event) => { clear(); setModel(event.target.value); }} />
-        <datalist id={`${modelId}-options`}>{models.map((option) => <option key={option} value={option} />)}</datalist>
-      </label>
+      <div className="space-y-1 text-xs text-text-secondary">
+        <label htmlFor={modelId}>{translate("keyChat.model")}</label>
+        <Combobox id={modelId} className={inputClass} value={model} options={models} maxLength={200} disabled={busy}
+          placeholder={translate("keyChat.modelPlaceholder")} emptyHint={translate("keyChat.modelPlaceholder")}
+          onChange={(value) => { if (value !== model) { clear(); setModel(value); } }} />
+      </div>
       {!provider.hasSecret && <p role="alert" className="text-xs text-warning">{translate("keyChat.missingSecret")}</p>}
       <div ref={transcript} role="log" aria-label={translate("keyChat.transcript")} aria-live="polite" className="h-64 space-y-3 overflow-y-auto rounded-control border border-border bg-surface-elevated p-3">
         {messages.length === 0 && !pendingText && <p className="text-xs text-text-muted">{translate("keyChat.empty")}</p>}

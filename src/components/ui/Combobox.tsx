@@ -9,6 +9,9 @@ interface ComboboxProps {
   /** 允许输入不在候选里的自定义值（默认允许） */
   allowCustom?: boolean;
   className?: string;
+  id?: string;
+  maxLength?: number;
+  disabled?: boolean;
   /** 无候选时的提示 */
   /** 空态文案。**必填**：本组件在 ui/ 下、拿不到 useT()，若给默认值就只能写死一种语言
    *  （原先默认 "无匹配项"，英文界面下会露出中文）。设为必填让编译器强制调用方传已翻译的串。 */
@@ -25,7 +28,10 @@ export function Combobox({
   onChange,
   placeholder,
   allowCustom = true,
-  className = "",
+  className = "sr-control h-9 w-full px-3 text-sm placeholder:text-text-muted",
+  id,
+  maxLength,
+  disabled = false,
   emptyHint,
 }: ComboboxProps) {
   const [open, setOpen] = useState(false);
@@ -43,6 +49,11 @@ export function Combobox({
   // 点击外部关闭
   useEffect(() => {
     if (!open) return;
+    if (disabled) {
+      setOpen(false);
+      setTyping(false);
+      return;
+    }
     const onDown = (e: MouseEvent) => {
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
         setOpen(false);
@@ -51,9 +62,10 @@ export function Combobox({
     };
     document.addEventListener("mousedown", onDown);
     return () => document.removeEventListener("mousedown", onDown);
-  }, [open]);
+  }, [open, disabled]);
 
   const commit = (v: string) => {
+    if (disabled) return;
     onChange(v);
     setOpen(false);
     setTyping(false);
@@ -66,6 +78,9 @@ export function Combobox({
     <div ref={rootRef} className="relative">
       <div className="relative">
         <input
+          id={id}
+          maxLength={maxLength}
+          disabled={disabled}
           className={`${className} pr-8 transition-all duration-150 focus:border-route focus:outline-none focus:ring-2 focus:ring-route/20`}
           value={shownValue}
           placeholder={placeholder}
@@ -83,17 +98,18 @@ export function Combobox({
         <button
           type="button"
           tabIndex={-1}
+          disabled={disabled}
           onClick={() => {
             setOpen((v) => !v);
             setTyping(false);
           }}
-          className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-text-muted transition-colors hover:bg-surface-hover hover:text-text-primary"
+          className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-text-muted transition-colors hover:bg-surface-hover hover:text-text-primary disabled:pointer-events-none disabled:opacity-50"
         >
           <ChevronDown size={14} className={open ? "rotate-180 transition-transform" : "transition-transform"} />
         </button>
       </div>
 
-      {open && (
+      {open && !disabled && (
         <div className="absolute z-20 mt-1 max-h-48 w-full overflow-y-auto rounded-control border border-border-strong/70 bg-surface-overlay py-1 shadow-elevated backdrop-blur-sm">
           {filtered.length === 0 ? (
             <div className="px-3 py-2 text-xs text-text-muted">{emptyHint}</div>

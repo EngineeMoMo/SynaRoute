@@ -5,6 +5,7 @@ import { conversationError, keyChatModels, KeyChatRun, type KeyChatStarted } fro
 import { keyChatEn, keyChatZh } from "../src/lib/i18n.keyChat";
 import { translate } from "../src/lib/i18n";
 import { KeyChatDialog } from "../src/components/KeyChatDialog";
+import { Combobox } from "../src/components/ui/Combobox";
 import { api } from "../src/lib/bridge";
 import type { ProviderKey } from "../src/types";
 
@@ -14,7 +15,7 @@ const provider: ProviderKey = {
   id: "selected", categoryId: "codex", name: "Test provider", vendor: "custom",
   baseUrl: "https://provider.example/v1", protocol: "openai_chat", hasSecret: true,
   enabled: false, allowInAggregate: false, priority: 0, params: {},
-  models: [{ realName: "model-a", source: "manual" }],
+  models: [{ realName: "model-a", source: "manual" }, { realName: "model-b", source: "manual" }],
   mappings: [{ id: "mapping", expectedName: "alias", realName: "model-a" }],
   defaultModel: "model-a", health: { status: "unknown", failCount: 0 },
 };
@@ -22,7 +23,7 @@ const started: KeyChatStarted = { requestId: "request-id", categoryId: "codex" }
 
 describe("single-Key conversation tests", () => {
   it("deduplicates model suggestions and includes this Key's aliases", () => {
-    expect(keyChatModels(provider)).toEqual(["model-a", "alias"]);
+    expect(keyChatModels(provider)).toEqual(["model-a", "model-b", "alias"]);
   });
 
   it("enforces UTF-8 byte and history limits", () => {
@@ -72,7 +73,26 @@ describe("single-Key conversation tests", () => {
     expect(html).toContain('role="log"');
     expect(html).toContain("Clear conversation");
     expect(html).toContain("Send test");
+    const modelInput = html.match(/<input\b[^>]*>/)?.[0] ?? "";
+    const modelId = modelInput.match(/\bid="([^"]+)"/)?.[1];
+    expect(modelId).toBeTruthy();
+    expect(html).toContain(`for="${modelId}"`);
+    expect(modelInput).toContain('maxLength="200"');
+    expect(modelInput).toContain('value="model-a"');
     expect(html).not.toMatch(/keyChat\.[A-Za-z]/);
+  });
+
+  it.each([false, true])("locks both model entry and its picker while busy=%s", (disabled) => {
+    const html = renderToStaticMarkup(createElement(Combobox, {
+      value: "model-b", options: keyChatModels(provider), onChange: vi.fn(),
+      emptyHint: "Enter a model", disabled,
+    }));
+    const input = html.match(/<input\b[^>]*>/)?.[0] ?? "";
+    const picker = html.match(/<button\b[^>]*>/)?.[0] ?? "";
+    expect(input).toContain('value="model-b"');
+    expect(picker).toContain('type="button"');
+    expect(input.includes('disabled=""')).toBe(disabled);
+    expect(picker.includes('disabled=""')).toBe(disabled);
   });
 
   it("explains missing credentials without offering a fake successful test", async () => {
