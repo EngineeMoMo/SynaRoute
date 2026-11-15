@@ -42,7 +42,7 @@ fn enabled(
             .split(';')
             .next()
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
-        && content_encoding.map_or(true, |value| value.eq_ignore_ascii_case("identity"))
+        && content_encoding.is_none_or(|value| value.eq_ignore_ascii_case("identity"))
 }
 
 struct Relay<S> {

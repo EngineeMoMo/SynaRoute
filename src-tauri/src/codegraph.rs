@@ -21,7 +21,9 @@
 
 use crate::proc::hidden;
 use serde::{Deserialize, Serialize};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -303,15 +305,17 @@ pub async fn init_project(work_dir: &Path) -> Result<String, String> {
         "未找到 codegraph 可执行文件；请先安装（npm i -g @colbymchenry/codegraph）".to_string()
     })?;
     let dir = work_dir.to_string_lossy().to_string();
-    let out = match tokio::time::timeout(
+    let out = match timeout_output_with_limit(
+        hidden(&r.program).args(["init", &dir]),
         INIT_TIMEOUT,
-        hidden(&r.program).args(["init", &dir]).output(),
     )
     .await
     {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => return Err(format!("启动 codegraph init 失败: {e}")),
-        Err(_) => return Err("codegraph init 超时（超过 10 分钟）".into()),
+        Ok(o) => o,
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+            return Err("codegraph init 超时（超过 10 分钟）".into())
+        }
+        Err(e) => return Err(format!("启动 codegraph init 失败: {e}")),
     };
     let text = format!(
         "{}{}",
@@ -333,13 +337,72 @@ pub async fn init_project(work_dir: &Path) -> Result<String, String> {
 
 /// 带超时地执行命令并收集输出。超时视为失败（Err），避免卡死拖垮整轮聚合。
 async fn timeout_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
-    match tokio::time::timeout(CLI_TIMEOUT, cmd.output()).await {
-        Ok(r) => r,
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "codegraph CLI 超时",
-        )),
-    }
+    timeout_output_with_limit(cmd, CLI_TIMEOUT).await
+}
+
+/// 执行命令并在超时后明确终止子进程。
+///
+/// 不能直接对 `cmd.output()` 套 `timeout`：Future 被取消只会停止等待，已经启动的
+/// codegraph 进程仍可能继续跑。这里自己持有 `Child`，超时分支 kill + wait，并让
+/// `kill_on_drop` 覆盖异常退出路径。
+#[allow(clippy::io_other_error)]
+async fn timeout_output_with_limit(
+    cmd: &mut Command,
+    limit: Duration,
+) -> std::io::Result<std::process::Output> {
+    use tokio::io::AsyncReadExt;
+
+    cmd.kill_on_drop(true);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "codegraph stdout 未建立管道"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "codegraph stderr 未建立管道"))?;
+
+    let stdout_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+
+    let status = match tokio::time::timeout(limit, child.wait()).await {
+        Ok(result) => result?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "codegraph CLI 超时",
+            ));
+        }
+    };
+
+    let stdout = stdout_task
+        .await
+        .map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("读取 codegraph stdout 失败: {e}"))
+        })??;
+    let stderr = stderr_task
+        .await
+        .map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("读取 codegraph stderr 失败: {e}"))
+        })??;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// 跑一条 codegraph 子命令并把 stdout 解析成 `T`。
@@ -746,6 +809,48 @@ mod tests {
             "空目录里没有 .codegraph/，不该报就绪；实得 {st:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn timeout_output_terminates_the_child_process() {
+        let marker = std::env::temp_dir().join(format!(
+            "synaroute_codegraph_timeout_{}.txt",
+            std::process::id()
+        ));
+        let marker_text = marker.to_string_lossy().replace('\\', "/");
+        let mut command = {
+            #[cfg(windows)]
+            {
+                let mut command = hidden("powershell");
+                command.args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &format!(
+                        "Start-Sleep -Milliseconds 500; Set-Content -LiteralPath '{}' -Value leaked",
+                        marker_text
+                    ),
+                ]);
+                command
+            }
+            #[cfg(not(windows))]
+            {
+                let mut command = hidden("sh");
+                command.args([
+                    "-c",
+                    &format!("sleep 0.5; printf leaked > '{}'", marker_text),
+                ]);
+                command
+            }
+        };
+
+        let error = timeout_output_with_limit(&mut command, Duration::from_millis(50))
+            .await
+            .expect_err("超时必须返回 TimedOut");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(!marker.exists(), "超时后子进程不得继续执行后续写入");
+        std::fs::remove_file(marker).ok();
     }
 
     /// `detect` 必须真的去问文件系统「`.codegraph/` 在不在」。

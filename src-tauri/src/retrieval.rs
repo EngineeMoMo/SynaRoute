@@ -8,6 +8,7 @@
 //! 5. 按 max_tokens 限制裁剪内容
 
 use crate::agent_tools::is_sensitive_read_path;
+use crate::aggregate::write::{is_safe_relative_path, is_within_work_root};
 use crate::error::AppResult;
 use crate::proc::hidden;
 use serde::{Deserialize, Serialize};
@@ -186,6 +187,11 @@ fn walk_search(work_dir: &Path, keywords: &[String], max_files: usize) -> Vec<(P
                 .map(|e| e.to_lowercase())
                 .unwrap_or_default();
             if !TEXT_EXT.contains(&ext.as_str()) {
+                continue;
+            }
+            // 在打开文件前就执行敏感路径与硬链接校验；后面的统一过滤仍保留，
+            // 负责给 grep 路径和诊断结果做最终收口。
+            if is_sensitive_read_path(&path) {
                 continue;
             }
             scanned += 1;
@@ -419,11 +425,22 @@ async fn codegraph_symbols(
 ///
 /// 行号是 1-based 且**含端点**（codegraph 的约定，实机验证）。单个符号上限
 /// `MAX_SYMBOL_LINES` 行——防 God method 一口吃掉整个预算。
+fn resolve_codegraph_file(work_dir: &Path, file_path: &str) -> Option<PathBuf> {
+    if !is_safe_relative_path(file_path) {
+        return None;
+    }
+    let abs = work_dir.join(file_path);
+    if !is_within_work_root(work_dir, &abs) {
+        return None;
+    }
+    Some(abs)
+}
+
 fn slice_symbol(work_dir: &Path, node: &crate::codegraph::SymbolNode) -> Option<String> {
     const MAX_SYMBOL_LINES: usize = 150;
     const MAX_UNKNOWN_LINES: usize = 40;
 
-    let abs = work_dir.join(&node.file_path);
+    let abs = resolve_codegraph_file(work_dir, &node.file_path)?;
     if is_sensitive_read_path(&abs) {
         return None;
     }
@@ -644,7 +661,10 @@ fn pack_symbols(
         if total >= max_tokens {
             break;
         }
-        let abs = work_path.join(&n.file_path);
+        let Some(abs) = resolve_codegraph_file(work_path, &n.file_path) else {
+            denied += 1;
+            continue;
+        };
         if is_sensitive_read_path(&abs) {
             denied += 1;
             continue;
@@ -902,6 +922,36 @@ mod tests {
             "敏感文件即使被索引也不得切出内容"
         );
         std::fs::remove_dir_all(work).ok();
+    }
+
+    #[test]
+    fn codegraph_slice_refuses_paths_outside_work_root() {
+        let base = std::env::temp_dir().join(format!(
+            "synaroute_codegraph_boundary_{}",
+            std::process::id()
+        ));
+        let work = base.join("work");
+        let outside = base.join("outside.txt");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(&outside, "outside-secret\n").unwrap();
+
+        let mut diagnostics = Vec::new();
+        let (files, used) = pack_symbols(
+            &work,
+            &[
+                node("../outside.txt", 1, Some(1)),
+                node(&outside.to_string_lossy(), 1, Some(1)),
+            ],
+            100,
+            &mut diagnostics,
+        );
+
+        assert!(files.is_empty(), "codegraph 不得读取工作目录外文件");
+        assert_eq!(used, 0);
+        assert_eq!(diagnostics.iter().filter(|d| d.contains("凭据")).count(), 1);
+        assert!(slice_symbol(&work, &node("../outside.txt", 1, Some(1))).is_none());
+
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]

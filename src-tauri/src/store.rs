@@ -723,7 +723,7 @@ impl Store {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
             // 只在 1/10/100/1000… 这些量级点告警，避免磁盘僵死时告警本身刷爆日志。
-            if n == 1 || n % 100 == 0 {
+            if n == 1 || n.is_multiple_of(100) {
                 tracing::warn!("日志队列已满，累计丢弃 {n} 条（磁盘可能僵死或写入过慢）");
             }
         }

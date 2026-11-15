@@ -261,7 +261,7 @@ fn delete_threads_rows(home: &Path, data_dir: &Path, ids: &[String]) -> Option<S
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| e.to_string())?;
             for chunk in ids.chunks(SQL_CHUNK) {
-                let holes = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+                let holes = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
                 tx.execute(&format!("DELETE FROM threads WHERE id IN ({holes})"),
                     rusqlite::params_from_iter(chunk)).map_err(|e| e.to_string())?;
             }

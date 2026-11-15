@@ -176,7 +176,7 @@ pub fn emit(topic: Topic, category: Option<CategoryType>) {
     if tx.try_send((topic, category)).is_err() {
         let n = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
         // 只在量级点告警，避免高频丢弃时告警本身刷爆日志（照抄日志队列的节流写法）。
-        if n == 1 || n % 100 == 0 {
+        if n == 1 || n.is_multiple_of(100) {
             tracing::warn!("状态推送队列已满，累计丢弃 {n} 条（前端 30s 兜底轮询仍会追上）");
         }
     }

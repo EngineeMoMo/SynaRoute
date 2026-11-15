@@ -106,7 +106,7 @@ pub(crate) fn rectify_on_budget_error(
         return true;
     }
     if current == Some(floor) || (raise && current.is_some_and(|n| n > floor))
-        || (!raise && current.map_or(true, |n| n < floor)) { return false; }
+        || (!raise && current.is_none_or(|n| n < floor)) { return false; }
     payload["thinking"]["budget_tokens"] = Value::from(floor);
     let verb = if raise { "抬高" } else { "降低" };
     store.append_event(category, "failover", Some(&key.id), &format!(

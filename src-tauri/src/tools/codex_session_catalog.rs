@@ -415,7 +415,7 @@ pub(in crate::tools) fn repair_one(
     // ① provider：只改 local host，避免同库里的远端 catalog 副本被连带改写。
     if cols.contains("model_provider") && cols.contains("thread_id") {
         for chunk in mutable_ids.chunks(super::SQL_CHUNK) {
-            let holes = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+            let holes = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
             let sql = format!(
                 "UPDATE local_thread_catalog SET model_provider = ?1 \
                  WHERE host_id = ?2 AND thread_id IN ({holes}) AND model_provider IS NOT ?1"
@@ -434,7 +434,7 @@ pub(in crate::tools) fn repair_one(
     // ② `missing_candidate`：我们手上有「rollout 真的在磁盘上」这个事实，所以能确定地清掉它。
     if cols.contains("missing_candidate") && cols.contains("thread_id") {
         for chunk in mutable_ids.chunks(super::SQL_CHUNK) {
-            let holes = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+            let holes = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
             let sql = format!(
                 "UPDATE local_thread_catalog SET missing_candidate = 0 \
                  WHERE host_id = ?1 AND thread_id IN ({holes}) AND COALESCE(missing_candidate, 0) <> 0"
@@ -484,7 +484,7 @@ pub(in crate::tools) fn repair_one(
         )
         .unwrap_or(0);
     let insert_cols = insert_columns(&cols);
-    let holes = std::iter::repeat("?").take(insert_cols.len()).collect::<Vec<_>>().join(", ");
+    let holes = std::iter::repeat_n("?", insert_cols.len()).collect::<Vec<_>>().join(", ");
     let sql = format!(
         "INSERT OR IGNORE INTO local_thread_catalog ({}) VALUES ({holes})",
         insert_cols.join(", ")

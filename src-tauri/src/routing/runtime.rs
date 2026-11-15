@@ -107,7 +107,7 @@ impl Runtime {
         if lease.failed.load(Ordering::Acquire) { return; }
         if let Some(state) = self.sessions.lock().get_mut(&(lease.category, lease.session.clone())) {
             if state.generation == lease.generation && state.turn == lease.turn
-                && state.binding.as_ref().map_or(true, |b| b.ticket <= lease.ticket) {
+                && state.binding.as_ref().is_none_or(|b| b.ticket <= lease.ticket) {
                 if lease.failed.load(Ordering::Acquire) { return; }
                 state.previous_model = state.model.clone();
                 state.binding = Some(Binding { key_id: key_id.into(), real_model: real_model.into(), ticket: lease.ticket });

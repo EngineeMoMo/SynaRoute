@@ -148,7 +148,7 @@ pub async fn apply_codex_session_id_repair(token: String, on_progress: Channel<P
         let _guard = guard::acquire(&home)?;
         let plan = {
             let mut cached = PREVIEW.lock().map_err(|_| "修复预览状态不可用，请重启应用")?;
-            if cached.as_ref().map_or(true, |plan| plan.token != token) {
+            if cached.as_ref().is_none_or(|plan| plan.token != token) {
                 return Err("修复预览已失效，请重新扫描".into());
             }
             cached.take().ok_or_else(|| "缺少修复预览".to_string())?

@@ -1212,18 +1212,7 @@ pub fn run() {
             // 定时检查更新（30 分钟一轮，先睡后查）。**必须在 setup 里起**（要 AppHandle 才拿得到 updater）；不做前端定时器 / 不搭探测车的理由见该模块文档。
             update_watch::spawn_background(app.handle().clone(), state.store.clone()); store::decision::laya_local::autostart_on_launch(); // 用户开启时启动已装好的 Laya，永不安装
 
-            // 深链接导入（synaroute://）：`register` 让直接跑 exe / tauri dev 也能被唤起、且自愈（安装包也注册；macOS 由 bundle 注册，故此调用返 UnsupportedPlatform、`let _` 忽略）。
-            // `on_open_url` 覆盖冷启动与 macOS 已运行；Windows 已运行走 single-instance 回调（见上），两处同调 `handle_deeplink`。
-            {
-                use tauri_plugin_deep_link::DeepLinkExt;
-                let h = app.handle().clone();
-                let _ = app.deep_link().register("synaroute");
-                app.deep_link().on_open_url(move |event| {
-                    for url in event.urls() {
-                        deeplink_import::handle_deeplink(&h, url.as_str());
-                    }
-                });
-            }
+            deeplink_import::setup(app.handle());
 
             // 随系统启动时最小化到托盘（FR-025 需求原文要求）。判据是启动参数里有
             // `--autostart`（注册自启动项时带上的），而非「auto_start 为真」——

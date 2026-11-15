@@ -52,7 +52,7 @@ pub(crate) fn tray_tooltip(app: &tauri::AppHandle) -> String {
 /// 仅非 macOS 使用（mac 上托盘图标是 template，见 `apply_tray_icon`）。
 #[cfg(not(target_os = "macos"))]
 fn desaturate_rgba_in_place(rgba: &mut [u8]) -> bool {
-    if rgba.is_empty() || rgba.len() % 4 != 0 {
+    if rgba.is_empty() || !rgba.len().is_multiple_of(4) {
         return false;
     }
     for px in rgba.chunks_exact_mut(4) {

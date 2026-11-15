@@ -407,7 +407,7 @@ fn apply(result: Result<(Vec<OnlineRow>, String), String>, config_path: &Path, n
 /// 时间戳在**未来**（系统时钟回拨过）也算该刷新：否则一次回拨就让刷新停摆到时钟追上来为止。
 /// `saturating_sub` 防的是被手改过的缓存里塞了一个离谱的时间戳 —— 普通减法在调试构建下会溢出崩溃。
 fn is_due(fetched_at_ms: Option<i64>, now_ms: i64) -> bool {
-    fetched_at_ms.map_or(true, |t| !(0..REFRESH_MS).contains(&now_ms.saturating_sub(t)))
+    fetched_at_ms.is_none_or(|t| !(0..REFRESH_MS).contains(&now_ms.saturating_sub(t)))
 }
 
 /// 起后台刷新线程。在 `lib.rs` 里与 `balance_gate` / `codex_watch` 并列调一次。

@@ -215,7 +215,7 @@ where
         Ok((socket, bound))
     };
     let fallback = if exact { 0 } else { 8 };
-    for port in std::iter::once(preferred).chain(std::iter::repeat(0).take(fallback)) {
+    for port in std::iter::once(preferred).chain(std::iter::repeat_n(0, fallback)) {
         let Ok((_reservation, bound)) = reserve(port) else { continue };
         if !answers(bound).await {
             return Ok(bound);
@@ -475,7 +475,7 @@ async fn monitor_with_budget(id: String, port: u16, budget: fn(&str) -> u64) {
 fn health_due(phase: &str, tick: u64) -> bool {
     match phase {
         "model" | "degraded" => true,
-        "running" => tick % 5 == 0,
+        "running" => tick.is_multiple_of(5),
         _ => false,
     }
 }

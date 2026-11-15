@@ -189,6 +189,28 @@ pub(crate) fn handle_deeplink(app: &tauri::AppHandle, url: &str) {
     }
 }
 
+pub(crate) fn setup(app: &tauri::AppHandle) {
+    use tauri_plugin_deep_link::DeepLinkExt;
+
+    let handle = app.clone();
+    let _ = app.deep_link().register("synaroute");
+    app.deep_link().on_open_url(move |event| {
+        for url in event.urls() {
+            handle_deeplink(&handle, url.as_str());
+        }
+    });
+
+    match app.deep_link().get_current() {
+        Ok(Some(urls)) => {
+            for url in urls {
+                handle_deeplink(app, url.as_str());
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("读取启动深链接失败: {e}"),
+    }
+}
+
 // ============ IPC 命令（前端 bridge.ts 对齐） ============
 
 /// 确认框挂载时拉取当前待确认的导入预览（**不含密钥**）；无则 None。

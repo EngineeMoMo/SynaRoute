@@ -284,26 +284,39 @@ pub(crate) fn is_within_work_root(work_root: &Path, candidate: &Path) -> bool {
 /// 看不见链接。
 fn check_no_link_escape(work_root: &Path, full_path: &Path) -> Result<(), String> {
     // ① 最近的已存在祖先必须在 root 之内。
-    let mut probe = full_path.parent();
-    while let Some(dir) = probe {
-        if dir.exists() {
-            if !is_within_work_root(work_root, dir) {
-                return Err("目标解析后落在工作目录之外（疑似链接目录逃逸），已拒绝写入".into());
+    //
+    // 用 `symlink_metadata` 而不是 `exists()`：后者跟随链接，且对悬空链接返回 false。
+    // 若 `work/link` 指向一个尚不存在的目录，`create_dir_all(work/link/sub)` 仍可能沿着
+    // 这条悬空链接在工作目录外创建目录；因此链接本身必须在「最近的祖先」判定中被看见。
+    let root = work_root
+        .canonicalize()
+        .map_err(|_| "工作目录不存在或无法解析，已拒绝写入".to_string())?;
+    let mut probe = Some(full_path);
+    while let Some(path) = probe {
+        match std::fs::symlink_metadata(path) {
+            Ok(md) => {
+                if path == full_path && md.file_type().is_symlink() {
+                    return Err("目标是符号链接，写入会覆盖链接指向的文件，已拒绝写入".into());
+                }
+                let resolved = path.canonicalize().map_err(|_| {
+                    "目标路径含无法解析的符号链接，已拒绝写入".to_string()
+                })?;
+                if !resolved.starts_with(&root) {
+                    return Err("目标解析后落在工作目录之外（疑似链接目录逃逸），已拒绝写入".into());
+                }
+                break;
             }
-            break;
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                probe = path.parent();
+            }
+            Err(e) => {
+                return Err(format!("无法检查目标路径，已放弃写入：{e}"));
+            }
         }
-        probe = dir.parent();
     }
     // 一路向上都不存在（work_dir 本身都没了）：无法确认落点，fail-closed。
     if probe.is_none() {
         return Err("工作目录不存在或无法解析，已拒绝写入".into());
-    }
-
-    // ② 目标本身不得是符号链接（用 symlink_metadata，它不跟随链接）。
-    if let Ok(md) = std::fs::symlink_metadata(full_path) {
-        if md.file_type().is_symlink() {
-            return Err("目标是符号链接，写入会覆盖链接指向的文件，已拒绝写入".into());
-        }
     }
     Ok(())
 }
@@ -1255,6 +1268,35 @@ mod tests {
             "链接目标目录下绝不能被建出子目录"
         );
         assert!(!outside.join("sub/pwned.txt").exists(), "更不能写入内容");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 悬空链接也不能被 `create_dir_all` 当成工作目录内的普通目录继续向外创建。
+    #[test]
+    fn refuses_dangling_linked_dir_before_create_dir_all() {
+        let dir = temp_dir("apply_dangling_symlink");
+        let work = dir.join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let missing_target = outside.join("newdir");
+        let link = work.join("vendor");
+        if !link_file_for_test(&missing_target, &link) {
+            eprintln!("跳过：当前环境无法创建悬空文件符号链接");
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        assert!(!missing_target.exists());
+        let changes = apply(&work, "```file:vendor/sub/pwned.txt\nHACKED\n```\n");
+        assert_eq!(changes.len(), 1);
+        assert!(
+            !changes[0].success,
+            "悬空链接目录必须在建目录前被拒: {changes:?}"
+        );
+        assert!(why(&changes[0]).contains("无法解析"), "应报告链接无法解析: {changes:?}");
+        assert!(!missing_target.exists(), "悬空链接目标目录不能被创建");
 
         std::fs::remove_dir_all(&dir).ok();
     }

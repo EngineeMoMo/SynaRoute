@@ -155,7 +155,7 @@ fn threads_would_mutate(db: &Path, target: &str, ids: &[String]) -> bool {
         return true;
     };
     ids.chunks(SQL_CHUNK).any(|chunk| {
-        let holes = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let holes = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
         let target_pos = chunk.len() + 1;
         let sql = format!(
             "SELECT 1 FROM threads WHERE id IN ({holes}) AND model_provider IS NOT ?{target_pos} LIMIT 1"
@@ -300,8 +300,7 @@ pub(super) fn set_threads_provider(db: &Path, provider: &str, ids: &[String]) ->
     // `too many SQL variables` —— 而那是「安静失败」（路由不受影响，只有列表不同步）。
     let mut total = 0usize;
     for chunk in ids.chunks(SQL_CHUNK) {
-        // `repeat_n` 要 Rust 1.82，而本仓 MSRV 是 1.77（clippy 的 incompatible_msrv 会拦）。
-        let holes = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let holes = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
         let sql = format!(
             "UPDATE threads SET model_provider = ?1 \
              WHERE id IN ({holes}) AND model_provider IS NOT ?1"

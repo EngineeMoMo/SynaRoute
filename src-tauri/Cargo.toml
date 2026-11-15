@@ -1,10 +1,10 @@
 [package]
 name = "synaroute"
-version = "0.1.85"
+version = "0.1.86"
 description = "SynaRoute - 智能 API Key 路由代理与配置管理"
 authors = ["SynaRoute"]
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.90"
 
 [lib]
 name = "synaroute_lib"
@@ -25,7 +25,7 @@ tauri-build = { version = "2", features = [] }
 # dmg 分发，不上架，故可接受。若日后要上架，得把悬浮球在 macOS 上改成非透明形态。
 tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-shell = "2"
-tauri-plugin-updater = "2"
+tauri-plugin-updater = "2.14.1"
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 # 深链接一键导入（synaroute://）：网页点「导入到 SynaRoute」→ 唤起本应用弹确认框导入 Key。
@@ -58,7 +58,7 @@ toml = "0.8"
 
 # 读 cc-switch 的历史配置库（SQLite）以导入既有 Key。只读、绝不写回。
 # bundled：自带 SQLite C 源码一起编，免去用户机器上装 sqlite3 运行库。
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "backup"] }
 
 # 加密：Windows 用 DPAPI；非 Windows 开发回退用 AES-GCM
 aes-gcm = "0.10"

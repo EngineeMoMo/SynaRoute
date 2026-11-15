@@ -64,7 +64,7 @@ static WRITE_FAILED_LINES: AtomicU64 = AtomicU64::new(0);
 /// 磁盘僵死时告警本身不能变成刷屏源。原来那句 `warn!` 已并入这里，故调用点不必再打。
 pub(crate) fn note_open_failed_line() {
     let n = OPEN_FAILED_LINES.fetch_add(1, Ordering::Relaxed) + 1;
-    if n == 1 || n % 100 == 0 {
+    if n == 1 || n.is_multiple_of(100) {
         tracing::warn!("打开日志文件失败，累计丢弃 {n} 条（磁盘可能已满或目录不可写）");
     }
 }
@@ -97,7 +97,7 @@ pub(crate) fn open_failed_line_count() -> u64 {
 /// 真正的 ENOSPC 往往在 flush 时才浮出来，两处不同计数会让同一次盘满被记两遍。
 pub(crate) fn note_write_failed_line() {
     let n = WRITE_FAILED_LINES.fetch_add(1, Ordering::Relaxed) + 1;
-    if n == 1 || n % 100 == 0 {
+    if n == 1 || n.is_multiple_of(100) {
         tracing::warn!("写入日志文件失败，累计丢弃 {n} 条（磁盘可能已满或卷已掉线）");
     }
 }
