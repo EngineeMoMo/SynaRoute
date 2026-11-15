@@ -135,7 +135,11 @@ async fn grep_search(
 /// 纯 Rust 目录遍历兜底：当 `rg` 不可用时，手动递归工作目录、读取文本文件、
 /// 按关键词命中数打分。为控成本：限制深度、跳过常见忽略目录、只看文本类扩展名、
 /// 限制扫描文件总数上限。
-fn walk_search(work_dir: &Path, keywords: &[String], max_files: usize) -> Vec<(PathBuf, f32)> {
+fn walk_search(
+    work_dir: &Path,
+    keywords: &[String],
+    max_files: usize,
+) -> (Vec<(PathBuf, f32)>, Vec<String>) {
     // 忽略目录（与 rg 的 glob 保持一致）
     const IGNORE_DIRS: &[&str] = &[
         "node_modules", "target", "dist", ".git", ".codegraph", "build",
@@ -155,6 +159,7 @@ fn walk_search(work_dir: &Path, keywords: &[String], max_files: usize) -> Vec<(P
     let total_kw = keywords.len().max(1) as f32;
 
     let mut file_hits: Vec<(PathBuf, f32)> = Vec::new();
+    let mut denied = Vec::new();
     let mut scanned = 0usize;
 
     // 迭代式 DFS（避免递归深栈）
@@ -192,6 +197,12 @@ fn walk_search(work_dir: &Path, keywords: &[String], max_files: usize) -> Vec<(P
             // 在打开文件前就执行敏感路径与硬链接校验；后面的统一过滤仍保留，
             // 负责给 grep 路径和诊断结果做最终收口。
             if is_sensitive_read_path(&path) {
+                denied.push(
+                    path.strip_prefix(work_dir)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
                 continue;
             }
             scanned += 1;
@@ -212,7 +223,7 @@ fn walk_search(work_dir: &Path, keywords: &[String], max_files: usize) -> Vec<(P
 
     file_hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     file_hits.truncate(max_files);
-    file_hits
+    (file_hits, denied)
 }
 
 /// 读取文件前 N 字节并按 UTF-8 有效边界安全截断（避免中途切断多字节字符）。
@@ -576,7 +587,15 @@ pub async fn retrieve_detailed(work_dir: &str, prompt: &str, max_tokens: u32) ->
         Some(results) => results,
         None => {
             diag.push("ripgrep 不可用，改用纯 Rust 目录遍历".into());
-            walk_search(work_path, &keywords, 15)
+            let (results, denied) = walk_search(work_path, &keywords, 15);
+            if !denied.is_empty() {
+                diag.push(format!(
+                    "已排除可能含凭据的文件 {} 个: {}",
+                    denied.len(),
+                    denied.join(", ")
+                ));
+            }
+            results
         }
     };
 
