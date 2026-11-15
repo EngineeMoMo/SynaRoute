@@ -55,7 +55,7 @@ fn desaturate_rgba_in_place(rgba: &mut [u8]) -> bool {
     if rgba.is_empty() || !rgba.len().is_multiple_of(4) {
         return false;
     }
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         let lum = (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32)
             .round()
             .clamp(0.0, 255.0) as u8;

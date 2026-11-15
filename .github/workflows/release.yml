@@ -60,7 +60,7 @@ jobs:
               body: [
                 'Download the installer for your platform from the assets below.',
                 '',
-                '**v0.1.86 — Security and reliability hardening.**',
+                '**v0.1.87 — Security and reliability hardening.**',
                 '全链路安全与稳定性加固。',
                 'Codegraph retrieval now rejects traversal, absolute paths and symlink escapes, including dangling links.',
                 '代码检索拒绝路径穿越、绝对路径及符号链接越界（含悬空链接）。',
