@@ -62,6 +62,9 @@ jobs:
       - name: 前端单测
         run: npm test
 
+      - name: 性能报告解析与比较
+        run: npm run test:perf-report
+
   rust:
     runs-on: windows-latest
     steps:

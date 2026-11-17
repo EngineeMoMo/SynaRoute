@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { isTauri } from "@/lib/bridge";
 import { useStore } from "@/store";
 import { usePolling } from "@/lib/usePolling";
+import { createVisibleEventGate } from "./visibleEvents";
 
 /** 与后端 `events.rs` 的 `EVENT_NAME` 必须完全一致 */
 const EVENT_NAME = "synaroute://state-changed";
@@ -55,11 +56,13 @@ export function useBackendEvent(topics: BackendTopic[], fn: () => void) {
     let dead = false;
     let unlisten: (() => void) | null = null;
     const wanted = topicKey.split(",");
+    const gate = createVisibleEventGate(() => { if (!dead) fnRef.current(); }, () => document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", gate.resume);
 
     void import("@tauri-apps/api/event")
       .then(({ listen }) =>
         listen<StateChangedPayload>(EVENT_NAME, (e) => {
-          if (wanted.includes(e.payload.topic)) fnRef.current();
+          if (!dead && wanted.includes(e.payload.topic)) gate.notify(e.payload.topic === "import-request" || e.payload.topic === "update");
         }),
       )
       .then((un) => {
@@ -73,6 +76,7 @@ export function useBackendEvent(topics: BackendTopic[], fn: () => void) {
 
     return () => {
       dead = true;
+      document.removeEventListener("visibilitychange", gate.resume);
       unlisten?.();
     };
   }, [topicKey]);
@@ -120,16 +124,6 @@ export function useBackendEvents() {
   // - vault（密钥库锁态）目前是 CategoryPage 的局部 state，由该页自己订阅更贴近数据所在处；
   // - logs 若在 hub 处理，会变成「日志页没打开也每次都重拉 500 条事件」，
   //   正好抵消掉本项省下来的 IPC。交给 LogsPage / CategoryPage 各自订阅。
-
-  // 注册完成后立刻手动跑一次刷新。
-  //
-  // 从 App 挂载到 `listen` 的 Promise resolve 之间有几十毫秒窗口，而 **Tauri 事件不缓冲** ——
-  // 这期间后端发出的 emit 会永久丢失。不补这一次的话，恰好在启动瞬间发生的状态变化
-  // （例如启动时的自启动对账、密钥库锁态对账）要等 30s 兜底才会显示出来。
-  useEffect(() => {
-    void useStore.getState().refreshCategory();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   // 兜底：推送丢了/漏了也不会一直错下去。
   usePolling(() => {

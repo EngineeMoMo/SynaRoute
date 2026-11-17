@@ -18,6 +18,8 @@
 
 #![cfg(test)]
 
+#[path = "perf_scenarios.rs"] mod scenarios;
+
 use crate::model::{CategoryType, HealthState, KeyParams, ProviderKey, Protocol};
 use crate::proxy::ProxyManager;
 use crate::store::Store;
@@ -173,7 +175,7 @@ async fn measure_forward_latency() {
     const N: usize = 300;
 
     let (_store, proxy, port, mock, dir) = setup("latency").await;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(10)).build().unwrap();
     let via_proxy = format!("http://127.0.0.1:{port}/v1/messages");
     let direct = format!("{mock}/v1/messages");
 
@@ -232,7 +234,7 @@ async fn measure_rss_under_load() {
     const PER_ROUND: usize = 200;
 
     let (store, proxy, port, _mock, dir) = setup("rss").await;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(10)).build().unwrap();
     let url = format!("http://127.0.0.1:{port}/v1/messages");
 
     // 基线：起完代理、打过 0 个请求
@@ -241,7 +243,7 @@ async fn measure_rss_under_load() {
     if let Some(b) = base {
         println!("  基线（代理已起、0 请求）      : {:.1} MB", mb(b));
     } else {
-        println!("  ⚠ 拿不到 RSS，跳过该测量");
+        println!("SYNAROUTE_PERF {}", serde_json::json!({"name":"rss_load", "unsupported":true}));
         proxy.stop(CategoryType::ClaudeCli);
         std::fs::remove_dir_all(&dir).ok();
         return;
@@ -272,6 +274,8 @@ async fn measure_rss_under_load() {
     let peak = samples.iter().copied().max().unwrap_or(0);
     let growth_per_1k =
         (peak as f64 - base as f64) / (ROUNDS * PER_ROUND) as f64 * 1000.0 / (1024.0 * 1024.0);
+    println!("SYNAROUTE_PERF {}", serde_json::json!({"name":"rss_load", "samples":ROUNDS * PER_ROUND,
+        "baseline_bytes":base, "peak_bytes":peak, "after_idle_bytes":after_idle, "rounds_bytes":samples}));
     println!(
         "  → 峰值增长 {:.1} MB（{} 请求）；折算约 {:.2} MB / 1000 请求",
         mb(peak.saturating_sub(base)),
@@ -303,7 +307,7 @@ async fn measure_long_run_stability() {
         .unwrap_or(60);
 
     let (store, proxy, port, _mock, dir) = setup("longrun").await;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(10)).build().unwrap();
     let url = format!("http://127.0.0.1:{port}/v1/messages");
 
     println!("\n=== 测量 3：长跑 {secs}s 稳定性 ===");
@@ -314,10 +318,10 @@ async fn measure_long_run_stability() {
 
     while start.elapsed() < Duration::from_secs(secs) {
         for _ in 0..50 {
-            if let Ok(r) = client.post(&url).json(&payload()).send().await {
-                let _ = r.bytes().await;
-                sent += 1;
-            }
+            let response = client.post(&url).json(&payload()).send().await.unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            response.bytes().await.unwrap();
+            sent += 1;
         }
         if start.elapsed() >= next_report {
             let rss = current_rss_bytes().unwrap_or(0);
@@ -331,6 +335,8 @@ async fn measure_long_run_stability() {
     println!("  静置 5s 后再看一次...");
     tokio::time::sleep(Duration::from_secs(5)).await;
     let final_rss = current_rss_bytes().unwrap_or(0);
+    println!("SYNAROUTE_PERF {}", serde_json::json!({"name":"long_run", "duration_secs":secs,
+        "requests":sent, "final_rss_bytes":final_rss, "curve_seconds_bytes_requests":curve}));
     println!("  收尾 RSS: {:.1} MB（共发 {sent} 请求）", mb(final_rss));
     println!(
         "  用量聚合条数（应 == Key 数）: {}",

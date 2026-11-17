@@ -17,6 +17,7 @@ use std::time::SystemTime;
 #[path = "store_endpoint.rs"] mod endpoint;
 #[path = "store_balance.rs"] pub(crate) mod balance;
 #[path = "store_backup.rs"] mod backup;
+#[path = "store_event_feed.rs"] pub(crate) mod event_feed;
 pub use endpoint::base_url_has_path_suffix;
 
 pub struct Store {
@@ -28,6 +29,7 @@ pub struct Store {
     pub secrets: RwLock<SecretStore>,
     /// 内存态事件日志（FR-020），每分类最多保留 N 条
     events: RwLock<Vec<EventLogEntry>>,
+    event_feed: RwLock<event_feed::Feed>,
     /// 配置文件「上次已知磁盘状态」快照：(mtime, 字节数)。每次自己 persist 或初次加载时更新。
     /// list_keys 等读前对比磁盘状态,变化则重载,防止「磁盘被外部改过但内存不知情」。
     /// 用 (mtime, len) 双判据 + `!=`(非 `>`)：mtime `!=` 兼顾时钟回拨(NTP/睡眠/虚机 RTC 校时
@@ -373,7 +375,7 @@ impl Store {
             config_path,
             config: RwLock::new(config),
             secrets: RwLock::new(secrets),
-            events: RwLock::new(Vec::new()),
+            events: RwLock::new(Vec::new()), event_feed: RwLock::new(event_feed::Feed::default()),
             config_stamp: RwLock::new(initial_stamp),
             config_degraded: std::sync::atomic::AtomicBool::new(load_failed),
             log_tx: Self::spawn_log_writer(),
@@ -687,15 +689,15 @@ impl Store {
                             None => last.usage = Some(u),
                         }
                     }
+                    self.event_feed.write().changed(&last.id, std::iter::empty());
                     return;
                 }
             }
         }
+        let changed_id = entry.id.clone();
         ev.push(entry);
-        if ev.len() > MAX_EVENTS {
-            let overflow = ev.len() - MAX_EVENTS;
-            ev.drain(0..overflow);
-        }
+        let overflow = ev.len().saturating_sub(MAX_EVENTS);
+        self.event_feed.write().changed(&changed_id, ev.drain(0..overflow).map(|entry| entry.id));
     }
 
     /// 把一条日志**投递**给写线程（非阻塞）。转发热路径只做序列化 + 一次 channel push。
@@ -948,6 +950,7 @@ impl Store {
             if !target.detail.contains('↑') {
                 target.detail.push_str(&format!(" · {}", usage.fmt_compact()));
             }
+            self.event_feed.write().changed(&target.id, std::iter::empty());
         } // 写锁在此释放 —— emit 前必须放光锁（见 events::emit 文档）。
         crate::events::emit(crate::events::Topic::Logs, Some(category));
     }
@@ -2448,7 +2451,7 @@ impl Store {
             config_path,
             config: RwLock::new(config),
             secrets: RwLock::new(secrets),
-            events: RwLock::new(Vec::new()),
+            events: RwLock::new(Vec::new()), event_feed: RwLock::new(event_feed::Feed::default()),
             config_stamp: RwLock::new(initial_stamp),
             config_degraded: std::sync::atomic::AtomicBool::new(load_failed),
             log_tx: Self::spawn_log_writer(),

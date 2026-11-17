@@ -50,6 +50,7 @@ import type { CategoryPolicy, RoutingPolicyView, RoutingSaveResult, RoutingScene
 import { mockBridge } from "./mockData";
 import type { ActiveRequest, RequestStopResult } from "./activeRequests";
 import type { KeyChatRequest, KeyChatReply, KeyChatStarted } from "./keyChat";
+import type { EventCursor, EventDelta } from "./eventFeed";
 
 // Browser preview only: one mutable status so the switches stay consistent with each other.
 const layaMock: LayaLocalStatus = { supported: true, phase: "idle", endpoint: "http://127.0.0.1:8000/v1/systemone", logs: [], error: null, installed: false, autostart: false, mirror: false };
@@ -306,6 +307,9 @@ export const api = {
   /** 合并全部分类的事件日志（不按分类过滤），供运行日志页连续展示；每条自带 categoryId 标签。 */
   listAllEvents: () =>
     call<EventLogEntry[]>("list_all_events", undefined, () => mockBridge.listAllEvents()),
+
+  listEventDelta: (cursor: EventCursor | null) =>
+    call<EventDelta>("list_event_delta", { cursor }, () => mockBridge.listEventDelta(cursor)),
 
   /** 读局域网接入令牌（B5）。**只读不生成**；主口令锁定时后端返 Err。 */
   getLanToken: () =>

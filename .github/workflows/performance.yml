@@ -1,0 +1,33 @@
+name: Performance baseline
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          key: performance-release
+      - run: npm run test:perf-report
+      - run: npm run perf -- --output output/performance/report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-${{ github.sha }}
+          path: output/performance/
+          if-no-files-found: error
+          retention-days: 90

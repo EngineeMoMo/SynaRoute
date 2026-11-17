@@ -173,10 +173,8 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
    * 这条把它提到最显眼的位置，与上面 vaultLocked / takeover 两条警告同一模式
    * （那个模式已被证明好用）。
    *
-   * **为什么走后端 `recentFailure` 而不在前端遍历 `events`**：`refreshCategory`（本页 5s 轮询）
-   * 只拉 keys + proxy，**不含 events**——events 只在 `loadCategory`（挂载/切分类）时拉一次。
-   * 若在前端算，这条横幅就会一直显示挂载那一刻的旧快照、不随新失败更新；
-   * 而把 `listAllEvents` 加进 5s 轮询又会把 P1-6 刚消掉的「每 2s 搬 500 条」重新引回来。
+   * **为什么走后端 `recentFailure` 而不在前端遍历 `events`**：分类刷新不读取事件日志。
+   * events 仅由运行日志页按需增量同步，分类页不能依赖它判断最新失败。
    * 后端这个命令只返回**一条**已剥离 trace 的事件，代价可忽略。
    *
    * 结果要过 `genRef` 代际校验：切分类时本页不卸载，上一个分类的在途结果若直接写进来，

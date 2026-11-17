@@ -18,9 +18,11 @@ import { translate, type Lang } from "@/lib/i18n";
 import { api, isTauri } from "@/lib/bridge";
 import type { UserPrefs } from "@/lib/prefs";
 import { persistPreferences } from "@/lib/prefsWriter";
-import { reuseUnchanged } from "@/lib/reuseUnchanged";
 // 与后端 key_order::reorder_before / mockData.reorderKey 同语义的顺序变换（三处共用一份判据）
 import { reorderIds } from "@/lib/keyOrdering";
+import { createCategoryRefresh } from "@/lib/categoryRefresh";
+import { createRefreshQueue } from "@/lib/refreshQueue";
+import { mergeEventDelta, type EventCursor } from "@/lib/eventFeed";
 
 /**
  * 一条余额缓存：查询结果 + **产出它的那份配置的指纹**。
@@ -391,67 +393,20 @@ export const useStore = create<AppState>((set, get) => ({
   setDeeplinkImport: (p) => set({ deeplinkImport: p }),
 
   async loadCategory(c) {
-    set({ loading: true });
-    // 容错：4 个 IPC 独立结算，单个失败不拖垮其余刷新（避免"操作后列表不更新"的假象）。
-    const [keysR, proxyR, brainR, eventsR] = await Promise.allSettled([
-      api.listKeys(c),
-      api.getProxyState(c),
-      api.getBrainConfig(c),
-      api.listAllEvents(),
-    ]);
-    if (keysR.status === "rejected") console.error("listKeys failed", keysR.reason);
-    if (proxyR.status === "rejected") console.error("getProxyState failed", proxyR.reason);
-    if (brainR.status === "rejected") console.error("getBrainConfig failed", brainR.reason);
-    if (eventsR.status === "rejected") console.error("listAllEvents failed", eventsR.reason);
-    // **过期结果丢弃**：await 期间用户可能已经切走了。
-    //
-    // 竞态形态：点分类 A → `loadCategory("claude-cli")` 在途；立刻点分类 B →
-    // `setActiveCategory` 同步改了 activeCategory 并发起 `loadCategory("codex")`。
-    // 两个请求没有先后保证，A 后到就把 keys/proxy/brain 整份写成 A 的 ——
-    // 界面标题是 Codex、列表是 Claude CLI 的 Key。而 `loadCategory` 只在挂载/切分类时调，
-    // **没有轮询会把它纠正回来**，这一屏就一直错到用户再切一次分类。
-    // （同一形态在 KeyEditor 的健康探测路径上已修过一次，见那里的注释；这里是它的同胞。）
-    //
-    // `loading` 也不碰：那面旗归**最新**那次调用管，过期的这次插手会把加载态提前熄掉。
     if (get().activeCategory !== c) return;
-    set((s) => ({
-      keys: keysR.status === "fulfilled" ? reuseUnchanged(s.keys, keysR.value) : s.keys,
-      proxy: proxyR.status === "fulfilled" ? proxyR.value : s.proxy,
-      brain: brainR.status === "fulfilled" ? brainR.value : s.brain,
-      events: eventsR.status === "fulfilled" ? reuseUnchanged(s.events, eventsR.value) : s.events,
-      loading: false,
-    }));
+    set({ loading: true });
+    await refreshCategoryData({ category: c, full: true });
   },
 
   async refreshCategory() {
-    const c = get().activeCategory;
-    try {
-      const [keysR, proxyR] = await Promise.allSettled([
-        api.listKeys(c),
-        api.getProxyState(c),
-      ]);
-      // 过期结果丢弃，理由同 `loadCategory`：这是 5s 轮询，await 期间用户完全可能切走。
-      // 这条的自愈性比 loadCategory 好（下一轮会拉对的），但那也意味着**最长 5 秒**
-      // 的错数据窗口 —— 而用户切过去第一眼看的就是那 5 秒。
-      if (get().activeCategory !== c) return;
-      set((s) => ({
-        // 逐条复用内容未变的旧对象：这是 5s 轮询，不做的话 KeyCard 的 memo 恒失效。
-        keys: keysR.status === "fulfilled" ? reuseUnchanged(s.keys, keysR.value) : s.keys,
-        proxy: proxyR.status === "fulfilled" ? proxyR.value : s.proxy,
-      }));
-    } catch (e) {
-      console.error("refreshCategory failed", e);
-    }
+    await refreshCategoryData({ category: get().activeCategory, full: false });
   },
 
   // 轻量刷新：仅拉事件日志（运行日志页 2s 轮询用），不动 keys/proxy/brain，避免整页重载闪烁。
   // 合并全部分类，切换活动分类时日志连续不裁剪；分类过滤交给前端页面按 categoryId 客户端筛选。
   async refreshEvents() {
     try {
-      const events = await api.listAllEvents();
-      // 2s 轮询：日志页最密的刷新源。逐条复用未变的旧事件对象，让 LogRow 的 memo 生效——
-      // 事件是追加型的，新增一条时前面几百条内容都没动，不该跟着重渲染。
-      set((s) => ({ events: reuseUnchanged(s.events, events) }));
+      await refreshEventData(true);
     } catch (e) {
       console.error("refreshEvents failed", e);
     }
@@ -776,6 +731,16 @@ export const useStore = create<AppState>((set, get) => ({
     return true;
   },
 }));
+
+const refreshCategoryData = createCategoryRefresh(useStore.getState, useStore.setState);
+let eventCursor: EventCursor | null = null;
+const refreshEventData = createRefreshQueue(
+  async (_requested: boolean) => api.listEventDelta(eventCursor),
+  (delta) => {
+    useStore.setState((state) => ({ events: mergeEventDelta(state.events, delta) }));
+    eventCursor = delta.cursor;
+  },
+);
 
 /** 应用主题到 <html> class（shadcn/ui 深色约定）+ 同步系统窗口装饰（标题栏）。 */
 export function applyTheme(theme: ThemePref) {

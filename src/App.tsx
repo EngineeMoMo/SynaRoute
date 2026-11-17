@@ -2,19 +2,7 @@ import * as React from "react";
 import { useEffect, useState } from "react";
 import { Sidebar, type NavKey } from "@/components/Sidebar";
 import { RoutingOverviewPage } from "@/pages/RoutingOverviewPage";
-import { RoutingPoliciesPage } from "@/pages/RoutingPoliciesPage";
-import { CategoryPage } from "@/pages/CategoryPage";
-import { BrainPage } from "@/pages/BrainPage";
-import { LogsPage } from "@/pages/LogsPage";
-import { CodexSessionsPage } from "@/pages/CodexSessionsPage";
-import { UsagePage } from "@/pages/UsagePage";
-import { ReliabilityPage } from "@/pages/ReliabilityPage";
-import { SettingsPage } from "@/pages/SettingsPage";
-import { AboutPage } from "@/pages/AboutPage";
-import { VendorPage } from "@/pages/VendorPage";
-import { KeyEditor } from "@/components/KeyEditor";
 import { CommandPalette } from "@/components/CommandPalette";
-import { OnboardingWizard } from "@/components/OnboardingWizard";
 import { Toast } from "@/components/Toast";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
@@ -32,6 +20,18 @@ import { useT } from "@/lib/useT";
 import type { CategoryType, ProviderKey } from "@/types";
 
 const CATEGORY_KEYS: NavKey[] = ["claude-cli", "claude-desktop", "codex"];
+const RoutingPoliciesPage = React.lazy(() => import("@/pages/RoutingPoliciesPage").then((module) => ({ default: module.RoutingPoliciesPage })));
+const CategoryPage = React.lazy(() => import("@/pages/CategoryPage").then((module) => ({ default: module.CategoryPage })));
+const BrainPage = React.lazy(() => import("@/pages/BrainPage").then((module) => ({ default: module.BrainPage })));
+const LogsPage = React.lazy(() => import("@/pages/LogsPage").then((module) => ({ default: module.LogsPage })));
+const CodexSessionsPage = React.lazy(() => import("@/pages/CodexSessionsPage").then((module) => ({ default: module.CodexSessionsPage })));
+const UsagePage = React.lazy(() => import("@/pages/UsagePage").then((module) => ({ default: module.UsagePage })));
+const ReliabilityPage = React.lazy(() => import("@/pages/ReliabilityPage").then((module) => ({ default: module.ReliabilityPage })));
+const SettingsPage = React.lazy(() => import("@/pages/SettingsPage").then((module) => ({ default: module.SettingsPage })));
+const AboutPage = React.lazy(() => import("@/pages/AboutPage").then((module) => ({ default: module.AboutPage })));
+const VendorPage = React.lazy(() => import("@/pages/VendorPage").then((module) => ({ default: module.VendorPage })));
+const KeyEditor = React.lazy(() => import("@/components/KeyEditor").then((module) => ({ default: module.KeyEditor })));
+const OnboardingWizard = React.lazy(() => import("@/components/OnboardingWizard").then((module) => ({ default: module.OnboardingWizard })));
 
 export default function App() {
   // 细粒度订阅（勿改回整店解构）：App 是根组件，整店订阅会让**整棵树**在任何 store
@@ -234,7 +234,9 @@ export default function App() {
             前后两态」。名字全局唯一（同一时刻只渲染一个 main），重名会让整场过渡被中止。 */}
         <main className="flex-1 overflow-hidden" style={{ viewTransitionName: "page-main" }}>
           <ErrorBoundary resetKey={nav} label={t(`nav.${nav}`)}>
-            {renderMain()}
+            <React.Suspense fallback={<div role="status" className="p-6 text-sm text-text-muted">{t("common.loading")}</div>}>
+              {renderMain()}
+            </React.Suspense>
           </ErrorBoundary>
         </main>
       </div>
@@ -244,6 +246,8 @@ export default function App() {
         // React 18 会把 setEditorOpen(false) 与 openEdit(k) 批处理成 editorOpen 恒为 true，
         // 同类型同位置的元素不会重新挂载，而 KeyEditor 的字段全是 useState(initial?.x)
         // 只在挂载时取一次 —— 结果是抽屉标题换了、表单里还是上一条 Key 的 baseUrl 与密钥态。
+        <ErrorBoundary resetKey={String(editorSeq)} label={t(editingKey ? "editor.titleEdit" : "editor.titleNew")}>
+        <React.Suspense fallback={<div role="status" className="fixed inset-0 z-50 grid place-items-center bg-background/80">{t("common.loading")}</div>}>
         <KeyEditor
           key={`${editingKey?.id ?? "new"}-${editorSeq}`}
           initial={editingKey}
@@ -258,6 +262,8 @@ export default function App() {
             void loadCategory(activeCategory);
           }}
         />
+        </React.Suspense>
+        </ErrorBoundary>
       )}
 
       {paletteOpen && (
@@ -300,10 +306,14 @@ export default function App() {
           必须传 handleNav 本体——它同时做 setNav 与 setActiveCategory，
           只传 setActiveCategory 会让侧栏高亮与向导选的客户端对不上。 */}
       {onboarding?.shouldShow && (
+        <ErrorBoundary label={t("onboarding.title")}>
+        <React.Suspense fallback={<div role="status" className="fixed inset-0 z-50 grid place-items-center bg-background/80">{t("common.loading")}</div>}>
         <OnboardingWizard
           onPickCategory={handleNav}
           onOpenLogs={() => handleNav("logs")}
         />
+        </React.Suspense>
+        </ErrorBoundary>
       )}
 
       {/* 浏览器预览模式提示（Tauri 环境不显示） */}

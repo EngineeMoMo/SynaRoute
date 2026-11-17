@@ -1291,7 +1291,7 @@ pub fn run() {
             restore_tool_config,
             switch_to_official,
             list_events,
-            list_all_events,
+            list_all_events, store::event_feed::list_event_delta,
             get_lan_token,
             regenerate_lan_token,
             usage_commands::get_token_usage, usage_commands::get_usage_since, usage_commands::get_daily_usage, usage_commands::get_usage_with_cost,

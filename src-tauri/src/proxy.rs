@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 #[path = "model_pool.rs"] pub(crate) mod model_pool; // 对外模型并集 + 模型感知路由；来由见该文件模块注释
 #[path = "proxy/soft_error.rs"] mod soft_error; // 非流式「200 包着错误」的降级；调用**必须**排在 outcome.ok 守卫之前（有判据钉着），来由见该文件模块注释
 #[path = "proxy/codex_images.rs"] mod codex_images;
-pub(crate) mod active_requests; mod streaming; pub(crate) mod key_chat;
+pub(crate) mod active_requests; mod streaming; pub(crate) mod key_chat; mod request_body;
 // 对外可选模型集的**唯一**实现。re-export 而不是留一层包装函数：包装函数会让
 // 「proxy.rs 生产段里不许有第二份并集实现」那条源码级判据失去意义。
 pub(crate) use model_pool::discoverable_models;
@@ -439,7 +439,6 @@ async fn handle_request_inner(
         Err(status) => return Ok(error_resp(status, "请求体过大、读取超时或服务繁忙")),
     };
 
-    // 最后一个候选通过 mem::take 接管请求体，前面的尝试只借用。
     let mut req_json: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
     let client_model = req_json
         .get("model")
@@ -882,30 +881,11 @@ async fn handle_request_inner(
                 }
             };
 
-        // 本次尝试传给转发函数的 body（P2-5 第二步）。
-        //
-        // **只有「没有后续候选」时才交出所有权**（零拷贝移动）；只要还有下一个候选，
-        // 就必须传 Borrowed 让对方自己克隆——否则本次的改写（model / effort 注入）会污染
-        // 原始 body，下一个候选拿到的就是「上一个候选 resolve 后的模型名」，
-        // 那是静默的错路由（不报错、不 panic，只是打错了模型）。
-        //
-        // 那样非流式分支走到时 req_json 已被 take 空，forward_to_key 会收到 `Null`
-        // （表现为发给上游的 body 只剩 `"messages": []`）。初版就是这么写的，
-        // 被 codex_effort_injected_end_to_end 等三条既有测试当场抓住。
-        let take_body = |req_json: &mut Value| -> std::borrow::Cow<'static, Value> {
-            std::borrow::Cow::Owned(std::mem::take(req_json))
-        };
-
         // 流式直通分支：下游要 stream 且无需跨协议转换 → 真流式透传（边收边发）。
         // 先探上游状态码：非 2xx 则照常切换下一个 Key（首字节尚未发出，切换安全）；
         // 2xx 则把上游 SSE 流原样转给下游，正确设置 content-type，直接返回（不再切换）。
         if wants_stream && can_stream(key) {
-            let body = if next.is_some() {
-                std::borrow::Cow::Borrowed(&req_json)
-            } else {
-                take_body(&mut req_json)
-            };
-            match try_stream_to_key(&store, category, key, &path, body, &requested_model, &fwd_headers, req_log, remaining, route.lease.clone(), &active)
+            match try_stream_to_key(&store, category, key, &path, &mut req_json, &requested_model, &fwd_headers, req_log, remaining, route.lease.clone(), &active)
                 .await
             {
                 Ok(StreamAttempt::Streaming { resp, url, real_model, request_body }) => {
@@ -1069,14 +1049,8 @@ async fn handle_request_inner(
             continue;
         }
 
-        // 同上：只有没有后续候选时才交出所有权（零拷贝），否则借用让对方自己克隆。
-        let body = if next.is_some() {
-            std::borrow::Cow::Borrowed(&req_json)
-        } else {
-            take_body(&mut req_json)
-        };
         let result =
-            forward_to_key(&store, category, key, &path, body, &requested_model, &fwd_headers, req_log, remaining, &active)
+            forward_to_key(&store, category, key, &path, &mut req_json, &requested_model, &fwd_headers, req_log, remaining, &active)
                 .await;
         let elapsed = started.elapsed().as_millis() as u64;
         // 诊断头：本次尝试耗时。放在这里（三个分支之前）而不是各分支里 ——
@@ -1377,10 +1351,7 @@ async fn try_stream_to_key(
     category: CategoryType,
     key: &ProviderKey,
     path: &str,
-    // 下游请求体。用 `Cow` 而非 `&Value`（P2-5 第二步）：调用方对**最后一个候选**传
-    // `Cow::Owned`（零拷贝移动），之前的候选传 `Cow::Borrowed`（在函数内克隆，保证后续候选
-    // 拿到的仍是未被污染的原始 body）。同协议单候选是最常见路径，此时全程零深拷贝。
-    req_json: std::borrow::Cow<'_, Value>,
+    req_json: &mut Value,
     requested_model: &str,
     fwd_headers: &[(String, String)],
     // 见 `forward_to_key` 同名形参：仅用于决定是否构造只喂给日志的请求体快照。
@@ -1430,20 +1401,18 @@ async fn try_stream_to_key(
         // 响应侧回填 function_call 时据此把全名 <ns>__<sub> 拆回 {name, namespace} 两字段——
         // Codex router 用结构化 ToolName{namespace,name} 查表，不拆 name 字符串，缺 namespace
         // 字段就报 unsupported call（大脑聚合失效根因）。
-        let namespaces = crate::upstream::collect_tool_namespaces(&req_json);
-        let custom_tools = crate::upstream::collect_custom_tools(&req_json);
+        let namespaces = crate::upstream::collect_tool_namespaces(req_json);
+        let custom_tools = crate::upstream::collect_custom_tools(req_json);
         // Codex 的延迟工具检索器（type:"tool_search"）：模型对它的调用必须回程成
         // tool_search_call，Codex 才会本地跑 BM25 检索并在下一轮把 MCP 工具真 schema
         // 灌进 tool_search_output —— 那是 mcp__* 工具唯一的来源。
-        let search_tools = crate::upstream::collect_search_tools(&req_json);
+        let search_tools = crate::upstream::collect_search_tools(req_json);
         (namespaces, custom_tools, search_tools)
     });
 
     // 下游协议 → 上游 Key 协议：请求体按需转换。
     //
-    // `into_owned()`：调用方给的是 `Cow`——最后一个候选传 Owned（零拷贝移动），
-    // 之前的候选传 Borrowed（在此克隆一份，保证后续候选拿到的仍是未被污染的原始 body）。
-    let mut payload = req_json.into_owned();
+    let mut payload = request_body::AttemptBody::new(req_json, downstream == key.protocol);
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("model".into(), Value::String(real_model.clone()));
     }
@@ -1453,7 +1422,7 @@ async fn try_stream_to_key(
     if path_takes_sampling_params(path) {
         apply_key_params(&mut payload, &key.params, key.protocol);
     }
-    let payload = crate::upstream::convert_request_owned(payload, downstream, key.protocol);
+    payload.convert(downstream, key.protocol);
 
     // OpenAI→Anthropic 跨协议时，Anthropic 的 max_tokens 虽必填，但客户端可能没给（OpenAI
     // 允许省略）。转换器不知道目标 Key/真实模型，绝不能在里面回退 4096；这里才有完整信息，
@@ -1461,15 +1430,13 @@ async fn try_stream_to_key(
     // 必须跳过，否则严格 Anthropic 上游 400。
     // `mut`：拿到 budget 400 时要就地整流 `thinking.budget_tokens` 再重发一次（见下方
     // `rectify_thinking_budget`，与非流式路径同口径）。
-    let mut payload = if path_takes_sampling_params(path) {
-        ensure_anthropic_output_budget(payload, key, &real_model)?
+    if path_takes_sampling_params(path) {
+        ensure_anthropic_output_budget_mut(&mut payload, key, &real_model)?;
     } else {
         // 非补全端点不补 max_tokens → 不触发 apply_pending_thinking，故兜底剥掉哨兵字段
         // （为什么绝不能发给上游，见 `strip_pending_effort` 自己的文档）。
-        let mut payload = payload;
         crate::upstream::strip_pending_effort(&mut payload);
-        payload
-    };
+    }
     crate::upstream::validate_tools_for(key.protocol, &payload)?;
     // 跨协议转换出来的 Anthropic 请求打 prompt-caching 断点（省长会话重发；判据见函数文档）。
     let cache_injection = inject_cache_if_converted(&mut payload, downstream, key);
@@ -1551,6 +1518,7 @@ async fn try_stream_to_key(
         }
     };
     if !status.is_success() {
+        payload.detach();
         // Retry-After 须在读 body（消费 resp）之前取。
         let retry_after = parse_retry_after(resp.headers());
         let body = read_err_body(resp).await;
@@ -1662,11 +1630,17 @@ fn path_takes_sampling_params(path: &str) -> bool {
     !path.contains("count_tokens")
 }
 
+#[cfg(test)]
 fn ensure_anthropic_output_budget(
     mut payload: Value,
     key: &ProviderKey,
     real_model: &str,
 ) -> AppResult<Value> {
+    ensure_anthropic_output_budget_mut(&mut payload, key, real_model)?;
+    Ok(payload)
+}
+
+fn ensure_anthropic_output_budget_mut(payload: &mut Value, key: &ProviderKey, real_model: &str) -> AppResult<()> {
     if key.protocol != Protocol::Anthropic
         || payload
             .get("max_tokens")
@@ -1675,10 +1649,10 @@ fn ensure_anthropic_output_budget(
         // 提前返回也要清掉可能残留的中转字段：`_pending_effort` 绝不能发给上游。
         // 命中此分支的两种情况都不需要它——目标非 Anthropic（不会有该字段），
         // 或已带 max_tokens（转换时 thinking 已算过、不会暂存）。幂等清理，兜底而已。
-        crate::upstream::strip_pending_effort(&mut payload);
-        return Ok(payload);
+        crate::upstream::strip_pending_effort(payload);
+        return Ok(());
     }
-    let input_tokens = crate::upstream::estimate_json_tokens_without_image_transport(&payload);
+    let input_tokens = crate::upstream::estimate_json_tokens_without_image_transport(payload);
     let max_tokens = crate::upstream::anthropic_required_max_tokens(
         real_model,
         key.context_window_of_real(real_model),
@@ -1693,8 +1667,8 @@ fn ensure_anthropic_output_budget(
     // max_tokens 补齐后，把转换时暂存的 reasoning.effort 落成 thinking（Codex→Anthropic
     // 跨协议扩展思考修复）。apply_pending_thinking 内部会移除 `_pending_effort` 中转字段，
     // 无暂存时是无副作用的清理。必须在插入 max_tokens **之后**——thinking 预算依赖它。
-    crate::upstream::apply_pending_thinking(&mut payload, max_tokens as u64);
-    Ok(payload)
+    crate::upstream::apply_pending_thinking(payload, max_tokens as u64);
+    Ok(())
 }
 
 fn apply_key_params(payload: &mut Value, params: &crate::model::KeyParams, upstream: Protocol) {
@@ -1744,9 +1718,7 @@ async fn forward_to_key(
     category: CategoryType,
     key: &ProviderKey,
     path: &str,
-    // 见 `try_stream_to_key` 同名形参：`Cow` 让最后一个候选零拷贝移动，
-    // 之前的候选传 Borrowed 由本函数自行克隆（保证候选间 body 不被污染）。
-    req_json: std::borrow::Cow<'_, Value>,
+    req_json: &mut Value,
     requested_model: &str,
     fwd_headers: &[(String, String)],
     // 调用模型日志开关（默认关）。由调用方传入而非在此重读 settings：
@@ -1781,17 +1753,15 @@ async fn forward_to_key(
     // 而下面只改 model / effort，故先收集与后收集结果一致。
     let resp_tool_sets = (downstream != key.protocol).then(|| {
         (
-            crate::upstream::collect_custom_tools(&req_json),
-            crate::upstream::collect_search_tools(&req_json),
+            crate::upstream::collect_custom_tools(req_json),
+            crate::upstream::collect_search_tools(req_json),
             // namespaces：跨协议→Responses 时，回程 function_call 全名要按它拆成 name+namespace
             // 两字段，否则 Codex router 认不出 MCP 工具（unsupported call）。与流式路径同源收集。
-            crate::upstream::collect_tool_namespaces(&req_json),
+            crate::upstream::collect_tool_namespaces(req_json),
         )
     });
 
-    // `into_owned()`：最后一个候选传的是 Owned（零拷贝移动），之前的候选传 Borrowed
-    // （在此克隆，保证后续候选拿到未被污染的原始 body）。
-    let mut payload = req_json.into_owned();
+    let mut payload = request_body::AttemptBody::new(req_json, downstream == key.protocol);
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("model".into(), Value::String(real_model.clone()));
     }
@@ -1805,16 +1775,14 @@ async fn forward_to_key(
     }
 
     // 跨协议转换（下游协议 → 上游 Key 协议；同协议时 convert_request 内部直接返回克隆）
-    let payload = crate::upstream::convert_request_owned(payload, downstream, key.protocol);
+    payload.convert(downstream, key.protocol);
     // 与流式路径同进同退：补 Anthropic 必填的 max_tokens（见那里的完整说明）。
     // `mut`：下面拿到 budget 400 时要就地整流 `thinking.budget_tokens` 再重发一次。
-    let mut payload = if path_takes_sampling_params(path) {
-        ensure_anthropic_output_budget(payload, key, &real_model)?
+    if path_takes_sampling_params(path) {
+        ensure_anthropic_output_budget_mut(&mut payload, key, &real_model)?;
     } else {
-        let mut payload = payload;
         crate::upstream::strip_pending_effort(&mut payload);
-        payload
-    };
+    }
     crate::upstream::validate_tools_for(key.protocol, &payload)?;
     // 跨协议转换出来的 Anthropic 请求打 prompt-caching 断点（省长会话重发；判据见函数文档）。
     // 在日志快照之前，让快照如实反映我们发出去的 body。
@@ -1886,6 +1854,7 @@ async fn forward_to_key(
     // Retry-After 须在 resp.bytes() 消费响应体之前取（bytes() 拿走所有权）。
     let mut retry_after = parse_retry_after(resp.headers());
     let mut bytes = crate::diagnostics::redact_upstream_error_bytes(status.as_u16(), active.read_body(resp).await?, secret.as_str());
+    if !status.is_success() { payload.detach(); }
 
     // max_tokens 钳小后越界，见 `rectify_on_budget_error`）→ 就地降/关预算再打一次这条 Key。
     // 必须在这里、作用于**转换后**的 `payload`：`thinking.budget_tokens` 是转换链算出来的，

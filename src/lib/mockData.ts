@@ -28,6 +28,7 @@ import { createActiveRequestsMock } from "./mockData.activeRequests";
 import { mockResilienceOverview } from "./mockData.resilience";
 import { MOCK_VENDORS } from "./mockData.vendors";
 import { mockEvents } from "./mockData.events";
+import type { EventCursor, EventDelta } from "./eventFeed";
 import {
   mockCodexProviderTargets,
   mockCodexSessionIndexAudit,
@@ -579,6 +580,13 @@ export const mockBridge = {
     await delay();
     // 与真实后端同口径：列表剥掉 trace 正文，只留 hasTrace 布尔位。
     return clone(events).map((e) => ({ ...e, hasTrace: !!e.trace, trace: undefined }));
+  },
+  async listEventDelta(_cursor: EventCursor | null): Promise<EventDelta> {
+    await delay();
+    return {
+      cursor: { epoch: "preview", revision: 0 }, reset: true, removed: [],
+      entries: clone(events).map((entry) => ({ ...entry, hasTrace: !!entry.trace, trace: undefined })),
+    };
   },
   async tokenUsage() {
     await delay();
