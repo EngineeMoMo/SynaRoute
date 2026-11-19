@@ -10,6 +10,7 @@ export type SessionFilters = {
   onlyModelGone: boolean;
   sort: SessionSort;
 };
+export type SessionPageQuery = SessionFilters & { grouping: SessionGrouping; page: number; pageSize: number; refresh?: boolean; selected?: string[] };
 
 export const defaultSessionFilters: SessionFilters = {
   query: "", archive: "active", source: "user",

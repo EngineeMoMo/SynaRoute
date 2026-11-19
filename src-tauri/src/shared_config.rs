@@ -377,10 +377,10 @@ mod tests {
 
     #[test]
     fn shared_import_rejects_locked_legacy_tokens_before_creating_a_rollback_copy() {
-        let (store, directory) = temp_store("share-locked-legacy-backup");
+        let (store, directory) = crate::service::tests::credential_store("share-locked-legacy-backup");
         store.upsert_key(key(CategoryType::Codex)).unwrap();
         store.save_credential("k1", "shared-api-credential").unwrap();
-        store.secrets.write().enable_master_password("Migration-Aa123!").unwrap();
+        store.secrets.write().set_fixture_password("Migration-Aa123!").unwrap();
         store.secrets.write().lock();
         store.config.write().keys[0].balance_query = Some(crate::model::BalanceQuery {
             access_token: Some("legacy-shared-panel-token".into()),

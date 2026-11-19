@@ -45,6 +45,7 @@ use std::path::{Path, PathBuf};
 const MANIFEST_FILE: &str = "codex-session-providers.json";
 
 #[path = "codex_session_ops.rs"] pub(crate) mod ops;
+#[path = "codex_session_page.rs"] mod page;
 #[path = "codex_session_fs.rs"] pub(in crate::tools) mod files;
 #[path = "codex_session_history.rs"] pub(in crate::tools) mod history; // 顺 history_base 链拼完整历史（fork 只存分叉点之后的轮次）；理由见该文件模块头
 #[path = "codex_session_view.rs"] pub(in crate::tools) mod view;
@@ -75,7 +76,7 @@ use sqlite::{set_threads_provider, sqlite_root_of, DB_BACKUP_KEEP};
 ///
 /// 展示用的补充字段（标题 / 模型 / 档位 / token）由 [`view`] 从会话库或正文补上 ——
 /// 那些是「让用户认出这是哪条对话」用的，与路由正确性无关，故刻意不混进这一层。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionRef {
     /// 相对 `$CODEX_HOME` 的路径。清单里存的也是它 —— 存绝对路径会在换机器或改
@@ -328,8 +329,12 @@ fn parse_meta(line: &str) -> Option<(String, String, String, String, String, Str
 
 /// 扫描全部会话的首行元数据。
 pub(in crate::tools) fn scan_at(home: &Path) -> ScanReport {
+    scan_paths(home, collect_rollouts(home))
+}
+
+fn scan_paths(home: &Path, paths: Vec<(PathBuf, bool)>) -> ScanReport {
     let mut report = ScanReport::default();
-    for (path, archived) in collect_rollouts(home) {
+    for (path, archived) in paths {
         let metadata = fs::metadata(&path).ok();
         let bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
         let updated_at = metadata.and_then(|m| m.modified().ok())

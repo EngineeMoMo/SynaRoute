@@ -601,9 +601,9 @@ pub(crate) fn desktop_unacceptable_models(models: &[String]) -> Vec<&str> {
 /// 写锁在第一条语句结束即释放（`.write()` 的临时借用不跨到下一行），
 /// 故随后的 `sync_master_flag` 去拿 config 写锁不会与它叠在一起。
 pub(crate) fn enable_master_password(store: &Store, password: &str) -> AppResult<usize> {
-    store.migrate_balance_credentials()?;
     let migrated = store.secrets.write().enable_master_password(password)?;
     sync_master_flag(store, true);
+    store.migrate_balance_credentials()?;
     tracing::info!("已启用主口令模式，迁移 {migrated} 条密钥");
     Ok(migrated)
 }
@@ -862,16 +862,16 @@ pub(crate) fn unregister_mcp_for_category(
 pub(crate) async fn switch_to_official(
     store: &Arc<Store>,
     proxy: &Arc<ProxyManager>,
-    mcp: &McpManager,
+    mcp: &Arc<McpManager>,
     category: CategoryType,
 ) -> AppResult<()> {
     // 1. 停止代理（端口释放，短路窗口清空）。
     proxy.stop(category);
     store.append_event(category, "config", None, "切回官方：停止代理");
 
-    // 2. 还原客户端配置但保留 MCP —— 与界面/托盘「停止」共用同一入口
-    //    （`restore_client_config_keeping_mcp`），三条路径语义一致：断代理、留聚合。
-    match restore_client_config_keeping_mcp(store, mcp, category) {
+    let (restore_store, restore_mcp) = (store.clone(), mcp.clone());
+    match tauri::async_runtime::spawn_blocking(move || restore_client_config_keeping_mcp(&restore_store, &restore_mcp, category))
+        .await.map_err(|error| crate::error::AppError::ToolConfig(error.to_string()))? {
         Ok(msg) => {
             store.append_event(category, "config", None, &msg);
             store.append_event(
@@ -1461,6 +1461,12 @@ pub(crate) mod tests {
         (std::sync::Arc::new(store), dir)
     }
 
+    pub(crate) fn credential_store(tag: &str) -> (std::sync::Arc<Store>, std::path::PathBuf) {
+        let (store, dir) = temp_store(tag);
+        store.secrets.write().prepare_credential_fixture().unwrap();
+        (store, dir)
+    }
+
     pub(crate) fn key(category: CategoryType) -> ProviderKey {
         ProviderKey {
             tier_fable: None,
@@ -1643,7 +1649,7 @@ pub(crate) mod tests {
     /// 反向（写库失败时标记不得被写脏）由下一条测试守。
     #[test]
     fn save_secret_marks_has_secret_only_after_vault_write() {
-        let (store, dir) = temp_store("save_secret");
+        let (store, dir) = credential_store("save_secret");
         let mut k = key(CategoryType::ClaudeCli);
         k.has_secret = false;
         store.upsert_key(k).unwrap();
@@ -1795,7 +1801,7 @@ pub(crate) mod tests {
     /// 后者在备份被谁改成 best-effort 之后依然会绿。
     #[test]
     fn prune_orphan_secrets_backs_up_first_and_spares_live_keys() {
-        let (store, dir) = temp_store("prune");
+        let (store, dir) = credential_store("prune");
         store.upsert_key(key(CategoryType::ClaudeCli)).unwrap();
         store.secrets.write().set("k1", "sk-live").unwrap();
         store.secrets.write().set("k-ghost", "sk-orphan").unwrap();

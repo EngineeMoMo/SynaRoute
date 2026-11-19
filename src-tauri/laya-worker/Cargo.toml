@@ -1,0 +1,29 @@
+[package]
+name = "synaroute-laya-worker"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+laya-onnx = { git = "https://github.com/NandhaKishorM/laya", rev = "b1d656952f0f9581ea691a70cb6f38abf3eb13a9", default-features = false }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-std", "io-util", "sync", "macros"] }
+bytes = "1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+socket2 = "0.6"
+url = "2"
+windows = { version = "0.58", features = ["Win32_Networking_WinSock"] }
+
+[dev-dependencies]
+futures-util = "0.3"
+
+[profile.worker]
+inherits = "release"
+strip = true

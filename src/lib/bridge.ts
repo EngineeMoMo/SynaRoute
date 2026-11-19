@@ -1,4 +1,5 @@
 import { defaultDecision, type DecisionConfig, type DecisionView, type LayaLocalStatus } from "./decision";
+import { filterSessions, groupSessions, type SessionPageQuery } from "./codexSessionBrowser";
 import type { SharedTemplate, SharedImportResult } from "./sharedTemplate";
 import type { SessionMaintenanceProgress, SessionIdRepairPreview, SessionIdRepairResult } from "./sessionMaintenance";
 import type {
@@ -127,6 +128,9 @@ export const api = {
   layaLocalStop: () => call<LayaLocalStatus>("laya_local_stop", undefined, () => ({ ...layaMock })),
   layaLocalSetAutostart: (enabled: boolean) => call<LayaLocalStatus>("laya_local_set_autostart", { enabled }, () => { layaMock.autostart = enabled; return { ...layaMock }; }),
   layaLocalSetMirror: (enabled: boolean) => call<LayaLocalStatus>("laya_local_set_mirror", { enabled }, () => { layaMock.mirror = enabled; return { ...layaMock }; }),
+  layaLocalSetBackend: (backend: "python" | "rust") => call<LayaLocalStatus>("laya_local_set_backend", { backend }, desktopOnly),
+  layaLocalImportBundle: (directory: string) => call<LayaLocalStatus>("laya_local_import_bundle", { directory }, desktopOnly),
+  layaLocalRollbackBundle: () => call<LayaLocalStatus>("laya_local_rollback_bundle", undefined, desktopOnly),
   layaLocalSyncEndpoints: (endpoint: string) => call<CategoryType[]>("laya_local_sync_endpoints", { endpoint }, () => []),
   saveDecisionConfig: (categoryId: CategoryType, config: DecisionConfig, secret: string | null, clearSecret: boolean) => call<void>("save_decision_config", { categoryId, config, secret, clearSecret }, () => { throw new Error("请在桌面应用中保存判断配置 / Save decision settings in the desktop app"); }),
   buildSharedTemplate: () => call<SharedTemplate>("build_shared_template", undefined, () => ({
@@ -328,8 +332,18 @@ export const api = {
     call<string | null>("get_codex_config_model", undefined, () => mockBridge.getCodexConfigModel()),
 
   /** Codex 本地会话列表（会话管理页）。只读每个 rollout 的首行，几百条也很快。 */
-  listCodexSessions: () =>
-    call<CodexSessionList>("list_codex_sessions", undefined, () => mockBridge.listCodexSessions()),
+  listCodexSessions: (query?: SessionPageQuery) =>
+    call<CodexSessionList>("list_codex_sessions", { query }, async () => {
+      const data = await mockBridge.listCodexSessions();
+      if (!query) return data;
+      const rows = groupSessions(filterSessions(data.rows, query, data.currentProvider), query.grouping).flatMap((group) => group.rows);
+      const pageSize = Math.max(1, Math.min(200, query.pageSize));
+      const page = Math.min(query.page, Math.max(0, Math.ceil(rows.length / pageSize) - 1));
+      const providerCounts: Record<string, number> = {};
+      for (const row of data.rows) providerCounts[row.provider] = (providerCounts[row.provider] ?? 0) + 1;
+      return { ...data, rows: rows.slice(page * pageSize, (page + 1) * pageSize), page: { filteredTotal: rows.length, page, pageSize, providerCounts,
+        retainedSelection: (query.selected ?? []).filter((path) => data.rows.some((row) => row.relPath === path)) } };
+    }),
 
   setCodexSessionsArchived: (relPaths: string[], archived: boolean) =>
     call<CodexSessionArchiveResult>("set_codex_sessions_archived", { relPaths, archived }, () => {

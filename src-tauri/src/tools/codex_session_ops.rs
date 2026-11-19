@@ -32,10 +32,12 @@ use std::fs;
 use std::path::Path;
 
 /// 会话列表的一次快照。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexSessionList {
     pub rows: Vec<SessionRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<super::page::PageInfo>,
     /// `config.toml` 里当前生效的根 provider。前端据此把「与它不一致」的行标红 ——
     /// 那一列就是用户排查「旧对话为什么 401」的入口。
     pub current_provider: String,
@@ -58,7 +60,7 @@ fn current_root_provider(home: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn list_at(home: &Path, codex_keys: &[crate::model::ProviderKey]) -> CodexSessionList {
+pub(super) fn list_at(home: &Path, codex_keys: &[crate::model::ProviderKey]) -> CodexSessionList {
     let mut scan = scan_at(home);
     let current_provider = current_root_provider(home);
     // 标题/模型/档位/token 与统计都在这一步补上（见 `view` 的模块头：**文件为准、库来补充**）。
@@ -67,6 +69,7 @@ fn list_at(home: &Path, codex_keys: &[crate::model::ProviderKey]) -> CodexSessio
         .then_with(|| right.timestamp.cmp(&left.timestamp))
         .then_with(|| left.rel_path.cmp(&right.rel_path)));
     CodexSessionList {
+        page: None,
         rows: scan.sessions,
         current_provider,
         unreadable: scan.unreadable,
@@ -494,11 +497,14 @@ pub(crate) fn diagnostics_line() -> Option<String> {
 #[tauri::command]
 pub async fn list_codex_sessions(
     state: tauri::State<'_, crate::AppState>,
+    query: Option<super::page::PageQuery>,
 ) -> Result<CodexSessionList, String> {
     let home = super::super::codex_paths::codex_home().map_err(|e| e.to_string())?;
     let keys = state.store.enabled_keys_sorted(crate::model::CategoryType::Codex);
-    tauri::async_runtime::spawn_blocking(move || list_at(&home, &keys))
-        .await.map_err(|error| format!("读取会话失败：{error}"))
+    tauri::async_runtime::spawn_blocking(move || match query {
+        Some(query) => super::page::list(&home, &keys, &query),
+        None => Ok(list_at(&home, &keys)),
+    }).await.map_err(|error| format!("读取会话失败：{error}"))?
 }
 
 /// 删除选中的会话。前端仍必须先弹确认 —— 有备份不等于可以随手删。

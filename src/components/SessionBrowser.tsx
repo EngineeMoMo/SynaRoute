@@ -1,12 +1,12 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Archive, ArchiveRestore, ChevronDown, ChevronLeft, ChevronRight, Trash2 } from "lucide-react";
 import type { CodexSessionList, CodexSessionRow } from "@/types";
 import { useT } from "@/lib/useT";
-import { defaultSessionFilters, filterSessions, groupSessions, type SessionFilters, type SessionGrouping } from "@/lib/codexSessionBrowser";
+import { defaultSessionFilters, filterSessions, groupSessions, type SessionFilters, type SessionGrouping, type SessionPageQuery } from "@/lib/codexSessionBrowser";
 import { Button } from "@/components/ui/Button";
 import { SessionTable } from "@/components/SessionTable";
 
-export function SessionBrowser({ data, picked, disabled, onSelect, onDetails, onExport, onDelete, onArchive }: {
+export function SessionBrowser({ data, picked, disabled, onSelect, onDetails, onExport, onDelete, onArchive, onQuery }: {
   data: CodexSessionList;
   picked: Set<string>;
   disabled: boolean;
@@ -15,6 +15,7 @@ export function SessionBrowser({ data, picked, disabled, onSelect, onDetails, on
   onExport: (row: CodexSessionRow) => void;
   onDelete: (paths: string[]) => void;
   onArchive: (paths: string[], archived: boolean) => void;
+  onQuery?: (query: SessionPageQuery) => void;
 }) {
   const t = useT();
   const [filters, setFilters] = useState<SessionFilters>(defaultSessionFilters);
@@ -22,16 +23,21 @@ export function SessionBrowser({ data, picked, disabled, onSelect, onDetails, on
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(50);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    const timer = setTimeout(() => onQuery?.({ ...filters, grouping: mode, page, pageSize }), 180);
+    return () => clearTimeout(timer);
+  }, [filters, mode, page, pageSize, onQuery]);
   const updateFilter = <Key extends keyof SessionFilters>(key: Key, value: SessionFilters[Key]) => {
     setFilters((previous) => ({ ...previous, [key]: value }));
     setPage(0);
   };
-  const filtered = useMemo(() => filterSessions(data.rows, filters, data.currentProvider), [data, filters]);
+  const filtered = useMemo(() => data.page ? data.rows : filterSessions(data.rows, filters, data.currentProvider), [data, filters]);
   const groups = useMemo(() => groupSessions(filtered, mode), [filtered, mode]);
   const ordered = useMemo(() => groups.flatMap((group) => group.rows), [groups]);
-  const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize));
-  const currentPage = Math.min(page, pageCount - 1);
-  const pageRows = ordered.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
+  const filteredTotal = data.page?.filteredTotal ?? filtered.length;
+  const pageCount = Math.max(1, Math.ceil(filteredTotal / pageSize));
+  const currentPage = data.page?.page ?? Math.min(page, pageCount - 1);
+  const pageRows = data.page ? data.rows : ordered.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
   const pageGroups = groupSessions(pageRows, mode);
   const pageSelected = pageRows.length > 0 && pageRows.every((row) => picked.has(row.relPath));
   const visiblePaths = new Set(pageRows.map((row) => row.relPath));
@@ -39,6 +45,7 @@ export function SessionBrowser({ data, picked, disabled, onSelect, onDetails, on
   const selectClass = "rounded-control border border-border bg-surface px-2 py-1.5 text-sm text-text-primary";
 
   return <section className="space-y-3" aria-label={t("sessions.browser")}>
+    {!!data.stats.metadataFailures && <p role="status" className="text-sm text-warning">{t("sessions.metadataFailures", { n: data.stats.metadataFailures })}</p>}
     <div className="flex flex-wrap items-center gap-2">
       <input type="search" value={filters.query} onChange={(event) => updateFilter("query", event.target.value)}
         placeholder={t("sessions.filterPlaceholder")} aria-label={t("sessions.filter")}
@@ -78,7 +85,7 @@ export function SessionBrowser({ data, picked, disabled, onSelect, onDetails, on
         <input type="checkbox" checked={filters.onlyModelGone} onChange={(event) => updateFilter("onlyModelGone", event.target.checked)} />
         {t("sessions.onlyModelGone")}
       </label>
-      <span className="ml-auto text-xs text-text-muted" role="status">{t("sessions.filtered", { n: filtered.length, total: data.rows.length })}</span>
+      <span className="ml-auto text-xs text-text-muted" role="status">{t("sessions.filtered", { n: filteredTotal, total: data.stats.total })}</span>
     </div>
     <div className="flex flex-wrap items-center gap-2 rounded-control border border-border bg-surface-hover p-3">
       <Button variant="outline" size="sm" disabled={disabled || !pageRows.length}
@@ -120,7 +127,7 @@ export function SessionBrowser({ data, picked, disabled, onSelect, onDetails, on
           </button>
           <Button variant="ghost" size="sm" disabled={disabled}
             onClick={() => onSelect(allRows.map((row) => row.relPath), !allSelected)}>
-            {t(allSelected ? "sessions.deselectGroup" : "sessions.selectGroup")}
+            {t(data.page ? (allSelected ? "sessions.deselectPage" : "sessions.selectPage") : (allSelected ? "sessions.deselectGroup" : "sessions.selectGroup"))}
           </Button>
         </div>
         <div id={region} hidden={!expanded}>
@@ -131,7 +138,7 @@ export function SessionBrowser({ data, picked, disabled, onSelect, onDetails, on
       </div>;
     })}
     <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3">
-      <span className="text-xs text-text-muted">{t("sessions.page", { page: currentPage + 1, pages: pageCount, total: filtered.length })}</span>
+      <span className="text-xs text-text-muted">{t("sessions.page", { page: currentPage + 1, pages: pageCount, total: filteredTotal })}</span>
       <div className="flex items-center gap-2">
         <select aria-label={t("sessions.pageSize")} value={pageSize} className={selectClass}
           onChange={(event) => { setPageSize(Number(event.target.value)); setPage(0); }}>

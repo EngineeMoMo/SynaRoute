@@ -496,7 +496,7 @@ mod tests {
     /// 落盘：确认后建出 Key、密钥入库、可读回。
     #[test]
     fn apply_creates_a_key_with_secret() {
-        let (store, dir) = crate::service::tests::temp_store("dl_apply");
+        let (store, dir) = crate::service::tests::credential_store("dl_apply");
         let key_b64 = b64("sk-landed-999");
         let url = format!(
             "synaroute://v1/import?resource=provider&name=W&endpoint=https://w.test/v1&apiKey={key_b64}\

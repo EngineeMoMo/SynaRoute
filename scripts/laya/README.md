@@ -44,6 +44,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\laya\start.ps1 -Mo
 
 接口依据：[Laya 原项目](https://github.com/NandhaKishorM/laya)、[服务实现](https://github.com/NandhaKishorM/laya/blob/main/laya/serve.py)。应用也支持 [Jev](https://docs.typesafe.ai/api) 和 OpenAI-compatible Chat Completions 判断服务。
 
+## 对比实验
+
+2026-11-17 已完成 0.3.29、0.4.35 和 Rust/ONNX 的固定模型、固定阈值对照。生产继续锁定 0.3.29；Rust/ONNX 仍是实验候选。原始数据、环境、复现命令及限制见 [COMPARISON.md](COMPARISON.md)，不以实验运行成功替代托管安装器验收。
+
 ## 故障恢复与验证
 
 - 安装目录、模型缓存、pip 缓存与临时目录按所在磁盘合计后与剩余空间比较：新装/修复时安装目录约 1.5 GB、可用环境复用至少 128 MB；模型未缓存时再加约 1 GB，新装/修复时临时文件与 pip 缓存各约 0.5 GB。网络路径（UNC）读不到剩余空间时跳过预检并写入日志。

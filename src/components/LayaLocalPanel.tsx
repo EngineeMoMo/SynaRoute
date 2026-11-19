@@ -45,6 +45,7 @@ export function LayaLocalPanel({ onConfigure, replaces }: { onConfigure: (endpoi
     return () => { cancelled = true; alive.current = false; window.clearTimeout(timer); };
   }, [zh]);
   const working = !!state && activePhases.includes(state.phase);
+  const rust = state?.backend === "rust";
   const phases: Record<string, string> = {
     idle: text("尚未启动", "Not started"), stopped: text("已停止", "Stopped"),
     checking: text("检查本地环境…", "Checking environment…"), python: text("安装 Python…", "Installing Python…"),
@@ -106,6 +107,24 @@ export function LayaLocalPanel({ onConfigure, replaces }: { onConfigure: (endpoi
     } catch (e) { if (alive.current) setError(String(e)); }
     finally { acting.current = false; if (alive.current) setBusy(false); }
   }
+  async function selectBackend(backend: "python" | "rust") {
+    if (acting.current) return;
+    acting.current = true; operation.current++; setBusy(true); setError(""); setNotice("");
+    try { setState(await api.layaLocalSetBackend(backend)); }
+    catch (failure) { if (alive.current) setError(String(failure)); }
+    finally { acting.current = false; if (alive.current) setBusy(false); }
+  }
+  async function changeBundle(rollback: boolean) {
+    if (acting.current) return;
+    acting.current = true; operation.current++; setBusy(true); setError(""); setNotice("");
+    try {
+      const directory = rollback ? null : await api.pickDirectory();
+      if (!rollback && !directory) return;
+      const next = directory ? await api.layaLocalImportBundle(directory) : await api.layaLocalRollbackBundle();
+      if (alive.current) { setState(next); setNotice(rollback ? text("已校验并恢复上一份模型包。", "Previous bundle verified and restored.") : text("文件逐一校验完成，已导入 Rust 模型包。", "Bundle imported after verifying every file.")); }
+    } catch (failure) { if (alive.current) setError(String(failure)); }
+    finally { acting.current = false; if (alive.current) setBusy(false); }
+  }
   // Applies to the next model download only; never starts, stops or re-downloads anything now.
   async function setMirror(enabled: boolean) {
     if (acting.current) return;
@@ -137,9 +156,9 @@ export function LayaLocalPanel({ onConfigure, replaces }: { onConfigure: (endpoi
   return <section className="space-y-3 rounded-control border border-border p-3" aria-busy={busy}>
     {pending && <ConfirmDialog
       tone={replaces ? "danger" : "primary"}
-      title={pending.kind === "repair" ? text("修复本地服务环境", "Repair local service") : setupKind ? text("安装并启动本地服务", "Set up local service") : text("替换当前判断服务", "Replace the current decision service")}
-      description={<>{setupKind && <span className="block">{setupText}</span>}{replaces && <span className="mt-2 block font-medium text-text-primary">{replaceText}</span>}<span className="mt-2 block">{text("是否继续？", "Continue?")}</span></>}
-      confirmLabel={setupKind ? text("确认，自动安装并运行", "Confirm, install and run") : text("确认替换", "Replace")}
+      title={rust ? text("校验并启动 Rust Laya", "Verify and start Rust Laya") : pending.kind === "repair" ? text("修复本地服务环境", "Repair local service") : setupKind ? text("安装并启动本地服务", "Set up local service") : text("替换当前判断服务", "Replace the current decision service")}
+      description={<>{setupKind && <span className="block">{rust ? text("逐一核对已导入文件的 SHA-256 后加载模型；不会下载。", "Every imported file is checked against its SHA-256 before loading. No downloads.") : setupText}</span>}{replaces && <span className="mt-2 block font-medium text-text-primary">{replaceText}</span>}<span className="mt-2 block">{text("是否继续？", "Continue?")}</span></>}
+      confirmLabel={rust ? text("确认启动", "Start") : setupKind ? text("确认，自动安装并运行", "Confirm, install and run") : text("确认替换", "Replace")}
       cancelLabel={text("取消", "Cancel")}
       onCancel={() => setPending(null)}
       onConfirm={() => { const kind = pending.kind; setPending(null); void action(kind); }}
@@ -148,17 +167,26 @@ export function LayaLocalPanel({ onConfigure, replaces }: { onConfigure: (endpoi
       <h3 className="text-sm font-medium text-text-primary">{text("Laya 本地服务", "Local Laya service")}</h3>
       <span role="status" className="text-xs text-text-secondary">{state ? phases[state.phase] ?? state.phase : text("等待连接桌面服务…", "Waiting for desktop service…")}</span>
     </div>
-    <p className="text-xs leading-relaxed text-text-secondary">{text("先检查已有环境，可用则直接启动。首次安装需要联网，约占 3.5 GB 磁盘空间。服务就绪后自动保存本地接口；运行方式保持你的选择。退出 SynaRoute 时服务停止。", "Existing environments are checked and reused. First setup needs internet access and takes about 3.5 GB of disk. The local endpoint is saved once ready; your selected mode is preserved. The service stops when SynaRoute exits.")}</p>
+    {state?.rustSupported && <label className="flex flex-wrap items-center gap-2 text-xs text-text-secondary">
+      {text("运行后端", "Backend")}
+      <select className="rounded-control border border-border bg-surface px-2 py-1" value={rust ? "rust" : "python"} disabled={busy || working} onChange={event => void selectBackend(event.target.value === "rust" ? "rust" : "python")}>
+        <option value="python">Python Laya 0.3.29</option><option value="rust">Rust / ONNX</option>
+      </select>
+    </label>}
+    <p className="text-xs leading-relaxed text-text-secondary">{rust ? text("导入固定版本模型包（约 1.35 GB），逐文件核对 SHA-256；每次启动再次校验。模型仅在本机处理。停止后可切回 Python，保留原环境。退出 SynaRoute 时服务停止。", "Import the pinned bundle (about 1.35 GB); every file is SHA-256 checked on import and at each launch. Inference stays on this machine. Stop to switch back to the retained Python environment. The service stops with SynaRoute.") : text("先检查已有环境，可用则直接启动。首次安装需要联网，约占 3.5 GB 磁盘空间。服务就绪后自动保存本地接口；运行方式保持你的选择。退出 SynaRoute 时服务停止。", "Existing environments are checked and reused. First setup needs internet access and takes about 3.5 GB of disk. The local endpoint is saved once ready; your selected mode is preserved. The service stops when SynaRoute exits.")}</p>
+    {rust && <p className="break-all text-xs text-text-muted">{state?.version}{text("。上游尚未发布 ONNX 下载包，请导入按仓库说明生成的已校验离线包。", ". Upstream ONNX downloads are not published yet. Import the verified offline bundle described in the repository guide.")}</p>}
     <p className="text-xs leading-relaxed text-text-muted">{text("判断方式：Laya 只判断「这个任务是否需要深入推理」，判定需要时把思考强度提高到 high，从不降低。在 36 条中英任务的留出测试中，需要深入推理的 12 条里提高了 4 条，其余 24 条里误提高 1 条；未提高时保持原有设置。约 1000 token 以上的输入会截断，此时保持原有设置。运行时常驻约 1.6 GB 内存。建议先用「仅建议」观察运行日志。", "How it judges: Laya only decides whether a task needs deep reasoning; when it does, effort is raised to high, never lowered. On a held-out set of 36 Chinese and English tasks it raised 4 of the 12 that needed deep reasoning and wrongly raised 1 of the other 24; otherwise the existing setting is kept. Inputs above about 1,000 tokens are truncated, and the existing setting is kept. While running it keeps about 1.6 GB of memory. Start with Suggest and check the activity log.")}</p>
     {working && state?.phase !== "running" && state?.phase !== "stopping" && <p className="text-xs text-text-muted">{text(`已用时 ${state?.elapsedSeconds ?? 0} 秒。环境检查最多 2 分钟，Python 安装 15 分钟，依赖安装 30 分钟，模型加载 20 分钟；可随时取消。`, `Elapsed: ${state?.elapsedSeconds ?? 0}s. Limits: environment check 2 min, Python 15 min, dependencies 30 min, model loading 20 min. Cancel at any time.`)}</p>}
     {state?.phase === "stopping" && <p className="text-xs text-text-muted">{text("中途打断 Python 安装程序可能留下装了一半的 Python，因此会等它结束后再停止（最多 10 分钟，超时则强制停止）。", "Interrupting the Python installer can leave a half-installed Python, so the stop waits for it to finish (up to 10 minutes, then it is forced).")}</p>}
     {state && !state.supported ? <p className="text-xs text-text-muted">{text("一键部署目前支持 Windows，其他系统可手动连接 Laya 服务。", "One-click setup currently supports Windows; other systems can connect to Laya manually.")}</p> : <div className="flex flex-wrap gap-2">
-      <Button size="sm" disabled={!state || busy || working} onClick={() => request(canLaunch ? "launch" : "start")}>{state?.phase === "failed" ? text("重试", "Retry") : canLaunch ? text("启动本地服务", "Start local service") : text("一键安装并运行", "Install and run")}</Button>
+      <Button size="sm" disabled={!state || busy || working || (rust && !canLaunch)} onClick={() => request(canLaunch ? "launch" : "start")}>{state?.phase === "failed" ? text("重试", "Retry") : canLaunch ? text("启动本地服务", "Start local service") : text("一键安装并运行", "Install and run")}</Button>
+      {rust && !working && <Button size="sm" variant="secondary" disabled={busy} onClick={() => void changeBundle(false)}>{text("导入离线模型包", "Import offline bundle")}</Button>}
+      {rust && !working && state?.canRollback && <Button size="sm" variant="secondary" disabled={busy} onClick={() => void changeBundle(true)}>{text("恢复上一份模型包", "Restore previous bundle")}</Button>}
       {working && <Button size="sm" variant="secondary" disabled={busy || state?.phase === "stopping"} onClick={() => void action("stop")}>{state?.phase === "running" ? text("停止", "Stop") : text("取消", "Cancel")}</Button>}
-      {!working && !!state?.supported && <Button size="sm" variant="secondary" disabled={busy} onClick={() => request("repair")}>{text("修复环境并运行", "Repair and run")}</Button>}
+      {!working && !!state?.supported && <Button size="sm" variant="secondary" disabled={busy || (rust && !canLaunch)} onClick={() => request("repair")}>{rust ? text("重新校验并运行", "Verify and run") : text("修复环境并运行", "Repair and run")}</Button>}
       {state?.phase === "running" && <Button size="sm" variant="secondary" disabled={busy} onClick={() => request("use")}>{text("使用此本地服务", "Use this local service")}</Button>}
     </div>}
-    {!working && !!state?.supported && <p className="text-xs text-text-muted">{text("修复会重新下载依赖并创建独立环境（约 1.5 GB），保留原环境和模型缓存。", "Repair downloads dependencies into a separate environment (about 1.5 GB), retaining the previous environment and model cache.")}</p>}
+    {!rust && !working && !!state?.supported && <p className="text-xs text-text-muted">{text("修复会重新下载依赖并创建独立环境（约 1.5 GB），保留原环境和模型缓存。", "Repair downloads dependencies into a separate environment (about 1.5 GB), retaining the previous environment and model cache.")}</p>}
     {!!state?.supported && <ToggleRow
       title={text("随 SynaRoute 自动启动本地服务", "Start the local service with SynaRoute")}
       desc={text("默认关闭。开启后，每次启动 SynaRoute 时自动启动已安装的本地服务，并使用上次运行成功的端口；环境未安装或该端口被占用时不会启动，也不会下载或安装任何内容。本机设置，不随配置导出。", "Off by default. When on, each SynaRoute launch starts the installed local service on the port it last ran on. It does not start if the environment is not installed or that port is taken, and never downloads or installs anything. Machine-local; not included in configuration export.")}
@@ -167,7 +195,7 @@ export function LayaLocalPanel({ onConfigure, replaces }: { onConfigure: (endpoi
       disabled={busy}
       onChange={(v) => void setAutostart(v)}
     />}
-    {!!state?.supported && <ToggleRow
+    {!rust && !!state?.supported && <ToggleRow
       title={text("通过镜像 hf-mirror.com 下载模型", "Download the model through hf-mirror.com")}
       desc={text("默认关闭。无法访问 Hugging Face 时可开启：之后的模型下载改从镜像站进行，下载的文件仍逐个核对已验证的 SHA-256 后才加载；Python 与依赖的下载来源不变，已下载的模型不会重新下载。本机设置，不随配置导出。", "Off by default. Turn on when Hugging Face is unreachable: later model downloads come from the mirror, and each downloaded file is still checked against its verified SHA-256 before loading. Python and dependency sources do not change, and an already downloaded model is not downloaded again. Machine-local; not included in configuration export.")}
       cost={text("hf-mirror.com 是第三方站点，会看到模型下载请求。", "hf-mirror.com is a third-party site and sees the model download requests.")}

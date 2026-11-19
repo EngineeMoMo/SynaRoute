@@ -12,7 +12,8 @@
 //! judges keep the three-level question.
 use serde_json::{json, Value};
 
-pub(super) const QUESTION: &str = "Does answering this task require deep, multi-step reasoning such as system architecture, ambiguous debugging or a formal proof?";
+#[path = "../laya_question.rs"] mod question;
+use question::QUESTION;
 /// Fixed on the calibration set before the held-out set was scored.
 pub(super) const THRESHOLD: f64 = 0.75;
 

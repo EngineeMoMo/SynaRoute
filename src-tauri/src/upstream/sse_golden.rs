@@ -26,9 +26,9 @@
 use super::sse::{sse_direction, SseDirection, SseTranslator};
 use crate::model::Protocol;
 
-const FIXTURE_ANTHROPIC: &str = include_str!("../testdata/sse/upstream_anthropic.sse");
-const FIXTURE_CHAT: &str = include_str!("../testdata/sse/upstream_chat.sse");
-const FIXTURE_RESPONSES: &str = include_str!("../testdata/sse/upstream_responses.sse");
+const FIXTURE_ANTHROPIC: &str = concat!(include_str!("../testdata/sse/upstream_anthropic.sse"), "\n");
+const FIXTURE_CHAT: &str = concat!(include_str!("../testdata/sse/upstream_chat.sse"), "\n");
+const FIXTURE_RESPONSES: &str = concat!(include_str!("../testdata/sse/upstream_responses.sse"), "\n");
 
 /// 上游字节的切分方式。翻译器是行缓冲状态机，其输出**必须与切分方式无关**。
 #[derive(Clone, Copy, Debug)]

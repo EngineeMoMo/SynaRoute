@@ -73,7 +73,11 @@ pub(crate) struct Credentials {
 
 impl Store {
     pub(crate) fn migrate_balance_credentials(&self) -> AppResult<bool> {
-        if self.secrets.read().is_locked()
+        let vault = self.secrets.read();
+        let mode = vault.master_state();
+        let awaiting_password = mode.required && !mode.enabled && !vault.is_degraded();
+        drop(vault);
+        if mode.locked || awaiting_password
             || !self.config.read().keys.iter().any(|key| {
                 key.balance_query
                     .as_ref()
@@ -266,7 +270,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::tests::temp_store;
+    use crate::service::tests::credential_store;
 
     fn configured(store: &Store) -> ProviderKey {
         let key = store
@@ -294,7 +298,7 @@ mod tests {
 
     #[test]
     fn panel_tokens_are_encrypted_and_can_be_replaced_or_cleared() {
-        let (store, directory) = temp_store("balance_secrets");
+        let (store, directory) = credential_store("balance_secrets");
         let mut key = configured(&store);
         let reference = key
             .balance_query
@@ -351,7 +355,7 @@ mod tests {
 
     #[test]
     fn cache_survives_metadata_edits_but_not_query_or_secret_edits() {
-        let (store, _) = temp_store("balance_invalidation");
+        let (store, _) = credential_store("balance_invalidation");
         let mut key = configured(&store);
         store.update_balance_cache(&key.id, result()).unwrap();
         key.name = "renamed".into();
@@ -367,7 +371,7 @@ mod tests {
 
     #[test]
     fn shared_credentials_invalidate_all_dependent_balances() {
-        let (store, _) = temp_store("balance_shared_secret");
+        let (store, _) = credential_store("balance_shared_secret");
         let key = configured(&store);
         let mut dependent = key.clone();
         dependent.id = "balance-dependent".into();
@@ -384,7 +388,7 @@ mod tests {
 
     #[test]
     fn old_queries_cannot_restore_cache_or_overwrite_a_new_url() {
-        let (store, _) = temp_store("balance_stale");
+        let (store, _) = credential_store("balance_stale");
         let key = configured(&store);
         let credentials = store.balance_credentials(&key).unwrap();
         let mut stale = result();
@@ -418,7 +422,7 @@ mod tests {
 
     #[test]
     fn unreferenced_panel_tokens_can_be_pruned_without_removing_the_current_token() {
-        let (store, _) = temp_store("balance_token_cleanup");
+        let (store, _) = credential_store("balance_token_cleanup");
         let mut key = configured(&store);
         let previous = key
             .balance_query
@@ -452,7 +456,7 @@ mod tests {
 
     #[test]
     fn failed_configuration_write_preserves_the_original_encrypted_token() {
-        let (store, directory) = temp_store("balance_failed_write");
+        let (store, directory) = credential_store("balance_failed_write");
         let mut key = configured(&store);
         let previous = key.balance_query.as_ref().unwrap().access_token_ref.clone();
         std::fs::remove_file(directory.join("config.json")).unwrap();
@@ -477,7 +481,7 @@ mod tests {
 
     #[test]
     fn removing_a_shared_api_credential_clears_dependent_balances() {
-        let (store, _) = temp_store("balance_remove_credential");
+        let (store, _) = credential_store("balance_remove_credential");
         let mut key = configured(&store);
         key.balance_query.as_mut().unwrap().api_key_ref = Some("shared-credential".into());
         let key = store.upsert_key(key).unwrap();

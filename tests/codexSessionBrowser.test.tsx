@@ -18,6 +18,17 @@ function session(id: string, changes: Partial<CodexSessionRow> = {}): CodexSessi
 }
 
 describe("Codex session browsing", () => {
+  it("renders a backend page without applying a second local slice or losing off-page selection", () => {
+    const data = { ...mockCodexSessions(), rows: [session("page-three", { archived: true })],
+      page: { filteredTotal: 125, page: 2, pageSize: 50, providerCounts: { synaroute: 125 } } };
+    const html = renderToStaticMarkup(createElement(SessionBrowser, {
+      data, picked: new Set(["sessions/off-page.jsonl"]), disabled: false,
+      onSelect() {}, onDetails() {}, onExport() {}, onDelete() {}, onArchive() {}, onQuery() {},
+    }));
+    expect(html).toContain("Conversation page-three");
+    expect(html).toContain("125");
+    expect(html).not.toContain("Conversation off-page");
+  });
   it("keeps user forks and unknown sources visible while separating known internal sessions", () => {
     const rows = [session("user"), session("fork", { forked: true, internal: true }),
       session("internal", { threadSource: "guardian_review", internal: true }),

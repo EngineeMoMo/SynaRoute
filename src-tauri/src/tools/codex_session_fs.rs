@@ -69,29 +69,40 @@ pub(in crate::tools) fn split_eol(line: &str) -> (&str, &str) {
 /// 目录不存在**不是错误**：干净安装的机器上 `archived_sessions` 常常没有，
 /// 而把它当错误会让整次接入失败在一件无关紧要的事上。
 pub(in crate::tools) fn collect_rollouts(home: &Path) -> Vec<(PathBuf, bool)> {
-    let mut out = Vec::new();
-    for dir in SESSION_DIRS {
-        let archived = dir == "archived_sessions";
-        walk(&home.join(dir), 0, archived, &mut out);
-    }
-    out
+    collect_rollouts_checked(home).0
 }
 
-fn walk(dir: &Path, depth: usize, archived: bool, out: &mut Vec<(PathBuf, bool)>) {
+pub(in crate::tools) fn collect_rollouts_checked(home: &Path) -> (Vec<(PathBuf, bool)>, usize) {
+    let mut out = Vec::new();
+    let mut failures = 0;
+    for dir in SESSION_DIRS {
+        let archived = dir == "archived_sessions";
+        walk(&home.join(dir), 0, archived, &mut out, &mut failures);
+    }
+    (out, failures)
+}
+
+fn walk(dir: &Path, depth: usize, archived: bool, out: &mut Vec<(PathBuf, bool)>, failures: &mut usize) {
     if depth > MAX_DEPTH {
+        *failures += 1;
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => { if error.kind() != io::ErrorKind::NotFound { *failures += 1; } return; }
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { *failures += 1; continue; };
         let path = entry.path();
         match entry.file_type() {
-            Ok(t) if t.is_dir() => walk(&path, depth + 1, archived, out),
+            Ok(t) if t.is_dir() => walk(&path, depth + 1, archived, out, failures),
             Ok(t) if t.is_file() => {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if name.starts_with("rollout-") && name.ends_with(".jsonl") {
                     out.push((path, archived));
                 }
             }
+            Err(_) => *failures += 1,
             _ => {}
         }
     }

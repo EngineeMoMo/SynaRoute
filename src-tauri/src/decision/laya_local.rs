@@ -7,10 +7,26 @@ mod policy;
 #[cfg(windows)]
 #[path = "laya_windows.rs"]
 mod windows;
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[path = "laya_rust.rs"]
+mod rust;
+
+fn operations() -> &'static tokio::sync::Mutex<()> {
+    static VALUE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    VALUE.get_or_init(Default::default)
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
+    #[serde(default = "python_backend")]
+    pub backend: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub rust_supported: bool,
+    #[serde(default, skip_deserializing)]
+    pub can_rollback: bool,
     pub supported: bool,
     pub phase: String,
     pub endpoint: String,
@@ -45,6 +61,10 @@ pub struct Status {
 impl Default for Status {
     fn default() -> Self {
         Self {
+            backend: python_backend(),
+            version: None,
+            rust_supported: cfg!(all(windows, target_arch = "x86_64")),
+            can_rollback: false,
             supported: cfg!(windows),
             phase: "idle".into(),
             endpoint: "http://127.0.0.1:8000/v1/systemone".into(),
@@ -68,10 +88,17 @@ const PREFS_FILE: &str = "laya-local.json";
 #[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Prefs {
+    #[serde(default = "python_backend")]
+    backend: String,
     #[serde(default)]
     autostart: bool,
     #[serde(default)]
     mirror: bool,
+}
+fn python_backend() -> String { "python".into() }
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn selected_backend() -> String {
+    data_dir().map(|directory| prefs_in(&directory).backend).filter(|backend| backend == "rust").unwrap_or_else(python_backend)
 }
 /// Any read or parse failure means off: launching a 1.6 GB service, or sending downloads to a
 /// third party, on a guess is the wrong default.
@@ -81,16 +108,21 @@ fn prefs_in(dir: &Path) -> Prefs {
         .and_then(|text| serde_json::from_str::<Prefs>(&text).ok())
         .unwrap_or_default()
 }
+#[cfg(any(windows, test))]
 fn autostart_in(dir: &Path) -> bool {
     prefs_in(dir).autostart
 }
 fn write_autostart_in(dir: &Path, autostart: bool) -> Result<(), String> {
-    write_prefs_in(dir, Prefs { autostart, ..prefs_in(dir) })
+    update_prefs(dir, |prefs| prefs.autostart = autostart)
 }
 fn write_mirror_in(dir: &Path, mirror: bool) -> Result<(), String> {
-    write_prefs_in(dir, Prefs { mirror, ..prefs_in(dir) })
+    update_prefs(dir, |prefs| prefs.mirror = mirror)
 }
-fn write_prefs_in(dir: &Path, prefs: Prefs) -> Result<(), String> {
+fn update_prefs(dir: &Path, edit: impl FnOnce(&mut Prefs)) -> Result<(), String> {
+    static WRITES: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _write = WRITES.lock();
+    let mut prefs = prefs_in(dir);
+    edit(&mut prefs);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let path = dir.join(PREFS_FILE);
     let tmp = dir.join(format!("{PREFS_FILE}.{}.tmp", uuid::Uuid::new_v4().simple()));
@@ -109,7 +141,15 @@ fn data_dir() -> Option<std::path::PathBuf> {
 /// Every command returns through here, so the panel never sees `installed`/`autostart` flip
 /// between a poll and the result of a click.
 fn complete(mut status: Status) -> Status {
-    #[cfg(windows)]
+    status.rust_supported = cfg!(all(windows, target_arch = "x86_64"));
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if status.backend == "rust" {
+        status.installed = rust::installed();
+        status.can_rollback = rust::root().is_ok_and(|root| crate::laya_runtime::bundle::can_rollback(&root));
+    } else {
+        status.installed = windows::installed();
+    }
+    #[cfg(all(windows, not(target_arch = "x86_64")))]
     {
         status.installed = windows::installed();
     }
@@ -118,12 +158,15 @@ fn complete(mut status: Status) -> Status {
     status.mirror = prefs.mirror;
     status
 }
+#[cfg(windows)]
 fn mirror_pref() -> bool {
     data_dir().is_some_and(|dir| prefs_in(&dir).mirror)
 }
 
 #[tauri::command]
 pub fn laya_local_status() -> Status {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if selected_backend() == "rust" { return complete(rust::status()); }
     #[cfg(windows)]
     let status = windows::status();
     #[cfg(not(windows))]
@@ -132,6 +175,11 @@ pub fn laya_local_status() -> Status {
 }
 #[tauri::command]
 pub async fn laya_local_start(repair: Option<bool>, no_install: Option<bool>) -> Result<Status, String> {
+    let _operation = operations().lock().await;
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if selected_backend() == "rust" {
+        return rust::start(false).await.map(complete);
+    }
     #[cfg(windows)]
     {
         windows::start(repair.unwrap_or(false), no_install.unwrap_or(false), mirror_pref()).await.map(complete)
@@ -146,11 +194,53 @@ pub async fn laya_local_start(repair: Option<bool>, no_install: Option<bool>) ->
 /// completes it when the installer returns, or forces it after a bounded wait.
 #[tauri::command]
 pub async fn laya_local_stop() -> Result<Status, String> {
+    let _operation = operations().lock().await;
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if selected_backend() == "rust" { return rust::stop().await.map(complete); }
     #[cfg(windows)]
     let status = windows::stop(false).await?;
     #[cfg(not(windows))]
     let status = Status::default();
     Ok(complete(status))
+}
+
+#[tauri::command]
+pub async fn laya_local_set_backend(backend: String) -> Result<Status, String> {
+    let _operation = operations().lock().await;
+    if !matches!(backend.as_str(), "python" | "rust") { return Err("Unknown local backend".into()); }
+    if backend == "rust" && !cfg!(all(windows, target_arch = "x86_64")) { return Err("Rust Laya currently requires Windows x64".into()); }
+    if !matches!(laya_local_status().phase.as_str(), "idle" | "stopped" | "failed") { return Err("Stop the local service before switching its backend".into()); }
+    let directory = data_dir().ok_or("data directory unavailable")?;
+    update_prefs(&directory, |prefs| prefs.backend = backend)?;
+    Ok(laya_local_status())
+}
+
+#[tauri::command]
+pub async fn laya_local_import_bundle(directory: String) -> Result<Status, String> {
+    let _operation = operations().lock().await;
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        if selected_backend() != "rust" { return Err("Select Rust Laya before importing its bundle".into()); }
+        rust::import(directory.into()).await.map(complete)
+    }
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    { let _ = directory; Err("Rust Laya currently requires Windows x64".into()) }
+}
+
+#[tauri::command]
+pub async fn laya_local_rollback_bundle() -> Result<Status, String> {
+    let _operation = operations().lock().await;
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        if selected_backend() != "rust" || !matches!(rust::status().phase.as_str(), "idle" | "stopped" | "failed") {
+            return Err("Stop Rust Laya before restoring its previous bundle".into());
+        }
+        let directory = rust::root()?;
+        tokio::task::spawn_blocking(move || crate::laya_runtime::bundle::rollback(&directory)).await.map_err(|error| error.to_string())??;
+        Ok(complete(rust::status()))
+    }
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    { Err("Rust Laya currently requires Windows x64".into()) }
 }
 /// Takes effect at the next launch only: switching it never starts or stops a running service.
 #[tauri::command]
@@ -184,12 +274,17 @@ pub(crate) fn autostart_on_launch() {
         tauri::async_runtime::spawn(async {
             // Let the window come up before PyTorch and the model load.
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let _operation = operations().lock().await;
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            if selected_backend() == "rust" { let _ = rust::start(true).await; return; }
             let _ = windows::start_on_launch(mirror_pref()).await;
         });
     }
 }
 /// The app is exiting and its job object kills the tree anyway, so this never defers.
 pub(crate) async fn shutdown() {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    let _ = rust::stop().await;
     #[cfg(windows)]
     let _ = windows::stop(true).await;
 }

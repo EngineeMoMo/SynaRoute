@@ -88,7 +88,7 @@ impl LimitKind {
             Self::ToolSlots => format!("工具调用数超过 {MAX_TOOL_SLOTS}"),
             Self::ToolSeen => format!("工具调用去重记录超过 {MAX_TOOL_SEEN} 条"),
             Self::LineBuffer => format!(
-                "单行数据超过 {MAX_LINE_BYTES} 字节（上游可能并未在发送 SSE，或发送了超大完整行）"
+                "单行数据超过或 SSE 事件累计超过 {MAX_LINE_BYTES} 字节；上游可能并未在发送 SSE，或事件体异常过大"
             ),
             Self::Accum => format!("累积正文超过 {MAX_ACCUM_BYTES} 字节"),
         }
@@ -115,15 +115,7 @@ impl SseTranslator {
         Err(self.take_tool_limit_error().unwrap_or_default())
     }
 
-    /// 在把完整行复制到临时 Vec 之前检查它的真实字节数。
-    pub(super) fn complete_line_too_long(&mut self, len: usize) -> bool {
-        if len > MAX_LINE_BYTES {
-            self.note_limit(LimitKind::LineBuffer);
-            true
-        } else {
-            false
-        }
-    }
+
 
     /// 记下越界项。**先到的那一项赢** —— 它是根因，后面那些多半是它的连带。
     fn note_limit(&mut self, kind: LimitKind) {
@@ -185,18 +177,7 @@ impl SseTranslator {
         self.reasoning_accum.push_str(chunk);
     }
 
-    /// 行缓冲上限检查；越界返回那条错误事件。`push` 在行循环**之后**调一次。
-    ///
-    /// 判据只看**还没等到 `\n` 的那一段**（完整行已被行循环 drain 掉）——
-    /// 按整个 buf 判会把「一个 chunk 里塞几十条完整行」这个正常形态误杀。
-    /// 放在循环之后也是必须的：一个 `\n` 都没有时循环压根不进入，
-    /// 那正是这条上限要挡的形态。
-    pub(super) fn line_buffer_error(&mut self) -> Option<String> {
-        if self.buf.len() > MAX_LINE_BYTES {
-            self.note_limit(LimitKind::LineBuffer);
-        }
-        self.take_tool_limit_error()
-    }
+
 
     /// 越界后要发的那条事件（没越界返回 `None`）。`push` 每处理完一行就问它一次。
     pub(super) fn take_tool_limit_error(&mut self) -> Option<String> {

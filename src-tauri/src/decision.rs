@@ -12,6 +12,7 @@ use std::{collections::BTreeMap, time::Duration};
 #[path = "decision/laya_local.rs"] pub(crate) mod laya_local;
 #[path = "decision/native_judge.rs"] mod native_judge;
 #[path = "decision/laya_judge.rs"] mod laya_judge;
+#[path = "decision/accounting.rs"] pub(crate) mod accounting;
 #[cfg(test)] #[path = "decision/cache_retry_test.rs"] mod cache_retry_test;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -279,6 +280,7 @@ fn parse_level(provider: Provider, body: &Value) -> Option<Level> {
 
 async fn judge(
     store: &Store,
+    category: CategoryType,
     config: &DecisionConfig,
     prompt: &str,
 ) -> Result<Level, &'static str> {
@@ -288,7 +290,7 @@ async fn judge(
     if prompt.is_empty() || prompt.len() > 24_000 {
         return Err("问题为空或过长 / empty or oversized task");
     }
-    let body = query(store, config, request_body(config, prompt)).await?;
+    let body = query(store, category, config, request_body(config, prompt)).await?;
     parse_level(config.provider, &body)
         .ok_or("判断不确定或格式不兼容 / uncertain or incompatible result")
 }
@@ -298,7 +300,7 @@ fn is_loopback_endpoint(endpoint: &str) -> bool {
     crate::upstream::is_loopback_url(endpoint)
 }
 
-async fn query(store: &Store, config: &DecisionConfig, body: Value) -> Result<Value, &'static str> {
+async fn query(store: &Store, category: CategoryType, config: &DecisionConfig, body: Value) -> Result<Value, &'static str> {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(4));
@@ -323,6 +325,7 @@ async fn query(store: &Store, config: &DecisionConfig, body: Value) -> Result<Va
     }
     // The managed service does not start with the app; after a restart auto mode would otherwise
     // fall back every round with only "connection error".
+    let mut accounting = accounting::RequestUsage::new(store, category, config);
     let mut response = request.send().await.map_err(|e| {
         if local && e.is_connect() {
             "本地判断服务未运行，请在「动态思考」中启动 / local decision service is not running"
@@ -330,9 +333,7 @@ async fn query(store: &Store, config: &DecisionConfig, body: Value) -> Result<Va
             "连接失败或超时 / connection error or timeout"
         }
     })?;
-    if !response.status().is_success() {
-        return Err("服务返回错误状态 / service rejected request");
-    }
+    let success = response.status().is_success();
     let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()
@@ -346,6 +347,8 @@ async fn query(store: &Store, config: &DecisionConfig, body: Value) -> Result<Va
     }
     let body: Value =
         serde_json::from_slice(&bytes).map_err(|_| "响应格式无效 / invalid response")?;
+    accounting.observe(&body);
+    if !success { return Err("服务返回错误状态 / service rejected request"); }
     Ok(body)
 }
 
@@ -375,7 +378,7 @@ pub(crate) async fn prepare(
     } else {
         tokio::time::timeout(
             Duration::from_millis((budget_ms / 10).clamp(1, 4000)),
-            judge(store, &config, prompt),
+            judge(store, category, &config, prompt),
         )
         .await
         .unwrap_or(Err("判断超时 / decision timeout"))
@@ -459,7 +462,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("synaroute-decision-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         (
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
             dir,
         )
     }

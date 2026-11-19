@@ -14,11 +14,13 @@ const WINDOW: usize = 8192;
 struct State {
     upstream: Upstream, translator: Option<SseTranslator>, finished: bool,
     head: Vec<u8>, tail: Vec<u8>, errored: bool, eof: bool,
+    monitor: Option<crate::upstream::sse_frames::Monitor>,
     store: Arc<Store>, category: CategoryType, key_id: String, requested_model: String, real_model: String,
     lease: Option<crate::store::routing::runtime::Lease>, active: Control,
 }
 impl State {
-    fn observe(&mut self, bytes: &[u8]) {
+    fn observe(&mut self, bytes: &[u8]) -> usize {
+        let consumed = self.monitor.as_mut().map_or(bytes.len(), |monitor| monitor.push(bytes));
         let n = (WINDOW - self.head.len()).min(bytes.len());
         self.head.extend_from_slice(&bytes[..n]);
         if bytes.len() >= WINDOW {
@@ -27,19 +29,21 @@ impl State {
             let remove = self.tail.len().saturating_add(bytes.len()).saturating_sub(WINDOW);
             self.tail.drain(..remove); self.tail.extend_from_slice(bytes);
         }
+        consumed
     }
     fn saw_error(&self) -> bool {
-        self.errored || crate::upstream::sse_stream_errored(&String::from_utf8_lossy(&self.tail))
+        self.errored || self.translator.as_ref().is_some_and(SseTranslator::failed)
+            || self.monitor.as_ref().is_some_and(|monitor| monitor.failed(self.eof))
     }
 }
 impl Drop for State {
     fn drop(&mut self) {
         let errored = self.saw_error();
-        if !matches!(self.active.end(), Some(End::Operator | End::Disconnected)) && (self.eof || self.errored) {
+        if !matches!(self.active.end(), Some(End::Operator | End::Disconnected)) && (self.errored || (self.eof && self.monitor.is_some())) {
             crate::health::record_stream_end(&self.store, self.category, &self.key_id, &self.requested_model, &self.real_model, errored);
             crate::store::routing::policy::stream_end(&self.store, &self.lease, errored);
         }
-        let usage = if let Some(tr) = &self.translator { tr.accumulated_usage() } else {
+        let usage = if let Some(tr) = &self.translator { tr.accumulated_usage() } else if let Some(monitor) = &self.monitor { monitor.usage() } else {
             let mut raw = String::from_utf8_lossy(&self.head).into_owned();
             raw.push('\n'); raw.push_str(&String::from_utf8_lossy(&self.tail));
             crate::upstream::extract_usage_from_sse(&raw)
@@ -62,6 +66,11 @@ pub(super) fn response(
     let content_type = resp.headers().get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("text/event-stream").to_owned();
     let encoding = resp.headers().get("content-encoding").and_then(|h| h.to_str().ok())
         .map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("identity")).map(str::to_owned);
+    if translated && encoding.is_some() {
+        return Err(crate::error::AppError::upstream_msg("Cannot translate an encoded upstream SSE stream"));
+    }
+    let monitor = (encoding.is_none() && content_type.split(';').next().is_some_and(|kind| kind.trim().eq_ignore_ascii_case("text/event-stream")))
+        .then(|| crate::upstream::sse_frames::Monitor::new(key.protocol));
     active.phase(Phase::Waiting);
     // One shared inlet for both streaming exits; permit stays with this stream, not the handler.
     let counter = active.clone();
@@ -69,16 +78,16 @@ pub(super) fn response(
         if let Ok(bytes) = chunk { counter.received(bytes.len()); }
     }), permit);
     let state = State { upstream, translator, finished: false, head: Vec::new(), tail: Vec::new(),
-        errored: false, eof: false, store: store.clone(), category, key_id: key.id.clone(),
+        errored: false, eof: false, monitor, store: store.clone(), category, key_id: key.id.clone(),
         requested_model: requested_model.into(), real_model: real_model.into(), lease, active };
-    let stream = futures_util::stream::unfold(state, |mut st| async move {
+    let stream = futures_util::stream::unfold(state, move |mut st| async move {
         if st.finished { return None; }
         loop {
             match st.upstream.next().await {
                 Some(Ok(bytes)) => {
-                    st.observe(&bytes);
+                    let consumed = st.observe(&bytes);
                     let output = match &mut st.translator {
-                        Some(tr) => Bytes::from(tr.push(&bytes)), None => bytes,
+                        Some(tr) => Bytes::from(tr.push(&bytes)), None => bytes.slice(..consumed),
                     };
                     if !output.is_empty() { return Some((Ok(output), st)); }
                 }
@@ -91,10 +100,12 @@ pub(super) fn response(
                     // Release the network stream and its permit before yielding a final frame.
                     // That frame may remain blocked by downstream backpressure indefinitely.
                     st.upstream = Box::pin(futures_util::stream::empty());
+                    let tail = st.translator.as_mut().map(|tr| tr.finish()).unwrap_or_default();
                     let error = st.saw_error();
                     st.active.finish(if error { End::UpstreamError } else { End::Complete });
-                    if error { return None; } // never synthesize completed after an upstream error
-                    let tail = st.translator.as_mut().map(|tr| tr.finish()).unwrap_or_default();
+                    if error && st.translator.is_none() && !st.monitor.as_ref().is_some_and(|monitor| monitor.explicit_error()) {
+                        return Some((Ok(Bytes::from(crate::upstream::sse_frames::failure(downstream))), st));
+                    }
                     if tail.is_empty() { return None; }
                     return Some((Ok(Bytes::from(tail)), st));
                 }

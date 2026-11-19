@@ -23,9 +23,9 @@ use windows::Win32::{
     },
 };
 
-struct Job(isize);
+pub(super) struct Job(isize);
 impl Job {
-    fn attach(pid: u32) -> Result<Self, String> {
+    pub(super) fn attach(pid: u32) -> Result<Self, String> {
         // The PowerShell script waits for stdin before it can start any child process.
         unsafe {
             let job = CreateJobObjectW(None, None).map_err(|e| e.to_string())?;
@@ -66,7 +66,7 @@ fn running() -> &'static Mutex<Option<Running>> {
     VALUE.get_or_init(Default::default)
 }
 fn state_file() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|p| p.join("SynaRoute/laya/last-status.json"))
+    install_dir().map(|directory| directory.join("last-status.json"))
 }
 /// Temp file plus rename: a torn write would drop `ready_endpoint`, and the next launch-time start
 /// would then come up on the default port while saved settings point at the old one.
@@ -103,6 +103,9 @@ pub(super) fn installed() -> bool {
     install_dir().is_some_and(|dir| installed_at(&dir))
 }
 fn install_dir() -> Option<PathBuf> {
+    if std::env::var_os(crate::store::data_dir::ENV_OVERRIDE).is_some_and(|value| !value.is_empty()) {
+        return super::data_dir().map(|directory| directory.join("laya"));
+    }
     dirs::data_local_dir().map(|p| p.join("SynaRoute/laya"))
 }
 /// Same pointer rule as start.ps1: `environment.txt` names `venv` or `env-<32 hex>`, else `venv`.

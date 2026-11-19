@@ -31,7 +31,7 @@ const BACKUP_SUFFIX: &str = "synaroute.bak";
 pub(crate) mod codex; pub(crate) mod overview; pub(crate) mod scene_config;
 
 /// 写入 / 备份 / 回滚 / 还原这一层。抽出来的判据见该模块头。
-mod fsops;
+mod fsops; pub(crate) mod claude_restore;
 
 use fsops::{
     backup_and_write_bytes, backup_and_write_json, backup_path_for, created_marker_path_for,
@@ -108,8 +108,8 @@ fn apply_claude_cli_at(
     endpoint: &str,
     default_model: Option<&str>,
 ) -> AppResult<String> {
+    let _guard = claude_restore::lock(); claude_restore::recover_locked(path)?;
     let mut root = read_json_or_empty(path)?;
-
     // 确保 env 对象存在
     let env = root
         .as_object_mut()
@@ -1077,7 +1077,7 @@ pub fn restore(category: CategoryType) -> AppResult<String> {
         }
     }
 
-    match restore_one(&path) {
+    match if category == CategoryType::ClaudeCli { claude_restore::restore(&path) } else { restore_one(&path) } {
         Ok(true) => restored.push(path.display().to_string()),
         Ok(false) => {}
         Err(e) => {

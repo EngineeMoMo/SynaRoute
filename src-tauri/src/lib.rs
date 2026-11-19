@@ -12,7 +12,10 @@ mod error;
 mod events;
 mod health;
 mod http_ingress;
+#[cfg(all(windows, target_arch = "x86_64"))] mod laya_runtime;
 mod mcp;
+#[cfg(all(feature = "native-acceptance", any(target_os = "linux", all(windows, target_arch = "x86_64", target_env = "msvc"))))]
+pub mod native_acceptance;
 mod model;
 mod notification;
 mod portable;
@@ -372,14 +375,13 @@ fn get_tool_config_preview(
 }
 
 #[tauri::command]
-fn restore_tool_config(
-    state: tauri::State<AppState>,
+async fn restore_tool_config(
+    state: tauri::State<'_, AppState>,
     category_id: CategoryType,
 ) -> AppResult<String> {
-    // 走「保留 MCP」的还原：这是前端「停止代理」按钮触发的命令，而停代理与关 MCP 是两条路
-    // —— 用户停代理只想断路由，没要求关掉大脑聚合。对 Codex 尤其重要（代理设置与 mcp_servers
-    // 同在 config.toml，裸 restore 会顺手抹掉 MCP）。见 service::restore_client_config_keeping_mcp。
-    service::restore_client_config_keeping_mcp(&state.store, &state.mcp, category_id)
+    let (store, mcp) = (state.store.clone(), state.mcp.clone());
+    tauri::async_runtime::spawn_blocking(move || service::restore_client_config_keeping_mcp(&store, &mcp, category_id))
+        .await.map_err(|error| crate::error::AppError::ToolConfig(error.to_string()))?
 }
 
 /// 「切回官方」：停止该分类代理 + 还原客户端配置，但**保留 MCP 注册**。
@@ -1247,6 +1249,7 @@ pub fn run() {
                 let proxy_bg = state.proxy.clone();
                 let app_bg = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
+                    let _ = tauri::async_runtime::spawn_blocking(tools::claude_restore::recover_on_launch).await;
                     let restored = service::restore_proxies_on_launch(&store_bg, &proxy_bg).await;
                     // 托盘图标按「是否有代理在跑」灰度化（FR-022），恢复完必须刷一次，
                     // 否则托盘显示「全停」而实际在跑。
@@ -1338,7 +1341,7 @@ pub fn run() {
             list_vendors,
             upsert_vendor,
             delete_vendor,
-            store::decision::get_decision_config, store::decision::save_decision_config, store::decision::native_discovery::native_defaults, store::decision::native::native_open, store::decision::native::native_snapshot, store::decision::native::native_turn, store::decision::native::native_approve, store::decision::native::native_close, store::decision::laya_local::laya_local_status, store::decision::laya_local::laya_local_start, store::decision::laya_local::laya_local_stop, store::decision::laya_local::laya_local_set_autostart, store::decision::laya_local::laya_local_set_mirror, store::decision::laya_local::laya_local_sync_endpoints,
+            store::decision::get_decision_config, store::decision::save_decision_config, store::decision::native_discovery::native_defaults, store::decision::native::native_open, store::decision::native::native_snapshot, store::decision::native::native_turn, store::decision::native::native_approve, store::decision::native::native_close, store::decision::laya_local::laya_local_status, store::decision::laya_local::laya_local_start, store::decision::laya_local::laya_local_stop, store::decision::laya_local::laya_local_set_autostart, store::decision::laya_local::laya_local_set_mirror, store::decision::laya_local::laya_local_sync_endpoints, store::decision::laya_local::laya_local_set_backend, store::decision::laya_local::laya_local_import_bundle, store::decision::laya_local::laya_local_rollback_bundle,
             aggregate::aggregate_plan,
             aggregate::aggregate_execute,
             aggregate::aggregate_write,
@@ -1769,10 +1772,7 @@ fn handle_tray_proxy_toggle(app: &tauri::AppHandle, id: &str) {
     if running {
         proxy.stop(category);
         store.append_event(category, "config", None, "托盘停止代理");
-        // 停止即退出接入态（与前端 stopProxy 一致）：还原客户端配置，**但保留 MCP**。
-        // 停代理与关 MCP 是两条独立的路——见 service::restore_client_config_keeping_mcp。
-        // Codex 连同 auth.json 一起复原，用户官方登录立即恢复；其 mcp_servers 因整文件
-        // 回滚被抹掉后，这里幂等补回。
+        tauri::async_runtime::spawn_blocking(move || {
         match service::restore_client_config_keeping_mcp(&store, &mcp, category) {
             Ok(msg) => store.append_event(category, "config", None, &msg),
             Err(e) => store.append_event(
@@ -1783,6 +1783,7 @@ fn handle_tray_proxy_toggle(app: &tauri::AppHandle, id: &str) {
             ),
         }
         let _ = rebuild_tray(&app);
+        });
         return;
     }
 

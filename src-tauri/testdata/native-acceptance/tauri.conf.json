@@ -1,0 +1,8 @@
+{
+  "productName": "SynaRoute Acceptance",
+  "identifier": "com.synaroute.localacceptance",
+  "version": "0.0.0",
+  "build": {"frontendDist": "web"},
+  "app": {"windows": []},
+  "bundle": {"active": false, "icon": ["../../icons/icon.png", "../../icons/icon.ico"]}
+}

@@ -751,6 +751,7 @@ export interface CodexSessionRow {
 
 /** 列表页顶部那张统计卡。 */
 export interface CodexSessionStats {
+  metadataFailures?: number;
   total: number;
   active: number;
   archived: number;
@@ -767,6 +768,7 @@ export interface CodexSessionStats {
 /** 会话列表的一次快照。 */
 export interface CodexSessionList {
   rows: CodexSessionRow[];
+  page?: { filteredTotal: number; page: number; pageSize: number; providerCounts: Record<string, number>; retainedSelection?: string[] };
   /** `config.toml` 里当前生效的根 provider；空串 = 读不出来（此时不标红任何行） */
   currentProvider: string;
   /** 首行认不出的文件数（Codex 换过 rollout 格式时该让用户看到这个数字） */

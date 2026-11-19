@@ -54,7 +54,7 @@ fn fixture() -> (Store, std::path::PathBuf) {
     ));
     std::fs::create_dir_all(&directory).unwrap();
     let store =
-        Store::new_at(directory.join("config.json"), directory.join("secrets.enc")).unwrap();
+        Store::credential_fixture(directory.join("config.json"), directory.join("secrets.enc")).unwrap();
     (store, directory)
 }
 
@@ -219,7 +219,7 @@ fn sanitizing_does_not_unlock_or_modify_the_local_secret_vault() {
     store
         .secrets
         .write()
-        .enable_master_password("Migration-Aa123!")
+        .set_fixture_password("Migration-Aa123!")
         .unwrap();
     store.secrets.write().lock();
     let original_vault = std::fs::read(directory.join("secrets.enc")).unwrap();
@@ -295,7 +295,7 @@ fn raw_rollback_preview_and_copy_work_without_unlocking_or_importing() {
     store
         .secrets
         .write()
-        .enable_master_password("Migration-Aa123!")
+        .set_fixture_password("Migration-Aa123!")
         .unwrap();
     store.secrets.write().lock();
     let vault = std::fs::read(directory.join("secrets.enc")).unwrap();

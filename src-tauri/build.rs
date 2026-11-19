@@ -18,7 +18,10 @@
 //!
 //! 这类失效不报错、不警告，只能靠肉眼看图标。故在此显式声明依赖。
 
+mod build_laya;
+
 fn main() {
+    build_laya::embed();
     // 与 tauri.conf.json 的 bundle.icon 列表保持一致。
     //
     // `icon.ico` 是 Windows 资源段真正用的那个（tauri-build 只挑第一个 `.ico`）；
@@ -34,5 +37,11 @@ fn main() {
         println!("cargo:rerun-if-changed={icon}");
     }
 
-    tauri_build::build()
+    tauri_build::build();
+    if std::env::var_os("CARGO_FEATURE_NATIVE_ACCEPTANCE").is_some()
+        && std::env::var("TARGET").as_deref() == Ok("x86_64-pc-windows-msvc")
+    {
+        let resources = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("resource.lib");
+        println!("cargo:rustc-link-arg-tests={}", resources.display());
+    }
 }

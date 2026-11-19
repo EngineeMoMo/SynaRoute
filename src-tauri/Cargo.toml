@@ -1,6 +1,6 @@
 [package]
 name = "synaroute"
-version = "0.1.90"
+version = "0.1.91"
 description = "SynaRoute - 智能 API Key 路由代理与配置管理"
 authors = ["SynaRoute"]
 edition = "2021"
@@ -76,6 +76,7 @@ regex = "1"
 # 路径 / 时间 / 日志 / 错误
 dirs = "5"
 tempfile = "3"
+notify = "8.2"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
@@ -135,3 +136,16 @@ security-framework-sys = "2"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+native-acceptance = []
+
+[[test]]
+name = "native_acceptance"
+path = "testdata/native-acceptance/test.rs"
+required-features = ["native-acceptance"]
+
+[patch.crates-io]
+glib = { git = "https://github.com/Quickture/gtk-rs-core", rev = "40b7211287f85b7d06077dcf4457c80a4ab1c57e" }
+glib-sys = { git = "https://github.com/Quickture/gtk-rs-core", rev = "40b7211287f85b7d06077dcf4457c80a4ab1c57e" }
+gobject-sys = { git = "https://github.com/Quickture/gtk-rs-core", rev = "40b7211287f85b7d06077dcf4457c80a4ab1c57e" }
+gio-sys = { git = "https://github.com/Quickture/gtk-rs-core", rev = "40b7211287f85b7d06077dcf4457c80a4ab1c57e" }
+glib-macros = { git = "https://github.com/Quickture/gtk-rs-core", rev = "40b7211287f85b7d06077dcf4457c80a4ab1c57e" }

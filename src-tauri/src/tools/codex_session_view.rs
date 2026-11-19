@@ -77,9 +77,10 @@ pub(in crate::tools) struct ThreadInfo {
 /// CodexPlusPlus 的会话页顶部就是这四个数字 + 库路径。它们的用处很具体：**「总数」与我们
 /// 报的「已同步 N 条」能对上账**，而 `dbPath` 回答「你到底在读哪个库」—— 后者在
 /// `CODEX_SQLITE_HOME` 被设过、或机器上同时有新旧两个库时是唯一能定性的信息。
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStats {
+    pub metadata_failures: usize,
     pub total: usize,
     pub active: usize,
     pub archived: usize,
@@ -206,9 +207,10 @@ pub(in crate::tools) fn enrich(
     current_provider: &str,
     codex_keys: &[crate::model::ProviderKey],
 ) -> SessionStats {
-    let info = thread_info(home);
+    let (info, metadata_failures) = thread_info(home);
     let projects = project_names(home);
     let mut stats = SessionStats {
+        metadata_failures,
         total: rows.len(),
         db_path: super::session_db_paths(home)
             .first()
@@ -291,13 +293,15 @@ fn clip(s: &str) -> String {
 /// 读会话库里的展示信息。任何失败都返回目前收集到的那部分 —— 这一层**不许影响列表能不能
 /// 出来**：库被 Codex 锁着是常态，那时用户看到的应该是「没有标题的完整列表」，
 /// 而不是一个错误页。
-fn thread_info(home: &Path) -> HashMap<String, ThreadInfo> {
+fn thread_info(home: &Path) -> (HashMap<String, ThreadInfo>, usize) {
     let mut out: HashMap<String, ThreadInfo> = HashMap::new();
+    let mut failures = 0;
     for db in super::session_db_paths(home) {
         let Ok(conn) = rusqlite::Connection::open_with_flags(
             &db,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         ) else {
+            failures += 1;
             continue;
         };
         let _ = conn.busy_timeout(std::time::Duration::from_millis(800));
@@ -312,6 +316,7 @@ fn thread_info(home: &Path) -> HashMap<String, ThreadInfo> {
             .unwrap_or_default();
         let has = |c: &str| cols.iter().any(|x| x == c);
         if !has("id") {
+            failures += 1;
             continue;
         }
         // 标题的取值顺序见模块头。`COALESCE` 里只放**确实存在**的列。
@@ -337,7 +342,7 @@ fn thread_info(home: &Path) -> HashMap<String, ThreadInfo> {
             pick("thread_source"),
             pick("source"),
         );
-        let Ok(mut stmt) = conn.prepare(&sql) else { continue };
+        let Ok(mut stmt) = conn.prepare(&sql) else { failures += 1; continue };
         let Ok(rows) = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -353,15 +358,17 @@ fn thread_info(home: &Path) -> HashMap<String, ThreadInfo> {
                 },
             ))
         }) else {
+            failures += 1;
             continue;
         };
-        for (id, info) in rows.flatten() {
+        for row in rows {
+            let Ok((id, info)) = row else { failures += 1; continue; };
             // 多个库时**先到的赢**（`session_db_paths` 把新布局排在 legacy 之前）——
             // legacy 库里可能是迁移前的旧快照，用它覆盖新库会让标题倒退。
             out.entry(id).or_insert(info);
         }
     }
-    out
+    (out, failures)
 }
 
 /// 从 rollout 正文里读第一条用户消息。

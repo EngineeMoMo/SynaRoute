@@ -790,7 +790,7 @@ mod tests {
     /// 与诊断报告，两者都是用户会分享出去的东西。见 `the_token_plaintext_never_enters_an_event`。
     #[test]
     fn ensure_token_creates_one_and_makes_it_visible_in_an_event() {
-        let (store, dir) = crate::service::tests::temp_store("lan_guard_ensure");
+        let (store, dir) = crate::service::tests::credential_store("lan_guard_ensure");
         assert!(
             store.secrets.read().get(TOKEN_ID).unwrap().is_none(),
             "夹具应当是干净的"
@@ -838,7 +838,7 @@ mod tests {
     /// 且把单一生成点变成两个 —— 而两个生成点意味着「谁先跑」决定用户看到哪个值。
     #[test]
     fn read_lan_token_from_never_creates_one() {
-        let (store, dir) = crate::service::tests::temp_store("lan_read_pure");
+        let (store, dir) = crate::service::tests::credential_store("lan_read_pure");
 
         assert_eq!(read_lan_token_from(&store), Ok(None), "干净库应返 None");
         assert!(
@@ -871,11 +871,11 @@ mod tests {
     /// 同 CLAUDE.md 那条教训：注入不变红时先怀疑用例没压到那个分支。
     #[test]
     fn a_locked_vault_reports_an_error_not_an_absent_token() {
-        let (store, dir) = crate::service::tests::temp_store("lan_locked");
+        let (store, dir) = crate::service::tests::credential_store("lan_locked");
         ensure_token(&store);
         let existing = store.secrets.read().get(TOKEN_ID).unwrap().unwrap().to_string();
 
-        store.secrets.write().enable_master_password("TestPass123").unwrap();
+        store.secrets.write().set_fixture_password("TestPass123").unwrap();
         store.secrets.write().lock();
         assert!(store.secrets.read().is_locked(), "夹具应处于锁定态");
 
@@ -908,7 +908,7 @@ mod tests {
     /// 而泄露的那个令牌仍然有效。
     #[test]
     fn regenerating_replaces_the_token_and_leaves_an_audit_event() {
-        let (store, dir) = crate::service::tests::temp_store("lan_regen");
+        let (store, dir) = crate::service::tests::credential_store("lan_regen");
         ensure_token(&store);
         let old = store.secrets.read().get(TOKEN_ID).unwrap().unwrap().to_string();
 
@@ -955,7 +955,7 @@ mod tests {
     /// 再在 diagnostics 里单独打个补丁也能过 —— 那就漏掉了日志文件那条更大的路径。
     #[test]
     fn the_token_plaintext_never_enters_an_event_or_the_diagnostics_report() {
-        let (store, dir) = crate::service::tests::temp_store("lan_no_plaintext");
+        let (store, dir) = crate::service::tests::credential_store("lan_no_plaintext");
         ensure_token(&store);
         let token = store.secrets.read().get(TOKEN_ID).unwrap().unwrap().to_string();
         let rotated = regenerate_lan_token_in(&store).expect("重生成应成功");
@@ -1055,7 +1055,7 @@ mod tests {
     /// 🔴 这条防的是「令牌校验写成恒拒」—— 那样上面那条测试照样绿，而功能完全不可用。
     #[tokio::test]
     async fn guarded_lets_a_correct_token_through_to_the_forwarder() {
-        let (store, dir) = crate::service::tests::temp_store("lan_guard_ok");
+        let (store, dir) = crate::service::tests::credential_store("lan_guard_ok");
         let token = "t".repeat(64);
         store.secrets.write().set(TOKEN_ID, &token).expect("写令牌");
 

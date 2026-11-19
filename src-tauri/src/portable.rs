@@ -32,6 +32,8 @@ use serde::{Deserialize, Serialize};
 #[path = "portable_sanitize.rs"] pub(crate) mod sanitize;
 #[path = "portable_file.rs"] pub(crate) mod file;
 #[path = "portable_credentials.rs"] pub(crate) mod credentials;
+#[cfg(test)]
+#[path = "portable_platform_tests.rs"] mod platform_tests;
 #[cfg(test)] use sha2::{Digest, Sha256};
 #[cfg(test)] #[path = "portable_config_tests.rs"] mod config_tests;
 #[cfg(test)] #[path = "portable_security_tests.rs"] mod security_tests;
@@ -609,7 +611,7 @@ mod tests {
     }
 
     fn store_at(dir: &std::path::Path) -> Store {
-        Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap()
+        Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap()
     }
 
     fn key(id: &str, name: &str) -> ProviderKey {
@@ -784,7 +786,7 @@ mod tests {
 
         let dst = store_at(&dst_dir);
         dst.upsert_key(key("local", "本机原有")).unwrap();
-        dst.secrets.write().enable_master_password("TestPass123").unwrap();
+        dst.secrets.write().set_fixture_password("TestPass123").unwrap();
         dst.secrets.write().lock();
         assert!(dst.secrets.read().is_locked(), "前置条件：锁定态");
 
@@ -1206,7 +1208,7 @@ mod tests {
         // 备份必须是**删除之前**的那一份：拿它替换回去，被删的密钥要能重新读出来。
         // 只断言「文件存在」是不够的——备份成一个空文件同样能过。
         std::fs::copy(bak, dst_dir.join("secrets.enc")).unwrap();
-        let restored = crate::secret::SecretStore::load(dst_dir.join("secrets.enc")).unwrap();
+        let restored = crate::secret::SecretStore::load_credential_fixture(dst_dir.join("secrets.enc")).unwrap();
         assert_eq!(
             restored.get("gone").unwrap().as_deref().map(String::as_str),
             Some("sk-gone"),
@@ -1240,7 +1242,7 @@ mod tests {
         // 直接调 lock() 不会进入锁定态。故必须先启用主口令，再锁。
         store.secrets.write().set("ghost2", "sk-ghost2").unwrap();
         assert_eq!(store.count_orphan_secrets(), 1);
-        store.secrets.write().enable_master_password("pw-123456").unwrap();
+        store.secrets.write().set_fixture_password("pw-123456").unwrap();
         store.secrets.write().lock();
         assert!(store.secrets.read().is_locked(), "前置条件：必须真的进入锁定态");
         assert_eq!(

@@ -1,46 +1,3 @@
-//! 跨协议流里**上游 error 事件的翻译**。
-//!
-//! # 它补的洞
-//!
-//! `SseTranslator` 的六个方向函数**没有一个读 `error`**（`sse.rs` 模块头那句
-//! 「翻译器会把它不认识的 error 事件整个丢掉」就是这件事）。于是跨协议流式下：
-//! 上游 200 之后在流内报错 → 错误被丢掉 → `finish()` 照常冲刷
-//! `response.completed` / `message_stop` → **下游拿到一条「成功完成的空回答」**。
-//!
-//! 本仓已经为此付过两笔代价：
-//! - 健康记账那一半修过了（`StreamState::record_health` 用**原始**尾窗判错，
-//!   注释里写着「此前跨协议这条路连失败检测都没有」）；
-//! - 而**给下游的呈现**一直没修：`stream_idle` 的模块头只好写明「那句文案只在同协议
-//!   Anthropic 直通时到得了用户眼前」，跨协议下用户看到的是「流意外结束」。
-//!
-//! 这个模块修的是后者，顺带让 `stream_idle` 注入的静默超时事件在跨协议下也有呈现
-//! —— 它注入的就是一条 Anthropic 形态的 `error` 事件，走的是同一条路。
-//!
-//! # 🔴 为什么落在 `process_line` 里，而不是流末
-//!
-//! 终止性错误一到就该转给下游，客户端才能立刻停下来；等到流末才发，中间那段时间
-//! 客户端仍在等下一个 token。而且流末那条路（`proxy.rs` 的 `finish()`）**只在正常终止
-//! 时走到**，连接被对端掐断时压根不执行。
-//!
-//! # 🔴 为什么不需要新字段
-//!
-//! 发了错误就必须**抑制随后的收尾事件** —— 否则下游先收到「失败」再收到
-//! `response.completed` / `message_stop`，两条自相矛盾，而客户端多半以后者为准，
-//! 于是又变回「成功完成的空回答」。
-//!
-//! `started` 这个既有字段**已经是那个闩**：`emit_responses_completed` 与
-//! `emit_anthropic_stop` 开头都是 `if !self.started { return 空 }`（sse.rs 里那句
-//! 「用 started 兼作幂等：completed 后置 false」）。故这里把它置 false 即可，
-//! 不新增状态、不给未来多一个要同步的不变量。
-//! **Chat 下游不受这个闩影响**：OpenAI 流的约定是 `data: {"error":…}` 之后仍发 `[DONE]`，
-//! 而 `finish()` 对 Chat 方向无条件返回它。
-//!
-//! ⚠️ **但那个 `[DONE]` 在跨协议生产路径上实际发不出去** —— 别照着上面那句去排查。
-//! `proxy.rs` 流末还有一道**更宽**的门：`saw_upstream_error()` 用**原始尾窗**判，
-//! 认任何非 null 的 `error` 字段（本模块只认对象/字符串），命中即 `return None`、
-//! 压根不调 `finish()`。那道门刻意保留 —— 它盖住本模块判不出的那一小块差集
-//! （如 `"error": 42`），没有它那些形态会退回「假成功」，
-//! 而缺一个终止符（错误本身已经发出去了）远好于一条假成功。
 
 use super::{sse, sse_data, SseDirection, SseTranslator};
 use serde_json::{json, Value};
@@ -50,6 +7,7 @@ const MSG_CAP: usize = 500;
 
 pub(crate) fn declares_error(json: &Value) -> bool {
     matches!(json.get("type").and_then(Value::as_str), Some("error" | "response.failed"))
+        || json.pointer("/response/status").and_then(Value::as_str) == Some("failed")
 }
 
 /// 这个 SSE 载荷是不是「上游报错」？是则返回可读消息。
@@ -59,13 +17,10 @@ pub(crate) fn declares_error(json: &Value) -> bool {
 /// - Chat：`{"error":{"message":…}}`（顶层 `error` 对象）
 /// - Responses：`{"type":"error","message":…}` 或 `{"type":"response.failed","response":{"error":…}}`
 ///
-/// **假阳性防线**：只认「`error` 是对象或字符串」。有些上游在正常 chunk 里带
-/// `"error": null` 占位，`Value::Null` 既不是对象也不是字符串，故不会被误判 ——
-/// 而误判的代价是把一条正常增量翻译成错误、当场掐断一次好的对话。
 pub(crate) fn upstream_error_message(json: &Value) -> Option<String> {
     let err = json.get("error");
     let is_err = declares_error(json)
-        || matches!(err, Some(v) if v.is_object() || v.is_string());
+        || err.is_some_and(|value| !value.is_null());
     if !is_err {
         return None;
     }
@@ -94,11 +49,12 @@ pub(crate) fn upstream_error_message(json: &Value) -> Option<String> {
 }
 
 impl SseTranslator {
-    /// 命中上游错误就翻成**下游协议**的错误事件，并抑制随后的收尾事件（见模块头）。
+    /// 命中上游错误就翻成**下游协议**的错误事件，并抑制随后的收尾事件。
     ///
     /// 返回 `None` = 这不是错误，调用方继续走正常的六方向分派。
     pub(super) fn translate_upstream_error(&mut self, json: &Value) -> Option<String> {
         let msg = upstream_error_message(json)?;
+        self.status.failed = true;
         let out = match self.dir {
             // 下游 Anthropic：与上游 Anthropic 的流内错误、以及 `stream_idle` 注入的那条
             // 形态完全一致 —— 客户端本就要处理它，零新增契约。
@@ -106,7 +62,6 @@ impl SseTranslator {
                 "error",
                 &json!({ "type": "error", "error": { "type": "api_error", "message": msg } }),
             ),
-            // 下游 Chat：OpenAI 流式确实会发 `data: {"error":…}`；`[DONE]` 随后由 finish() 给。
             SseDirection::ResponsesToChat | SseDirection::AnthropicToChat => {
                 sse_data(&json!({ "error": { "type": "api_error", "message": msg } }))
             }
@@ -114,9 +69,6 @@ impl SseTranslator {
             // 不用裸 `error` —— 后者在 Codex 的解析器里没有对应分支的把握更低。
             //
             // ⚠️ **这一支只做过静态设计、没有真机取证**（Codex 侧解析器行为）。
-            // 判据是「不比今天更差」：今天下游拿到的是 `response.completed` +
-            // 空/半截内容（= 静默成功），而 `response.failed` 最坏也只是被忽略、
-            // 退回今天的行为；被认出来则是一条明确的失败。两个方向都不劣化。
             SseDirection::ChatToResponses | SseDirection::AnthropicToResponses => sse(
                 "response.failed",
                 &json!({
@@ -227,12 +179,9 @@ mod tests {
         assert!(!t.translate_upstream_error(&e).unwrap().is_empty());
         assert_eq!(t.finish(), "", "错误之后不许再发 message_stop");
 
-        // Chat 下游**在翻译器这一层**刻意例外：OpenAI 约定错误之后仍发 [DONE]。
-        // ⚠️ 生产路径上它仍发不出去 —— proxy.rs 流末那道更宽的门先早退了（见模块头末尾）。
-        // 本断言守的是「这一层不要主动抑制它」，不是「用户一定会收到」。
         let mut t = tr(SseDirection::AnthropicToChat);
         assert!(!t.translate_upstream_error(&e).unwrap().is_empty());
-        assert_eq!(t.finish(), "data: [DONE]\n\n", "Chat 下游仍要 [DONE]");
+        assert_eq!(t.finish(), "", "错误后不合成正常终态");
     }
 
     /// 上游把整个 HTML 错误页塞进 message 时要截断（按字符边界，不切裂多字节）。
@@ -253,7 +202,7 @@ mod tests {
         let src = std::fs::read_to_string("src/upstream/sse.rs").unwrap();
         let prod = crate::proxy::custom_headers::production_code_only(&src);
         let hook = prod
-            .find("self.translate_upstream_error(&json)")
+            .find("self.translate_upstream_error(json)")
             .expect("process_line 必须先过错误翻译这一道");
         let dispatch = prod
             .find("SseDirection::ChatToResponses => Some(self.chat_chunk_to_responses")

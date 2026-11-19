@@ -1,0 +1,57 @@
+<!doctype html><meta charset="utf-8"><title>SynaRoute native acceptance</title>
+<script>
+window.addEventListener("DOMContentLoaded", async () => {
+  const invoke = window.__TAURI_INTERNALS__.invoke;
+  const check = (condition, message) => { if (!condition) throw Error(message); };
+  const report = {};
+  try {
+    const bundle = await invoke("probe_bundle");
+    const page = await invoke("list_codex_sessions", {query: {archive: "all", source: "all"}});
+    check(page.rows.length === 1 && page.page.filteredTotal === 1, "wrong session home or page");
+    const relPaths = [page.rows[0].relPath];
+    try {
+      const archived = await invoke("set_codex_sessions_archived", {relPaths, archived: true});
+      check(archived.updated.length === 1, "archive failed");
+      const archivedPage = await invoke("list_codex_sessions", {query:{archive:"archived", source:"all", refresh:true}});
+      check(archivedPage.rows.length === 1 && archivedPage.rows[0].archived, "archived session missing");
+      const restored = await invoke("set_codex_sessions_archived", {relPaths, archived: false});
+      check(restored.updated.length === 1, "restore failed");
+      report.archive = "restored";
+    } catch (error) {
+      if (!String(error).includes("仍在运行")) throw error;
+      report.archive = "running-client guard";
+    }
+    check((await invoke("list_active_requests", {categoryId:"codex"})).length === 0, "unexpected active requests");
+    const initial = await invoke("laya_local_status");
+    check(initial.backend === "python", "unexpected initial backend");
+    if (!bundle) {
+      check(!initial.rustSupported, "expected a session-only platform");
+      await invoke("probe_done", {report});
+      return;
+    }
+    check((await invoke("laya_local_set_backend", {backend:"rust"})).backend === "rust", "backend selection failed");
+    const first = await invoke("laya_local_import_bundle", {directory: bundle});
+    check(first.installed && !first.canRollback, "first bundle import failed");
+    check((await invoke("laya_local_import_bundle", {directory: bundle})).canRollback, "previous installation missing");
+    check((await invoke("laya_local_rollback_bundle")).installed, "rollback failed");
+    report.rollback = true;
+    await invoke("laya_local_start", {repair:false, noInstall:true});
+    let status;
+    for (let attempt = 0; attempt < 240; attempt++) {
+      status = await invoke("laya_local_status");
+      if (status.phase === "running" || status.phase === "failed") break;
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    check(status.phase === "running", JSON.stringify(status));
+    try { await invoke("laya_local_set_backend", {backend:"python"}); throw Error("switch while running was accepted"); }
+    catch (error) { if (!String(error).includes("Stop the local service")) throw error; }
+    report.inference = await invoke("probe_inference");
+    check((await invoke("laya_local_stop")).phase === "stopped", "stop failed");
+    report.stopped = await invoke("probe_stopped");
+    check(report.stopped, "worker listener survived shutdown");
+    check((await invoke("laya_local_set_backend", {backend:"python"})).backend === "python", "Python fallback failed");
+    report.pythonRestored = true;
+  } catch (error) { report.error = String(error); }
+  await invoke("probe_done", {report});
+});
+</script>

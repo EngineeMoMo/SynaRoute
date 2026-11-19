@@ -1,0 +1,14 @@
+{
+  "version": "multilingual-7b928d8-onnx1-ort1.30.0-win-x64",
+  "sdkCommit": "b1d656952f0f9581ea691a70cb6f38abf3eb13a9",
+  "modelCommit": "7b928d828b7b0e022f929d9bd2e44165aa270148",
+  "files": [
+    {"path": "model/model.onnx", "bytes": 2295392, "sha256": "b47e0e9d027781217a81ea7ee73b43aacca7a03a9d7911c4020ac0a9434f6f63"},
+    {"path": "model/model.onnx.data", "bytes": 1287635968, "sha256": "f01238e183ace77661282e4eb2dd9b872c7044cb9678f904cf409e6cc1146d09"},
+    {"path": "model/rl_agent_config.json", "bytes": 472, "sha256": "25061739243b617ad88d1219ba6f8a9c86c5881ca28df024fa2d9b3b2fcc30c6"},
+    {"path": "model/tokenizer/tokenizer.json", "bytes": 34363188, "sha256": "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f"},
+    {"path": "model/tokenizer/tokenizer_config.json", "bytes": 524, "sha256": "6c6b2d8e3c84ce0e671c129cd6b374b235d6f9863042a5836358d00a89bbb5a1"},
+    {"path": "runtime/onnxruntime.dll", "bytes": 18446176, "sha256": "e42c5c917207ff706530315177e39dca2539695a6a8d968a22225e34291b1f12"},
+    {"path": "runtime/onnxruntime_providers_shared.dll", "bytes": 21856, "sha256": "46b999f9d5cd9d284091407e9f50a262624e6a71265fc428a1dfbd42d149bd81"}
+  ]
+}

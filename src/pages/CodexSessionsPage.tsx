@@ -15,7 +15,7 @@ import { FolderOpen, Wand2 } from "lucide-react";
 import { SessionBrowser } from "@/components/SessionBrowser";
 import { SessionDetailDialog } from "@/components/SessionDetailDialog";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
-import { normalizeSessionRow, retainSessionSelection, selectSessionPaths } from "@/lib/codexSessionBrowser";
+import { defaultSessionFilters, normalizeSessionRow, retainSessionSelection, selectSessionPaths, type SessionPageQuery } from "@/lib/codexSessionBrowser";
 import { Button } from "@/components/ui/Button";
 import { RefreshButton } from "@/components/ui/RefreshButton";
 import { InlineAlert } from "@/components/ui/InlineAlert";
@@ -55,6 +55,8 @@ export function CodexSessionsPage() {
   const [target, setTarget] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState<Set<string>>(new Set());
+  const pickedRef = useRef(picked);
+  pickedRef.current = picked;
   const [deleteRequest, setDeleteRequest] = useState<string[] | null>(null);
   const [archiveRequest, setArchiveRequest] = useState<{ paths: string[]; archived: boolean } | null>(null);
   const [detail, setDetail] = useState<CodexSessionRow | null>(null);
@@ -66,16 +68,21 @@ export function CodexSessionsPage() {
   const [confirmingSync, setConfirmingSync] = useState(false);
   const [maintenanceError, setMaintenanceError] = useState("");
   const loadGeneration = useRef(0);
+  const [query, setQuery] = useState<SessionPageQuery>({ ...defaultSessionFilters, grouping: "project", page: 0, pageSize: 50 });
+  const queryRef = useRef(query);
+  queryRef.current = query;
+  const metadataLoaded = useRef(false);
   const operationInFlight = useRef(false);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (refresh = true) => {
     const generation = ++loadGeneration.current;
+    const requestedSelection = new Set(pickedRef.current);
     setError(null);
     try {
       const [sessionsResult, targetsResult, auditResult] = await Promise.allSettled([
-        api.listCodexSessions(),
-        api.listCodexProviderTargets(),
-        api.auditCodexSessionIndex(),
+        api.listCodexSessions({ ...queryRef.current, refresh, selected: [...requestedSelection] }),
+        refresh || !metadataLoaded.current ? api.listCodexProviderTargets() : Promise.resolve(null),
+        refresh || !metadataLoaded.current ? api.auditCodexSessionIndex() : Promise.resolve(null),
       ]);
       if (generation !== loadGeneration.current) return;
       if (sessionsResult.status === "fulfilled") {
@@ -83,16 +90,22 @@ export function CodexSessionsPage() {
         const rows = Array.isArray(next.rows)
           ? next.rows.map(normalizeSessionRow).filter((row): row is CodexSessionRow => row !== null) : [];
         setData({ ...next, rows });
-        setPicked((previous) => retainSessionSelection(previous, rows));
-        setDetail((previous) => previous ? rows.find((row) => row.relPath === previous.relPath) ?? null : null);
+        if (!next.page) setPicked((previous) => retainSessionSelection(previous, rows));
+        else if (next.page.retainedSelection) {
+          const retained = new Set(next.page.retainedSelection);
+          setPicked((previous) => new Set([...previous].filter((path) => !requestedSelection.has(path) || retained.has(path))));
+        }
+        setDetail((previous) => previous ? rows.find((row) => row.relPath === previous.relPath) ?? (next.page ? previous : null) : null);
       } else {
         setError(String(sessionsResult.reason));
       }
-      if (targetsResult.status === "fulfilled") {
+      if (targetsResult.status === "fulfilled" && targetsResult.value) {
         setTargets(targetsResult.value);
-        setTarget((previous) => chooseKnownTarget(targetsResult.value, previous));
+        const nextTargets = targetsResult.value;
+        setTarget((previous) => chooseKnownTarget(nextTargets, previous));
       }
-      if (auditResult.status === "fulfilled") setAudit(auditResult.value);
+      if (auditResult.status === "fulfilled" && auditResult.value) setAudit(auditResult.value);
+      metadataLoaded.current = targetsResult.status === "fulfilled" && auditResult.status === "fulfilled";
       setMaintenanceError([targetsResult, auditResult]
         .filter((result): result is PromiseRejectedResult => result.status === "rejected")
         .map((result) => String(result.reason)).join("\n"));
@@ -100,10 +113,10 @@ export function CodexSessionsPage() {
       if (generation !== loadGeneration.current) return;
       setError(String(e));
     }
-  }, []);
+  }, [query]);
 
   useEffect(() => {
-    void load();
+    void load(false);
     return () => { loadGeneration.current += 1; };
   }, [load]);
 
@@ -117,7 +130,7 @@ export function CodexSessionsPage() {
    * 下拉里选的目标，两者未必是同一个 provider。真正权威的数字是同步完那条结果消息。
    */
   const willChange = useMemo(
-    () => (data?.rows ?? []).filter((r) => r.provider !== target).length,
+    () => data?.page ? data.stats.total - (data.page.providerCounts[target] ?? 0) : (data?.rows ?? []).filter((r) => r.provider !== target).length,
     [data, target],
   );
 
@@ -425,9 +438,10 @@ export function CodexSessionsPage() {
 
       {data === null && !error ? (
         <p className="text-sm text-text-muted">{t("sessions.loading")}</p>
-      ) : data?.rows.length === 0 ? (
+      ) : data?.stats.total === 0 ? (
         <p className="text-sm text-text-muted">{t("sessions.empty")}</p>
       ) : data ? <SessionBrowser data={data} picked={picked} disabled={disabled}
+        onQuery={setQuery}
         onSelect={(paths, selected) => setPicked((previous) => selectSessionPaths(previous, paths, selected))}
         onDetails={setDetail} onExport={(row) => void doExport(row)} onDelete={requestDelete} onArchive={requestArchive} /> : null}
       {deleteRequest && <ConfirmDialog title={t("sessions.confirmTitle")}

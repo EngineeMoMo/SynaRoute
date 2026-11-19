@@ -13,7 +13,7 @@ fn fixture() -> (Store, std::path::PathBuf) {
         uuid::Uuid::new_v4()
     ));
     let store =
-        Store::new_at(directory.join("config.json"), directory.join("secrets.enc")).unwrap();
+        Store::credential_fixture(directory.join("config.json"), directory.join("secrets.enc")).unwrap();
     (store, directory)
 }
 
@@ -292,7 +292,7 @@ fn replace_snapshots_credentials_even_when_only_existing_ids_are_overwritten() {
     assert_eq!(report.secrets_pruned, 0);
     let path = report.secrets_backup_path.unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    let vault = crate::secret::SecretStore::load(path.into()).unwrap();
+    let vault = crate::secret::SecretStore::load_credential_fixture(path.into()).unwrap();
     assert_eq!(
         vault.get("provider").unwrap().unwrap().as_str(),
         "original-provider-secret"
@@ -367,7 +367,7 @@ fn locked_legacy_tokens_are_never_exported_and_migrate_after_unlock() {
     source
         .secrets
         .write()
-        .enable_master_password("Migration-Aa123!")
+        .set_fixture_password("Migration-Aa123!")
         .unwrap();
     drop(source);
     let legacy = AppConfig {
@@ -453,8 +453,8 @@ fn legacy_plaintext_backup_imports_directly_into_encrypted_storage() {
 #[test]
 fn startup_migrates_legacy_tokens_and_failed_encryption_preserves_original_file() {
     for fail in [false, true] {
-        let (store, directory) = fixture();
-        drop(store);
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path();
         let legacy = AppConfig {
             keys: vec![ProviderKey {
                 id: "startup-legacy".into(),
@@ -480,6 +480,11 @@ fn startup_migrates_legacy_tokens_and_failed_encryption_preserves_original_file(
             );
         } else {
             let loaded = loaded.unwrap();
+            if loaded.secrets.read().master_state().required {
+                assert_eq!(std::fs::read(directory.join("config.json")).unwrap(), original);
+                assert!(!directory.join("secrets.enc").exists());
+                crate::service::enable_master_password(&loaded, "Migration-Aa123!").unwrap();
+            }
             assert!(!std::fs::read_to_string(directory.join("config.json"))
                 .unwrap()
                 .contains("private-startup-token"));

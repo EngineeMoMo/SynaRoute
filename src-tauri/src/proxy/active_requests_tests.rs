@@ -11,7 +11,7 @@ use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
 fn store() -> Arc<Store> {
     let dir = std::env::temp_dir().join(format!("synaroute-active-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    Arc::new(Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap())
+    Arc::new(Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap())
 }
 fn begin(store: &Arc<Store>, id: &str) -> Guard {
     store.active_requests.begin(store.clone(), id, CategoryType::ClaudeCli, "m", true)
@@ -378,7 +378,7 @@ async fn operator_stop_preserves_existing_binding_even_after_an_error_event() {
 
 #[tokio::test]
 async fn completed_translation_releases_permit_before_final_frame_is_consumed() {
-    let s = store(); let upstream = mock(Some(ANTHROPIC_START), None, true, false).await;
+    let s = store(); let upstream = mock(Some("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"), None, true, false).await;
     let id = add_key(&s, &upstream.url, Protocol::Anthropic, 0);
     let key = s.get_key(&id).unwrap();
     let guard = begin(&s, "final-frame");
@@ -394,6 +394,40 @@ async fn completed_translation_releases_permit_before_final_frame_is_consumed() 
     }
     assert_eq!(concurrency::in_flight(&id), 0, "EOF must release permit before consumer polls again");
     drop(body); drop(guard);
+}
+
+#[tokio::test]
+async fn clean_eof_without_terminal_and_named_errors_fail_health_on_raw_and_translated_streams() {
+    for (upstream_protocol, partial, downstream_protocol) in [
+        (Protocol::OpenaiChat, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n", Protocol::OpenaiResponses),
+        (Protocol::OpenaiResponses, "event: response.output_text.delta\ndata: {\"delta\":\"partial\"}\n\n", Protocol::Anthropic),
+        (Protocol::Anthropic, "event: content_block_delta\ndata: {\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n", Protocol::OpenaiChat),
+    ] {
+        for translated in [false, true] {
+            for ending in [None, Some("event: error\ndata: {\"message\":\"named failure\"}\n\n")] {
+                let store = store();
+                let upstream = mock(Some(partial), ending, true, false).await;
+                let key_id = add_key(&store, &upstream.url, upstream_protocol, 0);
+                let key = store.get_key(&key_id).unwrap();
+                let guard = begin(&store, "lifecycle-regression");
+                let control = guard.control();
+                let downstream = if translated { downstream_protocol } else { upstream_protocol };
+                let translator = crate::upstream::sse_direction(downstream, upstream_protocol).map(crate::upstream::SseTranslator::new);
+                let response = bounded(reqwest::Client::builder().no_proxy().build().unwrap().get(&upstream.url).send()).await.unwrap();
+                let response = super::super::streaming::response(response, bounded(concurrency::acquire(&key_id)).await,
+                    &store, CategoryType::ClaudeCli, &key, "model", "model", downstream, translator, None, control.clone()).unwrap();
+                upstream.release.notify_one();
+                let bytes = bounded(response.into_body().collect()).await.unwrap().to_bytes();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("error") || text.contains("response.failed"), "{text}");
+                assert!(!text.contains("response.completed") && !text.contains("message_stop") && !text.contains("[DONE]"), "{text}");
+                assert_eq!(control.end(), Some(End::UpstreamError));
+                assert_eq!(store.get_key(&key_id).unwrap().health.fail_count, 1);
+                assert_eq!(concurrency::in_flight(&key_id), 0);
+                drop(guard);
+            }
+        }
+    }
 }
 
 #[tokio::test]

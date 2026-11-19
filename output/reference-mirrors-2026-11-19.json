@@ -1,0 +1,52 @@
+{
+  "evidenceType": "reference-mirrors",
+  "generatedAt": "2026-11-19T09:22:40.0848729-05:00",
+  "referenceRoot": "D:\\ReferenceProject",
+  "mirrorRoot": "D:\\ReferenceProject\\mirrors",
+  "sourceCheckoutEvidence": "output/reference-checkouts-2026-11-19.json",
+  "remoteForksCreated": false,
+  "remoteForkStatus": "not-created: no gh CLI, authenticated target account, or organization target was confirmed",
+  "mirrors": [
+    {
+      "name": "Laya",
+      "source": "NandhaKishorM/laya",
+      "sourceUrl": "https://github.com/NandhaKishorM/laya.git",
+      "referenceCheckout": "D:\\ReferenceProject\\laya",
+      "mirrorPath": "D:\\ReferenceProject\\mirrors\\laya.git",
+      "pinnedRef": "refs/heads/main",
+      "pinnedCommit": "b1d656952f0f9581ea691a70cb6f38abf3eb13a9",
+      "commitSubject": "release: 0.4.35, the TypeScript HTTP client can ask the server for a routing snapshot",
+      "commitDate": "2026-11-16T18:10:12+05:30",
+      "bundlePath": "D:\\ReferenceProject\\mirrors\\laya-b1d656952f0f9581ea691a70cb6f38abf3eb13a9.bundle",
+      "bundleSha256": "59FC09B09A0C89F9286A06A8EC8821CD1846DDE778E55C5B679F736CF31D16B7",
+      "bundleVerificationFile": "D:\\ReferenceProject\\mirrors\\laya-b1d656952f0f9581ea691a70cb6f38abf3eb13a9.bundle.verify.txt",
+      "bundleVerification": {
+        "status": "passed",
+        "completeHistory": true,
+        "hashAlgorithm": "sha1"
+      },
+      "worktreePreserved": true
+    },
+    {
+      "name": "Quickture gtk-rs-core",
+      "source": "Quickture/gtk-rs-core",
+      "sourceUrl": "https://github.com/Quickture/gtk-rs-core.git",
+      "referenceCheckout": null,
+      "mirrorPath": "D:\\ReferenceProject\\mirrors\\gtk-rs-core-quickture.git",
+      "pinnedRef": "refs/heads/pinned/40b7211287f85b7d06077dcf4457c80a4ab1c57e",
+      "pinnedCommit": "40b7211287f85b7d06077dcf4457c80a4ab1c57e",
+      "commitSubject": "Fix RUSTSEC-2024-0429: Unsoundness in VariantStrIter",
+      "commitDate": "2026-01-17T17:46:17-08:00",
+      "bundlePath": "D:\\ReferenceProject\\mirrors\\gtk-rs-core-quickture-40b7211287f85b7d06077dcf4457c80a4ab1c57e.bundle",
+      "bundleSha256": "D861B570829BD8D8DFBFB549E4F0AE816F241E080B91CF8066389A3AB71D8511",
+      "bundleVerificationFile": "D:\\ReferenceProject\\mirrors\\gtk-rs-core-quickture-40b7211287f85b7d06077dcf4457c80a4ab1c57e.bundle.verify.txt",
+      "bundleVerification": {
+        "status": "passed",
+        "completeHistory": true,
+        "hashAlgorithm": "sha1"
+      },
+      "worktreePreserved": true,
+      "note": "Mirror seeded from an existing local Cargo Git object cache after upstream transfer stalled; no C-drive reference checkout was created."
+    }
+  ]
+}

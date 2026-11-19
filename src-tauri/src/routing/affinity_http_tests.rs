@@ -41,7 +41,7 @@ async fn upstream(mode: usize) -> Upstream {
 async fn routing_http_affinity_failover_stream_failure_and_breaker() {
     let a = upstream(1).await; let b = upstream(0).await;
     let dir = std::env::temp_dir().join(format!("sr-affinity-http-{}", uuid::Uuid::new_v4()));
-    let store = Arc::new(Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
+    let store = Arc::new(Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
     let make = |priority, url: &str| ProviderKey { id: uuid::Uuid::new_v4().to_string(), enabled: true, priority, base_url: url.into(), protocol: Protocol::Anthropic,
         models: vec![ModelInfo { real_name: "m".into(), source: "manual".into(), fetched_at: None, context_window: None, max_output_tokens: None }], ..Default::default() };
     let mut ka = make(0, &a.url); let mut kb = make(1, &b.url);

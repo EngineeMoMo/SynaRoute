@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 fn fixture() -> (Store, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
-    let store = Store::new_at(
+    let store = Store::credential_fixture(
         directory.path().join("config.json"),
         directory.path().join("secrets.enc"),
     )
@@ -54,7 +54,7 @@ fn locked_local_legacy_tokens_block_clean_replace_before_any_mutation() {
     store
         .secrets
         .write()
-        .enable_master_password("Migration-Aa123!")
+        .set_fixture_password("Migration-Aa123!")
         .unwrap();
     let config_path = directory.path().join("config.json");
     let secrets_path = directory.path().join("secrets.enc");
@@ -140,7 +140,7 @@ fn backup_encrypts_disk_only_legacy_tokens_preserving_unknown_fields_and_origina
     );
     drop(store);
     std::fs::copy(&path, &config_path).unwrap();
-    let restored = Store::new_at(config_path, directory.path().join("secrets.enc")).unwrap();
+    let restored = Store::credential_fixture(config_path, directory.path().join("secrets.enc")).unwrap();
     let restored_key = restored.get_key("legacy-provider").unwrap();
     assert_eq!(
         restored_key
@@ -235,7 +235,11 @@ fn degraded_configuration_refuses_backups_even_after_external_repair() {
 #[test]
 fn credential_persistence_failure_preserves_legacy_tokens_and_creates_no_backup() {
     let (store, directory) = fixture();
-    std::fs::create_dir(directory.path().join("secrets.enc")).unwrap();
+    let vault = directory.path().join("secrets.enc");
+    if vault.exists() {
+        std::fs::rename(&vault, directory.path().join("saved-vault")).unwrap();
+    }
+    std::fs::create_dir(vault).unwrap();
     let raw = legacy_bytes();
     let path = directory.path().join("config.json");
     std::fs::write(&path, &raw).unwrap();

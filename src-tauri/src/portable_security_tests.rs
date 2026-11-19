@@ -4,7 +4,7 @@ use crate::store::decision::{DecisionConfig, Provider};
 
 fn fixture() -> (tempfile::TempDir, Store) {
     let directory = tempfile::tempdir().unwrap();
-    let store = Store::new_at(
+    let store = Store::credential_fixture(
         directory.path().join("config.json"),
         directory.path().join("secrets.enc"),
     )
@@ -122,7 +122,7 @@ fn changed_origin_cannot_reuse_local_credentials_even_when_locked() {
                 store
                     .secrets
                     .write()
-                    .enable_master_password("Vault-T9!mQ4#xR8")
+                    .set_fixture_password("Vault-T9!mQ4#xR8")
                     .unwrap();
                 store.secrets.write().lock();
             }

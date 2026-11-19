@@ -1,0 +1,117 @@
+{
+  "generatedAt": "2026-11-19T07:33:16.4113804-05:00",
+  "referenceRoot": "D:\\ReferenceProject",
+  "policy": "只更新 refs/remotes/origin/*；参考工作树保持可复现实验提交；不创建远端 fork",
+  "repositories": [
+    {
+      "repo": "farion1231/cc-switch",
+      "localPath": "D:\\ReferenceProject\\cc-switch",
+      "branch": "main",
+      "worktreeHead": "ed6d51e590ff8a34431ca60eacfc78e12704075b",
+      "remoteHead": "b044f4b03190b8208e7e592d326609e7f2fbe097",
+      "worktreeUnchangedSinceFetch": true,
+      "commitsAhead": 27,
+      "stable": "v4.0.35",
+      "newest": "v4.0.35"
+    },
+    {
+      "repo": "router-for-me/CLIProxyAPI",
+      "localPath": "D:\\ReferenceProject\\CLIProxyAPI",
+      "branch": "main",
+      "worktreeHead": "a5e8f69e56309e1ef6d6872e667da81fdfbce2ce",
+      "remoteHead": "a5e8f69e56309e1ef6d6872e667da81fdfbce2ce",
+      "worktreeUnchangedSinceFetch": true,
+      "commitsAhead": 0,
+      "stable": "v8.0.77",
+      "newest": "v8.0.77"
+    },
+    {
+      "repo": "router-for-me/EasyCLIProxyAPI",
+      "localPath": "D:\\ReferenceProject\\EasyCLIProxyAPI",
+      "branch": "main",
+      "worktreeHead": "8f847a4a6295e9b6b14c2522bfd4b035d100a0fd",
+      "remoteHead": "e4223d5eefa22a3301ca7e2a28d05897432b07f9",
+      "worktreeUnchangedSinceFetch": true,
+      "commitsAhead": 32,
+      "stable": "v0.3.111",
+      "newest": "v0.3.111"
+    },
+    {
+      "repo": "caidaoli/ccLoad",
+      "localPath": "D:\\ReferenceProject\\ccLoad",
+      "branch": "master",
+      "worktreeHead": "d7c4086a45e9176f967ba6882d538ddc2cb6b4db",
+      "remoteHead": "963db80cde2a7749a1865b6d468bdd65691b6bbb",
+      "worktreeUnchangedSinceFetch": true,
+      "commitsAhead": 5,
+      "stable": "v5.0.1",
+      "newest": "v5.0.2-beta.2"
+    },
+    {
+      "repo": "BigPizzaV3/CodexPlusPlus",
+      "localPath": "D:\\ReferenceProject\\CodexPlusPlus",
+      "branch": "main",
+      "worktreeHead": "7abbcf278dd15e713e3af68c5a089a45332bbf12",
+      "remoteHead": "bae1d4be1d55b3c79c9f80f5ac0afa802be65530",
+      "worktreeUnchangedSinceFetch": true,
+      "commitsAhead": 55,
+      "stable": "v2.7.2",
+      "newest": "v2.7.2"
+    },
+    {
+      "repo": "lidge-jun/opencodex",
+      "localPath": "D:\\ReferenceProject\\opencodex",
+      "branch": "dev",
+      "worktreeHead": "c36793a9336b70cfe5bc3b7f6e6f751e730fb6fc",
+      "remoteHead": "c38d6eef7986b3b9acbb6e8ac17407ab84e5633e",
+      "worktreeUnchangedSinceFetch": true,
+      "commitsAhead": 52,
+      "stable": "v2.100.5",
+      "newest": "v2.100.5"
+    },
+    {
+      "repo": "repoprompt/repoprompt-ce",
+      "localPath": "D:\\ReferenceProject\\repoprompt-ce",
+      "branch": "main",
+      "worktreeHead": "d202e8add9692e8b2023bc45e895265384e7a9fc",
+      "remoteHead": "ab5b63ef3eaa55c2d23cfad3b7fd603a1704377c",
+      "worktreeUnchangedSinceFetch": true,
+      "commitsAhead": 10,
+      "stable": "v1.9.0",
+      "newest": "v1.9.0"
+    },
+    {
+      "repo": "cheaper-inference/OmniRoute",
+      "localPath": "D:\\ReferenceProject\\OmniRoute",
+      "branch": "release/v3.8.55",
+      "worktreeHead": "bc4b0c5f5190d4bf64be616225e2a4403ede6492",
+      "remoteHead": "0aeb4591751d87583506490948da8d1e8ce69b10",
+      "worktreeUnchangedSinceFetch": true,
+      "commitsAhead": 7,
+      "stable": "v3.8.54",
+      "newest": "v3.8.54"
+    },
+    {
+      "repo": "NandhaKishorM/laya",
+      "localPath": "D:\\ReferenceProject\\laya",
+      "branch": "main",
+      "worktreeHead": "b1d656952f0f9581ea691a70cb6f38abf3eb13a9",
+      "remoteHead": "a27ed198f304ed16382220cf9e718ec3aa8d2fcb",
+      "worktreeUnchangedSinceFetch": true,
+      "commitsAhead": 1,
+      "stable": "v0.4.35",
+      "newest": "v0.4.35"
+    },
+    {
+      "repo": "miuuyy/Astra-Ares",
+      "localPath": "D:\\ReferenceProject\\Astra-Ares",
+      "branch": "main",
+      "worktreeHead": "55ced4d2d0193c92f98e37b1e222e7136a0ffe4c",
+      "remoteHead": "55ced4d2d0193c92f98e37b1e222e7136a0ffe4c",
+      "worktreeUnchangedSinceFetch": true,
+      "commitsAhead": 0,
+      "stable": null,
+      "newest": null
+    }
+  ]
+}

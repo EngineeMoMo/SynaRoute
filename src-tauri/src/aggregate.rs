@@ -1783,7 +1783,7 @@ mod tests {
     fn test_store(tag: &str) -> (std::path::PathBuf, Arc<Store>) {
         let dir = temp_dir(tag);
         let store = Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         (dir, store)
     }

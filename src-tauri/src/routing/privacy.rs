@@ -175,12 +175,12 @@ mod tests {
     #[test]
     fn routing_matrix_locked_terms_and_match_limit() {
         let dir = std::env::temp_dir().join(format!("sr-locked-terms-{}", uuid::Uuid::new_v4()));
-        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        let store = Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
         let policy = super::super::config::CategoryPolicy { privacy: PrivacyConfig { mode: PrivacyMode::Block, ..Default::default() }, ..Default::default() };
         super::super::save_policy(&store, CategoryType::Codex, policy, Some(vec!["private-term".into()]), 0).unwrap();
         let config = super::super::settings(&store).unwrap().categories[&CategoryType::Codex].privacy.clone();
         assert!(!std::fs::read_to_string(dir.join("config.json")).unwrap().contains("private-term"));
-        store.secrets.write().enable_master_password("Violet!River7-Cobalt9").unwrap();
+        store.secrets.write().set_fixture_password("Violet!River7-Cobalt9").unwrap();
         store.secrets.write().lock();
         assert!(enforce(&store, CategoryType::Codex, &json!({"input":"ordinary"}), Protocol::OpenaiResponses, &config).is_err());
         let text = (0..300).map(|n| format!("user{n}@example.com ")).collect::<String>();

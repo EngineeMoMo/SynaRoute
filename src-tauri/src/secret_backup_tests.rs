@@ -4,7 +4,7 @@ use super::*;
 fn repeated_vault_snapshots_preserve_each_encrypted_generation() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("secrets.enc");
-    let mut secrets = SecretStore::load(path.clone()).unwrap();
+    let mut secrets = SecretStore::load_credential_fixture(path.clone()).unwrap();
     let mut generations = Vec::new();
     for index in 0..8 {
         let credential = format!("backup-test-credential-{index}");
@@ -22,7 +22,7 @@ fn repeated_vault_snapshots_preserve_each_encrypted_generation() {
     for (backup, expected, credential) in generations {
         assert!(paths.insert(backup.clone()));
         assert_eq!(std::fs::read(&backup).unwrap(), expected);
-        let restored = SecretStore::load(backup).unwrap();
+        let restored = SecretStore::load_credential_fixture(backup).unwrap();
         assert_eq!(
             restored.get("provider").unwrap().unwrap().as_str(),
             credential

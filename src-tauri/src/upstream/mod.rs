@@ -27,6 +27,8 @@ mod probe;
 pub(crate) mod response_body;
 mod session;
 mod sse;
+pub(crate) mod sse_frames;
+#[cfg(test)] #[path = "sse_lifecycle_tests.rs"] mod sse_lifecycle_tests;
 mod error_hint;
 mod stream_idle;
 mod thinking_effort; // Anthropic 两套 thinking 形态 → 中枢档位；来由见该文件模块注释
@@ -180,6 +182,7 @@ pub(crate) fn body_is_upstream_error(bytes: &[u8]) -> Option<String> {
 }
 
 /// 从流末尾窗内可解析的 SSE 事件识别失败；截断或非 SSE 数据不在该判据覆盖范围。
+#[cfg(test)]
 pub fn sse_stream_errored(sse: &str) -> bool {
     for line in sse.lines() {
         let Some(data) = line.trim().strip_prefix("data:") else {

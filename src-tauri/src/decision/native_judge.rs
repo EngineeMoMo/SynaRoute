@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 
 pub(super) async fn select(
     store: &Store,
+    category: crate::model::CategoryType,
     mut config: DecisionConfig,
     prompt: &str,
     efforts: &[String],
@@ -18,7 +19,7 @@ pub(super) async fn select(
     }
     if config.provider == Provider::Laya {
         // Upgrade-only (see laya_judge): never lower the user's manual effort.
-        let body = query(store, &config, laya_judge::body(&config.model, prompt)).await?;
+        let body = query(store, category, &config, laya_judge::body(&config.model, prompt)).await?;
         if !laya_judge::needs_deep_reasoning(&body) {
             return Err("未判定为需要深度推理，保持手动档位 / not a deep task; manual effort kept");
         }
@@ -52,7 +53,7 @@ pub(super) async fn select(
         json!({"model":config.model,"state":prompt,"questions":{"effort":{
             "type":"choice","instructions":instructions,"criteria":criteria}}})
     };
-    let body = query(store, &config, body).await?;
+    let body = query(store, category, &config, body).await?;
     parse(config.provider, &body, efforts)
         .ok_or("不确定或超出原生目录 / uncertain or outside native catalog")
 }

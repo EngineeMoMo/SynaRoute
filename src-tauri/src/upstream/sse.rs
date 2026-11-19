@@ -24,7 +24,8 @@ use super::tools_meta::{
 // 能力边界：Chat 上游只产出「文本 / tool_call / finish / usage」增量，故覆盖这几类；Responses
 // 独有的 reasoning_summary / image 等因 Chat 源头无数据而不出现 —— 能力上限，非遗漏。
 
-#[path = "sse_error.rs"] pub(crate) mod sse_error; // 上游流内 error 的跨协议翻译；来由见该文件模块注释
+#[path = "sse_error.rs"] pub(crate) mod sse_error;
+#[path = "sse_lifecycle.rs"] mod sse_lifecycle;
 #[path = "sse_bounds.rs"] mod sse_bounds; // 工具调用累积的体积上限；来由见该文件模块注释
 
 /// SSE 流的跨协议翻译方向。
@@ -66,7 +67,10 @@ pub struct SseTranslator {
     dir: SseDirection,
     /// 未处理完的上游字节。**缓冲字节而非字符串**：多字节字符可能被 TCP 分段切开，
     /// 逐块解码会把它腐蚀成 U+FFFD（详见 push 的注释）。
-    buf: Vec<u8>,
+    decoder: super::sse_frames::Decoder,
+    status: super::sse_frames::Status,
+    ending: String,
+    finished: bool,
     /// 目标形态里输出消息/响应的 id（首次需要时惰性生成）。
     resp_id: String,
     msg_id: String,
@@ -144,7 +148,10 @@ impl SseTranslator {
     pub fn with_namespaces(dir: SseDirection, tool_namespaces: Vec<String>) -> Self {
         Self {
             dir,
-            buf: Vec::new(),
+            decoder: super::sse_frames::Decoder::default(),
+            status: super::sse_frames::Status::default(),
+            ending: String::new(),
+            finished: false,
             resp_id: format!("resp_{}", uuid_like()),
             msg_id: format!("msg_{}", uuid_like()),
             started: false,
@@ -190,34 +197,41 @@ impl SseTranslator {
 
     /// 喂入一块上游字节，返回应发给下游的 SSE 文本（可能为空）。
     ///
-    /// **缓冲字节而非字符串**，且只对**完整行**解码 —— 必须如此，非风格问题：一个 3 字节中文字符
-    /// 可能被 TCP 分段切开分两次 push 进来，逐块解码时前后两半各自非法、各被替换成 U+FFFD，
-    /// 用户看到凭空出现的「」。按行解码则安全（SSE 保证按行发 JSON，行内必是完整 UTF-8）。
-    /// 回归测试见 `sse_multibyte_text_survives_arbitrary_chunk_boundaries`。
     pub fn push(&mut self, chunk: &[u8]) -> String {
-        if self.limit_hit_emitted { return String::new() }
-        self.buf.extend_from_slice(chunk);
+        if self.failed() || self.finished { return String::new() }
         let mut out = String::new();
-        // 逐个完整行处理，保留最后不完整的一段在 buf。
-        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
-            // 完整行也要在 drain 前检查：同一个 chunk 里带换行时，事后检查 buf 已经看不到它。
-            if self.complete_line_too_long(nl.saturating_add(1)) {
-                if let Some(e) = self.take_tool_limit_error() { out.push_str(&e); }
-                break;
+        for event in self.decoder.push(chunk) {
+            let was_terminal = self.status.terminal;
+            self.status.observe(self.upstream_protocol(), &event);
+            if was_terminal && !self.status.failed {
+                if let Some(usage) = event.get("usage").filter(|usage| !usage.is_null()) {
+                    self.capture_openai_usage(usage);
+                }
+                continue;
             }
-            // raw 是独立的 owned Vec，text 借的是 raw 而非 self，
-            // 故下面调 `self.process_line(&mut self, ..)` 不会撞借用检查。
-            let raw: Vec<u8> = self.buf.drain(..=nl).collect();
-            let text = String::from_utf8_lossy(&raw);
-            let line = text.trim_end_matches(['\r', '\n']);
-            if let Some(ev) = self.process_line(line) {
-                out.push_str(&ev);
+            if let Some(output) = self.process_event(&event) {
+                if self.status.failed {
+                    self.ending.clear();
+                    out.push_str(&output);
+                    break;
+                } else if self.status.terminal {
+                    self.ending.push_str(&output);
+                } else {
+                    out.push_str(&output);
+                }
             }
-            if let Some(e) = self.take_tool_limit_error() { out.push_str(&e); break }
+            if let Some(error) = self.take_tool_limit_error() { out.push_str(&error); break; }
         }
-        // 行缓冲上限必须查在循环**之外**：上游一个 `\n` 都不发时那个循环压根不进入，
-        // 而那正是这条上限要挡的形态（详见 sse_bounds::MAX_LINE_BYTES）。
-        if let Some(e) = self.line_buffer_error() { out.push_str(&e) }
+        if self.decoder.failed && !self.status.failed && !self.limit_hit_emitted {
+            self.ending.clear();
+            if self.decoder.oversized {
+                self.limit_hit = Some(sse_bounds::LimitKind::LineBuffer);
+                out.push_str(&self.take_tool_limit_error().unwrap_or_default());
+                return out;
+            }
+            self.status.failed = true;
+            out.push_str(&self.translate_upstream_error(&json!({"type":"error","message":"Invalid upstream SSE frame: expected UTF-8 JSON object"})).unwrap_or_default());
+        }
         out
     }
 
@@ -245,10 +259,6 @@ impl SseTranslator {
         if let Some(cw) = detail("cache_write_tokens") { self.cache_creation = cw; }
     }
 
-    /// 给**跨协议流式的用量采集**用。同协议直通走「尾窗缓存 + 事后 `extract_usage_from_sse`」；
-    /// 跨协议不能照搬（尾窗里是已转换的下游格式），而翻译器本来就得读懂上游 usage 才能翻译，
-    /// 直接问它最准。判 0 而非「见过 usage 事件」：token 为 0 的成功请求实际不存在。
-    ///
     /// 🔴 OpenAI 上游的输入总数**含**缓存读/写（Anthropic 的不含），记账前必须减掉 —— 否则缓存部分
     /// 先按全价、再按缓存价各算一次（同协议那条路的 `upstream::usage::parse_usage_object` 一直是减的）。
     pub fn accumulated_usage(&self) -> Option<crate::model::TokenUsage> {
@@ -261,46 +271,16 @@ impl SseTranslator {
         Some(crate::model::TokenUsage { input: self.input_tokens.saturating_sub(cached), output: self.output_tokens, cache_read, cache_creation })
     }
 
-    /// 流结束时冲刷收尾事件（Responses 需要 response.completed；Chat 需 [DONE]）。
-    pub fn finish(&mut self) -> String {
-        if self.limit_hit_emitted { return String::new() }
+    fn process_event(&mut self, json: &Value) -> Option<String> {
+        if json.get("type").and_then(Value::as_str) == Some("synaroute.chat.done") { return None; }
+        if let Some(t) = self.translate_upstream_error(json) { return Some(t); }
         match self.dir {
-            SseDirection::ChatToResponses | SseDirection::AnthropicToResponses => {
-                self.emit_responses_completed(None)
-            }
-            SseDirection::ChatToAnthropic | SseDirection::ResponsesToAnthropic => {
-                self.emit_anthropic_stop()
-            }
-            SseDirection::ResponsesToChat | SseDirection::AnthropicToChat => {
-                "data: [DONE]\n\n".to_string()
-            }
-        }
-    }
-
-    fn process_line(&mut self, line: &str) -> Option<String> {
-        let data = line.strip_prefix("data:")?.trim();
-        if data.is_empty() {
-            return None;
-        }
-        if data == "[DONE]" {
-            // Chat 上游结束标记：对 Responses 方向由 finish() 统一收尾，这里吞掉。
-            return match self.dir {
-                SseDirection::ResponsesToChat | SseDirection::AnthropicToChat => {
-                    Some("data: [DONE]\n\n".to_string())
-                }
-                _ => None,
-            };
-        }
-        let json: Value = serde_json::from_str(data).ok()?;
-        // 必须排在六方向分派**之前**（那六个函数一个都不读 `error`）。有判据钉住这个顺序。
-        if let Some(t) = self.translate_upstream_error(&json) { return Some(t); }
-        match self.dir {
-            SseDirection::ChatToResponses => Some(self.chat_chunk_to_responses(&json)),
-            SseDirection::ResponsesToChat => Some(self.responses_event_to_chat(&json)),
-            SseDirection::ChatToAnthropic => Some(self.chat_chunk_to_anthropic(&json)),
-            SseDirection::AnthropicToChat => Some(self.anthropic_event_to_chat(&json)),
-            SseDirection::AnthropicToResponses => Some(self.anthropic_chunk_to_responses(&json)),
-            SseDirection::ResponsesToAnthropic => Some(self.responses_event_to_anthropic(&json)),
+            SseDirection::ChatToResponses => Some(self.chat_chunk_to_responses(json)),
+            SseDirection::ResponsesToChat => Some(self.responses_event_to_chat(json)),
+            SseDirection::ChatToAnthropic => Some(self.chat_chunk_to_anthropic(json)),
+            SseDirection::AnthropicToChat => Some(self.anthropic_event_to_chat(json)),
+            SseDirection::AnthropicToResponses => Some(self.anthropic_chunk_to_responses(json)),
+            SseDirection::ResponsesToAnthropic => Some(self.responses_event_to_anthropic(json)),
         }
     }
 
@@ -374,10 +354,8 @@ impl SseTranslator {
             // assistant 回复持久化进会话；此前只发 delta（实时流），重开对话文本回复全丢。
             out.push_str(&self.emit_text_item_done());
         }
-        // usage 单独出现（无 choices 或 choices 空）时，触发 completed；同时入账（见 capture_openai_usage）。
         if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
             self.capture_openai_usage(u);
-            out.push_str(&self.emit_responses_completed(Some(u)));
         }
         out
     }
@@ -706,7 +684,6 @@ impl SseTranslator {
         if !self.started {
             return String::new();
         }
-        // 上游没给 finish_reason 就断流时，累积的 tool_calls 还没成块，这里兜底冲刷。
         let mut out = self.flush_anthropic_tool_calls();
         self.started = false;
         out.push_str(&self.close_anthropic_text_block());
@@ -1483,6 +1460,7 @@ mod tests {
         t.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n");
         t.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":34}}\n\n");
         let tail = t.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        let tail = tail + &t.finish();
         assert!(
             tail.contains("\"prompt_tokens\":120"),
             "Anthropic→Chat 必须把 input_tokens 作为 prompt_tokens 发出: {tail}"
@@ -1499,6 +1477,7 @@ mod tests {
         let tail2 = t2.push(
             b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n\n",
         );
+        let tail2 = tail2 + &t2.finish();
         assert!(
             tail2.contains("\"prompt_tokens\":7") && tail2.contains("\"completion_tokens\":9"),
             "Responses→Chat 必须发 usage: {tail2}"
@@ -1647,10 +1626,10 @@ mod tests {
 
     #[test]
     fn sse_finish_is_idempotent_when_no_content() {
-        // 空流（上游直接结束、无任何 chunk）：finish 不得产出半截事件。
         let mut tr = SseTranslator::new(SseDirection::ChatToResponses);
         let tail = tr.finish();
-        assert!(tail.is_empty(), "未开始的流收尾应为空，实际:\n{tail}");
+        assert!(tail.contains("response.failed"), "空流不能冒充成功:\n{tail}");
+        assert!(tr.finish().is_empty());
     }
 
     #[test]
@@ -2128,16 +2107,16 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
     }
 
     #[test]
-    fn sse_chat_to_anthropic_flushes_tool_calls_without_finish_reason() {
-        // 上游没给 finish_reason 就断流：收尾时必须兜底冲刷累积的工具调用，不能整个丢掉。
+    fn sse_chat_to_anthropic_rejects_unfinished_tool_calls() {
         let mut tr = SseTranslator::new(SseDirection::ChatToAnthropic);
         let mut out = String::new();
         out.push_str(&tr.push(br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c5","function":{"name":"t","arguments":"{}"}}]}}]}
 
 "#));
         out.push_str(&tr.finish());
-        assert_eq!(anthropic_tool_blocks(&out).len(), 1, "断流也应交付工具:\n{out}");
-        assert!(out.contains("\"stop_reason\":\"tool_use\""));
+        assert!(anthropic_tool_blocks(&out).is_empty(), "截断工具不得执行:\n{out}");
+        assert!(out.contains("event: error"));
+        assert!(!out.contains("message_stop"));
     }
 
     /// 跨协议流式的用量必须能取出来。
@@ -2191,10 +2170,6 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
     }
 
     /// 🔴 **跨协议长流的用量必须照样取到。**
-    ///
-    /// 这条钉的是 `usage.rs` 那个洞的**反面**：同协议直通走「8KB 尾窗 + 事后解析」，
-    /// 长回答会把承载用量的那一行切断（见 `a_realistic_responses_completed_event_survives_the_window`）；
-    /// 而跨协议这条路由翻译器**边收边累积**两个计数器，压根不经过窗口。
     ///
     /// 取证意义：2026-09-20 用户日志里 k40（Anthropic 协议 + Codex 的 Responses 下游 =
     /// 走本路径）那几条成功请求也没有 token 数，需要排除「这里还有第二个洞」。
@@ -2360,6 +2335,7 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
         out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"synaroute_ai\\\"}\"}}\n\n"));
         out.push_str(&tr.push(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"));
         out.push_str(&tr.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n"));
+        out.push_str(&tr.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
         out.push_str(&tr.finish());
         assert!(out.contains("\"type\":\"tool_search_call\""), "流式应输出 tool_search_call:\n{out}");
         assert!(out.contains("\"execution\":\"client\""), "须标明客户端执行:\n{out}");
@@ -2384,6 +2360,7 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
         out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"prompt\\\":\\\"hi\\\"}\"}}\n\n"));
         out.push_str(&tr.push(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"));
         out.push_str(&tr.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n"));
+        out.push_str(&tr.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
         out.push_str(&tr.finish());
         assert!(out.contains("\"type\":\"function_call\""), "普通工具应保持 function_call:\n{out}");
         assert!(!out.contains("tool_search_call"), "不应误改写:\n{out}");
@@ -2430,6 +2407,7 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
         out.push_str(&tr.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}\n\n"));
         out.push_str(&tr.push(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"));
         out.push_str(&tr.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n"));
+        out.push_str(&tr.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
         out.push_str(&tr.finish());
         assert!(out.contains("\"type\":\"function_call\""), "非 custom 工具应输出 function_call:\n{out}");
         assert!(out.contains("\"arguments\""), "function_call 应携带 arguments:\n{out}");

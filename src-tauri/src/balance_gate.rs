@@ -536,7 +536,7 @@ mod tests {
 
     fn store(tag: &str) -> Arc<Store> {
         let dir = temp_dir(tag);
-        Arc::new(Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap())
+        Arc::new(Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap())
     }
 
     /// 一次「成功拿到数值」的查询结果。刻意从 `failed("")` 派生，免得日后

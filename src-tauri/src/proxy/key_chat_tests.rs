@@ -63,7 +63,7 @@ async fn mock(
 fn store(url: &str, protocol: Protocol) -> (tempfile::TempDir, Arc<Store>, ChatRequest) {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(
-        Store::new_at(
+        Store::credential_fixture(
             directory.path().join("config.json"),
             directory.path().join("secrets.enc"),
         )

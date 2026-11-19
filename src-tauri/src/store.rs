@@ -640,7 +640,7 @@ impl Store {
             key_id: key_id.map(|s| s.to_string()),
             // 事件构造时就回填 key_name（key_id → 可读名）：日志文件与列表都带可读名，
             // 排障/路径可视化不必拿 uuid 反查。走窄读取器（只克隆 name），不用 get_key 整份克隆。
-            key_name: key_id.and_then(|kid| self.key_name(kid)),
+            key_name: key_id.and_then(|kid| self.key_name(kid).or_else(|| decision::accounting::name(kid))),
             detail: detail.to_string(),
             repeat: 1,
             collapse_key: collapse_key.clone(),
@@ -2552,7 +2552,7 @@ mod tests {
         let dir = temp_dir("lifecycle");
         let cfg_path = dir.join("config.json");
         let sec_path = dir.join("secrets.enc");
-        let store = Store::new_at(cfg_path.clone(), sec_path).unwrap();
+        let store = Store::credential_fixture(cfg_path.clone(), sec_path).unwrap();
 
         // 新增
         store.upsert_key(sample_key("k1", 0)).unwrap();
@@ -2577,7 +2577,7 @@ mod tests {
         assert_eq!(store.list_keys(CategoryType::ClaudeCli).len(), 1);
 
         // 重新加载：删除结果应真正落盘（重启后仍生效）
-        let reloaded = Store::new_at(cfg_path, dir.join("secrets.enc")).unwrap();
+        let reloaded = Store::credential_fixture(cfg_path, dir.join("secrets.enc")).unwrap();
         assert!(reloaded.get_key("k1").is_none(), "重载后 k1 仍应不存在");
         assert!(reloaded.get_key("k2").is_some(), "k2 应保留");
 
@@ -2669,7 +2669,7 @@ mod tests {
     fn the_lan_token_survives_orphan_pruning() {
         let dir = temp_dir("lan_token_vs_prune");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // 一条真 Key（有密钥）+ 一条真孤儿（密钥库有、配置里没有）+ 局域网令牌。
         let mut k = sample_key("k1", 0);
@@ -4763,14 +4763,14 @@ mod tests {
     #[test]
     fn reconcile_has_secret_skips_while_vault_locked() {
         let dir = temp_dir("reconcile_locked");
-        let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
+        let store = Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
         store.upsert_key(sample_key("k1", 0)).unwrap();
         store.secrets.write().set("k1", "sk-x").unwrap();
         store.reconcile_has_secret_flags().unwrap();
         assert!(store.get_key("k1").unwrap().has_secret, "前置条件：标记应为真");
 
         // 切到主口令模式后手动上锁（模拟「重启后还没解锁」）。
-        store.secrets.write().enable_master_password("TestPass123").unwrap();
+        store.secrets.write().set_fixture_password("TestPass123").unwrap();
         store.secrets.write().lock();
 
         let fixed = store.reconcile_has_secret_flags().unwrap();

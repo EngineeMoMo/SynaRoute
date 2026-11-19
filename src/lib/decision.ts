@@ -10,6 +10,7 @@ export interface DecisionConfig {
 export interface DecisionView { config: DecisionConfig; hasSecret: boolean }
 /** Mirror of `decision/laya_local.rs::Status` (camelCase). */
 export interface LayaLocalStatus {
+  backend?: "python" | "rust"; version?: string | null; rustSupported?: boolean; canRollback?: boolean;
   supported: boolean; phase: string; endpoint: string; logs: string[]; error: string | null;
   errorCode?: string | null; elapsedSeconds?: number; installed?: boolean; autostart?: boolean;
   mirror?: boolean; critical?: boolean; readyEndpoint?: string | null; servedEndpoints?: string[];

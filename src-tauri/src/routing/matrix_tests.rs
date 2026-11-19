@@ -52,7 +52,7 @@ impl Fixture {
             }
         });
         let dir = std::env::temp_dir().join(format!("sr-routing-matrix-{}", uuid::Uuid::new_v4()));
-        let store = Arc::new(Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
+        let store = Arc::new(Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
         let key = ProviderKey { id: uuid::Uuid::new_v4().to_string(), category_id: CategoryType::Codex, base_url: endpoint, protocol, enabled: true,
             models: ["judge", "target", "default"].into_iter().map(|name| ModelInfo { real_name: name.into(), source: "manual".into(), fetched_at: None, context_window: None, max_output_tokens: None }).collect(), ..Default::default() };
         store.upsert_key(key.clone()).unwrap(); store.secrets.write().set(&key.id, "dummy-test-secret").unwrap();
@@ -73,7 +73,7 @@ fn routing_terms_config_write_failure_keeps_old_secret_and_restart() {
     use super::config::{CategoryPolicy, PrivacyMode};
     let dir = std::env::temp_dir().join(format!("sr-terms-rollback-{}", uuid::Uuid::new_v4()));
     let config = dir.join("config.json"); let secrets = dir.join("secrets.enc");
-    let store = Store::new_at(config.clone(), secrets.clone()).unwrap();
+    let store = Store::credential_fixture(config.clone(), secrets.clone()).unwrap();
     let mut policy = CategoryPolicy::default(); policy.privacy.mode = PrivacyMode::Block;
     super::save_policy(&store, CategoryType::Codex, policy.clone(), Some(vec!["original-private-term".into()]), 0).unwrap();
     let old = super::settings(&store).unwrap();
@@ -86,7 +86,7 @@ fn routing_terms_config_write_failure_keeps_old_secret_and_restart() {
     assert_eq!(&*super::privacy::terms(&store, &current.categories[&CategoryType::Codex].privacy).unwrap(), &["original-private-term"]);
     assert_eq!(std::fs::read(&secrets).unwrap(), vault, "failed replacement must remove its new secret");
     std::fs::remove_dir(&config).unwrap(); std::fs::rename(saved, &config).unwrap(); drop(store);
-    let restarted = Store::new_at(config, secrets).unwrap();
+    let restarted = Store::credential_fixture(config, secrets).unwrap();
     assert_eq!(&*super::privacy::terms(&restarted, &super::settings(&restarted).unwrap().categories[&CategoryType::Codex].privacy).unwrap(), &["original-private-term"]);
     drop(restarted); std::fs::remove_dir_all(dir).unwrap();
 }

@@ -2335,7 +2335,7 @@ mod tests {
         let unavailable = spawn_mock(500, "temporary upstream failure").await;
         let healthy = spawn_mock(200, r#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#).await;
         let directory = temp_dir("model_scoped_gate");
-        let store = Arc::new(Store::new_at(directory.join("config.json"), directory.join("secrets.enc")).unwrap());
+        let store = Arc::new(Store::credential_fixture(directory.join("config.json"), directory.join("secrets.enc")).unwrap());
         let mut first = key("gate-model-first", 0, &unavailable);
         first.category_id = CategoryType::Codex;
         first.models = vec![model_ctx("first", None)];
@@ -3514,7 +3514,7 @@ mod tests {
 
         let dir = temp_dir("no_pollute");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // 两条 Key 把同一个对外名映射到**不同**真实模型名
         let mut k1 = key("k1", 0, &bad);
@@ -3623,7 +3623,7 @@ mod tests {
 
         let dir = temp_dir("failover_budget");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // 5 个候选都指向同一个慢上游；每个 Key 自身超时 900ms
         for i in 0..5 {
@@ -3685,7 +3685,7 @@ mod tests {
 
         let dir = temp_dir("stream_probe_to");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         for i in 0..2 {
             let mut k = key(&format!("k{i}"), i, &stuck);
@@ -3744,7 +3744,7 @@ mod tests {
 
         let dir = temp_dir("failover_budget_first");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         store.upsert_key(key("k1", 0, &good)).unwrap();
         store.secrets.write().set("k1", "x").unwrap();
@@ -3784,7 +3784,7 @@ mod tests {
 
         let dir = temp_dir("failover_budget_off");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         store.upsert_key(key("k1", 0, &bad)).unwrap();
         store.upsert_key(key("k2", 1, &good)).unwrap();
@@ -3820,7 +3820,7 @@ mod tests {
 
         let dir = temp_dir("failover");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         store.upsert_key(key("k1", 0, &bad)).unwrap();
         store.upsert_key(key("k2", 1, &good)).unwrap();
@@ -3858,12 +3858,12 @@ mod tests {
         .await;
         let dir = temp_dir("locked");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         store.upsert_key(key("k1", 0, &upstream)).unwrap();
         store.secrets.write().set("k1", "sk-x").unwrap();
         // 启用主口令 → 已解锁态；随后显式上锁，模拟「新进程启动但用户还没输口令」。
-        store.secrets.write().enable_master_password("TestPass123").unwrap();
+        store.secrets.write().set_fixture_password("TestPass123").unwrap();
         store.secrets.write().lock();
         assert!(store.secrets.read().is_locked(), "前置条件：处于锁定态");
 
@@ -4028,7 +4028,7 @@ mod tests {
     async fn gated_requests_do_not_log_breaker_fallback_they_never_performed() {
         let dir = temp_dir("gate_no_spam");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // 死端口：连接层失败（既计熔断、又被判临时 → 会武装短路窗口）
         let mut k = key("k1", 0, "http://127.0.0.1:1");
@@ -4112,7 +4112,7 @@ mod tests {
         let bad2 = spawn_mock(500, "err").await;
         let dir = temp_dir("allfail");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         store.upsert_key(key("k1", 0, &bad1)).unwrap();
         store.upsert_key(key("k2", 1, &bad2)).unwrap();
@@ -4184,7 +4184,7 @@ mod tests {
     async fn an_all_fallback_pool_is_rejected_before_the_loop_not_at_its_tail() {
         let dir = temp_dir("allskip");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // k1 用映射宣称 `adv-only`，但**处于熔断中**→ 被 rank_candidates 剔除。
         // k2 只认识 real-a、有 default_model → 对 adv-only 是 Fallback。
@@ -4248,7 +4248,7 @@ mod tests {
         let bad2 = spawn_mock(401, "invalid api key").await;
         let dir = temp_dir("hardfail");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // 用 ClaudeDesktop 分类：与其它用例的 gate key 天然隔开
         let mut k1 = key("k1", 0, &bad1);
@@ -4324,7 +4324,7 @@ mod tests {
         let limited_long = spawn_mock_with_headers(429, "slow down", &[("retry-after", "42")]).await;
         let dir = temp_dir("retry_after");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // 分类用 Codex：本用例走 Responses 之外的 Anthropic 端点也无妨，这里只关心 Retry-After
         // 是否被采集并透传（gate 已按代理实例隔离，用哪个分类都不会污染别的用例）。
@@ -4399,7 +4399,7 @@ mod tests {
         let bad = spawn_mock(400, r#"{"error":{"message":"bad request"}}"#).await;
         let dir = temp_dir("stream_trace_body");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // 链路快照只在「调用模型日志」开关开启时产生
         let mut s = store.get_settings();
@@ -4479,7 +4479,7 @@ mod tests {
                 spawn_sse_mock("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n").await
             } else { spawn_mock(status, r#"{"content":[{"type":"text","text":"ok"}]}"#).await };
             let dir = temp_dir("passive-profiles");
-            let store = Arc::new(Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
+            let store = Arc::new(Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
             let mut settings = store.get_settings(); settings.request_log_enabled = false; settings.upstream_retry_enabled = false;
             store.save_settings(UserPrefs::from(&settings)).unwrap();
             let id = format!("profile-{}", uuid::Uuid::new_v4());
@@ -4522,7 +4522,7 @@ mod tests {
         let mock = spawn_mock(200, r#"{"ok":true}"#).await;
         let dir = temp_dir("trace_url_mask");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let mut s = store.get_settings();
         s.request_log_enabled = true; // 快照只在这个开关开着时才构造
@@ -4664,7 +4664,7 @@ mod tests {
         let flaky = spawn_mock(500, "internal error").await; // 无 retry-after 头
         let dir = temp_dir("retry_after_mixed");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let mut k1 = key("mp1", 0, &quota);
         k1.category_id = CategoryType::Codex;
@@ -4715,7 +4715,7 @@ mod tests {
         let expired = spawn_mock(401, r#"{"error":{"message":"invalid api key"}}"#).await;
         let dir = temp_dir("mixed_pool");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // k1 先被尝试（priority 0）回 429，k2 后被尝试回 401 —— 401 是「最后一次失败」。
         let mut k1 = key("mf1", 0, &limited);
@@ -4791,7 +4791,7 @@ mod tests {
         let captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let upstream = spawn_capture_mock(captured.clone()).await;
         let dir = temp_dir("routing_privacy_e2e");
-        let store = Arc::new(Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
+        let store = Arc::new(Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
         let mut settings = store.get_settings(); settings.request_log_enabled = true; settings.log_downstream_raw_enabled = true;
         store.save_settings(UserPrefs::from(&settings)).unwrap();
         let mut k = key("routing-privacy-e2e", 0, &upstream);
@@ -4928,7 +4928,7 @@ mod tests {
         // 两个 store 各配一条同样的 Anthropic Key，只是上游地址不同
         let mk = |dir: &std::path::Path, url: &str| {
             let store = std::sync::Arc::new(
-                Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+                Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
             );
             store.upsert_key(key("k1", 0, url)).unwrap();
             store.secrets.write().set("k1", "sk-test").unwrap();
@@ -5020,7 +5020,7 @@ mod tests {
 
         let dir = temp_dir("effort_e2e");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // Codex 分类的 Anthropic 上游 Key（跨协议：下游 Responses → 上游 Anthropic）。
         let mut k = key("k1", 0, &upstream);
@@ -5135,7 +5135,7 @@ mod tests {
 
         let dir = temp_dir("budget_e2e_ns");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let mut k = key("k1", 0, &upstream);
         k.category_id = CategoryType::Codex;
@@ -5190,7 +5190,7 @@ mod tests {
 
         let dir = temp_dir("budget_e2e_snapshot");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // 链路快照只在「调用模型日志」开关开启时构造。
         let mut s = store.get_settings();
@@ -5246,7 +5246,7 @@ mod tests {
 
         let dir = temp_dir("budget_e2e_stream");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let mut k = key("k1", 0, &upstream);
         k.category_id = CategoryType::Codex;
@@ -5401,7 +5401,7 @@ mod tests {
 
         let dir = temp_dir("image_e2e");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let mut k = key("k1", 0, &upstream);
         k.category_id = CategoryType::Codex;
@@ -5530,7 +5530,7 @@ mod tests {
         let upstream = spawn_body_and_headers_mock(bodies.clone(), headers.clone()).await;
 
         let dir = temp_dir("cache_e2e_conv");
-        let store = std::sync::Arc::new(Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
+        let store = std::sync::Arc::new(Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
         let mut k = key("k1", 0, &upstream);
         k.category_id = CategoryType::Codex;    // 下游 Responses
         k.protocol = Protocol::Anthropic;        // 上游 Anthropic → 跨协议
@@ -5585,7 +5585,7 @@ mod tests {
         let upstream = spawn_body_and_headers_mock(bodies.clone(), headers.clone()).await;
 
         let dir = temp_dir("cache_e2e_direct");
-        let store = std::sync::Arc::new(Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
+        let store = std::sync::Arc::new(Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap());
         let mut k = key("k1", 0, &upstream);
         k.category_id = CategoryType::ClaudeCli; // 下游 Anthropic
         k.protocol = Protocol::Anthropic;         // 上游 Anthropic → 同协议直通
@@ -5639,7 +5639,7 @@ mod tests {
 
         let dir = temp_dir("tool_search_e2e");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let mut k = key("k1", 0, &upstream);
         k.category_id = CategoryType::Codex;
@@ -5731,7 +5731,7 @@ mod tests {
 
         let dir = temp_dir("effort_e2e_resp");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // Codex 分类的 Responses 上游 Key（同协议：下游 Responses → 上游 Responses，convert_request 直通）。
         let mut k = key("k1", 0, &upstream);
@@ -5783,7 +5783,7 @@ mod tests {
         .await;
         let dir = temp_dir("codex_usage_stream");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let mut k = key("usage-responses-e2e", 0, &upstream);
         k.category_id = CategoryType::Codex;
@@ -5847,7 +5847,7 @@ mod tests {
 
         let dir = temp_dir("sampling_resp_e2e");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let mut k = key("k1", 0, &upstream);
         k.category_id = CategoryType::Codex;
@@ -6051,7 +6051,7 @@ mod tests {
     async fn proxy_get_v1_models_returns_the_union() {
         let dir = temp_dir("listmodels");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let mut a = key("a", 0, "http://x");
         a.mappings = vec![mapping("opus-4-8", "glm-5.2"), mapping("opus-4-7", "glm-5.1")];
@@ -6100,7 +6100,7 @@ mod tests {
     async fn proxy_retrieve_single_model_returns_object_not_list() {
         let dir = temp_dir("retrievemodel");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let mut a = key("a", 0, "http://x");
         a.mappings = vec![mapping("opus-4-8", "glm-5.2")];
@@ -6155,7 +6155,7 @@ mod tests {
     async fn proxy_handles_managed_settings_and_otlp_locally() {
         let dir = temp_dir("sideendpoints");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // 故意配一个**指向黑洞的** Key：若这些端点被误当成补全请求转发，
         // 就会去连 base_url 而后失败——用 404/200 的即时应答证明它们没走转发路径。
@@ -6197,7 +6197,7 @@ mod tests {
         // 原样返回 grok-4.5 会被 CLI 静默过滤；必须包成 claude-synaroute-grok-4.5。
         let dir = temp_dir("listmodels-wrap");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let mut k = key("k1", 0, "http://x");
         k.models = vec![model_info("grok-4.5")];
@@ -6224,7 +6224,7 @@ mod tests {
         // 已合规名不二次包装
         let dir = temp_dir("listmodels-claude");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let mut k = key("k1", 0, "http://x");
         k.models = vec![model_info("claude-opus-4-5")];
@@ -6250,7 +6250,7 @@ mod tests {
         // 模型发现不受健康态影响——健康只决定路由，不决定「能选哪些模型」。
         let dir = temp_dir("listmodels-down");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let mut k = key("k1", 0, "http://x");
         k.mappings = vec![mapping("opus-4-8", "glm-5.2")];
@@ -6432,7 +6432,7 @@ mod tests {
         let up = spawn_sse_inflight_error_mock().await;
         let dir = temp_dir("sse_inflight_err");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         store.upsert_key(key("k1", 0, &up)).unwrap();
         store.secrets.write().set("k1", "sk-test").unwrap();
@@ -6493,7 +6493,7 @@ mod tests {
         let up = spawn_mock(200, r#"{"ok":true}"#).await;
         let dir = temp_dir("meta_success");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         store.upsert_key(key("k1", 0, &up)).unwrap();
         store.secrets.write().set("k1", "sk-secret-value").unwrap();
@@ -6541,7 +6541,7 @@ mod tests {
         let good = spawn_mock(200, r#"{"ok":true}"#).await;
         let dir = temp_dir("meta_failover");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         store.upsert_key(key("k1", 0, &bad)).unwrap();
         store.upsert_key(key("k2", 1, &good)).unwrap();
@@ -6583,7 +6583,7 @@ mod tests {
         let up = spawn_mock(401, r#"{"error":"bad key"}"#).await;
         let dir = temp_dir("meta_fail");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         store.upsert_key(key("k1", 0, &up)).unwrap();
         store.secrets.write().set("k1", "x").unwrap();
@@ -6626,7 +6626,7 @@ mod tests {
         let up = spawn_mock(200, r#"{"ok":true}"#).await;
         let dir = temp_dir("meta_noleak");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // 把「像令牌一样的 URL 路径」也放进 base_url，模拟真实中转站形态
         let mut k = key("k1", 0, &format!("{up}/v1/tok-abc123"));
@@ -6670,7 +6670,7 @@ mod tests {
         .await;
         let dir = temp_dir("error_secret_redact");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let mut settings = store.get_settings();
         settings.request_log_enabled = true;
@@ -6709,7 +6709,7 @@ mod tests {
         let up = spawn_mock(200, r#"{"ok":true}"#).await;
         let dir = temp_dir("meta_cjk");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let mut k = key("k1", 0, &up);
         k.name = "「林夕」公益站".into();
@@ -6820,7 +6820,7 @@ mod tests {
         let good = spawn_mock(200, r#"{"ok":true}"#).await;
         let dir = temp_dir("mlock_e2e");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         store.upsert_key(key("k1", 0, &bad)).unwrap();
         store.upsert_key(key("k2", 1, &good)).unwrap();
@@ -6881,7 +6881,7 @@ mod tests {
         let good = spawn_mock(200, r#"{"ok":true}"#).await;
         let dir = temp_dir("mlock_alias");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         // k1：两个不同的对外名 → **同一个**真实模型
         let mut k1 = key("k1", 0, &bad);
@@ -6951,7 +6951,7 @@ mod tests {
         let up = spawn_mock(404, r#"{"error":"nope"}"#).await;
         let dir = temp_dir("mlock_fallback");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         store.upsert_key(key("k1", 0, &up)).unwrap();
         store.secrets.write().set("k1", "x").unwrap();
@@ -7005,7 +7005,7 @@ mod tests {
         let good = spawn_mock(200, r#"{"ok":true}"#).await;
         let dir = temp_dir("mlock_401");
         let store = std::sync::Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         store.upsert_key(key("k1", 0, &bad)).unwrap();
         store.upsert_key(key("k2", 1, &good)).unwrap();

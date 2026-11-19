@@ -272,6 +272,7 @@ pub(crate) fn rows(store: &Store) -> Vec<UsageCostRow> {
         }
     }
     let facts = usage_keys::sync(Path::new(&store.config_path_display()), live);
+    live_slots.extend(crate::store::decision::accounting::configured_slots(store));
 
     // 先装历史桶（它们带真实数字），再把「配置里有、但一次 usage 都没捕获过」的 Key 补成占位行。
     // 顺序不能反 —— 反了会让占位行覆盖掉真实数字。`BTreeMap` 顺带给出稳定的行序（否则表格会无故跳动）。
@@ -334,8 +335,8 @@ fn build_row(
     UsageCostRow {
         category_id,
         // 聚合行（key_id 为空串）不算「已删除」——它压根没有 Key。
-        key_deleted: key.is_none() && !key_id.is_empty(),
-        key_name: key.as_ref().map(|k| k.name.clone()).or_else(|| tomb.map(|t| t.name.clone())),
+        key_deleted: key.is_none() && !key_id.is_empty() && crate::store::decision::accounting::name(&key_id).is_none(),
+        key_name: key.as_ref().map(|k| k.name.clone()).or_else(|| tomb.map(|t| t.name.clone())).or_else(|| crate::store::decision::accounting::name(&key_id)),
         key_id,
         usage,
         has_recorded_usage,

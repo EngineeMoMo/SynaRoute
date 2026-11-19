@@ -680,7 +680,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         let key = ProviderKey {
             tier_fable: None,
@@ -720,7 +720,7 @@ mod tests {
             )
             .unwrap();
 
-        store.secrets.write().enable_master_password("TestPass123").unwrap();
+        store.secrets.write().set_fixture_password("TestPass123").unwrap();
         store.secrets.write().lock();
 
         check_one(&store, "k1").await;
@@ -795,7 +795,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("synaroute_probe_conc_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = StdArc::new(
-            Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
+            Store::credential_fixture(dir.join("config.json"), dir.join("secrets.enc")).unwrap(),
         );
         const N: usize = 12;
         for i in 0..N {

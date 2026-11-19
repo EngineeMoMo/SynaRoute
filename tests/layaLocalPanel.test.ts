@@ -87,7 +87,7 @@ describe("Laya local setup requires confirmation", () => {
   it("a stop waiting for the Python installer blocks every other action", () => {
     // Not "working" during "stopping" would re-enable the install button while the installer still runs.
     expect(panel).toMatch(/const activePhases = \[[^\]]*"stopping"/);
-    expect(panel).toContain("disabled={!state || busy || working}");
+    expect(panel).toContain("disabled={!state || busy || working || (rust && !canLaunch)}");
     expect(panel).toContain('disabled={busy || state?.phase === "stopping"}');
     expect(panel).toMatch(/stopping: text\(/);
   });
@@ -107,6 +107,9 @@ describe("Laya local setup requires confirmation", () => {
       laya_local_stop: ["layaLocalStop", panel],
       laya_local_set_autostart: ["layaLocalSetAutostart", panel],
       laya_local_set_mirror: ["layaLocalSetMirror", panel],
+      laya_local_set_backend: ["layaLocalSetBackend", panel],
+      laya_local_import_bundle: ["layaLocalImportBundle", panel],
+      laya_local_rollback_bundle: ["layaLocalRollbackBundle", panel],
       laya_local_sync_endpoints: ["layaLocalSyncEndpoints", decisionPanel],
     };
     for (const [cmd, [method, user]] of Object.entries(commands)) {

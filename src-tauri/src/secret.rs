@@ -22,6 +22,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use zeroize::Zeroizing;
 #[path = "secret_backup.rs"] mod backup;
+#[cfg(test)]
+#[path = "credential_fixture.rs"] mod credential_fixture;
 
 /// 主口令模式的库头部：KDF 参数 + 盐 + 校验串。存在即表示当前是主口令模式。
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
