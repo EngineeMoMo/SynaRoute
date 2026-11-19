@@ -2,7 +2,7 @@
 //
 // 用 Node 脚本而不是 Vite 插件：两件事都发生在产物目录上，写成脚本更直白，
 // 也方便单独跑一次核对结果。
-import { copyFileSync, existsSync, writeFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,19 +16,17 @@ const PATHS = ["", "download", "docs", "docs/cli", "docs/brain", "docs/mcp", "ch
 
 // ---- 1. SPA 兜底 ----
 // GitHub Pages 对未知路径直接返回 404.html，不像 Netlify 那样有 rewrite 规则。
-// 把 index.html 原样复制成 404.html，深链（/zh/docs/cli）刷新才不会真的 404 ——
-// 浏览器拿到的是同一份应用外壳，前端路由再按当前 URL 渲染出正确页面。
 const indexHtml = join(dist, "index.html");
 if (!existsSync(indexHtml)) {
   console.error("[postbuild] 找不到 dist/index.html，构建可能失败了");
   process.exit(1);
 }
-copyFileSync(indexHtml, join(dist, "404.html"));
+const notFoundShell = readFileSync(indexHtml, "utf8").replace("</head>", '<meta name="robots" content="noindex,follow"></head>');
+writeFileSync(join(dist, "404.html"), notFoundShell, "utf8");
 console.log("[postbuild] 已生成 404.html（SPA 深链兜底）");
 
 // ---- 2. sitemap.xml ----
 // 每个 URL 都带上另一语言版本的 hreflang，避免中英两版被判为重复内容。
-const today = new Date().toISOString().slice(0, 10);
 const urls = [];
 for (const lang of LANGS) {
   for (const p of PATHS) {
@@ -42,7 +40,6 @@ for (const lang of LANGS) {
         `    <loc>${loc}</loc>`,
         alternates,
         `    <xhtml:link rel="alternate" hreflang="x-default" href="${SITE_URL}/en${p ? `/${p}` : ""}"/>`,
-        `    <lastmod>${today}</lastmod>`,
         // 首页权重最高，文档次之，条款类最低
         `    <priority>${p === "" ? "1.0" : p.startsWith("docs") ? "0.8" : "0.6"}</priority>`,
         "  </url>",

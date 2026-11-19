@@ -63,6 +63,7 @@ export const zh: Dict = {
   "hero.badge": "桌面软件 · 全部本地运行 · 无需注册账号",
   // 标题拆两段：中文两段各自套 whitespace-nowrap 锁成整体，避免窄屏在
   // 「Key 互为备份」中间断行。切分点就是那个逗号，改文案时保持这个结构。
+  "hero.pageTitle": "本地 AI 路由、API Key 故障转移与多模型协作",
   "hero.titleLead": "多个 Key 互为备份，",
   "hero.titleTail": "多个模型协同思考",
   // 🔴 这两句里的每个数字都必须能对着源码核（同本文件顶部那条准则）：

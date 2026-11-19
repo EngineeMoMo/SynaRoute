@@ -8,7 +8,7 @@
 //
 // 为什么走 CDP 连系统 Chrome、而不是 renderToString / vite-react-ssg / puppeteer：
 //   1) 零新增依赖、零 React 代码改动——本仓既定做法（见 capture-shots.mjs），
-//      renderToString 要把 BrowserRouter 换 StaticRouter、还要给 detectLang/useTheme/
+//      renderToString 要把 BrowserRouter 换 StaticRouter、还要给 useTheme/
 //      matchMedia/localStorage 逐个补 Node 守卫，牵动全站、风险大；
 //   2) 真浏览器里 window/localStorage/DOMParser/useSeo 的 useEffect 全部照常执行——
 //      逐页的 title / description / canonical / hreflang 会被真实写进 <head>，
@@ -26,6 +26,7 @@ import {
 import { dirname, join, extname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
+import assert from "node:assert/strict";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const dist = join(root, "..", "dist");
@@ -166,6 +167,7 @@ async function main() {
   }
   // postbuild 保存的原始外壳；重复预渲染时 index.html 已是完整英文首页。
   const shellHtml = readFileSync(join(dist, "404.html"), "utf8");
+  const siteOrigin = `https://${readFileSync(join(dist, "CNAME"), "utf8").trim()}`;
 
   const chrome = CHROME_CANDIDATES.find(existsSync);
   if (!chrome) {
@@ -224,11 +226,17 @@ async function main() {
         const url = `http://127.0.0.1:${SERVE_PORT}${route}`;
         await cdp.send("Page.navigate", { url });
 
-        // 等 React 挂载出内容：#root 有子节点即算渲染出结构。
         let ok = false;
         for (let i = 0; i < 80; i++) {
           const ready = await cdp.evaluate(
-            `(() => { const r = document.getElementById('root'); return !!r && r.childElementCount > 0; })()`
+            `(() => {
+              const canonical = document.querySelector('link[rel="canonical"]');
+              return location.pathname === ${JSON.stringify(route)}
+                && !!document.querySelector('#root main h1')
+                && !document.querySelector('main [aria-busy="true"]')
+                && canonical?.href === ${JSON.stringify(`${siteOrigin}${route}`)}
+                && document.querySelector('meta[name="robots"]')?.content === 'index,follow';
+            })()`
           );
           if (ready) {
             ok = true;
@@ -236,10 +244,7 @@ async function main() {
           }
           await sleep(150);
         }
-        if (!ok) throw new Error(`${route} 渲染超时：#root 一直是空的（线上 JS 可能坏了）`);
-
-        // 让 useSeo 的 useEffect、markdown 渲染、release 兜底都落定
-        await sleep(500);
+        if (!ok) throw new Error(`${route} 渲染超时：正文、canonical 或索引指令未就绪`);
 
         // 强制显形：.reveal 初始 opacity:0，滚动进视口才淡入。预渲染不滚动，
         // 首屏以下会停在透明态——内容在 DOM 里（Google 读得到），但索性显形，
@@ -264,6 +269,39 @@ async function main() {
         console.log(`  ✓ ${route} (${(html.length / 1024).toFixed(0)} KB)`);
       }
     }
+    const aliases = [
+      ["/", "/en"],
+      ["/index.html", "/en"],
+      ["/en/", "/en"],
+      ["/en.html", "/en"],
+      ["/en/index.html", "/en"],
+      ["/zh/docs/cli/", "/zh/docs/cli"],
+      ["/zh/docs/cli.html", "/zh/docs/cli"],
+      ["/zh/docs/cli/index.html", "/zh/docs/cli"],
+    ];
+    const missing = ["/missing", "/de/docs", "/en/docs/missing"];
+    for (const [route, canonicalPath] of [...aliases, ...missing.map((route) => [route, null])]) {
+      await cdp.send("Page.navigate", { url: `http://127.0.0.1:${SERVE_PORT}${route}` });
+      let state;
+      for (let attempt = 0; attempt < 80; attempt++) {
+        state = await cdp.evaluate(`({
+          pathname: location.pathname,
+          canonical: document.querySelector('link[rel="canonical"]')?.getAttribute('href') ?? null,
+          alternates: document.querySelectorAll('link[rel="alternate"][hreflang]').length,
+          robots: document.querySelector('meta[name="robots"]')?.content,
+          heading: document.querySelector('main h1')?.textContent,
+        })`);
+        const expectedRobots = canonicalPath ? "index,follow" : "noindex,follow";
+        if (state.pathname === route && state.heading && state.robots === expectedRobots) break;
+        await sleep(150);
+      }
+      assert.equal(state.pathname, route, `${route} 不得触发客户端重定向`);
+      assert.ok(state.heading, `${route} 必须渲染完整页面`);
+      assert.equal(state.canonical, canonicalPath ? `${siteOrigin}${canonicalPath}` : null, `${route} 规范网址不一致`);
+      assert.equal(state.robots, canonicalPath ? "index,follow" : "noindex,follow", `${route} 索引指令不一致`);
+      if (!canonicalPath) assert.equal(state.alternates, 0, `${route} 错误页不得提供语言替代网址`);
+    }
+    console.log(`[prerender] ${aliases.length} 个网址别名与 ${missing.length} 个错误页的浏览器验证通过`);
     ws.close();
   } finally {
     proc.kill();

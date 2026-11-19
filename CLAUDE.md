@@ -3104,31 +3104,38 @@ Tauri 2 桌面应用（Rust 后端 `src-tauri/` + React/TS 前端）。代理路
 - **判据取证方法**：如何反查 `claude.exe` / `codex.exe` 的字段与内嵌官方 gateway 规范
   （本轮所有「客户端认什么字段」的结论都出自此，不是文档推测）
 
-## 官网搜索索引硬规则（2026-10-08）
+## 官网搜索索引硬规则（2026-11-18 更新）
 
-**本次已确认的遗漏**：Google Search Console 报告的是 `https://synaroute.mofamilys.com/`。
-线上 `/zh`、`/en` 已返回 200 且有预渲染正文，robots 与 sitemap 正常，但 `/` 仍返回空的
-`<div id="root"></div>`，无静态 canonical 或跳转，依赖 JavaScript 按浏览器语言导航。
-因此「语言页已预渲染」不能证明根入口已处理；这个技术缺陷也不能单独证明 Google 不收录的全部原因。
+**当前实现**：`67a9639` 起，根网址 `/` 直接返回 HTTP 200 和完整英文首页正文，不跳转，
+canonical 指向 `/en`。2026-11-18 起各页页脚都链接另一语言的同一页，未知路径保留原网址并显示
+`noindex,follow` 的 404。下面的规则以此为准；旧版要求的 `/` 跳转 `/zh` 已废弃，不得恢复
+meta refresh、JavaScript 跳转或按浏览器语言重定向。
 
-- **根入口目标必须稳定**：`/` 固定跳转 `/zh`，canonical 同指 `/zh`。当前 GitHub Pages
-  部署使用独立的 0 秒 HTML meta refresh 页面和可点击链接，不依赖 JavaScript、浏览器语言
-  或爬虫身份。客户端根路由保持同一目标，英文内容继续通过 `/en` 和语言切换访问。
-- **跳转只写最终根产物**：由 `site/scripts/prerender.mjs` 在内容页预渲染后生成
-  `site/dist/index.html`。不得加进 `site/index.html` 共用模板，否则内容页和 404 兜底会继承
-  跳转。`dist/404.html` 保留原始 SPA 外壳，重复预渲染也从它读取外壳。
-- **检查实际产物，不能只检查源码**：官网发布前必须运行 `cd site` 后的 `npm run build`。
-  不得跳过其中的 `scripts/check-seo.mjs`；它检查根跳转、canonical、无需 JS 的链接、404
-  无跳转，以及 sitemap 每条网址的两份 HTML 都有 `<main>`、`<h1>`、匹配的 canonical，
-  且不含跳转或 noindex。不能为通过构建而删除检查或把错误降成警告。
-- **路由改动同步三处**：应用路由、sitemap 清单、预渲染清单保持一致；sitemap 只列内容页，
-  不加入根跳转入口。详细文件位置与流程统一维护在 `site/README.md` 的 SEO 章节。
-- **按报告的精确网址排查**：线上单独检查 `/`、`/zh`、`/en` 及报告中的具体 URL，核对
+- **根入口不跳转**：`/` 与 `/en` 正文相同，canonical 都是 `/en`，`x-default` 指向英文页。
+  `site/dist/index.html` 由 `site/scripts/prerender.mjs` 在内容页预渲染后用英文首页写入，
+  不得在 `site/index.html` 共用模板中加入跳转或 canonical。`dist/404.html` 保留原始 SPA
+  外壳并带 `noindex,follow`，重复预渲染也从它读取外壳。
+- **规范网址唯一**：带尾斜杠、`.html` 或 `/index.html` 的别名渲染同一页面，canonical 指向
+  无扩展名的规范网址。未知路径不得重定向，必须显示 404，并且不输出 canonical 与 hreflang。
+- **全站能经普通链接到达**：中英文首页标题不同，每页页脚链接另一语言的同一页。
+  关闭 JavaScript 也要能从 `/` 到达 sitemap 中的每一个网址。
+- **检查实际产物，不能只检查源码**：官网发布前必须在 `site` 目录运行 `npm run build`。
+  其中 `prerender.mjs` 用浏览器验证网址别名和错误页；`scripts/check-seo.mjs` 检查 404 无跳转
+  且带 noindex，`/` 与 `/en` 正文一致，sitemap 每条网址的两份 HTML 都有 `<main>`、`<h1>`、
+  正确的 canonical、语言替代链接和 `lang`，不含跳转或 noindex，标题与描述不重复，
+  并且都能从 `/` 沿 HTML 链接到达。不能为通过构建而删除检查或把错误降成警告。
+- **部署后核对线上**：`deploy-site.yml` 部署后运行 `site/scripts/check-live-seo.mjs`，
+  在本地对应 `cd site` 后的 `npm run check:seo:live`。它用相同判据检查线上首个 HTTP 响应、
+  真实 404 和 `X-Robots-Tag`。
+- **路由改动同步三处**：应用路由、sitemap 清单、预渲染清单保持一致。sitemap 只列规范网址，
+  不列 `/`，也不写 `lastmod`。详细文件位置与流程统一维护在 `site/README.md` 的 SEO 章节。
+- **按报告的精确网址排查**：线上单独检查 `/`、`/zh`、`/en` 及报告中的具体网址，核对
   HTTP 状态、原始 HTML 正文、跳转、canonical、robots meta/响应头和 sitemap。
   仅返回 200 不代表可收录，不得把所有排除报告直接归因为 Google 数据滞后。
 - **区分完成状态**：本地构建通过、已部署、线上复核通过、Google 已收录是四个不同状态。
-  发布后用 Search Console「测试实际网址」核对语言首页再请求收录；根入口作为跳转页无需
-  单独收录。不得承诺收录时间，也不得把「验证已开始」或代码修复描述为「Google 已恢复收录」。
+  发布后用 Search Console「测试实际网址」核对 `/zh` 与 `/en` 再请求收录；`/` 是 `/en` 的
+  别名，不必单独请求收录。不得承诺收录时间，也不得把「验证已开始」或代码修复描述为
+  「Google 已恢复收录」。
 
 ## ⚠️ 构建/部署硬规则（踩过坑，务必遵守）
 

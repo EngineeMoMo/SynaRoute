@@ -9,6 +9,7 @@
     "build": "node scripts/check-i18n.mjs && tsc && vite build && node scripts/check-opacity.mjs && node scripts/postbuild.mjs && node scripts/prerender.mjs && node scripts/check-seo.mjs && node scripts/check-forbidden.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "check:seo:live": "node scripts/check-live-seo.mjs",
     "icons": "node scripts/gen-favicon.mjs && node scripts/gen-og.mjs",
     "check": "node scripts/check-i18n.mjs && node scripts/check-forbidden.mjs"
   },

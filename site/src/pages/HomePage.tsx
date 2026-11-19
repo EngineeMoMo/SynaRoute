@@ -11,14 +11,13 @@ import { FAQ } from "@/components/sections/FAQ";
 import { FinalCTA } from "@/components/sections/FinalCTA";
 import { useSeo } from "@/hooks/useSeo";
 import { useLang, useT } from "@/hooks/useLang";
-import { siteConfig } from "@/config/site";
 
 export default function HomePage() {
   const t = useT();
   const lang = useLang();
 
   useSeo({
-    title: siteConfig.name,
+    title: t("hero.pageTitle"),
     description: t("hero.desc"),
     lang,
   });

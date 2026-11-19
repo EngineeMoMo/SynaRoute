@@ -1,7 +1,6 @@
 import { useEffect } from "react";
 import {
   BrowserRouter,
-  Navigate,
   Outlet,
   Route,
   Routes,
@@ -12,8 +11,9 @@ import { Header } from "@/components/layout/Header";
 import { Footer } from "@/components/layout/Footer";
 import { BackToTop } from "@/components/layout/BackToTop";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
-import { detectLang, isLang } from "@/i18n";
+import { isLang } from "@/i18n";
 import { scrollToId } from "@/lib/motion";
+import { normalizeSitePath } from "@/lib/seoPath";
 import { useT } from "@/hooks/useLang";
 
 import HomePage from "@/pages/HomePage";
@@ -47,16 +47,10 @@ function ScrollManager() {
   return null;
 }
 
-/** 语言段非法时（如 /fr/download）回落到默认语言，而不是渲染一个 404 */
 function LangLayout() {
   const { lang } = useParams();
   const t = useT();
   const location = useLocation();
-
-  if (!isLang(lang) && location.pathname !== "/") {
-    const rest = location.pathname.split("/").filter(Boolean).slice(1).join("/");
-    return <Navigate to={`/${detectLang()}${rest ? `/${rest}` : ""}`} replace />;
-  }
 
   return (
     <>
@@ -79,7 +73,7 @@ function LangLayout() {
           —— ErrorBoundary 的 state 不会自己因为路由变化而重置。
         */}
         <ErrorBoundary key={location.pathname} label={location.pathname}>
-          <Outlet />
+          {isLang(lang) || location.pathname === "/" ? <Outlet /> : <NotFoundPage />}
         </ErrorBoundary>
       </main>
       <Footer />
@@ -92,25 +86,32 @@ export default function App() {
   return (
     <BrowserRouter>
       <ScrollManager />
-      <Routes>
-        <Route path="/" element={<LangLayout />}>
-          <Route index element={<HomePage />} />
-        </Route>
-
-        <Route path="/:lang" element={<LangLayout />}>
-          <Route index element={<HomePage />} />
-          <Route path="download" element={<DownloadPage />} />
-          <Route path="docs" element={<DocsIndexPage />} />
-          <Route path="docs/:slug" element={<DocPage />} />
-          <Route path="changelog" element={<ChangelogPage />} />
-          <Route path="privacy" element={<LegalPage kind="privacy" />} />
-          <Route path="terms" element={<LegalPage kind="terms" />} />
-          <Route path="*" element={<NotFoundPage />} />
-        </Route>
-
-        {/* 语言段都没有的兜底（如 /foo）：仍要渲染出完整外壳的 404，不能白屏 */}
-        <Route path="*" element={<Navigate to={`/${detectLang()}/404`} replace />} />
-      </Routes>
+      <SiteRoutes />
     </BrowserRouter>
+  );
+}
+
+function SiteRoutes() {
+  const location = useLocation();
+  const pathname = normalizeSitePath(location.pathname);
+  return (
+    <Routes location={pathname === location.pathname ? undefined : { ...location, pathname }}>
+      <Route path="/" element={<LangLayout />}>
+        <Route index element={<HomePage />} />
+      </Route>
+
+      <Route path="/:lang" element={<LangLayout />}>
+        <Route index element={<HomePage />} />
+        <Route path="download" element={<DownloadPage />} />
+        <Route path="docs" element={<DocsIndexPage />} />
+        <Route path="docs/:slug" element={<DocPage />} />
+        <Route path="changelog" element={<ChangelogPage />} />
+        <Route path="privacy" element={<LegalPage kind="privacy" />} />
+        <Route path="terms" element={<LegalPage kind="terms" />} />
+        <Route path="*" element={<NotFoundPage />} />
+      </Route>
+
+      <Route path="*" element={<LangLayout />} />
+    </Routes>
   );
 }

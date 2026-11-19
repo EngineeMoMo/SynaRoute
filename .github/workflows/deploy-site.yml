@@ -87,3 +87,9 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Verify live indexing prerequisites
+        run: node site/scripts/check-live-seo.mjs

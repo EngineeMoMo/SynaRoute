@@ -63,6 +63,7 @@ export const en: Dict = {
   "hero.badge": "Desktop app · Runs entirely on your machine · No account",
   // Split in two so the zh build can lock each half with whitespace-nowrap — see zh.ts.
   // English must NOT be locked (measured: one half alone needs 325px at a 320px viewport).
+  "hero.pageTitle": "Local AI routing, API key failover and multi-model collaboration",
   "hero.titleLead": "Many keys backing each other up, ",
   "hero.titleTail": "many models thinking together",
   "hero.desc":

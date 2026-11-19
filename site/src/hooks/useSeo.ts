@@ -11,6 +11,7 @@ export interface SeoInput {
   image?: string;
   /** 文章类页面（文档、更新日志）标 article，其余标 website */
   type?: "website" | "article";
+  indexable?: boolean;
 }
 
 /** 找到或建一个 <meta>，避免每次导航往 head 里堆重复标签 */
@@ -41,11 +42,9 @@ function upsertLink(rel: string, href: string, extra: Record<string, string> = {
  * 刻意不引 react-helmet 之类的库（模板第 10.1 节：如无必要不用大型库）——
  * 需要的只是往 head 里写十来个标签，直接操作 DOM 更小更直白。
  *
- * ⚠️ 已知局限：这是客户端渲染，meta 要等 JS 执行后才出现。Google 会执行 JS，
- * 但部分抓取器（含一些社交平台的分享卡片抓取）只读初始 HTML。
- * index.html 里因此预置了一份默认的 title/description/OG 作为兜底。
+ * 构建时预渲染保存这些标签，客户端导航时继续更新。
  */
-export function useSeo({ title, description, lang, image, type = "website" }: SeoInput) {
+export function useSeo({ title, description, lang, image, type = "website", indexable = true }: SeoInput) {
   const { pathname } = useLocation();
 
   useEffect(() => {
@@ -58,6 +57,7 @@ export function useSeo({ title, description, lang, image, type = "website" }: Se
     document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
 
     upsertMeta('meta[name="description"]', { name: "description", content: description });
+    upsertMeta('meta[name="robots"]', { name: "robots", content: indexable ? "index,follow" : "noindex,follow" });
 
     upsertMeta('meta[property="og:title"]', { property: "og:title", content: fullTitle });
     upsertMeta('meta[property="og:description"]', { property: "og:description", content: description });
@@ -75,13 +75,18 @@ export function useSeo({ title, description, lang, image, type = "website" }: Se
     upsertMeta('meta[name="twitter:description"]', { name: "twitter:description", content: description });
     upsertMeta('meta[name="twitter:image"]', { name: "twitter:image", content: ogImage });
 
+    if (!indexable) {
+      document.head.querySelectorAll('link[rel="canonical"], link[rel="alternate"][hreflang]').forEach((el) => el.remove());
+      return;
+    }
+
     upsertLink("canonical", canonical);
 
     // hreflang：把同一页面的另一语言版本告诉搜索引擎，避免被判重复内容
-    const rest = pathname.split("/").filter(Boolean).slice(1).join("/");
+    const rest = canonicalPath.split("/").filter(Boolean).slice(1).join("/");
     for (const { value } of LANGS) {
       upsertLink("alternate", `${siteConfig.url}/${value}${rest ? `/${rest}` : ""}`, { hreflang: value });
     }
     upsertLink("alternate", `${siteConfig.url}/${DEFAULT_LANG}${rest ? `/${rest}` : ""}`, { hreflang: "x-default" });
-  }, [title, description, lang, image, type, pathname]);
+  }, [title, description, lang, image, type, pathname, indexable]);
 }

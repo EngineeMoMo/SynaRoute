@@ -59,7 +59,7 @@ export default function ChangelogPage() {
 
   return (
     <Container className="py-28 sm:py-32">
-      <div className="mx-auto max-w-3xl">
+      <div className="mx-auto max-w-3xl" aria-busy={loading}>
         <header>
           <h1 className="text-3xl font-bold tracking-tight text-text-primary sm:text-4xl">
             {t("changelog.title")}

@@ -11,7 +11,7 @@ export default function NotFoundPage() {
   const lang = useLang();
   const path = useLocalizedPath();
 
-  useSeo({ title: t("notFound.title"), description: t("notFound.desc"), lang });
+  useSeo({ title: t("notFound.title"), description: t("notFound.desc"), lang, indexable: false });
 
   return (
     <Container className="flex min-h-[70vh] flex-col items-center justify-center py-28 text-center">

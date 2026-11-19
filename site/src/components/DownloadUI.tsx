@@ -298,12 +298,12 @@ export function PlatformCard({
 
 /** 平台卡片组，Hero 之外的下载区与下载页共用 */
 export function PlatformGrid({ className }: { className?: string }) {
-  const { release } = useLatestRelease();
+  const { release, loading } = useLatestRelease();
   const detected = useDetectedPlatform();
   const t = useT();
 
   return (
-    <div className={className}>
+    <div className={className} aria-busy={loading}>
       {/* 🔴 `lg:grid-cols-3` 是必须的：三个平台放两列，第三张（Linux）从 640px 到
           2560px **永远**独占一行、右半边全空，而它旁边就是本页最重要的转化区。
           三档都排满：<640 单列、640~1023 两列（最后一行空一个，但那一档卡片够宽、

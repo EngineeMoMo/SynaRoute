@@ -4,12 +4,15 @@ import { Logo } from "@/components/ui/Logo";
 import { Container } from "@/components/ui/Section";
 import { footerNav } from "@/data/nav";
 import { siteConfig } from "@/config/site";
-import { useLocalizedPath, useT } from "@/hooks/useLang";
+import { LANGS } from "@/i18n";
+import { useLang, useLocalizedPath, useSwitchLangPath, useT } from "@/hooks/useLang";
 import { externalLinkProps } from "@/lib/utils";
 import { scrollToId } from "@/lib/motion";
 
 export function Footer() {
   const t = useT();
+  const lang = useLang();
+  const switchPath = useSwitchLangPath();
   const path = useLocalizedPath();
   const navigate = useNavigate();
   const location = useLocation();
@@ -85,6 +88,17 @@ export function Footer() {
           </p>
 
           <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+            {LANGS.filter(({ value }) => value !== lang).map(({ value, label }) => (
+              <Link
+                key={value}
+                to={switchPath(value)}
+                lang={value}
+                hrefLang={value}
+                className="inline-flex min-h-11 items-center text-xs text-text-secondary transition-colors hover:text-text-primary lg:min-h-0 lg:py-1"
+              >
+                {label}
+              </Link>
+            ))}
             <a
               href={siteConfig.github.url}
               {...externalLinkProps}

@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ArrowLeft, ExternalLink } from "lucide-react";
 import { Container } from "@/components/ui/Section";
-import { docs, findDoc } from "@/data/docs";
+import { docs, findDoc, type DocEntry } from "@/data/docs";
 import { siteConfig } from "@/config/site";
 import { useMarkdown } from "@/hooks/useMarkdown";
 import { useSeo } from "@/hooks/useSeo";
@@ -12,28 +12,27 @@ import NotFoundPage from "@/pages/NotFoundPage";
 
 export default function DocPage() {
   const { slug } = useParams();
+  const doc = findDoc(slug);
+  return doc ? <DocArticle doc={doc} /> : <NotFoundPage />;
+}
+
+function DocArticle({ doc }: { doc: DocEntry }) {
   const lang = useLang();
   const t = useT();
   const path = useLocalizedPath();
-  const doc = findDoc(slug);
-
-  // Hook 必须无条件调用且顺序固定，所以即使文档不存在也要走一遍（喂空串）。
-  // 判空放在渲染分支里，不放在 hook 之前。
-  const { html, toc } = useMarkdown(doc ? doc.body[lang] : "");
+  const { html, toc } = useMarkdown(doc.body[lang]);
 
   // 切文档时回到顶部，否则从长文档跳到短文档会停在半空
   useEffect(() => {
     window.scrollTo({ top: 0 });
-  }, [slug, lang]);
+  }, [doc.slug, lang]);
 
   useSeo({
-    title: doc ? t(`${doc.i18nPrefix}.title`) : t("notFound.title"),
-    description: doc ? t(`${doc.i18nPrefix}.desc`) : t("notFound.desc"),
+    title: t(`${doc.i18nPrefix}.title`),
+    description: t(`${doc.i18nPrefix}.desc`),
     lang,
     type: "article",
   });
-
-  if (!doc) return <NotFoundPage />;
 
   return (
     <Container className="py-28 sm:py-32">
