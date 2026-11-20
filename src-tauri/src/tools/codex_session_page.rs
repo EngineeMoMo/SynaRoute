@@ -71,13 +71,14 @@ struct Index {
 
 struct HomeState { index: Option<Index>, watch: storage::Watch }
 type HomeIndex = Arc<Mutex<HomeState>>;
-static INDEXES: OnceLock<Mutex<HashMap<PathBuf, HomeIndex>>> = OnceLock::new();
+type HomeIndexes = Mutex<HashMap<PathBuf, HomeIndex>>;
+static INDEXES: OnceLock<HomeIndexes> = OnceLock::new();
 
 pub(super) fn list(home: &Path, keys: &[ProviderKey], query: &PageQuery) -> Result<CodexSessionList, String> {
-    list_with_snapshot(home, keys, query, storage::snapshot)
+    list_with_snapshot(home, keys, query, INDEXES.get_or_init(Default::default), storage::snapshot)
 }
 
-fn list_with_snapshot(home: &Path, keys: &[ProviderKey], query: &PageQuery, mut read_snapshot: impl FnMut(&Path) -> storage::Snapshot) -> Result<CodexSessionList, String> {
+fn list_with_snapshot(home: &Path, keys: &[ProviderKey], query: &PageQuery, indexes: &HomeIndexes, mut read_snapshot: impl FnMut(&Path) -> storage::Snapshot) -> Result<CodexSessionList, String> {
     if query.query.len() > 4096 || query.selected.len() > 100_000 || !matches!(query.archive.as_str(), "all" | "active" | "archived")
         || !matches!(query.source.as_str(), "all" | "user" | "internal") || !matches!(query.sort.as_str(), "updated" | "created" | "title")
         || !matches!(query.grouping.as_str(), "project" | "time") {
@@ -92,7 +93,7 @@ fn list_with_snapshot(home: &Path, keys: &[ProviderKey], query: &PageQuery, mut 
     };
     let keys_signature = serde_json::to_string(keys).map_err(|error| error.to_string())?;
     let entry = {
-        let mut indexes = INDEXES.get_or_init(Default::default).lock().map_err(|_| "Session index unavailable")?;
+        let mut indexes = indexes.lock().map_err(|_| "Session index unavailable")?;
         if indexes.len() >= 4 && !indexes.contains_key(&home) { indexes.clear(); }
         indexes.entry(home.clone()).or_insert_with(|| Arc::new(Mutex::new(HomeState { index: None, watch: storage::Watch::new(&home) }))).clone()
     };
@@ -246,6 +247,7 @@ mod tests {
         use std::io::Write;
 
         for source in ["rollout", "wal", "config", "index", "projects"] {
+            let indexes = HomeIndexes::default();
             let directory = tempfile::tempdir().unwrap();
             let home = directory.path().canonicalize().unwrap();
             let path = fixture(&home, 1);
@@ -256,7 +258,7 @@ mod tests {
             } else { None };
             let query = PageQuery { source: "all".into(), refresh: true, ..Default::default() };
             let mut reads = 0;
-            let result = list_with_snapshot(&home, &[], &query, |home| {
+            let result = list_with_snapshot(&home, &[], &query, &indexes, |home| {
                 reads += 1;
                 if reads % 2 == 0 {
                     match source {
@@ -275,10 +277,10 @@ mod tests {
             assert_eq!(result.stats.metadata_failures, 0, "{source}");
             assert_eq!(result.page.unwrap().filtered_total, 1);
             assert!(storage::load(&home).is_empty(), "{source}: unstable snapshot persisted");
-            let entry = INDEXES.get().unwrap().lock().unwrap()[&home].clone();
+            let entry = indexes.lock().unwrap()[&home].clone();
             assert!(entry.lock().unwrap().index.is_none(), "{source}: unstable snapshot cached");
 
-            let stable = list(&home, &[], &query).unwrap();
+            let stable = list_with_snapshot(&home, &[], &query, &indexes, storage::snapshot).unwrap();
             assert!(!stable.stats.indexing_changed, "{source}");
             assert_eq!(stable.rows.len(), 1);
             assert_eq!(stable.rows[0].bytes, fs::metadata(&path).unwrap().len());
@@ -287,7 +289,7 @@ mod tests {
             let saved = storage::load(&home)[&path].stamp.clone();
             let cached_at = entry.lock().unwrap().index.as_ref().unwrap().at;
             let mut reads = 0;
-            let busy = list_with_snapshot(&home, &[], &query, |home| {
+            let busy = list_with_snapshot(&home, &[], &query, &indexes, |home| {
                 reads += 1;
                 if reads % 2 == 0 {
                     fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{}\n").unwrap();
@@ -297,7 +299,7 @@ mod tests {
             assert!(busy.stats.indexing_changed);
             assert_eq!(storage::load(&home)[&path].stamp, saved);
             assert_eq!(entry.lock().unwrap().index.as_ref().unwrap().at, cached_at);
-            let updated = list(&home, &[], &PageQuery { refresh: false, ..query }).unwrap();
+            let updated = list_with_snapshot(&home, &[], &PageQuery { refresh: false, ..query }, &indexes, storage::snapshot).unwrap();
             assert!(!updated.stats.indexing_changed);
             assert_eq!(updated.rows[0].bytes, fs::metadata(&path).unwrap().len());
         }
@@ -310,7 +312,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = fixture(directory.path(), 1);
         let mut reads = 0;
-        let result = list_with_snapshot(directory.path(), &[], &PageQuery::default(), |home| {
+        let result = list_with_snapshot(directory.path(), &[], &PageQuery::default(), &HomeIndexes::default(), |home| {
             reads += 1;
             if reads == 2 {
                 fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{}\n").unwrap();
