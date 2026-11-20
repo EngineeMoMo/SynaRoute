@@ -20,6 +20,7 @@
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, sep } from "node:path";
 import { scanRepo } from "./lib/secret-scan.mjs";
+import { checkTauriVersions } from "./lib/tauri-versions.mjs";
 // 🔴 「测试段起始行」判据从共享模块导入，**不要**在这里再写一份。
 // 本文件原先自带一份收窄版（只认裸 `mod tests`，漏掉 `pub(crate) mod tests`），
 // 与 check-ratchet.mjs 那份已经漂移。在**本文件**里那个盲区的失效方向是隐蔽的：
@@ -603,6 +604,19 @@ const pass = (name, detail) => console.log(`✅ ${name}${detail ? ` —— ${det
       "visual-tokens-must-match-icon-and-site",
       `${SHARED.length} 项令牌三方同色，--primary = #6D5EF7（图标锚点）`
     );
+}
+
+{
+  try {
+    const result = checkTauriVersions(
+      JSON.parse(readFileSync("package-lock.json", "utf8")),
+      readFileSync("src-tauri/Cargo.lock", "utf8")
+    );
+    if (result.problems.length) fail("tauri-packages-must-match-rust", result.problems.join("\n"));
+    else pass("tauri-packages-must-match-rust", `${result.checked} 个 Tauri npm 包与 Rust major/minor 一致`);
+  } catch (error) {
+    fail("tauri-packages-must-match-rust", error.message);
+  }
 }
 
 if (failed) {
