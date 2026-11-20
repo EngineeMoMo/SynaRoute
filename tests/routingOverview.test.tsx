@@ -34,10 +34,6 @@ function render() {
   return renderToStaticMarkup(createElement(RoutingOverviewPage, { onManage: vi.fn(), onOpenLogs: vi.fn(), onOpenReliability: vi.fn() }));
 }
 
-function svgIds(html: string) {
-  return [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
-}
-
 beforeEach(() => { state.data = fixture(); state.failed = false; state.loading = false; useStore.setState({ lang: "zh" }); });
 afterEach(() => vi.unstubAllGlobals());
 
@@ -55,32 +51,40 @@ describe("routing overview", () => {
     expect(html).toContain("添加第一个 Key");
   });
 
-  it("keeps animated SVG definitions unique when the same visual renders twice", () => {
-    const empty = renderToStaticMarkup(
-      createElement("div", null,
-        createElement(RouteEmptyState, { title: "A", description: "A", action: null }),
-        createElement(RouteEmptyState, { title: "B", description: "B", action: null }),
-      ),
-    );
-    const pulse = renderToStaticMarkup(
-      createElement("div", null,
-        createElement(RoutePulse, { categories: fixture().categories, vaultLocked: false }),
-        createElement(RoutePulse, { categories: fixture().categories, vaultLocked: false }),
-      ),
-    );
-    for (const html of [empty, pulse]) {
-      const ids = svgIds(html);
-      expect(ids.length).toBeGreaterThan(1);
-      expect(new Set(ids).size).toBe(ids.length);
-      for (const id of ids) expect(html).toContain(`url(#${id})`);
+  it("keeps translated node names in readable HTML outside the SVG graphics", () => {
+    for (const lang of ["zh", "en"] as const) {
+      useStore.setState({ lang });
+      const html = renderToStaticMarkup(createElement(RoutePulse, { categories: fixture().categories, vaultLocked: false }));
+      const graphics = [...html.matchAll(/<svg\b[\s\S]*?<\/svg>/g)].map((match) => match[0]).join("");
+      expect(graphics).not.toContain("<text");
+      for (const key of ["overview.signalHub", "nav.claude-cli", "nav.claude-desktop", "nav.codex"]) {
+        const label = translate(lang, key);
+        expect(html).toContain(`<h3 class="route-pulse-name">${label}</h3>`);
+        expect(graphics).not.toContain(label);
+      }
+      expect(html).toContain("<dl");
+      expect(html.match(/<dt\b/g)).toHaveLength(4);
     }
   });
 
-  it("does not mount SMIL route packets when reduced motion is requested", () => {
-    vi.stubGlobal("window", { matchMedia: () => ({ matches: true }) });
+  it("only moves listening routes and stops every route when the vault is locked", () => {
+    const categories = fixture().categories;
+    const renderSignal = (vaultLocked: boolean) => renderToStaticMarkup(createElement(RoutePulse, { categories, vaultLocked }));
+    expect(renderSignal(false).match(/class="route-pulse__path is-live"/g)).toHaveLength(2);
+    const locked = renderSignal(true);
+    expect(locked).not.toContain("is-live");
+    expect(locked).toContain(overviewZh["overview.signalLocked"]);
+    for (const category of categories) category.running = false;
+    expect(renderSignal(false)).not.toContain("is-live");
+  });
+
+  it("keeps route motion in CSS that respects the reduced-motion preference", () => {
     const html = renderToStaticMarkup(createElement(RoutePulse, { categories: fixture().categories, vaultLocked: false }));
     expect(html).toContain("route-pulse__path");
     expect(html).not.toContain("<animateMotion");
+    const css = readFileSync("src/styles.css", "utf8");
+    const reducedMotionRule = css.slice(css.indexOf("@media (prefers-reduced-motion: reduce)"));
+    expect(reducedMotionRule).toMatch(/\.route-pulse__path\.is-live[^{}]*\{\s*animation: none;/);
   });
 
   it("renders all clients and distinguishes configured values from observed attempts", () => {

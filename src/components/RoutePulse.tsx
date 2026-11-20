@@ -1,15 +1,16 @@
-import { Activity, KeyRound, LockKeyhole, Radio, ShieldCheck } from "lucide-react";
+import { Activity, KeyRound, LockKeyhole, Radio, ShieldCheck, Waypoints } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { useId } from "react";
+import type { CSSProperties } from "react";
+import { CATEGORY_ICONS } from "@/lib/categoryIcons";
 import { useT } from "@/lib/useT";
-import { usePrefersReducedMotion } from "@/lib/usePrefersReducedMotion";
 import type { CategoryOverview } from "@/lib/routingOverview";
 
-const NODE_LAYOUT = [
-  { x: 108, y: 116, path: "M 116 116 C 205 116, 270 108, 350 108" },
-  { x: 380, y: 34, path: "M 380 42 C 380 64, 380 78, 380 96" },
-  { x: 652, y: 116, path: "M 644 116 C 555 116, 490 108, 410 108" },
-] as const;
+function connectorPath(index: number, total: number) {
+  const position = ((index + 0.5) / total) * 1000;
+  if (Math.abs(position - 500) < 16) return `M ${position} 48 L 500 0`;
+  const direction = position < 500 ? 1 : -1;
+  return `M ${position} 48 V 32 Q ${position} 24 ${position + direction * 8} 24 H ${500 - direction * 8} Q 500 24 500 16 V 0`;
+}
 
 function Metric({
   icon: Icon,
@@ -23,16 +24,16 @@ function Metric({
   tone?: "default" | "primary" | "warning";
 }) {
   return (
-    <div className="route-pulse-metric rounded-control border border-border/80 bg-surface/70 px-3.5 py-3">
-      <div className="flex items-center gap-2 text-[11px] text-text-secondary">
+    <div className="route-pulse-metric">
+      <dt className="flex items-center gap-2 text-xs leading-5 text-text-secondary">
         <Icon
           size={14}
-          className={tone === "warning" ? "text-warning" : tone === "primary" ? "text-primary" : "text-text-secondary"}
+          className={`shrink-0 ${tone === "warning" ? "text-warning" : tone === "primary" ? "text-primary" : "text-text-secondary"}`}
           aria-hidden="true"
         />
         <span>{label}</span>
-      </div>
-      <div className="mt-1.5 text-xl font-semibold tracking-tight text-text-primary tabular-nums">{value}</div>
+      </dt>
+      <dd className="mt-1.5 text-xl font-semibold tracking-tight text-text-primary tabular-nums">{value}</dd>
     </div>
   );
 }
@@ -47,10 +48,6 @@ export function RoutePulse({
   refreshing?: boolean;
 }) {
   const t = useT();
-  const instanceId = useId().replace(/:/g, "");
-  const reducedMotion = usePrefersReducedMotion();
-  const centerGlowId = `route-pulse-center-glow-${instanceId}`;
-  const filterId = `route-pulse-glow-${instanceId}`;
   const total = categories.length;
   const running = categories.filter((category) => category.running).length;
   const configured = categories.filter((category) => category.connection.state === "configured").length;
@@ -69,7 +66,7 @@ export function RoutePulse({
           : "overview.signalIdle";
 
   return (
-    <section className="route-pulse-shell overflow-hidden rounded-card border border-border bg-surface shadow-card" data-testid="route-pulse">
+    <section className="route-pulse-shell overflow-hidden rounded-card border border-border bg-surface shadow-card" data-testid="route-pulse" aria-label={t("overview.signalTitle")}>
       <div className="flex flex-wrap items-start justify-between gap-4 border-b border-border/80 px-5 py-4">
         <div className="min-w-0">
           <p className="sr-section-label">{t("overview.signalEyebrow")}</p>
@@ -89,7 +86,7 @@ export function RoutePulse({
         >
           <span
             className={`h-1.5 w-1.5 rounded-full ${
-              live && !failed ? "bg-primary status-pulse" : failed || vaultLocked ? "bg-warning" : "bg-border-strong"
+              live && !failed ? "bg-primary" : failed || vaultLocked ? "bg-warning" : "bg-border-strong"
             }`}
             aria-hidden="true"
           />
@@ -97,63 +94,56 @@ export function RoutePulse({
         </span>
       </div>
 
-      <div className="grid gap-4 p-4 lg:grid-cols-[minmax(0,1.35fr)_minmax(16rem,0.65fr)]">
-        <div className="route-pulse-visual relative min-h-[220px] overflow-hidden rounded-control border border-border/80 bg-surface-elevated" aria-hidden="true">
-          <svg className="h-full min-h-[220px] w-full" viewBox="0 0 760 220" role="presentation">
-            <defs>
-              <radialGradient id={centerGlowId} cx="50%" cy="50%" r="50%">
-                <stop offset="0%" stopColor="rgb(var(--primary) / 0.26)" />
-                <stop offset="100%" stopColor="rgb(var(--primary) / 0)" />
-              </radialGradient>
-              <filter id={filterId} x="-80%" y="-80%" width="260%" height="260%">
-                <feGaussianBlur stdDeviation="3" result="blur" />
-                <feMerge>
-                  <feMergeNode in="blur" />
-                  <feMergeNode in="SourceGraphic" />
-                </feMerge>
-              </filter>
-            </defs>
-
-            <path className="route-pulse__grid" d="M 44 174 H 716 M 84 64 H 676" />
-            <circle cx="380" cy="108" r="76" className="route-pulse__halo" />
-
+      <div className="route-pulse-visual">
+        <div className="route-pulse-diagram" style={{ "--route-count": Math.max(total, 1) } as CSSProperties}>
+          <div className={`route-pulse-hub ${live ? "is-live" : ""}`}>
+            <span className="route-pulse-icon route-pulse-icon--hub" aria-hidden="true"><Waypoints size={22} strokeWidth={1.75} /></span>
+            <div className="route-pulse-copy">
+              <h3 className="route-pulse-name">{t("overview.signalHub")}</h3>
+              <p className="route-pulse-detail">{t("overview.signalHubHint")}</p>
+            </div>
+          </div>
+          <svg className="route-pulse-connectors" viewBox="0 0 1000 48" preserveAspectRatio="none" aria-hidden="true">
             {categories.map((category, index) => {
-              const layout = NODE_LAYOUT[index] ?? NODE_LAYOUT[NODE_LAYOUT.length - 1];
               const isConfigured = category.connection.state === "configured";
               const isLive = category.running && !vaultLocked;
+              const path = connectorPath(index, total);
               return (
                 <g key={category.categoryId}>
-                  <path d={layout.path} className={`route-pulse__path ${isConfigured ? "is-configured" : ""} ${isLive ? "is-live" : ""}`} />
-                  {isLive && !reducedMotion && (
-                    <circle r="3.2" className="route-pulse__packet" filter={`url(#${filterId})`}>
-                      <animateMotion dur="2.8s" repeatCount="indefinite" path={layout.path} />
-                    </circle>
-                  )}
-                  {isLive && <circle cx={layout.x} cy={layout.y} r="15" className="route-pulse__node-ring" />}
-                  <circle cx={layout.x} cy={layout.y} r="7" className={`route-pulse__node ${isLive ? "is-live" : ""} ${isConfigured ? "is-configured" : ""}`} />
-                  <text x={layout.x} y={layout.y + 31} textAnchor="middle" className="route-pulse__label">
-                    {t(`nav.${category.categoryId}`)}
-                  </text>
+                  <path d={path} vectorEffect="non-scaling-stroke" className={`route-pulse__path ${isConfigured ? "is-configured" : ""}`} />
+                  {isLive && <path d={path} vectorEffect="non-scaling-stroke" className="route-pulse__path is-live" />}
                 </g>
               );
             })}
-
-            <circle cx="380" cy="108" r="48" fill={`url(#${centerGlowId})`} />
-            <circle cx="380" cy="108" r="24" className={`route-pulse__hub ${live ? "is-live" : ""}`} filter={live ? `url(#${filterId})` : undefined} />
-            {live && <circle cx="380" cy="108" r="31" className="route-pulse__hub-ring" />}
-            <text x="380" y="106" textAnchor="middle" className="route-pulse__hub-label">SR</text>
-            <text x="380" y="121" textAnchor="middle" className="route-pulse__hub-caption">{t("overview.signalHub")}</text>
           </svg>
-          <div className="pointer-events-none absolute inset-x-8 bottom-2 h-px bg-gradient-to-r from-transparent via-primary/20 to-transparent" />
-        </div>
-
-        <div className="grid grid-cols-2 gap-2.5 lg:grid-cols-1">
-          <Metric icon={Radio} value={`${running}/${total}`} label={t("overview.signalListening")} tone={running > 0 ? "primary" : "default"} />
-          <Metric icon={ShieldCheck} value={`${configured}/${total}`} label={t("overview.signalConfigured")} tone={configured === total && total > 0 ? "primary" : "default"} />
-          <Metric icon={KeyRound} value={enabledKeys} label={t("overview.signalKeys")} tone={enabledKeys > 0 ? "primary" : "default"} />
-          <Metric icon={vaultLocked ? LockKeyhole : Activity} value={observed} label={t("overview.signalObserved")} tone={failed > 0 || vaultLocked ? "warning" : "default"} />
+          <ul className="route-pulse-clients">
+            {categories.map((category) => {
+              const Icon = CATEGORY_ICONS[category.categoryId];
+              const isLive = category.running && !vaultLocked;
+              const isLocked = category.running && vaultLocked;
+              return (
+                <li key={category.categoryId} className={`route-pulse-client ${isLive ? "is-live" : ""}`}>
+                  <span className="route-pulse-icon" aria-hidden="true"><Icon size={19} strokeWidth={1.75} /></span>
+                  <div className="route-pulse-copy">
+                    <h3 className="route-pulse-name">{t(`nav.${category.categoryId}`)}</h3>
+                    <p className="route-pulse-detail flex items-center gap-1.5">
+                      <span className={`route-pulse-dot ${isLocked ? "is-locked" : isLive ? "is-live" : ""}`} aria-hidden="true" />
+                      <span>{t(isLocked ? "overview.signalLocked" : category.running ? "overview.running" : "overview.stopped")}</span>
+                    </p>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
         </div>
       </div>
+
+      <dl className="route-pulse-metrics">
+        <Metric icon={Radio} value={`${running}/${total}`} label={t("overview.signalListening")} tone={running > 0 ? "primary" : "default"} />
+        <Metric icon={ShieldCheck} value={`${configured}/${total}`} label={t("overview.signalConfigured")} tone={configured === total && total > 0 ? "primary" : "default"} />
+        <Metric icon={KeyRound} value={enabledKeys} label={t("overview.signalKeys")} tone={enabledKeys > 0 ? "primary" : "default"} />
+        <Metric icon={vaultLocked ? LockKeyhole : Activity} value={observed} label={t("overview.signalObserved")} tone={failed > 0 || vaultLocked ? "warning" : "default"} />
+      </dl>
     </section>
   );
 }

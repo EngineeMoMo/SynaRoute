@@ -397,121 +397,217 @@
 
   /* 总览页的路由信号图：静态链路保持安静，只有真实运行中的线路流动。 */
   .route-pulse-shell {
-    background:
-      radial-gradient(circle at 68% 18%, rgb(var(--primary) / 0.08), transparent 28%),
-      linear-gradient(135deg, rgb(var(--surface) / 0.98), rgb(var(--surface-elevated) / 0.94));
+    container: route-pulse / inline-size;
   }
 
   .route-pulse-visual {
-    background:
-      radial-gradient(circle at 50% 48%, rgb(var(--primary) / 0.08), transparent 30%),
-      linear-gradient(180deg, rgb(var(--surface-elevated) / 0.96), rgb(var(--surface-hover) / 0.5));
+    padding: 24px;
+    background: rgb(var(--surface-hover) / 0.4);
   }
 
-  .route-pulse-metric {
-    transition: border-color 180ms ease, background-color 180ms ease, transform 180ms ease;
+  .route-pulse-diagram {
+    max-width: 56rem;
+    margin-inline: auto;
   }
 
-  .route-pulse-metric:hover {
-    border-color: rgb(var(--primary) / 0.24);
-    background-color: rgb(var(--surface) / 0.92);
-    transform: translateY(-1px);
+  .route-pulse-hub,
+  .route-pulse-client {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+    padding: 14px 16px;
+    border: 1px solid rgb(var(--border));
+    border-radius: 10px;
+    background: rgb(var(--surface));
+    transition: border-color 180ms ease, background-color 180ms ease;
   }
 
-  .route-pulse__grid {
-    fill: none;
-    stroke: rgb(var(--border) / 0.55);
-    stroke-width: 1;
-    stroke-dasharray: 1 9;
+  .route-pulse-hub {
+    width: max-content;
+    max-width: 100%;
+    margin-inline: auto;
+    padding-inline: 20px;
   }
 
-  .route-pulse__halo {
-    fill: none;
-    stroke: rgb(var(--primary) / 0.08);
-    stroke-width: 1;
-    stroke-dasharray: 2 8;
+  .route-pulse-hub.is-live {
+    border-color: rgb(var(--primary) / 0.3);
+  }
+
+  .route-pulse-icon {
+    display: grid;
+    flex: 0 0 32px;
+    width: 32px;
+    height: 32px;
+    place-items: center;
+    border-radius: 9px;
+    background: rgb(var(--surface-hover));
+    color: rgb(var(--text-secondary));
+  }
+
+  .route-pulse-icon--hub {
+    flex-basis: 40px;
+    width: 40px;
+    height: 40px;
+    background: rgb(var(--primary) / 0.08);
+    color: rgb(var(--primary));
+  }
+
+  .route-pulse-copy {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .route-pulse-name {
+    color: rgb(var(--text-primary));
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 20px;
+  }
+
+  .route-pulse-detail {
+    margin-top: 4px;
+    color: rgb(var(--text-secondary));
+    font-size: 12px;
+    line-height: 18px;
+  }
+
+  .route-pulse-dot {
+    flex: 0 0 6px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: rgb(var(--border-strong));
+  }
+
+  .route-pulse-dot.is-live {
+    background: rgb(var(--primary));
+  }
+
+  .route-pulse-dot.is-locked {
+    background: rgb(var(--warning));
+  }
+
+  .route-pulse-connectors {
+    display: block;
+    width: calc(100% + 16px);
+    height: 48px;
+    margin-inline: -8px;
   }
 
   .route-pulse__path {
     fill: none;
-    stroke: rgb(var(--border-strong) / 0.56);
-    stroke-linecap: round;
+    stroke: rgb(var(--border-strong));
     stroke-width: 1.5;
-    transition: stroke 220ms ease, opacity 220ms ease;
+    stroke-linecap: round;
   }
 
   .route-pulse__path.is-configured {
-    stroke: rgb(var(--primary) / 0.24);
+    stroke: rgb(var(--primary) / 0.3);
   }
 
   .route-pulse__path.is-live {
-    stroke: rgb(var(--primary) / 0.6);
-    stroke-dasharray: 7 11;
-    animation: synaroute-route-flow 2.4s linear infinite;
+    stroke: rgb(var(--primary) / 0.65);
+    stroke-dasharray: 4 14;
+    animation: synaroute-route-flow 3.6s linear infinite;
   }
 
-  .route-pulse__packet {
-    fill: rgb(var(--primary));
+  .route-pulse-clients {
+    display: grid;
+    grid-template-columns: repeat(var(--route-count, 3), minmax(0, 1fr));
+    gap: 16px;
   }
 
-  .route-pulse__node {
-    fill: rgb(var(--surface-elevated));
-    stroke: rgb(var(--border-strong) / 0.75);
-    stroke-width: 2;
-    transition: fill 220ms ease, stroke 220ms ease;
+  .route-pulse-client {
+    padding-inline: 12px;
   }
 
-  .route-pulse__node.is-configured {
-    stroke: rgb(var(--primary) / 0.46);
+  .route-pulse-metrics {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    border-top: 1px solid rgb(var(--border));
   }
 
-  .route-pulse__node.is-live {
-    fill: rgb(var(--primary));
-    stroke: rgb(var(--primary-foreground));
+  .route-pulse-metric {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding: 16px 20px;
   }
 
-  .route-pulse__node-ring,
-  .route-pulse__hub-ring {
-    fill: none;
-    stroke: rgb(var(--primary) / 0.26);
-    stroke-width: 1;
-    animation: synaroute-node-breathe 2.8s ease-in-out infinite;
+  .route-pulse-metric dt {
+    flex: 1;
+    align-items: flex-start;
   }
 
-  .route-pulse__hub {
-    fill: rgb(var(--surface));
-    stroke: rgb(var(--border-strong));
-    stroke-width: 1.5;
+  .route-pulse-metric dt svg {
+    margin-top: 3px;
   }
 
-  .route-pulse__hub.is-live {
-    fill: rgb(var(--primary));
-    stroke: rgb(var(--primary-foreground));
+  .route-pulse-metric + .route-pulse-metric {
+    border-left: 1px solid rgb(var(--border));
   }
 
-  .route-pulse__hub-label,
-  .route-pulse__hub-caption,
-  .route-pulse__label {
-    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
-    user-select: none;
-  }
+  @container route-pulse (max-width: 36rem) {
+    .route-pulse-visual {
+      padding: 20px;
+    }
 
-  .route-pulse__hub-label {
-    fill: rgb(var(--text-primary));
-    font-size: 12px;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-  }
+    .route-pulse-hub {
+      width: auto;
+      margin-bottom: 16px;
+      padding-inline: 16px;
+    }
 
-  .route-pulse__hub.is-live + .route-pulse__hub-ring + .route-pulse__hub-label {
-    fill: rgb(var(--primary-foreground));
-  }
+    .route-pulse-connectors {
+      display: none;
+    }
 
-  .route-pulse__hub-caption,
-  .route-pulse__label {
-    fill: rgb(var(--text-secondary));
-    font-size: 10px;
-    font-weight: 500;
+    .route-pulse-clients {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 12px;
+      margin-left: 32px;
+    }
+
+    .route-pulse-client {
+      position: relative;
+    }
+
+    .route-pulse-client::before {
+      position: absolute;
+      top: -17px;
+      bottom: -13px;
+      left: -17px;
+      width: 1px;
+      background: rgb(var(--border-strong));
+      content: "";
+    }
+
+    .route-pulse-client:last-child::before {
+      bottom: 50%;
+    }
+
+    .route-pulse-client::after {
+      position: absolute;
+      top: 50%;
+      left: -17px;
+      width: 16px;
+      height: 1px;
+      background: rgb(var(--border-strong));
+      content: "";
+    }
+
+    .route-pulse-metrics {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .route-pulse-metric:nth-child(odd) {
+      border-left: 0;
+    }
+
+    .route-pulse-metric:nth-child(n + 3) {
+      border-top: 1px solid rgb(var(--border));
+    }
   }
 
   .route-pulse-skeleton {
@@ -542,47 +638,23 @@
     animation: synaroute-skeleton-sweep 1.8s ease-in-out infinite;
   }
 
-  .route-empty-state {
-    background:
-      radial-gradient(circle at 50% 38%, rgb(var(--primary) / 0.06), transparent 28%),
-      linear-gradient(180deg, rgb(var(--surface) / 0.92), rgb(var(--surface-hover) / 0.32));
-  }
-
   .route-empty__track {
     fill: none;
+    stroke: rgb(var(--border-strong));
     stroke-linecap: round;
     stroke-width: 1.5;
-    stroke-dasharray: 3 8;
-    animation: synaroute-route-flow 3.6s linear infinite;
-  }
-
-  .route-empty__track--secondary {
-    opacity: 0.55;
-    animation-direction: reverse;
-    animation-duration: 4.4s;
   }
 
   .route-empty__node {
-    fill: rgb(var(--surface));
-    stroke: rgb(var(--border-strong) / 0.85);
-    stroke-width: 2;
+    fill: rgb(var(--surface-hover));
+    stroke: rgb(var(--border-strong));
+    stroke-width: 1.5;
   }
 
   .route-empty__hub {
-    fill: rgb(var(--surface));
-    stroke: rgb(var(--primary) / 0.48);
-    stroke-width: 2;
-  }
-
-  .route-empty__core {
-    fill: rgb(var(--primary));
-  }
-
-  .route-empty__ring {
-    fill: none;
+    fill: rgb(var(--primary) / 0.06);
     stroke: rgb(var(--primary) / 0.26);
-    stroke-width: 1;
-    animation: synaroute-node-breathe 2.8s ease-in-out infinite;
+    stroke-width: 1.5;
   }
 }
 
@@ -661,13 +733,8 @@
   .status-shake,
   .sr-flow,
   .route-pulse__path.is-live,
-  .route-pulse__node-ring,
-  .route-pulse__hub-ring,
-  .route-pulse__packet,
   .route-pulse-skeleton::after,
-  .route-card-skeleton::after,
-  .route-empty__track,
-  .route-empty__ring {
+  .route-card-skeleton::after {
     animation: none;
   }
   .animate-in,
@@ -745,16 +812,6 @@
 @keyframes synaroute-route-flow {
   to {
     stroke-dashoffset: -36;
-  }
-}
-
-@keyframes synaroute-node-breathe {
-  0%,
-  100% {
-    opacity: 0.2;
-  }
-  50% {
-    opacity: 0.8;
   }
 }
 

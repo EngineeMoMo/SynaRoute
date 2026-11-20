@@ -115,13 +115,16 @@ export function RoutingOverviewPage({ onManage, onOpenLogs, onOpenReliability, o
 function OverviewSkeleton({ label }: { label: string }) {
   return (
     <div role="status" aria-label={label} className="space-y-4">
-      <div className="route-pulse-skeleton rounded-card border border-border bg-surface p-5">
+      <div className="route-pulse-shell route-pulse-skeleton rounded-card border border-border bg-surface p-5">
         <div className="h-3 w-24 rounded bg-surface-hover" />
         <div className="mt-3 h-5 w-48 rounded bg-surface-hover" />
         <div className="mt-2 h-3 w-80 max-w-full rounded bg-surface-hover" />
-        <div className="mt-5 grid gap-3 lg:grid-cols-[minmax(0,1.35fr)_minmax(16rem,0.65fr)]">
-          <div className="h-56 rounded-control bg-surface-hover" />
-          <div className="grid grid-cols-2 gap-2.5 lg:grid-cols-1">
+        <div className="mt-6">
+          <div className="mx-auto h-20 w-60 max-w-full rounded-control bg-surface-hover" />
+          <div className="route-pulse-clients mt-8">
+            {Array.from({ length: 3 }, (_, index) => <div key={index} className="h-20 rounded-control bg-surface-hover" />)}
+          </div>
+          <div className="route-pulse-metrics mt-5 gap-4 border-0 pt-4">
             {Array.from({ length: 4 }, (_, index) => <div key={index} className="h-16 rounded-control bg-surface-hover" />)}
           </div>
         </div>
