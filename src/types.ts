@@ -752,6 +752,7 @@ export interface CodexSessionRow {
 /** 列表页顶部那张统计卡。 */
 export interface CodexSessionStats {
   metadataFailures?: number;
+  indexingChanged?: boolean;
   total: number;
   active: number;
   archived: number;

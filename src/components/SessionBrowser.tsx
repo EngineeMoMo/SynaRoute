@@ -45,6 +45,7 @@ export function SessionBrowser({ data, picked, disabled, onSelect, onDetails, on
   const selectClass = "rounded-control border border-border bg-surface px-2 py-1.5 text-sm text-text-primary";
 
   return <section className="space-y-3" aria-label={t("sessions.browser")}>
+    {data.stats.indexingChanged && <p role="status" className="text-sm text-warning">{t("sessions.indexingChanged")}</p>}
     {!!data.stats.metadataFailures && <p role="status" className="text-sm text-warning">{t("sessions.metadataFailures", { n: data.stats.metadataFailures })}</p>}
     <div className="flex flex-wrap items-center gap-2">
       <input type="search" value={filters.query} onChange={(event) => updateFilter("query", event.target.value)}

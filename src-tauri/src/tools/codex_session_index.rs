@@ -39,7 +39,7 @@ impl Watch {
     }
 }
 
-type Snapshot = (Vec<(PathBuf, bool)>, Vec<Stamp>, usize);
+pub(super) type Snapshot = (Vec<(PathBuf, bool)>, Vec<Stamp>, usize);
 
 pub(super) fn snapshot(home: &Path) -> Snapshot {
     fn walk(root: &Path, depth: usize, archived: bool, snapshot: &mut Snapshot) {

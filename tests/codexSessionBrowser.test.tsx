@@ -18,6 +18,19 @@ function session(id: string, changes: Partial<CodexSessionRow> = {}): CodexSessi
 }
 
 describe("Codex session browsing", () => {
+  it("keeps conversations visible and reports concurrent updates without a load error", () => {
+    const data = { ...mockCodexSessions(), rows: [session("writing")] };
+    data.stats = { ...data.stats, indexingChanged: true };
+    const html = renderToStaticMarkup(createElement(SessionBrowser, {
+      data, picked: new Set<string>(), disabled: false,
+      onSelect() {}, onDetails() {}, onExport() {}, onDelete() {}, onArchive() {},
+    }));
+    expect(html).toContain("Conversation writing");
+    expect(html).toContain('role="status"');
+    expect(html).toContain(sessionsZh["sessions.indexingChanged"]);
+    expect(html).not.toContain(sessionsZh["sessions.loadFailed"]);
+    expect(sessionsEn["sessions.indexingChanged"]).toBeTruthy();
+  });
   it("renders a backend page without applying a second local slice or losing off-page selection", () => {
     const data = { ...mockCodexSessions(), rows: [session("page-three", { archived: true })],
       page: { filteredTotal: 125, page: 2, pageSize: 50, providerCounts: { synaroute: 125 } } };

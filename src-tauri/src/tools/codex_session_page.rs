@@ -74,6 +74,10 @@ type HomeIndex = Arc<Mutex<HomeState>>;
 static INDEXES: OnceLock<Mutex<HashMap<PathBuf, HomeIndex>>> = OnceLock::new();
 
 pub(super) fn list(home: &Path, keys: &[ProviderKey], query: &PageQuery) -> Result<CodexSessionList, String> {
+    list_with_snapshot(home, keys, query, storage::snapshot)
+}
+
+fn list_with_snapshot(home: &Path, keys: &[ProviderKey], query: &PageQuery, mut read_snapshot: impl FnMut(&Path) -> storage::Snapshot) -> Result<CodexSessionList, String> {
     if query.query.len() > 4096 || query.selected.len() > 100_000 || !matches!(query.archive.as_str(), "all" | "active" | "archived")
         || !matches!(query.source.as_str(), "all" | "user" | "internal") || !matches!(query.sort.as_str(), "updated" | "created" | "title")
         || !matches!(query.grouping.as_str(), "project" | "time") {
@@ -96,7 +100,7 @@ pub(super) fn list(home: &Path, keys: &[ProviderKey], query: &PageQuery) -> Resu
     let changed = state.watch.changed();
     let persisted = if state.index.is_none() && !query.refresh { storage::load(&home) } else { HashMap::new() };
     for attempt in 0..2 {
-        let (paths, before, scan_failures) = storage::snapshot(&home);
+        let (paths, before, scan_failures) = read_snapshot(&home);
         let cached = state.index.as_ref();
         let expired = query.refresh || cached.is_none_or(|index| index.at.elapsed() >= Duration::from_secs(30));
         if !expired && changed.is_empty() && scan_failures == 0 && cached.is_some_and(|index| index.identity == before && index.keys == keys_signature && index.snapshot.stats.metadata_failures == 0) {
@@ -115,14 +119,13 @@ pub(super) fn list(home: &Path, keys: &[ProviderKey], query: &PageQuery) -> Resu
         let current_provider = fs::read_to_string(home.join("config.toml")).ok().and_then(|text| text.parse::<toml::Value>().ok())
             .and_then(|value| value.get("model_provider")?.as_str().map(str::to_owned)).unwrap_or_default();
         let mut stats = view::enrich(&home, &mut scan.sessions, &current_provider, keys);
-        let (_, after, after_failures) = storage::snapshot(&home);
+        let (_, after, after_failures) = read_snapshot(&home);
         stats.metadata_failures += scan_failures.max(after_failures);
-        if before != after {
-            if attempt == 0 { continue; }
-            return Err("会话库正在变化，请重试 / Session files changed during indexing; retry".into());
-        }
+        stats.indexing_changed = before != after;
+        if stats.indexing_changed && attempt == 0 { continue; }
         let snapshot = CodexSessionList { rows: scan.sessions, page: None, current_provider, unreadable: scan.unreadable, path_rejected: scan.path_rejected, stats };
         let result = select(&snapshot, query);
+        if snapshot.stats.indexing_changed { return Ok(result); }
         if stats_safe(&snapshot) { storage::save(&home, &next_files); }
         state.index = Some(Index { at: Instant::now(), identity: after, keys: keys_signature.clone(), files: next_files, snapshot });
         return Ok(result);
@@ -236,6 +239,90 @@ mod tests {
         let fallback = list(directory.path(), &[], &query).unwrap();
         assert_eq!(fallback.rows.len(), 1);
         assert!(fallback.stats.metadata_failures > 0);
+    }
+
+    #[test]
+    fn continuous_writes_return_rows_without_caching_an_unstable_snapshot() {
+        use std::io::Write;
+
+        for source in ["rollout", "wal", "config", "index", "projects"] {
+            let directory = tempfile::tempdir().unwrap();
+            let home = directory.path().canonicalize().unwrap();
+            let path = fixture(&home, 1);
+            let connection = if source == "wal" {
+                let connection = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+                connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE threads(id TEXT, title TEXT); INSERT INTO threads VALUES ('00000000-0000-4000-8000-000000000001','Initial');").unwrap();
+                Some(connection)
+            } else { None };
+            let query = PageQuery { source: "all".into(), refresh: true, ..Default::default() };
+            let mut reads = 0;
+            let result = list_with_snapshot(&home, &[], &query, |home| {
+                reads += 1;
+                if reads % 2 == 0 {
+                    match source {
+                        "rollout" => fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{}\n").unwrap(),
+                        "wal" => { connection.as_ref().unwrap().execute("UPDATE threads SET title=?1", [format!("Update {reads}")]).unwrap(); }
+                        "config" => fs::write(home.join("config.toml"), format!("model_provider = 'provider_{reads}'\n")).unwrap(),
+                        "index" => fs::OpenOptions::new().create(true).append(true).open(home.join("session_index.jsonl")).unwrap().write_all(b"{}\n").unwrap(),
+                        _ => fs::write(home.join(".codex-global-state.json"), format!("{{\"revision\":{reads}}}")).unwrap(),
+                    }
+                }
+                storage::snapshot(home)
+            }).unwrap();
+            assert_eq!(reads, 4, "{source}: expected one retry");
+            assert_eq!(result.rows.len(), 1, "{source}");
+            assert!(result.stats.indexing_changed, "{source}");
+            assert_eq!(result.stats.metadata_failures, 0, "{source}");
+            assert_eq!(result.page.unwrap().filtered_total, 1);
+            assert!(storage::load(&home).is_empty(), "{source}: unstable snapshot persisted");
+            let entry = INDEXES.get().unwrap().lock().unwrap()[&home].clone();
+            assert!(entry.lock().unwrap().index.is_none(), "{source}: unstable snapshot cached");
+
+            let stable = list(&home, &[], &query).unwrap();
+            assert!(!stable.stats.indexing_changed, "{source}");
+            assert_eq!(stable.rows.len(), 1);
+            assert_eq!(stable.rows[0].bytes, fs::metadata(&path).unwrap().len());
+            if source == "wal" { assert_eq!(stable.rows[0].title, "Update 4"); }
+            if source == "config" { assert_eq!(stable.current_provider, "provider_4"); }
+            let saved = storage::load(&home)[&path].stamp.clone();
+            let cached_at = entry.lock().unwrap().index.as_ref().unwrap().at;
+            let mut reads = 0;
+            let busy = list_with_snapshot(&home, &[], &query, |home| {
+                reads += 1;
+                if reads % 2 == 0 {
+                    fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{}\n").unwrap();
+                }
+                storage::snapshot(home)
+            }).unwrap();
+            assert!(busy.stats.indexing_changed);
+            assert_eq!(storage::load(&home)[&path].stamp, saved);
+            assert_eq!(entry.lock().unwrap().index.as_ref().unwrap().at, cached_at);
+            let updated = list(&home, &[], &PageQuery { refresh: false, ..query }).unwrap();
+            assert!(!updated.stats.indexing_changed);
+            assert_eq!(updated.rows[0].bytes, fs::metadata(&path).unwrap().len());
+        }
+    }
+
+    #[test]
+    fn a_single_concurrent_change_recovers_on_retry() {
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = fixture(directory.path(), 1);
+        let mut reads = 0;
+        let result = list_with_snapshot(directory.path(), &[], &PageQuery::default(), |home| {
+            reads += 1;
+            if reads == 2 {
+                fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{}\n").unwrap();
+            }
+            storage::snapshot(home)
+        }).unwrap();
+        assert_eq!(reads, 4);
+        assert!(!result.stats.indexing_changed);
+        assert_eq!(result.rows[0].bytes, fs::metadata(&path).unwrap().len());
+        let home = directory.path().canonicalize().unwrap();
+        let saved = storage::load(&home);
+        assert_eq!(saved[&home.join(path.strip_prefix(directory.path()).unwrap())].row.as_ref().unwrap().bytes, result.rows[0].bytes);
     }
 
     #[test]

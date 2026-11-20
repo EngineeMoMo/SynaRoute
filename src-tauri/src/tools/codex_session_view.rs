@@ -81,6 +81,7 @@ pub(in crate::tools) struct ThreadInfo {
 #[serde(rename_all = "camelCase")]
 pub struct SessionStats {
     pub metadata_failures: usize,
+    pub indexing_changed: bool,
     pub total: usize,
     pub active: usize,
     pub archived: usize,
