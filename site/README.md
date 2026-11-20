@@ -61,7 +61,7 @@ npm run icons       # 重生成 favicon / logo / OG 图（改了品牌图形才�
 | `--text-secondary`（浅色） | `#64646E` | `#71717A` | 应用值在纯白上是 4.83:1，勉强过 4.5。官网有 `primary/8`、`warning/8`、`surface-hover` 这些淡底纹区块，底色一浅立刻掉到 3.89~4.40 全线不达标。深一档后在这些底纹上仍有 4.98~5.34 |
 | `--primary-solid` | 新增 token | 无 | 白字压在实心主色块上要 4.5:1。深色模式把 `--primary` 提亮成 `#8174FF` 是为了「主色当文字画在近黑底上」，白字压这个亮紫只有 **3.57:1**。两种用法诉求相反，只能拆成两个 token。**所有 `text-primary-foreground` 的底色必须用 `bg-primary-solid`** |
 | `boxShadow`（`shadow-card` / `shadow-card-hover`） | 覆盖成读 CSS 变量，另加 `shadow-raised` | `0 1px 2px rgba(0,0,0,.04)` / `0 4px 12px rgba(0,0,0,.08)` | 应用那两档在官网上等于不存在：浅色下 `#FFF` 压在 `#FAFAFA` 上本身只差 1.04:1，4% 的 1px 投影看不见；**深色下黑影压在 `#0E0E11` 上算出来差 0.6/255，一条 CSS 都没写**，于是全站 30 余处 `hover:shadow-card-hover` 在深色模式下毫无反馈。官网侧分两档 + 深浅各一组值，见 `styles.css` 的 `--shadow-*` |
-| `text-muted` 的用途 | 仅装饰 | 次要标签 | `#A1A1AA` on 白 = 2.56:1，深色 `#52525B` on `#18181B` = 2.20:1。官网正文层级靠**字号 + 字重**分级，不用第三档灰。详见 `styles.css` 顶部 |
+| `text-muted` 的用途 | 仅装饰 | 次要标签 | 浅色 `#A1A1AA` on 白 = 2.56:1；深色辅助色已提高至 `#94949F`，在 `#18181B` / `#232329` 上分别为 5.90:1 / 5.21:1。官网正文继续用 `text-secondary`，层级靠**字号 + 字重**分级。详见 `styles.css` 顶部 |
 
 另有两个官网独有的变量：`--border-strong`（可点卡片 hover 的第二条通道，深色下它是主通道）
 与 `--primary-deep`（渐变/强调的深端）。

@@ -54,7 +54,7 @@ function ClientRow({ row, onManage }: { row: CategoryOverview; onManage: (catego
     <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3.5">
       <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
         <h2 id={`overview-${row.categoryId}`} className="flex items-center gap-2.5 text-base font-semibold"><Icon size={19} className="text-primary" aria-hidden />{t(`nav.${row.categoryId}`)}</h2>
-        <span className={`inline-flex items-center gap-1.5 rounded-pill border px-2 py-1 text-[11px] ${row.running ? "border-primary/20 bg-primary/8 text-primary" : "border-border bg-surface-hover text-text-secondary"}`} aria-live="polite"><span className={`h-1.5 w-1.5 rounded-full ${row.running ? "bg-primary status-pulse" : "bg-border-strong"}`} aria-hidden />{t(row.running ? "overview.running" : "overview.stopped")}</span>
+        <span className={`inline-flex items-center gap-1.5 rounded-pill border px-2 py-1 text-[11px] ${row.running ? "border-primary/20 bg-primary/8 text-primary" : "border-border bg-surface-hover text-text-secondary"}`} aria-live="polite"><span className={`h-1.5 w-1.5 rounded-full ${row.running ? "bg-primary status-pulse" : "bg-text-secondary"}`} aria-hidden />{t(row.running ? "overview.running" : "overview.stopped")}</span>
         <code className="break-all text-xs text-text-secondary">{row.endpoint}</code>
       </div>
       <Button size="sm" variant="outline" onClick={() => onManage(row.categoryId)} aria-label={`${t("overview.manage")} · ${t(`nav.${row.categoryId}`)}`}>{t("overview.manage")}</Button>

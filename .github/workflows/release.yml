@@ -68,6 +68,8 @@ jobs:
                 '窄窗口自动切换纵向布局；空状态采用统一的几何图形，去掉过大的光晕和装饰性波浪。',
                 'Light and dark themes, Chinese and English labels, and reduced-motion preferences are supported. Only listening routes animate while the vault is unlocked.',
                 '适配深浅主题、中英文和减少动态效果设置；仅监听中且密钥库解锁的线路显示轻量动效。',
+                'Dark-mode secondary labels, SVG connectors, inactive indicators and empty states have clearer contrast. Status text remains readable in both themes.',
+                '提高深色模式辅助文字、SVG 连线、停用状态点和空状态图的对比度，状态文字在深浅主题下均保持清晰。',
                 'Sessions remain readable when Codex updates its files during a scan. The list reports concurrent changes, retries once, and avoids caching an unstable snapshot.',
                 'Codex 会话在扫描期间持续写入时仍显示可读取的记录，提示数据仍在变化，重试一次且不缓存不稳定快照。',
                 '',

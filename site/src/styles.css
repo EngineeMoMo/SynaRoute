@@ -15,9 +15,9 @@
    则是真正复用的 —— 见 tailwind.config.js 里 import ../tailwind.config.js。
 
    ⚠️ `text-muted` 不可用于正文。
-   实测对比度：#A1A1AA on #FFF = 2.56:1，深色下 #52525B on #18181B = 2.20:1，
-   都远低于 WCAG AA 对正文要求的 4.5:1。它在桌面应用里只标注极次要的小标签，
-   放到官网当段落色就会糊成一片（曾经 Features / Benefits 的说明文字都这么写）。
+   浅色 #A1A1AA on #FFF = 2.56:1，低于正文所需对比度。
+   深色辅助色已提高至 #94949F，仍保持正文使用 text-secondary 的统一约定。
+   Features / Benefits 的说明文字曾误用装饰色，因此正文不依赖第三档灰。
    官网的分级方式是**字号 + 字重**，不是第三档灰：
      · 标题      text-text-primary   + 大字号 semibold
      · 引导句    text-text-primary   + 15px medium
@@ -83,7 +83,7 @@
     --border-strong: 63 63 70; /* #3F3F46 —— 同 :root，深色下它是 hover 的主通道 */
     --text-primary: 250 250 250; /* #FAFAFA */
     --text-secondary: 161 161 170; /* #A1A1AA */
-    --text-muted: 82 82 91; /* #52525B —— 见文件顶部：不可用于文字 */
+    --text-muted: 148 148 159; /* #94949F */
 
     /* 深色下把主色略微提亮，避免靛紫在近黑底上发闷 */
     --primary: 129 116 255;

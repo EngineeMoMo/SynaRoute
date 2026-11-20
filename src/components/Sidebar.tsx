@@ -138,7 +138,7 @@ export function Sidebar({ active, onSelect, onOpenPalette }: SidebarProps) {
         </div>
         <div className="min-w-0 leading-tight">
           <div className="text-sm font-semibold text-text-primary">SynaRoute</div>
-          <div className="truncate text-[11px] text-text-muted">{t("app.tagline")}</div>
+          <div className="truncate text-[11px] text-text-secondary">{t("app.tagline")}</div>
         </div>
         {/* 语言 / 主题快捷切换：无需进设置（FR-快捷切换） */}
         <div className="ml-auto shrink-0">

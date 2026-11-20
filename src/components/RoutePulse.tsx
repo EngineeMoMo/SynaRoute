@@ -76,9 +76,9 @@ export function RoutePulse({
         <span
           className={`route-pulse-status inline-flex shrink-0 items-center gap-2 rounded-pill border px-3 py-1.5 text-xs font-medium ${
             live && !failed
-              ? "border-primary/25 bg-primary/8 text-primary"
+              ? "border-primary/25 bg-primary/8 text-text-primary"
               : failed || vaultLocked
-                ? "border-warning/30 bg-warning/8 text-warning"
+                ? "border-warning/30 bg-warning/8 text-text-primary"
                 : "border-border bg-surface-hover text-text-secondary"
           }`}
           role="status"
@@ -86,7 +86,7 @@ export function RoutePulse({
         >
           <span
             className={`h-1.5 w-1.5 rounded-full ${
-              live && !failed ? "bg-primary" : failed || vaultLocked ? "bg-warning" : "bg-border-strong"
+              live && !failed ? "bg-primary" : failed || vaultLocked ? "bg-warning" : "bg-text-secondary"
             }`}
             aria-hidden="true"
           />
