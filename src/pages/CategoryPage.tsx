@@ -18,10 +18,11 @@ import { discoverableModels, keyExpectedSet, routingPrimaryKey } from "@/lib/mod
 // 有 5 个监听器要成对拆掉的状态机，混在页面组件里必然漏掉某一条清理。
 import { useKeyDrag } from "@/lib/useKeyDrag";
 import type { EventLogEntry, ProviderKey } from "@/types";
-import { Plus, AlertTriangle, Inbox, X } from "lucide-react";
+import { Plus, AlertTriangle, RefreshCw, X } from "lucide-react";
 import { CATEGORY_ICONS } from "@/lib/categoryIcons";
 import { EnvConflictBanner } from "@/components/EnvConflictBanner";
 import { ActiveRequestsPanel } from "@/components/ActiveRequestsPanel";
+import { RouteEmptyState } from "@/components/RouteEmptyState";
 
 /** 分类主页：代理状态条 + 模型映射兜底提示 + Key 卡片列表 */
 export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }: {
@@ -307,18 +308,25 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
           不挂的话长列表里「把末尾那条拖到首位」根本走不到（首位那张卡在视口外）。 */}
       <div ref={drag.scrollRef} className="min-h-0 flex-1 space-y-2 overflow-y-auto px-6 pb-24">
         <ActiveRequestsPanel key={activeCategory} category={activeCategory} />
-        {loading && <div className="py-10 text-center text-sm text-text-muted">{t("common.loading")}</div>}
+        {loading && sorted.length > 0 && (
+          <div role="status" aria-live="polite" className="flex items-center gap-2 rounded-control border border-primary/15 bg-primary/8 px-3 py-2 text-xs text-primary">
+            <RefreshCw size={14} className="animate-spin motion-reduce:animate-none" aria-hidden="true" />
+            <span>{t("common.loading")}</span>
+          </div>
+        )}
+
+        {loading && sorted.length === 0 && <CategoryListSkeleton label={t("common.loading")} />}
 
         {!loading && sorted.length === 0 && (
-          <div className="flex flex-col items-center justify-center gap-3 py-16 text-text-muted">
-            <Inbox size={40} />
-            <p className="text-sm">{t("category.empty")}</p>
-            <div>
+          <RouteEmptyState
+            title={t("category.empty")}
+            description={t("category.emptyHint")}
+            action={
               <Button variant="secondary" onClick={onAddKey}>
                 <Plus size={16} /> {t("category.addFirst")}
               </Button>
-            </div>
-          </div>
+            }
+          />
         )}
 
         {!loading &&
@@ -352,6 +360,32 @@ export function CategoryPage({ onAddKey, onEditKey, onDuplicateKey, onOpenLogs }
           <div aria-hidden className="h-0.5 rounded-full bg-primary" />
         )}
       </div>
+    </div>
+  );
+}
+
+function CategoryListSkeleton({ label }: { label: string }) {
+  return (
+    <div role="status" aria-label={label} className="space-y-2">
+      {Array.from({ length: 3 }, (_, index) => (
+        <div key={index} className="route-card-skeleton rounded-card border border-border bg-surface p-4">
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex min-w-0 flex-1 items-center gap-3">
+              <div className="h-9 w-9 rounded-control bg-surface-hover" />
+              <div className="min-w-0 flex-1 space-y-2">
+                <div className="h-3.5 w-40 max-w-full rounded bg-surface-hover" />
+                <div className="h-2.5 w-64 max-w-full rounded bg-surface-hover" />
+              </div>
+            </div>
+            <div className="h-8 w-20 rounded-control bg-surface-hover" />
+          </div>
+          <div className="mt-4 grid gap-2 sm:grid-cols-3">
+            <div className="h-11 rounded-control bg-surface-hover" />
+            <div className="h-11 rounded-control bg-surface-hover" />
+            <div className="h-11 rounded-control bg-surface-hover" />
+          </div>
+        </div>
+      ))}
     </div>
   );
 }

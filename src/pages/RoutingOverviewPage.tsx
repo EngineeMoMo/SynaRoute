@@ -9,6 +9,7 @@ import { useStore } from "@/store";
 import { useRoutingOverview } from "@/lib/useRoutingOverview";
 import { attemptLabel, connectionReason, type CategoryOverview, type LatestAttempt } from "@/lib/routingOverview";
 import type { CategoryType } from "@/types";
+import { RoutePulse } from "@/components/RoutePulse";
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return <div className="grid grid-cols-[minmax(110px,0.7fr)_minmax(0,1fr)] gap-3 text-xs leading-5">
@@ -28,7 +29,7 @@ function Attempt({ attempt }: { attempt: LatestAttempt | null }) {
   return <div className="space-y-3">
     <div className="flex flex-wrap items-start justify-between gap-2">
       <span className="min-w-0 break-all text-base font-semibold" title={t("overview.keyId", { id: attempt.keyId })}>{attempt.keyName}</span>
-      <span className="flex items-center gap-1.5 text-xs text-text-primary"><Icon size={14} className={attempt.ok ? "text-primary" : "text-danger"} aria-hidden />{t(`overview.${attemptLabel(attempt)}`)}</span>
+      <span className={`inline-flex items-center gap-1.5 rounded-pill border px-2 py-1 text-[11px] font-medium ${attempt.ok ? "border-primary/20 bg-primary/8 text-primary" : "border-danger/25 bg-danger/8 text-danger"}`}><Icon size={14} aria-hidden />{t(`overview.${attemptLabel(attempt)}`)}</span>
     </div>
     <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3 rounded-control bg-surface-hover px-3 py-3">
       <div className="min-w-0"><p className="mb-1 text-xs text-text-secondary">{t("overview.requested")}</p><p className="break-all text-sm font-medium">{attempt.requestedModel || "—"}</p></div>
@@ -49,11 +50,11 @@ function ClientRow({ row, onManage }: { row: CategoryOverview; onManage: (catego
   const connection = row.connection;
   const warning = connection.state === "needs_attention" || connection.state === "unknown";
   const ConnectionIcon = warning ? CircleAlert : connection.state === "configured" ? FileCheck2 : Circle;
-  return <article className="overflow-hidden rounded-card border border-border bg-surface" aria-labelledby={`overview-${row.categoryId}`} data-category={row.categoryId}>
+  return <article className="group overflow-hidden rounded-card border border-border bg-surface transition-[border-color,box-shadow,transform] duration-200 hover:-translate-y-0.5 hover:border-primary/25 hover:shadow-card-hover motion-reduce:transform-none" aria-labelledby={`overview-${row.categoryId}`} data-category={row.categoryId}>
     <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3.5">
       <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
         <h2 id={`overview-${row.categoryId}`} className="flex items-center gap-2.5 text-base font-semibold"><Icon size={19} className="text-primary" aria-hidden />{t(`nav.${row.categoryId}`)}</h2>
-        <span className="flex items-center gap-1.5 text-xs"><span className={`h-2 w-2 rounded-full ${row.running ? "bg-primary" : "bg-border-strong"}`} aria-hidden />{t(row.running ? "overview.running" : "overview.stopped")}</span>
+        <span className={`inline-flex items-center gap-1.5 rounded-pill border px-2 py-1 text-[11px] ${row.running ? "border-primary/20 bg-primary/8 text-primary" : "border-border bg-surface-hover text-text-secondary"}`} aria-live="polite"><span className={`h-1.5 w-1.5 rounded-full ${row.running ? "bg-primary status-pulse" : "bg-border-strong"}`} aria-hidden />{t(row.running ? "overview.running" : "overview.stopped")}</span>
         <code className="break-all text-xs text-text-secondary">{row.endpoint}</code>
       </div>
       <Button size="sm" variant="outline" onClick={() => onManage(row.categoryId)} aria-label={`${t("overview.manage")} · ${t(`nav.${row.categoryId}`)}`}>{t("overview.manage")}</Button>
@@ -100,12 +101,32 @@ export function RoutingOverviewPage({ onManage, onOpenLogs, onOpenReliability, o
       </div>
       {failed && <InlineAlert tone="warning" className="text-text-primary" role="alert">{t(data ? "overview.stale" : "overview.error")}</InlineAlert>}
       {data?.vaultLocked && <InlineAlert tone="warning" className="text-text-primary" icon={LockKeyhole}>{t("overview.vaultLocked")}</InlineAlert>}
-      {!data && !failed && <p role="status" className="py-8 text-sm text-text-secondary">{t("common.loading")}</p>}
+      {!data && !failed && <OverviewSkeleton label={t("common.loading")} />}
       {data && <>
+        <RoutePulse categories={data.categories} vaultLocked={data.vaultLocked} refreshing={loading} />
         {data.categories.map((row) => <ClientRow key={row.categoryId} row={row} onManage={onManage} />)}
         <div className="grid gap-3 text-xs leading-5 text-text-secondary lg:grid-cols-2"><p>{t("overview.configNote")}</p><p>{t("overview.latestNote")}</p></div>
         <p className="text-xs tabular-nums text-text-secondary">{t("overview.updated", { time: new Date(data.capturedAt).toLocaleString(lang === "zh" ? "zh-CN" : "en-US") })}</p>
       </>}
     </div>
   </div>;
+}
+
+function OverviewSkeleton({ label }: { label: string }) {
+  return (
+    <div role="status" aria-label={label} className="space-y-4">
+      <div className="route-pulse-skeleton rounded-card border border-border bg-surface p-5">
+        <div className="h-3 w-24 rounded bg-surface-hover" />
+        <div className="mt-3 h-5 w-48 rounded bg-surface-hover" />
+        <div className="mt-2 h-3 w-80 max-w-full rounded bg-surface-hover" />
+        <div className="mt-5 grid gap-3 lg:grid-cols-[minmax(0,1.35fr)_minmax(16rem,0.65fr)]">
+          <div className="h-56 rounded-control bg-surface-hover" />
+          <div className="grid grid-cols-2 gap-2.5 lg:grid-cols-1">
+            {Array.from({ length: 4 }, (_, index) => <div key={index} className="h-16 rounded-control bg-surface-hover" />)}
+          </div>
+        </div>
+      </div>
+      {Array.from({ length: 3 }, (_, index) => <div key={index} className="h-52 rounded-card border border-border bg-surface" />)}
+    </div>
+  );
 }

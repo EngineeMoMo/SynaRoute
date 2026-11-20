@@ -75,7 +75,7 @@ export const en: Dict = {
   "hero.ctaWindows": "Download for Windows",
   "hero.ctaOtherPlatforms": "Other platforms & architectures",
   "hero.ctaPickPlatform": "Not your system? Pick a platform",
-  "hero.ctaPrimaryMacHint": "macOS build coming soon",
+  "hero.ctaPrimaryMacHint": "No macOS installer is available for this release",
   "hero.ctaSecondary": "View on GitHub",
   "hero.versionPrefix": "Current version",
   "hero.screenshotAlt":
@@ -269,8 +269,8 @@ export const en: Dict = {
   "download.button": "Download",
   "download.buttonComingSoon": "Coming soon",
   "download.recommended": "Recommended for you",
-  "download.macNote": "The macOS build is in development and is not available for download yet.",
-  "download.linuxNote": "No Linux build is planned.",
+  "download.macNote": "No macOS installer is available for this release. Check the release page for the latest status.",
+  "download.linuxNote": "No Linux installer is available for this release. Check the release page for the latest status.",
   "download.otherBuilds": "Other builds:",
   "download.fallbackNote":
     "Couldn't fetch the latest release from GitHub, so the known version is shown below. You can also go straight to the releases page.",

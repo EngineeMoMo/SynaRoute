@@ -46,9 +46,8 @@ jobs:
       #   workflow 都不用这两个事件
       - uses: actions/checkout@v7
 
-      # setup-node v5 起：`package.json` 里有 `packageManager` 字段时会**自动**开缓存
-      # （v6 又把自动缓存收窄到只对 npm）。本仓根与 site 两个 package.json 都没有该字段，
-      # 故行为不变；下面 `cache: npm` 是显式指定，v7 仍支持。
+      # 根 package.json 明确声明 npm，site 仍由自己的 package-lock.json 管理；
+      # 下面 `cache: npm` 显式指定缓存来源，避免 package manager 声明与 CI 安装器漂移。
       - uses: actions/setup-node@v7
         with:
           node-version: "20"

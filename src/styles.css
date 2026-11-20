@@ -394,6 +394,196 @@
     background-size: 38% 100%;
     animation: synaroute-flow 2.6s linear infinite;
   }
+
+  /* 总览页的路由信号图：静态链路保持安静，只有真实运行中的线路流动。 */
+  .route-pulse-shell {
+    background:
+      radial-gradient(circle at 68% 18%, rgb(var(--primary) / 0.08), transparent 28%),
+      linear-gradient(135deg, rgb(var(--surface) / 0.98), rgb(var(--surface-elevated) / 0.94));
+  }
+
+  .route-pulse-visual {
+    background:
+      radial-gradient(circle at 50% 48%, rgb(var(--primary) / 0.08), transparent 30%),
+      linear-gradient(180deg, rgb(var(--surface-elevated) / 0.96), rgb(var(--surface-hover) / 0.5));
+  }
+
+  .route-pulse-metric {
+    transition: border-color 180ms ease, background-color 180ms ease, transform 180ms ease;
+  }
+
+  .route-pulse-metric:hover {
+    border-color: rgb(var(--primary) / 0.24);
+    background-color: rgb(var(--surface) / 0.92);
+    transform: translateY(-1px);
+  }
+
+  .route-pulse__grid {
+    fill: none;
+    stroke: rgb(var(--border) / 0.55);
+    stroke-width: 1;
+    stroke-dasharray: 1 9;
+  }
+
+  .route-pulse__halo {
+    fill: none;
+    stroke: rgb(var(--primary) / 0.08);
+    stroke-width: 1;
+    stroke-dasharray: 2 8;
+  }
+
+  .route-pulse__path {
+    fill: none;
+    stroke: rgb(var(--border-strong) / 0.56);
+    stroke-linecap: round;
+    stroke-width: 1.5;
+    transition: stroke 220ms ease, opacity 220ms ease;
+  }
+
+  .route-pulse__path.is-configured {
+    stroke: rgb(var(--primary) / 0.24);
+  }
+
+  .route-pulse__path.is-live {
+    stroke: rgb(var(--primary) / 0.6);
+    stroke-dasharray: 7 11;
+    animation: synaroute-route-flow 2.4s linear infinite;
+  }
+
+  .route-pulse__packet {
+    fill: rgb(var(--primary));
+  }
+
+  .route-pulse__node {
+    fill: rgb(var(--surface-elevated));
+    stroke: rgb(var(--border-strong) / 0.75);
+    stroke-width: 2;
+    transition: fill 220ms ease, stroke 220ms ease;
+  }
+
+  .route-pulse__node.is-configured {
+    stroke: rgb(var(--primary) / 0.46);
+  }
+
+  .route-pulse__node.is-live {
+    fill: rgb(var(--primary));
+    stroke: rgb(var(--primary-foreground));
+  }
+
+  .route-pulse__node-ring,
+  .route-pulse__hub-ring {
+    fill: none;
+    stroke: rgb(var(--primary) / 0.26);
+    stroke-width: 1;
+    animation: synaroute-node-breathe 2.8s ease-in-out infinite;
+  }
+
+  .route-pulse__hub {
+    fill: rgb(var(--surface));
+    stroke: rgb(var(--border-strong));
+    stroke-width: 1.5;
+  }
+
+  .route-pulse__hub.is-live {
+    fill: rgb(var(--primary));
+    stroke: rgb(var(--primary-foreground));
+  }
+
+  .route-pulse__hub-label,
+  .route-pulse__hub-caption,
+  .route-pulse__label {
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    user-select: none;
+  }
+
+  .route-pulse__hub-label {
+    fill: rgb(var(--text-primary));
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+  }
+
+  .route-pulse__hub.is-live + .route-pulse__hub-ring + .route-pulse__hub-label {
+    fill: rgb(var(--primary-foreground));
+  }
+
+  .route-pulse__hub-caption,
+  .route-pulse__label {
+    fill: rgb(var(--text-secondary));
+    font-size: 10px;
+    font-weight: 500;
+  }
+
+  .route-pulse-skeleton {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .route-pulse-skeleton::after {
+    position: absolute;
+    inset: 0;
+    content: "";
+    background: linear-gradient(100deg, transparent 20%, rgb(var(--surface) / 0.55) 45%, transparent 70%);
+    transform: translateX(-100%);
+    animation: synaroute-skeleton-sweep 1.8s ease-in-out infinite;
+  }
+
+  .route-card-skeleton {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .route-card-skeleton::after {
+    position: absolute;
+    inset: 0;
+    content: "";
+    background: linear-gradient(100deg, transparent 20%, rgb(var(--surface) / 0.5) 45%, transparent 70%);
+    transform: translateX(-100%);
+    animation: synaroute-skeleton-sweep 1.8s ease-in-out infinite;
+  }
+
+  .route-empty-state {
+    background:
+      radial-gradient(circle at 50% 38%, rgb(var(--primary) / 0.06), transparent 28%),
+      linear-gradient(180deg, rgb(var(--surface) / 0.92), rgb(var(--surface-hover) / 0.32));
+  }
+
+  .route-empty__track {
+    fill: none;
+    stroke-linecap: round;
+    stroke-width: 1.5;
+    stroke-dasharray: 3 8;
+    animation: synaroute-route-flow 3.6s linear infinite;
+  }
+
+  .route-empty__track--secondary {
+    opacity: 0.55;
+    animation-direction: reverse;
+    animation-duration: 4.4s;
+  }
+
+  .route-empty__node {
+    fill: rgb(var(--surface));
+    stroke: rgb(var(--border-strong) / 0.85);
+    stroke-width: 2;
+  }
+
+  .route-empty__hub {
+    fill: rgb(var(--surface));
+    stroke: rgb(var(--primary) / 0.48);
+    stroke-width: 2;
+  }
+
+  .route-empty__core {
+    fill: rgb(var(--primary));
+  }
+
+  .route-empty__ring {
+    fill: none;
+    stroke: rgb(var(--primary) / 0.26);
+    stroke-width: 1;
+    animation: synaroute-node-breathe 2.8s ease-in-out infinite;
+  }
 }
 
 /**
@@ -469,7 +659,15 @@
 @media (prefers-reduced-motion: reduce) {
   .status-pulse,
   .status-shake,
-  .sr-flow {
+  .sr-flow,
+  .route-pulse__path.is-live,
+  .route-pulse__node-ring,
+  .route-pulse__hub-ring,
+  .route-pulse__packet,
+  .route-pulse-skeleton::after,
+  .route-card-skeleton::after,
+  .route-empty__track,
+  .route-empty__ring {
     animation: none;
   }
   .animate-in,
@@ -541,6 +739,28 @@
   }
   to {
     background-position: 138% 0;
+  }
+}
+
+@keyframes synaroute-route-flow {
+  to {
+    stroke-dashoffset: -36;
+  }
+}
+
+@keyframes synaroute-node-breathe {
+  0%,
+  100% {
+    opacity: 0.2;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+
+@keyframes synaroute-skeleton-sweep {
+  to {
+    transform: translateX(100%);
   }
 }
 

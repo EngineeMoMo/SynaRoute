@@ -1058,13 +1058,10 @@ fn unregister_mcp_codex_at(path: &Path) -> AppResult<(String, bool)> {
 /// 调用顺序是这两条纪律的**唯一**落点（有源码级判据钉着，两个方向的注入都变红）。
 pub fn restore(category: CategoryType) -> AppResult<String> {
     // 桌面端另一套语义（3p + gateway 档 + _meta），故单独分派。
-    if category == CategoryType::ClaudeDesktop {
-        return restore_claude_desktop();
-    }
     let path = match category {
         CategoryType::ClaudeCli => claude_cli_settings_path()?,
         CategoryType::Codex => codex::config_path()?,
-        CategoryType::ClaudeDesktop => unreachable!("桌面端已在上方分派"),
+        CategoryType::ClaudeDesktop => return restore_claude_desktop(),
     };
     let mut restored = Vec::new();
     let mut deferred: Option<AppError> = None;

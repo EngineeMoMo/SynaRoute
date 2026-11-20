@@ -15,20 +15,20 @@
   "frozen": {
     "src-tauri/src/agent_tools.rs": 929,
     "src-tauri/src/aggregate.rs": 1184,
-    "src-tauri/src/balance.rs": 1088,
-    "src-tauri/src/lib.rs": 1836,
-    "src-tauri/src/model.rs": 1935,
-    "src-tauri/src/proxy.rs": 2611,
-    "src-tauri/src/secret.rs": 1099,
-    "src-tauri/src/service.rs": 1443,
-    "src-tauri/src/store.rs": 2572,
-    "src-tauri/src/tools.rs": 1797,
+    "src-tauri/src/balance.rs": 1018,
+    "src-tauri/src/lib.rs": 1826,
+    "src-tauri/src/model.rs": 1934,
+    "src-tauri/src/proxy.rs": 2302,
+    "src-tauri/src/secret.rs": 1071,
+    "src-tauri/src/service.rs": 1439,
+    "src-tauri/src/store.rs": 2467,
+    "src-tauri/src/tools.rs": 1794,
     "src-tauri/src/upstream/convert.rs": 1656,
-    "src-tauri/src/upstream/sse.rs": 1234,
-    "src/components/KeyEditor.tsx": 1449,
-    "src/lib/i18n.ts": 1373,
+    "src-tauri/src/upstream/sse.rs": 1211,
+    "src/components/KeyEditor.tsx": 1448,
+    "src/lib/i18n.ts": 1368,
     "src/pages/BrainPage.tsx": 1135,
-    "src/pages/SettingsPage.tsx": 1845
+    "src/pages/SettingsPage.tsx": 1839
   },
   "counters": {
     "bare_persist_calls": 3

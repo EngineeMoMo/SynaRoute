@@ -4,8 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { inspectableLines } from "../scripts/lib/rust-source.mjs";
 import { RoutingOverviewPage } from "@/pages/RoutingOverviewPage";
+import { RouteEmptyState } from "@/components/RouteEmptyState";
+import { RoutePulse } from "@/components/RoutePulse";
 import { attemptLabel, connectionReason, createOverviewRefresher, type RoutingOverview } from "@/lib/routingOverview";
 import { overviewEn, overviewZh } from "@/lib/i18n.overview";
+import { categoryZh } from "@/lib/i18n.category";
 import { useStore } from "@/store";
 import { translate, type TFunc } from "@/lib/i18n";
 
@@ -31,12 +34,64 @@ function render() {
   return renderToStaticMarkup(createElement(RoutingOverviewPage, { onManage: vi.fn(), onOpenLogs: vi.fn(), onOpenReliability: vi.fn() }));
 }
 
+function svgIds(html: string) {
+  return [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
+}
+
 beforeEach(() => { state.data = fixture(); state.failed = false; state.loading = false; useStore.setState({ lang: "zh" }); });
+afterEach(() => vi.unstubAllGlobals());
 
 describe("routing overview", () => {
+  it("keeps the empty route state visual and actionable", () => {
+    const html = renderToStaticMarkup(
+      createElement(RouteEmptyState, {
+        title: "还没有配置任何 Key",
+        description: categoryZh["category.emptyHint"],
+        action: createElement("button", { type: "button" }, "添加第一个 Key"),
+      }),
+    );
+    expect(html).toContain("route-empty-visual");
+    expect(html).toContain(categoryZh["category.emptyHint"]);
+    expect(html).toContain("添加第一个 Key");
+  });
+
+  it("keeps animated SVG definitions unique when the same visual renders twice", () => {
+    const empty = renderToStaticMarkup(
+      createElement("div", null,
+        createElement(RouteEmptyState, { title: "A", description: "A", action: null }),
+        createElement(RouteEmptyState, { title: "B", description: "B", action: null }),
+      ),
+    );
+    const pulse = renderToStaticMarkup(
+      createElement("div", null,
+        createElement(RoutePulse, { categories: fixture().categories, vaultLocked: false }),
+        createElement(RoutePulse, { categories: fixture().categories, vaultLocked: false }),
+      ),
+    );
+    for (const html of [empty, pulse]) {
+      const ids = svgIds(html);
+      expect(ids.length).toBeGreaterThan(1);
+      expect(new Set(ids).size).toBe(ids.length);
+      for (const id of ids) expect(html).toContain(`url(#${id})`);
+    }
+  });
+
+  it("does not mount SMIL route packets when reduced motion is requested", () => {
+    vi.stubGlobal("window", { matchMedia: () => ({ matches: true }) });
+    const html = renderToStaticMarkup(createElement(RoutePulse, { categories: fixture().categories, vaultLocked: false }));
+    expect(html).toContain("route-pulse__path");
+    expect(html).not.toContain("<animateMotion");
+  });
+
   it("renders all clients and distinguishes configured values from observed attempts", () => {
     const html = render();
     expect(html.match(/<article /g)).toHaveLength(3);
+    expect(html).toContain('data-testid="route-pulse"');
+    expect(html).toContain(overviewZh["overview.signalTitle"]);
+    expect(html).toContain(overviewZh["overview.signalListening"]);
+    expect(html).toContain(overviewZh["overview.signalConfigured"]);
+    expect(html).toContain(overviewZh["overview.signalKeys"]);
+    expect(html).toContain(overviewZh["overview.signalObserved"]);
     for (const value of ["Configured primary", "Actual backup", "configured-model", "client-model", "routing-alias", "actual-model"]) expect(html).toContain(value);
     expect(html).toContain("流式已建流");
     expect(html).toContain("尝试失败");
@@ -64,6 +119,7 @@ describe("routing overview", () => {
     expect(render()).not.toContain("<article");
     state.failed = false; state.loading = true;
     expect(render()).toContain('role="status"');
+    expect(render()).toContain("route-pulse-skeleton");
   });
 
   it("discloses a locked vault and translates all new presentation", () => {

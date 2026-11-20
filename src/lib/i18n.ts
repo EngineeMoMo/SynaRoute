@@ -10,7 +10,7 @@ import { mappingEn, mappingZh } from "./i18n.mapping";
 import { backupSecurityEn, backupSecurityZh } from "./i18n.backup";
 import { brainRunEn, brainRunZh } from "./i18n.brain"; import { sessionsEn, sessionsZh } from "./i18n.sessions"; import { resilienceEn, resilienceZh } from "./i18n.resilience";
 import { orderingEn, orderingZh } from "./i18n.ordering"; import { routingEn, routingZh } from "./i18n.routing";
-import { securityEn, securityZh } from "./i18n.security"; import { overviewEn, overviewZh } from "./i18n.overview"; import { activeRequestsEn, activeRequestsZh } from "./i18n.activeRequests";
+import { securityEn, securityZh } from "./i18n.security"; import { overviewEn, overviewZh } from "./i18n.overview"; import { activeRequestsEn, activeRequestsZh } from "./i18n.activeRequests"; import { categoryEn, categoryZh } from "./i18n.category";
 
 export type Lang = "zh" | "en";
 
@@ -457,7 +457,7 @@ const zh: Dict = {
   ...fieldsZh,
   ...securityZh,
   ...mappingZh,
-  ...brainRunZh, ...sessionsZh, ...orderingZh, ...resilienceZh, ...overviewZh, ...routingZh, ...activeRequestsZh,
+  ...brainRunZh, ...sessionsZh, ...orderingZh, ...resilienceZh, ...overviewZh, ...routingZh, ...activeRequestsZh, ...categoryZh,
   "logs.empty": "暂无事件",
   "logs.searchPlaceholder": "搜索日志（Key 名、模型、错误…）",
   "logs.noMatch": "没有匹配「{q}」的日志",
@@ -1129,7 +1129,7 @@ const en: Dict = {
   ...fieldsEn,
   ...securityEn,
   ...mappingEn,
-  ...brainRunEn, ...sessionsEn, ...orderingEn, ...resilienceEn, ...overviewEn, ...routingEn, ...activeRequestsEn,
+  ...brainRunEn, ...sessionsEn, ...orderingEn, ...resilienceEn, ...overviewEn, ...routingEn, ...activeRequestsEn, ...categoryEn,
   "logs.empty": "No events yet",
   "logs.searchPlaceholder": "Search logs (key, model, error…)",
   "logs.noMatch": "No logs match “{q}”",
