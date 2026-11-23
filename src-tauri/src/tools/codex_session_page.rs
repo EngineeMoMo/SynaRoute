@@ -264,9 +264,13 @@ mod tests {
                     match source {
                         "rollout" => fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{}\n").unwrap(),
                         "wal" => { connection.as_ref().unwrap().execute("UPDATE threads SET title=?1", [format!("Update {reads}")]).unwrap(); }
-                        "config" => fs::write(home.join("config.toml"), format!("model_provider = 'provider_{reads}'\n")).unwrap(),
+                        "config" => fs::write(home.join("config.toml"), format!("model_provider = 'provider_{reads}'\n{}", "\n".repeat(reads))).unwrap(),
                         "index" => fs::OpenOptions::new().create(true).append(true).open(home.join("session_index.jsonl")).unwrap().write_all(b"{}\n").unwrap(),
-                        _ => fs::write(home.join(".codex-global-state.json"), format!("{{\"revision\":{reads}}}")).unwrap(),
+                        _ => fs::write(home.join(".codex-global-state.json"), format!("{{\"revision\":{reads}}}{}", " ".repeat(reads))).unwrap(),
+                    }
+                    if let Some(name) = match source { "config" => Some("config.toml"), "projects" => Some(".codex-global-state.json"), _ => None } {
+                        fs::OpenOptions::new().write(true).open(home.join(name)).unwrap()
+                            .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000))).unwrap();
                     }
                 }
                 storage::snapshot(home)
