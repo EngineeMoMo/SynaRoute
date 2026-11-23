@@ -456,7 +456,7 @@ fn remove_from(
     std::fs::create_dir_all(backup_dir)?;
     let path = backup_dir.join(format!(
         "{BACKUP_PREFIX}-{}.json",
-        chrono::Local::now().format("%Y%m%d-%H%M%S%.3f")
+        jiff::ZonedDateTime::now().strftime("%Y%m%d-%H%M%S%.3f")
     ));
     // 备份里带的是**发现清单**（已脱敏），不是原始值 —— 凭据类的值我们从头到尾没读进来过。
     // 也就是说这份备份能回答「当时有哪些、指向哪里」，但不能拿来一键恢复一个 token。

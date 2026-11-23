@@ -19,7 +19,7 @@ pub(crate) mod concurrency;
 use crate::model::{HealthState, HealthStatus};
 use crate::store::Store;
 use crate::upstream;
-use chrono::Utc;
+use jiff::Timestamp;
 use std::sync::Arc;
 
 /// 发系统通知（熔断/恢复告警）。非 test 走 `notification::notify`；test 下是 no-op
@@ -135,7 +135,7 @@ pub fn record_model_unavailable(store: &Arc<Store>, key_id: &str, real_model: &s
         // 猜错会锁掉一个本来好的模型，而那种误伤是静默的。
         return;
     }
-    let now = Utc::now().timestamp_millis();
+    let now = Timestamp::now().as_millisecond();
     let mut escalate = false;
     let mut locked_secs = 0i64;
     let mut lock_count = 0u32;
@@ -224,7 +224,7 @@ fn decay_model_lock(h: &mut HealthState, real_model: &str) -> bool {
         // 计数降了，锁窗也要相应缩短，否则「计数已经降到 1，却还按 30 分钟锁着」。
         let steps = (entry.fail_count - 1).min(20);
         let backoff = MODEL_LOCK_BASE_MS.saturating_mul(1i64 << steps).min(MODEL_LOCK_MAX_MS);
-        let now = Utc::now().timestamp_millis();
+        let now = Timestamp::now().as_millisecond();
         entry.until = entry.until.min(now + backoff);
     }
     true
@@ -263,7 +263,7 @@ pub async fn check_one(store: &Arc<Store>, key_id: &str) {
         Some(msg) => upstream::health_probe_real(&key, &secret, &msg).await,
         None => upstream::health_probe(&key, &secret).await,
     };
-    let now = Utc::now().timestamp_millis();
+    let now = Timestamp::now().as_millisecond();
 
     // 探测/熔断分离（借鉴 cc-switch）：探测**只观测可达性**，写 status + latency，
     // 绝不碰 breaker_until / fail_count。可达即 Up、连接层不可达即 Down；此 status 仅供
@@ -307,7 +307,7 @@ pub async fn check_one(store: &Arc<Store>, key_id: &str) {
 /// 注意：只动 fail_count / breaker_until，不改 status（status 交给后台探测维护，
 /// 避免设 Down 后 is_candidate 永久拒绝、而实时流量又进不来无法恢复的死锁）。
 pub fn record_live_failure(store: &Arc<Store>, key_id: &str) {
-    let now = Utc::now().timestamp_millis();
+    let now = Timestamp::now().as_millisecond();
     // 先读「是否已熔断」：熔断是状态跃迁，只在「未熔断 → 刚熔断」时发一次系统通知
     // （不是每次失败都发，否则刷屏）。这条读与下面的 mutate_health 之间有个极窄窗口，
     // 并发下可能漏报一次 —— 通知本就是尽力而为（events::notify 失败不致命），可接受。
@@ -440,7 +440,7 @@ pub fn record_stream_end(
 /// 这条性质完全不变（`is_candidate` 只看 `breaker_until`，不看 `fail_count`）；
 /// 变的只是「这条 Key 最近不太行」这段记忆不再被一次成功抹得一干二净。
 pub fn record_live_success(store: &Arc<Store>, key_id: &str, real_model: Option<&str>) {
-    let now = Utc::now().timestamp_millis();
+    let now = Timestamp::now().as_millisecond();
     // mutate 前读熔断残留：与 mutate 后对比，判断「本次是否真的清掉了熔断」。
     // 这里口径是 `is_some()`（有无残留）而非「窗口是否还活着」，且**刻意**与
     // `record_live_failure` 不同：残留只有真实成功才会被清成 None，所以
@@ -525,7 +525,7 @@ pub fn is_candidate(health: &HealthState) -> bool {
 ///
 /// 顺序上先判第一层：Key 级熔断成立时，模型锁的状态无关紧要。
 pub fn is_candidate_for_model(health: &HealthState, real_model: Option<&str>) -> bool {
-    let now = Utc::now().timestamp_millis();
+    let now = Timestamp::now().as_millisecond();
     // 第一层：熔断中 → 不可用；其余（含探测判 Down 的）一律给机会——真实流量才是可用性裁判。
     let key_ok = match health.breaker_until {
         Some(until) => until <= now,
@@ -643,7 +643,7 @@ mod tests {
     /// 之后无论故障多少轮都静默——而这恰恰是健康告警这个功能要解决的问题。
     #[test]
     fn breaker_arm_transition_uses_live_window_not_residual_field() {
-        let now = Utc::now().timestamp_millis();
+        let now = Timestamp::now().as_millisecond();
         // 窗口已自然到期，但字段仍有残留（真实成功前不会被清）。
         let expired = hs(HealthStatus::Up, 3, Some(now - 1_000));
         assert!(
@@ -676,7 +676,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "synaroute_health_locked_{}_{}",
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            jiff::Timestamp::now().as_nanosecond()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(
@@ -867,7 +867,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "synaroute_cand_eq_{}_{}",
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            jiff::Timestamp::now().as_nanosecond()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(
@@ -903,7 +903,7 @@ mod tests {
                 health,
             }
         };
-        let future = chrono::Utc::now().timestamp_millis() + 60_000;
+        let future = jiff::Timestamp::now().as_millisecond() + 60_000;
         let cat = CategoryType::ClaudeCli;
 
         // 故意乱序插入 + 混入他分类与禁用项，同时放一个熔断中的。
@@ -958,7 +958,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "synaroute_health_race_{}_{}",
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            jiff::Timestamp::now().as_nanosecond()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(
@@ -1039,7 +1039,7 @@ mod tests {
 
     #[test]
     fn candidate_respects_breaker_window() {
-        let now = Utc::now().timestamp_millis();
+        let now = Timestamp::now().as_millisecond();
         // 熔断未到期 → 即便 status 是 Up 也不可用
         assert!(!is_candidate(&hs(HealthStatus::Up, 0, Some(now + 60_000))));
         // 熔断已过期 → 恢复可用
@@ -1048,7 +1048,7 @@ mod tests {
 
     #[test]
     fn select_candidates_falls_back_when_all_tripped() {
-        let now = Utc::now().timestamp_millis();
+        let now = Timestamp::now().as_millisecond();
         let mut tripped = key("k");
         tripped.health = hs(HealthStatus::Up, 3, Some(now + 60_000)); // 熔断中但非 Down
 
@@ -1060,7 +1060,7 @@ mod tests {
 
     #[test]
     fn select_candidates_prefers_healthy_no_fallback() {
-        let now = Utc::now().timestamp_millis();
+        let now = Timestamp::now().as_millisecond();
         let mut healthy = key("ok");
         healthy.health = hs(HealthStatus::Up, 0, None);
         let mut tripped = key("bad");
@@ -1302,7 +1302,7 @@ mod tests {
     fn live_success_records_grace_timestamp() {
         let store = temp_store();
         store.upsert_key(key("k")).unwrap();
-        let before = Utc::now().timestamp_millis();
+        let before = Timestamp::now().as_millisecond();
 
         record_live_success(&store, "k", None);
         let h = store.get_key("k").unwrap().health;
@@ -1310,7 +1310,7 @@ mod tests {
         assert!(ts >= before, "时间戳应为记录时刻");
 
         // 宽限窗口内：探测失败不应熔断该 Key（在 check_one 里用 last_live_success 判定）。
-        let now = Utc::now().timestamp_millis();
+        let now = Timestamp::now().as_millisecond();
         assert!(now - ts < LIVE_SUCCESS_GRACE_MS, "刚记录应在宽限窗口内");
     }
 
@@ -1374,7 +1374,7 @@ mod tests {
 
         let remaining = |store: &Arc<Store>| {
             let h = store.get_key("k").unwrap().health;
-            h.model_locks["m"].until - Utc::now().timestamp_millis()
+            h.model_locks["m"].until - Timestamp::now().as_millisecond()
         };
 
         record_model_unavailable(&store, "k", "m");
@@ -1424,7 +1424,7 @@ mod tests {
         // 衰减路径上有同一份指数计算，同样要过 64 这一关。
         record_live_success(&store, "k", Some("m"));
         let after = store.get_key("k").unwrap().health.model_locks["m"].until
-            - Utc::now().timestamp_millis();
+            - Timestamp::now().as_millisecond();
         assert!(after > 0, "衰减路径也不得算出非正锁窗：{after}ms");
     }
 
@@ -1538,7 +1538,7 @@ mod tests {
     fn stale_model_locks_are_swept_but_recently_expired_ones_are_kept() {
         let store = temp_store();
         store.upsert_key(key("k")).unwrap();
-        let now = Utc::now().timestamp_millis();
+        let now = Timestamp::now().as_millisecond();
 
         let _ = store.mutate_health("k", |h| {
             // 早已陈旧：到期时间在「now - 陈旧阈值」之前
@@ -1585,7 +1585,7 @@ mod tests {
     /// 若哪天把扫描判据放宽成「到期就删」，这条会连同上面那条一起变红。
     #[test]
     fn sweeping_does_not_change_the_escalation_verdict() {
-        let now = Utc::now().timestamp_millis();
+        let now = Timestamp::now().as_millisecond();
         let mut h = HealthState::default();
         for (name, until) in [
             ("live1", now + 60_000),
@@ -1621,7 +1621,7 @@ mod tests {
     fn escalation_counts_live_locks_not_expired_leftovers() {
         let store = temp_store();
         store.upsert_key(key("k")).unwrap();
-        let now = Utc::now().timestamp_millis();
+        let now = Timestamp::now().as_millisecond();
 
         // 手工塞两条**已过期**的锁 + 一条新鲜的
         let _ = store.mutate_health("k", |h| {
@@ -1646,7 +1646,7 @@ mod tests {
     /// 到期即自动放行（惰性恢复，无后台定时器）。判据与 `breaker_until` 完全同源。
     #[test]
     fn an_expired_model_lock_stops_blocking_even_though_the_entry_remains() {
-        let now = Utc::now().timestamp_millis();
+        let now = Timestamp::now().as_millisecond();
         let mut h = HealthState::default();
         h.model_locks.insert(
             "m".into(),

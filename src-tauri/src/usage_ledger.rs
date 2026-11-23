@@ -70,7 +70,7 @@ impl UsageLedger {
     /// 只翻脏标记、不在这里落盘：转发热路径上的一次写盘要序列化整份快照再走
     /// `atomic_write`（含 fsync），合并给后台那趟 60s 的 flush 才是对的。
     pub(crate) fn record(&self, category: CategoryType, key_id: &str, model: &str, u: &TokenUsage) {
-        self.record_at(category, key_id, model, u, chrono::Utc::now().timestamp_millis());
+        self.record_at(category, key_id, model, u, jiff::Timestamp::now().as_millisecond());
     }
 
     fn record_at(&self, category: CategoryType, key_id: &str, model: &str, u: &TokenUsage, recorded_ms: i64) {
@@ -145,7 +145,7 @@ impl UsageLedger {
     }
 
     fn write_locked(&self, force: bool) -> bool {
-        self.write_with(force, chrono::Utc::now().timestamp_millis(), |bytes| {
+        self.write_with(force, jiff::Timestamp::now().as_millisecond(), |bytes| {
             crate::secret::atomic_write(&self.path, bytes)
         })
     }
@@ -286,13 +286,13 @@ fn merge_into_day(buckets: &mut Vec<DailyUsageBucket>, date: &str, rows: Vec<Tok
 /// 日期是 `YYYY-MM-DD`，字典序 = 时间序，故直接比字符串。解析不出的日期**保留**：
 /// 手工编辑过的桶不该被静默删除。
 fn retire_expired(buckets: &mut Vec<DailyUsageBucket>, retired: &mut Vec<TokenUsageByKey>, today: &str) {
-    let Ok(t) = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d") else {
+    let Ok(t) = jiff::civil::Date::strptime("%Y-%m-%d", today) else {
         return;
     };
-    let cutoff = (t - chrono::Duration::days(KEEP_DAYS)).format("%Y-%m-%d").to_string();
+    let cutoff = (t - jiff::Span::new().days(KEEP_DAYS)).strftime("%Y-%m-%d").to_string();
     let mut folded: BTreeMap<UsageKey, TokenUsage> = BTreeMap::new();
     buckets.retain(|b| {
-        let parsed = chrono::NaiveDate::parse_from_str(&b.date, "%Y-%m-%d").is_ok();
+        let parsed = jiff::civil::Date::strptime("%Y-%m-%d", &b.date).is_ok();
         let keep = !parsed || b.date.as_str() > cutoff.as_str();
         if !keep {
             for r in &b.entries {
@@ -334,9 +334,8 @@ mod tests {
     }
 
     fn local_ms(value: &str) -> i64 {
-        use chrono::TimeZone;
-        chrono::Local.from_local_datetime(&chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").unwrap())
-            .single().unwrap().timestamp_millis()
+        jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S", value).unwrap()
+            .to_zoned_datetime(jiff::tz::TimeZone::system()).unwrap().timestamp().as_millisecond()
     }
 
     fn sum_day(buckets: &[DailyUsageBucket], date: &str) -> u64 {
@@ -467,7 +466,7 @@ mod tests {
         let writer_ledger = ledger.clone();
         let writer = std::thread::spawn(move || {
             let _commit = writer_ledger.commit_lock.lock();
-            writer_ledger.write_with(false, chrono::Utc::now().timestamp_millis(), |bytes| {
+            writer_ledger.write_with(false, jiff::Timestamp::now().as_millisecond(), |bytes| {
                 ready_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(5)).expect("提交测试协调超时");
                 crate::secret::atomic_write(&writer_ledger.path, bytes)
@@ -528,7 +527,7 @@ mod tests {
         let cfg = temp_cfg("v3_upgrade");
         let path = super::super::usage_file_path(&cfg);
         // 日期取「3 天前」而不是写死：写死的日期过了 90 天就会被滚进 retired，用例自己过期。
-        let day = local_date_string(chrono::Utc::now().timestamp_millis() - 3 * 86_400_000);
+        let day = local_date_string(jiff::Timestamp::now().as_millisecond() - 3 * 86_400_000);
         std::fs::write(&path, format!(r#"{{"version":3,"sinceMs":1700000000000,"dailyBuckets":[
             {{"date":"{day}","entries":[{{"categoryId":"claude-cli","keyId":"k","usage":{{"input":500,"output":5}}}}]}}
         ],"retired":[{{"categoryId":"claude-cli","keyId":"k","usage":{{"input":70,"output":7}}}}]}}"#)).unwrap();
@@ -553,7 +552,7 @@ mod tests {
     fn purging_a_key_removes_every_trace_of_it_and_nothing_else() {
         let cfg = temp_cfg("purge_all");
         let path = super::super::usage_file_path(&cfg);
-        let recent = local_date_string(chrono::Utc::now().timestamp_millis() - 2 * 86_400_000);
+        let recent = local_date_string(jiff::Timestamp::now().as_millisecond() - 2 * 86_400_000);
         // 一份已经有「被删的 Key 的 retired + 日桶」与「留下的 Key」的 v4 文件。
         std::fs::write(&path, format!(r#"{{"version":4,"sinceMs":1,"dailyBuckets":[
             {{"date":"{recent}","entries":[
@@ -639,8 +638,8 @@ mod tests {
     #[test]
     fn the_rolling_window_keeps_exactly_ninety_days_and_folds_the_rest() {
         let row = |n| TokenUsageByKey::from_slot((CategoryType::ClaudeCli, "k".into(), "m".into()), u(n));
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
-        let day = |back: i64| (today - chrono::Duration::days(back)).format("%Y-%m-%d").to_string();
+        let today = jiff::civil::Date::new(2026, 10, 12).unwrap();
+        let day = |back: i64| (today - jiff::Span::new().days(back)).strftime("%Y-%m-%d").to_string();
         let mut buckets = vec![
             DailyUsageBucket { date: day(0), entries: vec![row(1)] },
             DailyUsageBucket { date: day(89), entries: vec![row(10)] },
@@ -658,12 +657,12 @@ mod tests {
     /// 🔴 「今天」只能从 [`local_date_string`] 来。
     ///
     /// 行为用例证明不了这一条：在 UTC 时区的机器上（CI 就是），本地日期与 UTC 日期恒相等，
-    /// 把 flush 里那一行改回 `Utc::now().format(..)` 所有用例照样全绿 —— 而用户在东八区。
+    /// 把 flush 里那一行改回 `Timestamp::now().strftime(..)` 所有用例照样全绿 —— 而用户在东八区。
     /// 故用源码级判据钉住：生产段不许出现从 UTC 时刻直接取日期的写法。
     #[test]
     fn today_is_never_derived_from_utc_in_production_code() {
         let prod = crate::proxy::custom_headers::production_code_only(include_str!("usage_ledger.rs"));
-        for banned in ["Utc::now().format", "Utc::now().date_naive", "and_utc()"] {
+        for banned in ["Timestamp::now().strftime", "TimeZone::UTC", "clock::utc_date()"] {
             assert!(!prod.contains(banned), "生产段出现了 `{banned}` —— 东八区每天 0~8 点会被算进昨天");
         }
         let recording = prod.split_once("fn record_at(").unwrap().1.split_once("pub(crate) fn mark_dirty(").unwrap().0;

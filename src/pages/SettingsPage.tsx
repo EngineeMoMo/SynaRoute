@@ -5,6 +5,7 @@ import { api } from "@/lib/bridge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { LanSection } from "@/components/LanSection";
+import { useLanSettings } from "@/lib/useLanSettings";
 import { ToggleRow } from "@/components/ToggleRow";
 import { MasterPasswordToggle } from "@/components/MasterPasswordToggle";
 import { BackupImportPreview } from "@/components/BackupImportPreview";
@@ -279,30 +280,8 @@ export function SettingsPage() {
    * **关了端口仍对整个局域网敞开**（界面说「已关闭」而实际没关，安全方向的静默失效）。
    * 后端会顺带重启正在运行的代理，返回受影响分类数，这里据它提示用户。
    *
-   * 失败必须回滚开关：显示「已开/已关」而实际相反，是这类开关最坑的形态。
    */
-  const handleToggleLan = (v: boolean) => {
-    if (!settings) return;
-    const prev = settings;
-    setSettings({ ...settings, lanExposure: v });
-    void api
-      .setLanExposure(v)
-      .then((restarted) => {
-        // 上面那次 setSettings 只改**页面局部** state，这里同步全局 store。
-        // ⚠️ 必须用**函数式**更新：原先写的是 `{ settings: { ...prev, lanExposure: v } }`，
-        // 而 `prev` 是旧快照 —— 这期间别处对 settings 的改动会被整份覆盖回去，
-        // 正是 CLAUDE.md 记的那条 P0（切主题把刚关掉的开机自启动装回系统）的成因。
-        useStore.setState((st) => ({
-          settings: st.settings ? { ...st.settings, lanExposure: v } : st.settings,
-        }));
-        if (restarted > 0) showToast("success", t("settings.lanRestarted", { n: restarted }));
-      })
-      .catch((e) => {
-        console.error("setLanExposure failed", e);
-        setSettings(prev);
-        showToast("error", String((e as Error)?.message ?? e));
-      });
-  };
+  const lan = useLanSettings(setSettings);
 
   // MCP 开关/端口走专用命令：携带当前活跃分类，后端据此自动注册 synaroute 到对应工具客户端
   // （~/.claude.json 或 ~/.codex/config.toml），并在端口漂移时重写。不走通用 saveSettings，
@@ -619,7 +598,7 @@ export function SettingsPage() {
                 分开写就得把 `lanExposure` 传两遍、且谁都可能忘记同步显示条件。 */}
             <LanSection
               enabled={settings?.lanExposure ?? false}
-              onToggle={handleToggleLan}
+              onToggle={lan.toggle} busy={lan.busy} unknown={lan.unknown} status={lan.status}
               t={t}
               onToast={showToast}
             />

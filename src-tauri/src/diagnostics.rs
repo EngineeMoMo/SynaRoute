@@ -116,21 +116,6 @@ pub(crate) fn connection_error(url: &str, error: reqwest::Error) -> String {
     format!("连接 {} 失败: {}", mask_url_credentials(url), http_error_message(error))
 }
 
-/// 只在错误响应或 200 包裹错误时遮掉密钥，正常模型正文保持字节不变。
-pub(crate) fn redact_upstream_error_bytes(
-    status: u16,
-    bytes: bytes::Bytes,
-    secret: &str,
-) -> bytes::Bytes {
-    if status >= 400 || crate::upstream::body_is_upstream_error(&bytes).is_some() {
-        return bytes::Bytes::from(redact_secret(
-            &String::from_utf8_lossy(&bytes),
-            secret,
-        ));
-    }
-    bytes
-}
-
 // ==== 诊断报告（UX#12）====
 
 /// 诊断报告里那些**只能由 lib.rs 提供**的运行环境信息。
@@ -172,7 +157,7 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
     let _ = writeln!(
         r,
         "生成时间：{}",
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z")
+        jiff::ZonedDateTime::now().strftime("%Y-%m-%d %H:%M:%S %:z")
     );
     let _ = writeln!(r);
     let _ = writeln!(r, "## 本文件包含什么");
@@ -344,10 +329,10 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
         MAX_EVENTS_IN_REPORT.min(total)
     );
     for e in events.iter().rev().take(MAX_EVENTS_IN_REPORT).rev() {
-        let ts = chrono::DateTime::from_timestamp_millis(e.ts)
+        let ts = crate::clock::from_millis(e.ts)
             .map(|d| {
-                d.with_timezone(&chrono::Local)
-                    .format("%m-%d %H:%M:%S")
+                d.to_zoned_datetime(jiff::tz::TimeZone::system())
+                    .strftime("%m-%d %H:%M:%S")
                     .to_string()
             })
             .unwrap_or_else(|| e.ts.to_string());
@@ -381,7 +366,7 @@ pub(crate) fn build_diagnostics_report(store: &Store, env: &DiagnosticsEnv) -> S
 pub(crate) fn diagnostics_file_name() -> String {
     format!(
         "synaroute-diagnostics-{}.txt",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
+        jiff::ZonedDateTime::now().strftime("%Y%m%d-%H%M%S")
     )
 }
 

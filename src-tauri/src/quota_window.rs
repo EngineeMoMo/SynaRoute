@@ -57,7 +57,7 @@
 
 use crate::model::CategoryType;
 use crate::store::Store;
-use chrono::Utc;
+use jiff::Timestamp;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -80,7 +80,7 @@ fn table() -> &'static parking_lot::Mutex<HashMap<String, i64>> {
 ///
 /// 顺带清掉已过期的条目：读路径上做清理，免得为它单开一趟后台线程。
 pub fn active(key_id: &str) -> bool {
-    let now = Utc::now().timestamp_millis();
+    let now = Timestamp::now().as_millisecond();
     let mut t = table().lock();
     t.retain(|_, until| *until > now);
     t.contains_key(key_id)
@@ -91,7 +91,7 @@ pub fn active(key_id: &str) -> bool {
 /// 给 503 闸门算 `Retry-After` 用：`active()` 只回答「挡不挡」，算不出「多久恢复」。
 /// 顺带清过期条目，与 [`active`] 同口径。
 pub fn until_ms(key_id: &str) -> Option<i64> {
-    let now = Utc::now().timestamp_millis();
+    let now = Timestamp::now().as_millisecond();
     let mut t = table().lock();
     t.retain(|_, until| *until > now);
     t.get(key_id).copied()
@@ -110,7 +110,7 @@ pub fn arm(store: &Arc<Store>, category: CategoryType, key_id: &str, secs: i64) 
         return;
     }
     let capped = secs.min(MAX_WINDOW_SECS);
-    let now = Utc::now().timestamp_millis();
+    let now = Timestamp::now().as_millisecond();
     let until = now + capped * 1000;
     let fresh = {
         let mut t = table().lock();
@@ -272,7 +272,7 @@ mod tests {
         let s = store("quota_cap");
         arm(&s, CategoryType::ClaudeCli, "qw_a", 86_400);
         let until = *table().lock().get("qw_a").expect("窗口已武装");
-        let secs = (until - Utc::now().timestamp_millis()) / 1000;
+        let secs = (until - Timestamp::now().as_millisecond()) / 1000;
         assert!(
             secs <= MAX_WINDOW_SECS && secs > MAX_WINDOW_SECS - 5,
             "必须夹到 {MAX_WINDOW_SECS}s 附近，实际 {secs}s"

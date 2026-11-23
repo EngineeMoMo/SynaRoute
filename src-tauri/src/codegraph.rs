@@ -355,60 +355,46 @@ async fn timeout_output_with_limit(
     cmd.kill_on_drop(true);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
-    let mut stdout = child
+    let (mut child, tree) = crate::proc::tree::spawn(cmd).await?;
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "codegraph stdout 未建立管道"))?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "codegraph stderr 未建立管道"))?;
 
-    let stdout_task = tokio::spawn(async move {
+    let read = async |pipe: &mut (dyn tokio::io::AsyncRead + Unpin + Send)| {
         let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
-    });
-
-    let status = match tokio::time::timeout(limit, child.wait()).await {
-        Ok(result) => result?,
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            stdout_task.abort();
-            stderr_task.abort();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "codegraph CLI 超时",
-            ));
+        pipe.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes).await?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "codegraph CLI 输出超过 4 MiB 上限"));
         }
+        Ok::<_, io::Error>(bytes)
     };
-
-    let stdout = stdout_task
-        .await
-        .map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("读取 codegraph stdout 失败: {e}"))
-        })??;
-    let stderr = stderr_task
-        .await
-        .map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("读取 codegraph stderr 失败: {e}"))
-        })??;
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
+    let mut stdout = stdout;
+    let mut stderr = stderr;
+    let mut tree = Some(tree);
+    let result = tokio::time::timeout(limit, async {
+        tokio::try_join!(async { let status = child.wait().await?; drop(tree.take()); Ok::<_, io::Error>(status) }, read(&mut stdout), read(&mut stderr))
+    }).await;
+    match result {
+        Ok(Ok((status, stdout, stderr))) => Ok(std::process::Output { status, stdout, stderr }),
+        result => {
+            drop(tree);
+            let _ = child.start_kill();
+            drop(stdout); drop(stderr);
+            let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+            Err(match result { Ok(Err(error)) => error, _ => io::Error::new(io::ErrorKind::TimedOut, "codegraph CLI 超时") })
+        }
+    }
 }
 
 /// 跑一条 codegraph 子命令并把 stdout 解析成 `T`。
 ///
 /// **失败判据是「能否解析成 T」，不是退出码**——codegraph 退出码恒为 0，失败信息只在 stdout
-/// （如 `✗ CodeGraph not initialized`）。解析失败时返回带 stdout 摘要的 Err，供调用方落日志；
+/// （如 `✗ CodeGraph not initialized`）。解析失败时仅返回行列位置，避免日志包含敏感输出；
 /// 旧实现在此静默返回空，导致「集成从未生效」看起来像「没有命中」。
 async fn run_json<T: serde::de::DeserializeOwned>(
     program: &str,
@@ -419,9 +405,7 @@ async fn run_json<T: serde::de::DeserializeOwned>(
         .map_err(|e| format!("启动失败: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     serde_json::from_str::<T>(stdout.trim()).map_err(|e| {
-        // 只截前 200 字符：codegraph 的错误是单行人话，够定位；避免把整份 JSON 灌进日志。
-        let head: String = stdout.trim().chars().take(200).collect();
-        format!("解析 JSON 失败({e}); stdout 摘要: {head}")
+        format!("解析 codegraph JSON 失败（第 {} 行，第 {} 列）", e.line(), e.column())
     })
 }
 
@@ -486,7 +470,7 @@ pub async fn query_symbols(
         &["query", keyword, "--json", "-p", &dir, "-l", &lim],
     )
     .await?;
-    Ok(hits.into_iter().map(|h| h.node).collect())
+    Ok(hits.into_iter().map(|h| h.node).filter(|node| crate::agent_tools::resolve_readable(work_dir, &node.file_path).is_ok()).take(limit).collect())
 }
 
 /// 取某符号的影响面（`impact <sym> --json -p <dir> --depth N`）——跨文件调用链。
@@ -504,7 +488,7 @@ pub async fn impact(
         &["impact", symbol, "--json", "-p", &dir, "--depth", &d],
     )
     .await?;
-    Ok(out.affected)
+    Ok(out.affected.into_iter().filter(|node| crate::agent_tools::resolve_readable(work_dir, &node.file_path).is_ok()).collect())
 }
 
 /// 取直接调用方（`callers <sym> --json -p <dir> -l N`）。
@@ -525,7 +509,7 @@ pub async fn callers(
         &["callers", symbol, "--json", "-p", &dir, "-l", &lim],
     )
     .await?;
-    Ok(out.callers)
+    Ok(out.callers.into_iter().filter(|node| crate::agent_tools::resolve_readable(work_dir, &node.file_path).is_ok()).take(limit).collect())
 }
 
 /// 取直接被调方（`callees <sym> --json -p <dir> -l N`）。见 [`callers`] 的保留理由。
@@ -543,8 +527,12 @@ pub async fn callees(
         &["callees", symbol, "--json", "-p", &dir, "-l", &lim],
     )
     .await?;
-    Ok(out.callees)
+    Ok(out.callees.into_iter().filter(|node| crate::agent_tools::resolve_readable(work_dir, &node.file_path).is_ok()).take(limit).collect())
 }
+
+#[cfg(test)]
+#[path = "codegraph_output_tests.rs"]
+mod output_tests;
 
 #[cfg(test)]
 mod tests {

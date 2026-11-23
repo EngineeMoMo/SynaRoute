@@ -289,7 +289,7 @@ pub fn build_export(
         ExportFile {
             format_version: FORMAT_VERSION,
             app_version: app_version.to_string(),
-            exported_at: chrono::Utc::now().to_rfc3339(),
+            exported_at: crate::clock::rfc3339(jiff::Timestamp::now()),
             payload_sha256,
             payload,
             secrets,

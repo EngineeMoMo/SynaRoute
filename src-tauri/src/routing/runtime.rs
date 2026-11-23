@@ -27,6 +27,7 @@ pub struct Lease {
     pub category: CategoryType,
     pub ticket: u64,
     pub failed: Arc<AtomicBool>,
+    pub upstream: Option<Arc<super::upstream_identity::Snapshot>>,
 }
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,12 +50,14 @@ pub struct CachedDecision { pub rule: Option<String>, pub expires: Instant }
 pub struct Runtime {
     pub edit: ReentrantMutex<()>,
     pub sessions: Mutex<HashMap<(CategoryType, String), TurnState>>,
+    pub(super) responses: Mutex<HashMap<(CategoryType, String, String), super::continuations::ObservedResponse>>,
     pub activities: Mutex<BTreeMap<CategoryType, Activity>>,
     pub decisions: Mutex<HashMap<String, CachedDecision>>,
     pub cooldowns: Mutex<HashMap<String, Instant>>,
     pub judges: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub previews: Mutex<HashMap<String, PendingScene>>,
     sequence: AtomicU64,
+    upstream_revisions: Mutex<BTreeMap<CategoryType, u64>>,
 }
 
 pub struct PendingScene {
@@ -66,9 +69,20 @@ pub struct PendingScene {
 }
 
 impl Runtime {
+    pub fn upstream_revision(&self, category: CategoryType) -> u64 {
+        self.upstream_revisions.lock().get(&category).copied().unwrap_or_default()
+    }
+    pub fn invalidate_upstream(&self, category: CategoryType) {
+        self.upstream_revisions.lock().insert(category, self.next());
+        self.reset(category);
+    }
+    pub fn current_upstream(&self, lease: &Lease) -> bool {
+        lease.upstream.as_ref().is_none_or(|snapshot| snapshot.revision == self.upstream_revision(lease.category))
+    }
     pub fn next(&self) -> u64 { self.sequence.fetch_add(1, Ordering::Relaxed) + 1 }
     pub fn reset(&self, category: CategoryType) {
         self.sessions.lock().retain(|(cat, _), _| *cat != category);
+        self.responses.lock().retain(|(cat, _, _), _| *cat != category);
         self.activities.lock().remove(&category);
     }
     pub fn begin(&self, category: CategoryType, session: &str, turn: &str, position: usize, fingerprint: &str, mode: AffinityMode) -> Option<Lease> {
@@ -91,7 +105,7 @@ impl Runtime {
             if mode != AffinityMode::Session { state.binding = None; }
         }
         state.touched = Instant::now();
-        Some(Lease { session: session.into(), turn: turn.into(), generation: state.generation, category, ticket: self.next(), failed: Arc::new(AtomicBool::new(false)) })
+        Some(Lease { session: session.into(), turn: turn.into(), generation: state.generation, category, ticket: self.next(), failed: Arc::new(AtomicBool::new(false)), upstream: None })
     }
     pub fn state(&self, lease: &Lease) -> Option<TurnState> {
         self.sessions.lock().get(&(lease.category, lease.session.clone()))
@@ -116,6 +130,7 @@ impl Runtime {
     }
     pub fn failed(&self, lease: &Lease) {
         lease.failed.store(true, Ordering::Release);
+        self.responses.lock().retain(|(category, session, _), response| *category != lease.category || session != &lease.session || response.binding.ticket != lease.ticket);
         if let Some(state) = self.sessions.lock().get_mut(&(lease.category, lease.session.clone())) {
             if state.generation == lease.generation && state.binding.as_ref().is_some_and(|b| b.ticket == lease.ticket) {
                 state.binding = None;
@@ -134,7 +149,7 @@ impl Runtime {
         let mut activities = self.activities.lock();
         let activity = activities.entry(category).or_default();
         activity.category_id = Some(category);
-        activity.observed_at = chrono::Utc::now().timestamp_millis();
+        activity.observed_at = jiff::Timestamp::now().as_millisecond();
         update(activity);
     }
     pub fn judge_gate(&self, key: &str) -> Option<Arc<tokio::sync::Mutex<()>>> {

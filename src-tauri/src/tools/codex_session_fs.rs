@@ -368,7 +368,7 @@ pub(in crate::tools) fn backup_file(
     let dir = data_dir.join("backups").join(kind);
     fs::create_dir_all(&dir).map_err(|e| format!("建备份目录失败: {e}"))?;
     let stem = src.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let ts = format!("{}-{:04}", chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f"), seq() % 10_000);
+    let ts = format!("{}-{:04}", jiff::Timestamp::now().strftime("%Y%m%dT%H%M%S%.3f"), seq() % 10_000);
     let out = dir.join(format!("{stem}.{ts}.bak"));
     fs::copy(src, &out).map_err(|e| format!("备份 {} 失败: {e}", src.display()))?;
     prune_backups(&dir, keep);

@@ -425,9 +425,9 @@ pub(crate) fn spawn_background(store: &crate::store::Store) {
             tokio::time::sleep(FIRST_DELAY).await;
             loop {
                 let fetched = current().map(|s| s.fetched_at_ms);
-                if is_due(fetched, chrono::Utc::now().timestamp_millis()) {
+                if is_due(fetched, jiff::Timestamp::now().as_millisecond()) {
                     let result = fetch_from(MIRRORS, MAX_BODY_BYTES).await;
-                    apply(result, &config_path, chrono::Utc::now().timestamp_millis());
+                    apply(result, &config_path, jiff::Timestamp::now().as_millisecond());
                 }
                 tokio::time::sleep(CHECK_EVERY).await;
             }
@@ -472,7 +472,7 @@ pub(crate) fn status_line() -> String {
     let mut line = format!("内置表核对于 {}", s.builtin_date);
     match (s.online_rows, s.online_fetched_at_ms) {
         (n, Some(at)) if n > 0 => {
-            let when = chrono::DateTime::from_timestamp_millis(at).map(|d| d.to_rfc3339()).unwrap_or_default();
+            let when = crate::clock::from_millis(at).map(crate::clock::rfc3339).unwrap_or_default();
             line += &format!("；在线表 {n} 个模型（{}，拉取于 {when}）", s.online_source.unwrap_or_default());
         }
         _ => line += "；无在线表",

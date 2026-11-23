@@ -138,7 +138,7 @@ fn stats_safe(snapshot: &CodexSessionList) -> bool { snapshot.stats.metadata_fai
 
 fn time(row: &SessionRef, sort: &str) -> i64 {
     let text = if sort == "created" || row.updated_at.is_empty() { &row.timestamp } else { &row.updated_at };
-    chrono::DateTime::parse_from_rfc3339(text).map_or(0, |time| time.timestamp_millis())
+    crate::clock::parse(text).map_or(0, |time| time.as_millisecond())
 }
 
 fn project(row: &SessionRef) -> String {
@@ -165,11 +165,11 @@ fn select(snapshot: &CodexSessionList, query: &PageQuery) -> CodexSessionList {
         (if query.sort == "title" { left.title.to_lowercase().cmp(&right.title.to_lowercase()) } else { time(right, &query.sort).cmp(&time(left, &query.sort)) })
             .then_with(|| left.rel_path.cmp(&right.rel_path))
     });
-    let today = chrono::Local::now().date_naive();
+    let today = jiff::ZonedDateTime::now().date();
     let group_key = |row: &SessionRef| {
         if query.grouping == "project" { return project(row); }
-        let elapsed = chrono::DateTime::from_timestamp_millis(time(row, "updated")).filter(|_| time(row, "updated") != 0)
-            .map(|time| today.signed_duration_since(time.with_timezone(&chrono::Local).date_naive()).num_days());
+        let elapsed = crate::clock::from_millis(time(row, "updated")).filter(|_| time(row, "updated") != 0)
+            .and_then(|time| today.since(time.to_zoned_datetime(jiff::tz::TimeZone::system()).date()).ok().map(|span| span.get_days()));
         match elapsed { None => "unknown", Some(days) if days <= 0 => "today", Some(1) => "yesterday", Some(days) if days <= 6 => "week", _ => "older" }.into()
     };
     let mut group_order = HashMap::new();

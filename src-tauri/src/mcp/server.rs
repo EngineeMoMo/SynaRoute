@@ -9,13 +9,17 @@ pub(super) async fn serve(listener: TcpListener, store: Arc<Store>) {
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
                 let Ok((stream, _)) = accepted else { break };
+                let Ok(local) = stream.local_addr() else { continue };
                 if connections.len() >= crate::http_ingress::CONNECTION_LIMIT {
                     drop(stream);
                     continue;
                 }
                 let store = store.clone();
                 connections.spawn(async move {
-                    let svc = service_fn(move |req| handle_http(store.clone(), req));
+                    let svc = service_fn(move |mut req: Request<Incoming>| {
+                        req.extensions_mut().insert(crate::http_ingress::LocalAddress(local));
+                        handle_http(store.clone(), req)
+                    });
                     let _ = crate::http_ingress::http1()
                         .serve_connection(TokioIo::new(stream), svc).await;
                 });
@@ -38,7 +42,7 @@ mod tests {
             .unwrap();
         let task = tokio::spawn(serve(listener, store));
         stream
-            .write_all(b"GET /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(format!("GET /mcp HTTP/1.1\r\nHost: {}\r\n\r\n", stream.peer_addr().unwrap()).as_bytes())
             .await
             .unwrap();
         let mut buf = [0; 1024];

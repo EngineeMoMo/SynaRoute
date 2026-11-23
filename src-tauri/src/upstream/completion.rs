@@ -211,7 +211,7 @@ async fn anthropic_message(
         // `is_retriable_upstream_error` 的文档：401 + 响应体含「请检查网络连接」曾被误判可重试）。
         return Err(AppError::upstream_http_after(
             status.as_u16(),
-            format!("Anthropic HTTP {status}: {}", truncate_body(&crate::diagnostics::redact_secret(&raw, secret))),
+            format!("Anthropic HTTP {status}: {}", truncate_body(&super::error_redaction::body(key, secret, &raw))),
             retry_after,
         ));
     }
@@ -222,7 +222,7 @@ async fn anthropic_message(
     let text = parse_anthropic_text(&raw).ok_or_else(|| {
         AppError::upstream_http(
             status.as_u16(),
-            format!("Anthropic 响应无法解析: {}", truncate_body(&crate::diagnostics::redact_secret(&raw, secret))),
+            format!("Anthropic 响应无法解析: {}", truncate_body(&super::error_redaction::body(key, secret, &raw))),
         )
     })?;
     Ok(text)
@@ -261,7 +261,7 @@ async fn openai_chat(
         // 传真实状态码，理由同 `anthropic_message`。
         return Err(AppError::upstream_http_after(
             status.as_u16(),
-            format!("OpenAI HTTP {status}: {}", truncate_body(&crate::diagnostics::redact_secret(&raw, secret))),
+            format!("OpenAI HTTP {status}: {}", truncate_body(&super::error_redaction::body(key, secret, &raw))),
             retry_after,
         ));
     }
@@ -270,7 +270,7 @@ async fn openai_chat(
     let text = parse_openai_text(&raw).ok_or_else(|| {
         AppError::upstream_http(
             status.as_u16(),
-            format!("OpenAI 响应无法解析: {}", truncate_body(&crate::diagnostics::redact_secret(&raw, secret))),
+            format!("OpenAI 响应无法解析: {}", truncate_body(&super::error_redaction::body(key, secret, &raw))),
         )
     })?;
     Ok(text)

@@ -363,7 +363,7 @@ async fn handle_http(
     store: Arc<Store>,
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Err(status) = crate::http_ingress::check_origin(req.headers()) {
+    if let Err(status) = crate::http_ingress::check_host(&req).and_then(|()| crate::http_ingress::check_origin(req.headers())) {
         return Ok(json_response(status, rpc_error(Value::Null, -32600, "不允许的请求来源")));
     }
     // CORS 预检

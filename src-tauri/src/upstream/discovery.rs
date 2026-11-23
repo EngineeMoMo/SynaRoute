@@ -64,7 +64,7 @@ pub async fn fetch_models(key: &ProviderKey, secret: &str) -> AppResult<Vec<Stri
             // **把上游自己那句话带出来**：真机上 agentrouter.org 回的是
             // `unauthorized client detected`（客户端准入，不是密钥问题），
             // 而我们的 hint 说「请检查密钥是否填对」——方向相反。上游原文才是真因所在。
-            let body = crate::diagnostics::redact_secret(&super::response_body::text(resp).await.unwrap_or_default(), secret);
+            let body = super::error_redaction::body(key, secret, &super::response_body::text(resp).await.unwrap_or_default());
             let snippet: String = body.trim().chars().take(200).collect();
             last_err = if snippet.is_empty() {
                 format!("HTTP {status} @ {url}{hint}")
@@ -90,7 +90,7 @@ pub async fn fetch_models(key: &ProviderKey, secret: &str) -> AppResult<Vec<Stri
         let body: Value = match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(_) => {
-                last_err = non_json_models_hint(&url, &crate::diagnostics::redact_secret(&text, secret));
+                last_err = non_json_models_hint(&url, &super::error_redaction::body(key, secret, &text));
                 continue;
             }
         };

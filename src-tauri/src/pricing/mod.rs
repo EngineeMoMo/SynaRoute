@@ -855,7 +855,7 @@ mod tests {
     #[test]
     fn verified_on_is_a_real_date() {
         assert!(
-            chrono::NaiveDate::parse_from_str(PRICE_TABLE_VERIFIED_ON, "%Y-%m-%d").is_ok(),
+            jiff::civil::Date::strptime("%Y-%m-%d", PRICE_TABLE_VERIFIED_ON).is_ok(),
             "PRICE_TABLE_VERIFIED_ON 必须是 YYYY-MM-DD：{PRICE_TABLE_VERIFIED_ON}"
         );
     }

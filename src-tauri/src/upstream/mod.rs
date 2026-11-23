@@ -30,6 +30,7 @@ mod sse;
 pub(crate) mod sse_frames;
 #[cfg(test)] #[path = "sse_lifecycle_tests.rs"] mod sse_lifecycle_tests;
 mod error_hint;
+pub(crate) mod error_redaction;
 mod stream_idle;
 mod thinking_effort; // Anthropic 两套 thinking 形态 → 中枢档位；来由见该文件模块注释
 /// 文本模型拒绝图片时的被动剥图整流；与 `thinking_rectify` 同类（上游拒某种请求体→改体自愈）。

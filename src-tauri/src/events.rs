@@ -242,7 +242,7 @@ fn pump(rx: std::sync::mpsc::Receiver<Sig>) {
 
         // 发送。此时**不持有任何 Store 锁**，载荷里也没有任何 Store 数据。
         loop {
-            let now = chrono::Utc::now().timestamp_millis();
+            let now = jiff::Timestamp::now().as_millisecond();
             let (send, next_wake) = plan_emission(now, &last_sent, &pending);
             for sig in &send {
                 pending.remove(sig);
@@ -257,7 +257,7 @@ fn pump(rx: std::sync::mpsc::Receiver<Sig>) {
             }
             let Some(wake) = next_wake else { break };
             // 还有被压制的：睡到它可以发的时刻再补发（期间新到的信号会在下一轮 recv 里合并）。
-            let sleep_ms = (wake - chrono::Utc::now().timestamp_millis()).max(0) as u64;
+            let sleep_ms = (wake - jiff::Timestamp::now().as_millisecond()).max(0) as u64;
             std::thread::sleep(std::time::Duration::from_millis(sleep_ms.min(5_000)));
         }
     }

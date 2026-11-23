@@ -77,7 +77,7 @@ pub(crate) fn member_permits(category: CategoryType, limit: u32) -> Arc<Semaphor
 pub(crate) fn precheck_member(key: &ProviderKey) -> Option<String> {
     // ① 熔断窗口（真实流量连续失败触发）。聚合不做故障转移，跳过只为避免白等超时。
     if let Some(until) = key.health.breaker_until {
-        if until > chrono::Utc::now().timestamp_millis() {
+        if until > jiff::Timestamp::now().as_millisecond() {
             return Some("熔断窗口内，本轮跳过（聚合不做故障转移换 Key）".into());
         }
     }
@@ -176,14 +176,14 @@ mod tests {
 
         // ① 熔断窗口内
         let mut breaking = key_with("breaking");
-        breaking.health.breaker_until = Some(chrono::Utc::now().timestamp_millis() + 60_000);
+        breaking.health.breaker_until = Some(jiff::Timestamp::now().as_millisecond() + 60_000);
         assert!(
             precheck_member(&breaking)
                 .unwrap_or_default()
                 .contains("熔断")
         );
         // 已过期的熔断窗口不该继续挡（否则一条恢复了的 Key 永远回不来）。
-        breaking.health.breaker_until = Some(chrono::Utc::now().timestamp_millis() - 1);
+        breaking.health.breaker_until = Some(jiff::Timestamp::now().as_millisecond() - 1);
         assert!(precheck_member(&breaking).is_none());
 
         // ③ 余额已确定耗尽

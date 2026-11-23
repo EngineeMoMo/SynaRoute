@@ -186,7 +186,7 @@ pub async fn sanitize_legacy_backup(
         .set_title("另存已移除明文面板 Token 的备份副本")
         .set_file_name(format!(
             "synaroute-config-sanitized-{}.json",
-            chrono::Local::now().format("%Y%m%d-%H%M%S")
+            jiff::ZonedDateTime::now().strftime("%Y%m%d-%H%M%S")
         ))
         .add_filter("SynaRoute 配置", &["json"])
         .save_file(move |path| {

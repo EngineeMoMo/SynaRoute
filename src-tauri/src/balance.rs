@@ -499,7 +499,7 @@ fn parse_billing_usage_usd(body: &Value) -> Option<f64> {
 ///
 /// 与网络层分离，故可被单测直接喂各家的真实返回结构（见本文件测试）。
 pub fn extract_balance(body: &Value, custom_path: Option<&str>) -> BalanceResult {
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = jiff::Timestamp::now().as_millisecond();
 
     // 用户显式指定了路径就只认它：自动探测在这种情况下只会掩盖「路径填错了」。
     let remaining = match custom_path.map(str::trim).filter(|s| !s.is_empty()) {

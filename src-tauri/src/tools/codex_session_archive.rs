@@ -57,7 +57,7 @@ fn update_database(
     sqlite::backup_db(database, data_dir)?;
     let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     for (id, changed) in &mut matches {
         if !*changed {
             continue;
@@ -68,7 +68,7 @@ fn update_database(
         if affected == 0 {
             continue;
         }
-        for (column, value) in [("archived_at", now.timestamp()), ("archived_at_ms", now.timestamp_millis())] {
+        for (column, value) in [("archived_at", now.as_second()), ("archived_at_ms", now.as_millisecond())] {
             if columns.contains(column) {
                 transaction.execute(&format!("UPDATE threads SET {column} = ?1 WHERE id = ?2"),
                     rusqlite::params![archived.then_some(value), id.as_str()])

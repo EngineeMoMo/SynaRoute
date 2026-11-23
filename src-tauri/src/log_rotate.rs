@@ -140,7 +140,7 @@ pub(crate) fn file_name(date: &str, idx: u32) -> String {
 ///
 /// 严格拒绝其它形态（用户自己放的、旧版遗留的 `events.jsonl`、`2026-99-99.jsonl`）——
 /// **删错文件比留着旧日志严重得多**。
-pub(crate) fn parse_name(name: &str) -> Option<(chrono::NaiveDate, u32)> {
+pub(crate) fn parse_name(name: &str) -> Option<(jiff::civil::Date, u32)> {
     let stem = name.strip_suffix(".jsonl")?;
     // 先按「带序号」试：末尾一段全是数字且能剥出合法日期。
     if let Some((head, tail)) = stem.rsplit_once('.') {
@@ -149,19 +149,19 @@ pub(crate) fn parse_name(name: &str) -> Option<(chrono::NaiveDate, u32)> {
             if tail.len() > 1 && tail.starts_with('0') {
                 return None;
             }
-            if let Ok(d) = chrono::NaiveDate::parse_from_str(head, "%Y-%m-%d") {
+            if let Ok(d) = jiff::civil::Date::strptime("%Y-%m-%d", head) {
                 // 序号 0 也不接受：我们从不写 `.0.jsonl`，出现即来源不明。
                 let idx: u32 = tail.parse().ok()?;
                 return if idx == 0 { None } else { Some((d, idx)) };
             }
         }
     }
-    let d = chrono::NaiveDate::parse_from_str(stem, "%Y-%m-%d").ok()?;
+    let d = jiff::civil::Date::strptime("%Y-%m-%d", stem).ok()?;
     Some((d, 0))
 }
 
 /// 扫目录，返回某天已存在的序号（升序）。
-fn existing_indices(dir: &Path, date: &chrono::NaiveDate) -> Vec<u32> {
+fn existing_indices(dir: &Path, date: &jiff::civil::Date) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -199,7 +199,7 @@ impl OpenLog {
     /// 保证「判断满没满」只有一处判据。
     pub(crate) fn open(dir: PathBuf, date: String) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
-        let parsed = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok();
+        let parsed = jiff::civil::Date::strptime("%Y-%m-%d", &date).ok();
         let idx = parsed
             .as_ref()
             .and_then(|d| existing_indices(&dir, d).last().copied())
@@ -247,7 +247,7 @@ impl OpenLog {
     fn roll(&mut self) {
         let _ = self.w.flush();
         let next = self.idx + 1;
-        let Ok(date) = chrono::NaiveDate::parse_from_str(&self.date, "%Y-%m-%d") else {
+        let Ok(date) = jiff::civil::Date::strptime("%Y-%m-%d", &self.date) else {
             // 日期形态不对（不该发生）：不滚，继续写当前文件。
             // 同下面 open 失败那条 —— 必须退出「已达上限」状态，否则每行重试一次。
             self.give_up_rolling("日志文件名里的日期解析失败");
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn parse_name_accepts_both_forms_and_rejects_everything_else() {
-        let d = chrono::NaiveDate::from_ymd_opt(2026, 8, 27).unwrap();
+        let d = jiff::civil::Date::new(2026, 8, 27).unwrap();
         assert_eq!(parse_name("2026-08-27.jsonl"), Some((d, 0)));
         assert_eq!(parse_name("2026-08-27.1.jsonl"), Some((d, 1)));
         assert_eq!(parse_name("2026-08-27.15.jsonl"), Some((d, 15)));
@@ -398,8 +398,8 @@ mod tests {
     #[test]
     fn retention_also_deletes_rolled_shards_not_just_the_first_file() {
         let dir = tmp("retain_shards");
-        let today = chrono::Utc::now().date_naive();
-        let d = |off: i64| (today - chrono::Duration::days(off)).format("%Y-%m-%d").to_string();
+        let today = crate::clock::utc_date();
+        let d = |off: i64| (today - jiff::Span::new().days(off)).strftime("%Y-%m-%d").to_string();
 
         let expired_base = format!("{}.jsonl", d(super::super::LOG_RETAIN_DAYS + 1));
         let expired_shard = format!("{}.3.jsonl", d(super::super::LOG_RETAIN_DAYS + 1));
@@ -688,7 +688,7 @@ mod tests {
     #[ignore = "端到端实测（真写 16MB），手动跑：cargo test --lib openlog_rolls_end_to_end -- --ignored --nocapture"]
     fn openlog_rolls_end_to_end() {
         let dir = tmp("e2e");
-        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let date = jiff::Timestamp::now().strftime("%Y-%m-%d").to_string();
         let mut log = OpenLog::open(dir.clone(), date.clone()).unwrap();
 
         // 每行 1 KB，写到刚过单文件上限。

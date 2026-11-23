@@ -185,7 +185,7 @@ pub fn tool_defs(env: &ToolEnv) -> Vec<ToolDef> {
 ///
 /// 顺序有讲究：先判 `exists` 再判 `is_within_work_root`，因为后者在 canonicalize 失败时
 /// fail-closed，对一个根本不存在的路径会报出「疑似链接逃逸」这种误导性原因。
-fn resolve_readable(work_dir: &Path, rel: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_readable(work_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     // ① 字符串级：`..`、绝对路径、盘符、UNC
     if !is_safe_relative_path(rel) {
         return Err(format!(

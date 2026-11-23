@@ -2,7 +2,7 @@ use super::{config::{invalid, PrivacyConfig, PrivacyMode}, detectors::{self, Sca
 use crate::{error::AppResult, model::{CategoryType, Protocol}, store::Store};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 use zeroize::Zeroizing;
 
 const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
@@ -25,20 +25,35 @@ pub fn terms(store: &Store, config: &PrivacyConfig) -> AppResult<Zeroizing<Vec<S
     Ok(Zeroizing::new(terms))
 }
 
-fn argument_text<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+fn argument_text<'a>(value: &'a Value, out: &mut Vec<Cow<'a, str>>) {
     match value {
-        Value::String(text) => out.push(text),
-        Value::Array(values) => { for value in values { argument_text(value, out); } }
-        Value::Object(values) => { for value in values.values() { argument_text(value, out); } }
-        _ => {}
+        Value::String(text) => out.push(Cow::Borrowed(text)),
+        Value::Array(values) => { for value in values { out.push(Cow::Borrowed("\n")); argument_text(value, out); } }
+        Value::Object(values) => { for (key, value) in values {
+            out.extend([Cow::Borrowed("\n"), Cow::Borrowed(key.as_str()), Cow::Borrowed("=")]);
+            argument_text(value, out);
+        } }
+        Value::Number(number) => out.push(Cow::Owned(number.to_string())),
+        Value::Bool(value) => out.push(Cow::Borrowed(if *value { "true" } else { "false" })),
+        Value::Null => {}
     }
 }
 
-fn text_values<'a>(value: &'a Value, out: &mut Vec<&'a str>, unscanned: &mut bool) {
+fn is_text_block(value: &Value) -> bool {
+    matches!(value["type"].as_str(), Some("text" | "input_text" | "output_text")) && value["text"].is_string()
+}
+
+fn text_values<'a>(value: &'a Value, out: &mut Vec<Cow<'a, str>>, unscanned: &mut bool, merge_blocks: bool) {
     match value {
-        Value::String(s) => out.push(s),
+        Value::String(s) => out.push(Cow::Borrowed(s)),
         Value::Array(values) => {
-            for value in values { text_values(value, out, unscanned); }
+            let mut previous_text = false;
+            for value in values {
+                let text = is_text_block(value);
+                if !merge_blocks || !previous_text || !text { out.push(Cow::Borrowed("\n")); }
+                text_values(value, out, unscanned, merge_blocks);
+                previous_text = text;
+            }
         }
         Value::Object(object) => {
             let kind = object.get("type").and_then(Value::as_str).unwrap_or("");
@@ -49,6 +64,7 @@ fn text_values<'a>(value: &'a Value, out: &mut Vec<&'a str>, unscanned: &mut boo
             for (key, value) in object {
                 // Tool arguments are user data, not protocol envelopes: even name/type/source are text.
                 if kind == "tool_use" && key == "input" || key == "arguments" {
+                    out.push(Cow::Borrowed("\n"));
                     argument_text(value, out);
                     continue;
                 }
@@ -59,14 +75,17 @@ fn text_values<'a>(value: &'a Value, out: &mut Vec<&'a str>, unscanned: &mut boo
                 if matches!(key.as_str(), "id" | "call_id" | "tool_use_id" | "tool_call_id" | "name" | "role" | "type" | "model" | "cache_control" | "source") {
                     continue;
                 }
-                text_values(value, out, unscanned);
+                if key != "text" || !matches!(kind, "text" | "input_text" | "output_text") {
+                    out.push(Cow::Borrowed("\n"));
+                }
+                text_values(value, out, unscanned, merge_blocks);
             }
         }
         _ => {}
     }
 }
 
-fn collect_text(body: &Value, protocol: Protocol) -> AppResult<(String, bool)> {
+fn collect_text(body: &Value, protocol: Protocol, merge_blocks: bool) -> AppResult<(String, bool)> {
     if !body.is_object() { return Err(invalid("请求不是有效的 JSON 对象，无法执行敏感内容检查")); }
     let mut parts = Vec::new();
     let mut unscanned = false;
@@ -76,23 +95,33 @@ fn collect_text(body: &Value, protocol: Protocol) -> AppResult<(String, bool)> {
         Protocol::OpenaiResponses => &["instructions", "input", "tools"],
     };
     for field in fields {
-        if let Some(value) = body.get(*field) { text_values(value, &mut parts, &mut unscanned); }
+        if let Some(value) = body.get(*field) {
+            parts.push(Cow::Borrowed("\n"));
+            text_values(value, &mut parts, &mut unscanned, merge_blocks);
+        }
     }
     if body.get("previous_response_id").is_some_and(|v| !v.is_null()) { unscanned = true; }
     let total = parts.iter().try_fold(0usize, |size, s| size.checked_add(s.len()))
         .filter(|size| *size <= MAX_TEXT_BYTES).ok_or_else(|| invalid("文本超过敏感内容检查上限，未发送请求"))?;
     let mut text = String::with_capacity(total);
-    // Adjacent text blocks may split a credential; joining without separators keeps that detectable.
-    for part in parts { text.push_str(part); }
+    for part in parts { text.push_str(&part); }
     Ok((text, unscanned))
 }
 
 pub fn scan_request(body: &Value, protocol: Protocol, config: &PrivacyConfig, terms: &[String]) -> AppResult<Outcome> {
-    let (text, unscanned) = collect_text(body, protocol)?;
-    let text = Zeroizing::new(text);
-    let result = detectors::scan(&text, config, terms);
-    if result.limited { return Err(invalid("敏感内容命中数量超过检查上限，未发送请求")); }
-    Ok(Outcome { counts: result.counts, unscanned })
+    let mut outcome = Outcome::default();
+    for merge_blocks in [false, true] {
+        let (text, unscanned) = collect_text(body, protocol, merge_blocks)?;
+        let text = Zeroizing::new(text);
+        let result = detectors::scan(&text, config, terms);
+        if result.limited { return Err(invalid("敏感内容命中数量超过检查上限，未发送请求")); }
+        outcome.unscanned |= unscanned;
+        for (kind, count) in result.counts {
+            let existing = outcome.counts.entry(kind).or_default();
+            *existing = (*existing).max(count);
+        }
+    }
+    Ok(outcome)
 }
 
 pub fn enforce(store: &Store, category: CategoryType, body: &Value, protocol: Protocol, config: &PrivacyConfig) -> AppResult<Outcome> {
@@ -138,6 +167,35 @@ pub async fn preview_sensitive_content(state: tauri::State<'_, crate::AppState>,
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn structured_credentials_keep_keys_and_scalar_values() {
+        for input in [json!({"password":"private-fixture"}), json!({"nested":[{"access_token":"private-fixture"}]}), json!({"password":12345678})] {
+            for (protocol, body) in [
+                (Protocol::Anthropic, json!({"messages":[{"role":"assistant","content":[{"type":"tool_use","input":input}]}]})),
+                (Protocol::OpenaiChat, json!({"messages":[{"role":"assistant","tool_calls":[{"function":{"arguments":input}}]}]})),
+                (Protocol::OpenaiResponses, json!({"input":[{"type":"function_call","arguments":input}]})),
+            ] {
+                let result = scan_request(&body, protocol, &PrivacyConfig::default(), &[]).unwrap();
+                assert_eq!(result.counts.get("credential"), Some(&1), "{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn independent_messages_and_fields_preserve_detector_boundaries() {
+        let token = format!("sk-proj-{}", "F".repeat(30));
+        for (protocol, body) in [
+            (Protocol::Anthropic, json!({"system":"You are helpful","messages":[{"role":"user","content":token}]})),
+            (Protocol::OpenaiChat, json!({"messages":[{"role":"system","content":"You are helpful"},{"role":"user","content":token}]})),
+            (Protocol::OpenaiResponses, json!({"instructions":"You are helpful","input":token})),
+            (Protocol::Anthropic, json!({"messages":[{"role":"user","content":[{"type":"text","text":"prefix"},{"type":"text","text":token}]}]})),
+            (Protocol::OpenaiResponses, json!({"input":[{"type":"function_call","arguments":{"first":"ordinary","second":token}}]})),
+        ] {
+            let result = scan_request(&body, protocol, &PrivacyConfig::default(), &[]).unwrap();
+            assert_eq!(result.counts.get("api_key"), Some(&1));
+        }
+    }
+
     #[test]
     fn tool_argument_keys_are_not_protocol_metadata() {
         for field in ["name", "type", "source", "id", "model", "signature", "encrypted_content"] {

@@ -98,18 +98,21 @@ pub fn identify(hints: &Hints, body: &Value, category: CategoryType, protocol: P
         first.get_or_insert(message);
         latest = Some((index, message, text));
     }
-    let (index, message, prompt) = latest?;
+    let continuation = (protocol == Protocol::OpenaiResponses).then(|| body.get("previous_response_id")).flatten().filter(|value| !value.is_null());
+    if latest.is_none() && continuation.is_none() { return None; }
     let peer = match peer {
         IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v)),
         value => value,
     };
     let peer_scope = if peer.is_loopback() { "loopback".to_owned() } else { peer.to_string() };
-    // A native ID is required; the prefix only partitions branches sharing that ID.
-    let first = super::hash_bytes(&serde_json::to_vec(first?).ok()?);
+    let first = if protocol == Protocol::OpenaiResponses { None } else { Some(super::hash_bytes(&serde_json::to_vec(first?).ok()?)) };
     let session = super::hash_bytes(&serde_json::to_vec(&(category.as_str(), protocol_name(protocol), peer_scope, id, &hints.branch, first)).ok()?);
-    let turn = super::hash_bytes(&serde_json::to_vec(&(user_count, message)).ok()?);
-    Some(Identity { session, turn, position: user_count, new_turn: index + 1 == messages.len(),
-        prompt: (!prompt.trim().is_empty() && prompt.len() <= 24_000).then_some(prompt), source })
+    let turn = if continuation.is_some() {
+        super::hash_bytes(&serde_json::to_vec(&(continuation, &body["input"])).ok()?)
+    } else { super::hash_bytes(&serde_json::to_vec(&(user_count, latest.as_ref()?.1)).ok()?) };
+    let new_turn = latest.as_ref().is_some_and(|(index, _, _)| index + 1 == messages.len());
+    let prompt = latest.map(|(_, _, prompt)| prompt).filter(|prompt| !prompt.trim().is_empty() && prompt.len() <= 24_000);
+    Some(Identity { session, turn, position: user_count, new_turn, prompt, source })
 }
 
 pub fn opaque_history(body: &Value) -> bool {
@@ -117,7 +120,7 @@ pub fn opaque_history(body: &Value) -> bool {
         match value {
             Value::Object(obj) => obj.get("encrypted_content").is_some_and(|v| !v.is_null())
                 || obj.get("signature").is_some_and(|v| !v.is_null())
-                || obj.get("type").and_then(Value::as_str) == Some("item_reference")
+                || matches!(obj.get("type").and_then(Value::as_str), Some("item_reference" | "redacted_thinking"))
                 || obj.values().any(has_opaque),
             Value::Array(values) => values.iter().any(has_opaque),
             _ => false,
@@ -130,6 +133,13 @@ pub fn opaque_history(body: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn redacted_thinking_is_opaque_even_before_a_new_user_turn() {
+        let body = json!({"messages":[{"role":"assistant","content":[{"type":"redacted_thinking","data":"opaque"}]},{"role":"user","content":"continue"}]});
+        assert!(opaque_history(&body));
+        assert!(!opaque_history(&json!({"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"plain"}]}]})));
+    }
+
     fn hints(category: CategoryType, id: &str) -> Hints {
         Hints { peer: Some("127.0.0.1".parse().unwrap()), claude: (category != CategoryType::Codex).then(|| id.into()), codex: (category == CategoryType::Codex).then(|| id.into()), ..Default::default() }
     }

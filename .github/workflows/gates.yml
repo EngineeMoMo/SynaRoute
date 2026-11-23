@@ -94,3 +94,18 @@ jobs:
       - name: cargo test（第 2 遍，抓偶发）
         working-directory: ./src-tauri
         run: cargo test --lib
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Build assets for native CSP acceptance
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build
+
+      - name: Native WebView CSP acceptance
+        working-directory: ./src-tauri
+        run: cargo test --locked --features native-acceptance,custom-protocol --test security_webview -- --ignored --nocapture --test-threads=1

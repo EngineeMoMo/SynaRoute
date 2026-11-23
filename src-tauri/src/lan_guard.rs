@@ -399,6 +399,7 @@ pub(crate) fn guarded(
     category: crate::model::CategoryType,
     gate_key: String,
     peer: SocketAddr,
+    local: SocketAddr,
 ) -> impl hyper::service::Service<
     Request<Incoming>,
     Response = Response<crate::proxy::ResBody>,
@@ -407,6 +408,7 @@ pub(crate) fn guarded(
 > {
     service_fn(move |mut req: Request<Incoming>| {
         req.extensions_mut().insert(crate::store::routing::identity::VerifiedPeer(peer.ip()));
+        req.extensions_mut().insert(crate::http_ingress::LocalAddress(local));
         let store = store.clone();
         let gate_key = gate_key.clone();
         async move {
@@ -747,7 +749,7 @@ mod tests {
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             // 刻意不用真实对端地址：要验的是「guard 按传入的 peer 判定」这条接线。
-            let svc = guarded(store_srv, crate::model::CategoryType::ClaudeCli, String::new(), lan());
+            let svc = guarded(store_srv, crate::model::CategoryType::ClaudeCli, String::new(), lan(), stream.local_addr().unwrap());
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
                 .await;
@@ -1064,7 +1066,7 @@ mod tests {
         let store_srv = store.clone();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let svc = guarded(store_srv, crate::model::CategoryType::ClaudeCli, String::new(), lan());
+            let svc = guarded(store_srv, crate::model::CategoryType::ClaudeCli, String::new(), lan(), stream.local_addr().unwrap());
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
                 .await;

@@ -706,7 +706,7 @@ impl ToolSession {
             if !status2.is_success() {
                 return Err(AppError::upstream_http_after(
                     status2.as_u16(),
-                    format!("{label} HTTP {status2}: {}", truncate_body(&crate::diagnostics::redact_secret(&raw2, p.secret))),
+                    format!("{label} HTTP {status2}: {}", truncate_body(&super::error_redaction::body(key, p.secret, &raw2))),
                     retry_after2,
                 ));
             }
@@ -714,7 +714,7 @@ impl ToolSession {
             return parse_anthropic_turn(&raw2).ok_or_else(|| {
                 AppError::upstream_http(
                     status2.as_u16(),
-                    format!("{label} 响应无法解析: {}", truncate_body(&crate::diagnostics::redact_secret(&raw2, p.secret))),
+                    format!("{label} 响应无法解析: {}", truncate_body(&super::error_redaction::body(key, p.secret, &raw2))),
                 )
             });
         }
@@ -722,7 +722,7 @@ impl ToolSession {
         if !status.is_success() {
             return Err(AppError::upstream_http_after(
                 status.as_u16(),
-                format!("{label} HTTP {status}: {}", truncate_body(&crate::diagnostics::redact_secret(&raw, p.secret))),
+                format!("{label} HTTP {status}: {}", truncate_body(&super::error_redaction::body(key, p.secret, &raw))),
                 retry_after,
             ));
         }
@@ -740,7 +740,7 @@ impl ToolSession {
         if let Some(msg) = super::body_is_upstream_error(raw.as_bytes()) {
             return Err(AppError::upstream_http(
                 status.as_u16(),
-                format!("{label} 上游回了 HTTP {status} 但正文是一个错误：{msg}"),
+                format!("{label} 上游回了 HTTP {status} 但正文是一个错误：{}", super::error_redaction::body(key, p.secret, &msg)),
             ));
         }
         // 记 token 用量(含 cache_read/cache_creation)。命中缓存时 cache_read 会显著大于 0,
@@ -754,7 +754,7 @@ impl ToolSession {
         parsed.ok_or_else(|| {
             AppError::upstream_http(
                 status.as_u16(),
-                format!("{label} 响应无法解析: {}", truncate_body(&crate::diagnostics::redact_secret(&raw, p.secret))),
+                format!("{label} 响应无法解析: {}", truncate_body(&super::error_redaction::body(key, p.secret, &raw))),
             )
         })
     }

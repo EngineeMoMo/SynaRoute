@@ -11,6 +11,7 @@ use crate::health;
 use crate::model::{CategoryType, Protocol, ProviderKey, RequestTrace};
 use crate::store::Store;
 use bytes::Bytes;
+use futures_util::FutureExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
@@ -28,7 +29,7 @@ use tokio::task::JoinHandle;
 #[path = "model_pool.rs"] pub(crate) mod model_pool; // 对外模型并集 + 模型感知路由；来由见该文件模块注释
 #[path = "proxy/soft_error.rs"] mod soft_error; // 非流式「200 包着错误」的降级；调用**必须**排在 outcome.ok 守卫之前（有判据钉着），来由见该文件模块注释
 #[path = "proxy/codex_images.rs"] mod codex_images;
-pub(crate) mod active_requests; mod streaming; pub(crate) mod key_chat; mod request_body;
+pub(crate) mod active_requests; mod streaming; mod stream_redaction; pub(crate) mod key_chat; mod request_body;
 // 对外可选模型集的**唯一**实现。re-export 而不是留一层包装函数：包装函数会让
 // 「proxy.rs 生产段里不许有第二份并集实现」那条源码级判据失去意义。
 pub(crate) use model_pool::discoverable_models;
@@ -108,7 +109,7 @@ fn all_failed_gate() -> &'static Mutex<HashMap<String, GateEntry>> {
 }
 
 fn arm_all_failed_gate(gate_key: &str, retry_after_secs: Option<i64>) {
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = jiff::Timestamp::now().as_millisecond();
     let new_until = now + ALL_FAILED_SHORT_CIRCUIT_MS;
     let new_retry_at = retry_after_secs.map(|s| now + s.saturating_mul(1000));
 
@@ -149,7 +150,7 @@ fn prune_all_failed_gates(gate: &mut HashMap<String, GateEntry>, now: i64) {
 }
 
 fn all_failed_gate_remaining(gate_key: &str) -> Option<(i64, i64)> {
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = jiff::Timestamp::now().as_millisecond();
     let mut gate = all_failed_gate().lock();
     match gate.get(gate_key).copied() {
         Some(e) if e.until_ms > now => {
@@ -193,8 +194,17 @@ fn model_gate_key(namespace: &str, model: &str) -> String {
 
 pub struct ProxyManager {
     store: Arc<Store>,
-    running: Mutex<HashMap<CategoryType, RunningProxy>>,
+    running: Mutex<ProxyLifecycle>,
+    start_gate: tokio::sync::Mutex<()>,
+    pub(crate) settings_gate: tokio::sync::Mutex<()>,
     gate_ns: u64,
+}
+
+#[derive(Default)]
+struct ProxyLifecycle {
+    entries: HashMap<CategoryType, RunningProxy>,
+    stopped: Vec<futures_util::future::Shared<futures_util::future::BoxFuture<'static, ()>>>,
+    revisions: HashMap<CategoryType, u64>,
 }
 
 impl ProxyManager {
@@ -203,7 +213,8 @@ impl ProxyManager {
         static NEXT_NS: AtomicU64 = AtomicU64::new(0);
         Self {
             store,
-            running: Mutex::new(HashMap::new()),
+            running: Mutex::new(ProxyLifecycle::default()),
+            start_gate: tokio::sync::Mutex::new(()), settings_gate: tokio::sync::Mutex::new(()),
             gate_ns: NEXT_NS.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -212,24 +223,32 @@ impl ProxyManager {
         gate_key_of(self.gate_ns, category)
     }
 
-    pub fn port_of(&self, category: CategoryType) -> Option<u16> {
-        self.running.lock().get(&category).map(|p| p.port)
-    }
-
-    pub fn is_running(&self, category: CategoryType) -> bool {
-        self.running.lock().contains_key(&category)
-    }
+    pub fn port_of(&self, category: CategoryType) -> Option<u16> { self.running.lock().entries.get(&category).map(|p| p.port) }
+    pub fn is_running(&self, category: CategoryType) -> bool { self.running.lock().entries.contains_key(&category) }
 
     pub async fn start(&self, category: CategoryType) -> AppResult<u16> {
-        if let Some(p) = self.port_of(category) {
-            return Ok(p);
-        }
+        let _settings = self.settings_gate.lock().await; let _guard = self.start_gate.lock().await;
+        self.start_locked(category).await
+    }
+
+    pub(crate) async fn restart(&self, category: CategoryType) -> AppResult<u16> {
+        let _guard = self.start_gate.lock().await;
+        self.stop(category);
+        self.start_locked(category).await
+    }
+
+    async fn start_locked(&self, category: CategoryType) -> AppResult<u16> {
+        if let Some(port) = self.port_of(category) { return Ok(port); }
+        let (revision, stopped) = {
+            let state = self.running.lock();
+            (*state.revisions.get(&category).unwrap_or(&0), state.stopped.clone())
+        };
+        for handle in stopped { handle.await; }
+        self.running.lock().stopped.retain(|handle| handle.peek().is_none());
         let settings = self.store.get_settings();
         let lan = settings.lan_exposure;
         if lan { lan_guard::ensure_token(&self.store); } // 先备好令牌+落事件，否则用户看不到它
 
-        // 粘滞固定端口 + 双栈绑定，判据都在 `proxy_listen`（含「为什么 v6 必须 only_v6」）。
-        // 端口粘滞的理由：客户端配置只在它自己启动时读一次，端口漂移会让它追不上。
         let preferred = settings
             .proxy_ports
             .get(&category)
@@ -239,12 +258,12 @@ impl ProxyManager {
             .await
             .map_err(AppError::Proxy)?;
         let port = bound.port;
-        // 端口粘滞：实际绑定端口若与首选不同（回退了），写回配置作为下次首选，避免每次都回退漂移。
         if settings.proxy_ports.get(&category).copied() != Some(port) {
-            let _ = self.store.set_proxy_port(category, port);
+            self.store.set_proxy_port(category, port)?;
         }
 
-        // 关闭信号通道：stop() 时 send(true)，accept 循环退出、每个连接任务 select 到即断开。
+        let mut running = self.running.lock();
+        if *running.revisions.get(&category).unwrap_or(&0) != revision { return Err(AppError::Proxy("代理启动已被停止操作取消".into())); }
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let store = self.store.clone();
         let accept_shutdown = shutdown_rx.clone();
@@ -257,6 +276,7 @@ impl ProxyManager {
                     accepted = proxy_listen::accept_either(&bound) => {
                         // peer 是局域网鉴权的唯一依据，**别再丢回 `_`** —— 丢了就只能放行所有人。
                         let Ok((stream, peer)) = accepted else { break };
+                        let Ok(local) = stream.local_addr() else { continue };
                         let Ok(permit) = connections.clone().try_acquire_owned() else { continue };
                         let io = TokioIo::new(stream);
                         let store = store.clone();
@@ -264,7 +284,7 @@ impl ProxyManager {
                         let mut conn_shutdown = shutdown_rx.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
-                            let svc = lan_guard::guarded(store, category, gate_key, peer);
+                            let svc = lan_guard::guarded(store, category, gate_key, peer, local);
                             let conn = crate::http_ingress::http1()
                                 .serve_connection(io, svc);
                             tokio::pin!(conn);
@@ -280,27 +300,11 @@ impl ProxyManager {
             }
         });
 
-        // 竞态处理（并发 start 同一分类）：绑定发生在 await 期间、锁外，故拿锁后再检查一次。
-        // 若别的调用已插入，则放弃我们刚建的这套（发关闭信号 + abort，释放刚绑的端口），
-        // 返回已存在的端口——避免泄漏一个无法再被 stop 的监听器。
-        let mut running = self.running.lock();
-        if let Some(existing) = running.get(&category) {
-            let _ = shutdown_tx.send(true);
-            handle.abort();
-            return Ok(existing.port);
-        }
-        // 启动即解除该分类的「全部 Key 失败」短路窗口。
-        //
-        // 窗口原本只有两条解除路径——一次成功转发或自然到期（5s）。而「停止代理 → 换/修好 Key
-        // → 重新启动」是用户已经介入的明确信号，此前被忽略，导致刚点启动后最长 5s 内的请求
-        // 仍被挡成失败，用户视角是「刚点了启动却说全部 Key 不可用」。
         clear_all_failed_gate(&self.gate_key(category));
-        running.insert(
+        running.entries.insert(
             category,
             RunningProxy { port, handle, shutdown: shutdown_tx },
         );
-        // 显式放锁再 emit。这个 guard 是在 318 行取的、本来会活到函数末尾 ——
-        // 「emit 前放光锁」的纪律见 events::emit 的文档。
         drop(running);
         crate::events::emit(crate::events::Topic::Proxy, Some(category));
         Ok(port)
@@ -308,24 +312,20 @@ impl ProxyManager {
 
     pub fn stop(&self, category: CategoryType) {
         self.store.routing_runtime.reset(category);
-        // 必须先把 guard 取出来再用：写成 `if let Some(p) = self.running.lock().remove(..)`
-        // 的话，那个临时 MutexGuard 会活到整个 if-let 语句结束，emit 就落在持锁期间了。
-        // 泵的设计让持锁 emit 也不至于死锁，但「emit 前放光锁」这条纪律要守住 ——
-        // 它防的是将来有人把泵简化掉、换成直接 app.emit 时悄悄埋雷。
         let was_running = {
             let mut running = self.running.lock();
-            match running.remove(&category) {
+            *running.revisions.entry(category).or_default() += 1;
+            match running.entries.remove(&category) {
                 Some(p) => {
                     // 先广播关闭信号（断开已建立的 keep-alive 连接），再 abort accept 循环。
                     let _ = p.shutdown.send(true);
                     p.handle.abort();
+                    running.stopped.push(p.handle.map(|_| ()).boxed().shared());
                     true
                 }
                 None => false,
             }
         };
-        // 停止时也清一次：代理已不在服务，残留的短路窗口对下一次启动毫无意义（语义更干净，
-        // 也让「stop → 立刻 start」这条路径不依赖 start 侧的清理）。
         clear_all_failed_gate(&self.gate_key(category));
         if was_running {
             crate::events::emit(crate::events::Topic::Proxy, Some(category));
@@ -334,11 +334,9 @@ impl ProxyManager {
 
     pub fn stop_all(&self) -> usize {
         for category in CategoryType::ALL { self.store.routing_runtime.reset(category); }
-        // 一次性取走全部句柄，锁内只做 remove、不做 I/O。
-        let handles: Vec<RunningProxy> = {
-            let mut running = self.running.lock();
-            running.drain().map(|(_, p)| p).collect()
-        };
+        let mut running = self.running.lock();
+        for category in CategoryType::ALL { *running.revisions.entry(category).or_default() += 1; }
+        let handles: Vec<RunningProxy> = running.entries.drain().map(|(_, p)| p).collect();
         let n = handles.len();
         for p in &handles {
             // 先广播「关闭」，让在途连接走干净的收尾路径。
@@ -346,6 +344,7 @@ impl ProxyManager {
         }
         for p in handles {
             p.handle.abort();
+            running.stopped.push(p.handle.map(|_| ()).boxed().shared());
         }
         n
     }
@@ -380,7 +379,7 @@ async fn handle_request_inner(
     // 本地副本：`log_success` / `log_request` 两个闭包要按值捕获它写进 `RequestTrace`，
     // 而 `meta` 全程要可变借用（沿路填字段）。借一次 String 比让闭包持有 `&mut meta` 简单得多。
     let request_id = meta.request_id.clone();
-    if let Err(status) = crate::http_ingress::check_origin(req.headers()) {
+    if let Err(status) = crate::http_ingress::check_host(&req).and_then(|()| crate::http_ingress::check_origin(req.headers())) {
         return Ok(error_resp(status, "不允许的请求来源"));
     }
     // 保留完整路径 + query（如 /v1/messages/count_tokens?beta=true）：同协议转发时原样透传，
@@ -1050,7 +1049,7 @@ async fn handle_request_inner(
         }
 
         let result =
-            forward_to_key(&store, category, key, &path, &mut req_json, &requested_model, &fwd_headers, req_log, remaining, &active)
+            forward_to_key(&store, category, key, &path, &mut req_json, &requested_model, &fwd_headers, req_log, remaining, route.lease.as_ref(), &active)
                 .await;
         let elapsed = started.elapsed().as_millis() as u64;
         // 诊断头：本次尝试耗时。放在这里（三个分支之前）而不是各分支里 ——
@@ -1075,6 +1074,7 @@ async fn handle_request_inner(
                 // 非流式有完整响应体 → 能真取到 token 用量（两协议字段名已在
                 // extract_usage 里归一）。上游没给用量时返回 None，日志如实不显示。
                 let parsed_body = serde_json::from_slice::<Value>(&outcome.bytes).ok();
+                if let Some(body) = &parsed_body { route.observe_response(&store, key, &outcome.real_model, downstream, body); }
                 let usage = parsed_body.as_ref().and_then(crate::upstream::extract_usage);
                 // 检测截断：finish_reason:"length"（OpenAI）/ stop_reason:"max_tokens"（Anthropic）
                 let was_truncated = parsed_body.as_ref().and_then(|v| {
@@ -1373,8 +1373,7 @@ async fn try_stream_to_key(
     // 武装短路窗口 + 计入熔断，客户端据此无限退避重试 —— 而这个问题**永不自愈**
     // （密钥根本没存进去，或主口令未解锁），用户还会以为是中转站过载、方向完全错。
     // Invalid 走硬错误分支：原样回 400、不熔断好 Key、不退避，把可行动原因直接摆给客户端。
-    let secret = store
-        .secret_for(&key.id)?
+    let secret = crate::store::routing::upstream_identity::secret_for_request(store, key, route_lease.as_ref())?
         .ok_or_else(|| {
             AppError::Invalid(format!(
                 "Key「{}」没有可用的密钥：请在 Key 编辑器里填写 API 密钥并保存（若已启用主口令，请先解锁后重试）。",
@@ -1512,7 +1511,7 @@ async fn try_stream_to_key(
     // 候选一个都轮不到,而 stream:true 是主路径。读不全无所谓,宁可给「读取超时」占位。
     let read_err_body = |resp: reqwest::Response| async {
         match tokio::time::timeout_at(deadline, active.read_body(resp)).await {
-            Ok(Ok(b)) => crate::diagnostics::redact_secret(&String::from_utf8_lossy(&b), secret.as_str()),
+            Ok(Ok(b)) => stream_redaction::Redactor::new(key, &secret).body(&b),
             Ok(Err(e)) => format!("（错误体读取失败：{e}）"),
             Err(_) => format!("（错误体读取超时：{}ms 内未读完，已按失败切换下一个候选）", probe_to.as_millis()),
         }
@@ -1545,7 +1544,7 @@ async fn try_stream_to_key(
         let (namespaces, custom_tools, search_tools) = tool_sets.expect("sse_dir 为 Some 时 tool_sets 必然已收集");
         crate::upstream::SseTranslator::with_namespaces_and_custom(dir, namespaces, custom_tools, search_tools)
     });
-    let response = streaming::response(resp, permit, store, category, key, requested_model, &real_model,
+    let response = streaming::response(resp, permit, store, category, key, secret.as_str(), requested_model, &real_model,
         downstream, translator, route_lease, active.clone())?;
 
     // 转换后发往上游的请求体快照（供调用模型日志核对 reasoning→thinking 等映射）。
@@ -1728,12 +1727,11 @@ async fn forward_to_key(
     // 故障转移剩余预算；None = 用户关闭了整体预算。与 Key 自身超时取**小**值：
     // 谁先到谁生效，既不让单个慢 Key 吃光整池预算，也不放宽用户为该 Key 设的上限。
     budget_left: Option<std::time::Duration>,
-    active: &active_requests::Control,
+    route_lease: Option<&crate::store::routing::runtime::Lease>, active: &active_requests::Control,
 ) -> AppResult<ForwardOutcome> {
     // 同 try_stream_to_key：走带解密缓存的 secret_for（P2-6）。
     // 密钥缺失同样判 `Invalid`（本地配置错误、永不自愈），理由见流式那处的完整说明。
-    let secret = store
-        .secret_for(&key.id)?
+    let secret = crate::store::routing::upstream_identity::secret_for_request(store, key, route_lease)?
         .ok_or_else(|| {
             AppError::Invalid(format!(
                 "Key「{}」没有可用的密钥：请在 Key 编辑器里填写 API 密钥并保存（若已启用主口令，请先解锁后重试）。",
@@ -1853,7 +1851,7 @@ async fn forward_to_key(
     let mut status = resp.status();
     // Retry-After 须在 resp.bytes() 消费响应体之前取（bytes() 拿走所有权）。
     let mut retry_after = parse_retry_after(resp.headers());
-    let mut bytes = crate::diagnostics::redact_upstream_error_bytes(status.as_u16(), active.read_body(resp).await?, secret.as_str());
+    let mut bytes = stream_redaction::error_bytes(status.as_u16(), active.read_body(resp).await?, key, &secret);
     if !status.is_success() { payload.detach(); }
 
     // max_tokens 钳小后越界，见 `rectify_on_budget_error`）→ 就地降/关预算再打一次这条 Key。
@@ -1875,7 +1873,7 @@ async fn forward_to_key(
             .map_err(|error| AppError::upstream_msg(crate::diagnostics::connection_error(&url, error)))?;
         status = resp.status();
         retry_after = parse_retry_after(resp.headers());
-        bytes = crate::diagnostics::redact_upstream_error_bytes(status.as_u16(), active.read_body(resp).await?, secret.as_str());
+        bytes = stream_redaction::error_bytes(status.as_u16(), active.read_body(resp).await?, key, &secret);
     }
 
     // 跨协议响应翻译：上游 2xx 时，把响应体从上游协议翻译回下游客户端期望的协议格式。
@@ -2291,8 +2289,8 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
         return Some(secs.clamp(0, MAX_RETRY_AFTER_SECS));
     }
     // 形态二：HTTP-date（如 `Wed, 21 Oct 2026 07:28:00 GMT`）→ 换算成相对秒数。
-    let when = chrono::DateTime::parse_from_rfc2822(raw).ok()?;
-    let delta = when.timestamp() - chrono::Utc::now().timestamp();
+    let when = jiff::fmt::rfc2822::DateTimeParser::new().parse_timestamp(raw).ok()?;
+    let delta = when.as_second() - jiff::Timestamp::now().as_second();
     Some(delta.clamp(0, MAX_RETRY_AFTER_SECS))
 }
 
@@ -4042,7 +4040,7 @@ mod tests {
                 crate::model::HealthState {
                     status: crate::model::HealthStatus::Down,
                     fail_count: 3,
-                    breaker_until: Some(chrono::Utc::now().timestamp_millis() + 600_000),
+                    breaker_until: Some(jiff::Timestamp::now().as_millisecond() + 600_000),
                     ..Default::default()
                 },
             )
@@ -4206,7 +4204,7 @@ mod tests {
             display_name: None,
         }];
         k1.health.breaker_until =
-            Some(chrono::Utc::now().timestamp_millis() + 60_000);
+            Some(jiff::Timestamp::now().as_millisecond() + 60_000);
         let mut k2 = key("as2", 1, "http://127.0.0.1:1");
         k2.category_id = CategoryType::ClaudeDesktop;
         k2.models = vec![mi("real-b")];
@@ -4761,17 +4759,17 @@ mod tests {
         assert_eq!(parse_retry_after(&h), Some(30));
 
         // 形态二：HTTP-date（RFC 7231 允许）。取相对秒数，允许 ±2s 抖动。
-        let future = chrono::Utc::now() + chrono::Duration::seconds(60);
-        let date = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let future = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(60);
+        let date = future.strftime("%a, %d %b %Y %H:%M:%S GMT").to_string();
         h.insert(RETRY_AFTER, HeaderValue::from_str(&date).unwrap());
         let got = parse_retry_after(&h).expect("HTTP-date 形态应能解析");
         assert!((58..=62).contains(&got), "HTTP-date 应换算成约 60s，实际 {got}");
 
         // 已过期的 HTTP-date → 夹到 0（不产生负数退避）。
-        let past = chrono::Utc::now() - chrono::Duration::seconds(120);
+        let past = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(120);
         h.insert(
             RETRY_AFTER,
-            HeaderValue::from_str(&past.format("%a, %d %b %Y %H:%M:%S GMT").to_string()).unwrap(),
+            HeaderValue::from_str(&past.strftime("%a, %d %b %Y %H:%M:%S GMT").to_string()).unwrap(),
         );
         assert_eq!(parse_retry_after(&h), Some(0));
 

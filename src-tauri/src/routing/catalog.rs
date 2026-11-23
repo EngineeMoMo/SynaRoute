@@ -36,7 +36,7 @@ pub fn fingerprint(keys: &[ProviderKey], active: Option<&String>, revision: u64,
     let material: Vec<_> = keys.iter().map(|k| serde_json::json!([
         k.id, k.enabled, k.priority, k.base_url, k.protocol, k.models, k.mappings,
         k.default_model, k.tier_haiku, k.tier_sonnet, k.tier_opus, k.tier_fable,
-        k.allow_named_model_fallback
+        k.allow_named_model_fallback, k.headers_json
     ])).collect();
     hash_bytes(&serde_json::to_vec(&(material, active, revision, model)).unwrap_or_default())
 }

@@ -66,7 +66,7 @@ impl ProfileStore {
     pub fn load(path: PathBuf) -> Self {
         let fresh = || ProfileSnapshot {
             version: 1,
-            since: chrono::Utc::now().timestamp_millis(),
+            since: jiff::Timestamp::now().as_millisecond(),
             rows: vec![],
             dropped: 0,
             read_only: false,
@@ -121,7 +121,7 @@ impl ProfileStore {
             ok,
             status,
             latency,
-            chrono::Utc::now().timestamp_millis(),
+            jiff::Timestamp::now().as_millisecond(),
         );
     }
 
@@ -208,7 +208,7 @@ impl ProfileStore {
 
     pub fn snapshot(&self) -> ProfileSnapshot {
         let mut s = self.state.lock().snapshot.clone();
-        let day = chrono::Utc::now().timestamp_millis().div_euclid(DAY_MS);
+        let day = jiff::Timestamp::now().as_millisecond().div_euclid(DAY_MS);
         s.rows.retain(|r| r.day >= day - 29 && r.day <= day);
         s
     }
@@ -247,7 +247,7 @@ mod tests {
             id: "one".into(),
             ..Default::default()
         };
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = jiff::Timestamp::now().as_millisecond();
         store.record_at(&key, "alias", "model", true, true, Some(200), 80, now);
         store.record_at(&key, "alias", "model", true, false, Some(429), 999, now);
         store.record_at(&key, "alias", "model", false, true, Some(200), 400, now);
@@ -282,7 +282,7 @@ mod tests {
         let path = dir.join("profiles.json");
         let store = ProfileStore::load(path.clone());
         let mut key = ProviderKey { id: "latest-first".into(), name: "Original name".into(), ..Default::default() };
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = jiff::Timestamp::now().as_millisecond();
         store.record_at(&key, "alias", "real-first", true, true, Some(200), 11, now);
         key.id = "latest-second".into();
         key.name = "Replacement name".into();

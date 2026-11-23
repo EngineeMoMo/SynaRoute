@@ -92,6 +92,63 @@ fn routing_terms_config_write_failure_keeps_old_secret_and_restart() {
 }
 
 #[tokio::test]
+async fn responses_continuations_require_observed_ids_and_keep_model_key_and_scope() {
+    use super::{config::CategoryPolicy, identity::{Hints, VerifiedPeer}, policy};
+    let fixture = Fixture::new(Protocol::OpenaiResponses, 200, Duration::ZERO, "unused").await;
+    let mut group = fixture.group.clone(); group.rules.clear();
+    let baseline = group.model_id();
+    super::save_policy(&fixture.store, CategoryType::Codex, CategoryPolicy { groups: vec![group], ..Default::default() }, None, 0).unwrap();
+    let hints = |session: &str, peer: &str, branch: &str| {
+        let mut request = Request::builder().header("x-synaroute-session-id", session).header("x-synaroute-branch-id", branch).body(()).unwrap();
+        request.extensions_mut().insert(VerifiedPeer(peer.parse().unwrap())); Hints::from_request(&request)
+    };
+    let original = hints("session", "127.0.0.1", "main");
+    let first = json!({"input":"first task"});
+    let decision = policy::prepare(&fixture.store, CategoryType::Codex, &first, Protocol::OpenaiResponses, &original, &baseline, None).await.unwrap();
+    decision.served(&fixture.store, &fixture.key, "default");
+    let followup = json!({"input":"continue please","previous_response_id":"resp_fixture"});
+    assert!(policy::prepare(&fixture.store, CategoryType::Codex, &followup, Protocol::OpenaiResponses, &original, &baseline, None).await.is_err());
+    decision.observe_response(&fixture.store, &fixture.key, "default", Protocol::OpenaiResponses, &json!({"id":"resp_fixture","status":"completed"}));
+    for isolated in [hints("other", "127.0.0.1", "main"), hints("session", "192.168.1.8", "main"), hints("session", "127.0.0.1", "fork")] {
+        assert!(policy::prepare(&fixture.store, CategoryType::Codex, &followup, Protocol::OpenaiResponses, &isolated, &baseline, None).await.is_err());
+    }
+    let continued = policy::prepare(&fixture.store, CategoryType::Codex, &followup, Protocol::OpenaiResponses, &original, &baseline, None).await.unwrap();
+    assert_eq!(continued.model, "default");
+    assert_eq!(continued.lease.as_ref().unwrap().session, decision.lease.as_ref().unwrap().session);
+    let mut other = fixture.key.clone(); other.id = "other-key".into();
+    let mut candidates = vec![other, fixture.key.clone()];
+    continued.rank(&fixture.store, &mut candidates);
+    assert_eq!(candidates.len(), 1); assert_eq!(candidates[0].id, fixture.key.id);
+    continued.observe_response(&fixture.store, &fixture.key, "default", Protocol::OpenaiResponses, &json!({"id":"resp_next","status":"completed"}));
+    let tools = json!({"input":[{"type":"function_call_output","call_id":"tool","output":"done"}],"previous_response_id":"resp_next"});
+    assert!(policy::prepare(&fixture.store, CategoryType::Codex, &tools, Protocol::OpenaiResponses, &original, &baseline, None).await.is_ok());
+    fixture.store.routing_runtime.reset(CategoryType::Codex);
+    assert!(policy::prepare(&fixture.store, CategoryType::Codex, &followup, Protocol::OpenaiResponses, &original, &baseline, None).await.is_err());
+    assert_eq!(fixture.count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn redacted_history_keeps_observed_model_and_rejects_unseen_sessions() {
+    use super::{config::CategoryPolicy, identity::{Hints, VerifiedPeer}, policy};
+    let fixture = Fixture::new(Protocol::Anthropic, 200, Duration::ZERO, r#"{"intent":"tests"}"#).await;
+    let baseline = fixture.group.model_id();
+    super::save_policy(&fixture.store, CategoryType::Codex, CategoryPolicy { groups: vec![fixture.group.clone()], ..Default::default() }, None, 0).unwrap();
+    let mut request = Request::builder().header("x-synaroute-session-id", "opaque-session").body(()).unwrap();
+    request.extensions_mut().insert(VerifiedPeer("127.0.0.1".parse().unwrap()));
+    let hints = Hints::from_request(&request);
+    let first = json!({"messages":[{"role":"user","content":"write tests"}]});
+    let decision = policy::prepare(&fixture.store, CategoryType::Codex, &first, Protocol::Anthropic, &hints, &baseline, None).await.unwrap();
+    assert_eq!(decision.model, "target");
+    decision.served(&fixture.store, &fixture.key, "target");
+    let history = json!({"messages":[{"role":"user","content":"write tests"},{"role":"assistant","content":[{"type":"redacted_thinking","data":"opaque-fixture"}]},{"role":"user","content":"continue"}]});
+    let continued = policy::prepare(&fixture.store, CategoryType::Codex, &history, Protocol::Anthropic, &hints, &baseline, None).await.unwrap();
+    assert_eq!(continued.model, "target"); assert_eq!(fixture.count.load(Ordering::SeqCst), 1);
+    request.headers_mut().insert("x-synaroute-session-id", "unseen-session".parse().unwrap());
+    assert!(policy::prepare(&fixture.store, CategoryType::Codex, &history, Protocol::Anthropic, &Hints::from_request(&request), &baseline, None).await.is_err());
+    assert!(policy::prepare(&fixture.store, CategoryType::Codex, &history, Protocol::Anthropic, &Hints::default(), &baseline, None).await.is_err());
+}
+
+#[tokio::test]
 async fn routing_matrix_three_protocols_single_flight_and_usage() {
     for protocol in [Protocol::Anthropic, Protocol::OpenaiChat, Protocol::OpenaiResponses] {
         let fixture = Fixture::new(protocol, 200, Duration::from_millis(30), r#"{"intent":"tests"}"#).await;

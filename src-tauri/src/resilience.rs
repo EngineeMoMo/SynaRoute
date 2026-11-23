@@ -87,7 +87,7 @@ pub(crate) struct ResilienceOverview {
 
 /// 组装当前快照（纯只读，可脱离 tauri 单测）。
 pub(crate) fn build(store: &Store) -> ResilienceOverview {
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = jiff::Timestamp::now().as_millisecond();
     let running: std::collections::HashSet<CategoryType> =
         store.get_settings().proxy_running_categories.into_iter().collect();
     let mut categories = Vec::new();
@@ -178,7 +178,7 @@ mod tests {
             store.upsert_key(k).unwrap();
         }
         // res_broke 熔断中。
-        let future = chrono::Utc::now().timestamp_millis() + 60_000;
+        let future = jiff::Timestamp::now().as_millisecond() + 60_000;
         store.mutate_health("res_broke", |h| {
             h.breaker_until = Some(future);
             true

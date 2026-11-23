@@ -1,7 +1,7 @@
 use crate::model::Protocol;
 use serde_json::{json, Value};
 
-const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Default)]
 pub(crate) struct Decoder {
@@ -98,16 +98,20 @@ pub(crate) struct Monitor {
     status: Status,
     protocol: Protocol,
     usage: crate::model::TokenUsage,
+    response_id: Option<String>,
 }
 
 impl Monitor {
-    pub fn new(protocol: Protocol) -> Self { Self { decoder: Decoder::default(), status: Status::default(), protocol, usage: Default::default() } }
+    pub fn new(protocol: Protocol) -> Self { Self { decoder: Decoder::default(), status: Status::default(), protocol, usage: Default::default(), response_id: None } }
     pub fn push(&mut self, bytes: &[u8]) -> usize {
         if self.failed(false) { return 0; }
         let mut consumed = 0;
         for line in bytes.split_inclusive(|byte| *byte == b'\n' || *byte == b'\r') {
             for event in self.decoder.push(line) {
                 self.status.observe(self.protocol, &event);
+                if self.protocol == Protocol::OpenaiResponses && matches!(event["type"].as_str(), Some("response.completed" | "response.incomplete" | "response.done")) {
+                    self.response_id = event.pointer("/response/id").and_then(Value::as_str).filter(|id| id.len() <= 256).map(str::to_owned);
+                }
                 if let Some(usage) = super::extract_usage(&event) {
                     self.usage.input = self.usage.input.max(usage.input);
                     self.usage.output = self.usage.output.max(usage.output);
@@ -124,6 +128,7 @@ impl Monitor {
         self.decoder.failed || self.status.failed || (eof && (!self.status.terminal || self.decoder.pending()))
     }
     pub fn explicit_error(&self) -> bool { self.status.failed }
+    pub fn response_id(&self) -> Option<&str> { (!self.failed(false)).then_some(self.response_id.as_deref()).flatten() }
     pub fn usage(&self) -> Option<crate::model::TokenUsage> { (!self.usage.is_empty()).then_some(self.usage) }
 }
 

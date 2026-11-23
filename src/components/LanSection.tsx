@@ -27,23 +27,28 @@ export function LanSection({
   onToggle,
   t,
   onToast,
+  busy = false, unknown = false, status,
 }: {
   enabled: boolean;
   onToggle: (v: boolean) => void;
   t: (k: string, p?: Record<string, string>) => string;
   onToast: (kind: "success" | "error", msg: string) => void;
+  busy?: boolean; unknown?: boolean; status?: string | null;
 }) {
   return (
     <>
-      <ToggleRow
+      {unknown ? <p role="alert">{t("settings.lanUnknown")}</p> : <ToggleRow
         icon={KeyRound}
         title={t("settings.lanTitle")}
         desc={t("settings.lanDesc")}
         checked={enabled}
         onChange={onToggle}
         danger
-      />
-      <TokenPanel enabled={enabled} t={t} onToast={onToast} />
+        disabled={busy} badge={busy ? t("common.saving") : undefined}
+      />}
+      {status && <p role="alert" className="mt-2 text-xs text-danger">{status}</p>}
+      {unknown && <Button disabled={busy} onClick={() => onToggle(false)}>{t("settings.lanCloseRetry")}</Button>}
+      <TokenPanel enabled={enabled && !unknown} t={t} onToast={onToast} />
     </>
   );
 }

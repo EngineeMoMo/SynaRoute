@@ -1619,7 +1619,7 @@ mod tests {
         std::fs::write(&target, "USER EDIT").unwrap();
 
         // Phase1 开始于「很久以前」，而文件是刚写的 → 判为「确认后被改过」。
-        let long_ago = chrono::Utc::now().timestamp_millis() - 600_000;
+        let long_ago = jiff::Timestamp::now().as_millisecond() - 600_000;
         let changes = apply_changes(
             &work.to_string_lossy(),
             "```file:a.rs\nMODEL OUTPUT\n```\n",
@@ -1636,7 +1636,7 @@ mod tests {
 
         // 反面（同一份夹具）：Phase1 开始于「刚刚」→ 文件不比它新 → 照常写入。
         // 没有这一半，把 changed_since 改成恒 true 也不会红。
-        let just_now = chrono::Utc::now().timestamp_millis() + 5_000;
+        let just_now = jiff::Timestamp::now().as_millisecond() + 5_000;
         let ok = apply_changes(
             &work.to_string_lossy(),
             "```file:a.rs\nMODEL OUTPUT\n```\n",

@@ -1,5 +1,6 @@
 pub mod config;
 pub mod runtime;
+mod continuations;
 pub mod catalog;
 pub mod identity;
 pub mod detectors;
@@ -7,6 +8,7 @@ pub mod privacy;
 pub mod scenes;
 pub mod intent;
 pub mod policy;
+pub mod upstream_identity;
 #[cfg(test)] mod matrix_tests;
 #[cfg(test)] mod affinity_http_tests;
 

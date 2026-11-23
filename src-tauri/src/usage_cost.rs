@@ -256,7 +256,7 @@ pub(crate) fn over_budget_ids(store: &Store, category: CategoryType) -> std::col
 pub(crate) fn rows(store: &Store) -> Vec<UsageCostRow> {
     // 顺带把「当前还活着的 Key 的算钱事实」记下来，并拿回合并后的全表（见 usage_keys 模块头）。
     // 一趟遍历同时拿墓碑要的事实与并集要的 `(分类, id)` 位置 —— 两份「哪些 Key 算活着」必须是同一份。
-    let today = usage_keys::today_ms(chrono::Utc::now().timestamp_millis());
+    let today = usage_keys::today_ms(jiff::Timestamp::now().as_millisecond());
     let mut live_slots: Vec<(CategoryType, String)> = Vec::new();
     let mut live: BTreeMap<String, usage_keys::KeyFacts> = BTreeMap::new();
     for category in CategoryType::ALL {
@@ -712,7 +712,7 @@ mod tests {
         store.usage.record(CategoryType::ClaudeCli, "today", "claude-opus-5-5", &priced);
         store.usage.record(CategoryType::ClaudeCli, "today", "totally-unknown-llm-9000", &unknown);
 
-        let today = crate::usage_store::local_date_string(chrono::Utc::now().timestamp_millis());
+        let today = crate::usage_store::local_date_string(jiff::Timestamp::now().as_millisecond());
         let days = daily_costs(&store);
         let d = days.iter().find(|d| d.date == today).expect("今天的未落盘消耗必须并进当天");
         let row = rows(&store).into_iter().find(|r| r.key_id == "today").unwrap();

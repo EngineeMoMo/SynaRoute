@@ -171,7 +171,7 @@ pub async fn run_plan(
     // Phase1 **开始**的墙钟时刻，随计划一起回给前端、Phase2 原样回传。
     // 取开始而不是结束：检索发生在最开头，决策者手里的就是那一刻的文件内容，
     // 于是「Phase1 跑了 60 秒、用户在这期间改了文件」也能被 Phase2 判出来。
-    let plan_started_ms = chrono::Utc::now().timestamp_millis();
+    let plan_started_ms = jiff::Timestamp::now().as_millisecond();
     // 🔴 读用带兜底的，pin 给 Phase2 的只能是明确指定过的那个（见 `resolve_writable_work_dir`）。
     let read_dir = resolve_work_dir(&brain);
     let writable = write::resolve_writable_work_dir(&brain);

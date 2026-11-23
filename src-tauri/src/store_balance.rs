@@ -126,8 +126,16 @@ impl Store {
         reference: &str,
         change: impl FnOnce(&mut SecretStore) -> AppResult<()>,
     ) -> AppResult<()> {
+        let _edit = self.routing_runtime.edit.lock();
         let mut config = self.config.write();
-        change(&mut self.secrets.write())?;
+        let mut secrets = self.secrets.write();
+        let previous = secrets.get(reference).ok();
+        change(&mut secrets)?;
+        if previous.is_none() || previous != secrets.get(reference).ok() {
+            for key in config.keys.iter().filter(|key| key.id == reference) {
+                self.routing_runtime.invalidate_upstream(key.category_id);
+            }
+        }
         for key in &mut config.keys {
             if key.balance_query.as_ref().is_some_and(|query| {
                 query.api_key_ref.as_deref().unwrap_or(&key.id) == reference
@@ -262,7 +270,7 @@ impl Store {
         } else {
             5 * 60
         };
-        let age = (chrono::Utc::now().timestamp_millis() - cached.queried_at) / 1000;
+        let age = (jiff::Timestamp::now().as_millisecond() - cached.queried_at) / 1000;
         (age >= 0 && age < lifetime).then(|| cached.clone())
     }
 }
@@ -291,7 +299,7 @@ mod tests {
         BalanceResult {
             ok: true,
             remaining: Some(0.0),
-            queried_at: chrono::Utc::now().timestamp_millis(),
+            queried_at: jiff::Timestamp::now().as_millisecond(),
             ..BalanceResult::failed("")
         }
     }

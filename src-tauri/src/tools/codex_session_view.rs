@@ -246,8 +246,8 @@ pub(in crate::tools) fn enrich(
             if let Some(archived) = i.archived {
                 r.archived = archived;
             }
-            if let Some(updated) = i.updated_at_ms.and_then(chrono::DateTime::from_timestamp_millis) {
-                r.updated_at = updated.to_rfc3339();
+            if let Some(updated) = i.updated_at_ms.and_then(crate::clock::from_millis) {
+                r.updated_at = crate::clock::rfc3339(updated);
             }
             if r.thread_source.trim().is_empty() {
                 r.thread_source = i.thread_source.clone();
@@ -471,13 +471,13 @@ mod tests {
         assert!(rows[0].archived);
         assert_eq!(stats.archived, 1);
         assert_eq!(stats.active, 0);
-        assert_eq!(chrono::DateTime::parse_from_rfc3339(&rows[0].updated_at).unwrap().timestamp_millis(), 1793354400123);
+        assert_eq!(crate::clock::parse(&rows[0].updated_at).unwrap().as_millisecond(), 1793354400123);
         connection.execute("UPDATE threads SET archived = 0, updated_at_ms = 0", []).unwrap();
         rows[0].archived = true;
         let stats = enrich(&home, &mut rows, "synaroute", &[]);
         assert!(!rows[0].archived);
         assert_eq!(stats.active, 1);
-        assert_eq!(chrono::DateTime::parse_from_rfc3339(&rows[0].updated_at).unwrap().timestamp_millis(), 1793354400000);
+        assert_eq!(crate::clock::parse(&rows[0].updated_at).unwrap().as_millisecond(), 1793354400000);
         drop(connection);
         fs::remove_dir_all(home).unwrap();
     }

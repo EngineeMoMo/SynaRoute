@@ -65,7 +65,7 @@ impl Store {
         } else {
             raw
         };
-        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        let stamp = jiff::Timestamp::now().strftime("%Y%m%d-%H%M%S");
         let nonce = uuid::Uuid::new_v4();
         let backup = self
             .config_path

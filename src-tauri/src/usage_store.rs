@@ -119,16 +119,13 @@ fn usage_snapshot_version() -> u32 {
 /// 🔴 v3 及更早用 UTC 切天，于是 UTC+8 的用户每天 0~8 点的用量算在「昨天」——
 /// 入账与滚动删桶使用同一转换；待写记录在入账时固定日期，查询和落盘不重新分配。
 pub(crate) fn local_date_string(ms: i64) -> String {
-    date_string_at(ms, &chrono::Local)
+    date_string_at(ms, jiff::tz::TimeZone::system())
 }
 
 /// [`local_date_string`] 的可测形态（测试里传固定时区，结果不随跑测试的机器变）。
-fn date_string_at<Tz: chrono::TimeZone>(ms: i64, tz: &Tz) -> String
-where
-    Tz::Offset: std::fmt::Display,
-{
-    let utc = chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default();
-    utc.with_timezone(tz).format("%Y-%m-%d").to_string()
+fn date_string_at(ms: i64, tz: jiff::tz::TimeZone) -> String {
+    let utc = crate::clock::from_millis(ms).unwrap_or_default();
+    utc.to_zoned_datetime(tz).date().to_string()
 }
 /// `load_usage` 的结果。
 ///
@@ -178,7 +175,7 @@ pub(crate) fn usage_file_path(config_path: &Path) -> PathBuf {
 /// **v2 改动（2026-08-11）**：读到 v2 文件时把所有 `daily_buckets` 里的 entries
 /// 合并进内存累加器,这样重启后历史累计不会丢。v1 文件继续按老逻辑读 `entries`。
 pub(crate) fn load_usage(path: &Path) -> UsageLoad {
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = jiff::Timestamp::now().as_millisecond();
     // 三种降级，**写回权限不同**（别合并成一个分支）：
     // - 文件缺失（全新安装）：从零累计，允许写回；
     // - 内容解析失败（断电写坏）：从零累计，允许写回 —— 用好数据覆盖坏数据是对的；
@@ -328,14 +325,14 @@ mod tests {
     /// 那就是 v3 的老缺陷：东八区每天 0~8 点的用量算进「昨天」。
     #[test]
     fn day_boundary_follows_the_time_zone_not_utc() {
-        let ms = chrono::DateTime::parse_from_rfc3339("2026-10-12T00:30:00+08:00")
+        let ms = crate::clock::parse("2026-10-12T00:30:00+08:00")
             .unwrap()
-            .timestamp_millis();
-        let east8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-        assert_eq!(date_string_at(ms, &east8), "2026-10-12", "东八区零点半已经是新的一天");
-        assert_eq!(date_string_at(ms, &chrono::Utc), "2026-10-11", "同一时刻在 UTC 还是前一天");
-        let west5 = chrono::FixedOffset::west_opt(5 * 3600).unwrap();
-        assert_eq!(date_string_at(ms, &west5), "2026-10-11");
+            .as_millisecond();
+        let east8 = jiff::tz::TimeZone::fixed(jiff::tz::Offset::from_hours(8).unwrap());
+        assert_eq!(date_string_at(ms, east8), "2026-10-12", "东八区零点半已经是新的一天");
+        assert_eq!(date_string_at(ms, jiff::tz::TimeZone::UTC), "2026-10-11", "同一时刻在 UTC 还是前一天");
+        let west5 = jiff::tz::TimeZone::fixed(jiff::tz::Offset::from_hours(-5).unwrap());
+        assert_eq!(date_string_at(ms, west5), "2026-10-11");
     }
 
     /// v3 文件（行上没有 `model`）照常读入，模型维度为空串 —— 历史行不丢、不编造模型名。

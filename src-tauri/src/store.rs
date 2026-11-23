@@ -254,7 +254,7 @@ fn cleanup_old_logs_in(dir: &std::path::Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0; // 目录还不存在（首次运行）或读不了：无事可做
     };
-    let cutoff = chrono::Utc::now().date_naive() - chrono::Duration::days(LOG_RETAIN_DAYS);
+    let cutoff = crate::clock::utc_date() - jiff::Span::new().days(LOG_RETAIN_DAYS);
     let mut removed = 0usize;
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -331,7 +331,7 @@ impl Store {
                 // persist 把磁盘原有 N 条 Key 覆盖成 0,不可逆)。保留磁盘原文件,另存 .corrupt 备份。
                 let backup = config_path.with_file_name(format!(
                     "config.corrupt-{}.json",
-                    chrono::Utc::now().format("%Y%m%d-%H%M%S")
+                    jiff::Timestamp::now().strftime("%Y%m%d-%H%M%S")
                 ));
                 match std::fs::copy(config_path, &backup) {
                     Ok(_) => tracing::error!(
@@ -634,7 +634,7 @@ impl Store {
     ) {
         let entry = EventLogEntry {
             id: uuid::Uuid::new_v4().to_string(),
-            ts: chrono::Utc::now().timestamp_millis(),
+            ts: jiff::Timestamp::now().as_millisecond(),
             category_id: category,
             kind: kind.to_string(),
             key_id: key_id.map(|s| s.to_string()),
@@ -788,7 +788,7 @@ impl Store {
                     };
                     match cmd {
                         Some(LogCmd::Line { dir, line }) => {
-                            let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                            let date = jiff::Timestamp::now().strftime("%Y-%m-%d").to_string();
                             // 需要重开文件？（首次 / 跨天 / 用户改了日志目录）
                             let need_reopen = match &open {
                                 Some(o) => o.dir != dir || o.date != date,
@@ -965,7 +965,7 @@ impl Store {
     /// `fresh_ms` = 只认这么新的失败。陈旧失败不该一直挂在界面上让用户以为「现在还坏着」
     /// —— 与「陈旧探测结论不显示成确定不可达」同一处理原则。
     pub fn recent_failure(&self, category: CategoryType, fresh_ms: i64) -> Option<EventLogEntry> {
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = jiff::Timestamp::now().as_millisecond();
         let ev = self.events.read();
         // 倒序找最近一条失败；找到后再单独判新旧（过期即当作没有）。
         let latest = ev
@@ -1443,10 +1443,10 @@ impl Store {
         if key.id.trim().is_empty() {
             key.id = new_key_id();
         }
-        // 失败回滚：落盘失败不让内存领先磁盘（见 mutate_and_persist）。
         self.mutate_and_persist(|cfg| {
             balance::protect_key(&mut key, &mut self.secrets.write())?;
             if let Some(existing) = cfg.keys.iter_mut().find(|k| k.id == key.id) {
+                if routing::upstream_identity::changed(existing, &key) { self.routing_runtime.invalidate_upstream(existing.category_id); self.routing_runtime.invalidate_upstream(key.category_id); }
                 // ⚠️ **运行态字段一律沿用库里现值，前端传什么都忽略**。
                 //
                 // 这些字段由后端在运行中维护（健康探测/熔断计数/余额缓存），而前端的
@@ -3166,7 +3166,7 @@ mod tests {
         // 这不是为测试放宽判据——排空后行数仍必须精确等于事件数。
         store.flush_logs();
 
-        let date = chrono::Utc::now().format("%Y-%m-%d");
+        let date = jiff::Timestamp::now().strftime("%Y-%m-%d");
         let file = log_dir.join(format!("{date}.jsonl"));
         let raw = std::fs::read_to_string(&file).expect("应产出当天日志文件");
         let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -3220,7 +3220,7 @@ mod tests {
 
         // 文件侧：5 条都在。日志异步落盘，读前先排空队列（见 P1-3）。
         store.flush_logs();
-        let date = chrono::Utc::now().format("%Y-%m-%d");
+        let date = jiff::Timestamp::now().strftime("%Y-%m-%d");
         let raw = std::fs::read_to_string(log_dir.join(format!("{date}.jsonl"))).unwrap();
         let route_lines = raw
             .lines()
@@ -3407,8 +3407,8 @@ mod tests {
         // 先手写一个 v1 文件：`version=1`，只有全局 `entries`
         let v1_snap = UsageSnapshot {
             version: 1,
-            since_ms: chrono::Utc::now().timestamp_millis() - 95 * 86_400_000, // 95 天前
-            updated_ms: chrono::Utc::now().timestamp_millis(),
+            since_ms: jiff::Timestamp::now().as_millisecond() - 95 * 86_400_000, // 95 天前
+            updated_ms: jiff::Timestamp::now().as_millisecond(),
             daily_buckets: Vec::new(),
             retired: Vec::new(),
             entries: vec![TokenUsageByKey {
@@ -3450,7 +3450,7 @@ mod tests {
         assert!(!v2.daily_buckets.is_empty(), "v2 应有按日分桶");
 
         let dates: Vec<_> = v2.daily_buckets.iter().map(|b| &b.date).collect();
-        let today = crate::usage_store::local_date_string(chrono::Utc::now().timestamp_millis());
+        let today = crate::usage_store::local_date_string(jiff::Timestamp::now().as_millisecond());
         assert!(
             dates.contains(&&today),
             "今天的桶必须存在（当前日期 {today}，实际桶: {dates:?}）"
@@ -3528,7 +3528,7 @@ mod tests {
         use crate::upstream::TokenUsage;
         let dir = temp_dir("usage_pending");
         let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
-        let today = crate::usage_store::local_date_string(chrono::Utc::now().timestamp_millis());
+        let today = crate::usage_store::local_date_string(jiff::Timestamp::now().as_millisecond());
         let sum_today = |s: &Store| -> u64 {
             s.daily_usage_buckets()
                 .iter()
@@ -3613,8 +3613,8 @@ mod tests {
         let sec = dir.join("secrets.enc");
         let usage_path = dir.join("usage.json");
 
-        let today = chrono::Local::now().date_naive();
-        let day = |off: i64| (today - chrono::Duration::days(off)).format("%Y-%m-%d").to_string();
+        let today = jiff::ZonedDateTime::now().date();
+        let day = |off: i64| (today - jiff::Span::new().days(off)).strftime("%Y-%m-%d").to_string();
         let usage = |input: u64| TokenUsage { input, output: 0, cache_read: 0, cache_creation: 0 };
         let row = |input: u64| TokenUsageByKey {
             category_id: CategoryType::ClaudeCli,
@@ -3626,8 +3626,8 @@ mod tests {
         // 一个早已过期的桶（100 天前，1000）+ 一个还在窗口内的桶（3 天前，7）
         let snap = UsageSnapshot {
             version: crate::model::USAGE_SNAPSHOT_VERSION,
-            since_ms: chrono::Utc::now().timestamp_millis() - 120 * 86_400_000,
-            updated_ms: chrono::Utc::now().timestamp_millis(),
+            since_ms: jiff::Timestamp::now().as_millisecond() - 120 * 86_400_000,
+            updated_ms: jiff::Timestamp::now().as_millisecond(),
             daily_buckets: vec![
                 DailyUsageBucket { date: day(3), entries: vec![row(7)] },
                 DailyUsageBucket { date: day(100), entries: vec![row(1000)] },
@@ -4162,8 +4162,8 @@ mod tests {
             cfg.settings.log_dir = Some(log_dir.display().to_string());
         }
 
-        let today = chrono::Utc::now().date_naive();
-        let d = |offset: i64| (today - chrono::Duration::days(offset)).format("%Y-%m-%d").to_string();
+        let today = crate::clock::utc_date();
+        let d = |offset: i64| (today - jiff::Span::new().days(offset)).strftime("%Y-%m-%d").to_string();
 
         // 该删的：超过保留期
         let expired = [
@@ -4214,10 +4214,10 @@ mod tests {
     fn log_writer_cleans_expired_files_on_reopen_not_only_at_startup() {
         let dir = temp_dir("log_cleanup_rollover");
         let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();
-        let today = chrono::Utc::now().date_naive();
+        let today = crate::clock::utc_date();
         let stale = format!(
             "{}.jsonl",
-            (today - chrono::Duration::days(LOG_RETAIN_DAYS + 5)).format("%Y-%m-%d")
+            (today - jiff::Span::new().days(LOG_RETAIN_DAYS + 5)).strftime("%Y-%m-%d")
         );
 
         // 第一段：目录 A，写一条让写线程把 A 开起来
@@ -4247,7 +4247,7 @@ mod tests {
             "重开日志文件时应顺手清掉过期文件 {stale} —— 否则常驻不重启的用户永远不清理"
         );
         // 今天的文件当然要留着（它就是刚写进去的那个）
-        let today_file = format!("{}.jsonl", today.format("%Y-%m-%d"));
+        let today_file = format!("{}.jsonl", today.strftime("%Y-%m-%d"));
         assert!(dir_b.join(&today_file).exists(), "今天的日志文件不该被清理");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -4270,7 +4270,7 @@ mod tests {
         // 不 sleep，直接 flush —— 它必须自己保证排空
         store.flush_logs();
 
-        let date = chrono::Utc::now().format("%Y-%m-%d");
+        let date = jiff::Timestamp::now().strftime("%Y-%m-%d");
         let raw = std::fs::read_to_string(log_dir.join(format!("{date}.jsonl")))
             .expect("flush 后必须已有日志文件");
         let n = raw.lines().filter(|l| l.contains("flush-")).count();
@@ -5176,9 +5176,9 @@ mod tests {
         // 否则向导会在用户还没接入时就打勾，那是个假的正反馈。
         store.append_event(CategoryType::ClaudeCli, "route", None, "历史成功");
 
-        // 用真实时间切分前后（append_event 自己打 chrono 时间戳，测的就是真实写入路径）。
+        // 用真实时间切分前后（append_event 自己打时间戳，测的就是真实写入路径）。
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let since = chrono::Utc::now().timestamp_millis();
+        let since = jiff::Timestamp::now().as_millisecond();
         std::thread::sleep(std::time::Duration::from_millis(5));
 
         let probe = store.first_request_since(CategoryType::ClaudeCli, since);

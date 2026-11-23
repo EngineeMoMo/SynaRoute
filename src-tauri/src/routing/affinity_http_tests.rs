@@ -69,7 +69,7 @@ async fn routing_http_affinity_failover_stream_failure_and_breaker() {
     b.mode.store(0, Ordering::SeqCst);
     send(false).await.unwrap().bytes().await.unwrap();
     assert_eq!(a.count.load(Ordering::SeqCst), a_before + 1);
-    let mut health = store.get_key(&ka.id).unwrap().health; health.breaker_until = Some(chrono::Utc::now().timestamp_millis() + 60_000);
+    let mut health = store.get_key(&ka.id).unwrap().health; health.breaker_until = Some(jiff::Timestamp::now().as_millisecond() + 60_000);
     store.update_health(&ka.id, health).unwrap();
     send(false).await.unwrap().bytes().await.unwrap();
     assert_eq!(a.count.load(Ordering::SeqCst), a_before + 1, "affinity must not bypass an active breaker");

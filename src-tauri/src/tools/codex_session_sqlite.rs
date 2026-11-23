@@ -247,7 +247,7 @@ pub(super) fn backup_db(db: &Path, data_dir: &Path) -> Result<(), String> {
     let dir = data_dir.join("backups").join("codex-sqlite");
     fs::create_dir_all(&dir).map_err(|e| format!("建备份目录失败: {e}"))?;
     let identity = backup_identity(db)?;
-    let ts = format!("{}-{:04}", chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f"), files::seq() % 10_000);
+    let ts = format!("{}-{:04}", jiff::Timestamp::now().strftime("%Y%m%dT%H%M%S%.3f"), files::seq() % 10_000);
     let final_path = dir.join(format!("{identity}.{ts}.bak"));
     let temp_path = files::tmp_path_for(&final_path);
     if let Err(error) = online_backup(db, &temp_path) {

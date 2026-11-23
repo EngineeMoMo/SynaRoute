@@ -8,6 +8,42 @@ use serde_json::json;
 use std::{convert::Infallible, future::Future, io, sync::{atomic::{AtomicUsize, Ordering}, Weak}, time::Duration};
 use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
 
+#[tokio::test]
+async fn lan_partial_restart_failure_preserves_authoritative_state() {
+    let store = store();
+    let broken = CategoryType::ClaudeCli;
+    let healthy = CategoryType::Codex;
+    store.set_proxy_port(broken, 0).unwrap();
+    store.set_proxy_port(healthy, 0).unwrap();
+    let manager = Arc::new(crate::proxy::ProxyManager::new(store.clone()));
+    manager.start(broken).await.unwrap();
+    let healthy_port = manager.start(healthy).await.unwrap();
+    let (blocked_port, blockers) = loop {
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = first.local_addr().unwrap().port();
+        if port > u16::MAX - 20 { continue; }
+        let mut listeners = vec![first];
+        for candidate in (port + 1)..=(port + 20) {
+            match tokio::net::TcpListener::bind(("127.0.0.1", candidate)).await {
+                Ok(listener) => listeners.push(listener),
+                Err(_) => break,
+            }
+        }
+        if listeners.len() == 21 { break (port, listeners); }
+    };
+    store.set_proxy_port(broken, blocked_port).unwrap();
+    let result = crate::service::set_lan_exposure(&store, &manager, true).await;
+    let saved = store.get_settings().lan_exposure;
+    let running = manager.is_running(healthy);
+    let other_loopback = tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(("127.0.0.2", healthy_port))).await;
+    let wildcard_reachable = matches!(other_loopback, Ok(Ok(_)));
+    manager.stop_all();
+    drop(blockers);
+    println!("LAN_PARTIAL_FAILURE={}", json!({"returned_error":result.is_err(),"saved_lan_exposure":saved,"healthy_listener_running":running,"wildcard_listener_reachable":wildcard_reachable}));
+    assert!(result.is_err());
+    assert!(saved && running && wildcard_reachable);
+}
+
 fn store() -> Arc<Store> {
     let dir = std::env::temp_dir().join(format!("synaroute-active-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -40,6 +76,68 @@ fn registry_is_scoped_and_guard_drop_unregisters() {
     assert!(first.active_requests.list(CategoryType::ClaudeCli).is_empty());
     assert_eq!(first.list_events(CategoryType::ClaudeCli).iter().filter(|e| e.detail.contains("用户停止代理请求")).count(), 1);
     assert_eq!(first.active_requests.stop(CategoryType::ClaudeCli, "request-one"), StopResult::Finished);
+}
+
+#[tokio::test]
+async fn restart_waits_for_socket_release_and_concurrent_starts_share_port() {
+    let store = store();
+    store.set_proxy_port(CategoryType::Codex, 0).unwrap();
+    let manager = Arc::new(crate::proxy::ProxyManager::new(store.clone()));
+    let port = manager.start(CategoryType::Codex).await.unwrap();
+    assert_eq!(crate::service::set_lan_exposure(&store, &manager, false).await.unwrap(), 0);
+    for _ in 0..5 {
+        assert_eq!(manager.restart(CategoryType::Codex).await.unwrap(), port);
+        manager.stop(CategoryType::Codex);
+        let (first, second) = tokio::join!(manager.start(CategoryType::Codex), manager.start(CategoryType::Codex));
+        assert_eq!(first.unwrap(), port); assert_eq!(second.unwrap(), port);
+    }
+    for lan in [true, false] {
+        store.set_lan_exposure(lan).unwrap();
+        assert_eq!(manager.restart(CategoryType::Codex).await.unwrap(), port);
+    }
+    manager.stop(CategoryType::Codex);
+    let mut cancelled = Box::pin(manager.start(CategoryType::Codex));
+    assert!(futures_util::poll!(&mut cancelled).is_pending());
+    drop(cancelled);
+    assert_eq!(manager.start(CategoryType::Codex).await.unwrap(), port);
+    assert_eq!(manager.port_of(CategoryType::Codex), Some(port));
+    assert_eq!(store.get_settings().proxy_ports[&CategoryType::Codex], port);
+    manager.stop_all();
+}
+
+#[tokio::test]
+async fn starts_wait_for_settings_updates_before_binding() {
+    let store = store();
+    store.set_proxy_port(CategoryType::Codex, 0).unwrap();
+    let manager = Arc::new(crate::proxy::ProxyManager::new(store.clone()));
+    let settings = manager.settings_gate.lock().await;
+    let mut start = Box::pin(manager.start(CategoryType::Codex));
+    assert!(futures_util::poll!(&mut start).is_pending());
+    assert!(!manager.is_running(CategoryType::Codex));
+    drop(settings);
+    let port = start.await.unwrap();
+    assert_eq!(manager.port_of(CategoryType::Codex), Some(port));
+    manager.stop_all();
+}
+
+#[tokio::test]
+async fn sse_errors_redact_provider_credentials_before_downstream_and_event_logs() {
+    for upstream_protocol in [Protocol::Anthropic, Protocol::OpenaiChat, Protocol::OpenaiResponses] {
+        let store = store();
+        let secret = "private-upstream-fixture";
+        let upstream = mock(Some("event: error\ndata: {\"message\":\"invalid key private-upstream-fixture\"}\n\n"), None, true, false).await;
+        let id = add_key(&store, &upstream.url, upstream_protocol, 0);
+        let key = store.get_key(&id).unwrap();
+        let guard = begin(&store, "stream-redaction");
+        let response = bounded(reqwest::Client::builder().no_proxy().build().unwrap().get(&upstream.url).send()).await.unwrap();
+        let response = super::super::streaming::response(response, bounded(concurrency::acquire(&id)).await,
+            &store, CategoryType::ClaudeCli, &key, secret, "model", "model", upstream_protocol, None, None, guard.control()).unwrap();
+        upstream.release.notify_one();
+        let bytes = bounded(response.into_body().collect()).await.unwrap().to_bytes();
+        assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+        assert!(String::from_utf8_lossy(&bytes).contains("***"));
+        assert!(!serde_json::to_string(&store.list_events(CategoryType::ClaudeCli)).unwrap().contains(secret));
+    }
 }
 
 #[test]
@@ -364,7 +462,7 @@ async fn operator_stop_preserves_existing_binding_even_after_an_error_event() {
     let guard = begin(&s, "binding-request"); let control = guard.control();
     let response = bounded(reqwest::Client::builder().no_proxy().build().unwrap().post(&upstream.url).send()).await.unwrap();
     let response = super::super::streaming::response(response, bounded(concurrency::acquire(&id)).await,
-        &s, CategoryType::ClaudeCli, &key, "m", "m", Protocol::Anthropic, None, Some(lease.clone()), control).unwrap();
+        &s, CategoryType::ClaudeCli, &key, "", "m", "m", Protocol::Anthropic, None, Some(lease.clone()), control).unwrap();
     let mut downstream = relay(response, guard, Protocol::Anthropic).into_body();
     assert!(bounded(downstream.frame()).await.unwrap().unwrap().is_data());
     s.active_requests.stop(CategoryType::ClaudeCli, "binding-request");
@@ -385,7 +483,7 @@ async fn completed_translation_releases_permit_before_final_frame_is_consumed() 
     let response = bounded(reqwest::Client::builder().no_proxy().build().unwrap().post(&upstream.url).send()).await.unwrap();
     let translator = crate::upstream::SseTranslator::new(crate::upstream::sse_direction(Protocol::OpenaiChat, Protocol::Anthropic).unwrap());
     let mut body = super::super::streaming::response(response, bounded(concurrency::acquire(&id)).await,
-        &s, CategoryType::ClaudeCli, &key, "m", "m", Protocol::OpenaiChat, Some(translator), None, guard.control()).unwrap().into_body();
+        &s, CategoryType::ClaudeCli, &key, "", "m", "m", Protocol::OpenaiChat, Some(translator), None, guard.control()).unwrap().into_body();
     upstream.release.notify_one();
     // Consume until the generated terminal frame; retain the body without polling its EOF.
     loop {
@@ -415,7 +513,7 @@ async fn clean_eof_without_terminal_and_named_errors_fail_health_on_raw_and_tran
                 let translator = crate::upstream::sse_direction(downstream, upstream_protocol).map(crate::upstream::SseTranslator::new);
                 let response = bounded(reqwest::Client::builder().no_proxy().build().unwrap().get(&upstream.url).send()).await.unwrap();
                 let response = super::super::streaming::response(response, bounded(concurrency::acquire(&key_id)).await,
-                    &store, CategoryType::ClaudeCli, &key, "model", "model", downstream, translator, None, control.clone()).unwrap();
+                    &store, CategoryType::ClaudeCli, &key, "", "model", "model", downstream, translator, None, control.clone()).unwrap();
                 upstream.release.notify_one();
                 let bytes = bounded(response.into_body().collect()).await.unwrap().to_bytes();
                 let text = String::from_utf8_lossy(&bytes);

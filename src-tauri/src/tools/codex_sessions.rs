@@ -268,10 +268,10 @@ fn original_to_record(current: &str, fallback: &str) -> String {
 /// 旧版清单没有逐条记录「本来就是 target」的会话；只把**清单写成之后新建**的未记录会话
 /// 当成 born-as-target。时间取不到就 fail closed，不拿一个同名旧会话冒充新会话。
 fn born_after_sync(session: &SessionRef, synced_at: &str) -> bool {
-    let Ok(session_ts) = chrono::DateTime::parse_from_rfc3339(&session.timestamp) else {
+    let Ok(session_ts) = crate::clock::parse(&session.timestamp) else {
         return false;
     };
-    let Ok(sync_ts) = chrono::DateTime::parse_from_rfc3339(synced_at) else {
+    let Ok(sync_ts) = crate::clock::parse(synced_at) else {
         return false;
     };
     session_ts >= sync_ts
@@ -338,7 +338,7 @@ fn scan_paths(home: &Path, paths: Vec<(PathBuf, bool)>) -> ScanReport {
         let metadata = fs::metadata(&path).ok();
         let bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
         let updated_at = metadata.and_then(|m| m.modified().ok())
-            .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339())
+            .map(|time| crate::clock::rfc3339(jiff::Timestamp::try_from(time).unwrap_or_default()))
             .unwrap_or_default();
         let Ok(line) = read_first_line(&path) else {
             report.unreadable += 1;
@@ -604,7 +604,7 @@ pub(super) fn sync_to_at_observed(
         // 一出生就是 target、永远不会进 todo；没有这个空清单，停止时完全认不出它们。
         if manifest_was_empty || manifest.target != target {
             manifest.target = target.to_string();
-            manifest.synced_at = chrono::Utc::now().to_rfc3339();
+            manifest.synced_at = crate::clock::rfc3339(jiff::Timestamp::now());
         }
         write_manifest(data_dir, &manifest)?;
     }

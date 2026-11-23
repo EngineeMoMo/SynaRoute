@@ -15,6 +15,7 @@
 //! **新增任何子进程调用都必须走这里**，否则黑窗口会重新出现。
 
 use tokio::process::Command;
+#[path = "process_tree.rs"] pub(crate) mod tree;
 
 /// `CREATE_NO_WINDOW`（winbase.h）：不为子进程分配控制台窗口。
 ///

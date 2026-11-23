@@ -191,8 +191,7 @@ pub(crate) fn warn_desktop_unacceptable_models(store: &Store, category: Category
 /// 若这里自己算一份口径，改一次端口就会把桌面端 gateway 档的 `inferenceModels`
 /// 重写成与接入时不同的清单，两条路径自相矛盾。
 ///
-/// 写 config 失败**不让整个改端口失败**：端口已经落盘、代理已按新端口跑起来了，
-/// 此时返回 Err 会让前端以为改端口没成功，而实际状态已变——只记一条 error 事件。
+/// 客户端配置同步失败时停止该分类代理并返回错误，事件中保留失败原因。
 ///
 /// **该分类代理没在跑时只落盘、不启动**（返回配置里的首选端口）。
 /// 端口是启动时才绑定的，没在跑就没有「重启使其生效」这回事；而无条件 `start()` + `apply()`
@@ -206,6 +205,7 @@ pub(crate) async fn set_proxy_port(
     category: CategoryType,
     port: u16,
 ) -> AppResult<u16> {
+    let _guard = proxy.settings_gate.lock().await;
     // 先取运行态：`set_proxy_port` 落盘后再判会被后续的 stop/start 干扰。
     let was_running = proxy.is_running(category);
     store.set_proxy_port(category, port)?;
@@ -213,27 +213,20 @@ pub(crate) async fn set_proxy_port(
         // 未运行：新端口已粘滞落盘，下次启动自然生效。不动代理、不碰客户端配置。
         return Ok(port);
     }
-    proxy.stop(category);
-    let bound = proxy.start(category).await?;
+    let bound = proxy.restart(category).await?;
     // 用**真实绑定端口**而非请求端口：首选端口被占用时会回退，写错客户端就连不上。
+    if let Err(error) = sync_proxy_endpoint(store, category, bound) { proxy.stop(category); return Err(error); }
+    Ok(bound)
+}
+
+fn sync_proxy_endpoint(store: &Store, category: CategoryType, bound: u16) -> AppResult<()> {
     let endpoint = format!("http://127.0.0.1:{bound}");
     let keys = store.enabled_keys_sorted(category);
     let models = models_for_apply(store, category);
-    match crate::store::routing::settings(store).and_then(|routing| crate::tools::apply(crate::store::routing::catalog::groups(&routing, category), category, &endpoint, &models, &keys)) {
-        Ok(_) => record_apply_success(
-            store,
-            category,
-            &models,
-            &format!("代理端口已改为 {bound}，已重写客户端配置（客户端需重启读取新端口）"),
-        ),
-        Err(e) => store.append_event(
-            category,
-            "error",
-            None,
-            &format!("改端口后重写客户端配置失败: {e}"),
-        ),
-    }
-    Ok(bound)
+    crate::store::routing::settings(store)
+        .and_then(|routing| crate::tools::apply(crate::store::routing::catalog::groups(&routing, category), category, &endpoint, &models, &keys))
+        .map(|_| record_apply_success(store, category, &models, &format!("代理端口已改为 {bound}，已重写客户端配置（客户端需重启读取新端口）")))
+        .inspect_err(|error| store.append_event(category, "error", None, &format!("改端口后重写客户端配置失败，代理已停止: {error}")))
 }
 
 /// 切换「允许局域网访问代理」，并**让它对正在运行的代理立刻生效**。
@@ -248,19 +241,14 @@ pub(crate) async fn set_proxy_port(
 /// 后者是**安全方向**的「界面说 A、实际 B」：用户点关是为了收回暴露面，而它没收回。
 /// 这类开关必须要么真的生效、要么明确告知需重启，绝不能静默不生效。
 ///
-/// ## 为什么走「停 + 起」而不是热改
-///
-/// 与 [`set_proxy_port`] 同一手法（那里改端口也是停+起）：TcpListener 的绑定地址不可变，
-/// 只能重建。端口保持粘滞不变，故客户端配置**无需重写**（端口没动，客户端连的还是那个地址）
-/// —— 这是与改端口路径的关键差异，不必也不该去动客户端配置文件。
-///
 /// 返回实际受影响（重启过）的分类数，供 UI 提示「N 个代理已按新设置重启」。
 pub(crate) async fn set_lan_exposure(
     store: &Arc<Store>,
     proxy: &Arc<ProxyManager>,
     enabled: bool,
 ) -> AppResult<usize> {
-    // 先落盘：重启后的 `start()` 会重新读 settings 决定绑哪个地址。
+    let _guard = proxy.settings_gate.lock().await;
+    if store.get_settings().lan_exposure == enabled { return Ok(0); }
     store.set_lan_exposure(enabled)?;
 
     // 快照当前在跑的分类（重启期间 is_running 会变，必须先取）。
@@ -270,12 +258,13 @@ pub(crate) async fn set_lan_exposure(
         .filter(|c| proxy.is_running(*c))
         .collect();
 
+    let mut failure = None;
     for cat in &running {
-        proxy.stop(*cat);
-        // 端口粘滞不变 → 客户端配置无需重写。失败只记事件不中断其余分类：
-        // 半途返回会留下「一半分类停了没起」的更差状态。
-        match proxy.start(*cat).await {
-            Ok(port) => store.append_event(
+        let previous = proxy.port_of(*cat);
+        match proxy.restart(*cat).await {
+            Ok(port) => { if previous != Some(port) {
+                if let Err(error) = sync_proxy_endpoint(store, *cat, port) { proxy.stop(*cat); failure = Some(error); continue; }
+            } store.append_event(
                 *cat,
                 "config",
                 None,
@@ -283,16 +272,16 @@ pub(crate) async fn set_lan_exposure(
                     "已按新的局域网设置重启代理（监听 {}:{port}）",
                     if enabled { "0.0.0.0" } else { "127.0.0.1" }
                 ),
-            ),
-            Err(e) => store.append_event(
+            ); },
+            Err(e) => { store.append_event(
                 *cat,
                 "error",
                 None,
                 &format!("按新的局域网设置重启代理失败（该分类现已停止，请手动启动）: {e}"),
-            ),
+            ); failure = Some(e); },
         }
     }
-    Ok(running.len())
+    failure.map_or(Ok(running.len()), Err)
 }
 
 // ==== Key 与密钥 ====
@@ -467,7 +456,7 @@ pub(crate) async fn fetch_models_for_draft(
 /// 抽成纯函数是为了可测：这条继承规则一旦失效，症状是「用户手填的上下文窗口偶尔消失」，
 /// 而它只在「填过窗口 + 又点了拉取」这个组合下出现，端到端很难稳定复现。
 fn merge_context_windows(names: Vec<String>, previous: &[ModelInfo]) -> Vec<ModelInfo> {
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = jiff::Timestamp::now().as_millisecond();
     let old_ctx: std::collections::HashMap<&str, Option<u32>> = previous
         .iter()
         .map(|m| (m.real_name.as_str(), m.context_window))
@@ -1314,7 +1303,7 @@ pub(crate) fn build_export_bytes(
 pub(crate) fn export_file_name() -> String {
     format!(
         "synaroute-config-{}.json",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
+        jiff::ZonedDateTime::now().strftime("%Y%m%d-%H%M%S")
     )
 }
 

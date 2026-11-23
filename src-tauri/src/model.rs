@@ -648,7 +648,7 @@ impl BalanceResult {
             plan_name: None,
             total: None,
             used: None,
-            queried_at: chrono::Utc::now().timestamp_millis(),
+            queried_at: jiff::Timestamp::now().as_millisecond(),
             error: Some(reason.into()),
             transient: false,
             resolved_url_template: None,

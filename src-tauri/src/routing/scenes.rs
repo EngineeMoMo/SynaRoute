@@ -109,7 +109,7 @@ pub fn apply(store: &Store, proxy: &ProxyManager, token: &str) -> AppResult<Appl
     let changed = fingerprint(&target) != fingerprint(&before);
     let cfg_path = PathBuf::from(store.config_path_display());
     let backup = if changed {
-        let name = format!("config.pre-scene-{}-{}.json", chrono::Utc::now().format("%Y%m%d-%H%M%S"), uuid::Uuid::new_v4());
+        let name = format!("config.pre-scene-{}-{}.json", jiff::Timestamp::now().strftime("%Y%m%d-%H%M%S"), uuid::Uuid::new_v4());
         let path = cfg_path.with_file_name(name);
         crate::secret::atomic_write(&path, &serde_json::to_vec_pretty(&before)?)?;
         Some(path.display().to_string())

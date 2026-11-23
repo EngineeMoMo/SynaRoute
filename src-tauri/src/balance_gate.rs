@@ -242,7 +242,7 @@ pub(crate) async fn refresh_due(store: &Arc<Store>) {
     if running.is_empty() {
         return;
     }
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = jiff::Timestamp::now().as_millisecond();
     let mut due: Vec<String> = Vec::new();
     for cat in running {
         for id in store.enabled_key_ids(cat) {
@@ -307,7 +307,7 @@ pub(crate) async fn query_and_record(
                 "余额缓存命中: key={} remaining={:?} age={}s",
                 key_id,
                 cached.remaining,
-                (chrono::Utc::now().timestamp_millis() - cached.queried_at) / 1000
+                (jiff::Timestamp::now().as_millisecond() - cached.queried_at) / 1000
             );
             return Ok(cached);
         }

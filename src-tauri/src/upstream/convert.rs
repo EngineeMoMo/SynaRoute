@@ -787,7 +787,7 @@ pub fn anthropic_resp_to_openai(body: &Value) -> Value {
     json!({
         "id": id,
         "object": "chat.completion",
-        "created": chrono::Utc::now().timestamp(),
+        "created": jiff::Timestamp::now().as_second(),
         "model": model,
         "choices": [ {
             "index": 0,
@@ -1285,7 +1285,7 @@ pub fn chat_resp_to_responses(body: &Value) -> Value {
     json!({
         "id": id,
         "object": "response",
-        "created_at": chrono::Utc::now().timestamp(),
+        "created_at": jiff::Timestamp::now().as_second(),
         "status": resp_status,
         "model": model,
         "output": output,
@@ -1639,7 +1639,7 @@ pub fn responses_resp_to_chat(body: &Value) -> Value {
     json!({
         "id": id,
         "object": "chat.completion",
-        "created": chrono::Utc::now().timestamp(),
+        "created": jiff::Timestamp::now().as_second(),
         "model": model,
         "choices": [ {
             "index": 0,

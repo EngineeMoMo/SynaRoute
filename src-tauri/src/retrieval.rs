@@ -832,7 +832,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "synaroute_retrieval_hardlink_{}_{}",
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            jiff::Timestamp::now().as_nanosecond()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(".env"), "API_KEY=NEEDLE_RETRIEVAL_HARDLINK\\n").unwrap();

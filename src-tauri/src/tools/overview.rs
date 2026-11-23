@@ -296,7 +296,7 @@ fn build_with(
         })
         .collect();
     RoutingOverview {
-        captured_at: chrono::Utc::now().timestamp_millis(),
+        captured_at: jiff::Timestamp::now().as_millisecond(),
         vault_locked: store.secrets.read().is_locked(),
         categories,
     }

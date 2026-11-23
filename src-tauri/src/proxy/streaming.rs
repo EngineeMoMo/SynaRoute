@@ -15,12 +15,19 @@ struct State {
     upstream: Upstream, translator: Option<SseTranslator>, finished: bool,
     head: Vec<u8>, tail: Vec<u8>, errored: bool, eof: bool,
     monitor: Option<crate::upstream::sse_frames::Monitor>,
+    redactor: super::stream_redaction::Redactor,
+    native_response: bool,
     store: Arc<Store>, category: CategoryType, key_id: String, requested_model: String, real_model: String,
     lease: Option<crate::store::routing::runtime::Lease>, active: Control,
 }
 impl State {
     fn observe(&mut self, bytes: &[u8]) -> usize {
         let consumed = self.monitor.as_mut().map_or(bytes.len(), |monitor| monitor.push(bytes));
+        if self.native_response {
+            if let (Some(lease), Some(id)) = (&self.lease, self.monitor.as_ref().and_then(|monitor| monitor.response_id())) {
+                self.store.routing_runtime.observe_response(lease, id, &self.key_id, &self.real_model);
+            }
+        }
         let n = (WINDOW - self.head.len()).min(bytes.len());
         self.head.extend_from_slice(&bytes[..n]);
         if bytes.len() >= WINDOW {
@@ -32,7 +39,7 @@ impl State {
         consumed
     }
     fn saw_error(&self) -> bool {
-        self.errored || self.translator.as_ref().is_some_and(SseTranslator::failed)
+        self.errored || self.eof && self.redactor.pending() || self.translator.as_ref().is_some_and(SseTranslator::failed)
             || self.monitor.as_ref().is_some_and(|monitor| monitor.failed(self.eof))
     }
 }
@@ -58,7 +65,7 @@ impl Drop for State {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn response(
     resp: reqwest::Response, permit: tokio::sync::OwnedSemaphorePermit, store: &Arc<Store>,
-    category: CategoryType, key: &ProviderKey, requested_model: &str, real_model: &str,
+    category: CategoryType, key: &ProviderKey, secret: &str, requested_model: &str, real_model: &str,
     downstream: Protocol, translator: Option<SseTranslator>,
     lease: Option<crate::store::routing::runtime::Lease>, active: Control,
 ) -> crate::error::AppResult<Response<ResBody>> {
@@ -66,8 +73,8 @@ pub(super) fn response(
     let content_type = resp.headers().get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("text/event-stream").to_owned();
     let encoding = resp.headers().get("content-encoding").and_then(|h| h.to_str().ok())
         .map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("identity")).map(str::to_owned);
-    if translated && encoding.is_some() {
-        return Err(crate::error::AppError::upstream_msg("Cannot translate an encoded upstream SSE stream"));
+    if encoding.is_some() || !content_type.split(';').next().is_some_and(|kind| kind.trim().eq_ignore_ascii_case("text/event-stream")) {
+        return Err(crate::error::AppError::upstream_msg("Upstream streaming response must be unencoded text/event-stream"));
     }
     let monitor = (encoding.is_none() && content_type.split(';').next().is_some_and(|kind| kind.trim().eq_ignore_ascii_case("text/event-stream")))
         .then(|| crate::upstream::sse_frames::Monitor::new(key.protocol));
@@ -78,13 +85,15 @@ pub(super) fn response(
         if let Ok(bytes) = chunk { counter.received(bytes.len()); }
     }), permit);
     let state = State { upstream, translator, finished: false, head: Vec::new(), tail: Vec::new(),
-        errored: false, eof: false, monitor, store: store.clone(), category, key_id: key.id.clone(),
-        requested_model: requested_model.into(), real_model: real_model.into(), lease, active };
+        errored: false, eof: false, monitor, redactor: super::stream_redaction::Redactor::new(key, secret), store: store.clone(), category, key_id: key.id.clone(),
+        requested_model: requested_model.into(), real_model: real_model.into(), lease, active,
+        native_response: key.protocol == Protocol::OpenaiResponses && downstream == key.protocol };
     let stream = futures_util::stream::unfold(state, move |mut st| async move {
         if st.finished { return None; }
         loop {
             match st.upstream.next().await {
                 Some(Ok(bytes)) => {
+                    let bytes = Bytes::from(st.redactor.push(&bytes));
                     let consumed = st.observe(&bytes);
                     let output = match &mut st.translator {
                         Some(tr) => Bytes::from(tr.push(&bytes)), None => bytes.slice(..consumed),
@@ -93,14 +102,17 @@ pub(super) fn response(
                 }
                 Some(Err(e)) => {
                     st.errored = true; st.finished = true; st.active.finish(End::UpstreamError);
-                    return Some((Err(std::io::Error::other(crate::diagnostics::http_error_message(e))), st));
+                    return Some((Err(std::io::Error::other(st.redactor.message(&crate::diagnostics::http_error_message(e)))), st));
                 }
                 None => {
                     st.eof = true; st.finished = true;
                     // Release the network stream and its permit before yielding a final frame.
                     // That frame may remain blocked by downstream backpressure indefinitely.
                     st.upstream = Box::pin(futures_util::stream::empty());
-                    let tail = st.translator.as_mut().map(|tr| tr.finish()).unwrap_or_default();
+                    let pending = st.redactor.finish();
+                    st.observe(&pending);
+                    let mut tail = st.translator.as_mut().map(|tr| tr.push(&pending)).unwrap_or_else(|| String::from_utf8_lossy(&pending).into_owned());
+                    if let Some(translator) = &mut st.translator { tail.push_str(&translator.finish()); }
                     let error = st.saw_error();
                     st.active.finish(if error { End::UpstreamError } else { End::Complete });
                     if error && st.translator.is_none() && !st.monitor.as_ref().is_some_and(|monitor| monitor.explicit_error()) {

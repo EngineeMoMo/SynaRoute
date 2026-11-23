@@ -302,7 +302,7 @@ pub(crate) fn note_silent_downgrade(
     if !we_advertised {
         return;
     }
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = jiff::Timestamp::now().as_millisecond();
     if !should_announce(category, &format!("downgrade:{bare}"), now) {
         return;
     }
@@ -558,7 +558,7 @@ pub(crate) fn reject_if_unserviceable(
     // （「这些 Key 本可承接它、现在都被挡住」），否则那条 Key 明明能兜底却不在「谁支持」里。
     let supporters: Vec<&ProviderKey> =
         enabled.iter().filter(|k| serves_or_substitutes(k, requested)).collect();
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = jiff::Timestamp::now().as_millisecond();
     let retry_after = earliest_release_ms(&supporters, requested, now)
         .map(|until| ((until - now) as f64 / 1000.0).ceil() as i64);
 
@@ -707,7 +707,7 @@ mod tests {
     /// 把这条 Key 打成「Key 级熔断中」。
     fn breaker(mut k: ProviderKey, ms_from_now: i64) -> ProviderKey {
         k.health = HealthState {
-            breaker_until: Some(chrono::Utc::now().timestamp_millis() + ms_from_now),
+            breaker_until: Some(jiff::Timestamp::now().as_millisecond() + ms_from_now),
             ..Default::default()
         };
         k
@@ -715,7 +715,7 @@ mod tests {
 
     /// 把这条 Key 上某个**真实**模型名打成「单模型锁定中」。
     fn model_lock(mut k: ProviderKey, real: &str, ms_from_now: i64) -> ProviderKey {
-        let until = chrono::Utc::now().timestamp_millis() + ms_from_now;
+        let until = jiff::Timestamp::now().as_millisecond() + ms_from_now;
         k.health.model_locks.insert(real.into(), ModelLock { until, fail_count: 3 });
         k
     }
@@ -728,7 +728,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "sr_pool_{tag}_{}_{n}_{}",
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            jiff::Timestamp::now().as_nanosecond()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::new_at(dir.join("config.json"), dir.join("secrets.enc")).unwrap();

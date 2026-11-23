@@ -10,6 +10,33 @@ pub(crate) const CONNECTION_LIMIT: usize = 64;
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 static BODY_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
+#[derive(Clone, Copy)]
+pub(crate) struct LocalAddress(pub std::net::SocketAddr);
+
+pub(crate) fn check_host<B>(request: &hyper::Request<B>) -> Result<(), StatusCode> {
+    let mut hosts = request.headers().get_all(hyper::header::HOST).iter();
+    let host = hosts.next().and_then(|value| value.to_str().ok()).ok_or(StatusCode::FORBIDDEN)?;
+    if hosts.next().is_some() || host.contains('@') || host.chars().any(char::is_whitespace) { return Err(StatusCode::FORBIDDEN); }
+    let authority = host.parse::<hyper::http::uri::Authority>().map_err(|_| StatusCode::FORBIDDEN)?;
+    if request.uri().authority().is_some_and(|target| !target.as_str().eq_ignore_ascii_case(host)) { return Err(StatusCode::FORBIDDEN); }
+    let local = request.extensions().get::<LocalAddress>().map(|local| local.0);
+    if local.is_some_and(|local| authority.port_u16().unwrap_or(80) != local.port()) { return Err(StatusCode::FORBIDDEN); }
+    let name = authority.host().trim_start_matches('[').trim_end_matches(']');
+    let normalize = |ip: std::net::IpAddr| match ip {
+        std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(std::net::IpAddr::V6(ip)),
+        ip => ip,
+    };
+    let allowed = if name.eq_ignore_ascii_case("localhost") {
+        local.is_none_or(|local| normalize(local.ip()).is_loopback())
+    } else {
+        name.parse::<std::net::IpAddr>().is_ok_and(|ip| {
+            let ip = normalize(ip);
+            local.map_or_else(|| ip.is_loopback(), |local| ip == normalize(local.ip()))
+        })
+    };
+    if allowed { Ok(()) } else { Err(StatusCode::FORBIDDEN) }
+}
+
 pub(crate) fn origin_allowed(origin: Option<&str>) -> bool {
     let Some(origin) = origin else { return true };
     // Opaque origins (including sandboxed remote pages) must never be trusted.
@@ -122,6 +149,35 @@ mod tests {
     use http_body_util::{Full, StreamBody};
     use hyper::body::Frame;
     use std::convert::Infallible;
+
+    #[test]
+    fn hosts_match_the_actual_listener_and_reject_rebinding_names() {
+        for (address, host, allowed) in [
+            ("127.0.0.1:47100", "127.0.0.1:47100", true),
+            ("127.0.0.1:47100", "localhost:47100", true),
+            ("[::1]:47100", "[::1]:47100", true),
+            ("192.168.1.8:47100", "192.168.1.8:47100", true),
+            ("[fd00::8]:47100", "[fd00::8]:47100", true),
+            ("127.0.0.1:47100", "rebind.example:47100", false),
+            ("127.0.0.1:47100", "localhost.evil:47100", false),
+            ("127.0.0.1:47100", "localhost:47101", false),
+            ("127.0.0.1:47100", "localhost", false),
+            ("127.0.0.1:47100", "user@localhost:47100", false),
+            ("192.168.1.8:47100", "192.168.1.9:47100", false),
+            ("192.168.1.8:47100", "localhost:47100", false),
+        ] {
+            let mut request = hyper::Request::builder().header("host", host).body(()).unwrap();
+            request.extensions_mut().insert(LocalAddress(address.parse().unwrap()));
+            assert_eq!(check_host(&request).is_ok(), allowed, "{address} {host}");
+        }
+        let mut request = hyper::Request::new(());
+        assert!(check_host(&request).is_err());
+        request.headers_mut().append("host", "localhost".parse().unwrap());
+        request.headers_mut().append("host", "localhost".parse().unwrap());
+        assert!(check_host(&request).is_err());
+        let request = hyper::Request::builder().uri("http://evil.example/").header("host", "localhost").body(()).unwrap();
+        assert!(check_host(&request).is_err());
+    }
 
     #[test]
     fn opaque_and_malformed_origins_fail_closed() {
