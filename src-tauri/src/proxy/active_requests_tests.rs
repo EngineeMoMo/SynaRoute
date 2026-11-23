@@ -16,15 +16,16 @@ async fn lan_partial_restart_failure_preserves_authoritative_state() {
     store.set_proxy_port(broken, 0).unwrap();
     store.set_proxy_port(healthy, 0).unwrap();
     let manager = Arc::new(crate::proxy::ProxyManager::new(store.clone()));
-    manager.start(broken).await.unwrap();
+    let broken_port = manager.start(broken).await.unwrap();
     let healthy_port = manager.start(healthy).await.unwrap();
     let (blocked_port, blockers) = loop {
-        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
         let port = first.local_addr().unwrap().port();
         if port > u16::MAX - 20 { continue; }
+        if (port..=port + 20).contains(&healthy_port) || (port..=port + 20).contains(&broken_port) { continue; }
         let mut listeners = vec![first];
         for candidate in (port + 1)..=(port + 20) {
-            match tokio::net::TcpListener::bind(("127.0.0.1", candidate)).await {
+            match tokio::net::TcpListener::bind(("0.0.0.0", candidate)).await {
                 Ok(listener) => listeners.push(listener),
                 Err(_) => break,
             }
@@ -35,13 +36,15 @@ async fn lan_partial_restart_failure_preserves_authoritative_state() {
     let result = crate::service::set_lan_exposure(&store, &manager, true).await;
     let saved = store.get_settings().lan_exposure;
     let running = manager.is_running(healthy);
-    let other_loopback = tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(("127.0.0.2", healthy_port))).await;
-    let wildcard_reachable = matches!(other_loopback, Ok(Ok(_)));
+    let broken_stopped = !manager.is_running(broken);
+    let preserved_port = manager.port_of(healthy) == Some(healthy_port);
+    let connection = tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(("127.0.0.1", healthy_port))).await;
+    let listener_reachable = matches!(connection, Ok(Ok(_)));
     manager.stop_all();
     drop(blockers);
-    println!("LAN_PARTIAL_FAILURE={}", json!({"returned_error":result.is_err(),"saved_lan_exposure":saved,"healthy_listener_running":running,"wildcard_listener_reachable":wildcard_reachable}));
+    println!("LAN_PARTIAL_FAILURE={}", json!({"returned_error":result.is_err(),"saved_lan_exposure":saved,"healthy_listener_running":running,"broken_listener_stopped":broken_stopped,"preserved_port":preserved_port,"listener_reachable":listener_reachable}));
     assert!(result.is_err());
-    assert!(saved && running && wildcard_reachable);
+    assert!(saved && running && broken_stopped && preserved_port && listener_reachable);
 }
 
 fn store() -> Arc<Store> {

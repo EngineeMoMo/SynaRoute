@@ -176,6 +176,17 @@ mod tests {
     /// 🔴 **未开局域网时绝不能绑到通配地址** —— 那等于把代理暴露给整个局域网，
     /// 而界面显示的是「局域网暴露：关闭」。这是安全方向的「界面说 A、实际 B」。
     #[tokio::test]
+    async fn with_lan_both_sockets_are_on_wildcard_addresses() {
+        let bound = bind_sticky(true, 0, 0).await.unwrap();
+        assert!(bound.v4.local_addr().unwrap().ip().is_unspecified());
+        if ipv6_available() {
+            assert!(bound.v6.as_ref().expect("IPv6 is available").local_addr().unwrap().ip().is_unspecified());
+        }
+        let connected = tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(("127.0.0.1", bound.port))).await;
+        assert!(matches!(connected, Ok(Ok(_))));
+    }
+
+    #[tokio::test]
     async fn without_lan_neither_socket_is_on_a_wildcard_address() {
         let b = bind_sticky(false, 0, 0).await.unwrap();
         assert!(b.v4.local_addr().unwrap().ip().is_loopback());

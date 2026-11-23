@@ -137,9 +137,9 @@ jobs:
       - name: install frontend dependencies
         run: npm ci
 
-      - name: Linux vault security regression tests
-        if: matrix.platform == 'ubuntu-22.04'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib secret::tests
+      - name: Unix library regression tests
+        if: matrix.platform != 'windows-latest'
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 
       - uses: tauri-apps/tauri-action@v0
         env:
