@@ -49,7 +49,7 @@ import type { ResilienceOverview } from "@/lib/resilience";
 import type { RoutingOverview } from "./routingOverview";
 import type { CategoryPolicy, RoutingPolicyView, RoutingSaveResult, RoutingScene, RoutingSyncResult, SceneApplied, ScenePreview, SensitiveScan } from "./routingPolicies";
 import { mockBridge } from "./mockData";
-import type { ActiveRequest, RequestStopResult } from "./activeRequests";
+import type { ActiveRequest, RequestStopResult, RouteActivity } from "./activeRequests";
 import type { KeyChatRequest, KeyChatReply, KeyChatStarted } from "./keyChat";
 import type { EventCursor, EventDelta } from "./eventFeed";
 
@@ -121,6 +121,7 @@ export const api = {
   clearRoutingSessions: (categoryId: CategoryType) => call<void>("clear_routing_sessions", { categoryId }, () => mockBridge.clearRoutingSessions(categoryId)),
   previewSensitiveContent: (categoryId: CategoryType, text: string, credentials: boolean, emails: boolean, phones: boolean) => call<SensitiveScan>("preview_sensitive_content", { categoryId, text, credentials, emails, phones }, () => mockBridge.previewSensitiveContent(categoryId, text, { credentials, emails, phones })),
   routingOverview: () => call<RoutingOverview>("routing_overview", undefined, () => mockBridge.routingOverview()),
+  routeActivity: () => call<RouteActivity[]>("route_activity", undefined, () => mockBridge.routeActivity()),
   getDecisionConfig: (categoryId: CategoryType) => call<DecisionView>("get_decision_config", { categoryId }, () => defaultDecision()),
   layaLocalStatus: () => call<LayaLocalStatus>("laya_local_status", undefined, () => ({ ...layaMock })),
   // An object, not positional booleans: swapping repair/noInstall at a call site must not be possible.

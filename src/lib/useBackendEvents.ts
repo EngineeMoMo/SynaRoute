@@ -25,6 +25,7 @@ export type BackendTopic =
   | "proxy"
   | "vault"
   | "logs"
+  | "route-activity"
   /** 定时检查更新发现了新版本（后端 `update_watch`，30 分钟一轮）。载荷不带版本号 */
   | "update"
   /** 收到 synaroute:// 深链接导入请求，应弹确认框。载荷不带内容，前端调 deeplinkImportPeek 拉预览 */

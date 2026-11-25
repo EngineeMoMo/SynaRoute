@@ -11,10 +11,11 @@ import { overviewEn, overviewZh } from "@/lib/i18n.overview";
 import { categoryZh } from "@/lib/i18n.category";
 import { useStore } from "@/store";
 import { translate, type TFunc } from "@/lib/i18n";
+import type { CategoryType } from "@/types";
 
 vi.mock("@/lib/useT", () => ({ useT: (): TFunc => (key, vars) => translate(useStore.getState().lang, key, vars) }));
 
-const state = vi.hoisted(() => ({ data: null as RoutingOverview | null, failed: false, loading: false, refresh: vi.fn() }));
+const state = vi.hoisted(() => ({ data: null as RoutingOverview | null, failed: false, loading: false, refresh: vi.fn(), activeRoutes: new Set<CategoryType>() }));
 vi.mock("@/lib/useRoutingOverview", () => ({ useRoutingOverview: () => state }));
 
 function fixture(): RoutingOverview {
@@ -34,7 +35,7 @@ function render() {
   return renderToStaticMarkup(createElement(RoutingOverviewPage, { onManage: vi.fn(), onOpenLogs: vi.fn(), onOpenReliability: vi.fn() }));
 }
 
-beforeEach(() => { state.data = fixture(); state.failed = false; state.loading = false; useStore.setState({ lang: "zh" }); });
+beforeEach(() => { state.data = fixture(); state.failed = false; state.loading = false; state.activeRoutes.clear(); useStore.setState({ lang: "zh" }); });
 afterEach(() => vi.unstubAllGlobals());
 
 describe("routing overview", () => {
@@ -54,7 +55,7 @@ describe("routing overview", () => {
   it("keeps translated node names in readable HTML outside the SVG graphics", () => {
     for (const lang of ["zh", "en"] as const) {
       useStore.setState({ lang });
-      const html = renderToStaticMarkup(createElement(RoutePulse, { categories: fixture().categories, vaultLocked: false }));
+      const html = renderToStaticMarkup(createElement(RoutePulse, { categories: fixture().categories, vaultLocked: false, activeRoutes: new Set() }));
       const graphics = [...html.matchAll(/<svg\b[\s\S]*?<\/svg>/g)].map((match) => match[0]).join("");
       expect(graphics).not.toContain("<text");
       for (const key of ["overview.signalHub", "nav.claude-cli", "nav.claude-desktop", "nav.codex"]) {
@@ -67,24 +68,42 @@ describe("routing overview", () => {
     }
   });
 
-  it("only moves listening routes and stops every route when the vault is locked", () => {
+  it("moves only the client with request activity, not idle listeners or stopped routes", () => {
     const categories = fixture().categories;
-    const renderSignal = (vaultLocked: boolean) => renderToStaticMarkup(createElement(RoutePulse, { categories, vaultLocked }));
-    expect(renderSignal(false).match(/class="route-pulse__path is-live"/g)).toHaveLength(2);
-    const locked = renderSignal(true);
-    expect(locked).not.toContain("is-live");
+    const renderSignal = (activeRoutes: ReadonlySet<CategoryType>, vaultLocked = false) =>
+      renderToStaticMarkup(createElement(RoutePulse, { categories, vaultLocked, activeRoutes }));
+    const listening = renderSignal(new Set());
+    expect(listening).toContain(overviewZh["overview.running"]);
+    expect(listening).not.toContain("route-pulse__flow");
+    expect(listening).not.toContain("status-pulse");
+
+    const activity = new Set<CategoryType>(["codex", "claude-desktop"]);
+    const requested = renderSignal(activity);
+    expect(requested.match(/class="route-pulse__path route-pulse__flow"/g)).toHaveLength(2);
+    expect(requested.match(/class="route-pulse-icon(?: route-pulse-icon--hub)? status-pulse"/g)).toHaveLength(2);
+    expect(requested.match(/<li class="route-pulse-client is-active">[\s\S]*?<\/li>/g)).toEqual([
+      expect.stringContaining(translate("zh", "nav.codex")),
+    ]);
+    expect(requested).toContain(overviewZh["overview.signalTraffic"]);
+    expect(requested.match(/class="route-pulse-spine-flow(?: is-end)?"/g)).toHaveLength(3);
+
+    const concurrent = renderSignal(new Set(["codex", "claude-cli"]));
+    expect(concurrent.match(/class="route-pulse__path route-pulse__flow"/g)).toHaveLength(3);
+
+    const locked = renderSignal(activity, true);
+    expect(locked).not.toContain("route-pulse__flow");
+    expect(locked).not.toContain("route-pulse-spine-flow");
+    expect(locked).not.toContain("status-pulse");
     expect(locked).toContain(overviewZh["overview.signalLocked"]);
-    for (const category of categories) category.running = false;
-    expect(renderSignal(false)).not.toContain("is-live");
   });
 
   it("keeps route motion in CSS that respects the reduced-motion preference", () => {
-    const html = renderToStaticMarkup(createElement(RoutePulse, { categories: fixture().categories, vaultLocked: false }));
-    expect(html).toContain("route-pulse__path");
+    const html = renderToStaticMarkup(createElement(RoutePulse, { categories: fixture().categories, vaultLocked: false, activeRoutes: new Set(["claude-cli"]) }));
+    expect(html).toContain("route-pulse__flow");
     expect(html).not.toContain("<animateMotion");
     const css = readFileSync("src/styles.css", "utf8");
     const reducedMotionRule = css.slice(css.indexOf("@media (prefers-reduced-motion: reduce)"));
-    expect(reducedMotionRule).toMatch(/\.route-pulse__path\.is-live[^{}]*\{\s*animation: none;/);
+    expect(reducedMotionRule).toMatch(/\.route-pulse__flow,\s*\.route-pulse-spine-flow,\s*\.route-pulse-client\.is-active::after[^{}]*\{\s*animation: none;/);
   });
 
   it("renders all clients and distinguishes configured values from observed attempts", () => {
@@ -171,7 +190,9 @@ describe("routing overview", () => {
     expect(app).toContain('nav === "overview"');
     expect(app).toContain("<RoutingOverviewPage onManage={handleNav}");
     expect(bridge).toContain('call<RoutingOverview>("routing_overview"');
+    expect(bridge).toContain('call<RouteActivity[]>("route_activity"');
     expect(rust.slice(rust.indexOf("generate_handler!"))).toContain("tools::overview::routing_overview");
+    expect(rust.slice(rust.indexOf("generate_handler!"))).toContain("proxy::active_requests::route_activity");
     expect(hook).toContain("api.routingOverview()");
     expect(hook).toContain('useBackendEvent(["config", "settings", "health", "proxy", "vault", "logs"]');
     expect(hook).toContain("usePolling(() => void refresh(), FALLBACK_POLL_MS)");

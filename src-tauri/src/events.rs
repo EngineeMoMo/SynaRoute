@@ -76,6 +76,7 @@ pub enum Topic {
     Vault,
     /// 有新事件写入运行日志
     Logs,
+    RouteActivity,
     /// 定时检查更新发现了新版本（`update_watch`）。**只在结论变化时**发一次，
     /// 载荷里不带版本号 —— 前端收到后自己调 `check_for_updates` 拿版本与说明
     /// （同本模块「载荷里为什么不带业务数据」那条）
@@ -100,6 +101,7 @@ impl Topic {
             Topic::Proxy => "proxy",
             Topic::Vault => "vault",
             Topic::Logs => "logs",
+            Topic::RouteActivity => "route-activity",
             Topic::Update => "update",
             Topic::ImportRequest => "import-request",
         }
@@ -121,6 +123,7 @@ impl Topic {
             | Topic::Health
             | Topic::Proxy
             | Topic::Vault
+            | Topic::RouteActivity
             | Topic::Update
             // 深链接导入是用户主动触发的低频事件，不压制（压了只会让确认框迟到）。
             | Topic::ImportRequest => 0,

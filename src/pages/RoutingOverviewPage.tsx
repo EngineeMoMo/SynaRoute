@@ -89,7 +89,7 @@ export function RoutingOverviewPage({ onManage, onOpenLogs, onOpenReliability, o
 }) {
   const t = useT();
   const lang = useStore((s) => s.lang);
-  const { data, failed, loading, refresh } = useRoutingOverview();
+  const { data, failed, loading, refresh, activeRoutes } = useRoutingOverview();
   return <div className="h-full overflow-y-auto" data-testid="routing-overview">
     <PageHeader icon={Waypoints} title={t("nav.overview")} description={t("overview.description")} actions={
       <Button size="sm" variant="outline" onClick={() => void refresh()} disabled={loading}><RefreshCw size={14} className={loading ? "animate-spin motion-reduce:animate-none" : ""} aria-hidden />{t("overview.refresh")}</Button>
@@ -103,7 +103,7 @@ export function RoutingOverviewPage({ onManage, onOpenLogs, onOpenReliability, o
       {data?.vaultLocked && <InlineAlert tone="warning" className="text-text-primary" icon={LockKeyhole}>{t("overview.vaultLocked")}</InlineAlert>}
       {!data && !failed && <OverviewSkeleton label={t("common.loading")} />}
       {data && <>
-        <RoutePulse categories={data.categories} vaultLocked={data.vaultLocked} refreshing={loading} />
+        <RoutePulse categories={data.categories} vaultLocked={data.vaultLocked} activeRoutes={activeRoutes} refreshing={loading} />
         {data.categories.map((row) => <ClientRow key={row.categoryId} row={row} onManage={onManage} />)}
         <div className="grid gap-3 text-xs leading-5 text-text-secondary lg:grid-cols-2"><p>{t("overview.configNote")}</p><p>{t("overview.latestNote")}</p></div>
         <p className="text-xs tabular-nums text-text-secondary">{t("overview.updated", { time: new Date(data.capturedAt).toLocaleString(lang === "zh" ? "zh-CN" : "en-US") })}</p>

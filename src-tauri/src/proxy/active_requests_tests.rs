@@ -81,6 +81,34 @@ fn registry_is_scoped_and_guard_drop_unregisters() {
     assert_eq!(first.active_requests.stop(CategoryType::ClaudeCli, "request-one"), StopResult::Finished);
 }
 
+#[test]
+fn route_activity_is_per_client_and_keeps_short_requests_visible() {
+    let store = store();
+    let registry = &store.active_requests;
+    let cli = CategoryType::ClaudeCli;
+    let codex = CategoryType::Codex;
+    let snapshot = |now| registry.route_activity_at(now)
+        .into_iter()
+        .map(|route| (route.category_id, route.idle_in_ms))
+        .collect::<Vec<_>>();
+    let _key_chat = begin(&store, "key-chat");
+    assert!(snapshot(Instant::now()).is_empty());
+
+    let first = registry.begin_client(store.clone(), "cli-first", cli, "m", true);
+    let second = registry.begin_client(store.clone(), "cli-second", cli, "m", true);
+    let quick = registry.begin_client(store.clone(), "codex-quick", codex, "m", false);
+    drop(first);
+    assert_eq!(snapshot(Instant::now() + CLIENT_ROUTE_TAIL), vec![(cli, None), (codex, None)]);
+
+    drop(quick);
+    let finished = registry.1.lock()[&codex].last_finished.unwrap();
+    assert_eq!(snapshot(finished), vec![(cli, None), (codex, Some(CLIENT_ROUTE_TAIL.as_millis() as u64))]);
+    assert_eq!(snapshot(finished + CLIENT_ROUTE_TAIL), vec![(cli, None)]);
+
+    drop(second);
+    assert!(snapshot(Instant::now() + CLIENT_ROUTE_TAIL).is_empty());
+}
+
 #[tokio::test]
 async fn restart_waits_for_socket_release_and_concurrent_starts_share_port() {
     let store = store();
@@ -394,6 +422,10 @@ async fn live_stream_stop_preserves_usage_and_never_touches_health() {
         assert_eq!(concurrency::in_flight(&id), 1);
         let row = active_row(&s).await;
         assert_eq!(row.request_id, request_id); assert_eq!(row.bytes_received, start.len() as u64);
+        let flow = s.active_requests.route_activity_at(Instant::now());
+        assert_eq!(flow.len(), 1);
+        assert_eq!(flow[0].category_id, CategoryType::ClaudeCli);
+        assert_eq!(flow[0].idle_in_ms, None);
         s.active_requests.stop(CategoryType::ClaudeCli, &request_id);
         let mut text = String::new();
         while let Some(chunk) = bounded(chunks.next()).await { text.push_str(&String::from_utf8_lossy(&chunk.unwrap())); }

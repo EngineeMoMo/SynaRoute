@@ -18,6 +18,11 @@ export interface ActiveRequest {
 }
 export type RequestStopResult = "requested" | "alreadyStopping" | "finished";
 
+export interface RouteActivity {
+  categoryId: CategoryType;
+  idleInMs: number | null;
+}
+
 /** Serial snapshots; changing category/unmount invalidates all pending IPC results.
  * A failed refresh must never be presented as an authoritative empty list. */
 export class ActiveRequestFeed {

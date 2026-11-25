@@ -483,7 +483,7 @@ async fn handle_request_inner(
         ));
     }
 
-    let active_guard = store.active_requests.begin(store.clone(), &request_id, category, &requested_model, wants_stream);
+    let active_guard = store.active_requests.begin_client(store.clone(), &request_id, category, &requested_model, wants_stream);
     let active = active_guard.control();
     active_requests::run(active_guard, downstream, async {
     // 候选：启用 + 未熔断，按优先级。全被熔断时（如单 Key 刚熔断）忽略熔断兜底，

@@ -401,6 +401,8 @@
   }
 
   .route-pulse-visual {
+    --route-flow-fill: rgb(var(--primary));
+    --route-flow-track: rgb(var(--primary) / 0.28);
     padding: 24px;
     background: rgb(var(--surface-hover) / 0.4);
   }
@@ -434,6 +436,12 @@
     border-color: rgb(var(--primary) / 0.5);
   }
 
+  .route-pulse-hub.is-active,
+  .route-pulse-client.is-active {
+    border-color: rgb(var(--primary) / 0.7);
+    background: color-mix(in srgb, rgb(var(--surface)), var(--route-flow-fill) 5%);
+  }
+
   .route-pulse-icon {
     display: grid;
     flex: 0 0 32px;
@@ -451,6 +459,11 @@
     height: 40px;
     background: rgb(var(--primary) / 0.08);
     color: rgb(var(--primary));
+  }
+
+  .route-pulse-client.is-active .route-pulse-icon {
+    background: rgb(var(--primary) / 0.12);
+    color: var(--route-flow-fill);
   }
 
   .route-pulse-copy {
@@ -506,10 +519,19 @@
     stroke: rgb(var(--primary) / 0.85);
   }
 
-  .route-pulse__path.is-live {
-    stroke: rgb(var(--primary));
-    stroke-dasharray: 4 14;
-    animation: synaroute-route-flow 3.6s linear infinite;
+  .route-pulse__path.is-active {
+    stroke: var(--route-flow-track);
+  }
+
+  .route-pulse__flow {
+    stroke: var(--route-flow-fill);
+    stroke-width: 3;
+    stroke-dasharray: 14 22;
+    animation: synaroute-route-flow 750ms linear infinite;
+  }
+
+  .route-pulse-spine-flow {
+    display: none;
   }
 
   .route-pulse-clients {
@@ -575,8 +597,8 @@
 
     .route-pulse-client::before {
       position: absolute;
-      top: -17px;
-      bottom: -13px;
+      top: -13px;
+      bottom: -1px;
       left: -17px;
       width: 2px;
       background: rgb(var(--text-secondary) / 0.8);
@@ -595,6 +617,32 @@
       height: 2px;
       background: rgb(var(--text-secondary) / 0.8);
       content: "";
+    }
+
+    .route-pulse-spine-flow {
+      display: block;
+      position: absolute;
+      top: -13px;
+      bottom: -1px;
+      left: -17px;
+      width: 2px;
+      background-image: linear-gradient(var(--route-flow-fill) 14px, var(--route-flow-track) 14px);
+      background-size: 100% 36px;
+      animation: synaroute-route-spine-flow 750ms linear infinite;
+    }
+
+    .route-pulse-client:first-child::before,
+    .route-pulse-client:first-child .route-pulse-spine-flow {
+      top: -17px;
+    }
+
+    .route-pulse-spine-flow.is-end {
+      bottom: calc(50% - 2px);
+    }
+
+    .route-pulse-client.is-active::after {
+      background: linear-gradient(90deg, var(--route-flow-fill) 14px, var(--route-flow-track) 14px) 0 0 / 36px 100% repeat-x;
+      animation: synaroute-route-branch-flow 750ms linear infinite;
     }
 
     .route-pulse-metrics {
@@ -732,10 +780,19 @@
   .status-pulse,
   .status-shake,
   .sr-flow,
-  .route-pulse__path.is-live,
+  .route-pulse__flow,
+  .route-pulse-spine-flow,
+  .route-pulse-client.is-active::after,
   .route-pulse-skeleton::after,
   .route-card-skeleton::after {
     animation: none;
+  }
+  .route-pulse__flow {
+    stroke-dasharray: none;
+  }
+  .route-pulse-spine-flow,
+  .route-pulse-client.is-active::after {
+    background: var(--route-flow-fill);
   }
   .animate-in,
   .sr-enter {
@@ -812,6 +869,18 @@
 @keyframes synaroute-route-flow {
   to {
     stroke-dashoffset: -36;
+  }
+}
+
+@keyframes synaroute-route-spine-flow {
+  to {
+    background-position: 0 -36px;
+  }
+}
+
+@keyframes synaroute-route-branch-flow {
+  to {
+    background-position: -36px 0;
   }
 }
 

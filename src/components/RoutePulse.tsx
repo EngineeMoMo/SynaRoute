@@ -4,12 +4,13 @@ import type { CSSProperties } from "react";
 import { CATEGORY_ICONS } from "@/lib/categoryIcons";
 import { useT } from "@/lib/useT";
 import type { CategoryOverview } from "@/lib/routingOverview";
+import type { CategoryType } from "@/types";
 
 function connectorPath(index: number, total: number) {
   const position = ((index + 0.5) / total) * 1000;
-  if (Math.abs(position - 500) < 16) return `M ${position} 48 L 500 0`;
+  if (Math.abs(position - 500) < 16) return `M ${position} 48 L 500 16`;
   const direction = position < 500 ? 1 : -1;
-  return `M ${position} 48 V 32 Q ${position} 24 ${position + direction * 8} 24 H ${500 - direction * 8} Q 500 24 500 16 V 0`;
+  return `M ${position} 48 V 32 Q ${position} 24 ${position + direction * 8} 24 H ${500 - direction * 8} Q 500 24 500 16`;
 }
 
 function Metric({
@@ -41,10 +42,12 @@ function Metric({
 export function RoutePulse({
   categories,
   vaultLocked,
+  activeRoutes,
   refreshing = false,
 }: {
   categories: CategoryOverview[];
   vaultLocked: boolean;
+  activeRoutes: ReadonlySet<CategoryType>;
   refreshing?: boolean;
 }) {
   const t = useT();
@@ -55,15 +58,31 @@ export function RoutePulse({
   const observed = categories.filter((category) => category.latest !== null).length;
   const failed = categories.filter((category) => category.latest && !category.latest.ok).length;
   const live = running > 0 && !vaultLocked;
+  const routes = categories.map((category, index) => {
+    const isLive = category.running && !vaultLocked;
+    return {
+      category,
+      isLive,
+      isActive: isLive && activeRoutes.has(category.categoryId),
+      isConfigured: category.connection.state === "configured",
+      path: connectorPath(index, total),
+    };
+  });
+  const lastActiveIndex = routes.reduce((last, route, index) => route.isActive ? index : last, -1);
+  const hasActivity = lastActiveIndex >= 0;
+  const segments = [
+    ...routes.map(({ category, path, isConfigured, isActive }) => ({ id: category.categoryId, path, isConfigured, isActive })),
+    { id: "hub", path: "M 500 16 V 0", isConfigured: configured > 0, isActive: hasActivity },
+  ];
   const statusKey = refreshing
     ? "overview.signalRefreshing"
     : vaultLocked
       ? "overview.signalLocked"
       : failed > 0
         ? "overview.signalAttention"
-        : live
-          ? "overview.signalLive"
-          : "overview.signalIdle";
+        : hasActivity
+          ? "overview.signalTraffic"
+          : live ? "overview.signalLive" : "overview.signalIdle";
 
   return (
     <section className="route-pulse-shell overflow-hidden rounded-card border border-border bg-surface shadow-card" data-testid="route-pulse" aria-label={t("overview.signalTitle")}>
@@ -96,39 +115,34 @@ export function RoutePulse({
 
       <div className="route-pulse-visual">
         <div className="route-pulse-diagram" style={{ "--route-count": Math.max(total, 1) } as CSSProperties}>
-          <div className={`route-pulse-hub ${live ? "is-live" : ""}`}>
-            <span className="route-pulse-icon route-pulse-icon--hub" aria-hidden="true"><Waypoints size={22} strokeWidth={1.75} /></span>
+          <div className={`route-pulse-hub${live ? " is-live" : ""}${hasActivity ? " is-active" : ""}`}>
+            <span className={`route-pulse-icon route-pulse-icon--hub${hasActivity ? " status-pulse" : ""}`} aria-hidden="true"><Waypoints size={22} strokeWidth={1.75} /></span>
             <div className="route-pulse-copy">
               <h3 className="route-pulse-name">{t("overview.signalHub")}</h3>
               <p className="route-pulse-detail">{t("overview.signalHubHint")}</p>
             </div>
           </div>
-          <svg className="route-pulse-connectors" viewBox="0 0 1000 48" preserveAspectRatio="none" aria-hidden="true">
-            {categories.map((category, index) => {
-              const isConfigured = category.connection.state === "configured";
-              const isLive = category.running && !vaultLocked;
-              const path = connectorPath(index, total);
-              return (
-                <g key={category.categoryId}>
-                  <path d={path} vectorEffect="non-scaling-stroke" className={`route-pulse__path ${isConfigured ? "is-configured" : ""}`} />
-                  {isLive && <path d={path} vectorEffect="non-scaling-stroke" className="route-pulse__path is-live" />}
-                </g>
-              );
-            })}
-          </svg>
+          {total > 0 && <svg className="route-pulse-connectors" viewBox="0 0 1000 48" preserveAspectRatio="none" aria-hidden="true">
+            {segments.map(({ id, path, isConfigured, isActive }) => (
+              <path key={id} d={path} vectorEffect="non-scaling-stroke" className={`route-pulse__path${isConfigured ? " is-configured" : ""}${isActive ? " is-active" : ""}`} />
+            ))}
+            {segments.filter(({ isActive }) => isActive).map(({ id, path }) => (
+              <path key={`flow-${id}`} d={path} vectorEffect="non-scaling-stroke" className="route-pulse__path route-pulse__flow" />
+            ))}
+          </svg>}
           <ul className="route-pulse-clients">
-            {categories.map((category) => {
+            {routes.map(({ category, isLive, isActive }, index) => {
               const Icon = CATEGORY_ICONS[category.categoryId];
-              const isLive = category.running && !vaultLocked;
               const isLocked = category.running && vaultLocked;
               return (
-                <li key={category.categoryId} className={`route-pulse-client ${isLive ? "is-live" : ""}`}>
-                  <span className="route-pulse-icon" aria-hidden="true"><Icon size={19} strokeWidth={1.75} /></span>
+                <li key={category.categoryId} className={`route-pulse-client${isActive ? " is-active" : ""}`}>
+                  {index <= lastActiveIndex && <span className={`route-pulse-spine-flow${index === lastActiveIndex ? " is-end" : ""}`} aria-hidden="true" />}
+                  <span className={`route-pulse-icon${isActive ? " status-pulse" : ""}`} aria-hidden="true"><Icon size={19} strokeWidth={1.75} /></span>
                   <div className="route-pulse-copy">
                     <h3 className="route-pulse-name">{t(`nav.${category.categoryId}`)}</h3>
                     <p className="route-pulse-detail flex items-center gap-1.5">
                       <span className={`route-pulse-dot ${isLocked ? "is-locked" : isLive ? "is-live" : ""}`} aria-hidden="true" />
-                      <span>{t(isLocked ? "overview.signalLocked" : category.running ? "overview.running" : "overview.stopped")}</span>
+                      <span>{t(isLocked ? "overview.signalLocked" : isActive ? "overview.signalTraffic" : isLive ? "overview.running" : "overview.stopped")}</span>
                     </p>
                   </div>
                 </li>

@@ -1285,7 +1285,7 @@ pub fn run() {
             check_health, proxy::key_chat::test_key_conversation,
             get_brain_config,
             save_brain_config,
-            get_proxy_state, proxy::active_requests::list_active_requests, proxy::active_requests::stop_active_request,
+            get_proxy_state, proxy::active_requests::list_active_requests, proxy::active_requests::stop_active_request, proxy::active_requests::route_activity,
             start_proxy,
             stop_proxy,
             set_proxy_port,

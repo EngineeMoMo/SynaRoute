@@ -8,10 +8,11 @@ use http_body_util::BodyExt;
 use hyper::{body::{Body, Frame, SizeHint}, Response, StatusCode};
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::{collections::HashMap, pin::Pin, sync::Arc, task::{Context, Poll}, time::Instant};
+use std::{collections::HashMap, pin::Pin, sync::Arc, task::{Context, Poll}, time::{Duration, Instant}};
 use tokio::sync::{mpsc, watch};
 
 const STOP_MESSAGE: &str = "已由用户停止本次代理请求；不会继续尝试其他 Key。客户端可能自行发起新请求，上游也可能仍计费。";
+const CLIENT_ROUTE_TAIL: Duration = Duration::from_millis(1800);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum End { Complete, UpstreamError, Operator, Disconnected }
@@ -40,12 +41,76 @@ pub(crate) struct Snapshot {
     last_read_ms: Option<u64>,
 }
 #[derive(Default)]
-pub(crate) struct Registry(Mutex<HashMap<String, Arc<Entry>>>);
+struct ClientRoute {
+    in_flight: usize,
+    last_finished: Option<Instant>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RouteActivity {
+    category_id: CategoryType,
+    idle_in_ms: Option<u64>,
+}
+
+#[derive(Default)]
+pub(crate) struct Registry(
+    Mutex<HashMap<String, Arc<Entry>>>,
+    Mutex<HashMap<CategoryType, ClientRoute>>,
+);
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum StopResult { Requested, AlreadyStopping, Finished }
 
 impl Registry {
+    pub(super) fn begin_client(self: &Arc<Self>, store: Arc<Store>, id: &str, category: CategoryType, model: &str, streaming: bool) -> Guard {
+        let mut guard = self.begin(store, id, category, model, streaming);
+        self.update_client_route(category, true);
+        guard.client_route = true;
+        guard
+    }
+
+    fn update_client_route(&self, category: CategoryType, started: bool) {
+        let changed = {
+            let mut routes = self.1.lock();
+            let route = routes.entry(category).or_default();
+            if started {
+                route.in_flight += 1;
+                route.in_flight == 1
+            } else {
+                route.in_flight -= 1;
+                if route.in_flight == 0 {
+                    route.last_finished = Some(Instant::now());
+                }
+                route.in_flight == 0
+            }
+        };
+        if changed {
+            crate::events::emit(crate::events::Topic::RouteActivity, Some(category));
+        }
+    }
+
+    fn route_activity_at(&self, now: Instant) -> Vec<RouteActivity> {
+        let routes = self.1.lock();
+        CategoryType::ALL
+            .into_iter()
+            .filter_map(|category_id| {
+                let route = routes.get(&category_id)?;
+                let idle_in_ms = if route.in_flight > 0 {
+                    None
+                } else {
+                    let elapsed = now.saturating_duration_since(route.last_finished?);
+                    let remaining = CLIENT_ROUTE_TAIL.checked_sub(elapsed)?.as_millis() as u64;
+                    if remaining == 0 {
+                        return None;
+                    }
+                    Some(remaining)
+                };
+                Some(RouteActivity { category_id, idle_in_ms })
+            })
+            .collect()
+    }
+
     pub(super) fn begin(self: &Arc<Self>, store: Arc<Store>, id: &str, category: CategoryType, model: &str, streaming: bool) -> Guard {
         let (cancel, _) = watch::channel(false);
         let entry = Arc::new(Entry {
@@ -54,7 +119,7 @@ impl Registry {
                 key_id: None, key_name: None, attempts: 0, attempt_start: None, bytes: 0, last_read: None, end: None }),
         });
         self.0.lock().insert(id.into(), entry.clone());
-        Guard { registry: self.clone(), control: Control(entry), store }
+        Guard { registry: self.clone(), control: Control(entry), store, client_route: false }
     }
     pub(crate) fn list(&self, category: CategoryType) -> Vec<Snapshot> {
         let entries: Vec<_> = self.0.lock().values().filter(|e| e.category == category).cloned().collect();
@@ -123,12 +188,15 @@ impl Control {
         crate::upstream::response_body::read(response, |length| self.received(length)).await
     }
 }
-pub(super) struct Guard { registry: Arc<Registry>, control: Control, store: Arc<Store> }
+pub(super) struct Guard { registry: Arc<Registry>, control: Control, store: Arc<Store>, client_route: bool }
 impl Guard { pub(super) fn control(&self) -> Control { self.control.clone() } }
 impl Drop for Guard {
     fn drop(&mut self) {
         let end = self.control.finish(End::Disconnected);
         self.registry.0.lock().remove(&self.control.0.id);
+        if self.client_route {
+            self.registry.update_client_route(self.control.0.category, false);
+        }
         if end == End::Operator {
             let e = &self.control.0;
             let p = e.progress.lock();
@@ -241,6 +309,11 @@ where F: std::future::Future<Output = Result<Response<ResBody>, hyper::Error>> {
 #[tauri::command]
 pub(crate) fn list_active_requests(state: tauri::State<crate::AppState>, category_id: CategoryType) -> Vec<Snapshot> {
     state.store.active_requests.list(category_id)
+}
+
+#[tauri::command]
+pub(crate) fn route_activity(state: tauri::State<crate::AppState>) -> Vec<RouteActivity> {
+    state.store.active_requests.route_activity_at(Instant::now())
 }
 #[tauri::command]
 pub(crate) fn stop_active_request(state: tauri::State<crate::AppState>, category_id: CategoryType, request_id: String) -> StopResult {

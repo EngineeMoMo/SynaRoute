@@ -319,6 +319,11 @@ export const mockBridge = {
     await delay();
     return clone(mockRoutingOverview(store, proxyStates, settings));
   },
+  routeActivity() {
+    return (Object.keys(proxyStates) as CategoryType[])
+      .filter((categoryId) => this.listActiveRequests(categoryId).length > 0)
+      .map((categoryId) => ({ categoryId, idleInMs: null }));
+  },
   async listKeys(categoryId: CategoryType) {
     await delay();
     return clone(forShowcase(store[categoryId] ?? []));
