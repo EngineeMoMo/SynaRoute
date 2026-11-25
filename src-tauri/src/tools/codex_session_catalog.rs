@@ -64,7 +64,7 @@ pub(in crate::tools) struct CatalogReport {
     pub unmarked_missing: usize,
     /// 补进去的缺行数。
     pub inserted: usize,
-    /// 从 local host 的 Desktop 索引精确移除的已确认内部记录数。
+    /// 从 local host 的 Desktop 索引精确移除的已确认内部或附属记录数。
     pub removed: usize,
     /// 逐库失败原因（被 WAL 锁住、列不齐等），如实上报、不阻断。
     pub skipped: Vec<String>,
@@ -151,6 +151,7 @@ pub(in crate::tools) struct CatalogRow {
     pub thread_source: String,
     /// 文件名/首行已确认是 fork；即使 source 像内部线程也不得清理。
     pub forked: bool,
+    pub attached_parent_id: Option<String>,
 }
 
 /// 标题的 SQL 表达式：按 catalog 自己的优先级取（`name` 是 Codex 生成的短标题，
@@ -213,15 +214,20 @@ pub(in crate::tools) fn plan_from(home: &Path, target: &str, ids: &[String]) -> 
         } else {
             "''"
         };
+        let attached_expr = if cols.contains("attached_thread_parent_id") {
+            "NULLIF(TRIM(attached_thread_parent_id), '')"
+        } else { "NULL" };
         let sql = format!(
-            "SELECT id, {title_expr}, COALESCE(cwd, ''), {}, {}, COALESCE(source, ''), {src_expr} FROM threads",
+            "SELECT id, {title_expr}, COALESCE(cwd, ''), {}, {}, COALESCE(source, ''), {src_expr}, {attached_expr} FROM threads",
             ts("created_at_ms", "created_at"),
             ts("updated_at_ms", "updated_at"),
         );
         let Ok(mut stmt) = conn.prepare(&sql) else { continue };
         let rows = stmt.query_map([], |r| {
+            let thread_id: String = r.get(0)?;
+            let attached_parent_id = r.get::<_, Option<String>>(7)?.filter(|parent| parent != &thread_id);
             Ok(CatalogRow {
-                thread_id: r.get(0)?,
+                thread_id,
                 title: r.get(1)?,
                 cwd: files::display_path(&r.get::<_, String>(2)?),
                 created_at: r.get(3)?,
@@ -230,6 +236,7 @@ pub(in crate::tools) fn plan_from(home: &Path, target: &str, ids: &[String]) -> 
                 provider: target.to_string(),
                 thread_source: r.get(6)?,
                 forked: false,
+                attached_parent_id,
             })
         });
         if let Ok(iter) = rows {
@@ -295,7 +302,7 @@ pub(in crate::tools) fn cleanup_rows(
     merge_rollout_evidence(&mut rows, sessions);
     add_child_ids(&mut rows, child_ids);
     rows.into_iter()
-        .filter(|row| child_ids.contains(&row.thread_id) || row_is_confirmed_child(row))
+        .filter(|row| row.attached_parent_id.is_some() || child_ids.contains(&row.thread_id) || row_is_confirmed_child(row))
         .collect()
 }
 
@@ -316,6 +323,7 @@ pub(in crate::tools) fn add_child_ids(rows: &mut Vec<CatalogRow>, ids: &HashSet<
                 provider: String::new(),
                 thread_source: String::new(),
                 forked: false,
+                attached_parent_id: None,
             });
         }
     }
@@ -337,6 +345,7 @@ pub(in crate::tools) fn would_mutate(
             "SELECT 1 FROM local_thread_catalog WHERE host_id=?1 AND thread_id=?2 LIMIT 1",
             (&host, &row.thread_id), |_| Ok(true),
         ).unwrap_or(false);
+        if exists && row.attached_parent_id.is_some() { return Ok(true) }
         if row_has_user_veto(row) { continue }
         if exists && row_is_confirmed_child(row) { return Ok(true) }
         if exists && ((cols.contains("model_provider") && row.provider != target)
@@ -367,9 +376,11 @@ pub(in crate::tools) fn merge_rollout_evidence(rows: &mut Vec<CatalogRow>, sessi
             provider: session.provider.clone(),
             thread_source: session.thread_source.clone(),
             forked: session.forked,
+            attached_parent_id: session.attached_parent_id.clone(),
         };
         if let Some(row) = rows.iter_mut().find(|row| row.thread_id == session.thread_id) {
             row.forked |= rollout.forked;
+            row.attached_parent_id = rollout.attached_parent_id;
             let current_user = row.thread_source.trim().eq_ignore_ascii_case("user");
             let rollout_user = rollout.thread_source.trim().eq_ignore_ascii_case("user");
             if current_user || rollout_user {
@@ -462,8 +473,8 @@ pub(in crate::tools) fn repair_one(
         .iter()
         .filter(|row| {
             existing.contains(&row.thread_id)
-                && !catalog_users.contains(&row.thread_id)
-                && row_is_confirmed_child(row)
+                && (row.attached_parent_id.is_some()
+                    || (!catalog_users.contains(&row.thread_id) && row_is_confirmed_child(row)))
         })
         .collect();
     let missing: Vec<&CatalogRow> = if supports_repair(&cols) {
@@ -505,7 +516,7 @@ pub(in crate::tools) fn repair_one(
         ) {
             Ok(n) => removed += n,
             Err(e) => {
-                report.skipped.push(format!("{}: 内部索引未清理（{e}）", db_path.display()));
+                report.skipped.push(format!("{}: 非独立会话索引未清理（{e}）", db_path.display()));
                 return;
             }
         }
@@ -567,9 +578,10 @@ pub(in crate::tools) fn repair_one(
 /// 我们去补它等于把 Codex 刻意排除的东西塞回用户眼前。
 ///
 /// 删除只认正向 child 证据（已知 thread_source / truthy structured source / edge/job），
-/// 明确 user、fork 或任何冲突都保留。标题只用于防止旧 schema 的未知来源被**插入**，绝不作为 DELETE 证据。
+/// 明确 user、fork 或任何冲突都保留；由附属父关系确认的侧边聊天只清理主列表索引。
+/// 标题只用于防止旧 schema 的未知来源被**插入**，绝不作为 DELETE 证据。
 fn worth_listing(r: &CatalogRow) -> bool {
-    if row_is_confirmed_child(r) || r.forked {
+    if r.attached_parent_id.is_some() || row_is_confirmed_child(r) || r.forked {
         return false;
     }
     !super::view::is_injected_prompt(&r.title)
@@ -668,7 +680,36 @@ mod tests {
             provider: "synaroute".into(),
             thread_source: "user".into(),
             forked: false,
+            attached_parent_id: None,
         }
+    }
+
+    #[test]
+    fn attached_database_relationship_keeps_user_side_chats_out_of_top_level_catalog() {
+        let dir = tmp("attached_parent");
+        let db = catalog_db(&dir);
+        let state = Connection::open(dir.join("state_5.sqlite")).unwrap();
+        state.execute_batch("CREATE TABLE threads (id TEXT, name TEXT, cwd TEXT, source TEXT, thread_source TEXT, attached_thread_parent_id TEXT);
+            INSERT INTO threads VALUES ('parent','same title','','vscode','user',NULL),
+                ('attached','same title','','vscode','user','parent');").unwrap();
+        let rows = plan_from(&dir, "synaroute", &["parent".into(), "attached".into()]);
+        let attached = rows.iter().find(|row| row.thread_id == "attached").unwrap();
+        assert_eq!(attached.attached_parent_id.as_deref(), Some("parent"));
+        assert!(!would_mutate(&db, "synaroute", std::slice::from_ref(attached)).unwrap());
+        let mut report = CatalogReport::default();
+        repair_one(&db, "synaroute", &rows, &mut report);
+        assert_eq!(report.inserted, 1);
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("INSERT INTO local_thread_catalog (host_id,thread_id,display_title,source_created_at,source_updated_at,cwd,source_kind,model_provider,observation_sequence,thread_source) VALUES ('local','attached','same title',1,2,'','vscode','synaroute',2,'user')", []).unwrap();
+        assert!(would_mutate(&db, "synaroute", std::slice::from_ref(attached)).unwrap());
+        let mut cleanup = CatalogReport::default();
+        repair_one(&db, "synaroute", &rows, &mut cleanup);
+        assert_eq!(cleanup.removed, 1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM local_thread_catalog", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(state.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+        drop(conn);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 内部派生线程（本机实测的 `guardian_review`）：`thread_source` 非 user，

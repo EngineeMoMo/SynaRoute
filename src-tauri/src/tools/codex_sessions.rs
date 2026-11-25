@@ -99,6 +99,8 @@ pub(crate) struct SessionRef {
     /// 与 `thread_source`/edge/job 一样表示内部派生；普通用户 fork 不因此被排除。
     #[serde(default)]
     pub source: String,
+    #[serde(default)]
+    pub attached_parent_id: Option<String>,
     /// 这条 thread 的来源：`user` = 用户自己的对话，其它值（如 `guardian_review`）是
     /// Codex 内部派生出来的。**不隐藏、只标注** —— 隐藏用户的数据比多显示一行更糟，
     /// 而不标注的话「我明明只开了 3 个对话，这里怎么有 5 条」无从解释。
@@ -314,7 +316,9 @@ fn session_is_internal(session: &SessionRef, child_ids: &std::collections::HashS
         || child_ids.contains(&session.thread_id)
 }
 
-fn parse_meta(line: &str) -> Option<(String, String, String, String, String, String)> {
+type SessionMetadata = (String, String, String, String, String, String, Option<String>);
+
+fn parse_meta(line: &str) -> Option<SessionMetadata> {
     let (body, _) = split_eol(line);
     let rec: Value = serde_json::from_str(body.trim()).ok()?;
     if rec.get("type").and_then(Value::as_str) != Some("session_meta") {
@@ -324,7 +328,10 @@ fn parse_meta(line: &str) -> Option<(String, String, String, String, String, Str
     let s = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
     let id = if p.get("id").is_some() { s("id") } else { s("session_id") };
     let source = p.get("source").map(Value::to_string).unwrap_or_default();
-    Some((id, s("model_provider"), s("cwd"), s("timestamp"), s("thread_source"), source))
+    let attached_parent_id = (p.get("attached_thread") == Some(&Value::Bool(true)))
+        .then(|| s("forked_from_id").trim().to_owned())
+        .filter(|parent| !parent.is_empty() && parent != &id);
+    Some((id, s("model_provider"), s("cwd"), s("timestamp"), s("thread_source"), source, attached_parent_id))
 }
 
 /// 扫描全部会话的首行元数据。
@@ -344,7 +351,7 @@ fn scan_paths(home: &Path, paths: Vec<(PathBuf, bool)>) -> ScanReport {
             report.unreadable += 1;
             continue;
         };
-        let Some((meta_id, provider, cwd, timestamp, thread_source, source)) = parse_meta(&line) else {
+        let Some((meta_id, provider, cwd, timestamp, thread_source, source, attached_parent_id)) = parse_meta(&line) else {
             report.unreadable += 1;
             continue;
         };
@@ -356,6 +363,7 @@ fn scan_paths(home: &Path, paths: Vec<(PathBuf, bool)>) -> ScanReport {
         // 而不是回落到 `meta_id` —— 回落正是 fork 子会话会删错父会话行的那条路。
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let thread_id = files::thread_id_from_filename(&name).unwrap_or_default();
+        let attached_parent_id = attached_parent_id.filter(|parent| parent != &thread_id);
         report.sessions.push(SessionRef {
             // 首行的 id 与文件名末尾的 id 不同 = 这是从那条会话 fork 出来的分支。
             forked: !thread_id.is_empty() && !meta_id.is_empty() && thread_id != meta_id,
@@ -369,6 +377,7 @@ fn scan_paths(home: &Path, paths: Vec<(PathBuf, bool)>) -> ScanReport {
             internal: false,
             bytes,
             source,
+            attached_parent_id,
             thread_source,
             title: String::new(),
             model: String::new(),
@@ -866,7 +875,7 @@ fn describe(r: &SyncReport) -> Option<String> {
         }
         if db.catalog.removed > 0 {
             parts.push(format!(
-                "从 Codex Desktop 本地会话索引移除 {} 条内部记录（不影响路由，不删除会话、rollout 或正文）",
+                "从 Codex Desktop 本地会话索引移除 {} 条内部或侧边聊天记录（不影响路由，不删除会话、rollout 或正文）",
                 db.catalog.removed
             ));
         }
@@ -1466,6 +1475,106 @@ mod tests {
              INSERT INTO local_thread_catalog_metadata VALUES (4);"
         ).unwrap();
         c.execute("INSERT INTO local_thread_catalog VALUES ('local',?1,'title',1,2,'','vscode','synaroute',1,'guardian_review')", [id]).unwrap();
+    }
+
+    #[test]
+    fn attached_side_chats_do_not_duplicate_the_desktop_catalog() {
+        for modern_schema in [false, true] {
+            for polluted in [false, true] {
+                let home = tmp_home("attached_side_chats");
+                let data = home.join("appdata");
+                let parent = uuid_of("parent");
+                let attached = uuid_of("attached");
+                let ordinary = uuid_of("ordinary_fork");
+                let mut paths = Vec::new();
+                for id in [&parent, &attached, &ordinary] {
+                    let path = write_rollout(&home, "sessions/2026/09/01", id, "openai", "\n");
+                    let text = fs::read_to_string(&path).unwrap();
+                    let (first, tail) = text.split_once('\n').unwrap();
+                    let mut meta: Value = serde_json::from_str(first).unwrap();
+                    meta["payload"]["source"] = serde_json::json!("vscode");
+                    meta["payload"]["thread_source"] = serde_json::json!("user");
+                    if id != &parent {
+                        meta["payload"]["forked_from_id"] = serde_json::json!(parent);
+                        meta["payload"]["attached_thread"] = serde_json::json!(id == &attached);
+                    }
+                    fs::write(&path, format!("{meta}\n{tail}")).unwrap();
+                    paths.push(path);
+                }
+                let state = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+                state.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, cwd TEXT, source TEXT, thread_source TEXT, model_provider TEXT)").unwrap();
+                if modern_schema {
+                    state.execute("ALTER TABLE threads ADD COLUMN attached_thread_parent_id TEXT", []).unwrap();
+                }
+                for id in [&parent, &attached, &ordinary] {
+                    state.execute("INSERT INTO threads (id,name,cwd,source,thread_source,model_provider) VALUES (?1,'same title','','vscode','user','openai')", [id]).unwrap();
+                }
+                if modern_schema {
+                    state.execute("UPDATE threads SET attached_thread_parent_id=?1 WHERE id=?2", (&parent, &attached)).unwrap();
+                }
+                let db = home.join("sqlite/catalog.db");
+                catalog_db_for_cleanup(&db, &attached);
+                let catalog = rusqlite::Connection::open(&db).unwrap();
+                catalog.execute("UPDATE local_thread_catalog SET thread_source='user', display_title='same title'", []).unwrap();
+                catalog.execute("INSERT INTO local_thread_catalog SELECT 'remote',thread_id,display_title,source_created_at,source_updated_at,cwd,source_kind,model_provider,observation_sequence,thread_source FROM local_thread_catalog", []).unwrap();
+                if !polluted {
+                    catalog.execute("DELETE FROM local_thread_catalog WHERE host_id='local'", []).unwrap();
+                }
+
+                let result = sync_to_at(&home, &data, "synaroute").unwrap();
+                let report = result.sqlite.unwrap().catalog;
+                assert_eq!(report.removed, usize::from(polluted), "{report:?}");
+                assert_eq!(report.inserted, 2, "{report:?}");
+                let listed: Vec<String> = catalog.prepare("SELECT thread_id FROM local_thread_catalog WHERE host_id='local' ORDER BY thread_id").unwrap()
+                    .query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+                let mut expected = vec![parent.clone(), ordinary.clone()];
+                expected.sort();
+                assert_eq!(listed, expected);
+                assert_eq!(catalog.query_row("SELECT COUNT(*) FROM local_thread_catalog WHERE host_id='remote'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+                assert_eq!(state.query_row("SELECT COUNT(*) FROM threads WHERE model_provider='synaroute'", [], |row| row.get::<_, i64>(0)).unwrap(), 3);
+                assert!(paths.iter().all(|path| path.exists()));
+                let meta: Value = serde_json::from_str(&read_first_line(&paths[1]).unwrap()).unwrap();
+                assert_eq!(meta["payload"]["attached_thread"], true);
+                assert_eq!(meta["payload"]["forked_from_id"], parent);
+                catalog.execute("INSERT INTO local_thread_catalog SELECT 'local',thread_id,display_title,source_created_at,source_updated_at,cwd,source_kind,model_provider,observation_sequence,thread_source FROM local_thread_catalog WHERE host_id='remote'", []).unwrap();
+                let cleanup = sync_to_at(&home, &data, "synaroute").unwrap();
+                assert_eq!(cleanup.changed, 0);
+                assert_eq!(cleanup.sqlite.unwrap().catalog.removed, 1);
+                let again = sync_to_at(&home, &data, "synaroute").unwrap();
+                assert_eq!(again.changed, 0);
+                assert_eq!(again.sqlite.unwrap().catalog.total(), 0);
+                let text = fs::read_to_string(&paths[1]).unwrap();
+                let (first, tail) = text.split_once('\n').unwrap();
+                let mut detached: Value = serde_json::from_str(first).unwrap();
+                detached["payload"]["attached_thread"] = serde_json::json!(false);
+                detached["payload"]["model_provider"] = serde_json::json!("openai");
+                fs::write(&paths[1], format!("{detached}\n{tail}")).unwrap();
+                let detached_result = sync_to_at(&home, &data, "synaroute").unwrap();
+                assert_eq!(detached_result.sqlite.unwrap().catalog.inserted, 1);
+                assert_eq!(catalog.query_row("SELECT COUNT(*) FROM local_thread_catalog WHERE host_id='local'", [], |row| row.get::<_, i64>(0)).unwrap(), 3);
+                drop(catalog);
+                drop(state);
+                let _ = fs::remove_dir_all(&home);
+            }
+        }
+    }
+
+    #[test]
+    fn attached_metadata_requires_a_real_parent_and_explicit_flag() {
+        for (flag, parent, expected) in [
+            (serde_json::json!(true), "parent", Some("parent")),
+            (serde_json::json!(true), " parent ", Some("parent")),
+            (serde_json::json!(false), "parent", None),
+            (serde_json::json!("true"), "parent", None),
+            (Value::Null, "parent", None),
+            (serde_json::json!(true), "", None),
+            (serde_json::json!(true), "child", None),
+        ] {
+            let record = serde_json::json!({ "type": "session_meta", "payload": {
+                "id": "child", "attached_thread": flag, "forked_from_id": parent,
+            }});
+            assert_eq!(parse_meta(&record.to_string()).unwrap().6.as_deref(), expected);
+        }
     }
 
     /// Online Backup 必须得到 WAL 中的已提交行；删除前快照仍含 guardian。
