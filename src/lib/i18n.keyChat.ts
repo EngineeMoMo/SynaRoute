@@ -1,7 +1,7 @@
 type Dict = Record<string, string>;
 export const keyChatZh: Dict = {
   "keyChat.title": "单 Key 会话测试",
-  "keyChat.scope": "只使用此 Key 进行多轮对话，不走故障转移或大脑聚合，不改变启用状态、路由或健康评分。正文仅保留在当前窗口，本机日志只记结果和用量。",
+  "keyChat.scope": "只使用此 Key 测试纯文本多轮对话，不启用图片生成或工具调用，不走故障转移或大脑聚合，不改变启用状态、路由或健康评分。正文仅保留在当前窗口，本机日志只记结果和用量。",
   "keyChat.model": "模型（更换模型会清空当前会话）",
   "keyChat.modelPlaceholder": "选择或输入模型名，也可输入此 Key 的映射名",
   "keyChat.missingSecret": "此 Key 尚未配置密钥，请先在编辑窗口保存密钥。主口令库需先解锁。",
@@ -24,7 +24,7 @@ export const keyChatZh: Dict = {
 };
 export const keyChatEn: Dict = {
   "keyChat.title": "Single-Key conversation test",
-  "keyChat.scope": "Uses only this Key for multi-turn chat, without failover or Brain aggregation. It does not change routing, enabled state or health scores. Bodies stay in this window; local logs contain only results and usage.",
+  "keyChat.scope": "Uses only this Key for plain text multi-turn chat, without image generation, tool calls, failover or Brain aggregation. It does not change routing, enabled state or health scores. Bodies stay in this window; local logs contain only results and usage.",
   "keyChat.model": "Model (changing it clears this conversation)",
   "keyChat.modelPlaceholder": "Select or enter a model name or this Key's mapping alias",
   "keyChat.missingSecret": "Configure this Key's credential in the editor first. Unlock the master-password vault if needed.",

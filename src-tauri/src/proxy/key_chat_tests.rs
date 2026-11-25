@@ -7,6 +7,72 @@ use tokio::sync::oneshot;
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[tokio::test]
+async fn reference_compat_responses_conversation_explicitly_disables_tools() {
+    let _serial = SERIAL.lock().await;
+    let (url, received, server) = mock(200, json!({
+        "object":"response", "status":"completed", "output":[{
+            "type":"message", "role":"assistant",
+            "content":[{"type":"output_text", "text":"plain text reply"}]
+        }]
+    })).await;
+    let (_directory, store, request) = store(&url, Protocol::OpenaiResponses);
+    store.upsert_key(ProviderKey {
+        id: "selected".into(), category_id: CategoryType::Codex,
+        protocol: Protocol::OpenaiResponses, base_url: url,
+        headers_json: Some(r#"{"X-OpenAI-Internal-Codex-Responses-Lite":"false"}"#.into()),
+        ..Default::default()
+    }).unwrap();
+    let reply = run(store, request, |_| Ok(())).await.unwrap();
+    let captured = received.await.unwrap();
+    assert_eq!(reply.text, "plain text reply");
+    assert_eq!(captured.path, "/v1/responses");
+    assert_eq!(captured.body["tool_choice"], "none");
+    assert_eq!(captured.body["tools"], json!([]));
+    assert_eq!(captured.body["parallel_tool_calls"], false);
+    assert_eq!(captured.body["text"]["format"]["type"], "text");
+    assert_eq!(captured.headers["x-openai-internal-codex-responses-lite"], "true");
+    assert_eq!(captured.headers.get_all("x-openai-internal-codex-responses-lite").iter().count(), 1);
+    for message in captured.body["input"].as_array().unwrap() {
+        assert_eq!(message["type"], "message");
+        for content in message["content"].as_array().unwrap() {
+            assert!(matches!(content["type"].as_str(), Some("input_text" | "output_text")));
+        }
+    }
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn reference_compat_image_permission_error_explains_the_text_only_request() {
+    let _serial = SERIAL.lock().await;
+    let (url, received, server) = mock(403, json!({"error":{
+        "type":"permission_error", "message":"Image generation is not enabled for this group"
+    }})).await;
+    let (_directory, store, request) = store(&url, Protocol::OpenaiResponses);
+    let error = run(store, request, |_| Ok(())).await.unwrap_err().to_string();
+    received.await.unwrap();
+    assert!(error.contains("403"));
+    assert!(error.contains("Image generation is not enabled"));
+    assert!(error.contains("text-only test"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn reference_compat_failed_response_with_partial_text_is_not_success() {
+    let _serial = SERIAL.lock().await;
+    let (url, received, server) = mock(200, json!({
+        "object":"response", "status":"failed", "error":null,
+        "output":[{"type":"message", "role":"assistant",
+            "content":[{"type":"output_text", "text":"unfinished answer"}]}]
+    })).await;
+    let (_directory, store, request) = store(&url, Protocol::OpenaiResponses);
+    let result = run(store.clone(), request, |_| Ok(())).await;
+    received.await.unwrap();
+    assert!(result.is_err(), "failed response was accepted as a complete reply");
+    assert!(store.active_requests.list(CategoryType::Codex).is_empty());
+    server.await.unwrap();
+}
+
 struct Captured {
     path: String,
     headers: hyper::HeaderMap,

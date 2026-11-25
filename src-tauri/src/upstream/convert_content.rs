@@ -1,6 +1,10 @@
 use serde_json::{json, Value};
 use super::super::util::extract_text_content;
 
+pub(super) fn nonempty_function_arguments(arguments: Option<&Value>) -> &str {
+    arguments.and_then(Value::as_str).filter(|value| !value.trim().is_empty()).unwrap_or("{}")
+}
+
 pub(super) fn openai_user_content_to_anthropic(content: Option<&Value>) -> Value {
     let Some(Value::Array(parts)) = content else {
         return Value::String(extract_text_content(content));

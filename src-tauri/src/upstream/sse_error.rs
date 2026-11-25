@@ -8,6 +8,8 @@ const MSG_CAP: usize = 500;
 pub(crate) fn declares_error(json: &Value) -> bool {
     matches!(json.get("type").and_then(Value::as_str), Some("error" | "response.failed"))
         || json.pointer("/response/status").and_then(Value::as_str) == Some("failed")
+        || (json.get("object").and_then(Value::as_str) == Some("response")
+            && json.get("status").and_then(Value::as_str) == Some("failed"))
 }
 
 /// 这个 SSE 载荷是不是「上游报错」？是则返回可读消息。
@@ -127,6 +129,9 @@ mod tests {
     #[test]
     fn normal_chunks_are_never_mistaken_for_errors() {
         for ok in [
+            json!({ "object":"response", "status":"completed", "error":null }),
+            json!({ "object":"response", "status":"incomplete", "error":null }),
+            json!({ "status":"failed", "message":"ordinary application data" }),
             json!({ "choices": [ { "delta": { "content": "hi" } } ] }),
             json!({ "error": null }),
             json!({ "type": "content_block_delta", "delta": { "text": "hi" } }),
@@ -135,6 +140,14 @@ mod tests {
             json!({ "choices": [ { "delta": { "content": "an error occurred" } } ] }),
         ] {
             assert_eq!(upstream_error_message(&ok), None, "误判：{ok}");
+        }
+    }
+
+    #[test]
+    fn reference_compat_failed_response_without_an_error_object_is_recognized() {
+        for error in [Value::Null, json!({"message":"capacity exceeded"})] {
+            let response = json!({"object":"response", "status":"failed", "error":error});
+            assert!(upstream_error_message(&response).is_some());
         }
     }
 

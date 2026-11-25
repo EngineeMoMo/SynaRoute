@@ -67,7 +67,8 @@ describe("single-Key conversation tests", () => {
     expect(html).toContain("Single-Key conversation test");
     expect(html).toContain("Test provider");
     expect(html).toContain("https://provider.example/v1");
-    expect(html).toContain("without failover");
+    expect(html).toContain("plain text multi-turn chat");
+    expect(html).toContain("without image generation, tool calls, failover");
     expect(html).toContain("may incur charges");
     expect(html).toContain("not saved locally");
     expect(html).toContain('role="log"');

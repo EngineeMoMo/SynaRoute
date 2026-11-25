@@ -118,6 +118,12 @@ async fn send(
     if key.protocol.is_openai() {
         body["store"] = json!(false);
     }
+    if key.protocol == Protocol::OpenaiResponses {
+        body["tools"] = json!([]);
+        body["tool_choice"] = json!("none");
+        body["parallel_tool_calls"] = json!(false);
+        body["text"] = json!({"format":{"type":"text"}});
+    }
     let endpoint = match key.protocol {
         Protocol::Anthropic => "/v1/messages",
         Protocol::OpenaiChat => "/v1/chat/completions",
@@ -130,6 +136,16 @@ async fn send(
     let request = client.post(url).json(&body).timeout(timeout);
     let request = crate::upstream::apply_client_identity(request, key.protocol);
     let request = super::apply_upstream_headers(request, key, secret, &[], model);
+    let request = if key.protocol == Protocol::OpenaiResponses {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-openai-internal-codex-responses-lite",
+            reqwest::header::HeaderValue::from_static("true"),
+        );
+        request.headers(headers)
+    } else {
+        request
+    };
     control.phase(Phase::Waiting);
     let response = request.send().await.map_err(|error| {
         AppError::upstream_msg(redact(&error.without_url().to_string(), key, secret))
@@ -155,7 +171,10 @@ async fn send(
             .or_else(|| parsed["response"]["error"]["message"].as_str())
             .or_else(|| parsed["message"].as_str())
             .unwrap_or("Upstream request failed");
-        let message: String = redact(message, key, secret).chars().take(500).collect();
+        let mut message: String = redact(message, key, secret).chars().take(500).collect();
+        if message.to_ascii_lowercase().contains("image generation is not enabled") {
+            message.push_str("；本测试只发送文本，不请求图片或工具调用。请检查上游的自动工具注入或模型映射。 / This is a text-only test; check upstream tool injection or model mapping.");
+        }
         return Err(AppError::upstream_http(
             status.as_u16(),
             format!("HTTP {status}: {message}"),

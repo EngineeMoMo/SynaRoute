@@ -944,7 +944,7 @@ pub fn responses_to_chat(body: &Value) -> Value {
                                 // 工具存成 {name, namespace} 两字段，只取 name 会让模型下一轮照抄短名，
                                 // 回程拆不出 namespace → Codex 报 unsupported call。
                                 "name": join_namespaced_tool_name(it),
-                                "arguments": it.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}"),
+                                "arguments": nonempty_function_arguments(it.get("arguments")),
                             }
                         }));
                     }
@@ -1581,7 +1581,7 @@ pub fn responses_resp_to_chat(body: &Value) -> Value {
                             // 同请求侧：带 namespace 时拼回全名，保证下游客户端看到的工具名
                             // 与工具声明一致（见 join_namespaced_tool_name）。
                             "name": join_namespaced_tool_name(item),
-                            "arguments": item.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}"),
+                            "arguments": nonempty_function_arguments(item.get("arguments")),
                         }
                     }));
                 }
@@ -1656,6 +1656,55 @@ pub fn responses_resp_to_chat(body: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reference_compat_function_history_preserves_results_and_custom_input() {
+        for (arguments, expected) in [("", "{}"), (" \t\n", "{}"), ("{\"unfinished\":", "{\"unfinished\":")] {
+            let request = super::responses_to_chat(&serde_json::json!({
+                "input":[
+                    {"type":"function_call", "call_id":"call_status", "name":"status", "arguments":arguments},
+                    {"type":"function_call_output", "call_id":"call_status", "output":"ready"},
+                    {"type":"custom_tool_call", "call_id":"call_custom", "name":"exec", "input":""},
+                    {"type":"custom_tool_call_output", "call_id":"call_custom", "output":"done"}
+                ]
+            }));
+            assert_eq!(request["messages"][0]["tool_calls"][0]["function"]["arguments"], expected);
+            assert_eq!(request["messages"][1]["tool_call_id"], "call_status");
+            assert_eq!(request["messages"][1]["content"], "ready");
+            assert_eq!(request["messages"][2]["tool_calls"][0]["function"]["arguments"], "{\"input\":\"\"}");
+            assert_eq!(request["messages"][3]["tool_call_id"], "call_custom");
+        }
+    }
+
+    #[test]
+    fn reference_compat_empty_completed_function_arguments_become_an_object() {
+        for arguments in [serde_json::json!(""), serde_json::json!(" \t\n"), serde_json::Value::Null] {
+            let response = super::responses_resp_to_chat(&serde_json::json!({
+                "object":"response", "status":"completed", "output":[{
+                    "type":"function_call", "call_id":"call_empty", "namespace":"mcp__demo",
+                    "name":"status", "arguments":arguments
+                }]
+            }));
+            let call = &response["choices"][0]["message"]["tool_calls"][0];
+            assert_eq!(call["function"]["arguments"], "{}");
+            assert_eq!(call["function"]["name"], "mcp__demo__status");
+            assert_eq!(call["id"], "call_empty");
+        }
+    }
+
+    #[test]
+    fn reference_compat_nonempty_and_custom_arguments_remain_unchanged() {
+        for arguments in ["{\"name\":\"value\"}", "{\"unfinished\":"] {
+            let response = super::responses_resp_to_chat(&serde_json::json!({
+                "output":[{"type":"function_call", "name":"lookup", "arguments":arguments}]
+            }));
+            assert_eq!(response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], arguments);
+        }
+        let response = super::responses_resp_to_chat(&serde_json::json!({
+            "output":[{"type":"custom_tool_call", "name":"exec", "input":""}]
+        }));
+        assert_eq!(response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], "{\"input\":\"\"}");
+    }
+
     #[test]
     fn tool_id_repair_nonstream_roundtrip_preserves_call_and_namespace() {
         let body = serde_json::json!({"choices":[{"message":{"tool_calls":[{
