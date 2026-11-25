@@ -27,8 +27,9 @@
 //! 所以哪怕内容语义相同，一次真实改写也必然改变首行字节。那比 mtime 更难被绕过。
 
 use crate::error::{AppError, AppResult};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// 会话目录名。`archived_sessions` 不能漏 —— 漏了的表现是「归档里的旧会话仍 401」，
@@ -188,6 +189,7 @@ pub(in crate::tools) struct RewriteInfo {
 }
 
 const ENCRYPTED_MARK: &[u8] = b"encrypted_content";
+const SOURCE_CHANGED: &str = "会话在同步期间发生变化，未覆盖新内容，请重新同步";
 
 /// 一边读一边找 `encrypted_content`。**保留上一块尾部** `PAT.len()-1` 字节再拼着找，
 /// 否则标记恰好跨在两次 `read` 的边界上就会漏（那种漏是静默的：报告说「没有加密内容」）。
@@ -195,11 +197,13 @@ struct Sniff<R> {
     inner: R,
     tail: Vec<u8>,
     found: bool,
+    digest: Sha256,
 }
 
 impl<R: Read> Read for Sniff<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
+        self.digest.update(&buf[..n]);
         if n > 0 && !self.found {
             let mut hay = std::mem::take(&mut self.tail);
             hay.extend_from_slice(&buf[..n]);
@@ -214,46 +218,78 @@ impl<R: Read> Read for Sniff<R> {
 /// 用 `next_first` 换掉文件的首行，其余字节**逐字节照搬**。写临时文件后 rename，
 /// 于是任何中途失败都不会留下半个文件（这比对几百 MB 的会话做整份备份现实得多）。
 ///
-/// 原文件的 mtime 在 rename 之后**原样恢复**（见模块头）。恢复失败一律忽略 ——
+/// 原文件的 mtime 在临时文件上**原样恢复**（见模块头）。恢复失败一律忽略 ——
 /// 那只是元数据，为它把一次成功的改写判成失败毫无道理。
 pub(in crate::tools) fn replace_first_line(
     path: &Path,
     first: &str,
     next_first: &str,
 ) -> AppResult<RewriteInfo> {
-    let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
+    replace_first_line_observed(path, first, next_first, &mut || Ok(()))
+}
+
+fn replace_first_line_observed(
+    path: &Path,
+    first: &str,
+    next_first: &str,
+    before_replace: &mut dyn FnMut() -> io::Result<()>,
+) -> AppResult<RewriteInfo> {
     let tmp = tmp_path_for(path);
     let mut info = RewriteInfo::default();
     let copy = (|| -> io::Result<()> {
-        let mut src = File::open(path)?;
-        // 按**字节**偏移跳过首行：`String::len()` 就是 UTF-8 字节数，而 rollout 是 JSONL
-        // （必然 UTF-8）。带 BOM 的文件在上一步就因 JSON 解析失败被挡掉了。
-        src.seek(SeekFrom::Start(first.len() as u64))?;
-        let mut sniff = Sniff { inner: src, tail: Vec::new(), found: false };
-        let mut dst = File::create(&tmp)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(5);
+        }
+        let source = options.open(path)?;
+        let metadata = source.metadata()?;
+        let mut reader = BufReader::new(source);
+        let mut current_first = String::new();
+        reader.read_line(&mut current_first)?;
+        if current_first != first {
+            return Err(io::Error::other(SOURCE_CHANGED));
+        }
+        let mut digest = Sha256::new();
+        digest.update(first.as_bytes());
+        let mut sniff = Sniff { inner: reader, tail: Vec::new(), found: false, digest };
+        let mut dst = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         dst.write_all(next_first.as_bytes())?;
         io::copy(&mut sniff, &mut dst)?;
         info.had_encrypted_content = sniff.found;
         // 先落盘再 rename：崩在这之间留下的是一个孤立的 .tmp（下次扫描不认它，文件名不以
         // rollout- 开头），而不是一个内容不完整的 rollout。
-        dst.sync_all()
+        if let Ok(mtime) = metadata.modified() {
+            let _ = dst.set_times(fs::FileTimes::new().set_modified(mtime));
+        }
+        dst.sync_all()?;
+        drop(dst);
+        before_replace()?;
+        let mut current = BufReader::new(File::open(path)?);
+        let mut current_digest = Sha256::new();
+        loop {
+            let buffer = current.fill_buf()?;
+            if buffer.is_empty() { break; }
+            current_digest.update(buffer);
+            let length = buffer.len();
+            current.consume(length);
+        }
+        let current_metadata = fs::metadata(path)?;
+        if current_digest.finalize() != sniff.digest.finalize()
+            || current_metadata.len() != metadata.len()
+            || current_metadata.modified().ok() != metadata.modified().ok()
+        {
+            return Err(io::Error::other(SOURCE_CHANGED));
+        }
+        fs::rename(&tmp, path)
     })();
     if let Err(e) = copy {
         let _ = fs::remove_file(&tmp);
         return Err(AppError::ToolConfig(format!("改写 {} 失败: {e}", path.display())));
     }
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        AppError::ToolConfig(format!("替换 {} 失败: {e}", path.display()))
-    })?;
-    restore_mtime(path, mtime);
     Ok(info)
-}
-
-fn restore_mtime(path: &Path, mtime: Option<std::time::SystemTime>) {
-    let Some(mtime) = mtime else { return };
-    let Ok(f) = File::options().write(true).open(path) else { return };
-    let _ = f.set_times(fs::FileTimes::new().set_modified(mtime));
 }
 
 /// 一次 IO 失败到底是「文件被别的进程占着」还是「压根写不进去」。
@@ -265,6 +301,7 @@ fn restore_mtime(path: &Path, mtime: Option<std::time::SystemTime>) {
 /// —— 在只读卷上说这句话，用户照做之后一个字都不会变。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::tools) enum IoBlame {
+    Changed,
     /// 被别的进程独占。可自助：完全退出 Codex 再来一次。
     Locked,
     /// 权限/只读卷。退出 Codex 没用，要看目录权限。
@@ -294,7 +331,9 @@ pub(in crate::tools) fn blame_io(e: &io::Error) -> IoBlame {
 /// ⚠️ 认不出就返回 [`IoBlame::Other`]，也就是**退回到条件句**。宁可少说一句精确的话，
 /// 也不能按字符串猜错方向 —— 指错方向的提示比没有提示更糟。
 pub(in crate::tools) fn blame_from_text(msg: &str) -> IoBlame {
-    if msg.contains("os error 32") || msg.contains("os error 33") {
+    if msg.contains(SOURCE_CHANGED) {
+        IoBlame::Changed
+    } else if msg.contains("os error 32") || msg.contains("os error 33") {
         IoBlame::Locked
     } else if msg.contains("os error 5") || msg.contains("os error 13") {
         IoBlame::Unwritable
@@ -467,6 +506,52 @@ mod tests {
     /// 改写之后 mtime 必须与改写之前逐纳秒相同，而**首行字节确实变了**。
     ///
     /// 两条断言缺一不可：只断言 mtime 的话，一个「压根没改文件」的实现也能过。
+    #[test]
+    fn stale_first_line_cannot_overwrite_new_metadata() {
+        let dir = tmp_dir("stale-first-line");
+        let path = dir.join("rollout-test.jsonl");
+        let current = "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"new-provider\"}}\n{\"keep\":1}\n";
+        fs::write(&path, current).unwrap();
+        assert!(replace_first_line(&path, "{\"type\":\"session_meta\"}\n", "{\"type\":\"changed\"}\n").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), current);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_size_replacement_with_preserved_mtime_aborts_rewrite() {
+        let dir = tmp_dir("changed-body");
+        let path = dir.join("rollout-test.jsonl");
+        let first = "{\"type\":\"session_meta\"}\n";
+        fs::write(&path, format!("{first}old body\n")).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let replacement = format!("{first}new body\n");
+        let result = replace_first_line_observed(&path, first, "{\"type\":\"changed\"}\n", &mut || {
+            let next = dir.join("external.tmp");
+            fs::write(&next, &replacement)?;
+            File::options().write(true).open(&next)?.set_times(fs::FileTimes::new().set_modified(modified))?;
+            fs::rename(next, &path)
+        });
+        assert_eq!(blame_from_text(&result.unwrap_err().to_string()), IoBlame::Changed);
+        assert_eq!(fs::read_to_string(&path).unwrap(), replacement);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn active_writer_prevents_provider_rewrite() {
+        let dir = tmp_dir("active-writer");
+        let path = dir.join("rollout-test.jsonl");
+        let first = "{\"type\":\"session_meta\"}\n";
+        fs::write(&path, first).unwrap();
+        let writer = File::options().append(true).open(&path).unwrap();
+        assert!(replace_first_line(&path, first, "{\"type\":\"changed\"}\n").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), first);
+        drop(writer);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn rewriting_the_first_line_preserves_mtime_but_changes_the_bytes() {
         let dir = tmp_dir("mtime");

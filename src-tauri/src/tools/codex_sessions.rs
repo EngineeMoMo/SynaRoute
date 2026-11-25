@@ -841,6 +841,7 @@ fn describe(r: &SyncReport) -> Option<String> {
         // 归类得出来就给精确指路，认不出才退回条件句 —— Windows 把两种成因都映射成
         // `PermissionDenied`，只有 raw OS error 32/33 能分开（见 `files::blame_from_text`）。
         let why = match r.blame {
+            Some(files::IoBlame::Changed) => "（同步期间内容发生变化，已保留新内容）—— 请退出 Codex 后重新同步",
             Some(files::IoBlame::Locked) => {
                 "（文件正被 Codex 占用）—— 完全退出 Codex 后再点一次接入即可"
             }

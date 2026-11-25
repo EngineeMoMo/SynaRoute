@@ -144,7 +144,7 @@ fn delete_at(home: &Path, data_dir: &Path, rel_paths: &[String]) -> (usize, Vec<
         let why = match files::blame_io(&e) {
             files::IoBlame::Locked => "，文件正被 Codex 占用，完全退出 Codex 后再试",
             files::IoBlame::Unwritable => "，目录不可写，请检查权限",
-            files::IoBlame::Other => "",
+            files::IoBlame::Changed | files::IoBlame::Other => "",
         };
         failed.push(format!("session_index.jsonl 更新失败，正文未删除（{e}{why}）"));
         return (
@@ -168,7 +168,7 @@ fn delete_at(home: &Path, data_dir: &Path, rel_paths: &[String]) -> (usize, Vec<
                 let why = match files::blame_io(&e) {
                     files::IoBlame::Locked => "文件正被 Codex 占用，完全退出 Codex 后再试",
                     files::IoBlame::Unwritable => "目录或文件不可写，请检查权限",
-                    files::IoBlame::Other => "",
+                    files::IoBlame::Changed | files::IoBlame::Other => "",
                 };
                 failed.push(if why.is_empty() {
                     format!("{rel}（{e}）")

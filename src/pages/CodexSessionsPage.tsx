@@ -105,6 +105,7 @@ export function CodexSessionsPage() {
         setTarget((previous) => chooseKnownTarget(nextTargets, previous));
       }
       if (auditResult.status === "fulfilled" && auditResult.value) setAudit(auditResult.value);
+      if (auditResult.status === "rejected") setAudit(null);
       metadataLoaded.current = targetsResult.status === "fulfilled" && auditResult.status === "fulfilled";
       setMaintenanceError([targetsResult, auditResult]
         .filter((result): result is PromiseRejectedResult => result.status === "rejected")

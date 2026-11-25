@@ -48,28 +48,42 @@ pub(in crate::tools) fn session_db_paths(home: &Path) -> Vec<PathBuf> {
 }
 
 fn database_paths_in(root: &Path) -> Vec<PathBuf> {
+    database_paths_in_checked(root).unwrap_or_default()
+}
+
+pub(super) fn session_db_paths_checked(home: &Path) -> Result<Vec<PathBuf>, String> {
+    database_paths_in_checked(&sqlite_root(home)).map_err(|error| format!("会话数据库目录无法完整读取，未执行索引清理：{error}"))
+}
+
+fn database_paths_in_checked(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
-    if let Ok(entries) = fs::read_dir(root.join("sqlite")) {
-        for e in entries.flatten() {
-            let p = e.path();
-            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or_default();
-            if p.is_file() && matches!(ext, "db" | "sqlite" | "sqlite3") {
-                out.push(p);
+    match fs::read_dir(root.join("sqlite")) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry?.path();
+                let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+                if matches!(extension, "db" | "sqlite" | "sqlite3") && fs::metadata(&path)?.is_file() {
+                    out.push(path);
+                }
             }
         }
-        out.sort();
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
-    if let Ok(entries) = fs::read_dir(root) {
-        let mut legacy: Vec<_> = entries.flatten().filter_map(|entry| {
-            let name = entry.file_name();
-            let version = name.to_str()?.strip_prefix("state_")?.strip_suffix(".sqlite")?
-                .parse::<u32>().ok()?;
-            entry.path().is_file().then_some((version, entry.path()))
-        }).collect();
-        legacy.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-        out.extend(legacy.into_iter().map(|(_, path)| path));
+    out.sort();
+    let mut legacy = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let version = name.to_str().and_then(|name| name.strip_prefix("state_"))
+            .and_then(|name| name.strip_suffix(".sqlite")).and_then(|version| version.parse::<u32>().ok());
+        if let Some(version) = version {
+            if fs::metadata(entry.path())?.is_file() { legacy.push((version, entry.path())); }
+        }
     }
-    out
+    legacy.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    out.extend(legacy.into_iter().map(|(_, path)| path));
+    Ok(out)
 }
 
 pub(super) fn collect_child_thread_ids(home: &Path) -> std::collections::HashSet<String> {

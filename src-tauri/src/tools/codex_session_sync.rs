@@ -33,11 +33,13 @@
 use super::{files, SyncReport};
 use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 const PREFS_FILE: &str = "codex-session-prefs.json";
+
+#[path = "codex_session_cleanup.rs"]
+mod cleanup;
 
 /// 内置 provider。Codex 里它永远存在（所以指向它的旧会话不报「provider 不存在」而是
 /// **静默**打 `api.openai.com`），故它一定要在候选里 —— 「指回官方」是最常见的手动目标。
@@ -272,45 +274,16 @@ pub struct IndexAudit {
     pub sample: Vec<String>,
 }
 
-/// 最多回显几条孤儿 id。
-const ORPHAN_SAMPLE: usize = 5;
-
 /// 审计索引。**只读**。
 ///
 /// 孤儿的来路：用户在别处手删过 rollout、别的工具（cc-switch / CodexPlusPlus）删过、
 /// 或某次删除中途失败。它们的表现是 Codex 会话列表里**点开即报错的死条目**
 /// （恢复会话时只 `SELECT rollout_path`，拿到的是空气）。
 ///
-/// 🔴 **判据是「这个 id 在磁盘上有没有对应的 rollout」，不是「文件存不存在」**：索引行里
-/// 只有 id，没有路径。而 id 要从**文件名**推导（见 [`files::thread_id_from_filename`]）——
-/// 用首行的 `payload.id` 会让 fork 子会话把父会话的 id 也算成「还在」，那方向是安全的
-/// （少删），但会让清理永远清不掉父会话真正的孤儿行。
-pub(in crate::tools) fn audit_index(home: &Path) -> IndexAudit {
-    let live: BTreeSet<String> =
-        super::scan_at(home).sessions.into_iter().map(|s| s.thread_id).collect();
-    let Ok(text) = std::fs::read_to_string(home.join("session_index.jsonl")) else {
-        return IndexAudit::default();
-    };
-    let mut audit = IndexAudit::default();
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        audit.total += 1;
-        let id = serde_json::from_str::<Value>(line)
-            .ok()
-            .and_then(|v| v.get("id")?.as_str().map(str::to_string))
-            .unwrap_or_default();
-        // 认不出 id 的行一律不算孤儿 —— 删掉自己读不懂的东西是最坏的默认值。
-        if id.is_empty() || live.contains(&id) {
-            continue;
-        }
-        audit.orphans += 1;
-        if audit.sample.len() < ORPHAN_SAMPLE {
-            audit.sample.push(id);
-        }
-    }
-    audit
+/// 文件名（含压缩归档）与 SQLite 引用共同证明会话仍存在；不依赖首行能否解析。
+/// 扫描不完整或数据库不可读时返回错误，禁止把未知状态当成孤儿。
+pub(in crate::tools) fn audit_index(home: &Path) -> Result<IndexAudit, String> {
+    cleanup::audit(home)
 }
 
 /// 删掉孤儿行。返回真正删掉的行数。
@@ -320,46 +293,7 @@ pub(in crate::tools) fn audit_index(home: &Path) -> IndexAudit {
 /// 变量、或我们解析错了），全部行都会被判成孤儿。备份是这种情形唯一的退路。
 /// 备份失败就**不清理**（同 sqlite 那半的纪律：宁可不做，也不留一个无法回退的改动）。
 pub(in crate::tools) fn prune_index(home: &Path, data_dir: &Path) -> Result<usize, String> {
-    let path = home.join("session_index.jsonl");
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("读索引失败: {e}"))?;
-    let live: BTreeSet<String> =
-        super::scan_at(home).sessions.into_iter().map(|s| s.thread_id).collect();
-    let mut removed = 0usize;
-    let kept: Vec<&str> = text
-        .lines()
-        .filter(|l| {
-            if l.trim().is_empty() {
-                return false;
-            }
-            let id = serde_json::from_str::<Value>(l)
-                .ok()
-                .and_then(|v| v.get("id")?.as_str().map(str::to_string))
-                .unwrap_or_default();
-            if id.is_empty() || live.contains(&id) {
-                return true;
-            }
-            removed += 1;
-            false
-        })
-        .collect();
-    if removed == 0 {
-        return Ok(0);
-    }
-    files::backup_file(&path, data_dir, "codex-session-index", files::Keep::Count(5))?;
-    // 行尾按原文件保留（本仓在行尾上栽过三次）。
-    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
-    let mut out = kept.join(eol);
-    if !out.is_empty() {
-        out.push_str(eol);
-    }
-    let tmp = files::tmp_path_for(&path);
-    std::fs::write(&tmp, out)
-        .and_then(|_| std::fs::rename(&tmp, &path))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("写索引失败: {e}")
-        })?;
-    Ok(removed)
+    cleanup::prune(home, data_dir)
 }
 
 // ---- 命令 ----
@@ -413,7 +347,7 @@ pub async fn set_codex_session_auto_sync(enabled: bool) -> Result<(), String> {
 #[tauri::command]
 pub async fn audit_codex_session_index() -> Result<IndexAudit, String> {
     let home = super::super::codex_paths::codex_home().map_err(|e| e.to_string())?;
-    Ok(audit_index(&home))
+    tauri::async_runtime::spawn_blocking(move || audit_index(&home)).await.map_err(|error| error.to_string())?
 }
 
 /// 清掉索引里的孤儿行。
@@ -436,6 +370,7 @@ pub async fn prune_codex_session_index() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use std::fs;
 
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -566,6 +501,30 @@ mod tests {
     /// 索引孤儿：指向已不存在会话的行要被认出并清掉，**认不出 id 的行必须留着**，
     /// 且清理前必须留下备份。
     #[test]
+    fn orphan_cleanup_preserves_file_and_database_evidence() {
+        let home = tmp_home("orphan-evidence");
+        let data = home.join("data");
+        let compressed_id = uuid::Uuid::new_v4().to_string();
+        let orphan_id = uuid::Uuid::new_v4().to_string();
+        let rollout = write_rollout(&home, ID_A, "synaroute");
+        fs::write(home.join(rollout), "incomplete session metadata\n").unwrap();
+        fs::write(home.join(format!("sessions/rollout-{compressed_id}.jsonl.zst")), b"compressed").unwrap();
+        let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY)").unwrap();
+        db.execute("INSERT INTO threads VALUES (?1)", [ID_B]).unwrap();
+        let index = [ID_A, ID_B, &compressed_id, &orphan_id].iter()
+            .map(|id| format!("{{\"id\":\"{id}\"}}\n")).collect::<String>();
+        fs::write(home.join("session_index.jsonl"), index).unwrap();
+        assert_eq!(audit_index(&home).unwrap().orphans, 1);
+        assert_eq!(prune_index(&home, &data).unwrap(), 1);
+        let kept = fs::read_to_string(home.join("session_index.jsonl")).unwrap();
+        for id in [ID_A, ID_B, &compressed_id] { assert!(kept.contains(id)); }
+        assert!(!kept.contains(&orphan_id));
+        drop(db);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn orphan_index_rows_are_pruned_and_the_original_is_backed_up() {
         let home = tmp_home("orphan");
         let data = home.join("data");
@@ -580,7 +539,7 @@ mod tests {
         )
         .unwrap();
 
-        let audit = audit_index(&home);
+        let audit = audit_index(&home).unwrap();
         assert_eq!((audit.total, audit.orphans), (3, 1), "只有 B 是孤儿");
         assert_eq!(audit.sample, vec![ID_B.to_string()]);
 
