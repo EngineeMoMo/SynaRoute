@@ -2,11 +2,11 @@
 //! 从父模块抽出只为守住 900 行门；语义与判据仍由父模块测试段覆盖。
 
 use super::{catalog, files, ManifestEntry, SqliteOutcome};
+use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-// sqlite（best-effort：只影响 Desktop 的会话列表，不影响路由）
 
 /// 每个 sqlite 库保留几份写前备份。
 pub(super) const DB_BACKUP_KEEP: usize = 3;
@@ -53,7 +53,7 @@ fn database_paths_in(root: &Path) -> Vec<PathBuf> {
 }
 
 pub(super) fn session_db_paths_checked(home: &Path) -> Result<Vec<PathBuf>, String> {
-    database_paths_in_checked(&sqlite_root(home)).map_err(|error| format!("会话数据库目录无法完整读取，未执行索引清理：{error}"))
+    database_paths_in_checked(&sqlite_root(home)).map_err(|error| format!("会话数据库目录无法完整读取：{error}"))
 }
 
 fn database_paths_in_checked(root: &Path) -> std::io::Result<Vec<PathBuf>> {
@@ -162,7 +162,10 @@ pub(super) fn sync_sqlite(
     ids: &[String],
     catalog_rows: &[catalog::CatalogRow],
 ) -> Option<SqliteOutcome> {
-    let dbs = session_db_paths(home);
+    let dbs = match session_db_paths_checked(home) {
+        Ok(paths) => paths,
+        Err(error) => return Some(SqliteOutcome { error: Some(error), ..Default::default() }),
+    };
     if dbs.is_empty() {
         return None;
     }
@@ -174,7 +177,10 @@ pub(super) fn sync_sqlite(
     };
     let mut out = SqliteOutcome::default();
     for db in dbs {
-        let thread_mutation = !ids.is_empty() && threads_would_mutate(&db, target, ids);
+        let thread_mutation = match threads_would_mutate(&db, target, ids) {
+            Ok(value) => value,
+            Err(error) => { out.error.get_or_insert_with(|| format!("{}: {error}", db.display())); continue; }
+        };
         let catalog_mutation = match catalog::would_mutate(&db, target, &planned_rows) {
             Ok(value) => value,
             Err(e) => {
@@ -202,12 +208,16 @@ pub(super) fn sync_sqlite(
     Some(out)
 }
 
-fn threads_would_mutate(db: &Path, target: &str, ids: &[String]) -> bool {
-    if ids.is_empty() { return false }
-    let Ok(conn) = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
-        return true;
-    };
-    ids.chunks(SQL_CHUNK).any(|chunk| {
+fn has_provider_column(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('threads') WHERE name='model_provider')", [], |row| row.get(0))
+}
+
+fn threads_would_mutate(db: &Path, target: &str, ids: &[String]) -> rusqlite::Result<bool> {
+    if ids.is_empty() { return Ok(false); }
+    let conn = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(std::time::Duration::from_millis(1500))?;
+    if !has_provider_column(&conn)? { return Ok(false); }
+    for chunk in ids.chunks(SQL_CHUNK) {
         let holes = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
         let target_pos = chunk.len() + 1;
         let sql = format!(
@@ -216,8 +226,9 @@ fn threads_would_mutate(db: &Path, target: &str, ids: &[String]) -> bool {
         let mut params: Vec<&dyn rusqlite::ToSql> = chunk.iter()
             .map(|id| id as &dyn rusqlite::ToSql).collect();
         params.push(&target);
-        conn.query_row(&sql, params.as_slice(), |_| Ok(())).is_ok()
-    })
+        if conn.query_row(&sql, params.as_slice(), |_| Ok(())).optional()?.is_some() { return Ok(true); }
+    }
+    Ok(false)
 }
 
 /// 按清单把 `threads.model_provider` 改回原值。返回 `Some(错误)` 表示有库没处理成功。
@@ -229,10 +240,6 @@ fn threads_would_mutate(db: &Path, target: &str, ids: &[String]) -> bool {
 /// 要 open 一次库并可能等满 `busy_timeout` —— 逐条来在库被锁时最坏是「条目数 × 1.5 秒」，
 /// 那会让「停止代理」这个动作卡上几分钟。
 pub(super) fn restore_sqlite(home: &Path, entries: &[ManifestEntry]) -> Option<String> {
-    let dbs = session_db_paths(home);
-    if dbs.is_empty() {
-        return None;
-    }
     let mut groups: std::collections::HashMap<&str, Vec<String>> =
         std::collections::HashMap::new();
     for e in entries {
@@ -247,6 +254,7 @@ pub(super) fn restore_sqlite(home: &Path, entries: &[ManifestEntry]) -> Option<S
     if groups.is_empty() {
         return None;
     }
+    let dbs = match session_db_paths_checked(home) { Ok(paths) => paths, Err(error) => return Some(error) };
     let mut first_err = None;
     for db in dbs {
         for (provider, ids) in &groups {
@@ -338,14 +346,7 @@ pub(super) fn set_threads_provider(db: &Path, provider: &str, ids: &[String]) ->
     let _ = conn.busy_timeout(std::time::Duration::from_millis(1500));
     // 缺表/缺列 → 当作「这个库不管这件事」，不报错。Codex 的 schema 已经改过多次
     // （`state_5` 这个数字本身就是版本号），把它当错误会让接入在一件无关的事上失败。
-    let has_col: bool = conn
-        .query_row(
-            "SELECT 1 FROM pragma_table_info('threads') WHERE name = 'model_provider' LIMIT 1",
-            [],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
-    if !has_col {
+    if !has_provider_column(&conn).map_err(|error| format!("{}: {error}", db.display()))? {
         return Ok(0);
     }
     // 🔴 **必须分批**：每个 id 是一个绑定参数，而 SQLite 的 `SQLITE_MAX_VARIABLE_NUMBER`

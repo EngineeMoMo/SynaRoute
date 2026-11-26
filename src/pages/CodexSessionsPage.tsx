@@ -65,6 +65,7 @@ export function CodexSessionsPage() {
   const [syncing, setSyncing] = useState(false);
   const [repairing, setRepairing] = useState(false);
   const [syncProgress, setSyncProgress] = useState<Progress | null>(null);
+  const [syncNote, setSyncNote] = useState<string | null>(null);
   const [confirmingSync, setConfirmingSync] = useState(false);
   const [maintenanceError, setMaintenanceError] = useState("");
   const loadGeneration = useRef(0);
@@ -184,15 +185,15 @@ export function CodexSessionsPage() {
     if (busy || syncing || repairing || operationInFlight.current || !targets?.targets.some((option) => option.id === target && option.available)) return;
     operationInFlight.current = true;
     setSyncing(true);
+    setSyncNote(null);
     setSyncProgress({ phase: "scanning", completed: 0, total: 0 });
     setConfirmingSync(false);
     try {
-      setNote(await api.syncCodexSessions(target, setSyncProgress));
-      setSyncProgress({ phase: "complete", completed: 0, total: 0 });
+      setSyncNote(await api.syncCodexSessions(target, setSyncProgress));
     } catch (e) {
-      setSyncProgress(null);
-      setNote(String(e));
+      setSyncNote(String(e));
     } finally {
+      setSyncProgress(null);
       await load();
       setSyncing(false);
       operationInFlight.current = false;
@@ -338,7 +339,7 @@ export function CodexSessionsPage() {
               <select
                 value={target}
                 disabled={busy || syncing || repairing}
-                onChange={(e) => setTarget(e.target.value)}
+                onChange={(e) => { setTarget(e.target.value); setSyncNote(null); }}
                 className="min-w-[18rem] rounded-control border border-border bg-surface px-2 py-1.5 text-sm text-text-primary"
               >
                 {!target && <option value="" disabled>{t("sessions.noAvailableTarget")}</option>}
@@ -365,7 +366,8 @@ export function CodexSessionsPage() {
           </div>
           <p className="text-xs text-text-muted">{t("sessions.targetHint")}</p>
           <p className="text-xs text-text-muted">{t("sessions.syncHint")}</p>
-          <SessionMaintenanceProgress value={syncProgress} />
+          {!syncNote && <SessionMaintenanceProgress value={syncProgress} />}
+          {syncNote && <p role="status" className="whitespace-pre-wrap break-words text-sm text-text-primary">{syncNote}</p>}
           {/* 改用户的对话文件之前先让他看清会动几条、动成什么 —— 同大脑聚合落盘前那一屏预览 */}
           {confirmingSync && (
             <div className="rounded-control border border-warning/50 bg-warning/8 p-3">

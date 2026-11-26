@@ -328,9 +328,8 @@ pub async fn sync_codex_sessions(target: String, on_progress: tauri::ipc::Channe
     prefs.last_target = target.clone();
     let _ = write_prefs_in(&data_dir, &prefs);
     // 一条都没动也要如实说 —— 「已同步 0 条」比一句「完成」有信息量得多。
-    Ok(super::describe(&report).unwrap_or_else(|| {
-        format!("全部 {} 个历史对话已经指向 {target}，无需改动", report.already_ok)
-    }))
+    let summary = format!("本地核对结果：{} 个用户对话原本已指向 {target}，{} 个内部会话按设计跳过。未向上游发送测试请求。", report.already_ok, report.internal_skipped);
+    Ok(super::describe(&report).map_or_else(|| summary.clone(), |detail| format!("{detail}\n{summary}")))
     }).await.map_err(|error| error.to_string())?
 }
 

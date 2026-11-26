@@ -22,12 +22,11 @@
 //! 消失**（可见性）」—— 打错上游这个后果它们没写，而那才是 401 的来源。改的地方对、
 //! 描述不全。故本模块的判据按**路由正确性**设计，不按可见性。
 //!
-//! # rollout 是权威，sqlite 只影响列表侧
+//! # 恢复来源不止 rollout
 //!
-//! 恢复会话时 Codex 只 `SELECT rollout_path FROM threads WHERE id = ?`（二进制里那条
-//! SQL），provider 是从 rollout 文件读出来的 —— 实测夹具**根本没有 sqlite 记录**也照样
-//! 生效。`threads.model_provider` 管的是 Desktop 的会话列表，故 sqlite 那半是 best-effort、
-//! [`sync_to_at`] 的成功**不依赖它可写**。看到 sqlite 跳过就以为整个功能没生效，是误读。
+//! 没有 SQLite 记录时，Codex 也能从 rollout 恢复；已有记录时，app-server 的
+//! `merge_persisted_resume_metadata` 会采纳 `threads.model_provider`，除非恢复请求显式覆盖。
+//! 会话文件、属于本线程的模型设置、已有的库记录都要核对。磁盘同步不接管运行中的线程。
 //!
 //! # 🔴 已知边界：本模块只保证「路由到对的上游」，不保证旧对话一定能继续
 //!
@@ -162,6 +161,7 @@ pub(in crate::tools) struct SyncReport {
     pub changed: usize,
     /// 本来就已经是目标 provider、一个字节都没动的会话数。
     pub already_ok: usize,
+    pub internal_skipped: usize,
     /// 改写失败而跳过的会话数。成因归类在 [`SyncReport::blame`] 里 ——
     /// Windows 把「被占用」与「不可写」都映射成 `PermissionDenied`，只有 raw OS error
     /// 32/33 能把它们分开（见 [`files::blame_from_text`]）。
@@ -213,6 +213,8 @@ struct ManifestEntry {
     rel_path: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     records: Vec<providers::Record>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settings_records: Option<providers::SavedSettings>,
     /// 我们动它**之前**那一行里的值。空串表示原本没有这个字段 —— 还原时要把字段
     /// 整个摘掉，而不是写一个空串进去（那是两种不同的形态，Codex 对前者有默认行为）。
     original_provider: String,
@@ -562,10 +564,10 @@ pub(super) fn sync_to_at_observed(
     let mut done_ids = Vec::new();
     for (index, session) in scan.sessions.iter().enumerate() {
         observer("scanning", index, scan.sessions.len())?;
-        if session_is_internal(session, &excluded) { continue; }
+        if session_is_internal(session, &excluded) { report.internal_skipped += 1; continue; }
         let Some(path) = resolve_in_home(home, &session.rel_path) else { report.path_rejected += 1; continue };
         match providers::Plan::read(&path) {
-            Ok(plan) if plan.internal => {},
+            Ok(plan) if plan.internal => report.internal_skipped += 1,
             Ok(plan) if plan.matches(target) => {
                 report.already_ok += 1;
                 if !session.thread_id.is_empty() { done_ids.push(session.thread_id.clone()); }
@@ -699,9 +701,8 @@ pub(in crate::tools) fn restore_at(home: &Path, data_dir: &Path) -> AppResult<Op
         for session in born {
             if session_is_internal(&session, &excluded) { continue; }
             let path = resolve_in_home(home, &session.rel_path).ok_or_else(|| AppError::ToolConfig("会话路径越界，未还原".into()))?;
-            if let Some(records) = providers::born_records(&path, &manifest.target, &manifest.fallback_provider)? {
-                manifest.entries.push(ManifestEntry { rel_path: session.rel_path, thread_id: session.thread_id,
-                    original_provider: manifest.fallback_provider.clone(), records });
+            if let Some(entry) = providers::born_entry(&path, session, &manifest.target, &manifest.fallback_provider)? {
+                manifest.entries.push(entry);
             }
         }
         write_manifest(data_dir, &manifest)?;
@@ -719,7 +720,7 @@ pub(in crate::tools) fn restore_at(home: &Path, data_dir: &Path) -> AppResult<Op
             continue;
         };
         let result = path.try_exists().map_err(AppError::from).and_then(|exists| {
-            if exists { providers::restore(&path, &entry, &manifest.target) } else { Ok(false) }
+            if exists { providers::restore(&path, &entry, &manifest.target, &manifest.fallback_provider) } else { Ok(false) }
         });
         match result {
             Ok(true) => restored += 1,
@@ -745,7 +746,7 @@ pub(in crate::tools) fn restore_at(home: &Path, data_dir: &Path) -> AppResult<Op
     if restored == 0 && failed == 0 {
         // sqlite 那半的错误也要有出口 —— 否则「rollout 都已被用户删掉、而列表元数据没能
         // 还原」这个组合会一个字都不说。
-        return Ok(db_note.map(|e| format!("会话列表元数据未完全还原（不影响路由）：{e}")));
+        return Ok(db_note.map(|e| format!("会话库未完全还原，继续旧对话时仍可能使用原先的路由：{e}")));
     }
     let mut note = format!("已把 {restored} 个历史会话的 provider 改回原值");
     if gone > 0 {
@@ -757,7 +758,7 @@ pub(in crate::tools) fn restore_at(home: &Path, data_dir: &Path) -> AppResult<Op
         ));
     }
     if let Some(e) = db_note {
-        note.push_str(&format!("；会话列表元数据未完全还原（不影响路由）：{e}"));
+        note.push_str(&format!("；会话库未完全还原，继续旧对话时仍可能使用原先的路由：{e}"));
     }
     Ok(Some(note))
 }
@@ -860,8 +861,7 @@ fn describe(r: &SyncReport) -> Option<String> {
             parts.push(format!("已校准会话库 {} 条、Desktop 本地索引 {} 条 provider 记录", db.updated, db.catalog.provider_updated));
         }
         if let Some(e) = &db.error {
-            // 只影响列表元数据，所以措辞刻意不像故障 —— 免得用户以为路由没修好。
-            parts.push(format!("会话列表元数据未完全同步（不影响路由）：{e}"));
+            parts.push(format!("会话库未完全同步，继续旧对话时仍可能使用旧 provider：{e}"));
         }
         // Desktop 列表索引那一份的账。清理只删索引行，不影响路由或会话数据。
         if db.catalog.inserted > 0 || db.catalog.unmarked_missing > 0 {
@@ -1120,6 +1120,143 @@ mod tests {
             let row = serde_json::from_str::<Value>(line).ok()?;
             (row["type"] == "session_meta").then(|| row["payload"].get("model_provider").cloned())
         }).collect()
+    }
+
+    fn settings_event(ordinal: usize, owner: Option<&str>, provider: &str) -> Value {
+        json!({"type":"event_msg","ordinal":ordinal,"payload":{"type":"thread_settings_applied","thread_id":owner,
+            "thread_settings":{"model_provider_id":provider,"model":"keep-model","approval_policy":"never"}}})
+    }
+
+    fn setting_ids(path: &Path) -> Vec<String> {
+        fs::read_to_string(path).unwrap().lines().filter_map(|line| {
+            let row = serde_json::from_str::<Value>(line).ok()?;
+            (row["type"] == "event_msg" && row["payload"]["type"] == "thread_settings_applied")
+                .then(|| row["payload"]["thread_settings"]["model_provider_id"].as_str().map(str::to_owned)).flatten()
+        }).collect()
+    }
+
+    #[test]
+    fn settings_only_drift_in_a_user_fork_preserves_foreign_snapshots_body_and_mtime() {
+        let home = tmp_home("fork-settings");
+        let data = home.join("appdata");
+        let path = write_rollout(&home, "sessions", "child", "synaroute", "\r\n");
+        let child = uuid_of("child");
+        let parent = uuid_of("parent");
+        let base = fs::read_to_string(&path).unwrap().replace(&child, &parent);
+        let own = settings_event(2, Some(&child), "old-owned");
+        let inherited = settings_event(3, None, "inherited");
+        let foreign = settings_event(4, Some(&parent), "parent");
+        let mut latest = settings_event(5, None, "old-legacy");
+        latest["payload"].as_object_mut().unwrap().remove("thread_id");
+        let body = r#"{ "type":"response_item", "payload":{"type":"thread_settings_applied","thread_settings":{"model_provider_id":"body-only"}} }"#;
+        let untouched = format!("  {inherited}\r\n {foreign}\r\n{body}\r\n");
+        fs::write(&path, format!("{base}{own}\r\n{untouched}{latest}")).unwrap();
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(sync_to_at(&home, &data, "synaroute").unwrap().changed, 1);
+        assert_eq!(setting_ids(&path), ["synaroute", "inherited", "parent", "synaroute"]);
+        let synced = fs::read_to_string(&path).unwrap();
+        assert!(synced.starts_with(&base) && synced.contains(&untouched) && !synced.ends_with('\n'));
+        assert_eq!(synced.matches("\r\n").count(), 6);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+        assert_eq!(sync_to_at(&home, &data, "synaroute").unwrap().changed, 0);
+        restore_at(&home, &data).unwrap();
+        assert_eq!(setting_ids(&path), ["old-owned", "inherited", "parent", "old-legacy"]);
+        assert!(fs::read_to_string(&path).unwrap().contains(&untouched));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn v104_manifest_keeps_metadata_positions_and_never_restores_unmanaged_settings() {
+        use sha2::{Digest, Sha256};
+        for upgrade in [false, true] {
+            let home = tmp_home("v104-settings");
+            let data = home.join("appdata");
+            let sid = uuid_of("t1");
+            let path = write_rollout(&home, "sessions", &sid, "synaroute", "\n");
+            let own = settings_event(2, Some(&sid), "private-relay");
+            let later = appended_meta(&path, 3, Some(json!("synaroute")));
+            let already = settings_event(4, Some(&sid), "synaroute");
+            writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{own}\n{later}\n{already}").unwrap();
+            let old_record = |ordinal: usize, provider: &str| {
+                let identity = json!([ordinal,"2026-09-01T13:06:54.261Z",sid,sid,"2026-09-01T13:06:47.003Z"]);
+                json!({"identity":format!("{:x}", Sha256::digest(serde_json::to_vec(&identity).unwrap())),"provider":{"Id":provider}})
+            };
+            fs::create_dir_all(&data).unwrap();
+            fs::write(manifest_path_in(&data), json!({"target":"synaroute","syncedAt":"2026-09-01T13:07:00Z","entries":[{
+                "relPath":rel_of(&home,&path).unwrap(),"threadId":sid,"originalProvider":"openai",
+                "records":[old_record(0,"openai"),old_record(3,"another-relay")]
+            }]}).to_string()).unwrap();
+            if upgrade {
+                assert_eq!(sync_to_at(&home, &data, "synaroute").unwrap().changed, 1);
+                assert_eq!(setting_ids(&path), ["synaroute", "synaroute"]);
+                assert_eq!(sync_to_at(&home, &data, "different").unwrap().changed, 1);
+            }
+            restore_at(&home, &data).unwrap();
+            assert_eq!(all_providers(&path), [Some(json!("openai")), Some(json!("another-relay"))]);
+            assert_eq!(setting_ids(&path), ["private-relay", "synaroute"]);
+            assert!(!manifest_path_in(&data).exists());
+            let _ = fs::remove_dir_all(home);
+        }
+    }
+
+    #[test]
+    fn restoring_new_settings_inherits_the_original_without_overwriting_an_external_provider() {
+        let home = tmp_home("restore-new-settings");
+        let data = home.join("appdata");
+        let sid = uuid_of("t1");
+        let path = write_rollout(&home, "sessions", &sid, "openai", "\n");
+        let append = |event| writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{event}").unwrap();
+        append(settings_event(2, Some(&sid), "original"));
+        sync_to_at(&home, &data, "synaroute").unwrap();
+        append(settings_event(3, Some(&sid), "synaroute"));
+        sync_to_at(&home, &data, "second").unwrap();
+        let text = fs::read_to_string(&path).unwrap().replacen("\"model_provider_id\":\"second\"", "\"model_provider_id\":\"external\"", 1);
+        fs::write(&path, text).unwrap();
+        append(settings_event(4, Some(&sid), "second"));
+        append(settings_event(5, Some(&sid), "outside"));
+        restore_at(&home, &data).unwrap();
+        assert_eq!(setting_ids(&path), ["external", "original", "original", "outside"]);
+        assert_eq!(provider_of(&path), "openai");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn replaced_settings_block_rollback_before_writing_the_file_or_index() {
+        let home = tmp_home("replaced-settings");
+        let data = home.join("appdata");
+        let sid = uuid_of("t1");
+        let path = write_rollout(&home, "sessions", &sid, "openai", "\n");
+        let db = home.join("state_5.sqlite");
+        make_threads_db(&db, "openai");
+        writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}", settings_event(2, Some(&sid), "openai")).unwrap();
+        sync_to_at(&home, &data, "synaroute").unwrap();
+        let replaced = fs::read_to_string(&path).unwrap().replace("keep-model", "replaced-model");
+        fs::write(&path, &replaced).unwrap();
+        let note = restore_at(&home, &data).unwrap().unwrap();
+        assert!(note.contains("未能还原") && manifest_path_in(&data).exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), replaced);
+        assert_eq!(provider_in_db(&db), "synaroute");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn interrupted_target_switch_can_restore_settings_still_using_the_previous_target() {
+        let home = tmp_home("interrupted-settings");
+        let data = home.join("appdata");
+        let sid = uuid_of("t1");
+        let path = write_rollout(&home, "sessions", &sid, "openai", "\n");
+        writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}", settings_event(2, Some(&sid), "openai")).unwrap();
+        sync_to_at(&home, &data, "synaroute").unwrap();
+        let cancelled = sync_to_at_observed(&home, &data, "next", &mut |phase, _, _| {
+            if phase == "syncing" { return Err(AppError::ToolConfig("paused fixture".into())); }
+            Ok(())
+        });
+        assert!(cancelled.is_err());
+        assert_eq!(setting_ids(&path), ["synaroute"]);
+        restore_at(&home, &data).unwrap();
+        assert_eq!(setting_ids(&path), ["openai"]);
+        assert_eq!(provider_of(&path), "openai");
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -1405,10 +1542,13 @@ mod tests {
         let born = write_rollout(&home, "sessions/2026/09/02", "born", "synaroute", "\n");
         let text = fs::read_to_string(&born).unwrap();
         fs::write(&born, text.replace("2026-09-01T13:06:47.003Z", "2999-09-02T00:00:00Z")).unwrap();
+        let born_settings = settings_event(2, Some(&uuid_of("born")), "synaroute");
+        writeln!(fs::OpenOptions::new().append(true).open(&born).unwrap(), "{born_settings}").unwrap();
 
         let note = restore_at(&home, &data).unwrap().expect("旧会话与接入期间新会话都该还原");
         assert!(note.contains('2'), "应还原 old + born 两条：{note}");
         assert_eq!(provider_of(&old), "openai");
+        assert_eq!(setting_ids(&born), ["openai"]);
         assert_eq!(provider_of(&born), "openai", "接入期间新建的会话不能留在已删除的 provider 上");
         assert_eq!(provider_of(&manual), "synaroute", "接入前就指向 target 的手配旧会话不许猜着改");
         let _ = fs::remove_dir_all(&home);
@@ -2115,7 +2255,7 @@ mod tests {
         set_readonly(&db, true);
         let note = restore_at(&home, &data).unwrap().unwrap();
         assert_eq!(provider_of(&roll), "openai", "rollout 那半照旧要还原");
-        assert!(note.contains("列表元数据"), "要如实报出 sqlite 没还原成功");
+        assert!(note.contains("会话库未完全还原"), "要如实报出 sqlite 没还原成功");
         assert!(
             manifest_path_in(&data).exists(),
             "sqlite 还没回滚成功时清单必须留着，否则重试路径被永久切掉"
@@ -2274,6 +2414,7 @@ mod tests {
                     original_provider: "openai".into(),
                     thread_id: "v".into(),
                     records: Vec::new(),
+                    settings_records: None,
                 }],
             },
         )
@@ -2374,6 +2515,21 @@ mod tests {
             "缺列应当是「0 行、无错误」而不是失败"
         );
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_failed_provider_query_is_not_reported_as_an_aligned_index() {
+        let home = tmp_home("index-query-error");
+        let data = home.join("appdata");
+        write_rollout(&home, "sessions", "t1", "synaroute", "\n");
+        let conn = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        conn.execute_batch("CREATE TABLE threads (model_provider TEXT); INSERT INTO threads VALUES ('openai')").unwrap();
+        drop(conn);
+        let report = sync_to_at(&home, &data, "synaroute").unwrap();
+        assert_eq!((report.changed, report.already_ok), (0, 1));
+        assert!(report.sqlite.as_ref().unwrap().error.is_some());
+        assert!(describe(&report).unwrap().contains("仍可能使用旧 provider"));
+        let _ = fs::remove_dir_all(home);
     }
 
     /// 🔴 **接线判据：上面 11 条全都直调函数，把两处调用点摘掉它们照样全绿** ——
@@ -2531,7 +2687,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert!(db.contains("不影响路由"));
+        assert!(db.contains("仍可能使用旧 provider"));
 
         let cleanup = describe(&SyncReport {
             sqlite: Some(SqliteOutcome {
@@ -2605,7 +2761,7 @@ mod tests {
         let path = write_rollout(&home, "sessions/2026/09/01", sid, "stale", "\n");
 
         assert_eq!(
-            resume_provider(&exe, &home, sid),
+            resume_provider(&exe, &home, sid).unwrap(),
             "stale",
             "对照组：会话自带的 provider 必须压过 config 的根 provider —— \
              它不成立的话这个模块就没有存在理由"
@@ -2613,7 +2769,7 @@ mod tests {
 
         assert_eq!(sync_to_at(&home, &data, "current").unwrap().changed, 1);
         assert_eq!(
-            resume_provider(&exe, &home, sid),
+            resume_provider(&exe, &home, sid).unwrap(),
             "current",
             "同步之后 Codex 必须按我们写的值恢复会话"
         );
@@ -2621,19 +2777,55 @@ mod tests {
         let stale_checkpoint = appended_meta(&path, 3, Some(json!("stale")));
         writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{stale_checkpoint}").unwrap();
         assert_eq!(sync_to_at(&home, &data, "current").unwrap().changed, 1);
-        assert_eq!(resume_provider(&exe, &home, sid), "current");
+        assert_eq!(resume_provider(&exe, &home, sid).unwrap(), "current");
+        let cold = tmp_home("cold-settings");
+        fs::copy(home.join("config.toml"), cold.join("config.toml")).unwrap();
+        let path = write_rollout(&cold, "sessions/2026/09/01", sid, "current", "\n");
+        let mut meta: Value = serde_json::from_str(&read_first_line(&path).unwrap()).unwrap();
+        meta["payload"]["cwd"] = json!(cold);
+        meta["payload"]["source"] = json!("vscode");
+        let body = json!({"timestamp":"2026-09-01T13:06:54Z","type":"response_item","payload":
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"Fixture"}]}});
+        let settings = json!({ "timestamp":"2026-11-26T01:00:00Z", "type":"event_msg", "payload":{
+            "type":"thread_settings_applied", "thread_id":sid, "thread_settings":{
+                "model":"probe-model", "model_provider_id":"openai", "cwd":cold, "runtime_workspace_roots":[cold],
+                "approval_policy":"never", "approvals_reviewer":"user",
+                "permission_profile":{"type":"managed","file_system":{"type":"restricted","entries":[
+                    {"path":{"type":"special","value":{"kind":"root"}},"access":"read"}
+                ]},"network":"restricted"},
+                "collaboration_mode":{"mode":"default","settings":{"model":"probe-model","reasoning_effort":null,"developer_instructions":null}},
+                "disabled_plugin_ids":[]
+            }
+        }});
+        fs::write(&path, format!("{meta}\n{body}\n{settings}\n")).unwrap();
+        let error = resume_provider(&exe, &cold, sid).expect_err("线程快照仍选 openai 时不应恢复为 current");
+        assert!(error.replace('`', "").contains("from current to openai"), "{error}");
+        assert_eq!(sync_to_at(&cold, &cold.join("appdata"), "current").unwrap().changed, 1);
+        assert_eq!(resume_provider(&exe, &cold, sid).unwrap(), "current");
+        let state = cold.join("state_5.sqlite");
+        assert_eq!(set_threads_provider(&state, "openai", &[sid.into()]).unwrap(), 1);
+        let indexed = resume_provider(&exe, &cold, sid);
+        assert!(indexed.as_deref() == Ok("openai") || indexed.as_ref().is_err_and(|error| error.contains("provider") && error.contains("openai")), "{indexed:?}");
+        let repaired = sync_to_at(&cold, &cold.join("appdata"), "current").unwrap();
+        assert!(repaired.sqlite.unwrap().updated > 0);
+        assert_eq!(resume_provider(&exe, &cold, sid).unwrap(), "current");
+        let _ = fs::remove_dir_all(cold);
         let _ = fs::remove_dir_all(&home);
     }
 
     /// 起一次 `codex app-server`，`thread/resume` 之后读回它认定的 `modelProvider`。
-    fn resume_provider(exe: &str, home: &Path, sid: &str) -> String {
+    fn resume_provider(exe: &str, home: &Path, sid: &str) -> Result<String, String> {
         use std::io::BufRead as _;
         use std::process::{Command, Stdio};
 
         let mut child = Command::new(exe)
             .arg("app-server")
+            .current_dir(home)
             .env("CODEX_HOME", home)
             .env("CODEX_SQLITE_HOME", home)
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("NO_PROXY", "localhost,127.0.0.1")
             .env("RUST_LOG", "error")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2649,10 +2841,10 @@ mod tests {
         };
         send(
             &mut stdin,
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"probe","version":"1.0.0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"probe","version":"1.0.0"},"capabilities":{"experimentalApi":true}}}"#,
         );
         // 必须等 initialize 的响应再发别的：app-server 在握手完成前会拒绝其它方法。
-        let mut provider = String::new();
+        let mut provider = Err("没读到 thread/resume 的 modelProvider".to_owned());
         let mut line = String::new();
         let mut sent_resume = false;
         // 上限而不是无限循环：app-server 会持续推通知，读不到目标时要能自己结束。
@@ -2669,20 +2861,16 @@ mod tests {
                     &mut stdin,
                     &format!(
                         "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"thread/resume\",\
-                         \"params\":{{\"threadId\":\"{sid}\",\"approvalPolicy\":\"never\"}}}}"
+                         \"params\":{{\"threadId\":\"{sid}\",\"approvalPolicy\":\"never\",\"sandbox\":\"read-only\"}}}}"
                     ),
                 );
                 sent_resume = true;
             } else if id == Some(2) {
-                if let Some(e) = msg.get("error") {
-                    panic!("thread/resume 失败: {e}");
+                if let Some(error) = msg.get("error") {
+                    provider = Err(error.to_string());
+                } else if let Some(id) = msg["result"]["modelProvider"].as_str() {
+                    if msg["result"]["thread"]["modelProvider"] == id { provider = Ok(id.to_owned()); }
                 }
-                provider = msg
-                    .get("result")
-                    .and_then(|r| r.get("modelProvider"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
                 break;
             }
         }
@@ -2690,7 +2878,6 @@ mod tests {
         // kill 之后必须 wait：否则留下僵尸进程（clippy::zombie_processes 会红）。
         // 探针每跑一次起一个 313 MB 的 app-server，攒着不回收会把开发机拖垮。
         let _ = child.wait();
-        assert!(!provider.is_empty(), "没读到 thread/resume 的 modelProvider");
         provider
     }
 }

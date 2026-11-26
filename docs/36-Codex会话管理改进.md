@@ -19,9 +19,25 @@
 
 ### 同步后继续历史会话
 
-列表里的 provider 来自首条 `session_meta`，不是整份会话的一致性证明。一份 rollout 可以有多条 `session_meta`。对照 [CodexPlusPlus 的多条元数据回归用例](https://github.com/BigPizzaV3/CodexPlusPlus/blob/e012af63ac4c0d4fa292a8bcde5ff3ed5e8f5293/crates/codex-plus-data/tests/all/provider_sync.rs#L1489)，并用 Codex CLI `0.171.0-alpha.13.2` 做了隔离实测：首条为 `synaroute`、后续为 `openai` 时，恢复被拒绝。全部一致后能恢复，手动压缩和下一轮消息均完成；两次请求都到达本地模拟代理，没有打到模拟的官方端点。这验证了一个漏同步条件，不代表所有 401 都由它导致。
+列表及「指向别处」统计只读各文件的首条 `session_meta`。一份 rollout 可以有多条 `session_meta`（见 [CodexPlusPlus 的回归用例](https://github.com/BigPizzaV3/CodexPlusPlus/blob/e012af63ac4c0d4fa292a8bcde5ff3ed5e8f5293/crates/codex-plus-data/tests/all/provider_sync.rs#L1489)），还可以有 `event_msg → thread_settings_applied → thread_settings.model_provider_id`。v0.1.104 只检查了前者。此前在自定义 provider 上测通的是**本地摘要及下一轮消息**，不是截图中的远端压缩；两者都可能请求 `/v1/responses`。
 
-完全退出 Codex 后执行「仅同步 provider」。同步逐行核对用户会话的全部 provider 记录，并检查已一致文件所对应的 SQLite 索引，即使列表看起来无需修改。显式标为用户的会话不会仅因一条旧的子线程关系被跳过；有明确内部来源的 Guardian / 子代理仍不改。非元数据行按字节保留；回滚清单兼容旧格式，分条记录原值。此流程不接管正在运行的 Codex 窗口，也不更换上游 Key。
+用真实 Codex CLI `0.171.0-alpha.13.2`、假凭据和两个不同的回环端点验证了三个条件：
+
+| 磁盘上的 provider | 实际结果 |
+|---|---|
+| 全部元数据 `synaroute`，恢复用的线程设置为 `openai` | `thread/resume` 拒绝切换 provider；未发送 HTTP 请求。这是同步漏项，但本身不是 401。 |
+| 元数据 `openai`，无覆盖它的线程设置，根配置 `synaroute` | 恢复选中 `openai`。普通消息先成功；超过测试上下文阈值后，带 `compaction_trigger` 的请求到达模拟官方端点，返回与截图同类的 `Error running remote compact task … 401`。 |
+| 元数据和线程设置均为 `synaroute` | 恢复成功；在测试中为代理显式声明 V2 压缩能力后，同样的自动压缩只到达模拟代理且完成。这个能力声明是为了验证远端分支，不是给用户的配置建议。 |
+
+同步按 [Codex 的模型恢复规则](https://github.com/openai/codex/blob/ad9d659a8491fc5169a00dcf7b7e6ca8a87adf69/codex-rs/app-server/src/request_processors/persisted_resume_settings.rs#L116) 区分本线程、其他线程和未标归属的旧设置；不改 fork 复制来的其他线程设置。只改匹配记录里的 provider，正文及未修改行逐字节保留。元数据与设置分开记原值：直接还原旧清单不碰它未管理的线程设置。没有显式 provider 覆盖时，[Codex 也会从已存在的 `threads.model_provider` 恢复](https://github.com/openai/codex/blob/ad9d659a8491fc5169a00dcf7b7e6ca8a87adf69/codex-rs/app-server/src/request_processors/thread_processor.rs#L285)；读取会话库失败不能算作「已经一致」。明确内部来源的 Guardian / 子代理仍跳过。同步核对的是磁盘，不会更换密钥或接管已打开的线程，也不验证真实上游。
+
+**已有 v0.1.104 不必重复同步即可自查：** 在报错电脑上从「会话管理 → 找到该对话 → 详情 → 复制会话 ID」获取 ID，在放有诊断脚本的目录打开 PowerShell：
+
+```powershell
+.\check-codex-session-route.ps1 -ThreadId (Read-Host 'Thread ID')
+```
+
+脚本在仓库 `scripts/` 下，只读该 ID 的 rollout 和索引记录；不读取 `auth.json`、不联网、不输出正文、目录或自定义 provider 名。非默认数据目录可用 `-CodexHome`、`-SqliteHome` 指定。`MetadataProviders` 列出各条会话元数据使用的 provider；`ResumeSettingsProvider` 是最近可用于恢复的线程设置，`(none)` 表示无设置，不等于 `openai`。`ThreadIndexProviders` 通过 Windows 自带的 SQLite 以只读模式查询该 ID；`(no row)` 表示没有索引行，`(unavailable)`、`(unreadable)` 或非零的 `UnparsedCandidates` 表示诊断不完整。三处都没指向官方却仍报官方 401 时，应核对报错窗口的会话 ID、数据目录以及出错时间的代理请求记录，而不是再次改写历史文件。
 
 归档只修改 `threads` 的归档字段，不移动 rollout，也不改正文、provider、标题或最近活动时间。`archived_at` 使用秒，`archived_at_ms` 使用毫秒，取消归档时置空。修改前使用已有 SQLite Online Backup 保存包含已提交 WAL 页的一致快照，数据库更新使用事务。无法备份时不修改；没有数据库记录的会话返回逐项失败。操作入口要求先退出 Codex/ChatGPT，并共用已有的维护锁。备份目录为应用数据目录下的 `backups/codex-sqlite/`。
 

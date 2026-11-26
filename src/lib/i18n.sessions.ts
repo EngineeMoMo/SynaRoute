@@ -159,7 +159,7 @@ export const sessionsZh: Dict = {
   "sessions.syncConfirmNone":
     "列表中 {total} 条会话的首记录均为 {target}，后续记录仍可能不同。请完全退出 Codex/ChatGPT。同步会检查用户对话中的全部 provider 记录，并在备份数据库后修复索引、清理 local_thread_catalog 中已确认的内部索引行。不会删除对话，不修复工具 ID。",
   "sessions.syncConfirmOk": "确认同步",
-  "sessions.dbNone": "未找到（不影响路由，只影响列表里的标题与模型）",
+  "sessions.dbNone": "此目录中未找到会话库；列表从会话文件读取",
   "sessions.inDbHint":
     "会话库里有 {n} 条记录，磁盘上有 {total} 个会话文件。差额是库里没有记录的那些（fork 出来的分支就属于这一类）—— 它们同样带 provider，所以我们按文件而不是按库列表。",
 
@@ -173,10 +173,10 @@ export const sessionsZh: Dict = {
   "sessions.syncNow": "仅同步 provider",
   "sessions.syncing": "同步中…",
   "sessions.syncHint":
-    "接入时已经自动同步过一次。这个按钮用于补做当时没成功的那些 —— 最常见的成因是接入那一刻 Codex 正开着、文件被独占。",
+    "核对用户对话的会话元数据、恢复时读取的线程设置和本地索引。同步结果不代表这条对话已通过上游验证。",
   "sessions.autoSync": "接入时自动同步历史会话",
   "sessions.autoSyncHint":
-    "这是 SynaRoute 唯一会主动改你对话文件的自动动作（只改首行那一个字段，正文与文件修改时间都不动）。同时在用别的配置切换工具时可以关掉它，关掉后仍可用上面的按钮手动同步。",
+    "接入时同步历史对话的 provider，包括后续会话元数据和本线程的恢复设置。保留对话正文和文件修改时间；关闭后仍可手动同步。",
 
   "sessions.indexTitle": "会话索引",
   "sessions.indexOrphans":
@@ -346,7 +346,7 @@ export const sessionsEn: Dict = {
   "sessions.syncConfirmNone":
     "The first record of all {total} session(s) points at {target}, but later records may differ. Fully quit Codex/ChatGPT. Sync checks all provider records in user conversations. After a database backup, it repairs indexes and cleans confirmed internal rows in local_thread_catalog. It does not delete conversations or repair tool IDs.",
   "sessions.syncConfirmOk": "Sync",
-  "sessions.dbNone": "Not found (routing is unaffected; only titles and models in this list are)",
+  "sessions.dbNone": "No session database found here; this list uses session files",
   "sessions.inDbHint":
     "The session database has {n} row(s) while {total} session file(s) exist on disk. The difference is sessions the database has no row for (forked branches are one such case) — they carry a provider too, which is why we list files rather than database rows.",
 
@@ -360,10 +360,10 @@ export const sessionsEn: Dict = {
   "sessions.syncNow": "Sync provider only",
   "sessions.syncing": "Syncing…",
   "sessions.syncHint":
-    "Applying already synced once. This button is for finishing whatever failed then — most often because Codex was running and held the files open.",
+    "Checks user conversations’ session metadata, settings used on resume, and local indexes. A sync result is not an upstream connectivity test.",
   "sessions.autoSync": "Sync past sessions when applying",
   "sessions.autoSyncHint":
-    "This is the only automatic action in which SynaRoute modifies your conversation files (only that one field on the first line; the body and the file's modification time stay untouched). Turn it off if you also use another config-switching tool — the manual button above still works.",
+    "Syncs providers in session metadata and this thread’s resume settings when applying. Conversation content and file modification times are preserved. You can still sync manually when this is off.",
 
   "sessions.indexTitle": "Session index",
   "sessions.indexOrphans":

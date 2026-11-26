@@ -7,7 +7,7 @@
 //! | 位置 | 谁的事实来源 | 我们此前写吗 |
 //! |---|---|---|
 //! | rollout 首行 `session_meta.payload.model_provider` | **路由**（`thread/resume` 读它） | ✅ |
-//! | `state_5.sqlite` 的 `threads.model_provider` | 列表 | ✅ |
+//! | `state_5.sqlite` 的 `threads.model_provider` | 列表；新版也用于恢复 | ✅ |
 //! | `local_thread_catalog.model_provider` | **Desktop 列表** | ❌ |
 //!
 //! 本机实测（2026-09-06，codex-cli 0.151.0-alpha.7.2）：`local_thread_catalog` **不在**
@@ -15,8 +15,7 @@
 //! `threads` 表。也就是说两张表在两个不同的库里 —— 只按「有 `threads` 表的库」去写，
 //! 这一份永远不会被碰到。
 //!
-//! 好消息是它**不影响路由**（`thread/resume` 只读 rollout，见父模块模块头），所以此前的
-//! 401 修复是完整的。它影响的是「Desktop 的会话列表里那条对话属于哪个 provider」。
+//! `local_thread_catalog` 用于 Desktop 列表；不要与恢复时使用的 `threads` 表混为一谈。
 //!
 //! # 三件事，风险递增，都只在列已存在时做
 //!
