@@ -2,8 +2,8 @@
 //!
 //! # 为什么需要它（2026-09-03 实测，codex-cli 0.151.0-alpha.7.2）
 //!
-//! 每条 thread **自带一个 provider 身份**，写在 rollout 首行的
-//! `session_meta.payload.model_provider`；app-server 的 `thread/resume` 用它**覆盖
+//! 每条 thread **自带一个 provider 身份**，写在 rollout 的 `session_meta.payload.model_provider`。
+//! 同一文件可有多条 `session_meta`，仅首条对齐并不够；app-server 的 `thread/resume` 用它**覆盖
 //! `config.toml` 的根 `model_provider`**。于是官方登录期创建的对话记着 `openai`
 //! （内置 provider、永远存在 → 不报 `Model provider not found` 而是**静默**打
 //! `api.openai.com`）→ 拿 `auth.json` 里我们的占位符 → **401**。
@@ -47,6 +47,7 @@ const MANIFEST_FILE: &str = "codex-session-providers.json";
 #[path = "codex_session_ops.rs"] pub(crate) mod ops;
 #[path = "codex_session_page.rs"] mod page;
 #[path = "codex_session_fs.rs"] pub(in crate::tools) mod files;
+#[path = "codex_session_providers.rs"] mod providers;
 #[path = "codex_session_history.rs"] pub(in crate::tools) mod history; // 顺 history_base 链拼完整历史（fork 只存分叉点之后的轮次）；理由见该文件模块头
 #[path = "codex_session_view.rs"] pub(in crate::tools) mod view;
 #[path = "codex_session_catalog.rs"] mod catalog; // Desktop 列表索引 local_thread_catalog（第三份 provider 副本）；理由见该文件模块头
@@ -210,6 +211,8 @@ struct Manifest {
 #[serde(rename_all = "camelCase")]
 struct ManifestEntry {
     rel_path: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    records: Vec<providers::Record>,
     /// 我们动它**之前**那一行里的值。空串表示原本没有这个字段 —— 还原时要把字段
     /// 整个摘掉，而不是写一个空串进去（那是两种不同的形态，Codex 对前者有默认行为）。
     original_provider: String,
@@ -282,21 +285,15 @@ fn born_after_sync(session: &SessionRef, synced_at: &str) -> bool {
 
 // 扫描（只读首行）
 
-/// 解析首行，只在它确实是 `session_meta` 时返回。
-///
-/// 🔴 **判定与改写都只针对首行。** 取证方式：本机 5 个 rollout 的首行逐个 dump 过，
-/// `type` 全部是 `session_meta`（含 2 个 fork 子会话与 1 个 guardian 子代理会话）。
-/// ⚠️ **依据不是 `ordinal == 0`** —— 那 5 个里一个是 `ordinal: 53`（带 `history_base`
-/// 的续接会话）、一个压根没有 `ordinal` 字段。原注释拿它当依据是错的，而它声称核对过，
-/// 属本仓最贵的那类过时注释；行为一直是对的（只看第一行、只认 `type`）。
-///
-/// CodexPlusPlus 遍历全文找 session_meta，那要把几十 MB 整个读进内存；而万一 Codex 日后
-/// 挪走它，我们的表现是**首行认不出 → 跳过并计数**，不是静默改错行 —— 失效方向安全。
-///
-/// 返回的第一项是首行里的 `payload.id`，**只用于判断这是不是 fork 子会话**（子会话那里它
-/// 是父的 id）。真正的 thread id 由 [`files::thread_id_from_filename`] 从文件名推导。
-fn source_marks_internal(source: &str) -> bool {
-    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(source) else { return false };
+fn source_text_marks_internal(source: &str) -> bool {
+    let source = source.trim().to_ascii_lowercase();
+    matches!(source.as_str(), "subagent" | "internal" | "guardian_review" | "memory_consolidation")
+        || source.starts_with("subagent_") || source.starts_with("internal_")
+}
+
+fn source_value_marks_internal(source: &Value) -> bool {
+    if let Value::String(text) = source { return source_text_marks_internal(text); }
+    let Value::Object(object) = source else { return false };
     ["subagent", "sub_agent", "internal", "agent"].iter().any(|key| {
         object.get(*key).is_some_and(|value| match value {
             Value::Null => false,
@@ -310,7 +307,7 @@ fn source_marks_internal(source: &str) -> bool {
 }
 
 fn session_is_internal(session: &SessionRef, child_ids: &std::collections::HashSet<String>) -> bool {
-    source_marks_internal(&session.source)
+    serde_json::from_str::<Value>(&session.source).is_ok_and(|source| source_value_marks_internal(&source))
         || (!session.thread_source.trim().is_empty()
             && !session.thread_source.trim().eq_ignore_ascii_case("user"))
         || child_ids.contains(&session.thread_id)
@@ -560,21 +557,24 @@ pub(super) fn sync_to_at_observed(
     // CodexPlus++ 对齐：只同步根/用户会话。内部派生由 rollout source、thread_source 或
     // edge/job 证据确认；普通用户 fork 不因 forked 标记单独排除。
     let child_ids = sqlite::collect_child_thread_ids(home);
-    let mut todo: Vec<(PathBuf, &SessionRef)> = Vec::new();
-    for s in &scan.sessions {
-        if session_is_internal(s, &child_ids) {
-            continue;
-        }
-        if s.provider == target {
-            report.already_ok += 1;
-            continue;
-        }
-        match resolve_in_home(home, &s.rel_path) {
-            Some(path) => todo.push((path, s)),
-            // 扫描自产的 rel_path 不该越界。真越界了单独计数、单独措辞 —— 与「首行认不出」
-            // 合成一个数字会让用户拿到指错方向的解释（一个是路径推导出了问题，一个是
-            // Codex 改了 rollout 格式，两者的处置完全不同）。
-            None => report.path_rejected += 1,
+    let excluded = sqlite::provider_exclusions(home, &child_ids, &scan.sessions);
+    let mut todo = Vec::new();
+    let mut done_ids = Vec::new();
+    for (index, session) in scan.sessions.iter().enumerate() {
+        observer("scanning", index, scan.sessions.len())?;
+        if session_is_internal(session, &excluded) { continue; }
+        let Some(path) = resolve_in_home(home, &session.rel_path) else { report.path_rejected += 1; continue };
+        match providers::Plan::read(&path) {
+            Ok(plan) if plan.internal => {},
+            Ok(plan) if plan.matches(target) => {
+                report.already_ok += 1;
+                if !session.thread_id.is_empty() { done_ids.push(session.thread_id.clone()); }
+            },
+            Ok(plan) => todo.push((path, session, plan)),
+            Err(error) => {
+                report.skipped += 1;
+                report.blame.get_or_insert(files::blame_from_text(&error.to_string()));
+            },
         }
     }
 
@@ -598,32 +598,24 @@ pub(super) fn sync_to_at_observed(
         }
     }
     let mut newly_recorded = false;
-    for (_, s) in &todo {
-        if !manifest.entries.iter().any(|e| e.rel_path == s.rel_path) {
-            manifest.entries.push(ManifestEntry {
-                rel_path: s.rel_path.clone(),
-                original_provider: original_to_record(&s.provider, &manifest.fallback_provider),
-                thread_id: s.thread_id.clone(),
-            });
-            newly_recorded = true;
-        }
+    for (_, session, plan) in &todo {
+        newly_recorded |= plan.remember(&mut manifest, session, target)?;
     }
-    if newly_recorded || manifest_changed || manifest_was_empty {
+    if newly_recorded || manifest_changed || manifest_was_empty || manifest.target != target {
         // 初次同步即使一条旧会话都没有，也必须落一份清单：此后在接入期间新建的会话
         // 一出生就是 target、永远不会进 todo；没有这个空清单，停止时完全认不出它们。
-        if manifest_was_empty || manifest.target != target {
-            manifest.target = target.to_string();
+        if manifest_was_empty {
             manifest.synced_at = crate::clock::rfc3339(jiff::Timestamp::now());
         }
+        manifest.target = target.to_string();
         write_manifest(data_dir, &manifest)?;
     }
 
     // ③ 再改文件，并记下**确实改成功的** thread id。
-    let mut done_ids: Vec<String> = Vec::new();
-    for (index, (path, s)) in todo.iter().enumerate() {
+    for (index, (path, s, plan)) in todo.iter().enumerate() {
         observer("syncing", index, todo.len())?;
-        match rewrite_first_line(path, Some(target)) {
-            Ok(Some((_, info))) => {
+        match plan.sync(path, target) {
+            Ok(Some(info)) => {
                 report.changed += 1;
                 if info.had_encrypted_content {
                     report.encrypted += 1;
@@ -651,7 +643,7 @@ pub(super) fn sync_to_at_observed(
     // ④ provider/missing 只接受 rollout 那半确实成功的证据；失败的 user session 不能因为
     // 全量扫描而被 catalog 标成已同步。child cleanup 是独立的 cleanup-only 计划：它不依赖
     // provider rollout 是否成功，也不能反过来扩大 provider 同步范围。
-    observer("indexing", done_ids.len(), todo.len())?;
+    observer("indexing", done_ids.len(), scan.sessions.len())?;
     let catalog_rows = catalog_rows_for_sync(home, target, &done_ids, &child_ids, &scan.sessions);
     report.sqlite = sync_sqlite(home, data_dir, target, &done_ids, &catalog_rows);
     Ok(report)
@@ -702,42 +694,45 @@ pub(in crate::tools) fn restore_at(home: &Path, data_dir: &Path) -> AppResult<Op
     // born-as-target 也先写进清单，再改文件：若中途失败或 sqlite 被锁，下一次停止还能精确重试。
     // 这与同步侧「清单必须在改文件之前落盘」是同一条纪律，不能只存在内存里。
     if !born.is_empty() {
-        manifest.entries.extend(born.into_iter().map(|s| ManifestEntry {
-            rel_path: s.rel_path,
-            original_provider: manifest.fallback_provider.clone(),
-            thread_id: s.thread_id,
-        }));
+        let child_ids = sqlite::collect_child_thread_ids(home);
+        let excluded = sqlite::provider_exclusions(home, &child_ids, &born);
+        for session in born {
+            if session_is_internal(&session, &excluded) { continue; }
+            let path = resolve_in_home(home, &session.rel_path).ok_or_else(|| AppError::ToolConfig("会话路径越界，未还原".into()))?;
+            if let Some(records) = providers::born_records(&path, &manifest.target, &manifest.fallback_provider)? {
+                manifest.entries.push(ManifestEntry { rel_path: session.rel_path, thread_id: session.thread_id,
+                    original_provider: manifest.fallback_provider.clone(), records });
+            }
+        }
         write_manifest(data_dir, &manifest)?;
     }
-    let restore_entries = manifest.entries.clone();
+    let mut restore_index = Vec::new();
     let mut restored = 0usize;
     let mut failed = 0usize;
     let mut gone = 0usize;
 
-    for e in &restore_entries {
+    for entry in manifest.entries {
         // 路径遏制：清单被手改成 `../..` 时不许我们去改 `$CODEX_HOME` 之外的文件。
         // 算作 failed 而不是静默跳过 —— 清单留着，排障时能看到这条没处理成功。
-        let Some(path) = resolve_in_home(home, &e.rel_path) else {
+        let Some(path) = resolve_in_home(home, &entry.rel_path) else {
             failed += 1;
             continue;
         };
-        if !path.exists() {
-            // 用户后来删掉了那个会话。不是错误 —— 它已经不需要还原了。
-            gone += 1;
-            continue;
+        let result = path.try_exists().map_err(AppError::from).and_then(|exists| {
+            if exists { providers::restore(&path, &entry, &manifest.target) } else { Ok(false) }
+        });
+        match result {
+            Ok(true) => restored += 1,
+            Ok(false) => gone += 1,
+            Err(_) => { failed += 1; continue; }
         }
-        let want = (!e.original_provider.is_empty()).then_some(e.original_provider.as_str());
-        match rewrite_first_line(&path, want) {
-            Ok(Some(_)) => restored += 1,
-            Ok(None) => gone += 1,
-            Err(_) => failed += 1,
-        }
+        restore_index.push(entry);
     }
 
     // sqlite 那半也要对称回滚 —— 只做 rollout 不做 sqlite 的话，还原之后 Desktop 的
     // 会话列表会长期标着 synaroute 而实际路由已回到官方，且**永不自愈**（除非用户再
     // 接入一次）。同步那半刻意写了 sqlite，这一半漏掉就是我们自己造的不一致。
-    let db_note = restore_sqlite(home, &restore_entries);
+    let db_note = restore_sqlite(home, &restore_index);
 
     // 全部处理完才删清单（同 `restore_one` 还原成功后删 `.bak`）。有失败就留着 ——
     // 用户退出 Codex 后再点一次停止就能补完。
@@ -758,8 +753,7 @@ pub(in crate::tools) fn restore_at(home: &Path, data_dir: &Path) -> AppResult<Op
     }
     if failed > 0 {
         note.push_str(&format!(
-            "；{failed} 个未能还原（文件被 Codex 占用、目录不可写，或清单条目已越界）\
-             —— 若 Codex 正在运行，完全退出后再点一次「停止」即可补完，回滚清单已保留"
+            "；{failed} 个未能还原（文件不可写、路径越界，或会话元数据与清单不符）；这些会话的索引未改，回滚清单已保留"
         ));
     }
     if let Some(e) = db_note {
@@ -823,8 +817,7 @@ fn describe(r: &SyncReport) -> Option<String> {
     if r.changed > 0 {
         let target = if r.target.is_empty() { "目标 provider" } else { &r.target };
         parts.push(format!(
-            "已把 {} 个历史对话指向 {target}（重启 Codex 后生效；若某条旧对话仍报错，\
-             那是它的推理内容由原账号加密所致，新建对话不受影响）",
+            "已把 {} 个历史对话的全部 provider 记录指向 {target}（重启 Codex 后生效；同步不更换密钥，也不重新加密历史推理内容）",
             r.changed
         ));
     }
@@ -863,6 +856,9 @@ fn describe(r: &SyncReport) -> Option<String> {
         ));
     }
     if let Some(db) = &r.sqlite {
+        if db.updated > 0 || db.catalog.provider_updated > 0 {
+            parts.push(format!("已校准会话库 {} 条、Desktop 本地索引 {} 条 provider 记录", db.updated, db.catalog.provider_updated));
+        }
         if let Some(e) = &db.error {
             // 只影响列表元数据，所以措辞刻意不像故障 —— 免得用户以为路由没修好。
             parts.push(format!("会话列表元数据未完全同步（不影响路由）：{e}"));
@@ -1108,6 +1104,175 @@ mod tests {
     fn provider_of(path: &Path) -> String {
         let line = read_first_line(path).unwrap();
         parse_meta(&line).unwrap().1
+    }
+
+    fn appended_meta(path: &Path, ordinal: usize, provider: Option<Value>) -> String {
+        let mut meta: Value = serde_json::from_str(&read_first_line(path).unwrap()).unwrap();
+        meta["ordinal"] = json!(ordinal);
+        let payload = meta["payload"].as_object_mut().unwrap();
+        if let Some(value) = provider { payload.insert("model_provider".into(), value); }
+        else { payload.remove("model_provider"); }
+        serde_json::to_string(&meta).unwrap()
+    }
+
+    fn all_providers(path: &Path) -> Vec<Option<Value>> {
+        fs::read_to_string(path).unwrap().lines().filter_map(|line| {
+            let row = serde_json::from_str::<Value>(line).ok()?;
+            (row["type"] == "session_meta").then(|| row["payload"].get("model_provider").cloned())
+        }).collect()
+    }
+
+    #[test]
+    fn sync_checks_late_records_even_when_the_first_matches_and_restores_each_original() {
+        use std::io::Write as _;
+        let home = tmp_home("mixed-metadata");
+        let data = home.join("appdata");
+        let path = write_rollout(&home, "archived_sessions", "t1", "synaroute", "\r\n");
+        let ordinary = format!("  {{\"type\":\"response_item\",\"payload\":{{\"text\":\"session_meta model_provider {}\"}}}}  \r\n", "x".repeat(1024 * 1024));
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(ordinary.as_bytes()).unwrap();
+        for (index, value) in [Some(json!("openai")), None, Some(Value::Null), Some(json!(""))].into_iter().enumerate() {
+            write!(file, "{}{}", appended_meta(&path, index + 2, value), if index == 3 { "" } else { "\r\n" }).unwrap();
+        }
+        drop(file);
+        let original = all_providers(&path);
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(sync_to_at(&home, &data, "synaroute").unwrap().changed, 1);
+        assert_eq!(all_providers(&path), vec![Some(json!("synaroute")); 5]);
+        let synced = fs::read_to_string(&path).unwrap();
+        assert!(synced.contains(&ordinary) && !synced.ends_with('\n'));
+        assert_eq!(synced.matches("\r\n").count(), 6);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        assert_eq!(sync_to_at(&home, &data, "synaroute").unwrap().changed, 0);
+        assert_eq!(fs::read_to_string(&path).unwrap(), synced);
+        restore_at(&home, &data).unwrap();
+        assert_eq!(all_providers(&path), original);
+        assert!(fs::read_to_string(&path).unwrap().contains(&ordinary));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn upgrading_a_first_line_only_manifest_keeps_the_original_provider() {
+        use std::io::Write as _;
+        let home = tmp_home("old-manifest-multiple-records");
+        let data = home.join("appdata");
+        let path = write_rollout(&home, "sessions", "t1", "synaroute", "\n");
+        let late = appended_meta(&path, 2, Some(json!("other")));
+        writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{late}").unwrap();
+        fs::create_dir_all(&data).unwrap();
+        fs::write(manifest_path_in(&data), json!({"target":"synaroute","syncedAt":"2026-09-01T00:00:00Z","entries":[{
+            "relPath":rel_of(&home, &path).unwrap(), "originalProvider":"openai", "threadId":uuid_of("t1")
+        }]}).to_string()).unwrap();
+        assert_eq!(sync_to_at(&home, &data, "synaroute").unwrap().changed, 1);
+        assert_eq!(sync_to_at(&home, &data, "relay").unwrap().changed, 1);
+        let added = appended_meta(&path, 3, Some(json!("relay")));
+        writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{added}").unwrap();
+        restore_at(&home, &data).unwrap();
+        assert_eq!(all_providers(&path), ["openai", "other", "other"].map(|id| Some(json!(id))));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn verified_rollout_repairs_a_stale_sqlite_provider_without_rewriting_the_file() {
+        let home = tmp_home("stale-index-only");
+        let data = home.join("appdata");
+        let path = write_rollout(&home, "sessions", "t1", "synaroute", "\n");
+        let db = home.join("state_5.sqlite");
+        make_threads_db(&db, "openai");
+        let bytes = fs::read(&path).unwrap();
+        let report = sync_to_at(&home, &data, "synaroute").unwrap();
+        assert_eq!((report.changed, report.already_ok, report.sqlite.unwrap().updated), (0, 1, 1));
+        assert_eq!(provider_in_db(&db), "synaroute");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn explicit_users_override_stale_edges_but_not_confirmed_internal_sources() {
+        let home = tmp_home("sync-origin-priority");
+        let db_path = home.join("state_5.sqlite");
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT, source TEXT, thread_source TEXT);
+            CREATE TABLE thread_spawn_edges (child_thread_id TEXT);
+            CREATE TABLE local_thread_catalog_hosts (host_id TEXT, host_kind TEXT);
+            INSERT INTO local_thread_catalog_hosts VALUES ('this-host','local'),('other-host','remote');
+            CREATE TABLE local_thread_catalog (host_id TEXT, thread_id TEXT, thread_source TEXT);").unwrap();
+        let cases = [
+            ("db-user", "user", "subagent_review", true, "synaroute"),
+            ("catalog-user", "", "cli", true, "synaroute"),
+            ("rollout-user", "", "cli", true, "synaroute"),
+            ("remote-user", "", "cli", true, "openai"),
+            ("guardian", "guardian_review", "cli", false, "openai"),
+            ("structured", "user", r#"{"subagent":{"other":"guardian"}}"#, false, "openai"),
+        ];
+        let mut files = Vec::new();
+        for (label, kind, source, edge, expected) in cases {
+            let id = uuid_of(label);
+            let path = write_rollout(&home, "sessions", label, "openai", "\n");
+            db.execute("INSERT INTO threads VALUES (?1, 'openai', ?2, ?3)", (&id, source, kind)).unwrap();
+            if edge { db.execute("INSERT INTO thread_spawn_edges VALUES (?1)", [&id]).unwrap(); }
+            match label {
+                "rollout-user" => set_rollout_thread_source(&path, "user"),
+                "catalog-user" | "remote-user" => {
+                    let host = if label == "catalog-user" { "this-host" } else { "other-host" };
+                    db.execute("INSERT INTO local_thread_catalog VALUES (?1, ?2, 'user')", (host, &id)).unwrap();
+                }
+                _ => {}
+            }
+            files.push((path, id, expected));
+        }
+        drop(db);
+        let report = sync_to_at(&home, &home.join("appdata"), "synaroute").unwrap();
+        assert_eq!((report.changed, report.sqlite.unwrap().updated), (3, 3));
+        for (path, id, expected) in files {
+            assert_eq!(provider_of(&path), expected, "{}", path.display());
+            assert_eq!(provider_of_id(&db_path, &id), expected);
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_replaced_checkpoint_blocks_rollback_of_both_file_and_index_until_verified() {
+        let home = tmp_home("restore-changed-checkpoints");
+        let data = home.join("appdata");
+        let path = write_rollout(&home, "sessions", "t1", "openai", "\n");
+        let later = appended_meta(&path, 2, Some(json!("other")));
+        writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{later}").unwrap();
+        let db = home.join("state_5.sqlite");
+        make_threads_db(&db, "openai");
+        sync_to_at(&home, &data, "synaroute").unwrap();
+        let synced = fs::read_to_string(&path).unwrap();
+        let replaced = synced.replace("\"ordinal\":2", "\"ordinal\":42");
+        assert_ne!(synced, replaced);
+        fs::write(&path, &replaced).unwrap();
+        let note = restore_at(&home, &data).unwrap().unwrap();
+        assert!(note.contains("未能还原") && manifest_path_in(&data).exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), replaced);
+        assert_eq!(provider_in_db(&db), "synaroute");
+        fs::write(&path, synced).unwrap();
+        restore_at(&home, &data).unwrap();
+        assert_eq!(all_providers(&path), ["openai", "other"].map(|id| Some(json!(id))));
+        assert_eq!(provider_in_db(&db), "openai");
+        assert!(!manifest_path_in(&data).exists());
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn internal_source_late_in_a_rollout_vetoes_the_whole_file_and_its_sqlite_update() {
+        use std::io::Write as _;
+        let home = tmp_home("late-internal");
+        let path = write_rollout(&home, "sessions", "t1", "openai", "\n");
+        let mut late: Value = serde_json::from_str(&appended_meta(&path, 2, Some(json!("other")))).unwrap();
+        late["payload"]["source"] = json!({"subagent":{"other":"guardian"}});
+        writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{late}").unwrap();
+        let db = home.join("state_5.sqlite");
+        make_threads_db(&db, "openai");
+        let bytes = fs::read(&path).unwrap();
+        let report = sync_to_at(&home, &home.join("appdata"), "synaroute").unwrap();
+        assert_eq!((report.changed, report.already_ok, report.sqlite.unwrap().updated), (0, 0, 0));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(provider_in_db(&db), "openai");
+        let _ = fs::remove_dir_all(home);
     }
 
     /// 写首行的结构化 `payload.source`（Codex 给内部派生线程用的那个形态）。
@@ -2108,6 +2273,7 @@ mod tests {
                     rel_path: rel,
                     original_provider: "openai".into(),
                     thread_id: "v".into(),
+                    records: Vec::new(),
                 }],
             },
         )
@@ -2436,7 +2602,7 @@ mod tests {
              base_url = \"http://127.0.0.1:2/v1\"\nwire_api = \"responses\"\n",
         )
         .unwrap();
-        write_rollout(&home, "sessions/2026/09/01", sid, "stale", "\n");
+        let path = write_rollout(&home, "sessions/2026/09/01", sid, "stale", "\n");
 
         assert_eq!(
             resume_provider(&exe, &home, sid),
@@ -2451,6 +2617,11 @@ mod tests {
             "current",
             "同步之后 Codex 必须按我们写的值恢复会话"
         );
+        use std::io::Write as _;
+        let stale_checkpoint = appended_meta(&path, 3, Some(json!("stale")));
+        writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{stale_checkpoint}").unwrap();
+        assert_eq!(sync_to_at(&home, &data, "current").unwrap().changed, 1);
+        assert_eq!(resume_provider(&exe, &home, sid), "current");
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -2462,6 +2633,7 @@ mod tests {
         let mut child = Command::new(exe)
             .arg("app-server")
             .env("CODEX_HOME", home)
+            .env("CODEX_SQLITE_HOME", home)
             .env("RUST_LOG", "error")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

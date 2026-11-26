@@ -234,6 +234,21 @@ fn replace_first_line_observed(
     next_first: &str,
     before_replace: &mut dyn FnMut() -> io::Result<()>,
 ) -> AppResult<RewriteInfo> {
+    rewrite_checked(path, |reader, dst| {
+        let mut current = String::new();
+        reader.read_line(&mut current)?;
+        if current != first { return Err(io::Error::other(SOURCE_CHANGED)); }
+        dst.write_all(next_first.as_bytes())?;
+        io::copy(reader, dst)?;
+        Ok(())
+    }, before_replace)
+}
+
+pub(super) fn rewrite_checked(
+    path: &Path,
+    transform: impl FnOnce(&mut dyn BufRead, &mut dyn Write) -> io::Result<()>,
+    before_replace: &mut dyn FnMut() -> io::Result<()>,
+) -> AppResult<RewriteInfo> {
     let tmp = tmp_path_for(path);
     let mut info = RewriteInfo::default();
     let copy = (|| -> io::Result<()> {
@@ -246,18 +261,12 @@ fn replace_first_line_observed(
         }
         let source = options.open(path)?;
         let metadata = source.metadata()?;
-        let mut reader = BufReader::new(source);
-        let mut current_first = String::new();
-        reader.read_line(&mut current_first)?;
-        if current_first != first {
-            return Err(io::Error::other(SOURCE_CHANGED));
-        }
-        let mut digest = Sha256::new();
-        digest.update(first.as_bytes());
-        let mut sniff = Sniff { inner: reader, tail: Vec::new(), found: false, digest };
+        let mut sniff = Sniff { inner: source, tail: Vec::new(), found: false, digest: Sha256::new() };
         let mut dst = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        dst.write_all(next_first.as_bytes())?;
-        io::copy(&mut sniff, &mut dst)?;
+        let mut writer = io::BufWriter::new(&mut dst);
+        transform(&mut BufReader::new(&mut sniff), &mut writer)?;
+        writer.flush()?;
+        drop(writer);
         info.had_encrypted_content = sniff.found;
         // 先落盘再 rename：崩在这之间留下的是一个孤立的 .tmp（下次扫描不认它，文件名不以
         // rollout- 开头），而不是一个内容不完整的 rollout。

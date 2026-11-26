@@ -108,7 +108,7 @@ export const sessionsZh: Dict = {
   "sessions.confirmOk": "确认删除",
   "sessions.cancel": "取消",
   "sessions.mismatchHint":
-    "有 {n} 条会话指向别的 provider。它们在 Codex 里打开会走那个上游 —— 若那是官方 openai，就会用占位凭据换来 401。用下面的「仅同步 provider」把它们指向 SynaRoute 即可。",
+    "有 {n} 条会话的首条记录与当前 provider 不同。同步会检查用户对话中的全部 provider 记录；Codex 内部派生会话保留原值，不需要反复同步。",
   "sessions.unreadable": "{n} 个文件的首行无法解析（Codex 可能改过 rollout 格式），已跳过",
   "sessions.pathRejected": "{n} 个文件的路径无法安全定位，已跳过",
   "sessions.loadFailed": "读取会话列表失败",
@@ -155,9 +155,9 @@ export const sessionsZh: Dict = {
   "sessions.repair.backup": "备份目录：",
   "sessions.repair.after": "请重新打开 Codex 会话。若有未处理项，已完成的修复不会自动撤销；请处理原因后重新扫描。",
   "sessions.syncConfirmBody":
-    "请完全退出 Codex/ChatGPT。将把 {n} 条会话的 provider 改成 {target}，并同步相关索引；原 provider 记入回滚清单。此操作不修复工具 ID、不修改历史正文。若需要修复 ID，请使用独立的扫描预览入口。",
+    "请完全退出 Codex/ChatGPT。列表中有 {n} 条首记录不是 {target}；同步会检查用户对话中的每条 provider 记录及相关索引，跳过内部派生会话。原 provider 可还原；不修改对话正文，不修复工具 ID。",
   "sessions.syncConfirmNone":
-    "当前 {total} 条会话都已指向 {target}。请完全退出 Codex/ChatGPT；仍会备份、检查并清理 local_thread_catalog 中已确认的内部索引行。不会删除会话正文，也不会执行工具 ID 修复。",
+    "列表中 {total} 条会话的首记录均为 {target}，后续记录仍可能不同。请完全退出 Codex/ChatGPT。同步会检查用户对话中的全部 provider 记录，并在备份数据库后修复索引、清理 local_thread_catalog 中已确认的内部索引行。不会删除对话，不修复工具 ID。",
   "sessions.syncConfirmOk": "确认同步",
   "sessions.dbNone": "未找到（不影响路由，只影响列表里的标题与模型）",
   "sessions.inDbHint":
@@ -294,7 +294,7 @@ export const sessionsEn: Dict = {
   "sessions.confirmOk": "Delete",
   "sessions.cancel": "Cancel",
   "sessions.mismatchHint":
-    "{n} session(s) point at a different provider. Opening them in Codex routes to that upstream — if it is the official openai, the placeholder credential comes back as a 401. Use \"Sync provider only\" below to point them at SynaRoute.",
+    "The first record of {n} session(s) differs from the current provider. Sync checks every provider record in user conversations. Internal Codex sessions keep their original provider; do not resync them.",
   "sessions.unreadable":
     "{n} file(s) had an unparsable first line (Codex may have changed the rollout format); skipped",
   "sessions.pathRejected": "{n} file(s) could not be safely located; skipped",
@@ -342,9 +342,9 @@ export const sessionsEn: Dict = {
   "sessions.repair.backup": "Backup directory:",
   "sessions.repair.after": "Reopen your Codex session. Completed repairs are not automatically rolled back if other items fail; resolve the cause and scan again.",
   "sessions.syncConfirmBody":
-    "Fully quit Codex/ChatGPT. Change {n} session provider(s) to {target} and update related indexes. Original providers are recorded for rollback. This does not repair tool IDs or modify historical conversation content. Use the separate scan and preview action for ID repairs.",
+    "Fully quit Codex/ChatGPT. The first record of {n} session(s) differs from {target}. Sync checks every provider record and related index for user conversations, skipping internal sessions. Original providers can be restored. Sync does not change conversation content or repair tool IDs.",
   "sessions.syncConfirmNone":
-    "All {total} session(s) already point at {target}. Fully quit Codex/ChatGPT; confirmed internal rows in local_thread_catalog are still inspected and cleaned after a database backup. This does not delete conversation content or repair tool IDs.",
+    "The first record of all {total} session(s) points at {target}, but later records may differ. Fully quit Codex/ChatGPT. Sync checks all provider records in user conversations. After a database backup, it repairs indexes and cleans confirmed internal rows in local_thread_catalog. It does not delete conversations or repair tool IDs.",
   "sessions.syncConfirmOk": "Sync",
   "sessions.dbNone": "Not found (routing is unaffected; only titles and models in this list are)",
   "sessions.inDbHint":

@@ -17,6 +17,12 @@
 
 默认展示未归档的用户对话；明确的内部派生会话可以切换筛选查看，普通 fork 和来源未知的会话保留。文件仍然是列表的基础，数据库缺少的分支不会因此消失。标题缓存现在包含 Codex 根目录，避免切换 `CODEX_HOME` 时复用另一目录的同路径标题。
 
+### 同步后继续历史会话
+
+列表里的 provider 来自首条 `session_meta`，不是整份会话的一致性证明。一份 rollout 可以有多条 `session_meta`。对照 [CodexPlusPlus 的多条元数据回归用例](https://github.com/BigPizzaV3/CodexPlusPlus/blob/e012af63ac4c0d4fa292a8bcde5ff3ed5e8f5293/crates/codex-plus-data/tests/all/provider_sync.rs#L1489)，并用 Codex CLI `0.171.0-alpha.13.2` 做了隔离实测：首条为 `synaroute`、后续为 `openai` 时，恢复被拒绝。全部一致后能恢复，手动压缩和下一轮消息均完成；两次请求都到达本地模拟代理，没有打到模拟的官方端点。这验证了一个漏同步条件，不代表所有 401 都由它导致。
+
+完全退出 Codex 后执行「仅同步 provider」。同步逐行核对用户会话的全部 provider 记录，并检查已一致文件所对应的 SQLite 索引，即使列表看起来无需修改。显式标为用户的会话不会仅因一条旧的子线程关系被跳过；有明确内部来源的 Guardian / 子代理仍不改。非元数据行按字节保留；回滚清单兼容旧格式，分条记录原值。此流程不接管正在运行的 Codex 窗口，也不更换上游 Key。
+
 归档只修改 `threads` 的归档字段，不移动 rollout，也不改正文、provider、标题或最近活动时间。`archived_at` 使用秒，`archived_at_ms` 使用毫秒，取消归档时置空。修改前使用已有 SQLite Online Backup 保存包含已提交 WAL 页的一致快照，数据库更新使用事务。无法备份时不修改；没有数据库记录的会话返回逐项失败。操作入口要求先退出 Codex/ChatGPT，并共用已有的维护锁。备份目录为应用数据目录下的 `backups/codex-sqlite/`。
 
 本轮分页限制的是页面渲染数量，首次加载仍扫描完整本地 rollout 快照。Codex++ 的数据库分页缓存尚未引入；SynaRoute 继续同时展示数据库里没有记录的文件，因此不能直接替换成数据库分页。详情提供元数据与 CLI 命令，未增加 Desktop 私有协议跳转或对话正文预览。

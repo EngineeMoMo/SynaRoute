@@ -95,7 +95,7 @@ fn supports_repair(cols: &HashSet<String>) -> bool {
     .all(|c| cols.contains(*c))
 }
 
-fn columns_of(db: &Connection, table: &str) -> HashSet<String> {
+pub(super) fn columns_of(db: &Connection, table: &str) -> HashSet<String> {
     db.prepare(&format!("PRAGMA table_info('{table}')"))
         .and_then(|mut s| {
             s.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<_>>()
@@ -104,7 +104,7 @@ fn columns_of(db: &Connection, table: &str) -> HashSet<String> {
 }
 
 /// 真实的 `host_id`。**取不到就返回 `None` 表示别动手** —— 不硬编码 `"local"`。
-fn host_id(db: &Connection) -> Option<String> {
+pub(super) fn host_id(db: &Connection) -> Option<String> {
     let cols = columns_of(db, "local_thread_catalog_hosts");
     if !cols.contains("host_id") {
         return None;
@@ -252,7 +252,7 @@ pub(in crate::tools) fn plan_from(home: &Path, target: &str, ids: &[String]) -> 
     out
 }
 
-fn thread_source_marks_child(source: &str) -> bool {
+pub(super) fn thread_source_marks_child(source: &str) -> bool {
     matches!(source.trim().to_ascii_lowercase().as_str(),
         "guardian_review" | "subagent" | "memory_consolidation")
 }

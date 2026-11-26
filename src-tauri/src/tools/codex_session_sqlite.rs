@@ -3,6 +3,7 @@
 
 use super::{catalog, files, ManifestEntry, SqliteOutcome};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 // sqlite（best-effort：只影响 Desktop 的会话列表，不影响路由）
@@ -110,6 +111,44 @@ pub(super) fn collect_child_thread_ids(home: &Path) -> std::collections::HashSet
         }
     }
     ids
+}
+
+pub(super) fn provider_exclusions(home: &Path, edges: &HashSet<String>, sessions: &[super::SessionRef]) -> HashSet<String> {
+    let mut users: HashSet<String> = sessions.iter().filter(|session| session.thread_source.trim().eq_ignore_ascii_case("user"))
+        .map(|session| session.thread_id.clone()).collect();
+    let mut hints = edges.clone();
+    let mut confirmed = HashSet::new();
+    for path in session_db_paths(home) {
+        let Ok(conn) = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { continue };
+        for (table, id, source) in [("threads", "id", "source"), ("local_thread_catalog", "thread_id", "source_kind")] {
+            let cols = catalog::columns_of(&conn, table);
+            if !cols.contains(id) || !(cols.contains(source) || cols.contains("thread_source")) { continue; }
+            let host = if table == "local_thread_catalog" && cols.contains("host_id") {
+                let Some(host) = catalog::host_id(&conn) else { continue };
+                Some(host)
+            } else { None };
+            let source = if cols.contains(source) { source } else { "NULL" };
+            let kind = if cols.contains("thread_source") { "thread_source" } else { "NULL" };
+            let scope = if host.is_some() { " AND host_id = ?1" } else { "" };
+            let sql = format!("SELECT {id}, {source}, {kind} FROM {table} WHERE {id} <> ''{scope}");
+            let Ok(mut stmt) = conn.prepare(&sql) else { continue };
+            let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(host.iter()), |row| Ok((
+                row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))) else { continue };
+            for (id, source, kind) in rows.flatten() {
+                if catalog::thread_source_marks_child(&kind) || serde_json::from_str(&source).is_ok_and(|value| super::source_value_marks_internal(&value)) {
+                    confirmed.insert(id);
+                } else if kind.trim().eq_ignore_ascii_case("user") {
+                    users.insert(id);
+                } else if super::source_text_marks_internal(&source) {
+                    hints.insert(id);
+                }
+            }
+        }
+    }
+    confirmed.extend(hints.into_iter().filter(|id| !users.contains(id)));
+    confirmed
 }
 
 /// 把指定 thread 的 `threads.model_provider` 改成 `target`。
