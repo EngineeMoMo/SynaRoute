@@ -685,9 +685,11 @@ pub(super) fn sync_to_at_observed(
         target,
         &done_ids,
         &catalog_rows,
-        &user_event_ids,
-        &cwd_by_thread_id,
-        &excluded,
+        sqlite::IndexFacts {
+            user_event_ids: &user_event_ids,
+            cwd_by_thread_id: &cwd_by_thread_id,
+            excluded_ids: &excluded,
+        },
     );
     Ok(report)
 }
@@ -1740,12 +1742,18 @@ mod tests {
         let data = home.join("appdata");
         let user = write_rollout(&home, "sessions/2026/09/01", "user_metadata", "openai", "\n");
         let child = write_rollout(&home, "sessions/2026/09/01", "child_metadata", "openai", "\n");
-        writeln!(
-            fs::OpenOptions::new().append(true).open(&user).unwrap(),
-            "{}",
-            r#"{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#
-        )
-        .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&user)
+            .unwrap()
+            .write_all(br#"{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#)
+            .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&user)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
         set_rollout_thread_source(&child, "subagent");
 
         let user_id = uuid_of("user_metadata");
@@ -2150,9 +2158,11 @@ mod tests {
             "synaroute",
             &[],
             &[],
-            &[],
-            &BTreeMap::new(),
-            &std::collections::HashSet::new(),
+            sqlite::IndexFacts {
+                user_event_ids: &[],
+                cwd_by_thread_id: &BTreeMap::new(),
+                excluded_ids: &std::collections::HashSet::new(),
+            },
         ).unwrap();
         assert_eq!(out, SqliteOutcome::default());
         assert_eq!(provider_in_db(&db), "openai");

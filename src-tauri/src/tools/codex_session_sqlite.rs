@@ -17,6 +17,12 @@ pub(super) const DB_BACKUP_KEEP: usize = 3;
 pub(in crate::tools) const SQL_CHUNK: usize = 500;
 const _: () = assert!(SQL_CHUNK < 999, "旧版 SQLite 绑定参数上限就是 999");
 
+pub(super) struct IndexFacts<'a> {
+    pub(super) user_event_ids: &'a [String],
+    pub(super) cwd_by_thread_id: &'a BTreeMap<String, String>,
+    pub(super) excluded_ids: &'a HashSet<String>,
+}
+
 /// 候选库路径：`<sqlite 根>/sqlite/*.db` 优先，回落 `<sqlite 根>/state_5.sqlite`。
 ///
 /// 🔴 **两个都要试**。Codex 正在从单文件迁到 `sqlite/` 目录（本机同时存在两者）。
@@ -161,9 +167,7 @@ pub(super) fn sync_sqlite(
     target: &str,
     ids: &[String],
     catalog_rows: &[catalog::CatalogRow],
-    user_event_ids: &[String],
-    cwd_by_thread_id: &BTreeMap<String, String>,
-    excluded_ids: &HashSet<String>,
+    index_facts: IndexFacts<'_>,
 ) -> Option<SqliteOutcome> {
     let dbs = match session_db_paths_checked(home) {
         Ok(paths) => paths,
@@ -191,7 +195,12 @@ pub(super) fn sync_sqlite(
                 continue;
             }
         };
-        let metadata_mutation = match thread_metadata_would_mutate(&db, user_event_ids, cwd_by_thread_id, excluded_ids) {
+        let metadata_mutation = match thread_metadata_would_mutate(
+            &db,
+            index_facts.user_event_ids,
+            index_facts.cwd_by_thread_id,
+            index_facts.excluded_ids,
+        ) {
             Ok(value) => value,
             Err(error) => {
                 out.error.get_or_insert_with(|| format!("{}: {error}", db.display()));
@@ -212,7 +221,12 @@ pub(super) fn sync_sqlite(
             }
         }
         if metadata_mutation {
-            match set_threads_metadata(&db, user_event_ids, cwd_by_thread_id, excluded_ids) {
+            match set_threads_metadata(
+                &db,
+                index_facts.user_event_ids,
+                index_facts.cwd_by_thread_id,
+                index_facts.excluded_ids,
+            ) {
                 Ok((user_event_rows, cwd_rows)) => {
                     out.user_event_updated += user_event_rows;
                     out.cwd_updated += cwd_rows;
