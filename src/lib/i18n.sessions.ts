@@ -155,9 +155,9 @@ export const sessionsZh: Dict = {
   "sessions.repair.backup": "备份目录：",
   "sessions.repair.after": "请重新打开 Codex 会话。若有未处理项，已完成的修复不会自动撤销；请处理原因后重新扫描。",
   "sessions.syncConfirmBody":
-    "请完全退出 Codex/ChatGPT。列表中有 {n} 条首记录不是 {target}；同步会检查用户对话中的每条 provider 记录及相关索引，跳过内部派生会话。原 provider 可还原；不修改对话正文，不修复工具 ID。",
+    "请完全退出 Codex/ChatGPT。列表中有 {n} 条首记录不是 {target}；同步会检查用户对话中的每条 provider 记录及相关索引，跳过内部派生会话，并关闭会绕过 SynaRoute 的远端压缩开关。原 provider 可还原；不修改对话正文，不修复工具 ID。",
   "sessions.syncConfirmNone":
-    "列表中 {total} 条会话的首记录均为 {target}，后续记录仍可能不同。请完全退出 Codex/ChatGPT。同步会检查用户对话中的全部 provider 记录，并在备份数据库后修复索引、清理 local_thread_catalog 中已确认的内部索引行。不会删除对话，不修复工具 ID。",
+    "列表中 {total} 条会话的首记录均为 {target}，后续记录仍可能不同。请完全退出 Codex/ChatGPT。同步会检查用户对话中的全部 provider 记录，关闭会绕过 SynaRoute 的远端压缩开关，并在备份数据库后修复索引、清理 local_thread_catalog 中已确认的内部索引行。不会删除对话，不修复工具 ID。",
   "sessions.syncConfirmOk": "确认同步",
   "sessions.dbNone": "此目录中未找到会话库；列表从会话文件读取",
   "sessions.inDbHint":
@@ -166,17 +166,17 @@ export const sessionsZh: Dict = {
   "sessions.targetLabel": "同步目标",
   "sessions.targetOurs": "推荐",
   "sessions.targetHint":
-    "只改历史会话记的 provider，不动 config.toml —— 在这里选 openai 不等于切回官方登录（那要点「还原」）。",
+    "会修复 Codex 配置中的远端压缩开关，并同步历史会话记的 provider。在这里选 openai 不等于切回官方登录（那要点「还原」）。",
   "sessions.srcConfig": "配置",
   "sessions.srcRollout": "会话",
   "sessions.srcSqlite": "索引",
-  "sessions.syncNow": "仅同步 provider",
+  "sessions.syncNow": "同步会话并修复配置",
   "sessions.syncing": "同步中…",
   "sessions.syncHint":
-    "核对用户对话的会话元数据、恢复时读取的线程设置和本地索引。同步结果不代表这条对话已通过上游验证。",
+    "核对用户对话的会话元数据、恢复时读取的线程设置和本地索引，并关闭会绕过 SynaRoute 的 remote_compaction_v2。同步结果不代表这条对话已通过上游验证。",
   "sessions.autoSync": "接入时自动同步历史会话",
   "sessions.autoSyncHint":
-    "接入时同步历史对话的 provider，包括后续会话元数据和本线程的恢复设置。保留对话正文和文件修改时间；关闭后仍可手动同步。",
+    "接入时修复 Codex 配置中的远端压缩开关，并同步历史对话的 provider，包括后续会话元数据和本线程的恢复设置。保留对话正文和文件修改时间；关闭后仍可手动同步。",
 
   "sessions.indexTitle": "会话索引",
   "sessions.indexOrphans":
@@ -342,9 +342,9 @@ export const sessionsEn: Dict = {
   "sessions.repair.backup": "Backup directory:",
   "sessions.repair.after": "Reopen your Codex session. Completed repairs are not automatically rolled back if other items fail; resolve the cause and scan again.",
   "sessions.syncConfirmBody":
-    "Fully quit Codex/ChatGPT. The first record of {n} session(s) differs from {target}. Sync checks every provider record and related index for user conversations, skipping internal sessions. Original providers can be restored. Sync does not change conversation content or repair tool IDs.",
+    "Fully quit Codex/ChatGPT. The first record of {n} session(s) differs from {target}. Sync checks every provider record and related index for user conversations, skips internal sessions, and disables the remote compaction setting that bypasses SynaRoute. Original providers can be restored. Sync does not change conversation content or repair tool IDs.",
   "sessions.syncConfirmNone":
-    "The first record of all {total} session(s) points at {target}, but later records may differ. Fully quit Codex/ChatGPT. Sync checks all provider records in user conversations. After a database backup, it repairs indexes and cleans confirmed internal rows in local_thread_catalog. It does not delete conversations or repair tool IDs.",
+    "The first record of all {total} session(s) points at {target}, but later records may differ. Fully quit Codex/ChatGPT. Sync checks all provider records in user conversations and disables the remote compaction setting that bypasses SynaRoute. After a database backup, it repairs indexes and cleans confirmed internal rows in local_thread_catalog. It does not delete conversations or repair tool IDs.",
   "sessions.syncConfirmOk": "Sync",
   "sessions.dbNone": "No session database found here; this list uses session files",
   "sessions.inDbHint":
@@ -353,17 +353,17 @@ export const sessionsEn: Dict = {
   "sessions.targetLabel": "Sync target",
   "sessions.targetOurs": "recommended",
   "sessions.targetHint":
-    "This only rewrites the provider recorded in past sessions; config.toml is untouched — picking openai here is not the same as switching back to the official login (that's what Restore does).",
+    "This repairs the Codex remote compaction setting and rewrites the provider recorded in past sessions. Picking openai here is not the same as switching back to the official login (that's what Restore does).",
   "sessions.srcConfig": "config",
   "sessions.srcRollout": "sessions",
   "sessions.srcSqlite": "index",
-  "sessions.syncNow": "Sync provider only",
+  "sessions.syncNow": "Sync sessions and repair config",
   "sessions.syncing": "Syncing…",
   "sessions.syncHint":
-    "Checks user conversations’ session metadata, settings used on resume, and local indexes. A sync result is not an upstream connectivity test.",
+    "Checks user conversations’ session metadata, settings used on resume, and local indexes, and disables remote_compaction_v2 when it would bypass SynaRoute. A sync result is not an upstream connectivity test.",
   "sessions.autoSync": "Sync past sessions when applying",
   "sessions.autoSyncHint":
-    "Syncs providers in session metadata and this thread’s resume settings when applying. Conversation content and file modification times are preserved. You can still sync manually when this is off.",
+    "Repairs the Codex remote compaction setting and syncs providers in session metadata and this thread’s resume settings when applying. Conversation content and file modification times are preserved. You can still sync manually when this is off.",
 
   "sessions.indexTitle": "Session index",
   "sessions.indexOrphans":

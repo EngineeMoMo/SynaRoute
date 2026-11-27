@@ -789,28 +789,34 @@ const REMOTE_COMPACTION_FLAG: &str = "remote_compaction_v2";
 /// 后者可感知度低（降级到 Codex 自己的本地压缩兜底），且只在「绕过还原」这一条路径上成立
 /// —— 走正常还原时 `config.toml` 整份从 `.bak` 恢复，这行随之消失（同 `model` 键的机制）。
 ///
-/// # 🔴 已有值一律不覆盖，包括显式 `true`
+/// # 🔴 显式 `true` 也要关掉
 ///
-/// 那是用户的明确意图（他要远端压缩，且大概知道自己在做什么）。覆盖它就是
-/// 「替用户改掉他明确设过的东西」—— 同 cc-switch #6087 抢用户 `model_catalog_json`
-/// 指针那条教训。只在**这个键不存在**时才写。
+/// `remote_compaction_v2` 不走 `model_provider`，会直接请求 `api.openai.com/v1/responses`。
+/// 接入配置同时保留 SynaRoute 的占位凭据时，这条路径会把占位值发给官方并返回 401。
+/// 因此接入和历史会话同步都必须把它修为 `false`。
 ///
 /// # `[features]` 不是表时不碰
 ///
 /// 用户手写坏了（写成 `features = 1` 之类）是他的问题，而我们强行替换成表会改变整份 config
 /// 的语义、且下次他打开文件会发现自己写的东西没了。
-fn disable_remote_compaction(table: &mut toml::value::Table) -> bool {
+pub(super) fn disable_remote_compaction(table: &mut toml::value::Table) -> bool {
     let features = table
         .entry("features".to_string())
         .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
     let Some(features) = features.as_table_mut() else {
         return false;
     };
-    if features.contains_key(REMOTE_COMPACTION_FLAG) {
-        return false;
+    match features.get_mut(REMOTE_COMPACTION_FLAG) {
+        Some(value) if value.as_bool() == Some(true) => {
+            *value = toml::Value::Boolean(false);
+            true
+        }
+        Some(_) => false,
+        None => {
+            features.insert(REMOTE_COMPACTION_FLAG.to_string(), toml::Value::Boolean(false));
+            true
+        }
     }
-    features.insert(REMOTE_COMPACTION_FLAG.to_string(), toml::Value::Boolean(false));
-    true
 }
 
 /// 目录文件缺失时的告警文案。
@@ -1278,11 +1284,11 @@ mod tests {
         assert!(!disable_remote_compaction(&mut already), "已有值不该再写");
         assert_eq!(flag(&already), Some(false));
 
-        // ④ 🔴 显式 true **不许覆盖** —— 用户的明确意图（同 cc-switch #6087 抢指针那条教训）。
+        // ④ 🔴 显式 true 也必须改成 false，避免远端压缩绕过自定义 provider。
         let mut opted_in: toml::value::Table =
             toml::from_str("[features]\nremote_compaction_v2 = true\n").unwrap();
-        assert!(!disable_remote_compaction(&mut opted_in));
-        assert_eq!(flag(&opted_in), Some(true), "用户显式开的远端压缩必须保留");
+        assert!(disable_remote_compaction(&mut opted_in));
+        assert_eq!(flag(&opted_in), Some(false), "显式开启的远端压缩必须被关闭");
     }
 
     /// `[features]` 被用户写成非表时不碰它 —— 强行替换会改变整份 config 的语义。

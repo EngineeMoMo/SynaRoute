@@ -18,8 +18,8 @@
 //! `model_provider` 与全部 `[model_providers.<id>]`、rollout 首行里出现过的、会话库里出现
 //! 过的。**当前生效的那个排第一**，其余按 id 排序。
 //!
-//! 🔴 **它不改 `config.toml`。** 这一页只动历史会话的归属，不是「切换 provider」——
-//! 那是接入/还原的事。混起来会让用户以为在这里选 `openai` 就等于切回官方登录了。
+//! 它会在同一把锁内修复 `config.toml` 中会绕过自定义 provider 的远端压缩开关，同时同步
+//! 历史会话的归属。这里选 `openai` 仍然只改变历史会话记录，不等于切回官方登录。
 //!
 //! # 偏好落在自己的小文件里，不进 `AppSettings`
 //!
@@ -103,6 +103,34 @@ pub(in crate::tools) fn auto_sync_enabled() -> bool {
     }
 }
 
+fn repair_remote_compaction_at(path: &Path) -> AppResult<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(path)?;
+    let mut doc: toml::Value = if content.trim().is_empty() {
+        toml::Value::Table(Default::default())
+    } else {
+        content
+            .parse::<toml::Value>()
+            .map_err(|e| crate::error::AppError::ToolConfig(format!("解析 config.toml 失败: {e}")))?
+    };
+    let table = doc
+        .as_table_mut()
+        .ok_or_else(|| crate::error::AppError::ToolConfig("config.toml 顶层非表".into()))?;
+    let managed_by_synaroute = table
+        .get("model_provider")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|provider| provider == super::super::MCP_CLIENT_NAME);
+    if !managed_by_synaroute || !super::super::codex_catalog::disable_remote_compaction(table) {
+        return Ok(false);
+    }
+    let serialized = toml::to_string_pretty(&doc)
+        .map_err(|e| crate::error::AppError::ToolConfig(e.to_string()))?;
+    super::super::backup_and_write_bytes(path, serialized.as_bytes())?;
+    Ok(true)
+}
+
 /// 取锁之后再同步。两个调用方（接入、手动按钮）都必须走它。
 ///
 /// 锁被别的线程 poison 过（那说明另一趟同步 panic 了）时**照样继续** ——
@@ -114,12 +142,15 @@ pub(in crate::tools) fn locked_sync(
 ) -> AppResult<SyncReport> {
     let _guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _file_guard = super::guard::acquire(home).map_err(crate::error::AppError::ToolConfig)?;
+    repair_remote_compaction_at(&home.join("config.toml"))?;
     super::sync_to_at(home, data_dir, target)
 }
 
 fn locked_manual_sync(home: &Path, data_dir: &Path, target: &str, progress: &mut dyn FnMut(&str, usize, usize)) -> Result<SyncReport, String> {
     let _guard = SYNC_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _file_guard = super::guard::acquire(home)?;
+    repair_remote_compaction_at(&home.join("config.toml"))
+        .map_err(|error| error.to_string())?;
     let snapshot = super::target::TargetSnapshot::capture(home, target)?;
     if let super::ManifestState::Corrupt(path) = super::read_manifest_state(data_dir) {
         return Err(super::corrupt_err(&path).to_string());
