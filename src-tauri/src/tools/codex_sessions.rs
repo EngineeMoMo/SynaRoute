@@ -37,6 +37,7 @@
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -51,6 +52,7 @@ const MANIFEST_FILE: &str = "codex-session-providers.json";
 #[path = "codex_session_view.rs"] pub(in crate::tools) mod view;
 #[path = "codex_session_catalog.rs"] mod catalog; // Desktop 列表索引 local_thread_catalog（第三份 provider 副本）；理由见该文件模块头
 #[path = "codex_session_sqlite.rs"] mod sqlite;
+#[path = "codex_session_report.rs"] mod report;
 #[path = "codex_session_sync.rs"] pub(crate) mod sync;
 #[path = "codex_session_ids.rs"] mod ids;
 #[path = "codex_session_guard.rs"] mod guard;
@@ -187,6 +189,10 @@ pub(in crate::tools) struct SyncReport {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(in crate::tools) struct SqliteOutcome {
     pub updated: usize,
+    /// 由 rollout 中的用户消息补齐的 canonical thread 标记。
+    pub user_event_updated: usize,
+    /// 从 rollout 元数据同步到 canonical thread 的工作目录。
+    pub cwd_updated: usize,
     /// Desktop 列表索引那一份的账（provider 同步 / 清 missing 标记 / 补缺行）。
     pub catalog: catalog::CatalogReport,
     /// 任一库失败即有值（只留第一条，够给方向了）。
@@ -495,6 +501,27 @@ fn write_manifest(data_dir: &Path, m: &Manifest) -> AppResult<()> {
     })
 }
 
+fn record_index_facts(
+    user_event_ids: &mut Vec<String>,
+    cwd_by_thread_id: &mut BTreeMap<String, String>,
+    session: &SessionRef,
+    plan: &providers::Plan,
+) {
+    if session.thread_id.is_empty() {
+        return;
+    }
+    if plan.has_user_event && !user_event_ids.iter().any(|id| id == &session.thread_id) {
+        user_event_ids.push(session.thread_id.clone());
+    }
+    let cwd = plan
+        .cwd
+        .as_deref()
+        .or_else(|| (!session.cwd.trim().is_empty()).then_some(session.cwd.as_str()));
+    if let Some(cwd) = cwd {
+        cwd_by_thread_id.insert(session.thread_id.clone(), cwd.to_owned());
+    }
+}
+
 fn catalog_rows_for_sync(
     home: &Path,
     target: &str,
@@ -562,6 +589,8 @@ pub(super) fn sync_to_at_observed(
     let excluded = sqlite::provider_exclusions(home, &child_ids, &scan.sessions);
     let mut todo = Vec::new();
     let mut done_ids = Vec::new();
+    let mut user_event_ids = Vec::new();
+    let mut cwd_by_thread_id = BTreeMap::new();
     for (index, session) in scan.sessions.iter().enumerate() {
         observer("scanning", index, scan.sessions.len())?;
         if session_is_internal(session, &excluded) { report.internal_skipped += 1; continue; }
@@ -571,6 +600,7 @@ pub(super) fn sync_to_at_observed(
             Ok(plan) if plan.matches(target) => {
                 report.already_ok += 1;
                 if !session.thread_id.is_empty() { done_ids.push(session.thread_id.clone()); }
+                record_index_facts(&mut user_event_ids, &mut cwd_by_thread_id, session, &plan);
             },
             Ok(plan) => todo.push((path, session, plan)),
             Err(error) => {
@@ -625,6 +655,7 @@ pub(super) fn sync_to_at_observed(
                 if !s.thread_id.is_empty() {
                     done_ids.push(s.thread_id.clone());
                 }
+                record_index_facts(&mut user_event_ids, &mut cwd_by_thread_id, s, plan);
             }
             // 扫描时读到了、改写时又说无需改动：并发下有可能（Codex 自己刚改过）。
             // 这种情形 sqlite 那半也该跟上，故一样收进 done_ids。
@@ -633,6 +664,7 @@ pub(super) fn sync_to_at_observed(
                 if !s.thread_id.is_empty() {
                     done_ids.push(s.thread_id.clone());
                 }
+                record_index_facts(&mut user_event_ids, &mut cwd_by_thread_id, s, plan);
             }
             Err(e) => {
                 report.skipped += 1;
@@ -647,7 +679,16 @@ pub(super) fn sync_to_at_observed(
     // provider rollout 是否成功，也不能反过来扩大 provider 同步范围。
     observer("indexing", done_ids.len(), scan.sessions.len())?;
     let catalog_rows = catalog_rows_for_sync(home, target, &done_ids, &child_ids, &scan.sessions);
-    report.sqlite = sync_sqlite(home, data_dir, target, &done_ids, &catalog_rows);
+    report.sqlite = sync_sqlite(
+        home,
+        data_dir,
+        target,
+        &done_ids,
+        &catalog_rows,
+        &user_event_ids,
+        &cwd_by_thread_id,
+        &excluded,
+    );
     Ok(report)
 }
 
@@ -766,6 +807,7 @@ pub(in crate::tools) fn restore_at(home: &Path, data_dir: &Path) -> AppResult<Op
 
 // SQLite 实现抽到子模块；对兄弟模块重导出唯一的路径发现函数。
 use sqlite::{restore_sqlite, sync_sqlite};
+use report::describe;
 pub(in crate::tools) use sqlite::session_db_paths;
 
 // 对外入口（解析真实 `$CODEX_HOME` 与数据目录）
@@ -806,81 +848,6 @@ pub(in crate::tools) fn restore_from_manifest() -> AppResult<Option<String>> {
     let home = super::codex_paths::codex_home()?;
     let data_dir = crate::store::data_dir::app_data_dir()?;
     sync::locked_restore(&home, &data_dir)
-}
-
-/// 把报告写成一句话。
-///
-/// 🔴 **只说「已指向」，不说「已恢复可用」** —— 见模块头那条已知边界：跨账号的
-/// `encrypted_content` 可能仍然解不开。承诺一件我们保证不了的事，代价是用户按它排除掉
-/// 真正的方向。
-fn describe(r: &SyncReport) -> Option<String> {
-    let mut parts = Vec::new();
-    if r.changed > 0 {
-        let target = if r.target.is_empty() { "目标 provider" } else { &r.target };
-        parts.push(format!(
-            "已把 {} 个历史对话的全部 provider 记录指向 {target}（重启 Codex 后生效；同步不更换密钥，也不重新加密历史推理内容）",
-            r.changed
-        ));
-    }
-    if r.encrypted > 0 {
-        // 只说「可能」：我们能确定的只有「这些文件里有 encrypted_content」，续聊到底会不会
-        // 失败取决于上游账号，而那是我们看不到的。给出条数是为了让用户能对上号 ——
-        // 上面那句条件句在没有数字时无从核实，他只会反复怀疑代理。
-        parts.push(format!(
-            "其中 {} 条带有原账号加密的推理内容，续聊或压缩时可能报解密失败（新建对话不受影响）",
-            r.encrypted
-        ));
-    }
-    if r.skipped > 0 {
-        // 归类得出来就给精确指路，认不出才退回条件句 —— Windows 把两种成因都映射成
-        // `PermissionDenied`，只有 raw OS error 32/33 能分开（见 `files::blame_from_text`）。
-        let why = match r.blame {
-            Some(files::IoBlame::Changed) => "（同步期间内容发生变化，已保留新内容）—— 请退出 Codex 后重新同步",
-            Some(files::IoBlame::Locked) => {
-                "（文件正被 Codex 占用）—— 完全退出 Codex 后再点一次接入即可"
-            }
-            Some(files::IoBlame::Unwritable) => {
-                "（其所在目录或文件不可写）—— 退出 Codex 没用，请检查 CODEX_HOME 的权限与是否只读卷"
-            }
-            _ => "（文件被占用，或其所在目录不可写）—— 若 Codex 正在运行，请完全退出后再点一次接入",
-        };
-        parts.push(format!("{} 个对话未能同步{why}", r.skipped));
-    }
-    if r.unreadable > 0 {
-        parts.push(format!("{} 个会话文件的首行无法解析，已跳过", r.unreadable));
-    }
-    if r.path_rejected > 0 {
-        // 与上一条分开措辞：这里是路径本身出了问题，不是 rollout 的格式变了。
-        parts.push(format!(
-            "{} 个会话因路径无法安全定位而跳过（检查 CODEX_HOME 下是否有符号链接）",
-            r.path_rejected
-        ));
-    }
-    if let Some(db) = &r.sqlite {
-        if db.updated > 0 || db.catalog.provider_updated > 0 {
-            parts.push(format!("已校准会话库 {} 条、Desktop 本地索引 {} 条 provider 记录", db.updated, db.catalog.provider_updated));
-        }
-        if let Some(e) = &db.error {
-            parts.push(format!("会话库未完全同步，继续旧对话时仍可能使用旧 provider：{e}"));
-        }
-        // Desktop 列表索引那一份的账。清理只删索引行，不影响路由或会话数据。
-        if db.catalog.inserted > 0 || db.catalog.unmarked_missing > 0 {
-            parts.push(format!(
-                "另修正了 Desktop 会话列表索引（补 {} 条记录、清 {} 个失效标记）",
-                db.catalog.inserted, db.catalog.unmarked_missing
-            ));
-        }
-        if db.catalog.removed > 0 {
-            parts.push(format!(
-                "从 Codex Desktop 本地会话索引移除 {} 条内部或侧边聊天记录（不影响路由，不删除会话、rollout 或正文）",
-                db.catalog.removed
-            ));
-        }
-        if !db.catalog.skipped.is_empty() {
-            parts.push(format!("Desktop 本地会话索引清理未完全完成：{}", db.catalog.skipped.join("；")));
-        }
-    }
-    (!parts.is_empty()).then(|| parts.join("；"))
 }
 
 #[cfg(test)]
@@ -1767,6 +1734,68 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
+    #[test]
+    fn sqlite_metadata_follows_user_rollout_and_skips_internal_child() {
+        let home = tmp_home("sqlmetadata");
+        let data = home.join("appdata");
+        let user = write_rollout(&home, "sessions/2026/09/01", "user_metadata", "openai", "\n");
+        let child = write_rollout(&home, "sessions/2026/09/01", "child_metadata", "openai", "\n");
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&user).unwrap(),
+            "{}",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#
+        )
+        .unwrap();
+        set_rollout_thread_source(&child, "subagent");
+
+        let user_id = uuid_of("user_metadata");
+        let child_id = uuid_of("child_metadata");
+        let db = home.join("state_5.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE threads (id TEXT, model_provider TEXT, has_user_event INTEGER, cwd TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads VALUES (?1, 'openai', 0, 'C:/old-user')",
+            [&user_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads VALUES (?1, 'openai', 0, 'C:/old-child')",
+            [&child_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = sync_to_at(&home, &data, "synaroute").unwrap();
+        let sqlite = report.sqlite.unwrap();
+        assert_eq!(report.changed, 1);
+        assert_eq!(sqlite.updated, 1);
+        assert_eq!(sqlite.user_event_updated, 1);
+        assert_eq!(sqlite.cwd_updated, 1);
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let user_row: (String, i64, String) = conn
+            .query_row(
+                "SELECT model_provider, has_user_event, cwd FROM threads WHERE id=?1",
+                [&user_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(user_row, ("synaroute".to_string(), 1, "C:/work/demo".to_string()));
+        let child_row: (String, i64, String) = conn
+            .query_row(
+                "SELECT model_provider, has_user_event, cwd FROM threads WHERE id=?1",
+                [&child_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(child_row, ("openai".to_string(), 0, "C:/old-child".to_string()));
+        let _ = fs::remove_dir_all(&home);
+    }
+
     fn catalog_db_for_cleanup(path: &Path, id: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let c = rusqlite::Connection::open(path).unwrap();
@@ -2115,7 +2144,16 @@ mod tests {
         let db = home.join("state_5.sqlite");
         make_threads_db(&db, "openai");
 
-        let out = sync_sqlite(&home, &data, "synaroute", &[], &[]).unwrap();
+        let out = sync_sqlite(
+            &home,
+            &data,
+            "synaroute",
+            &[],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            &std::collections::HashSet::new(),
+        ).unwrap();
         assert_eq!(out, SqliteOutcome::default());
         assert_eq!(provider_in_db(&db), "openai");
         assert!(!data.join("backups").exists(), "没东西要写时连备份都不该产生");

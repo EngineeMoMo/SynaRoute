@@ -45,6 +45,8 @@ pub(super) struct Plan {
     settings: Vec<Snapshot>,
     legacy_start: usize,
     pub(super) internal: bool,
+    pub(super) has_user_event: bool,
+    pub(super) cwd: Option<String>,
 }
 
 fn changed() -> io::Error {
@@ -58,6 +60,11 @@ fn walk(path: &Path, reader: &mut dyn BufRead, output: &mut dyn Write, changes: 
     loop {
         line.clear();
         if reader.read_until(b'\n', &mut line)? == 0 { break; }
+        if line.windows(b"\"user_message\"".len()).any(|window| window == b"\"user_message\"")
+            || line.windows(b"\"user_input\"".len()).any(|window| window == b"\"user_input\"")
+        {
+            plan.has_user_event = true;
+        }
         let mut parsed = std::str::from_utf8(&line).ok()
             .filter(|text| text.contains("session_meta") || text.contains("thread_settings_applied") || text.contains("\\u"))
             .and_then(|text| serde_json::from_str::<Value>(text).ok());
@@ -65,6 +72,9 @@ fn walk(path: &Path, reader: &mut dyn BufRead, output: &mut dyn Write, changes: 
             return Err(io::Error::other("首行不是 session_meta"));
         }
         if let Some(row) = parsed.as_mut() {
+            if plan.cwd.is_none() && row["type"] == "session_meta" {
+                plan.cwd = row["payload"]["cwd"].as_str().map(str::trim).filter(|cwd| !cwd.is_empty()).map(str::to_owned);
+            }
             if let Some((slot, desired)) = plan.observe(row, owner.as_deref())?.and_then(|slot| changes.get(&slot).map(|want| (slot, want))) {
                 let (object, field) = match slot {
                     Slot::Meta(_) => (&mut row["payload"], "model_provider"),

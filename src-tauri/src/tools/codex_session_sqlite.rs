@@ -4,7 +4,7 @@
 use super::{catalog, files, ManifestEntry, SqliteOutcome};
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -161,6 +161,9 @@ pub(super) fn sync_sqlite(
     target: &str,
     ids: &[String],
     catalog_rows: &[catalog::CatalogRow],
+    user_event_ids: &[String],
+    cwd_by_thread_id: &BTreeMap<String, String>,
+    excluded_ids: &HashSet<String>,
 ) -> Option<SqliteOutcome> {
     let dbs = match session_db_paths_checked(home) {
         Ok(paths) => paths,
@@ -188,7 +191,14 @@ pub(super) fn sync_sqlite(
                 continue;
             }
         };
-        if !thread_mutation && !catalog_mutation {
+        let metadata_mutation = match thread_metadata_would_mutate(&db, user_event_ids, cwd_by_thread_id, excluded_ids) {
+            Ok(value) => value,
+            Err(error) => {
+                out.error.get_or_insert_with(|| format!("{}: {error}", db.display()));
+                continue;
+            }
+        };
+        if !thread_mutation && !catalog_mutation && !metadata_mutation {
             continue;
         }
         if let Err(e) = backup_db(&db, data_dir) {
@@ -198,6 +208,15 @@ pub(super) fn sync_sqlite(
         if thread_mutation {
             match set_threads_provider(&db, target, ids) {
                 Ok(n) => out.updated += n,
+                Err(e) => { out.error.get_or_insert(e); }
+            }
+        }
+        if metadata_mutation {
+            match set_threads_metadata(&db, user_event_ids, cwd_by_thread_id, excluded_ids) {
+                Ok((user_event_rows, cwd_rows)) => {
+                    out.user_event_updated += user_event_rows;
+                    out.cwd_updated += cwd_rows;
+                }
                 Err(e) => { out.error.get_or_insert(e); }
             }
         }
@@ -229,6 +248,96 @@ fn threads_would_mutate(db: &Path, target: &str, ids: &[String]) -> rusqlite::Re
         if conn.query_row(&sql, params.as_slice(), |_| Ok(())).optional()?.is_some() { return Ok(true); }
     }
     Ok(false)
+}
+
+fn thread_metadata_would_mutate(
+    db: &Path,
+    user_event_ids: &[String],
+    cwd_by_thread_id: &BTreeMap<String, String>,
+    excluded_ids: &HashSet<String>,
+) -> Result<bool, String> {
+    if user_event_ids.is_empty() && cwd_by_thread_id.is_empty() {
+        return Ok(false);
+    }
+    let conn = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("{}: {e}", db.display()))?;
+    conn.busy_timeout(std::time::Duration::from_millis(1500))
+        .map_err(|e| format!("{}: {e}", db.display()))?;
+    let cols = catalog::columns_of(&conn, "threads");
+    if cols.is_empty() {
+        return Ok(false);
+    }
+    if cols.contains("has_user_event") {
+        for id in user_event_ids.iter().filter(|id| !excluded_ids.contains(*id)) {
+            let pending: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM threads WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1)",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("{}: {e}", db.display()))?;
+            if pending {
+                return Ok(true);
+            }
+        }
+    }
+    if cols.contains("cwd") {
+        for (id, cwd) in cwd_by_thread_id.iter().filter(|(id, cwd)| !excluded_ids.contains(*id) && !cwd.trim().is_empty()) {
+            let pending: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM threads WHERE id = ?1 AND COALESCE(cwd, '') <> ?2)",
+                    (id, cwd),
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("{}: {e}", db.display()))?;
+            if pending {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn set_threads_metadata(
+    db: &Path,
+    user_event_ids: &[String],
+    cwd_by_thread_id: &BTreeMap<String, String>,
+    excluded_ids: &HashSet<String>,
+) -> Result<(usize, usize), String> {
+    let mut conn = rusqlite::Connection::open(db).map_err(|e| format!("{}: {e}", db.display()))?;
+    conn.busy_timeout(std::time::Duration::from_millis(1500))
+        .map_err(|e| format!("{}: {e}", db.display()))?;
+    let cols = catalog::columns_of(&conn, "threads");
+    if cols.is_empty() {
+        return Ok((0, 0));
+    }
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("{}: {e}", db.display()))?;
+    let mut user_event_rows = 0;
+    let mut cwd_rows = 0;
+    if cols.contains("has_user_event") {
+        for id in user_event_ids.iter().filter(|id| !excluded_ids.contains(*id)) {
+            user_event_rows += tx
+                .execute(
+                    "UPDATE threads SET has_user_event = 1 WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1",
+                    [id],
+                )
+                .map_err(|e| format!("{}: {e}", db.display()))?;
+        }
+    }
+    if cols.contains("cwd") {
+        for (id, cwd) in cwd_by_thread_id.iter().filter(|(id, cwd)| !excluded_ids.contains(*id) && !cwd.trim().is_empty()) {
+            cwd_rows += tx
+                .execute(
+                    "UPDATE threads SET cwd = ?1 WHERE id = ?2 AND COALESCE(cwd, '') <> ?1",
+                    (cwd, id),
+                )
+                .map_err(|e| format!("{}: {e}", db.display()))?;
+        }
+    }
+    tx.commit().map_err(|e| format!("{}: {e}", db.display()))?;
+    Ok((user_event_rows, cwd_rows))
 }
 
 /// 按清单把 `threads.model_provider` 改回原值。返回 `Some(错误)` 表示有库没处理成功。
