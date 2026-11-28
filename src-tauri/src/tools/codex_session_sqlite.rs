@@ -1,7 +1,7 @@
 //! Codex 会话 SQLite 的写前备份、provider 同步与对称还原。
 //! 从父模块抽出只为守住 900 行门；语义与判据仍由父模块测试段覆盖。
 
-use super::{catalog, files, ManifestEntry, SqliteOutcome};
+use super::{catalog, files, ManifestEntry, SqliteManifestEntry, SqliteOutcome};
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -157,10 +157,118 @@ pub(super) fn provider_exclusions(home: &Path, edges: &HashSet<String>, sessions
     confirmed
 }
 
-/// 把指定 thread 的 `threads.model_provider` 改成 `target`。
+/// 记录本次批量 provider 同步会改动的 SQLite 原值。
 ///
-/// `ids` = **rollout 那半确实改成功的**那些 thread id。空切片 → 一个字节都不写：那意味着
-/// 路由压根没被修好，此时改列表元数据只会制造一个替未完成修复背书的假现场。
+/// CodexPlus++ 的同步范围是数据库中全部可同步线程，而不是当前 rollout 扫描得到的
+/// `done_ids`。没有当前 rollout 的 native/paginated thread 也可能被 Codex 从 SQLite 恢复，
+/// 因而这些行必须进入回滚清单。只采集本地主机的 catalog，避免恢复时改动远端主机的投影。
+pub(super) fn collect_provider_manifest_entries(
+    home: &Path,
+    target: &str,
+    excluded_ids: &HashSet<String>,
+) -> Result<Vec<SqliteManifestEntry>, String> {
+    let dbs = session_db_paths_checked(home)?;
+    let mut entries = Vec::new();
+    for db in dbs {
+        let conn = rusqlite::Connection::open_with_flags(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|e| format!("{}: {e}", db.display()))?;
+        conn.busy_timeout(std::time::Duration::from_millis(1500))
+            .map_err(|e| format!("{}: {e}", db.display()))?;
+        let database_path = backup_path_key(&db);
+
+        let columns = catalog::columns_of(&conn, "threads");
+        if columns.contains("id") && columns.contains("model_provider") {
+            let mut statement = conn
+                .prepare(
+                    "SELECT id, model_provider FROM threads \
+                     WHERE COALESCE(id, '') <> '' AND model_provider IS NOT ?1",
+                )
+                .map_err(|e| format!("{}: {e}", db.display()))?;
+            let rows = statement
+                .query_map([target], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|e| format!("{}: {e}", db.display()))?;
+            for row in rows {
+                let (thread_id, original_provider) =
+                    row.map_err(|e| format!("{}: {e}", db.display()))?;
+                if !excluded_ids.contains(&thread_id) {
+                    entries.push(SqliteManifestEntry {
+                        database_path: database_path.clone(),
+                        table: "threads".into(),
+                        host_id: None,
+                        thread_id,
+                        original_provider,
+                    });
+                }
+            }
+        }
+
+        let columns = catalog::columns_of(&conn, "local_thread_catalog");
+        if columns.contains("host_id")
+            && columns.contains("thread_id")
+            && columns.contains("model_provider")
+        {
+            if let Some(host_id) = catalog::host_id(&conn) {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT thread_id, model_provider FROM local_thread_catalog \
+                         WHERE host_id = ?1 AND COALESCE(thread_id, '') <> '' \
+                         AND model_provider IS NOT ?2",
+                    )
+                    .map_err(|e| format!("{}: {e}", db.display()))?;
+                let rows = statement
+                    .query_map((&host_id, target), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                    })
+                    .map_err(|e| format!("{}: {e}", db.display()))?;
+                for row in rows {
+                    let (thread_id, original_provider) =
+                        row.map_err(|e| format!("{}: {e}", db.display()))?;
+                    if !excluded_ids.contains(&thread_id) {
+                        entries.push(SqliteManifestEntry {
+                            database_path: database_path.clone(),
+                            table: "local_thread_catalog".into(),
+                            host_id: Some(host_id.clone()),
+                            thread_id,
+                            original_provider,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    entries.sort_by(|left, right| {
+        (
+            &left.database_path,
+            &left.table,
+            &left.host_id,
+            &left.thread_id,
+        )
+            .cmp(&(
+                &right.database_path,
+                &right.table,
+                &right.host_id,
+                &right.thread_id,
+            ))
+    });
+    Ok(entries)
+}
+
+fn backup_path_key(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// 把所有可同步 thread 的 `model_provider` 改成 `target`。
+///
+/// provider 更新按 CodexPlus++ 的数据库范围执行。`ids` 仍然只用于从 rollout 证据补齐
+/// `has_user_event`、工作目录和 catalog 结构修复，不能限制 provider 本身的批量更新。
 pub(super) fn sync_sqlite(
     home: &Path,
     data_dir: &Path,
@@ -177,24 +285,37 @@ pub(super) fn sync_sqlite(
         return None;
     }
     // cleanup-only 必须运行：已有 guardian 污染行常发生在 rollout 全都已是 target 时。
-    let planned_rows = if catalog_rows.is_empty() {
+    let mut planned_rows = if catalog_rows.is_empty() {
         catalog::plan_from(home, target, ids)
     } else {
         catalog_rows.to_vec()
     };
+    for row in catalog::plan_from_all(home, target) {
+        if !planned_rows.iter().any(|existing| existing.thread_id == row.thread_id) {
+            planned_rows.push(row);
+        }
+    }
     let mut out = SqliteOutcome::default();
     for db in dbs {
-        let thread_mutation = match threads_would_mutate(&db, target, ids) {
+        let thread_mutation = match threads_would_mutate_all(&db, target, index_facts.excluded_ids) {
             Ok(value) => value,
             Err(error) => { out.error.get_or_insert_with(|| format!("{}: {error}", db.display())); continue; }
         };
-        let catalog_mutation = match catalog::would_mutate(&db, target, &planned_rows) {
+        let catalog_provider_mutation = match catalog::provider_would_mutate(&db, target, index_facts.excluded_ids) {
             Ok(value) => value,
             Err(e) => {
                 out.error.get_or_insert(e);
                 continue;
             }
         };
+        let catalog_repair_mutation = match catalog::would_mutate(&db, target, &planned_rows) {
+            Ok(value) => value,
+            Err(e) => {
+                out.error.get_or_insert(e);
+                continue;
+            }
+        };
+        let catalog_mutation = catalog_provider_mutation || catalog_repair_mutation;
         let metadata_mutation = match thread_metadata_would_mutate(
             &db,
             index_facts.user_event_ids,
@@ -215,7 +336,7 @@ pub(super) fn sync_sqlite(
             continue;
         }
         if thread_mutation {
-            match set_threads_provider(&db, target, ids) {
+            match set_all_threads_provider(&db, target, index_facts.excluded_ids) {
                 Ok(n) => out.updated += n,
                 Err(e) => { out.error.get_or_insert(e); }
             }
@@ -234,7 +355,10 @@ pub(super) fn sync_sqlite(
                 Err(e) => { out.error.get_or_insert(e); }
             }
         }
-        if catalog_mutation {
+        if catalog_provider_mutation {
+            catalog::sync_all_provider_rows(&db, target, index_facts.excluded_ids, &mut out.catalog);
+        }
+        if catalog_repair_mutation {
             catalog::repair_one(&db, target, &planned_rows, &mut out.catalog);
         }
     }
@@ -245,23 +369,92 @@ fn has_provider_column(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
     conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('threads') WHERE name='model_provider')", [], |row| row.get(0))
 }
 
-fn threads_would_mutate(db: &Path, target: &str, ids: &[String]) -> rusqlite::Result<bool> {
-    if ids.is_empty() { return Ok(false); }
+fn threads_would_mutate_all(
+    db: &Path,
+    target: &str,
+    excluded_ids: &HashSet<String>,
+) -> rusqlite::Result<bool> {
     let conn = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(std::time::Duration::from_millis(1500))?;
-    if !has_provider_column(&conn)? { return Ok(false); }
-    for chunk in ids.chunks(SQL_CHUNK) {
-        let holes = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
-        let target_pos = chunk.len() + 1;
+    let columns = catalog::columns_of(&conn, "threads");
+    if !columns.contains("model_provider") {
+        return Ok(false);
+    }
+    if !columns.contains("id") {
+        conn.prepare("SELECT id FROM threads LIMIT 1")?;
+        return Ok(false);
+    }
+    let mut excluded = excluded_ids.iter().collect::<Vec<_>>();
+    excluded.sort_unstable();
+    let chunks = if excluded.is_empty() {
+        vec![&excluded[..]]
+    } else {
+        excluded.chunks(SQL_CHUNK).collect::<Vec<_>>()
+    };
+    for chunk in chunks {
+        let exclusion = if chunk.is_empty() {
+            String::new()
+        } else {
+            let holes = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
+            format!(" AND id NOT IN ({holes})")
+        };
         let sql = format!(
-            "SELECT 1 FROM threads WHERE id IN ({holes}) AND model_provider IS NOT ?{target_pos} LIMIT 1"
+            "SELECT 1 FROM threads WHERE COALESCE(model_provider, '') <> ?1{exclusion} LIMIT 1"
         );
-        let mut params: Vec<&dyn rusqlite::ToSql> = chunk.iter()
-            .map(|id| id as &dyn rusqlite::ToSql).collect();
-        params.push(&target);
-        if conn.query_row(&sql, params.as_slice(), |_| Ok(())).optional()?.is_some() { return Ok(true); }
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&target];
+        params.extend(chunk.iter().map(|id| *id as &dyn rusqlite::ToSql));
+        if conn
+            .query_row(&sql, params.as_slice(), |_| Ok(()))
+            .optional()?
+            .is_some()
+        {
+            return Ok(true);
+        }
     }
     Ok(false)
+}
+
+fn set_all_threads_provider(
+    db: &Path,
+    provider: &str,
+    excluded_ids: &HashSet<String>,
+) -> Result<usize, String> {
+    let mut conn = rusqlite::Connection::open(db).map_err(|e| format!("{}: {e}", db.display()))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(1500));
+    let columns = catalog::columns_of(&conn, "threads");
+    if !columns.contains("id") || !columns.contains("model_provider") {
+        return Ok(0);
+    }
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("{}: {e}", db.display()))?;
+    let mut excluded = excluded_ids.iter().collect::<Vec<_>>();
+    excluded.sort_unstable();
+    let mut updated = 0;
+    let chunks = if excluded.is_empty() {
+        vec![&excluded[..]]
+    } else {
+        excluded.chunks(SQL_CHUNK).collect::<Vec<_>>()
+    };
+    for chunk in chunks {
+        let exclusion = if chunk.is_empty() {
+            String::new()
+        } else {
+            let holes = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
+            format!(" AND id NOT IN ({holes})")
+        };
+        let sql = format!(
+            "UPDATE threads SET model_provider = ?1 \
+             WHERE COALESCE(model_provider, '') <> ?1{exclusion}"
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&provider];
+        params.extend(chunk.iter().map(|id| *id as &dyn rusqlite::ToSql));
+        updated += tx
+            .execute(&sql, params.as_slice())
+            .map_err(|e| format!("{}: {e}", db.display()))?;
+    }
+    tx.commit().map_err(|e| format!("{}: {e}", db.display()))?;
+    Ok(updated)
 }
 
 fn thread_metadata_would_mutate(
@@ -354,7 +547,7 @@ fn set_threads_metadata(
     Ok((user_event_rows, cwd_rows))
 }
 
-/// 按清单把 `threads.model_provider` 改回原值。返回 `Some(错误)` 表示有库没处理成功。
+/// 按清单把 SQLite 中的 provider 改回原值。返回 `Some(错误)` 表示有库没处理成功。
 ///
 /// 原值为空串的条目（rollout 里原本没那个字段，或清单是本字段上线前写的）**跳过** ——
 /// 我们不知道 sqlite 里当时是什么，猜一个写进去比留着旧值更糟。
@@ -362,7 +555,12 @@ fn set_threads_metadata(
 /// 🔴 **按原值分组、一组一次连接**：清单可能有上百条，而 [`set_threads_provider`] 每次都
 /// 要 open 一次库并可能等满 `busy_timeout` —— 逐条来在库被锁时最坏是「条目数 × 1.5 秒」，
 /// 那会让「停止代理」这个动作卡上几分钟。
-pub(super) fn restore_sqlite(home: &Path, entries: &[ManifestEntry]) -> Option<String> {
+pub(super) fn restore_sqlite(
+    home: &Path,
+    entries: &[ManifestEntry],
+    sqlite_entries: &[SqliteManifestEntry],
+    target: &str,
+) -> Option<String> {
     let mut groups: std::collections::HashMap<&str, Vec<String>> =
         std::collections::HashMap::new();
     for e in entries {
@@ -374,20 +572,99 @@ pub(super) fn restore_sqlite(home: &Path, entries: &[ManifestEntry]) -> Option<S
             .or_default()
             .push(e.thread_id.clone());
     }
-    if groups.is_empty() {
+    if groups.is_empty() && sqlite_entries.is_empty() {
         return None;
     }
     let dbs = match session_db_paths_checked(home) { Ok(paths) => paths, Err(error) => return Some(error) };
     let mut first_err = None;
     for db in dbs {
-        for (provider, ids) in &groups {
-            if let Err(err) = set_threads_provider(&db, provider, ids) {
-                first_err.get_or_insert(err);
-                break; // 同一个库接着试也是同样的错（多半是锁），换下一个库
+        // 新清单按数据库路径精确记录 provider 原值。旧清单没有这部分信息时，
+        // 才回退到历史的按 thread id 广播还原逻辑。
+        if sqlite_entries.is_empty() {
+            for (provider, ids) in &groups {
+                if let Err(err) = set_threads_provider(&db, provider, ids) {
+                    first_err.get_or_insert(err);
+                    break; // 同一个库接着试也是同样的错（多半是锁），换下一个库
+                }
+            }
+        }
+        let key = backup_path_key(&db);
+        let matching = sqlite_entries
+            .iter()
+            .filter(|entry| entry.database_path == key)
+            .collect::<Vec<_>>();
+        if !matching.is_empty() {
+            if let Err(error) = restore_provider_manifest_entries(&db, &matching, target) {
+                first_err.get_or_insert(error);
             }
         }
     }
+    for entry in sqlite_entries {
+        if !session_db_paths(home)
+            .iter()
+            .any(|path| backup_path_key(path) == entry.database_path)
+        {
+            first_err.get_or_insert_with(|| format!("找不到清单记录对应的会话数据库：{}", entry.database_path));
+            break;
+        }
+    }
     first_err
+}
+
+fn restore_provider_manifest_entries(
+    db: &Path,
+    entries: &[&SqliteManifestEntry],
+    target: &str,
+) -> Result<(), String> {
+    let mut conn = rusqlite::Connection::open(db).map_err(|e| format!("{}: {e}", db.display()))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(1500));
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("{}: {e}", db.display()))?;
+    for entry in entries {
+        match entry.table.as_str() {
+            "threads" => {
+                if let Some(provider) = entry.original_provider.as_deref() {
+                    tx.execute(
+                        "UPDATE threads SET model_provider = ?1 \
+                         WHERE id = ?2 AND model_provider = ?3",
+                        (provider, &entry.thread_id, target),
+                    )
+                    .map_err(|e| format!("{}: {e}", db.display()))?;
+                } else {
+                    tx.execute(
+                        "UPDATE threads SET model_provider = NULL \
+                         WHERE id = ?1 AND model_provider = ?2",
+                        (&entry.thread_id, target),
+                    )
+                    .map_err(|e| format!("{}: {e}", db.display()))?;
+                }
+            }
+            "local_thread_catalog" => {
+                let Some(host_id) = entry.host_id.as_deref() else {
+                    continue;
+                };
+                if let Some(provider) = entry.original_provider.as_deref() {
+                    tx.execute(
+                        "UPDATE local_thread_catalog SET model_provider = ?1 \
+                         WHERE host_id = ?2 AND thread_id = ?3 AND model_provider = ?4",
+                        (provider, host_id, &entry.thread_id, target),
+                    )
+                    .map_err(|e| format!("{}: {e}", db.display()))?;
+                } else {
+                    tx.execute(
+                        "UPDATE local_thread_catalog SET model_provider = NULL \
+                         WHERE host_id = ?1 AND thread_id = ?2 AND model_provider = ?3",
+                        (host_id, &entry.thread_id, target),
+                    )
+                    .map_err(|e| format!("{}: {e}", db.display()))?;
+                }
+            }
+            table => return Err(format!("{}: 不支持的 SQLite provider 表 {table}", db.display())),
+        }
+    }
+    tx.commit().map_err(|e| format!("{}: {e}", db.display()))?;
+    Ok(())
 }
 
 fn backup_identity(db: &Path) -> Result<String, String> {

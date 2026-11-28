@@ -141,7 +141,7 @@ pub(in crate::tools) struct CatalogRow {
     /// Unix 秒（catalog 那几列是 `REAL`）。
     pub created_at: f64,
     pub updated_at: f64,
-    /// `threads.source`（本机实测是 `"vscode"`）。取不到就不补这一行 —— 见 [`plan_from`]。
+    /// `threads.source`（本机实测是 `"vscode"`）。旧 schema 缺失时按 CodexPlus++ 回退为 `cli`。
     pub source_kind: String,
     pub provider: String,
     /// `threads.thread_source`：`user` = 用户自己的对话，其它值（本机实测
@@ -195,7 +195,7 @@ pub(in crate::tools) fn plan_from(home: &Path, target: &str, ids: &[String]) -> 
         };
         let _ = conn.busy_timeout(std::time::Duration::from_millis(800));
         let cols = columns_of(&conn, "threads");
-        if !cols.contains("id") || !cols.contains("source") {
+        if !cols.contains("id") {
             continue;
         }
         let title_expr = title_expr_for(&cols);
@@ -208,6 +208,11 @@ pub(in crate::tools) fn plan_from(home: &Path, target: &str, ids: &[String]) -> 
                 (false, false) => "0".into(),
             }
         };
+        let source_expr = if cols.contains("source") {
+            "COALESCE(NULLIF(source, ''), 'cli')"
+        } else {
+            "'cli'"
+        };
         let src_expr = if cols.contains("thread_source") {
             "COALESCE(thread_source, '')"
         } else {
@@ -217,7 +222,7 @@ pub(in crate::tools) fn plan_from(home: &Path, target: &str, ids: &[String]) -> 
             "NULLIF(TRIM(attached_thread_parent_id), '')"
         } else { "NULL" };
         let sql = format!(
-            "SELECT id, {title_expr}, COALESCE(cwd, ''), {}, {}, COALESCE(source, ''), {src_expr}, {attached_expr} FROM threads",
+            "SELECT id, {title_expr}, COALESCE(cwd, ''), {}, {}, {source_expr}, {src_expr}, {attached_expr} FROM threads",
             ts("created_at_ms", "created_at"),
             ts("updated_at_ms", "updated_at"),
         );
@@ -245,6 +250,147 @@ pub(in crate::tools) fn plan_from(home: &Path, target: &str, ids: &[String]) -> 
                 {
                     out.push(row);
                 }
+            }
+        }
+    }
+    out
+}
+
+/// 从 canonical `threads` 收集可安全补入本地主机 catalog 的用户线程。
+///
+/// 这条路径覆盖 CodexPlus++ 的 native/paginated 会话。它们的历史可能已经迁入 SQLite，
+/// 当前 `sessions/` 没有对应 rollout，因而不能依赖 `done_ids` 生成 catalog 修复计划。
+pub(in crate::tools) fn plan_from_all(home: &Path, target: &str) -> Vec<CatalogRow> {
+    let mut out: Vec<CatalogRow> = Vec::new();
+    for db in super::session_db_paths(home) {
+        let Ok(conn) = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        else {
+            continue;
+        };
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(800));
+        let cols = columns_of(&conn, "threads");
+        if !cols.contains("id") {
+            continue;
+        }
+        let title_expr = title_expr_for(&cols);
+        let text_expr = |column: &str| {
+            if cols.contains(column) {
+                format!("COALESCE({column}, '')")
+            } else {
+                "''".to_string()
+            }
+        };
+        let source_kind_expr = if cols.contains("source") {
+            "COALESCE(NULLIF(source, ''), 'cli')".to_string()
+        } else if cols.contains("source_kind") {
+            "COALESCE(NULLIF(source_kind, ''), 'cli')".to_string()
+        } else {
+            "'cli'".to_string()
+        };
+        let ts = |ms: &str, seconds: &str| -> String {
+            match (cols.contains(ms), cols.contains(seconds)) {
+                (true, true) => format!("COALESCE({ms} / 1000.0, {seconds}, 0)"),
+                (true, false) => format!("COALESCE({ms} / 1000.0, 0)"),
+                (false, true) => format!("COALESCE({seconds}, 0)"),
+                (false, false) => "0".into(),
+            }
+        };
+        let archived_expr = if cols.contains("archived") {
+            "COALESCE(archived, 0)"
+        } else {
+            "0"
+        };
+        // CodexPlus++ 的 app-server 列表以 preview 判断是否有用户内容。
+        // paginated 会话迁入 SQLite 后，旧的 has_user_event 可能仍是 0。
+        let user_content_expr = if cols.contains("preview") {
+            "CASE WHEN COALESCE(preview, '') <> '' THEN 1 ELSE 0 END".to_string()
+        } else if cols.contains("has_user_event") {
+            "COALESCE(has_user_event, 1)".to_string()
+        } else {
+            "1".to_string()
+        };
+        let sql = format!(
+            "SELECT id, {title_expr}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {archived_expr}, {user_content_expr} FROM threads",
+            text_expr("cwd"),
+            ts("created_at_ms", "created_at"),
+            ts("updated_at_ms", "updated_at"),
+            text_expr("source"),
+            text_expr("thread_source"),
+            text_expr("rollout_path"),
+            text_expr("history_mode"),
+            text_expr("agent_role"),
+            source_kind_expr,
+        );
+        let Ok(mut statement) = conn.prepare(&sql) else { continue };
+        let Ok(rows) = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, i64>(12)?,
+            ))
+        }) else { continue };
+        for row in rows.flatten() {
+            let (
+                thread_id,
+                title,
+                cwd,
+                created_at,
+                updated_at,
+                source,
+                thread_source,
+                rollout_path,
+                history_mode,
+                agent_role,
+                source_kind,
+                archived,
+                has_user_content,
+            ) = row;
+            // 空 rollout_path 是 CodexPlus++ 认可的 native/paginated 形态。
+            let history_available = history_mode.trim().eq_ignore_ascii_case("paginated")
+                || rollout_path.trim().is_empty()
+                || super::resolve_in_home(home, rollout_path.trim())
+                    .is_some_and(|path| path.is_file());
+            let non_user = !thread_source.trim().is_empty()
+                && !thread_source.trim().eq_ignore_ascii_case("user");
+            let internal = thread_source_marks_child(&thread_source)
+                || source_kind_marks_child(&source)
+                || source_kind_marks_child(&source_kind);
+            if thread_id.trim().is_empty()
+                || archived != 0
+                || has_user_content == 0
+                || non_user
+                || internal
+                || agent_role.trim() != ""
+                || source_kind.trim().is_empty()
+                || source_kind.trim().eq_ignore_ascii_case("exec")
+                || !history_available
+            {
+                continue;
+            }
+            let row = CatalogRow {
+                thread_id,
+                title,
+                cwd: files::display_path(&cwd),
+                created_at,
+                updated_at,
+                source_kind,
+                provider: target.to_string(),
+                thread_source,
+                forked: false,
+                attached_parent_id: None,
+            };
+            if worth_listing(&row) && !out.iter().any(|existing| existing.thread_id == row.thread_id) {
+                out.push(row);
             }
         }
     }
@@ -361,6 +507,117 @@ pub(in crate::tools) fn would_mutate(
         }
     }
     Ok(false)
+}
+
+/// 只读判定本地主机 catalog 中是否有 provider 需要同步。
+///
+/// provider 同步的范围按 CodexPlus++ 的数据库语义覆盖完整 local host catalog，
+/// 不依赖当前 rollout 是否存在。内部派生线程由父模块收集的排除集合保护，远端 host
+/// 的投影则始终跳过。
+pub(in crate::tools) fn provider_would_mutate(
+    db_path: &Path,
+    target: &str,
+    excluded_ids: &HashSet<String>,
+) -> Result<bool, String> {
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("{}: {e}", db_path.display()))?;
+    let cols = columns_of(&conn, "local_thread_catalog");
+    if !cols.contains("host_id")
+        || !cols.contains("thread_id")
+        || !cols.contains("model_provider")
+    {
+        return Ok(false);
+    }
+    let Some(host) = host_id(&conn) else { return Ok(false) };
+    let mut excluded = excluded_ids.iter().collect::<Vec<_>>();
+    excluded.sort_unstable();
+    let chunks = if excluded.is_empty() {
+        vec![&excluded[..]]
+    } else {
+        excluded.chunks(super::SQL_CHUNK).collect::<Vec<_>>()
+    };
+    for chunk in chunks {
+        let exclusion = if chunk.is_empty() {
+            String::new()
+        } else {
+            let holes = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
+            format!(" AND thread_id NOT IN ({holes})")
+        };
+        let sql = format!(
+            "SELECT 1 FROM local_thread_catalog \
+             WHERE host_id = ?1 AND COALESCE(model_provider, '') <> ?2{exclusion} LIMIT 1"
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&host, &target];
+        params.extend(chunk.iter().map(|id| *id as &dyn rusqlite::ToSql));
+        match conn.query_row(&sql, params.as_slice(), |_| Ok(())) {
+            Ok(()) => return Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(error) => return Err(format!("{}: {error}", db_path.display())),
+        }
+    }
+    Ok(false)
+}
+
+/// 把本地主机 catalog 中的所有可同步 provider 改成目标值。
+pub(in crate::tools) fn sync_all_provider_rows(
+    db_path: &Path,
+    target: &str,
+    excluded_ids: &HashSet<String>,
+    report: &mut CatalogReport,
+) {
+    let Ok(mut conn) = Connection::open(db_path) else {
+        report.skipped.push(format!("{}: 打不开", db_path.display()));
+        return;
+    };
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(1500));
+    let cols = columns_of(&conn, "local_thread_catalog");
+    if !cols.contains("host_id")
+        || !cols.contains("thread_id")
+        || !cols.contains("model_provider")
+    {
+        return;
+    }
+    let Some(host) = host_id(&conn) else { return };
+    let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+        Ok(tx) => tx,
+        Err(error) => {
+            report.skipped.push(format!("{}: provider 未同步（{error}）", db_path.display()));
+            return;
+        }
+    };
+    let mut excluded = excluded_ids.iter().collect::<Vec<_>>();
+    excluded.sort_unstable();
+    let chunks = if excluded.is_empty() {
+        vec![&excluded[..]]
+    } else {
+        excluded.chunks(super::SQL_CHUNK).collect::<Vec<_>>()
+    };
+    let mut updated = 0usize;
+    for chunk in chunks {
+        let exclusion = if chunk.is_empty() {
+            String::new()
+        } else {
+            let holes = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
+            format!(" AND thread_id NOT IN ({holes})")
+        };
+        let sql = format!(
+            "UPDATE local_thread_catalog SET model_provider = ?1 \
+             WHERE host_id = ?2 AND COALESCE(model_provider, '') <> ?1{exclusion}"
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&target, &host];
+        params.extend(chunk.iter().map(|id| *id as &dyn rusqlite::ToSql));
+        match tx.execute(&sql, params.as_slice()) {
+            Ok(count) => updated += count,
+            Err(error) => {
+                report.skipped.push(format!("{}: provider 未同步（{error}）", db_path.display()));
+                return;
+            }
+        }
+    }
+    match tx.commit() {
+        Ok(()) => report.provider_updated += updated,
+        Err(error) => report.skipped.push(format!("{}: provider 提交失败（{error}）", db_path.display())),
+    }
 }
 
 pub(in crate::tools) fn merge_rollout_evidence(rows: &mut Vec<CatalogRow>, sessions: &[super::SessionRef]) {

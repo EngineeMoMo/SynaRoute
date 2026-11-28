@@ -103,7 +103,7 @@ pub(in crate::tools) fn auto_sync_enabled() -> bool {
     }
 }
 
-fn repair_remote_compaction_at(path: &Path) -> AppResult<bool> {
+fn repair_remote_compaction_at(path: &Path, target: &str) -> AppResult<bool> {
     if !path.exists() {
         return Ok(false);
     }
@@ -122,7 +122,10 @@ fn repair_remote_compaction_at(path: &Path) -> AppResult<bool> {
         .get("model_provider")
         .and_then(toml::Value::as_str)
         .is_some_and(|provider| provider == super::super::MCP_CLIENT_NAME);
-    if !managed_by_synaroute || !super::super::codex_catalog::disable_remote_compaction(table) {
+    let syncing_to_synaroute = target == super::super::MCP_CLIENT_NAME;
+    if (!managed_by_synaroute && !syncing_to_synaroute)
+        || !super::super::codex_catalog::disable_remote_compaction(table)
+    {
         return Ok(false);
     }
     let serialized = toml::to_string_pretty(&doc)
@@ -142,14 +145,14 @@ pub(in crate::tools) fn locked_sync(
 ) -> AppResult<SyncReport> {
     let _guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _file_guard = super::guard::acquire(home).map_err(crate::error::AppError::ToolConfig)?;
-    repair_remote_compaction_at(&home.join("config.toml"))?;
+    repair_remote_compaction_at(&home.join("config.toml"), target)?;
     super::sync_to_at(home, data_dir, target)
 }
 
 fn locked_manual_sync(home: &Path, data_dir: &Path, target: &str, progress: &mut dyn FnMut(&str, usize, usize)) -> Result<SyncReport, String> {
     let _guard = SYNC_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _file_guard = super::guard::acquire(home)?;
-    repair_remote_compaction_at(&home.join("config.toml"))
+    repair_remote_compaction_at(&home.join("config.toml"), target)
         .map_err(|error| error.to_string())?;
     let snapshot = super::target::TargetSnapshot::capture(home, target)?;
     if let super::ManifestState::Corrupt(path) = super::read_manifest_state(data_dir) {
@@ -236,18 +239,37 @@ fn sqlite_providers(home: &Path) -> Vec<String> {
             continue;
         };
         let _ = conn.busy_timeout(std::time::Duration::from_millis(600));
-        // 语句与连接的生存期都收在这个块里 —— `let Ok(..) = .. else { continue }` 会让
-        // 借用活过 `conn`（实测 E0597）。
-        let got: Vec<String> = match conn.prepare(
-            "SELECT DISTINCT model_provider FROM threads WHERE COALESCE(model_provider,'') <> ''",
-        ) {
-            Ok(mut stmt) => match stmt.query_map([], |r| r.get::<_, String>(0)) {
-                Ok(rows) => rows.flatten().collect(),
-                Err(_) => Vec::new(),
-            },
-            Err(_) => Vec::new(),
-        };
-        out.extend(got);
+        for (table, id_column) in [("threads", "id"), ("local_thread_catalog", "thread_id")] {
+            let columns = super::catalog::columns_of(&conn, table);
+            if !columns.contains(id_column) || !columns.contains("model_provider") {
+                continue;
+            }
+            let got: Vec<String> = if table == "local_thread_catalog" && columns.contains("host_id") {
+                let Some(host) = super::catalog::host_id(&conn) else { continue };
+                match conn.prepare(&format!(
+                    "SELECT DISTINCT model_provider FROM {table} \
+                     WHERE COALESCE(model_provider,'') <> '' AND host_id = ?1"
+                )) {
+                    Ok(mut stmt) => match stmt.query_map([host], |r| r.get::<_, String>(0)) {
+                        Ok(rows) => rows.flatten().collect(),
+                        Err(_) => Vec::new(),
+                    },
+                    Err(_) => Vec::new(),
+                }
+            } else {
+                match conn.prepare(&format!(
+                    "SELECT DISTINCT model_provider FROM {table} \
+                     WHERE COALESCE(model_provider,'') <> ''"
+                )) {
+                    Ok(mut stmt) => match stmt.query_map([], |r| r.get::<_, String>(0)) {
+                        Ok(rows) => rows.flatten().collect(),
+                        Err(_) => Vec::new(),
+                    },
+                    Err(_) => Vec::new(),
+                }
+            };
+            out.extend(got);
+        }
     }
     out
 }
@@ -454,6 +476,25 @@ mod tests {
             assert_eq!(item["payload"]["namespace"], "mcp__demo");
         }
         assert!(!home.join("data/codex-session-id-backups").exists());
+    }
+
+    #[test]
+    fn manual_sync_to_synaroute_repairs_remote_compaction_when_root_is_openai() {
+        let home = tmp_home("remote-compaction-target");
+        let relative = write_rollout(&home, ID_A, "openai");
+        fs::write(
+            home.join("config.toml"),
+            "model_provider = \"openai\"\n\n[features]\nremote_compaction_v2 = true\n\n[model_providers.synaroute]\nname = \"SynaRoute\"\n",
+        )
+        .unwrap();
+
+        locked_manual_sync(&home, &home.join("data"), "synaroute", &mut |_, _, _| {}).unwrap();
+
+        let config: toml::Value = fs::read_to_string(home.join("config.toml")).unwrap().parse().unwrap();
+        assert_eq!(config["features"]["remote_compaction_v2"].as_bool(), Some(false));
+        let first_line = fs::read_to_string(home.join(relative)).unwrap();
+        assert!(first_line.lines().next().unwrap().contains("\"model_provider\":\"synaroute\""));
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]

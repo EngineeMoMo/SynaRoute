@@ -39,6 +39,20 @@ describe("会话页与后端的两处契约", () => {
     expect(chooseKnownTarget({ ...base, targets: base.targets.map((option) => ({ ...option, available: false })) }, "openai")).toBe("");
   });
 
+  it("SynaRoute 可用时默认同步目标优先选择它", () => {
+    const options: CodexProviderTargetList = {
+      current: "openai",
+      ours: "synaroute",
+      prefs: { autoSyncDisabled: false, lastTarget: "openai" },
+      targets: [
+        { id: "openai", sources: ["config"], isCurrent: true, available: true },
+        { id: "synaroute", sources: ["config"], isCurrent: false, available: true },
+      ],
+    };
+    expect(chooseKnownTarget(options, "")).toBe("synaroute");
+    expect(chooseKnownTarget(options, "openai")).toBe("openai");
+  });
+
   /**
    * 🔴 「指向别处」这个数字只能有**一个**来源。
    *

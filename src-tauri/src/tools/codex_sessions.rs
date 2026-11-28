@@ -210,7 +210,25 @@ struct Manifest {
     /// 停止时按这一个真实快照交还；旧清单缺字段时从 config.toml 的 .bak 再取。
     #[serde(default)]
     fallback_provider: String,
+    /// SQLite 中被同步改写的原值。CodexPlus++ 会按数据库中的完整 provider 集合同步，
+    /// 因而不能只靠 rollout 条目回滚没有当前 rollout 的 canonical thread。
+    #[serde(default)]
+    sqlite_entries: Vec<SqliteManifestEntry>,
     entries: Vec<ManifestEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SqliteManifestEntry {
+    /// 规范化后的数据库路径，用于在停止代理时匹配原来的数据库。
+    database_path: String,
+    /// `threads` 或本地主机的 `local_thread_catalog`。
+    table: String,
+    #[serde(default)]
+    host_id: Option<String>,
+    thread_id: String,
+    /// `None` 表示同步前这一列是 NULL。
+    original_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -586,17 +604,28 @@ pub(super) fn sync_to_at_observed(
     // CodexPlus++ 对齐：只同步根/用户会话。内部派生由 rollout source、thread_source 或
     // edge/job 证据确认；普通用户 fork 不因 forked 标记单独排除。
     let child_ids = sqlite::collect_child_thread_ids(home);
-    let excluded = sqlite::provider_exclusions(home, &child_ids, &scan.sessions);
+    let mut excluded = sqlite::provider_exclusions(home, &child_ids, &scan.sessions);
     let mut todo = Vec::new();
     let mut done_ids = Vec::new();
     let mut user_event_ids = Vec::new();
     let mut cwd_by_thread_id = BTreeMap::new();
     for (index, session) in scan.sessions.iter().enumerate() {
         observer("scanning", index, scan.sessions.len())?;
-        if session_is_internal(session, &excluded) { report.internal_skipped += 1; continue; }
+        if session_is_internal(session, &excluded) {
+            if !session.thread_id.is_empty() {
+                excluded.insert(session.thread_id.clone());
+            }
+            report.internal_skipped += 1;
+            continue;
+        }
         let Some(path) = resolve_in_home(home, &session.rel_path) else { report.path_rejected += 1; continue };
         match providers::Plan::read(&path) {
-            Ok(plan) if plan.internal => report.internal_skipped += 1,
+            Ok(plan) if plan.internal => {
+                if !session.thread_id.is_empty() {
+                    excluded.insert(session.thread_id.clone());
+                }
+                report.internal_skipped += 1;
+            }
             Ok(plan) if plan.matches(target) => {
                 report.already_ok += 1;
                 if !session.thread_id.is_empty() { done_ids.push(session.thread_id.clone()); }
@@ -621,7 +650,9 @@ pub(super) fn sync_to_at_observed(
     };
     // 清单第一次落盘时锁定「接入前根 provider」。接入期间新建的会话本来就写 target，
     // 不会进逐条 entries；停止时只有这份快照能如实交还。旧清单留空，restore 再尝试读 .bak。
-    let manifest_was_empty = manifest.target.is_empty() && manifest.entries.is_empty();
+    let manifest_was_empty = manifest.target.is_empty()
+        && manifest.entries.is_empty()
+        && manifest.sqlite_entries.is_empty();
     let mut manifest_changed = false;
     if manifest.fallback_provider.is_empty() {
         if let Some(provider) = fallback_provider_from_backup(home) {
@@ -632,6 +663,19 @@ pub(super) fn sync_to_at_observed(
     let mut newly_recorded = false;
     for (_, session, plan) in &todo {
         newly_recorded |= plan.remember(&mut manifest, session, target)?;
+    }
+    let sqlite_entries = sqlite::collect_provider_manifest_entries(home, target, &excluded)
+        .map_err(AppError::ToolConfig)?;
+    for entry in sqlite_entries {
+        if !manifest.sqlite_entries.iter().any(|existing| {
+            existing.database_path == entry.database_path
+                && existing.table == entry.table
+                && existing.host_id == entry.host_id
+                && existing.thread_id == entry.thread_id
+        }) {
+            manifest.sqlite_entries.push(entry);
+            manifest_changed = true;
+        }
     }
     if newly_recorded || manifest_changed || manifest_was_empty || manifest.target != target {
         // 初次同步即使一条旧会话都没有，也必须落一份清单：此后在接入期间新建的会话
@@ -750,6 +794,12 @@ pub(in crate::tools) fn restore_at(home: &Path, data_dir: &Path) -> AppResult<Op
         }
         write_manifest(data_dir, &manifest)?;
     }
+    let rollout_thread_ids: std::collections::HashSet<String> = manifest
+        .entries
+        .iter()
+        .filter_map(|entry| (!entry.thread_id.is_empty()).then_some(entry.thread_id.clone()))
+        .collect();
+    let sqlite_manifest_entries = manifest.sqlite_entries.clone();
     let mut restore_index = Vec::new();
     let mut restored = 0usize;
     let mut failed = 0usize;
@@ -776,7 +826,24 @@ pub(in crate::tools) fn restore_at(home: &Path, data_dir: &Path) -> AppResult<Op
     // sqlite 那半也要对称回滚 —— 只做 rollout 不做 sqlite 的话，还原之后 Desktop 的
     // 会话列表会长期标着 synaroute 而实际路由已回到官方，且**永不自愈**（除非用户再
     // 接入一次）。同步那半刻意写了 sqlite，这一半漏掉就是我们自己造的不一致。
-    let db_note = restore_sqlite(home, &restore_index);
+    let restored_thread_ids: std::collections::HashSet<&str> = restore_index
+        .iter()
+        .filter_map(|entry| (!entry.thread_id.is_empty()).then_some(entry.thread_id.as_str()))
+        .collect();
+    let sqlite_entries_to_restore = sqlite_manifest_entries
+        .iter()
+        .filter(|entry| {
+            !rollout_thread_ids.contains(&entry.thread_id)
+                || restored_thread_ids.contains(entry.thread_id.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let db_note = restore_sqlite(
+        home,
+        &restore_index,
+        &sqlite_entries_to_restore,
+        &manifest.target,
+    );
 
     // 全部处理完才删清单（同 `restore_one` 还原成功后删 `.bak`）。有失败就留着 ——
     // 用户退出 Codex 后再点一次停止就能补完。
@@ -1705,16 +1772,12 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// ⑬ 🔴 **sqlite 只更新 rollout 那半确实处理过的 thread，不是全表 UPDATE。**
+    /// ⑬ 🔴 **SQLite provider 同步覆盖数据库独有的 thread。**
     ///
-    /// 第一版无条件 `UPDATE threads SET model_provider = ?`。于是 Codex 正在运行、
-    /// rollout 全被独占时（changed == 0），列表照样被改成 synaroute —— 而打开旧对话仍
-    /// 401。**列表替一个没完成的修复背了书**，用户据此排除掉「同步没生效」这个真方向。
-    ///
-    /// 判据用一条**孤立行**（sqlite 里有、磁盘上没有对应 rollout）：全表 UPDATE 会连它
-    /// 一起改，按 id 收窄则不会。
+    /// CodexPlus++ 的 provider 同步按数据库中的完整线程集合执行。native/paginated 会话
+    /// 可能没有当前 rollout 文件，但 Codex 仍会从 `threads.model_provider` 恢复它。
     #[test]
-    fn sqlite_only_touches_threads_whose_rollout_was_handled() {
+    fn sqlite_provider_sync_also_updates_threads_without_rollouts() {
         let home = tmp_home("sqlnarrow");
         let data = home.join("appdata");
         write_rollout(&home, "sessions/2026/09/01", "t1", "openai", "\n");
@@ -1726,13 +1789,16 @@ mod tests {
             .unwrap();
 
         let r = sync_to_at(&home, &data, "synaroute").unwrap();
-        assert_eq!((r.changed, r.sqlite.as_ref().unwrap().updated), (1, 1));
+        assert_eq!((r.changed, r.sqlite.as_ref().unwrap().updated), (1, 2));
         assert_eq!(provider_in_db(&db), "synaroute", "有 rollout 的那条要改");
         assert_eq!(
             provider_of_id(&db, "orphan"),
-            "openai",
-            "没有对应 rollout 的孤立行不许被改 —— 那是全表 UPDATE 的指纹"
+            "synaroute",
+            "没有 rollout 的 canonical thread 也必须按 CodexPlus++ 的数据库范围同步"
         );
+        restore_at(&home, &data).unwrap();
+        assert_eq!(provider_in_db(&db), "openai");
+        assert_eq!(provider_of_id(&db, "orphan"), "openai");
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -2068,11 +2134,11 @@ mod tests {
         let remaining: Vec<String> = catalog.prepare(
             "SELECT thread_id FROM local_thread_catalog WHERE host_id='local' ORDER BY thread_id"
         ).unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
-        assert_eq!(remaining, vec![user_id], "明确 user 必须保留");
+        assert_eq!(remaining, vec![user_id, uuid_of("t1")], "明确 user 必须保留，根 thread 也应补入");
         let revision: i64 = catalog.query_row(
             "SELECT catalog_revision FROM local_thread_catalog_metadata", [], |r| r.get(0)
         ).unwrap();
-        assert_eq!(revision, 11, "commit 成功删除 1 行，revision 只增加 1");
+        assert_eq!(revision, 12, "commit 删除 guardian 并补入根 thread，revision 增加 2");
         drop(catalog);
         assert_eq!(fs::read(&guardian).unwrap(), rollout_before, "cleanup 不许删改 rollout");
         assert_eq!(fs::read(&user).unwrap(), user_before);
@@ -2144,9 +2210,9 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// ⑬之二 `done_ids` 为空时普通 metadata 不写，但 cleanup-only 必须仍能运行。
+    /// ⑬之二 `done_ids` 为空时，数据库 provider 仍按 CodexPlus++ 的完整范围同步。
     #[test]
-    fn an_empty_done_list_leaves_sqlite_untouched() {
+    fn an_empty_rollout_list_still_syncs_database_provider_rows() {
         let home = tmp_home("sqlempty");
         let data = home.join("appdata");
         let db = home.join("state_5.sqlite");
@@ -2164,9 +2230,77 @@ mod tests {
                 excluded_ids: &std::collections::HashSet::new(),
             },
         ).unwrap();
-        assert_eq!(out, SqliteOutcome::default());
-        assert_eq!(provider_in_db(&db), "openai");
-        assert!(!data.join("backups").exists(), "没东西要写时连备份都不该产生");
+        assert_eq!(out.updated, 1);
+        assert_eq!(provider_in_db(&db), "synaroute");
+        assert!(data.join("backups").exists(), "数据库 provider 发生变化时必须保留写前备份");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn database_only_catalog_sync_updates_local_host_and_restores_it() {
+        let home = tmp_home("catalog-db-only");
+        let data = home.join("appdata");
+        let db = home.join("sqlite/catalog.db");
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE local_thread_catalog_hosts (host_id TEXT, host_kind TEXT);
+             INSERT INTO local_thread_catalog_hosts VALUES ('local', 'local'), ('remote', 'remote');
+             CREATE TABLE local_thread_catalog (
+                 host_id TEXT, thread_id TEXT, model_provider TEXT,
+                 PRIMARY KEY (host_id, thread_id)
+             );
+             INSERT INTO local_thread_catalog VALUES ('local', 'local-only', 'openai');
+             INSERT INTO local_thread_catalog VALUES ('remote', 'remote-only', 'openai');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = sync_to_at(&home, &data, "synaroute").unwrap();
+        let sqlite = report.sqlite.unwrap();
+        assert_eq!(sqlite.catalog.provider_updated, 1);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT model_provider FROM local_thread_catalog WHERE host_id='local'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "synaroute"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT model_provider FROM local_thread_catalog WHERE host_id='remote'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "openai"
+        );
+        drop(conn);
+
+        restore_at(&home, &data).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT model_provider FROM local_thread_catalog WHERE host_id='local'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "openai"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT model_provider FROM local_thread_catalog WHERE host_id='remote'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "openai"
+        );
+        assert!(!manifest_path_in(&data).exists());
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -2457,6 +2591,7 @@ mod tests {
                 target: "synaroute".into(),
                 synced_at: "x".into(),
                 fallback_provider: String::new(),
+                sqlite_entries: Vec::new(),
                 entries: vec![ManifestEntry {
                     rel_path: rel,
                     original_provider: "openai".into(),

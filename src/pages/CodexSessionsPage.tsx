@@ -42,7 +42,7 @@ export function chooseKnownTarget(
   previous: string,
 ): string {
   const known = new Set(options.targets.filter((option) => option.available).map((o) => o.id));
-  return [previous, options.prefs.lastTarget, options.ours, options.current].find((v) => known.has(v))
+  return [previous, options.ours, options.prefs.lastTarget, options.current].find((v) => known.has(v))
     ?? options.targets.find((option) => option.available)?.id
     ?? "";
 }
