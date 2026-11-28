@@ -132,9 +132,12 @@ export function CodexSessionsPage() {
    * 下拉里选的目标，两者未必是同一个 provider。真正权威的数字是同步完那条结果消息。
    */
   const willChange = useMemo(
-    () => data?.page ? data.stats.total - (data.page.providerCounts[target] ?? 0) : (data?.rows ?? []).filter((r) => r.provider !== target).length,
+    () => data?.page
+      ? Math.max(0, data.page.filteredTotal - (data.page.providerCounts[target] ?? 0))
+      : (data?.rows ?? []).filter((r) => r.provider !== target).length,
     [data, target],
   );
+  const visibleTotal = data?.page?.filteredTotal ?? data?.stats.total ?? 0;
 
   const doDelete = async () => {
     if (busy || syncing || repairing || operationInFlight.current || !deleteRequest?.length) return;
@@ -375,7 +378,7 @@ export function CodexSessionsPage() {
               <p className="mt-1 text-sm text-text-muted">
                 {willChange > 0
                   ? t("sessions.syncConfirmBody", { n: willChange, target })
-                  : t("sessions.syncConfirmNone", { total: data?.stats.total ?? 0, target })}
+                  : t("sessions.syncConfirmNone", { total: visibleTotal, target })}
               </p>
               <div className="mt-3 flex gap-2">
                 <Button size="sm" disabled={busy || syncing || repairing || !target} onClick={() => void doSync()}>

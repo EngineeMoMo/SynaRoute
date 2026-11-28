@@ -22,7 +22,7 @@ pub struct PageQuery {
 
 impl Default for PageQuery {
     fn default() -> Self {
-        Self { query: String::new(), archive: "active".into(), source: "user".into(), only_mismatched: false,
+        Self { query: String::new(), archive: "all".into(), source: "user".into(), only_mismatched: false,
             only_model_gone: false, sort: "updated".into(), grouping: "project".into(), page: 0, page_size: 50, refresh: false, selected: Vec::new() }
     }
 }
@@ -182,7 +182,7 @@ fn select(snapshot: &CodexSessionList, query: &PageQuery) -> CodexSessionList {
     let total = rows.len();
     let page = query.page.min(total.saturating_sub(1) / page_size);
     let mut provider_counts = BTreeMap::new();
-    for row in &snapshot.rows { *provider_counts.entry(row.provider.clone()).or_default() += 1; }
+    for row in &rows { *provider_counts.entry(row.provider.clone()).or_default() += 1; }
     let paths: std::collections::HashSet<_> = snapshot.rows.iter().map(|row| row.rel_path.as_str()).collect();
     let retained_selection = query.selected.iter().filter(|path| paths.contains(path.as_str())).cloned().collect();
     CodexSessionList { rows: rows.into_iter().skip(page * page_size).take(page_size).cloned().collect(),
@@ -207,6 +207,11 @@ mod tests {
         let first = list(directory.path(), &[], &query).unwrap();
         assert_eq!(first.rows.len(), 50);
         assert_eq!(first.page.unwrap().filtered_total, 125);
+        query.query = "00000000-0000-4000-8000-000000000001".into();
+        let narrowed = list(directory.path(), &[], &query).unwrap();
+        assert_eq!(narrowed.page.as_ref().unwrap().filtered_total, 1);
+        assert_eq!(narrowed.page.as_ref().unwrap().provider_counts.get("openai"), Some(&1));
+        query.query.clear();
         query.page = 2;
         assert_eq!(list(directory.path(), &[], &query).unwrap().rows.len(), 25);
         fs::remove_file(&paths[0]).unwrap();
@@ -229,7 +234,7 @@ mod tests {
         let database = directory.path().join("state_5.sqlite");
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE threads(id TEXT, title TEXT, archived INTEGER); INSERT INTO threads VALUES ('00000000-0000-4000-8000-000000000001','Before',0);").unwrap();
-        let query = PageQuery { source: "all".into(), ..Default::default() };
+        let query = PageQuery { archive: "active".into(), source: "all".into(), ..Default::default() };
         assert_eq!(list(directory.path(), &[], &query).unwrap().rows[0].title, "Before");
         connection.execute("UPDATE threads SET title='After', archived=1", []).unwrap();
         assert!(list(directory.path(), &[], &query).unwrap().rows.is_empty());

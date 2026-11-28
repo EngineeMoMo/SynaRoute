@@ -47,7 +47,7 @@ describe("Codex session browsing", () => {
       session("internal", { threadSource: "guardian_review", internal: true }),
       session("unknown", { threadSource: "new-source" }), session("archived", { archived: true })];
     expect(filterSessions(rows, defaultSessionFilters, "synaroute").map((row) => row.threadId).sort())
-      .toEqual(["fork", "unknown", "user"]);
+      .toEqual(["archived", "fork", "unknown", "user"]);
     expect(isInternalSession(session("veto", { internal: true }))).toBe(false);
     expect(filterSessions(rows, { ...defaultSessionFilters, source: "internal" }, "synaroute").map((row) => row.threadId))
       .toEqual(["internal"]);

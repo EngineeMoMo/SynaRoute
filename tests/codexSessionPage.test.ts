@@ -101,6 +101,11 @@ describe("会话页与后端的两处契约", () => {
     }
   });
 
+  it("同步确认数量跟随当前筛选结果", () => {
+    expect(code(page)).toContain("data.page.filteredTotal");
+    expect(code(page)).toContain("data.page.providerCounts[target]");
+  });
+
   it("provider 同步与 ID 修复的确认文案明确分开", () => {
     for (const dict of [sessionsZh, sessionsEn]) {
       for (const key of ["sessions.syncConfirmBody", "sessions.syncConfirmNone"] as const) {

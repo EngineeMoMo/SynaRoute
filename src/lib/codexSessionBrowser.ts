@@ -13,7 +13,7 @@ export type SessionFilters = {
 export type SessionPageQuery = SessionFilters & { grouping: SessionGrouping; page: number; pageSize: number; refresh?: boolean; selected?: string[] };
 
 export const defaultSessionFilters: SessionFilters = {
-  query: "", archive: "active", source: "user",
+  query: "", archive: "all", source: "user",
   onlyMismatched: false, onlyModelGone: false, sort: "updated",
 };
 
