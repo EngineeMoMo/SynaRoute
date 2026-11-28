@@ -1,38 +1,12 @@
-//! Codex 历史会话的 provider 同步：让**切换 provider 之前**创建的对话仍然路由到我们。
+//! Codex 历史会话 provider 同步，让切换 provider 前创建的对话继续路由到 SynaRoute。
 //!
-//! # 为什么需要它（2026-09-03 实测，codex-cli 0.151.0-alpha.7.2）
+//! 每条 thread 的 provider 写在 rollout 的 `session_meta.payload.model_provider`，
+//! 也可能保存在模型设置和 SQLite 的 `threads.model_provider`。`thread/resume` 会优先采用
+//! 会话自身的值，因此同步必须覆盖每个 provider 检查点和本地索引。
 //!
-//! 每条 thread **自带一个 provider 身份**，写在 rollout 的 `session_meta.payload.model_provider`。
-//! 同一文件可有多条 `session_meta`，仅首条对齐并不够；app-server 的 `thread/resume` 用它**覆盖
-//! `config.toml` 的根 `model_provider`**。于是官方登录期创建的对话记着 `openai`
-//! （内置 provider、永远存在 → 不报 `Model provider not found` 而是**静默**打
-//! `api.openai.com`）→ 拿 `auth.json` 里我们的占位符 → **401**。
-//!
-//! 用户看到的形态是：**旧对话每次都 401，新建对话完全正常**，而 `config.toml` 完好、
-//! [`super::drift_state`] 判 `Intact`、一个字都不报。这是占位符外发的**第三条**路径
-//! （另两条见 codex.rs 模块头）。
-//!
-//! **四组实测的对照表**（含「不传参也走会话里记的那个」这条决定性的一行）在测试段
-//! `the_real_codex_binary_resumes_with_the_provider_we_wrote` 的文档里 —— 它就是那张表的
-//! 可执行版本。协议侧印证：`Thread` 与 `ThreadResumeResponse` 的 `modelProvider` 都是
-//! **required**；权威定义可自己导：`codex.exe app-server generate-json-schema --out <dir>`。
-//!
-//! 🔴 **别把第三方工具的说法当成这条的解释。** `Dailin521/codex-provider-sync` 与
-//! CodexPlusPlus 改的就是这两处，但它们的 README 只说「切 provider 后旧会话**从列表里
-//! 消失**（可见性）」—— 打错上游这个后果它们没写，而那才是 401 的来源。改的地方对、
-//! 描述不全。故本模块的判据按**路由正确性**设计，不按可见性。
-//!
-//! # 恢复来源不止 rollout
-//!
-//! 没有 SQLite 记录时，Codex 也能从 rollout 恢复；已有记录时，app-server 的
-//! `merge_persisted_resume_metadata` 会采纳 `threads.model_provider`，除非恢复请求显式覆盖。
-//! 会话文件、属于本线程的模型设置、已有的库记录都要核对。磁盘同步不接管运行中的线程。
-//!
-//! # 🔴 已知边界：本模块只保证「路由到对的上游」，不保证旧对话一定能继续
-//!
-//! 跨账号恢复时 Responses 的 reasoning 带 `encrypted_content`、由签发它的账号加密，换上游
-//! 后可能解不开（与 `THINKING_SIGNATURE_INVALID` 同族）。故用户可见文案**只说「已把 N 个
-//! 旧对话指向 SynaRoute」**，绝不说「已恢复可用」—— 那是我们手里的信息支撑不了的承诺。
+//! 没有 SQLite 记录时从 rollout 恢复，已有记录时同时核对会话文件、模型设置和数据库。
+//! 磁盘同步不接管运行中的线程。跨账号恢复可能因 Responses 的 `encrypted_content` 无法继续，
+//! 所以用户提示只确认 provider 已完成同步。
 
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
